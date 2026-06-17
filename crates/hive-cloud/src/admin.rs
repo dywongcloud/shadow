@@ -47,13 +47,43 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/git/deploy", post(git_deploy))
         .route("/v1/builds/:id", get(build_get))
         .route("/v1/nodes/announce", post(node_announce))
+        .route("/v1/token", post(mint_token))
+        .route("/v1/auth", get(auth_status))
         .route("/v1/regions/catalog", get(region_catalog))
         .route("/v1/projects/:project/settings", get(project_settings_get))
         .route("/v1/projects/:project/build", put(project_build_put))
         .route("/v1/projects/:project/functions", put(project_functions_put))
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
+        .route("/v1/projects/:project/domains", post(project_domain_add))
+        .route("/v1/domains", get(domains_list))
         .with_state(cloud)
+}
+
+// ---- Auth (JWT) ----
+
+#[derive(Deserialize)]
+struct TokenReq {
+    #[serde(default = "default_sub")]
+    sub: String,
+    #[serde(default = "default_tenant")]
+    tenant: String,
+    #[serde(default = "default_role")]
+    role: String,
+}
+fn default_sub() -> String { "user".into() }
+fn default_tenant() -> String { "default".into() }
+fn default_role() -> String { "owner".into() }
+
+async fn auth_status() -> Json<Value> {
+    Json(json!({ "enforced": crate::auth::enforced() }))
+}
+
+async fn mint_token(Json(req): Json<TokenReq>) -> Result<Json<Value>, (StatusCode, String)> {
+    match crate::auth::issue(&req.sub, &req.tenant, &req.role, 8 * 3600) {
+        Ok(token) => Ok(Json(json!({ "token": token, "expires_in": 8 * 3600 }))),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
 }
 
 // ---- Project settings (env vars, build config, function settings) ----
@@ -72,6 +102,7 @@ async fn project_build_put(
     Json(build): Json<crate::project_settings::BuildConfig>,
 ) -> Json<Value> {
     c.projects.set_build(&project, build);
+    crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
 }
 
@@ -81,6 +112,7 @@ async fn project_functions_put(
     Json(f): Json<crate::project_settings::FunctionSettings>,
 ) -> Json<Value> {
     c.projects.set_functions(&project, f);
+    crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
 }
 
@@ -90,6 +122,7 @@ async fn project_env_put(
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Json<Value> {
     c.projects.put_env(&project, v);
+    crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
 }
 
@@ -98,7 +131,36 @@ async fn project_env_delete(
     Path((project, key)): Path<(String, String)>,
 ) -> Json<Value> {
     c.projects.delete_env(&project, &key);
+    crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
+}
+
+// ---- Domains ----
+
+#[derive(Deserialize)]
+struct AddDomain {
+    domain: String,
+}
+
+async fn project_domain_add(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+    Json(b): Json<AddDomain>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let ok = c.gw.add_alias(&b.domain, &project);
+    if !ok {
+        return Err((StatusCode::NOT_FOUND, format!("no deployment for project '{project}'")));
+    }
+    c.projects.add_domain(&project, b.domain.clone());
+    crate::persist::persist(&c);
+    let ev = c.event(&c.region, "DOMAIN", &b.domain, "/", 200, "domain-add", &project);
+    c.record(ev);
+    Ok(Json(json!({ "domain": b.domain, "project": project, "attached": true })))
+}
+
+async fn domains_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let pairs = c.projects.all_domains();
+    Json(json!(pairs.into_iter().map(|(p, d)| json!({ "project": p, "domain": d })).collect::<Vec<_>>()))
 }
 
 // ---- Git deploy (Import Git Repository) ----
@@ -197,12 +259,14 @@ async fn waf_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 async fn waf_add_rule(State(c): State<Arc<CloudState>>, Json(rule): Json<WafRule>) -> Json<Value> {
     c.waf.add_rule(rule);
+    crate::persist::persist(&c);
     Json(json!({ "rules": c.waf.rules() }))
 }
 
 async fn waf_del_rule(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
     let kept: Vec<WafRule> = c.waf.rules().into_iter().filter(|r| r.id != id).collect();
     c.waf.set_rules(kept);
+    crate::persist::persist(&c);
     Json(json!({ "rules": c.waf.rules() }))
 }
 
@@ -253,11 +317,13 @@ async fn routing_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 async fn add_redirect(State(c): State<Arc<CloudState>>, Json(r): Json<Redirect>) -> Json<Value> {
     c.router.add_redirect(r);
+    crate::persist::persist(&c);
     Json(json!({ "redirects": c.router.redirects() }))
 }
 
 async fn add_rewrite(State(c): State<Arc<CloudState>>, Json(r): Json<Rewrite>) -> Json<Value> {
     c.router.add_rewrite(r);
+    crate::persist::persist(&c);
     Json(json!({ "rewrites": c.router.rewrites() }))
 }
 

@@ -71,6 +71,8 @@ pub struct ProjectSettings {
     pub build: BuildConfig,
     #[serde(default)]
     pub functions: FunctionSettings,
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 /// Store keyed by project name.
@@ -134,6 +136,22 @@ impl ProjectStore {
         if let Some(s) = self.map.write().get_mut(project) {
             s.env.retain(|e| e.key != key);
         }
+    }
+
+    pub fn add_domain(&self, project: &str, domain: String) {
+        let mut m = self.map.write();
+        let s = m.entry(project.to_string()).or_default();
+        if !s.domains.contains(&domain) {
+            s.domains.push(domain);
+        }
+    }
+
+    /// All (project, domain) pairs across projects.
+    pub fn all_domains(&self) -> Vec<(String, String)> {
+        let m = self.map.read();
+        m.iter()
+            .flat_map(|(p, s)| s.domains.iter().map(move |d| (p.clone(), d.clone())))
+            .collect()
     }
 
     /// Env vars to inject into a function at deploy time (decrypted values).

@@ -27,3 +27,13 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
+jsonwebtoken = "9"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+# Optional: iroh-native, P2P-replicated durable store. Enable with
+# `--features guardian` (its API is evolving, so kept off the default build).
+guardian-db = { version = "0.16", optional = true }
+
+[features]
+default = []
+guardian = ["dep:guardian-db"]

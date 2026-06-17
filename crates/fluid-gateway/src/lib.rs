@@ -138,6 +138,20 @@ impl Gateway {
         info
     }
 
+    /// Attach a custom domain to a project (its first label aliases to the
+    /// project's current deployment). Returns true if the project exists.
+    pub fn add_alias(&self, domain: &str, project: &str) -> bool {
+        let label = domain.split('.').next().unwrap_or(domain).to_string();
+        let mut st = self.state.lock();
+        let target = st.aliases.get(project).cloned();
+        if let Some(id) = target {
+            st.aliases.insert(label, id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn list(&self) -> Vec<DeploymentInfo> {
         let st = self.state.lock();
         let mut out: Vec<DeploymentInfo> = st.deployments.values().map(view_of).collect();

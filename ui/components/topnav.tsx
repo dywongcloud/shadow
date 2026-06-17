@@ -13,6 +13,7 @@ const tabs = [
   { href: "/activity", label: "Activity" },
   { href: "/domains", label: "Domains" },
   { href: "/firewall", label: "Firewall" },
+  { href: "/network", label: "Network" },
   { href: "/usage", label: "Usage" },
   { href: "/settings", label: "Settings" },
 ];
@@ -61,7 +62,7 @@ export function TopNav() {
           <Link href="/new">
             <button className="rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium hover:bg-subtle">Invite</button>
           </Link>
-          <div className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-[#0761d1] text-xs font-semibold text-white">D</div>
+          <Link href="/account" className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-[#0761d1] text-xs font-semibold text-white">D</Link>
         </div>
       </div>
       {/* Row 2: tabs — active underline sits flush on the header's bottom border */}

@@ -173,23 +173,54 @@ async fn run_build(
         b.branch = actual_branch.clone();
     });
 
-    // Manifest: prefer fluid.json, else detect.
-    let mut manifest = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
-        Ok(s) => {
-            let mut m = Manifest::from_json(&s)?;
-            if m.project.is_empty() {
-                m.project = project.clone();
+    // Container path (Railway-style): a Dockerfile is built with podman and run
+    // as the deployment's process (listening on $PORT, proxied by the gateway).
+    let dockerfile = dir.join("Dockerfile");
+    let mut manifest;
+    if dockerfile.exists() {
+        log("Detected Dockerfile — building container image.".into());
+        let image = format!("hive-{}-{}", project, &commit[..commit.len().min(7)]);
+        let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
+        let t1 = now_ms();
+        let out = Command::new("podman")
+            .arg("build")
+            .arg("-t")
+            .arg(&image)
+            .arg(".")
+            .current_dir(&dir)
+            .output()
+            .await?;
+        // Stream a few build lines.
+        for line in String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .chain(String::from_utf8_lossy(&out.stdout).lines())
+            .filter(|l| !l.trim().is_empty())
+            .take(40)
+        {
+            log(format!("  {line}"));
+        }
+        anyhow::ensure!(out.status.success(), "podman build failed");
+        log(format!("Image built: {image} ({}ms), EXPOSE {exposed}", now_ms().saturating_sub(t1)));
+        manifest = container_manifest(&project, &image, exposed);
+    } else {
+        // Manifest: prefer fluid.json, else detect.
+        manifest = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
+            Ok(s) => {
+                let mut m = Manifest::from_json(&s)?;
+                if m.project.is_empty() {
+                    m.project = project.clone();
+                }
+                log("Detected fluid.json — using project configuration.".into());
+                m
             }
-            log("Detected fluid.json — using project configuration.".into());
-            m
-        }
-        Err(_) => {
-            let m = detect_manifest(&dir, &project).await;
-            let preset = if !m.functions.is_empty() { "function" } else { "static" };
-            log(format!("Detecting build settings… (preset: {preset})"));
-            m
-        }
-    };
+            Err(_) => {
+                let m = detect_manifest(&dir, &project).await;
+                let preset = if !m.functions.is_empty() { "function" } else { "static" };
+                log(format!("Detecting build settings… (preset: {preset})"));
+                m
+            }
+        };
+    }
     manifest.project = project.clone();
 
     // Inject project env vars + function settings.
@@ -262,6 +293,7 @@ async fn run_build(
     });
     let ev = cloud.event(&cloud.region, "DEPLOY", &info.alias, "/", 200, "deploy", &format!("git {}", req.repo_url));
     cloud.record(ev);
+    crate::persist::persist(cloud);
     Ok(())
 }
 
@@ -307,6 +339,57 @@ async fn detect_manifest(dir: &Path, project: &str) -> Manifest {
         static_dir: Some(".".into()),
         functions: vec![],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
+    }
+}
+
+/// Parse the container's listen port from a Dockerfile: prefer `EXPOSE`, else
+/// `ENV PORT=`, else None (caller defaults).
+async fn parse_expose(path: &Path) -> Option<u16> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let mut env_port = None;
+    for line in content.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("EXPOSE ").or_else(|| l.strip_prefix("expose ")) {
+            if let Some(p) = rest.split_whitespace().next().and_then(|s| s.split('/').next()) {
+                if let Ok(n) = p.parse::<u16>() {
+                    return Some(n);
+                }
+            }
+        }
+        let lu = l.to_uppercase();
+        if lu.starts_with("ENV PORT=") || lu.starts_with("ENV PORT ") {
+            if let Some(p) = l.split(|c| c == '=' || c == ' ').last() {
+                if let Ok(n) = p.trim().parse::<u16>() {
+                    env_port = Some(n);
+                }
+            }
+        }
+    }
+    env_port
+}
+
+/// A container deployment: the function "process" is `podman run`. The app is
+/// told to listen on `internal` (via PORT env) and we publish the cell's $PORT →
+/// that internal port, so the gateway proxies to 127.0.0.1:$PORT.
+fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
+    Manifest {
+        project: project.to_string(),
+        static_dir: None,
+        functions: vec![FunctionConfig {
+            name: "web".into(),
+            runtime: "container".into(),
+            // Structured marker the backend recognizes: run this image as a
+            // detached container, mapping the cell $PORT -> internal port.
+            start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string()],
+            env: Default::default(),
+            memory_mib: 512,
+            max_concurrency: 20,
+            min_instances: 1,
+            max_instances: 5,
+            idle_ttl_secs: 120,
+            max_duration_secs: 300,
+        }],
+        routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
     }
 }
 

@@ -48,6 +48,8 @@ pub struct MockBackend {
     funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
+    /// Per-cell podman container names (Railway-style container deploys).
+    containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
 }
 
 impl MockBackend {
@@ -56,6 +58,7 @@ impl MockBackend {
             cfg,
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
+            containers: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 }
@@ -201,17 +204,68 @@ impl CellBackend for MockBackend {
         func: &FunctionLaunch,
     ) -> anyhow::Result<CellEndpoint> {
         anyhow::ensure!(!func.start_cmd.is_empty(), "empty function start_cmd");
+
+        // Container deploys (Railway-style): `["__container__", image, internal]`.
+        // Run detached + named so the gateway can proxy to the published port and
+        // `terminate` can clean it up reliably (kill_on_drop can't stop podman).
+        if func.start_cmd[0] == "__container__" {
+            let image = func.start_cmd.get(1).cloned().unwrap_or_default();
+            let internal = func.start_cmd.get(2).cloned().unwrap_or_else(|| "8080".into());
+            let name = format!("hive-{}", cell.id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+            let _ = std::process::Command::new("podman").args(["rm", "-f", &name]).output();
+            let port = func.port;
+            let status = Command::new("podman")
+                .args([
+                    "run", "-d", "--name", &name, "-e", &format!("PORT={internal}"),
+                    "-p", &format!("127.0.0.1:{port}:{internal}"), &image,
+                ])
+                .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+                .output()
+                .await?;
+            anyhow::ensure!(status.status.success(), "podman run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
+            self.containers.lock().await.insert(cell.id.clone(), name);
+            let func_addr = format!("127.0.0.1:{port}");
+            wait_tcp_ready(&func_addr, Duration::from_secs(60)).await?;
+            // Front the container with the multiplexed tunnel server.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let tunnel_addr = listener.local_addr()?.to_string();
+            let max_conc = func.max_concurrency.max(1);
+            let task = tokio::spawn(async move {
+                loop {
+                    match listener.accept().await {
+                        Ok((conn, _)) => {
+                            let local = func_addr.clone();
+                            tokio::spawn(async move { fluid_tunnel::TunnelServer::serve(conn, local, max_conc).await; });
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            self.tunnels.lock().await.insert(cell.id.clone(), task);
+            return Ok(CellEndpoint::Tcp(tunnel_addr));
+        }
+
         let workdir = func
             .workdir
             .as_ref()
             .map(PathBuf::from)
             .unwrap_or_else(|| cell.root.clone());
 
+        // Ensure common tool dirs (podman/docker, homebrew) are on PATH so
+        // container deploys work regardless of how the node was launched.
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        let path = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{base_path}");
+        // Containers (podman) take longer to publish their port than a plain
+        // process, especially on macOS rootless networking.
+        let is_container = func.start_cmd.join(" ").contains("podman")
+            || func.start_cmd.join(" ").contains("docker");
+        let ready_timeout = if is_container { 60 } else { 15 };
+
         let mut cmd = Command::new(&func.start_cmd[0]);
         cmd.args(&func.start_cmd[1..])
             .current_dir(&workdir)
             .env("PORT", func.port.to_string())
-            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("PATH", path)
             .env("HOME", &workdir)
             .envs(&func.env)
             .stdin(Stdio::null())
@@ -224,7 +278,7 @@ impl CellBackend for MockBackend {
 
         // Readiness: wait until the function accepts TCP on its port.
         let func_addr = format!("127.0.0.1:{}", func.port);
-        wait_tcp_ready(&func_addr, Duration::from_secs(15)).await?;
+        wait_tcp_ready(&func_addr, Duration::from_secs(ready_timeout)).await?;
 
         // Front the function with a multiplexed tunnel server (the mock
         // equivalent of the in-VM cell agent). The gateway connects ONE tunnel
@@ -255,6 +309,10 @@ impl CellBackend for MockBackend {
         // Stop the tunnel accept loop.
         if let Some(task) = self.tunnels.lock().await.remove(&cell.id) {
             task.abort();
+        }
+        // Remove any container bound to this cell.
+        if let Some(name) = self.containers.lock().await.remove(&cell.id) {
+            let _ = Command::new("podman").args(["rm", "-f", &name]).output().await;
         }
         // Kill any function process bound to this cell.
         if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {

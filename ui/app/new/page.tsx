@@ -18,8 +18,8 @@ interface GhRepo {
 const TEMPLATES = [
   { name: "HTML Starter", desc: "A clean static site, deployed instantly.", url: "https://github.com/mdn/beginner-html-site" },
   { name: "Hello World", desc: "The smallest possible deploy.", url: "https://github.com/octocat/Hello-World" },
+  { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", url: "https://github.com/crccheck/docker-hello-world" },
   { name: "Static Portfolio", desc: "A single-page static portfolio.", url: "https://github.com/github/personal-website" },
-  { name: "Docs Site", desc: "A static documentation site.", url: "https://github.com/mdn/content" },
 ];
 
 export default function NewProjectPage() {

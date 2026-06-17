@@ -6,8 +6,12 @@
 //! region-aware node registry that meshes with peer nodes over HTTP gossip.
 
 mod admin;
+mod auth;
 mod edge;
 mod git;
+#[cfg(feature = "guardian")]
+mod guardian;
+mod persist;
 mod project_settings;
 mod state;
 
@@ -133,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
         hive,
     );
 
+    // Restore persisted platform state from disk (deployments, settings, WAF…).
+    persist::restore(&cloud, persist::load());
+
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
     if !args.peers.is_empty() {
@@ -142,7 +149,11 @@ async fn main() -> anyhow::Result<()> {
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())
         .layer(axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline));
-    let admin_router = admin::router(cloud.clone());
+    let admin_router = admin::router(cloud.clone())
+        .layer(axum::middleware::from_fn(auth::require_auth));
+    if auth::enforced() {
+        tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
+    }
 
     tracing::info!(region=%args.region, node=%args.name, public=%args.listen, admin=%args.admin, "hive-cloud node up");
 
