@@ -4,11 +4,12 @@ import Link from "next/link";
 import { Search, GitBranch, Github } from "lucide-react";
 import { useState } from "react";
 import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
+import { ProjectMenu } from "@/components/project-menu";
 import { usePoll, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function ProjectsPage() {
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 3000);
+  const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const [q, setQ] = useState("");
   const projects = new Map<string, Deployment>();
   for (const d of deps ?? []) if (!projects.has(d.project)) projects.set(d.project, d);
@@ -36,6 +37,7 @@ export default function ProjectsPage() {
                 <Badge tone={p.state === "ready" ? "green" : p.state === "building" ? "amber" : "default"} className="ml-auto">
                   {p.state}
                 </Badge>
+                <ProjectMenu project={p.project} alias={p.alias} onChange={refresh} />
               </div>
               <p className="mt-4 line-clamp-1 text-sm text-secondary">{p.git?.commit_message || "—"}</p>
               <div className="mt-3 flex items-center gap-1.5 text-xs text-muted">

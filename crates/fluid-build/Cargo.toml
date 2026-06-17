@@ -1,0 +1,15 @@
+[package]
+name = "fluid-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Framework-Defined Infrastructure: detect a project's framework, run its build,
+# and normalize the result into the Build Output API v3 — the standard contract
+# (static assets + serverless/edge functions + routing) the rest of the platform
+# provisions from. Mirrors Vercel's `vercel build` / Build Output API.
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

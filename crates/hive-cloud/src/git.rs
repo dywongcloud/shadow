@@ -216,24 +216,17 @@ async fn run_build(
         anyhow::ensure!(out.status.success(), "podman build failed");
         log(format!("Image built: {image} ({}ms), EXPOSE {exposed}", now_ms().saturating_sub(t1)));
         manifest = container_manifest(&project, &image, exposed);
+    } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
+        let mut m = Manifest::from_json(&s)?;
+        if m.project.is_empty() {
+            m.project = project.clone();
+        }
+        log("Detected fluid.json — using project configuration.".into());
+        manifest = m;
     } else {
-        // Manifest: prefer fluid.json, else detect.
-        manifest = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
-            Ok(s) => {
-                let mut m = Manifest::from_json(&s)?;
-                if m.project.is_empty() {
-                    m.project = project.clone();
-                }
-                log("Detected fluid.json — using project configuration.".into());
-                m
-            }
-            Err(_) => {
-                let m = detect_manifest(&dir, &project).await;
-                let preset = if !m.functions.is_empty() { "function" } else { "static" };
-                log(format!("Detecting build settings… (preset: {preset})"));
-                m
-            }
-        };
+        // Framework-Defined Infrastructure: detect the framework, run its real
+        // install + build, and normalize the result into the Build Output API.
+        manifest = build_via_fdi(cloud, bid, &dir, &project).await?;
     }
     manifest.project = project.clone();
 
@@ -251,13 +244,10 @@ async fn run_build(
         f.memory_mib = fsettings.memory_mib;
     }
 
-    // Simulated install/build for static-ish repos; real for those with commands.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Ensure static deployments always have something to serve at "/". Some
+    // repos (plain static, monorepos) have no index.html — generate a landing
+    // page so the deployed URL returns 200 instead of 404.
     if manifest.functions.is_empty() {
-        log("Running \"build\"".into());
-        // Ensure the static deployment has something to serve at "/". Many repos
-        // (monorepos, framework sources) have no index.html — generate a landing
-        // page so the deployed URL returns 200 instead of 404.
         let static_dir = manifest.static_dir.clone().unwrap_or_else(|| ".".into());
         let base = if static_dir == "." { dir.clone() } else { dir.join(&static_dir) };
         let index = base.join("index.html");
@@ -267,21 +257,10 @@ async fn run_build(
             let _ = tokio::fs::write(&index, html).await;
             log("No index.html found — generated a default landing page.".into());
         }
-        log("No build step required — serving static assets.".into());
-    } else {
-        let cmd = manifest.functions[0].start_cmd.join(" ");
-        log(format!("Running \"install\" command…"));
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        log(format!("Build completed. Launch command: `{cmd}`"));
     }
-    tokio::time::sleep(Duration::from_millis(250)).await;
 
     log("Uploading build outputs…".into());
-    log(format!(
-        "Functions: {}, Static assets prepared.",
-        manifest.functions.len()
-    ));
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    log(format!("Functions: {}, Static assets prepared.", manifest.functions.len()));
 
     // Register the routable deployment.
     let git = GitSource {
@@ -335,38 +314,150 @@ fn region_label(region: &str) -> String {
     .to_string()
 }
 
-async fn detect_manifest(dir: &Path, project: &str) -> Manifest {
-    if dir.join("package.json").exists() {
-        if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
-                if v.get("scripts").and_then(|s| s.get("start")).is_some() {
-                    return function_manifest(project, vec!["npm".into(), "start".into()]);
-                }
-            }
+/// Framework-Defined Infrastructure: detect the framework, run its real install
+/// + build commands (streamed), then normalize the output into a Manifest —
+/// either static assets or a serverless server. This is the executor that turns
+/// a source repo into the Build Output API contract (`fluid-build`).
+async fn build_via_fdi(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    dir: &Path,
+    project: &str,
+) -> anyhow::Result<Manifest> {
+    let log = |s: String| cloud.builds.log(bid, s);
+
+    // Build-config overrides ONLY when the project was explicitly configured —
+    // a fresh deploy uses pure framework detection (the generic BuildConfig
+    // default of "npm install"/"npm run build" is not treated as an override).
+    let bc = cloud.projects.get_if_set(project).map(|s| s.build);
+    let pick = |f: fn(&crate::project_settings::BuildConfig) -> &String| {
+        bc.as_ref().map(f).filter(|s| !s.trim().is_empty()).cloned()
+    };
+    let inst = pick(|b| &b.install_command);
+    let bld = pick(|b| &b.build_command);
+    let outd = pick(|b| &b.output_dir);
+
+    let plan = fluid_build::plan_build(dir, inst.as_deref(), bld.as_deref(), outd.as_deref());
+    log(format!(
+        "Detected framework: {} — primitive: {:?}",
+        plan.framework.name, plan.framework.primitive
+    ));
+
+    // npm/yarn/pnpm commands require a package.json; skip them if absent so plain
+    // static repos don't fail on `npm install`.
+    let has_pkg = dir.join("package.json").exists();
+    let is_node_cmd = |c: &str| {
+        let c = c.trim_start();
+        ["npm", "yarn", "pnpm", "bun", "next", "vite", "astro"].iter().any(|p| c.starts_with(p))
+    };
+    let runnable = |c: &str| !c.is_empty() && !(is_node_cmd(c) && !has_pkg);
+
+    // 1) Install dependencies (real, streamed).
+    if runnable(&plan.install_command) {
+        log(format!("Running \"{}\"", plan.install_command));
+        run_streamed(dir, &plan.install_command, cloud, bid)
+            .await
+            .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
+    }
+    // 2) Build (real, streamed).
+    if runnable(&plan.build_command) {
+        log(format!("Running \"{}\"", plan.build_command));
+        run_streamed(dir, &plan.build_command, cloud, bid)
+            .await
+            .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
+    }
+
+    let has_bo = fluid_build::has_build_output(dir);
+    if has_bo {
+        log("Build Output API detected (.vercel/output).".into());
+    }
+
+    use fluid_build::Primitive;
+    match plan.framework.primitive {
+        Primitive::Static => {
+            let sd = if has_bo { ".vercel/output/static".to_string() } else { plan.output_dir.clone() };
+            log(format!("Serving static assets from \"{sd}\"."));
+            Ok(static_manifest(project, &sd))
+        }
+        Primitive::Serverless | Primitive::Hybrid => {
+            // Node-server model: the framework was just built, so its production
+            // server (`next start`, `node build`, …) will boot and listen on
+            // $PORT in the build dir. The gateway proxies to it.
+            let start = detect_start_cmd(dir).await;
+            log(format!("Provisioning serverless server: `{}`.", start.join(" ")));
+            Ok(function_manifest(project, start))
         }
     }
-    for entry in ["app.py", "main.py", "server.py"] {
-        if dir.join(entry).exists() {
-            return function_manifest(project, vec!["python3".into(), entry.into()]);
-        }
-    }
-    for sd in ["", "public", "dist", "build", "out"] {
-        let probe = if sd.is_empty() { dir.join("index.html") } else { dir.join(sd).join("index.html") };
-        if probe.exists() {
-            return Manifest {
-                project: project.to_string(),
-                static_dir: Some(if sd.is_empty() { ".".into() } else { sd.into() }),
-                functions: vec![],
-                routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
-            };
-        }
-    }
+}
+
+fn static_manifest(project: &str, static_dir: &str) -> Manifest {
     Manifest {
         project: project.to_string(),
-        static_dir: Some(".".into()),
+        static_dir: Some(if static_dir.is_empty() { ".".into() } else { static_dir.to_string() }),
         functions: vec![],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
     }
+}
+
+/// The command that boots the built app's production server.
+async fn detect_start_cmd(dir: &Path) -> Vec<String> {
+    if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
+            if v.get("scripts").and_then(|s| s.get("start")).is_some() {
+                return vec!["npm".into(), "start".into()];
+            }
+        }
+    }
+    for entry in ["server.js", "index.js", "app.py", "main.py", "server.py"] {
+        if dir.join(entry).exists() {
+            let runner = if entry.ends_with(".py") { "python3" } else { "node" };
+            return vec![runner.into(), entry.into()];
+        }
+    }
+    vec!["npm".into(), "start".into()]
+}
+
+/// Run a shell command in `dir`, streaming stdout+stderr into the build log.
+async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &str) -> anyhow::Result<()> {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let path = format!(
+        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new("/bin/sh")
+        .arg("-lc")
+        .arg(command)
+        .current_dir(dir)
+        .env("PATH", &path)
+        .env("HOME", dir)
+        .env("CI", "1")
+        .env("NEXT_TELEMETRY_DISABLED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child.stdout.take().expect("piped");
+    let stderr = child.stderr.take().expect("piped");
+    let (c1, b1) = (cloud.clone(), bid.to_string());
+    let t1 = tokio::spawn(async move {
+        let mut lines = BufReader::new(stdout).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            c1.builds.log(&b1, format!("  {l}"));
+        }
+    });
+    let (c2, b2) = (cloud.clone(), bid.to_string());
+    let t2 = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(l)) = lines.next_line().await {
+            c2.builds.log(&b2, format!("  {l}"));
+        }
+    });
+    let status = child.wait().await?;
+    let _ = tokio::join!(t1, t2);
+    anyhow::ensure!(status.success(), "exited with {status}");
+    Ok(())
 }
 
 /// Parse the container's listen port from a Dockerfile: prefer `EXPOSE`, else

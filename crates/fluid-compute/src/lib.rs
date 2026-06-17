@@ -362,6 +362,21 @@ impl Fluid {
         let _ = self.backend.terminate(&handle).await;
     }
 
+    /// Remove a function pool entirely and terminate all its instances. Used
+    /// when a deployment is deleted.
+    pub async fn unregister(self: &Arc<Self>, key: &str) {
+        let handles: Vec<hive_backend::CellHandle> = {
+            let mut reg = self.registry.lock();
+            match reg.remove(key) {
+                Some(pool) => pool.instances.into_iter().map(|i| i.handle).collect(),
+                None => return,
+            }
+        };
+        for h in handles {
+            let _ = self.backend.terminate(&h).await;
+        }
+    }
+
     // ---- health checks ------------------------------------------------
 
     async fn health_loop(self: Arc<Self>) {

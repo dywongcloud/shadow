@@ -32,6 +32,10 @@ pub enum DbKind {
     Blob,
     Queue,
     Vector,
+    /// Topic-based publish/subscribe broker (RabbitMQ / Kafka-style fan-out).
+    Pubsub,
+    /// Secure WebSocket streaming channels (rooms) for realtime apps.
+    Realtime,
 }
 impl DbKind {
     pub fn label(&self) -> &'static str {
@@ -41,6 +45,8 @@ impl DbKind {
             DbKind::Blob => "Blob",
             DbKind::Queue => "Queue",
             DbKind::Vector => "Vector",
+            DbKind::Pubsub => "Pub/Sub",
+            DbKind::Realtime => "Realtime",
         }
     }
 }
@@ -116,12 +122,43 @@ struct VectorStore {
     items: RwLock<HashMap<String, HashMap<String, (Vec<f32>, serde_json::Value)>>>,
 }
 
+/// Pub/Sub + Realtime broker. Each named channel (topic or room) is a tokio
+/// broadcast bus: publishers fan out to every live subscriber in O(1).
+///
+/// Mesh note: to fan out across nodes we deliberately do NOT re-dial the iroh
+/// DHT per message (that would rate-limit fast). Instead we ride the already-
+/// established peer connections ("trunks") — the same long-lived QUIC tunnels /
+/// keep-alive HTTP pool the gossip loop uses — and replicate over those.
+struct Broker {
+    channels: RwLock<HashMap<String, tokio::sync::broadcast::Sender<String>>>,
+    published: RwLock<HashMap<String, u64>>,
+}
+impl Default for Broker {
+    fn default() -> Self {
+        Broker {
+            channels: RwLock::new(HashMap::new()),
+            published: RwLock::new(HashMap::new()),
+        }
+    }
+}
+impl Broker {
+    fn sender(&self, channel: &str) -> tokio::sync::broadcast::Sender<String> {
+        if let Some(s) = self.channels.read().get(channel) {
+            return s.clone();
+        }
+        let (tx, _rx) = tokio::sync::broadcast::channel(1024);
+        self.channels.write().insert(channel.to_string(), tx.clone());
+        tx
+    }
+}
+
 pub struct DatabaseStore {
     dbs: RwLock<Vec<Database>>,
     port: AtomicU32,
     blob: BlobStore,
     queue: QueueStore,
     vector: VectorStore,
+    broker: Broker,
 }
 
 impl DatabaseStore {
@@ -132,7 +169,28 @@ impl DatabaseStore {
             blob: BlobStore::default(),
             queue: QueueStore::default(),
             vector: VectorStore::default(),
+            broker: Broker::default(),
         }
+    }
+
+    // ---- Pub/Sub + Realtime broker ----
+    /// Publish a message to a channel; returns the number of live subscribers
+    /// that received it.
+    pub fn publish(&self, channel: &str, msg: String) -> usize {
+        *self.broker.published.write().entry(channel.to_string()).or_insert(0) += 1;
+        let tx = self.broker.sender(channel);
+        tx.send(msg).unwrap_or(0)
+    }
+    /// Subscribe to a channel, receiving all subsequent messages.
+    pub fn subscribe(&self, channel: &str) -> tokio::sync::broadcast::Receiver<String> {
+        self.broker.sender(channel).subscribe()
+    }
+    /// Live subscriber count for a channel.
+    pub fn subscriber_count(&self, channel: &str) -> usize {
+        self.broker.channels.read().get(channel).map(|s| s.receiver_count()).unwrap_or(0)
+    }
+    pub fn published_count(&self, channel: &str) -> u64 {
+        self.broker.published.read().get(channel).copied().unwrap_or(0)
     }
 
     pub fn list(&self, project: Option<&str>) -> Vec<Database> {
@@ -354,6 +412,25 @@ async fn provision_backing(
             c.insert("dimensions".into(), "1536".into());
             c.insert("metric".into(), "cosine".into());
             c.insert("token".into(), token("vec"));
+            Ok(("live".into(), c, None))
+        }
+        DbKind::Pubsub => {
+            let topic = format!("topic-{}", &id[3..11.min(id.len())]);
+            let mut c = HashMap::new();
+            c.insert("provider".into(), "Hive Pub/Sub".into());
+            c.insert("publish_url".into(), format!("/v1/storage/pubsub/{topic}/publish"));
+            c.insert("subscribe_ws".into(), format!("/v1/ws/pubsub/{topic}"));
+            c.insert("topic".into(), topic);
+            c.insert("token".into(), token("psb"));
+            Ok(("live".into(), c, None))
+        }
+        DbKind::Realtime => {
+            let room = format!("room-{}", &id[3..11.min(id.len())]);
+            let mut c = HashMap::new();
+            c.insert("provider".into(), "Hive Realtime (WSS)".into());
+            c.insert("channel_ws".into(), format!("/v1/ws/realtime/{room}"));
+            c.insert("room".into(), room);
+            c.insert("token".into(), token("rt"));
             Ok(("live".into(), c, None))
         }
     }

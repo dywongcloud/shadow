@@ -6,7 +6,7 @@ import { usePoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> = {
-  postgres: "blue", redis: "red", blob: "amber", queue: "green", vector: "default",
+  postgres: "blue", redis: "red", blob: "amber", queue: "green", vector: "default", pubsub: "blue", realtime: "green",
 };
 
 export default function AdminDatabasesPage() {

@@ -4,6 +4,7 @@ import { GeistMono } from "geist/font/mono";
 import { ClerkProvider } from "@clerk/nextjs";
 import "./globals.css";
 import { TopNav } from "@/components/topnav";
+import { Footer } from "@/components/footer";
 import { ThemeProvider } from "@/components/theme-provider";
 
 export const metadata: Metadata = {
@@ -22,10 +23,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       suppressHydrationWarning
       className={`${GeistSans.variable} ${GeistMono.variable}`}
     >
-      <body className="min-h-screen bg-bg font-sans text-fg antialiased">
+      <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
         <ThemeProvider>
           <TopNav />
-          <main className="mx-auto max-w-[1400px] px-4 py-8 sm:px-6">{children}</main>
+          <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
+          <Footer />
         </ThemeProvider>
       </body>
     </html>

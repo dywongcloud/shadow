@@ -1,8 +1,11 @@
 "use client";
 
 import { useState } from "react";
-import { Copy, Plus } from "lucide-react";
+import { Copy, Plus, LogOut } from "lucide-react";
+import { SignOutButton } from "@clerk/nextjs";
 import { Button, Input, SettingCard, Badge } from "@/components/ui";
+
+const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 export default function AccountPage() {
   const [name, setName] = useState("");
@@ -11,7 +14,14 @@ export default function AccountPage() {
 
   return (
     <div className="mx-auto max-w-3xl">
-      <h1 className="mb-6 text-2xl font-semibold tracking-tight">Account Settings</h1>
+      <div className="mb-6 flex items-center justify-between">
+        <h1 className="text-2xl font-semibold tracking-tight">Account Settings</h1>
+        {clerkOn ? (
+          <SignOutButton>
+            <Button variant="outline"><LogOut className="h-4 w-4" /> Sign out</Button>
+          </SignOutButton>
+        ) : null}
+      </div>
       <div className="flex flex-col gap-6">
         <SettingCard
           title="Avatar"

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use axum::{
     body::{Body, Bytes},
     extract::{Request, State},
-    http::{header, HeaderName, HeaderValue, StatusCode},
+    http::{HeaderName, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -86,15 +86,23 @@ pub async fn edge_pipeline(
         return resp;
     }
 
-    // 2) Bot management.
+    // 2) Bot management (incl. the three AI traffic types).
     let policy = *cloud.bot_policy.read();
-    if let Some(reason) = cloud.bot.should_block(&ua, policy) {
-        let ev = cloud.event(&region, &method, &host, &path, 403, "bot-block", &reason);
-        cloud.record(ev);
-        let mut resp = (StatusCode::FORBIDDEN, format!("blocked: {reason}")).into_response();
-        set(&mut resp, "x-hive-region", &region);
-        set(&mut resp, "x-hive-bot", &reason);
-        return resp;
+    match cloud.bot.evaluate(&ua, policy) {
+        hive_edge::bot::BotVerdict::Block(reason) => {
+            let ev = cloud.event(&region, &method, &host, &path, 403, "bot-block", &reason);
+            cloud.record(ev);
+            let mut resp = (StatusCode::FORBIDDEN, format!("blocked: {reason}")).into_response();
+            set(&mut resp, "x-hive-region", &region);
+            set(&mut resp, "x-hive-bot", &reason);
+            return resp;
+        }
+        hive_edge::bot::BotVerdict::Log(label) => {
+            // Allowed, but recorded so it shows up in firewall analytics.
+            let ev = cloud.event(&region, &method, &host, &path, 0, "bot-log", &label);
+            cloud.record(ev);
+        }
+        hive_edge::bot::BotVerdict::Allow => {}
     }
 
     // 2.5) Preview protection: preview deployments are private to team members

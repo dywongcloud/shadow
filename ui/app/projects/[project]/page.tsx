@@ -2,29 +2,60 @@
 
 import { useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import {
   Github,
   RotateCcw,
+  RefreshCw,
+  Trash2,
   ExternalLink,
   Code2,
   Terminal,
-  Globe,
   Check,
   ChevronRight,
   Activity,
+  Loader2,
 } from "lucide-react";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
-import { usePoll, type Deployment, type Overview } from "@/lib/api";
+import { apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function ProjectDetail({ params }: { params: { project: string } }) {
   const name = decodeURIComponent(params.project);
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 3000);
+  const router = useRouter();
+  const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
   const [tab, setTab] = useState<"overview" | "deployments">("overview");
+  const [busy, setBusy] = useState("");
 
   const mine = (deps ?? []).filter((d) => d.project === name);
   const prod = mine.find((d) => d.production) ?? mine[0];
+  const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
+
+  async function promote(id: string) {
+    setBusy(id);
+    try { await apiSend("POST", `/v1/deployments/${id}/promote`); await refresh(); }
+    catch (e) { alert(String(e)); } finally { setBusy(""); }
+  }
+  async function redeploy() {
+    setBusy("redeploy");
+    try {
+      const r = await apiSend<{ build_id: string }>("POST", `/v1/projects/${encodeURIComponent(name)}/redeploy`);
+      router.push(`/deploy/${r.build_id}`);
+    } catch (e) { alert(String(e)); setBusy(""); }
+  }
+  async function removeDeployment(id: string) {
+    if (!confirm(`Delete deployment ${id}?`)) return;
+    setBusy(id);
+    try { await apiSend("DELETE", `/v1/deployments/${id}`); await refresh(); }
+    catch (e) { alert(String(e)); } finally { setBusy(""); }
+  }
+  async function deleteProject() {
+    if (!confirm(`Delete the entire "${name}" project and ALL its deployments? This cannot be undone.`)) return;
+    setBusy("project");
+    try { await apiSend("DELETE", `/v1/projects/${encodeURIComponent(name)}`); router.push("/projects"); }
+    catch (e) { alert(String(e)); setBusy(""); }
+  }
 
   const checklist = [
     { label: "Connect Git Repository", done: !!prod?.git },
@@ -55,7 +86,15 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline"><RotateCcw className="h-4 w-4" /> Instant Rollback</Button>
+          <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
+            {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
+          </Button>
+          <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
+            <RotateCcw className="h-4 w-4" /> Instant Rollback
+          </Button>
+          <Button variant="danger" onClick={deleteProject} disabled={busy === "project"}>
+            {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
+          </Button>
           <a href={prod ? `http://${prod.alias}:8787/` : "#"} target="_blank" rel="noreferrer">
             <Button>Visit</Button>
           </a>
@@ -95,8 +134,12 @@ export default function ProjectDetail({ params }: { params: { project: string } 
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
               <div className="flex gap-2">
-                <Button variant="outline"><Github className="h-4 w-4" /> Connect Git</Button>
-                <Button variant="outline"><RotateCcw className="h-4 w-4" /> Instant Rollback</Button>
+                <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
+                  {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
+                </Button>
+                <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
+                  <RotateCcw className="h-4 w-4" /> Instant Rollback
+                </Button>
               </div>
             </div>
             <div className="grid grid-cols-1 gap-6 p-5 md:grid-cols-2">
@@ -185,7 +228,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
       ) : (
         <Table>
           <thead>
-            <tr><Th>Deployment</Th><Th>Status</Th><Th>Environment</Th><Th>Source</Th><Th>Created</Th><Th>By</Th></tr>
+            <tr><Th>Deployment</Th><Th>Status</Th><Th>Environment</Th><Th>Source</Th><Th>Created</Th><Th>By</Th><Th></Th></tr>
           </thead>
           <tbody>
             {mine.map((d) => (
@@ -207,6 +250,20 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 </Td>
                 <Td className="text-secondary">{timeAgo(d.created_at_ms)} ago</Td>
                 <Td className="text-secondary">{d.creator}</Td>
+                <Td>
+                  <div className="flex items-center justify-end gap-1">
+                    {busy === d.id ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-muted" />
+                    ) : (
+                      <>
+                        {!d.production && (
+                          <button title="Promote to production" onClick={() => promote(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RotateCcw className="h-3.5 w-3.5" /></button>
+                        )}
+                        <button title="Delete deployment" onClick={() => removeDeployment(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
+                      </>
+                    )}
+                  </div>
+                </Td>
               </tr>
             ))}
             {!mine.length && <tr><Td className="text-secondary">No deployments.</Td></tr>}

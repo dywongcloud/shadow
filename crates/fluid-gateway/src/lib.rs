@@ -158,6 +158,91 @@ impl Gateway {
         }
     }
 
+    /// Promote an existing deployment to be its project's production (rollback /
+    /// instant promote). Re-points the project alias + default to it.
+    pub fn promote(&self, id: &str) -> Option<DeploymentInfo> {
+        let did = DeploymentId::from(id.to_string());
+        let mut st = self.state.lock();
+        let project = st.deployments.get(&did)?.project.clone();
+        // Flip production flags within the project.
+        for d in st.deployments.values_mut() {
+            if d.project == project {
+                d.production = d.id == did;
+            }
+        }
+        st.aliases.insert(project, did.clone());
+        st.default = Some(did.clone());
+        st.deployments.get(&did).map(view_of)
+    }
+
+    /// Delete a single deployment: unregister its functions and drop it. Returns
+    /// the project it belonged to (so callers can persist / re-point).
+    pub async fn remove(&self, id: &str) -> Option<String> {
+        let did = DeploymentId::from(id.to_string());
+        let (project, keys) = {
+            let st = self.state.lock();
+            let dep = st.deployments.get(&did)?;
+            let keys: Vec<String> = dep
+                .manifest
+                .functions
+                .iter()
+                .map(|f| func_key(did.as_str(), &f.name))
+                .collect();
+            (dep.project.clone(), keys)
+        };
+        for k in keys {
+            self.fluid.unregister(&k).await;
+        }
+        let mut st = self.state.lock();
+        st.deployments.remove(&did);
+        // Drop any aliases that pointed at this deployment.
+        st.aliases.retain(|_, v| *v != did);
+        if st.default.as_ref() == Some(&did) {
+            st.default = st
+                .deployments
+                .values()
+                .max_by_key(|d| d.created_at_ms)
+                .map(|d| d.id.clone());
+        }
+        // Re-point the project alias to its newest remaining deployment.
+        if let Some(newest) = st
+            .deployments
+            .values()
+            .filter(|d| d.project == project)
+            .max_by_key(|d| d.created_at_ms)
+            .map(|d| d.id.clone())
+        {
+            st.aliases.insert(project.clone(), newest);
+        }
+        Some(project)
+    }
+
+    /// Delete every deployment for a project. Returns the removed deployment ids.
+    pub async fn remove_project(&self, project: &str) -> Vec<String> {
+        let ids: Vec<String> = {
+            let st = self.state.lock();
+            st.deployments
+                .values()
+                .filter(|d| d.project == project)
+                .map(|d| d.id.to_string())
+                .collect()
+        };
+        for id in &ids {
+            self.remove(id).await;
+        }
+        ids
+    }
+
+    /// The git source of a project's newest deployment (for "redeploy").
+    pub fn git_for_project(&self, project: &str) -> Option<fluid_core::GitSource> {
+        let st = self.state.lock();
+        st.deployments
+            .values()
+            .filter(|d| d.project == project)
+            .max_by_key(|d| d.created_at_ms)
+            .and_then(|d| d.git.clone())
+    }
+
     pub fn list(&self) -> Vec<DeploymentInfo> {
         let st = self.state.lock();
         let mut out: Vec<DeploymentInfo> = st.deployments.values().map(view_of).collect();

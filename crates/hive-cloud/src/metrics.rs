@@ -111,6 +111,24 @@ impl MetricsStore {
         out
     }
 
+    /// Per-project request totals over the last `minutes`, sorted desc.
+    pub fn project_totals(&self, minutes: usize, now_ms: u64) -> Vec<(String, u64)> {
+        let start = now_ms.saturating_sub((minutes as u64) * BUCKET_MS);
+        let b = self.buckets.read();
+        let mut totals: HashMap<String, u64> = HashMap::new();
+        for (t, bucket) in b.iter() {
+            if *t < start {
+                continue;
+            }
+            for (p, n) in &bucket.by_project {
+                *totals.entry(p.clone()).or_insert(0) += n;
+            }
+        }
+        let mut v: Vec<(String, u64)> = totals.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
     pub fn status_distribution(&self) -> HashMap<String, u64> {
         self.status_classes.read().clone()
     }

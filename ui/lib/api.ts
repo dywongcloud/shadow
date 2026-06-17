@@ -231,7 +231,7 @@ export interface Delivery {
 }
 
 // ---- Databases / storage ----
-export type DbKind = "postgres" | "redis" | "blob" | "queue" | "vector";
+export type DbKind = "postgres" | "redis" | "blob" | "queue" | "vector" | "pubsub" | "realtime";
 export type DbStatus = "provisioning" | "ready" | "error";
 export interface Database {
   id: string;
@@ -263,6 +263,7 @@ export interface Metrics {
   totals: { requests: number; errors: number; blocked: number; error_rate: number; cache_hit_ratio: number };
   status_distribution: Record<string, number>;
   top_paths: { path: string; count: number }[];
+  projects: { project: string; requests: number }[];
 }
 
 // ---- Incidents / ops ----

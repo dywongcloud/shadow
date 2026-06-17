@@ -13,6 +13,7 @@ hive-core = { workspace = true }
 hive-backend = { workspace = true }
 hive-controlplane = { workspace = true }
 fluid-core = { workspace = true }
+fluid-build = { workspace = true }
 fluid-compute = { workspace = true }
 fluid-gateway = { workspace = true }
 hive-edge = { workspace = true }

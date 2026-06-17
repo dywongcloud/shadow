@@ -37,7 +37,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/concurrency", get(concurrency_get))
         .route("/v1/routing", get(routing_get))
         .route("/v1/routing/redirects", post(add_redirect))
+        .route("/v1/routing/redirects/delete", post(del_redirect))
         .route("/v1/routing/rewrites", post(add_rewrite))
+        .route("/v1/routing/rewrites/delete", post(del_rewrite))
         .route("/v1/cron", get(cron_list).post(cron_add))
         .route("/v1/cron/:id", delete(cron_del))
         .route("/v1/workflows", get(wf_list).post(wf_define))
@@ -45,8 +47,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/workflows/runs", get(wf_runs))
         .route("/v1/sandbox", post(sandbox))
         .route("/deployments", get(dep_list).post(dep_create))
+        .route("/v1/deployments/:id", delete(dep_delete))
+        .route("/v1/deployments/:id/promote", post(dep_promote))
+        .route("/v1/projects/:project", delete(project_delete))
+        .route("/v1/projects/:project/redeploy", post(project_redeploy))
         .route("/v1/git/deploy", post(git_deploy))
         .route("/v1/builds/:id", get(build_get))
+        .route("/v1/build/frameworks", get(build_frameworks))
         .route("/v1/nodes/announce", post(node_announce))
         .route("/v1/token", post(mint_token))
         .route("/v1/auth", get(auth_status))
@@ -82,6 +89,12 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/storage/queue/:queue/pop", post(queue_pop))
         .route("/v1/storage/vector/:index", post(vector_upsert))
         .route("/v1/storage/vector/:index/query", post(vector_query))
+        // Pub/Sub + Realtime (WebSocket secure streaming)
+        .route("/v1/storage/pubsub/:topic", get(pubsub_info))
+        .route("/v1/storage/pubsub/:topic/publish", post(pubsub_publish))
+        .route("/v1/ws/pubsub/:topic", get(ws_pubsub))
+        .route("/v1/ws/realtime/:room", get(ws_realtime))
+        .route("/v1/ws/echo", get(ws_echo))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
         // ---- Owner / ops dashboard ----
@@ -213,6 +226,12 @@ async fn build_get(
     c.builds.get(&id).map(|b| Json(json!(b))).ok_or(StatusCode::NOT_FOUND)
 }
 
+/// Framework-Defined Infrastructure: the catalog of frameworks the builder can
+/// detect and compile into the Build Output API.
+async fn build_frameworks() -> Json<Value> {
+    Json(json!(fluid_build::PRESETS))
+}
+
 // ---- Deployments (previews) ----
 
 async fn dep_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
@@ -225,6 +244,52 @@ async fn dep_create(
 ) -> Json<Value> {
     let info = c.gw.deploy(req.root, req.manifest);
     Json(json!(info))
+}
+
+/// Roll back / promote: make an existing deployment the project's production.
+async fn dep_promote(
+    State(c): State<Arc<CloudState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let info = c.gw.promote(&id).ok_or(StatusCode::NOT_FOUND)?;
+    crate::persist::persist(&c);
+    let ev = c.event(&c.region, "PROMOTE", &info.alias, "/", 200, "deploy", &format!("rolled back to {id}"));
+    c.record(ev);
+    crate::webhooks::dispatch(&c.webhooks, &info.project, "deployment.promoted",
+        json!({ "id": id, "project": info.project, "url": format!("https://{}", info.alias) }));
+    Ok(Json(json!(info)))
+}
+
+/// Delete a single deployment (unregisters its functions).
+async fn dep_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+    let project = c.gw.remove(&id).await;
+    crate::persist::persist(&c);
+    Json(json!({ "removed": id, "project": project }))
+}
+
+/// Delete an entire project: all its deployments + settings.
+async fn project_delete(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+    let ids = c.gw.remove_project(&project).await;
+    c.projects.remove(&project);
+    crate::persist::persist(&c);
+    Json(json!({ "project": project, "removed_deployments": ids }))
+}
+
+/// Redeploy a project's newest git source (create a fresh deployment).
+async fn project_redeploy(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let git = c.gw.git_for_project(&project).ok_or(StatusCode::NOT_FOUND)?;
+    let req = fluid_core::GitDeployRequest {
+        repo_url: git.repo_url,
+        branch: Some(git.branch).filter(|b| !b.is_empty()),
+        project: Some(project),
+        creator: Some("you".into()),
+        production: true,
+    };
+    let build_id = crate::git::start_build(c.clone(), req);
+    Ok(Json(json!({ "build_id": build_id })))
 }
 
 // ---- Mesh: a peer announces itself to us ----
@@ -384,6 +449,25 @@ async fn add_redirect(State(c): State<Arc<CloudState>>, Json(r): Json<Redirect>)
 
 async fn add_rewrite(State(c): State<Arc<CloudState>>, Json(r): Json<Rewrite>) -> Json<Value> {
     c.router.add_rewrite(r);
+    crate::persist::persist(&c);
+    Json(json!({ "rewrites": c.router.rewrites() }))
+}
+
+#[derive(Deserialize)]
+struct BySource {
+    source: String,
+}
+
+async fn del_redirect(State(c): State<Arc<CloudState>>, Json(b): Json<BySource>) -> Json<Value> {
+    let kept: Vec<Redirect> = c.router.redirects().into_iter().filter(|r| r.source != b.source).collect();
+    c.router.set_redirects(kept);
+    crate::persist::persist(&c);
+    Json(json!({ "redirects": c.router.redirects() }))
+}
+
+async fn del_rewrite(State(c): State<Arc<CloudState>>, Json(b): Json<BySource>) -> Json<Value> {
+    let kept: Vec<Rewrite> = c.router.rewrites().into_iter().filter(|r| r.source != b.source).collect();
+    c.router.set_rewrites(kept);
     crate::persist::persist(&c);
     Json(json!({ "rewrites": c.router.rewrites() }))
 }
@@ -754,6 +838,89 @@ async fn vector_query(State(c): State<Arc<CloudState>>, Path(index): Path<String
     Json(json!({ "index": index, "matches": c.databases.vector_query(&index, &b.vector, b.top_k) }))
 }
 
+// ---- Pub/Sub + Realtime (WebSocket secure streaming) ----
+
+async fn pubsub_info(State(c): State<Arc<CloudState>>, Path(topic): Path<String>) -> Json<Value> {
+    Json(json!({
+        "topic": topic,
+        "subscribers": c.databases.subscriber_count(&topic),
+        "published": c.databases.published_count(&topic),
+    }))
+}
+
+async fn pubsub_publish(State(c): State<Arc<CloudState>>, Path(topic): Path<String>, Json(b): Json<QueueMsg>) -> Json<Value> {
+    let delivered = c.databases.publish(&topic, b.message.to_string());
+    Json(json!({ "topic": topic, "delivered": delivered }))
+}
+
+async fn ws_pubsub(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(c): State<Arc<CloudState>>,
+    Path(topic): Path<String>,
+) -> axum::response::Response {
+    let mut rx = c.databases.subscribe(&topic);
+    ws.on_upgrade(move |mut socket| async move {
+        use axum::extract::ws::Message;
+        let _ = socket
+            .send(Message::Text(json!({ "type": "subscribed", "topic": topic }).to_string()))
+            .await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(m) => { if socket.send(Message::Text(m)).await.is_err() { break; } }
+                    Err(_) => continue, // lagged: skip
+                },
+                client = socket.recv() => match client {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
+async fn ws_realtime(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(c): State<Arc<CloudState>>,
+    Path(room): Path<String>,
+) -> axum::response::Response {
+    let mut rx = c.databases.subscribe(&room);
+    let db = c.databases.clone();
+    ws.on_upgrade(move |mut socket| async move {
+        use axum::extract::ws::Message;
+        let _ = socket
+            .send(Message::Text(json!({ "type": "joined", "room": room }).to_string()))
+            .await;
+        loop {
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Ok(m) => { if socket.send(Message::Text(m)).await.is_err() { break; } }
+                    Err(_) => continue,
+                },
+                client = socket.recv() => match client {
+                    // Bidirectional: a client message is broadcast to the whole room.
+                    Some(Ok(Message::Text(t))) => { db.publish(&room, t); }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    })
+}
+
+async fn ws_echo(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Response {
+    ws.on_upgrade(|mut socket| async move {
+        use axum::extract::ws::Message;
+        while let Some(Ok(msg)) = socket.recv().await {
+            match msg {
+                Message::Text(t) => { if socket.send(Message::Text(format!("echo: {t}"))).await.is_err() { break; } }
+                Message::Close(_) => break,
+                _ => {}
+            }
+        }
+    })
+}
+
 // ============================ Monitoring ============================
 
 #[derive(Deserialize)]
@@ -784,6 +951,7 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, Query(q): Query<MetricsQ>
         },
         "status_distribution": c.metrics.status_distribution(),
         "top_paths": c.metrics.top_paths(10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
+        "projects": c.metrics.project_totals(minutes, now_ms()).into_iter().map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
     }))
 }
 

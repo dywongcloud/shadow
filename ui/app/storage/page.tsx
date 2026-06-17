@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { Database as DbIcon, Plus, X, Loader2, HardDrive, ListOrdered, Boxes, Zap } from "lucide-react";
+import { Database as DbIcon, Plus, X, Loader2, HardDrive, ListOrdered, Boxes, Zap, Radio, Wifi } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -13,12 +13,14 @@ const KINDS: { kind: DbKind; name: string; tag: string; desc: string; icon: Reac
   { kind: "blob", name: "Blob", tag: "Object Storage", desc: "S3-compatible object storage for files & assets.", icon: <HardDrive className="h-5 w-5" /> },
   { kind: "queue", name: "Queue", tag: "Messaging", desc: "Durable FIFO message queue for background jobs.", icon: <ListOrdered className="h-5 w-5" /> },
   { kind: "vector", name: "Vector", tag: "AI / Embeddings", desc: "Vector index with cosine search for AI apps.", icon: <Boxes className="h-5 w-5" /> },
+  { kind: "pubsub", name: "Pub/Sub", tag: "Messaging", desc: "Topic-based publish/subscribe fan-out (RabbitMQ-style).", icon: <Radio className="h-5 w-5" /> },
+  { kind: "realtime", name: "Realtime", tag: "Streaming", desc: "Secure WebSocket channels for live, bidirectional apps.", icon: <Wifi className="h-5 w-5" /> },
 ];
 
 const KIND_META = Object.fromEntries(KINDS.map((k) => [k.kind, k]));
 
 function kindBadge(kind: DbKind) {
-  const tone = { postgres: "blue", redis: "red", blob: "amber", queue: "green", vector: "default" } as const;
+  const tone = { postgres: "blue", redis: "red", blob: "amber", queue: "green", vector: "default", pubsub: "blue", realtime: "green" } as const;
   return <Badge tone={tone[kind] ?? "default"}>{KIND_META[kind]?.name ?? kind}</Badge>;
 }
 

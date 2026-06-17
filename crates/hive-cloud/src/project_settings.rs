@@ -125,6 +125,17 @@ impl ProjectStore {
         *self.map.write() = data;
     }
 
+    /// Forget a project's settings (used when a project is deleted).
+    pub fn remove(&self, project: &str) {
+        self.map.write().remove(project);
+    }
+
+    /// Settings only if the project was explicitly configured (None otherwise).
+    /// Distinguishes "user set a build command" from the generic defaults.
+    pub fn get_if_set(&self, project: &str) -> Option<ProjectSettings> {
+        self.map.read().get(project).cloned()
+    }
+
     /// Get with sensitive env values masked (for display).
     pub fn get_masked(&self, project: &str) -> ProjectSettings {
         let mut s = self.get(project);

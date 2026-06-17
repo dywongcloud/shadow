@@ -3,30 +3,21 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { Bell, ChevronsUpDown, ShieldHalf, Check, Plus, User } from "lucide-react";
-import {
-  SignedIn,
-  SignedOut,
-  SignInButton,
-  UserButton,
-} from "@clerk/nextjs";
+import { Bell, ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { usePoll, type Team } from "@/lib/api";
-
-const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 const tabs = [
   { href: "/", label: "Overview" },
   { href: "/projects", label: "Projects" },
   { href: "/storage", label: "Storage" },
-  { href: "/monitoring", label: "Monitoring" },
+  { href: "/observability", label: "Observability" },
+  { href: "/cdn", label: "CDN" },
   { href: "/integrations", label: "Integrations" },
-  { href: "/activity", label: "Activity" },
   { href: "/domains", label: "Domains" },
   { href: "/firewall", label: "Firewall" },
   { href: "/network", label: "Network" },
-  { href: "/teams", label: "Teams" },
   { href: "/usage", label: "Usage" },
   { href: "/settings", label: "Settings" },
 ];
@@ -42,8 +33,8 @@ function VercelMark() {
 
 export function TopNav() {
   const pathname = usePathname();
-  // The owner/ops dashboard renders its own chrome.
-  if (pathname.startsWith("/admin")) return null;
+  // The owner/ops dashboard + auth pages render their own minimal chrome.
+  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up")) return null;
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
@@ -69,20 +60,13 @@ export function TopNav() {
             <span className="absolute -right-0.5 -top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-[#0070f3] px-1 text-[10px] font-semibold text-white">1</span>
           </button>
           <ThemeToggle />
-          {clerkOn ? (
-            <>
-              <SignedIn>
-                <UserButton afterSignOutUrl="/sign-in" />
-              </SignedIn>
-              <SignedOut>
-                <SignInButton mode="modal">
-                  <button className="rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium hover:bg-subtle">Sign in</button>
-                </SignInButton>
-              </SignedOut>
-            </>
-          ) : (
-            <Link href="/account" className="ml-1 flex h-8 w-8 items-center justify-center rounded-full bg-[#0761d1] text-xs font-semibold text-white">D</Link>
-          )}
+          <Link
+            href="/account"
+            title="Account & settings"
+            className="flex h-8 w-8 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"
+          >
+            <Settings className="h-4 w-4" />
+          </Link>
         </div>
       </div>
       {/* Row 2: tabs — active underline sits flush on the header's bottom border */}

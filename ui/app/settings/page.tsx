@@ -1,14 +1,43 @@
 "use client";
 
+import { useState } from "react";
 import { Card, PageHeader, Badge, Button } from "@/components/ui";
+import { ActivityFeed } from "@/components/activity-feed";
 import { usePoll, type Overview, type NodeInfo } from "@/lib/api";
+import { cn } from "@/lib/utils";
 
 export default function SettingsPage() {
   const { data: ov } = usePoll<Overview>("/v1/overview", 5000);
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 5000);
+  const [tab, setTab] = useState<"general" | "activity">("general");
+
   return (
     <div>
-      <PageHeader title="Settings" desc="Team & cloud configuration" />
+      <PageHeader title="Team Settings" desc="Team configuration, cloud, and activity" />
+
+      <div className="mb-6 flex gap-1 border-b border-border">
+        {(["general", "activity"] as const).map((t) => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={cn(
+              "-mb-px border-b-2 px-3 pb-2.5 pt-1 text-sm capitalize transition-colors",
+              tab === t ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
+            )}
+          >
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {tab === "activity" ? <ActivityFeed /> : <General ov={ov} nodes={nodes} />}
+    </div>
+  );
+}
+
+function General({ ov, nodes }: { ov: Overview | null; nodes: NodeInfo[] | null }) {
+  return (
+    <div>
       <Card className="mb-4 p-5">
         <div className="mb-3 text-sm font-medium">Cloud</div>
         <Row label="Node" value={ov?.node ?? "—"} />

@@ -1,15 +1,16 @@
 "use client";
 
 import Link from "next/link";
-import { Github, Search, Plus, GitBranch } from "lucide-react";
+import { Github, Search, Plus, GitBranch, CheckCheck } from "lucide-react";
 import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
+import { ProjectMenu } from "@/components/project-menu";
 import { usePoll, type Deployment, type Event, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { useState } from "react";
 
 export default function OverviewPage() {
-  const { data: deps } = usePoll<Deployment[]>("/deployments", 3000);
+  const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: events } = usePoll<Event[]>("/v1/logs?limit=8", 2500);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
   const [q, setQ] = useState("");
@@ -63,35 +64,7 @@ export default function OverviewPage() {
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             {list.map((p) => (
-              <Link key={p.id} href={`/projects/${encodeURIComponent(p.project)}`}>
-                <Card className="p-5 transition-shadow hover:shadow-pop">
-                  <div className="flex items-center gap-3">
-                    <Triangle />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="truncate font-semibold">{p.project}</span>
-                        <span className="rounded-full border border-emerald-300 px-1.5 text-[11px] font-medium text-emerald-600">
-                          100
-                        </span>
-                      </div>
-                      <div className="truncate text-sm text-secondary">{p.alias}</div>
-                    </div>
-                  </div>
-                  <p className="mt-4 line-clamp-2 text-sm text-secondary">
-                    {p.git?.commit_message || "Deployed via dashboard"}
-                  </p>
-                  <div className="mt-4 flex items-center gap-1.5 text-xs text-muted">
-                    {timeAgo(p.created_at_ms)} ago via{" "}
-                    {p.git ? <Github className="h-3.5 w-3.5" /> : <span>CLI</span>}
-                    {p.git?.branch ? (
-                      <span className="ml-1 inline-flex items-center gap-1">
-                        <GitBranch className="h-3 w-3" />
-                        {p.git.branch}
-                      </span>
-                    ) : null}
-                  </div>
-                </Card>
-              </Link>
+              <ProjectCard key={p.id} p={p} onChange={refresh} />
             ))}
             {!list.length && (
               <Card className="col-span-full overflow-hidden p-8 text-center">
@@ -130,5 +103,71 @@ export default function OverviewPage() {
         </Card>
       </div>
     </div>
+  );
+}
+
+function repoLabel(url: string): string {
+  return url
+    .replace(/^https?:\/\/(www\.)?github\.com\//, "")
+    .replace(/^https?:\/\//, "")
+    .replace(/\.git$/, "");
+}
+
+/** Circular deployment-status ring with a double-check, like Vercel's. */
+function StatusRing({ state }: { state: string }) {
+  const tone =
+    state === "ready" ? "text-green border-green/40"
+    : state === "building" ? "text-amber-500 border-amber-500/40"
+    : state === "error" ? "text-red-500 border-red-500/40"
+    : "text-muted border-border-strong";
+  return (
+    <span className={`flex h-8 w-8 items-center justify-center rounded-full border-2 ${tone}`}>
+      <CheckCheck className="h-3.5 w-3.5" />
+    </span>
+  );
+}
+
+function ProjectCard({ p, onChange }: { p: Deployment; onChange?: () => void }) {
+  const hasGit = !!p.git;
+  return (
+    <Card className="p-5 transition-shadow hover:shadow-pop">
+      <div className="flex items-start justify-between gap-2">
+        <Link href={`/projects/${encodeURIComponent(p.project)}`} className="flex min-w-0 items-center gap-3">
+          <Triangle />
+          <div className="min-w-0">
+            <div className="truncate font-semibold">{p.project}</div>
+            <div className="truncate text-sm text-secondary">{p.alias}</div>
+          </div>
+        </Link>
+        <div className="flex shrink-0 items-center gap-1">
+          <StatusRing state={p.state} />
+          <ProjectMenu project={p.project} alias={p.alias} onChange={onChange} />
+        </div>
+      </div>
+
+      {hasGit ? (
+        <>
+          <div className="mt-3">
+            <span className="inline-flex max-w-full items-center gap-1.5 truncate rounded-md bg-subtle px-2 py-1 text-xs text-secondary">
+              <Github className="h-3.5 w-3.5 shrink-0" />
+              <span className="truncate">{repoLabel(p.git!.repo_url)}</span>
+            </span>
+          </div>
+          <p className="mt-3 truncate text-sm">{p.git!.commit_message || "Latest deployment"}</p>
+          <div className="mt-3 flex items-center gap-1.5 text-xs text-muted">
+            {timeAgo(p.created_at_ms)} ago on
+            <GitBranch className="h-3 w-3" />
+            {p.git!.branch || "main"}
+          </div>
+        </>
+      ) : (
+        <>
+          <Link href="/new" className="mt-3 inline-block text-sm font-medium text-link hover:underline">
+            Connect Git Repository
+          </Link>
+          <div className="mt-3 text-xs text-muted">{timeAgo(p.created_at_ms)} ago</div>
+        </>
+      )}
+    </Card>
   );
 }
