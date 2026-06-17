@@ -11,6 +11,7 @@ const sections = [
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },
   { slug: "webhooks", label: "Webhooks" },
+  { slug: "secure-compute", label: "Secure Compute" },
   { slug: "team", label: "Team & Privacy" },
 ];
 

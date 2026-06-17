@@ -24,6 +24,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/overview", get(overview))
         .route("/v1/nodes", get(nodes))
         .route("/v1/cluster", get(cluster_status))
+        .route("/v1/anycast", get(anycast_table))
+        .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
         .route("/v1/regions", get(regions))
         .route("/v1/logs", get(logs))
         .route("/v1/functions", get(functions))
@@ -71,6 +73,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/teams/:slug", get(team_get))
         .route("/v1/teams/:slug/members", post(team_add_member))
         .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
+        // ---- API keys (tenant-scoped platform tokens) ----
+        .route("/v1/apikeys", get(apikeys_list).post(apikey_create))
+        .route("/v1/apikeys/:id", delete(apikey_revoke))
         // ---- Webhooks ----
         .route("/v1/webhooks", get(webhooks_all).post(webhook_create_team))
         .route("/v1/webhooks/events", get(webhook_events))
@@ -220,7 +225,7 @@ async fn git_deploy(
 ) -> Json<Value> {
     // Assign the (new) project to the requesting tenant so it shows under their
     // team only.
-    let t = tenant(&headers);
+    let t = tenant(&c, &headers);
     let project = req.project.clone().unwrap_or_else(|| crate::git::project_name_from_url(&req.repo_url));
     c.projects.set_team(&project, &t);
     crate::persist::persist(&c);
@@ -244,14 +249,28 @@ async fn build_frameworks() -> Json<Value> {
 
 // ---- Deployments (previews) ----
 
-/// The tenant (team slug) for a request — from the `x-hive-team` header set by
-/// the dashboard's team switcher. Defaults to "personal".
-fn tenant(h: &HeaderMap) -> String {
+/// The tenant (team slug) for a request. A platform **API key**
+/// (`Authorization: Bearer hive_…`) scopes the request to the key's team; the
+/// dashboard's `x-hive-team` header is the fallback; default "personal".
+fn tenant(c: &Arc<CloudState>, h: &HeaderMap) -> String {
+    if let Some(team) = api_key_team(c, h) {
+        return team;
+    }
     h.get("x-hive-team")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "personal".into())
+}
+
+/// If a valid platform API key is presented, return its team.
+fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
+    let auth = h.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let tok = auth.strip_prefix("Bearer ")?;
+    if !tok.starts_with("hive_") {
+        return None;
+    }
+    c.apikeys.verify(tok).map(|k| k.team)
 }
 
 /// Normalize an owner slug: empty/absent => "personal".
@@ -260,7 +279,7 @@ fn norm(team: &str) -> &str {
 }
 
 async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
-    let t = tenant(&headers);
+    let t = tenant(&c, &headers);
     let list: Vec<_> = c
         .gw
         .list()
@@ -389,6 +408,35 @@ async fn cluster_status(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.cluster.status(members)))
 }
 
+/// Anycast routing table: every node with latency/health, and the node this edge
+/// would route a request to (lowest-latency healthy, region-preferred).
+async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let selected = c.registry.anycast(Some(&c.region));
+    Json(json!({
+        "region": c.region,
+        "selected": selected.as_ref().map(|n| n.name.clone()),
+        "table": c.registry.routing_table(),
+    }))
+}
+
+async fn ratelimit_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.ratelimit.stats()))
+}
+
+#[derive(Deserialize)]
+struct RateLimitBody {
+    enabled: bool,
+    #[serde(default)]
+    limit: u32,
+    #[serde(default)]
+    window_ms: u64,
+}
+
+async fn ratelimit_put(State(c): State<Arc<CloudState>>, Json(b): Json<RateLimitBody>) -> Json<Value> {
+    c.ratelimit.set(b.enabled, b.limit, b.window_ms);
+    Json(json!(c.ratelimit.stats()))
+}
+
 async fn regions(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.registry.regions()))
 }
@@ -408,7 +456,7 @@ struct LimitQ {
 
 async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<LimitQ>) -> Json<Value> {
     let limit = q.limit.unwrap_or(100);
-    let t = tenant(&headers);
+    let t = tenant(&c, &headers);
     let mut evs = c.recent_events(2000);
     // Tenant scope: only events for projects owned by this team. Infra events
     // (empty project) are shown to everyone.
@@ -711,6 +759,37 @@ async fn project_team_put(
     Json(json!(c.projects.get_masked(&project)))
 }
 
+// ============================ API keys ============================
+
+#[derive(Deserialize)]
+struct CreateApiKey {
+    name: String,
+    #[serde(default)]
+    role: String,
+}
+
+async fn apikeys_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    Json(json!(c.apikeys.list(&t).iter().map(|k| k.public()).collect::<Vec<_>>()))
+}
+
+async fn apikey_create(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(b): Json<CreateApiKey>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let (key, token) = c.apikeys.create(&b.name, &t, &b.role);
+    crate::persist::persist(&c);
+    // The plaintext token is returned exactly once.
+    let mut v = key.public();
+    v["token"] = json!(token);
+    Json(v)
+}
+
+async fn apikey_revoke(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let ok = c.apikeys.revoke(&id, &t);
+    crate::persist::persist(&c);
+    Json(json!({ "revoked": ok, "id": id }))
+}
+
 // ============================ Webhooks ============================
 
 async fn webhook_events() -> Json<Value> {
@@ -795,7 +874,7 @@ async fn webhook_deliveries(State(c): State<Arc<CloudState>>) -> Json<Value> {
 // ============================ Databases ============================
 
 async fn databases_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
-    let t = tenant(&headers);
+    let t = tenant(&c, &headers);
     let list: Vec<_> = c
         .databases
         .list(None)
@@ -824,7 +903,7 @@ async fn database_create(
 ) -> Json<Value> {
     let cloud = c.clone();
     if req.team.trim().is_empty() {
-        req.team = tenant(&headers);
+        req.team = tenant(&c, &headers);
     }
     let project = req.project.clone();
     let db = crate::databases::provision(c.databases.clone(), c.region.clone(), req, move |d| {
@@ -1024,7 +1103,7 @@ async fn ws_echo(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Res
 // ====================== Secure compute (WireGuard) ======================
 
 async fn securelinks_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
-    Json(json!(c.securelinks.list(&tenant(&headers))))
+    Json(json!(c.securelinks.list(&tenant(&c, &headers))))
 }
 
 async fn securelink_create(
@@ -1033,7 +1112,7 @@ async fn securelink_create(
     Json(mut req): Json<crate::securelink::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     if req.team.trim().is_empty() {
-        req.team = tenant(&headers);
+        req.team = tenant(&c, &headers);
     }
     let region = c.region.clone();
     let rec = c.securelinks.provision(req, &region).await.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -1071,7 +1150,7 @@ struct MetricsQ {
 
 async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<MetricsQ>) -> Json<Value> {
     let minutes = q.minutes.unwrap_or(60).min(180);
-    let t = tenant(&headers);
+    let t = tenant(&c, &headers);
     let project = q.project.as_deref().filter(|p| !p.is_empty());
     let series = c.metrics.series(minutes, now_ms(), project);
     let total_req: u64 = series.iter().map(|b| b.requests).sum();

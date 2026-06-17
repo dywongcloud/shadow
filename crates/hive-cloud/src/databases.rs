@@ -69,6 +69,10 @@ pub struct Database {
     pub kind: DbKind,
     pub region: String,
     pub status: DbStatus,
+    /// Marketplace provider label (e.g. "Neon", "Upstash") — cosmetic; the
+    /// backing engine is `kind`.
+    #[serde(default)]
+    pub provider: String,
     #[serde(default)]
     pub mode: String, // "live" (real backing service) | "simulated"
     #[serde(default)]
@@ -323,6 +327,8 @@ pub struct ProvisionReq {
     pub kind: DbKind,
     #[serde(default)]
     pub region: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// Provision a database. Returns the record immediately (status=provisioning)
@@ -343,6 +349,7 @@ pub fn provision(
         kind: req.kind,
         region: region.clone(),
         status: DbStatus::Provisioning,
+        provider: req.provider.clone().unwrap_or_else(|| req.kind.label().to_string()),
         mode: "simulated".into(),
         created_ms: now_ms(),
         connection: HashMap::new(),

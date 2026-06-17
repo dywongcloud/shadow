@@ -47,6 +47,8 @@ pub struct PlatformSnapshot {
     pub databases: Vec<crate::databases::Database>,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
+    #[serde(default)]
+    pub apikeys: Vec<crate::apikeys::ApiKey>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -98,6 +100,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
         incidents: cloud.incidents.snapshot(),
+        apikeys: cloud.apikeys.snapshot(),
     }
 }
 
@@ -136,6 +139,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
     cloud.incidents.load(snap.incidents);
+    cloud.apikeys.load(snap.apikeys);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

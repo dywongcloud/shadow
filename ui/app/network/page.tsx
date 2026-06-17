@@ -1,9 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Globe2, Server, Share2, ShieldCheck, Database, Network, Lock, Plus, X, Trash2, Loader2 } from "lucide-react";
+import { Globe2, Server, Share2, ShieldCheck, Database, Network } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
-import { apiSend, usePoll, type NodeInfo, type Overview, type SecureLink } from "@/lib/api";
+import { apiSend, usePoll, type NodeInfo, type Overview, type AnycastTable, type RateLimitStats } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
@@ -75,7 +75,7 @@ export default function NetworkPage() {
         </Card>
       </div>
 
-      <SecureConnections />
+      <AnycastRouting />
 
       <div className="mb-2 text-sm font-medium text-fg">Nodes</div>
       <Table>
@@ -118,110 +118,74 @@ function Arch({ icon, title, desc }: { icon: React.ReactNode; title: string; des
   );
 }
 
-/** Secure compute: ephemeral WireGuard tunnels to private backends. */
-function SecureConnections() {
-  const { data: links, refresh } = usePoll<SecureLink[]>("/v1/securelinks", 4000);
-  const [open, setOpen] = useState(false);
+/** Anycast routing table + L7 DDoS rate limiting. */
+function AnycastRouting() {
+  const { data: any } = usePoll<AnycastTable>("/v1/anycast", 3000);
+  const { data: rl, refresh } = usePoll<RateLimitStats>("/v1/ratelimit", 4000);
+  const [limit, setLimit] = useState("");
+  const [windowS, setWindowS] = useState("");
 
-  async function remove(id: string) {
-    await apiSend("DELETE", `/v1/securelinks/${id}`);
+  async function save(enabled: boolean) {
+    await apiSend("PUT", "/v1/ratelimit", {
+      enabled,
+      limit: Number(limit) || rl?.limit || 100,
+      window_ms: (Number(windowS) || (rl ? rl.window_ms / 1000 : 10)) * 1000,
+    });
     refresh();
   }
 
   return (
-    <div className="mb-6">
-      <Card className="mb-3">
-        <div className="flex items-start justify-between">
-          <div>
-            <div className="mb-1 flex items-center gap-2 text-sm font-medium"><Lock className="h-4 w-4" /> Secure Connections</div>
-            <p className="max-w-2xl text-sm text-secondary">
-              Reach private backends (a DB in a VPC) over an ephemeral WireGuard tunnel. Keys are
-              short-lived and minted on demand by the Key Exchange Service — no long-lived secrets
-              in your builds or functions.
-            </p>
-          </div>
-          <Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Connect Backend</Button>
-        </div>
-      </Card>
-
-      {!!links?.length && (
+    <div className="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-[1fr_360px]">
+      {/* Anycast table */}
+      <Card>
+        <div className="mb-1 flex items-center gap-2 text-sm font-medium"><Globe2 className="h-4 w-4" /> Anycast Routing</div>
+        <p className="mb-4 text-sm text-secondary">
+          Requests are routed to the lowest-latency healthy node (region-preferred), with automatic
+          failover — the network-hop equivalent of anycast, over the iroh mesh.
+        </p>
         <Table>
-          <thead><tr><Th>Backend</Th><Th>Local address</Th><Th>Wired to</Th><Th>Status</Th><Th>Expires</Th><Th></Th></tr></thead>
+          <thead><tr><Th>Node</Th><Th>Region</Th><Th>Latency</Th><Th>Health</Th><Th>Routing</Th></tr></thead>
           <tbody>
-            {links.map((l) => (
-              <tr key={l.id}>
-                <Td className="font-mono text-xs">{l.target}</Td>
-                <Td className="font-mono text-xs text-secondary">{l.local_addr}</Td>
-                <Td className="text-xs">
-                  {l.project ? <span className="font-mono">{l.project}.{l.env_var}</span> : <span className="text-muted">—</span>}
-                </Td>
-                <Td><Badge tone={l.status === "active" ? "green" : "default"}>{l.status}</Badge></Td>
-                <Td className="text-secondary">{l.status === "active" ? `in ${Math.max(0, Math.round((l.expires_ms - Date.now()) / 60000))}m` : "—"}</Td>
-                <Td><button onClick={() => remove(l.id)} className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button></Td>
+            {(any?.table ?? []).map((n) => (
+              <tr key={n.id}>
+                <Td className="font-medium">{n.name}</Td>
+                <Td><Badge tone="blue">{n.region}</Badge></Td>
+                <Td className="font-mono text-xs">{n.is_self ? "0ms (local)" : `${n.latency_ms ?? 0}ms`}</Td>
+                <Td>{n.healthy ? <Badge tone="green">healthy</Badge> : <Badge tone="red">down</Badge>}</Td>
+                <Td>{any?.selected === n.name ? <Badge tone="green">● serving</Badge> : <span className="text-xs text-muted">standby</span>}</Td>
               </tr>
             ))}
           </tbody>
         </Table>
-      )}
+      </Card>
 
-      {open && <ConnectModal onClose={() => setOpen(false)} onDone={() => { setOpen(false); refresh(); }} />}
-    </div>
-  );
-}
-
-function ConnectModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [target, setTarget] = useState("");
-  const [ttl, setTtl] = useState("900");
-  const [project, setProject] = useState("");
-  const [envVar, setEnvVar] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  async function connect() {
-    if (!target.trim()) return;
-    setBusy(true); setErr("");
-    try {
-      await apiSend("POST", "/v1/securelinks", {
-        target,
-        ttl_secs: Number(ttl) || 900,
-        project: project || undefined,
-        env_var: envVar || undefined,
-      });
-      onDone();
-    } catch (e) { setErr(String(e)); setBusy(false); }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-pop" onClick={(e) => e.stopPropagation()}>
-        <div className="mb-4 flex items-center justify-between"><h2 className="flex items-center gap-2 text-lg font-semibold"><Lock className="h-4 w-4" /> Connect Private Backend</h2><button onClick={onClose} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button></div>
-        <div className="space-y-3">
+      {/* L7 DDoS rate limiting */}
+      <Card>
+        <div className="mb-1 flex items-center gap-2 text-sm font-medium"><ShieldCheck className="h-4 w-4" /> L7 DDoS Mitigation</div>
+        <p className="mb-4 text-sm text-secondary">Per-IP rate limiting at the edge — floods are shed (429) before any compute.</p>
+        <div className="mb-3 flex items-center justify-between text-sm">
+          <span className="text-secondary">Status</span>
+          <Badge tone={rl?.enabled ? "green" : "default"}>{rl?.enabled ? "enabled" : "off"}</Badge>
+        </div>
+        <div className="mb-3 grid grid-cols-2 gap-2">
           <div>
-            <label className="mb-1 block text-xs font-medium text-secondary">Backend address (host:port)</label>
-            <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="db.internal:5432" className="w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-sm focus:outline-none" />
+            <label className="mb-1 block text-[11px] uppercase tracking-wide text-muted">Limit / IP</label>
+            <input value={limit} onChange={(e) => setLimit(e.target.value.replace(/[^0-9]/g, ""))} placeholder={String(rl?.limit ?? 100)} className="w-full rounded-md border border-border bg-card px-2 py-1.5 text-sm focus:outline-none" />
           </div>
           <div>
-            <label className="mb-1 block text-xs font-medium text-secondary">Lease TTL (seconds)</label>
-            <input value={ttl} onChange={(e) => setTtl(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none" />
+            <label className="mb-1 block text-[11px] uppercase tracking-wide text-muted">Window (s)</label>
+            <input value={windowS} onChange={(e) => setWindowS(e.target.value.replace(/[^0-9]/g, ""))} placeholder={String((rl?.window_ms ?? 10000) / 1000)} className="w-full rounded-md border border-border bg-card px-2 py-1.5 text-sm focus:outline-none" />
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="mb-1 block text-xs font-medium text-secondary">Wire to project <span className="text-muted">(optional)</span></label>
-              <input value={project} onChange={(e) => setProject(e.target.value)} placeholder="my-project" className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none" />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-secondary">Env var</label>
-              <input value={envVar} onChange={(e) => setEnvVar(e.target.value)} placeholder="DATABASE_URL" className="w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-sm focus:outline-none" />
-            </div>
-          </div>
-          <p className="text-xs text-muted">If set, the connector's local address is injected as that env var so the project's functions reach the backend through the tunnel.</p>
-          {err && <p className="text-xs text-red-500">{err}</p>}
         </div>
-        <div className="mt-6 flex justify-end gap-2">
-          <Button variant="outline" onClick={onClose}>Cancel</Button>
-          <Button onClick={connect} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Lock className="h-4 w-4" />} Establish Tunnel</Button>
+        <div className="mb-4 flex items-center justify-between text-sm">
+          <span className="text-secondary">Blocked (total)</span>
+          <span className="font-semibold tabular-nums text-red-500">{rl?.blocked_total ?? 0}</span>
         </div>
-      </div>
+        <div className="flex gap-2">
+          <Button onClick={() => save(true)} className="flex-1">Apply</Button>
+          <Button variant="outline" onClick={() => save(!rl?.enabled)}>{rl?.enabled ? "Disable" : "Enable"}</Button>
+        </div>
+      </Card>
     </div>
   );
 }

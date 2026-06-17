@@ -6,6 +6,7 @@
 //! region-aware node registry that meshes with peer nodes over HTTP gossip.
 
 mod admin;
+mod apikeys;
 mod auth;
 mod cluster;
 mod databases;
@@ -124,6 +125,8 @@ async fn main() -> anyhow::Result<()> {
         peer_id: None,
         last_seen_ms: now_ms(),
         is_self: true,
+        latency_ms: 0,
+        healthy: true,
     };
     let registry = NodeRegistry::new(me);
 
@@ -257,6 +260,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                     .timeout(Duration::from_secs(3))
                     .send()
                     .await;
+                let t0 = now_ms();
                 if let Ok(resp) = cloud
                     .http
                     .get(format!("{peer}/v1/nodes"))
@@ -264,11 +268,18 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                     .send()
                     .await
                 {
+                    // Round-trip latency to this peer (for anycast selection).
+                    let rtt = now_ms().saturating_sub(t0);
                     if let Ok(nodes) = resp.json::<Vec<NodeInfo>>().await {
+                        // The peer lists itself first (its `me()`); record its latency.
+                        let peer_self_id = nodes.first().map(|n| n.id.clone());
                         for n in nodes {
                             if n.id != cloud.node_name {
                                 cloud.registry.upsert_peer(n);
                             }
+                        }
+                        if let Some(pid) = peer_self_id {
+                            cloud.registry.set_health(&pid, rtt, true);
                         }
                     }
                 }

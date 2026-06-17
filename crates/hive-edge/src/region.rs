@@ -21,6 +21,12 @@ pub struct NodeInfo {
     pub last_seen_ms: u64,
     #[serde(default)]
     pub is_self: bool,
+    /// Measured round-trip latency to this node (ms); 0 for self.
+    #[serde(default)]
+    pub latency_ms: u64,
+    /// Health (responding to probes). Anycast skips unhealthy nodes.
+    #[serde(default = "crate::default_true_pub")]
+    pub healthy: bool,
 }
 
 pub struct NodeRegistry {
@@ -40,7 +46,41 @@ impl NodeRegistry {
         let mut me = self.me.clone();
         me.is_self = true;
         me.last_seen_ms = now_ms();
+        me.latency_ms = 0;
+        me.healthy = true;
         me
+    }
+
+    /// Record a peer's measured latency + health (from probing).
+    pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
+        if let Some(p) = self.peers.write().get_mut(id) {
+            p.latency_ms = latency_ms;
+            p.healthy = healthy;
+            if healthy {
+                p.last_seen_ms = now_ms();
+            }
+        }
+    }
+
+    /// Anycast selection: the optimal node to serve a request — the lowest-latency
+    /// healthy node, preferring `preferred` region when given (automatic failover
+    /// falls through to the next-best healthy node).
+    pub fn anycast(&self, preferred: Option<&str>) -> Option<NodeInfo> {
+        let mut healthy: Vec<NodeInfo> = self.nodes().into_iter().filter(|n| n.healthy).collect();
+        healthy.sort_by_key(|n| n.latency_ms);
+        if let Some(region) = preferred {
+            if let Some(n) = healthy.iter().find(|n| n.region == region) {
+                return Some(n.clone());
+            }
+        }
+        healthy.into_iter().next()
+    }
+
+    /// The full anycast routing table (healthy first, by latency).
+    pub fn routing_table(&self) -> Vec<NodeInfo> {
+        let mut nodes = self.nodes();
+        nodes.sort_by(|a, b| b.healthy.cmp(&a.healthy).then(a.latency_ms.cmp(&b.latency_ms)));
+        nodes
     }
 
     pub fn region(&self) -> &str {

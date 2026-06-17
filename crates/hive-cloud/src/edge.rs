@@ -47,6 +47,19 @@ pub async fn edge_pipeline(
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let region = cloud.region.clone();
 
+    // -1) L7 DDoS mitigation: shed per-IP floods before any compute work.
+    if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
+        let ev = cloud.event(&region, &method, &host, &path, 429, "rate-limited", &ip);
+        cloud.record(ev);
+        let mut resp = (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED").into_response();
+        set(&mut resp, "x-hive-region", &region);
+        set(&mut resp, "x-hive-ratelimit", "exceeded");
+        return resp;
+    }
+
+    // Anycast: pick the optimal (lowest-latency healthy) node for this request.
+    let anycast = cloud.registry.anycast(Some(&region));
+
     // 0) Routing layer: redirects (respond now) + rewrites (change path).
     match cloud.router.evaluate(&path) {
         RouteOutcome::Redirect { location, status } => {
@@ -163,12 +176,23 @@ pub async fn edge_pipeline(
         let mut resp = Response::from_parts(parts, Body::from(bytes));
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-cache", CacheState::Miss.header());
+        set_anycast(&mut resp, &anycast);
         resp
     } else {
         let mut resp = resp;
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-cache", CacheState::Miss.header());
+        set_anycast(&mut resp, &anycast);
         resp
+    }
+}
+
+/// Stamp the anycast routing decision onto a response for observability.
+fn set_anycast(resp: &mut Response, node: &Option<hive_edge::NodeInfo>) {
+    if let Some(n) = node {
+        set(resp, "x-hive-anycast-node", &n.name);
+        set(resp, "x-hive-anycast-region", &n.region);
+        set(resp, "x-hive-anycast-latency", &n.latency_ms.to_string());
     }
 }
 

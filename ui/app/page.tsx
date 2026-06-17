@@ -15,6 +15,7 @@ export default function OverviewPage() {
   const { data: events } = usePoll<Event[]>("/v1/logs?limit=8", 2500);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
   const [q, setQ] = useState("");
+  const [page, setPage] = useState(0);
 
   // Group deployments by project (latest per project = the project card).
   const projects = new Map<string, Deployment>();
@@ -22,6 +23,12 @@ export default function OverviewPage() {
   const list = Array.from(projects.values()).filter((p) =>
     p.project.toLowerCase().includes(q.toLowerCase())
   );
+
+  // Paginate so large fleets stay navigable.
+  const PAGE = 6;
+  const pageCount = Math.max(1, Math.ceil(list.length / PAGE));
+  const safePage = Math.min(page, pageCount - 1);
+  const shown = list.slice(safePage * PAGE, safePage * PAGE + PAGE);
 
   return (
     <div className="pb-24">
@@ -63,7 +70,7 @@ export default function OverviewPage() {
               <Input
                 placeholder="Search…"
                 value={q}
-                onChange={(e) => setQ(e.target.value)}
+                onChange={(e) => { setQ(e.target.value); setPage(0); }}
                 className="pl-9"
               />
             </div>
@@ -73,7 +80,7 @@ export default function OverviewPage() {
           </div>
 
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {list.map((p) => (
+            {shown.map((p) => (
               <ProjectCard key={p.id} p={p} onChange={refresh} />
             ))}
             {!list.length && (
@@ -82,6 +89,18 @@ export default function OverviewPage() {
               </Card>
             )}
           </div>
+
+          {pageCount > 1 && (
+            <div className="mt-5 flex items-center justify-between text-sm">
+              <span className="text-muted">
+                {list.length} project{list.length === 1 ? "" : "s"} · page {safePage + 1} of {pageCount}
+              </span>
+              <div className="flex gap-2">
+                <Button variant="outline" disabled={safePage === 0} onClick={() => setPage(safePage - 1)}>Previous</Button>
+                <Button variant="outline" disabled={safePage >= pageCount - 1} onClick={() => setPage(safePage + 1)}>Next</Button>
+              </div>
+            </div>
+          )}
         </div>
 
         {/* Recent Activity */}

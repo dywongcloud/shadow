@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Webhook, Bell, ChevronRight } from "lucide-react";
+import { Webhook, Bell, KeyRound, ChevronRight } from "lucide-react";
 import { Card, PageHeader, Badge, Button } from "@/components/ui";
 import { ActivityFeed } from "@/components/activity-feed";
 import { usePoll, type Overview, type NodeInfo } from "@/lib/api";
@@ -14,7 +14,8 @@ export default function SettingsPage() {
     <div>
       <PageHeader title="Team Settings" desc="Team configuration, cloud, and activity" />
 
-      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <NavCard href="/settings/api-keys" icon={<KeyRound className="h-4 w-4" />} title="API Keys" desc="Tenant-scoped tokens for the platform API." />
         <NavCard href="/settings/webhooks" icon={<Webhook className="h-4 w-4" />} title="Webhooks" desc="Send signed events to your endpoints." />
         <NavCard href="/settings/notifications" icon={<Bell className="h-4 w-4" />} title="Notifications" desc="Web, email, push & SMS preferences." />
       </div>

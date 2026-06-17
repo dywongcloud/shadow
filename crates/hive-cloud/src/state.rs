@@ -8,8 +8,8 @@ use fluid_gateway::Gateway;
 use hive_controlplane::Hive;
 use hive_core::now_ms;
 use hive_edge::{
-    bot::BotPolicy, BotManager, CdnCache, ConcurrencyLimiter, CronScheduler, NodeRegistry, Router,
-    Waf, WorkflowEngine,
+    bot::BotPolicy, BotManager, CdnCache, ConcurrencyLimiter, CronScheduler, NodeRegistry,
+    RateLimiter, Router, Waf, WorkflowEngine,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -39,6 +39,8 @@ pub struct CloudState {
     pub bot_policy: RwLock<BotPolicy>,
     pub cdn: Arc<CdnCache>,
     pub limiter: Arc<ConcurrencyLimiter>,
+    /// Per-IP L7 rate limiter (DDoS mitigation) at the edge.
+    pub ratelimit: Arc<RateLimiter>,
     pub router: Arc<Router>,
     pub registry: Arc<NodeRegistry>,
     pub cron: Arc<CronScheduler>,
@@ -57,6 +59,7 @@ pub struct CloudState {
     pub metrics: crate::metrics::MetricsStore,
     pub incidents: crate::incidents::IncidentStore,
     pub securelinks: crate::securelink::SecureLinkStore,
+    pub apikeys: crate::apikeys::ApiKeyStore,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
 
@@ -97,6 +100,7 @@ impl CloudState {
             bot_policy: RwLock::new(BotPolicy::default()),
             cdn,
             limiter,
+            ratelimit: Arc::new(RateLimiter::new(100, 10_000)),
             router,
             registry,
             cron,
@@ -114,6 +118,7 @@ impl CloudState {
             metrics: crate::metrics::MetricsStore::new(),
             incidents: crate::incidents::IncidentStore::new(),
             securelinks: crate::securelink::SecureLinkStore::new(),
+            apikeys: crate::apikeys::ApiKeyStore::new(),
             owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),

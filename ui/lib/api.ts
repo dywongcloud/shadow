@@ -100,6 +100,22 @@ export interface NodeInfo {
   peer_id: string | null;
   last_seen_ms: number;
   is_self: boolean;
+  latency_ms?: number;
+  healthy?: boolean;
+}
+
+export interface AnycastTable {
+  region: string;
+  selected: string | null;
+  table: NodeInfo[];
+}
+
+export interface RateLimitStats {
+  enabled: boolean;
+  limit: number;
+  window_ms: number;
+  tracked_ips: number;
+  blocked_total: number;
 }
 
 export interface Event {
@@ -258,6 +274,7 @@ export interface Database {
   kind: DbKind;
   region: string;
   status: DbStatus;
+  provider?: string;
   mode: string;
   created_ms: number;
   connection: Record<string, string>;
@@ -316,6 +333,18 @@ export interface AdminOverview {
   incidents_open: number;
   cluster: { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string };
   webhooks: number;
+}
+
+// ---- Platform API keys ----
+export interface ApiKey {
+  id: string;
+  name: string;
+  prefix: string;
+  team: string;
+  role: string;
+  created_ms: number;
+  last_used_ms: number;
+  token?: string; // only present in the create response
 }
 
 // ---- Secure compute (private backend tunnels) ----
