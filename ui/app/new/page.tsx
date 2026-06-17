@@ -152,7 +152,7 @@ export default function NewProjectPage() {
                   <div className="font-medium">{t.name}</div>
                   <div className="text-sm text-secondary">{t.desc}</div>
                 </div>
-                <Button variant="outline" onClick={() => deploy(t.url, undefined, t.name.toLowerCase().replace(/\s+/g, "-"))} disabled={deploying}>
+                <Button variant="outline" onClick={() => deploy(t.url, undefined, t.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""))} disabled={deploying}>
                   Clone
                 </Button>
               </Card>

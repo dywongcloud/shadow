@@ -45,7 +45,7 @@ export default function NewRulePage() {
       } else {
         await apiSend("POST", "/v1/routing/rewrites", { source, destination: dest });
       }
-      router.push("/cdn/routing");
+      router.push("/cdn");
     } catch (e) { alert(String(e)); setBusy(false); }
   }
 
@@ -58,7 +58,7 @@ export default function NewRulePage() {
 
   return (
     <div>
-      <Link href="/cdn/routing" className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"><ArrowLeft className="h-4 w-4" /> All Routes</Link>
+      <Link href="/cdn" className="inline-flex items-center gap-1.5 text-sm text-link hover:underline"><ArrowLeft className="h-4 w-4" /> All Routes</Link>
       <h1 className="mb-8 mt-3 text-3xl font-semibold tracking-tight">New Rule</h1>
 
       {/* NL generation */}
@@ -135,7 +135,7 @@ export default function NewRulePage() {
       </div>
 
       <div className="mt-6 flex items-center justify-end gap-2">
-        <Link href="/cdn/routing"><Button variant="outline">Cancel</Button></Link>
+        <Link href="/cdn"><Button variant="outline">Cancel</Button></Link>
         <Button variant="outline" onClick={() => alert(code)}>View Code</Button>
         <Button onClick={create} disabled={busy}>Create Rule</Button>
       </div>

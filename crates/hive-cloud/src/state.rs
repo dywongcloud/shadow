@@ -56,6 +56,7 @@ pub struct CloudState {
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
     pub incidents: crate::incidents::IncidentStore,
+    pub securelinks: crate::securelink::SecureLinkStore,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
 
@@ -112,6 +113,7 @@ impl CloudState {
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),
             incidents: crate::incidents::IncidentStore::new(),
+            securelinks: crate::securelink::SecureLinkStore::new(),
             owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),

@@ -9,6 +9,7 @@ interface AuditEvent extends Event {
 
 const tone: Record<string, "green" | "red" | "amber" | "blue" | "default"> = {
   deploy: "green",
+  delete: "red",
   "domain-add": "blue",
   cron: "blue",
   "waf-deny": "red",

@@ -14,16 +14,39 @@ use std::sync::Arc;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// Event types a webhook can subscribe to.
+/// Event types a webhook can subscribe to (Vercel-style catalog).
 pub const ALL_EVENTS: &[&str] = &[
+    // Deployment
     "deployment.created",
     "deployment.building",
     "deployment.ready",
+    "deployment.succeeded",
     "deployment.error",
+    "deployment.canceled",
     "deployment.promoted",
+    "deployment.rollback",
+    "deployment.checks.failed",
+    "deployment.checks.succeeded",
+    // Project
+    "project.created",
+    "project.removed",
+    "project.renamed",
+    "project.env-variable.created",
+    "project.env-variable.updated",
+    "project.env-variable.deleted",
+    // Domain
+    "domain.added",
+    "domain.created",
+    "domain.dns.records.changed",
+    "project.domain.verified",
+    // Data
     "database.created",
     "database.ready",
-    "domain.added",
+    // Observability
+    "alerts.triggered",
+    // Firewall
+    "firewall.attack",
+    // Incidents
     "incident.opened",
     "incident.resolved",
 ];

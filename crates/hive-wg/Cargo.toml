@@ -1,0 +1,21 @@
+[package]
+name = "hive-wg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Secure compute networking: ephemeral userspace WireGuard-style tunnels plus a
+# Key Exchange Service that mints short-lived peer credentials — the pattern
+# Vercel's Hive uses to let builds & functions reach private customer backends
+# (VPCs) without long-lived secrets.
+#
+# The datapath uses WireGuard's exact Noise handshake
+# (Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s) via the `snow` Noise framework, which
+# tracks modern curve25519-dalek (so it coexists with iroh in this workspace).
+
+[dependencies]
+snow = "0.9"
+rand = { workspace = true }
+base64 = "0.22"
+serde = { workspace = true }
+hive-core = { workspace = true }

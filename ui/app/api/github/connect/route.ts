@@ -16,10 +16,10 @@ export async function POST(req: NextRequest) {
   if (!entity) entity = "user-" + Math.random().toString(36).slice(2, 10);
   const origin = req.nextUrl.origin;
   const redirectUrl = `${origin}/new?connected=github`;
-  const url = await githubConnect(entity, redirectUrl);
-  const res = url
-    ? NextResponse.json({ redirectUrl: url })
-    : NextResponse.json({ error: "Failed to initiate GitHub connection" }, { status: 500 });
+  const result = await githubConnect(entity, redirectUrl);
+  const res = result.redirectUrl
+    ? NextResponse.json({ redirectUrl: result.redirectUrl })
+    : NextResponse.json({ error: result.error || "Failed to initiate GitHub connection" }, { status: 500 });
   res.cookies.set("hive_entity", entity, { httpOnly: true, sameSite: "lax", path: "/" });
   return res;
 }

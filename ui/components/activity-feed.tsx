@@ -5,7 +5,7 @@ import { Badge, Triangle } from "@/components/ui";
 import { usePoll, type Event } from "@/lib/api";
 
 function tone(a: string) {
-  if (a.includes("deny") || a.includes("block") || a === "throttled") return "red" as const;
+  if (a.includes("deny") || a.includes("block") || a === "throttled" || a === "delete") return "red" as const;
   if (a.includes("cache")) return "blue" as const;
   if (a === "cron" || a === "redirect" || a === "rewrite" || a === "deploy" || a === "domain-add") return "amber" as const;
   return "green" as const;
@@ -23,6 +23,7 @@ function describe(e: Event): string {
     case "redirect": return `redirected ${e.path} → ${e.detail}`;
     case "rewrite": return `rewrote ${e.path} → ${e.detail}`;
     case "preview-protected": return `blocked an anonymous preview request to ${e.host}`;
+    case "delete": return e.detail || `deleted ${e.project}`;
     default: return `${e.method} ${e.path} → ${e.status}`;
   }
 }

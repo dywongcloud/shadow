@@ -17,6 +17,7 @@ fluid-build = { workspace = true }
 fluid-compute = { workspace = true }
 fluid-gateway = { workspace = true }
 hive-edge = { workspace = true }
+hive-wg = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }

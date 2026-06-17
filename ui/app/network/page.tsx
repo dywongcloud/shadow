@@ -1,8 +1,9 @@
 "use client";
 
-import { Globe2, Server, Share2, ShieldCheck, Database, Network } from "lucide-react";
-import { Card, Badge, PageHeader, Table, Th, Td } from "@/components/ui";
-import { usePoll, type NodeInfo, type Overview } from "@/lib/api";
+import { useState } from "react";
+import { Globe2, Server, Share2, ShieldCheck, Database, Network, Lock, Plus, X, Trash2, Loader2 } from "lucide-react";
+import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
+import { apiSend, usePoll, type NodeInfo, type Overview, type SecureLink } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
@@ -74,6 +75,8 @@ export default function NetworkPage() {
         </Card>
       </div>
 
+      <SecureConnections />
+
       <div className="mb-2 text-sm font-medium text-fg">Nodes</div>
       <Table>
         <thead><tr><Th>Node</Th><Th>Region</Th><Th>Endpoint</Th><Th>Role</Th><Th>Seen</Th></tr></thead>
@@ -112,5 +115,113 @@ function Arch({ icon, title, desc }: { icon: React.ReactNode; title: string; des
       <div className="mb-2 flex items-center gap-2 text-sm font-medium">{icon}{title}</div>
       <p className="text-sm text-secondary">{desc}</p>
     </Card>
+  );
+}
+
+/** Secure compute: ephemeral WireGuard tunnels to private backends. */
+function SecureConnections() {
+  const { data: links, refresh } = usePoll<SecureLink[]>("/v1/securelinks", 4000);
+  const [open, setOpen] = useState(false);
+
+  async function remove(id: string) {
+    await apiSend("DELETE", `/v1/securelinks/${id}`);
+    refresh();
+  }
+
+  return (
+    <div className="mb-6">
+      <Card className="mb-3">
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="mb-1 flex items-center gap-2 text-sm font-medium"><Lock className="h-4 w-4" /> Secure Connections</div>
+            <p className="max-w-2xl text-sm text-secondary">
+              Reach private backends (a DB in a VPC) over an ephemeral WireGuard tunnel. Keys are
+              short-lived and minted on demand by the Key Exchange Service — no long-lived secrets
+              in your builds or functions.
+            </p>
+          </div>
+          <Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Connect Backend</Button>
+        </div>
+      </Card>
+
+      {!!links?.length && (
+        <Table>
+          <thead><tr><Th>Backend</Th><Th>Local address</Th><Th>Wired to</Th><Th>Status</Th><Th>Expires</Th><Th></Th></tr></thead>
+          <tbody>
+            {links.map((l) => (
+              <tr key={l.id}>
+                <Td className="font-mono text-xs">{l.target}</Td>
+                <Td className="font-mono text-xs text-secondary">{l.local_addr}</Td>
+                <Td className="text-xs">
+                  {l.project ? <span className="font-mono">{l.project}.{l.env_var}</span> : <span className="text-muted">—</span>}
+                </Td>
+                <Td><Badge tone={l.status === "active" ? "green" : "default"}>{l.status}</Badge></Td>
+                <Td className="text-secondary">{l.status === "active" ? `in ${Math.max(0, Math.round((l.expires_ms - Date.now()) / 60000))}m` : "—"}</Td>
+                <Td><button onClick={() => remove(l.id)} className="text-muted hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button></Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      )}
+
+      {open && <ConnectModal onClose={() => setOpen(false)} onDone={() => { setOpen(false); refresh(); }} />}
+    </div>
+  );
+}
+
+function ConnectModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
+  const [target, setTarget] = useState("");
+  const [ttl, setTtl] = useState("900");
+  const [project, setProject] = useState("");
+  const [envVar, setEnvVar] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  async function connect() {
+    if (!target.trim()) return;
+    setBusy(true); setErr("");
+    try {
+      await apiSend("POST", "/v1/securelinks", {
+        target,
+        ttl_secs: Number(ttl) || 900,
+        project: project || undefined,
+        env_var: envVar || undefined,
+      });
+      onDone();
+    } catch (e) { setErr(String(e)); setBusy(false); }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div className="w-full max-w-md rounded-xl border border-border bg-card p-6 shadow-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="mb-4 flex items-center justify-between"><h2 className="flex items-center gap-2 text-lg font-semibold"><Lock className="h-4 w-4" /> Connect Private Backend</h2><button onClick={onClose} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button></div>
+        <div className="space-y-3">
+          <div>
+            <label className="mb-1 block text-xs font-medium text-secondary">Backend address (host:port)</label>
+            <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="db.internal:5432" className="w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-sm focus:outline-none" />
+          </div>
+          <div>
+            <label className="mb-1 block text-xs font-medium text-secondary">Lease TTL (seconds)</label>
+            <input value={ttl} onChange={(e) => setTtl(e.target.value.replace(/[^0-9]/g, ""))} className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none" />
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-secondary">Wire to project <span className="text-muted">(optional)</span></label>
+              <input value={project} onChange={(e) => setProject(e.target.value)} placeholder="my-project" className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:outline-none" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-secondary">Env var</label>
+              <input value={envVar} onChange={(e) => setEnvVar(e.target.value)} placeholder="DATABASE_URL" className="w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-sm focus:outline-none" />
+            </div>
+          </div>
+          <p className="text-xs text-muted">If set, the connector's local address is injected as that env var so the project's functions reach the backend through the tunnel.</p>
+          {err && <p className="text-xs text-red-500">{err}</p>}
+        </div>
+        <div className="mt-6 flex justify-end gap-2">
+          <Button variant="outline" onClick={onClose}>Cancel</Button>
+          <Button onClick={connect} disabled={busy}>{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Lock className="h-4 w-4" />} Establish Tunnel</Button>
+        </div>
+      </div>
+    </div>
   );
 }

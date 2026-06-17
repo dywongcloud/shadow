@@ -46,10 +46,26 @@ html {
 
 html,
 body {
-  background: hsl(var(--background));
+  background-color: hsl(var(--background));
   color: hsl(var(--foreground));
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+}
+
+/* Very faint large-square grid canvas behind the whole dashboard. Uses the
+   foreground channel at a tiny alpha so it adapts to light & dark automatically. */
+body {
+  background-image:
+    linear-gradient(to right, hsl(var(--foreground) / 0.018) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--foreground) / 0.018) 1px, transparent 1px);
+  background-size: 128px 128px;
+  background-position: -1px -1px;
+  background-attachment: fixed;
+}
+.dark body {
+  background-image:
+    linear-gradient(to right, hsl(var(--foreground) / 0.028) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--foreground) / 0.028) 1px, transparent 1px);
 }
 
 * {

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{delete, get, post, put},
     Json, Router,
 };
@@ -72,7 +72,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/teams/:slug/members", post(team_add_member))
         .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
         // ---- Webhooks ----
-        .route("/v1/webhooks", get(webhooks_all))
+        .route("/v1/webhooks", get(webhooks_all).post(webhook_create_team))
         .route("/v1/webhooks/events", get(webhook_events))
         .route("/v1/webhooks/deliveries", get(webhook_deliveries))
         .route("/v1/webhooks/:id", delete(webhook_delete))
@@ -95,6 +95,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/ws/pubsub/:topic", get(ws_pubsub))
         .route("/v1/ws/realtime/:room", get(ws_realtime))
         .route("/v1/ws/echo", get(ws_echo))
+        // ---- Secure compute (private backend tunnels) ----
+        .route("/v1/securelinks", get(securelinks_list).post(securelink_create))
+        .route("/v1/securelinks/:id", delete(securelink_delete))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
         // ---- Owner / ops dashboard ----
@@ -212,8 +215,15 @@ async fn domains_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 async fn git_deploy(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     Json(req): Json<fluid_core::GitDeployRequest>,
 ) -> Json<Value> {
+    // Assign the (new) project to the requesting tenant so it shows under their
+    // team only.
+    let t = tenant(&headers);
+    let project = req.project.clone().unwrap_or_else(|| crate::git::project_name_from_url(&req.repo_url));
+    c.projects.set_team(&project, &t);
+    crate::persist::persist(&c);
     // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
     let build_id = crate::git::start_build(c.clone(), req);
     Json(json!({ "build_id": build_id }))
@@ -234,8 +244,30 @@ async fn build_frameworks() -> Json<Value> {
 
 // ---- Deployments (previews) ----
 
-async fn dep_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.gw.list()))
+/// The tenant (team slug) for a request — from the `x-hive-team` header set by
+/// the dashboard's team switcher. Defaults to "personal".
+fn tenant(h: &HeaderMap) -> String {
+    h.get("x-hive-team")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "personal".into())
+}
+
+/// Normalize an owner slug: empty/absent => "personal".
+fn norm(team: &str) -> &str {
+    if team.is_empty() { "personal" } else { team }
+}
+
+async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&headers);
+    let list: Vec<_> = c
+        .gw
+        .list()
+        .into_iter()
+        .filter(|d| norm(&c.projects.team_of(&d.project)) == t)
+        .collect();
+    Json(json!(list))
 }
 
 async fn dep_create(
@@ -260,9 +292,28 @@ async fn dep_promote(
     Ok(Json(json!(info)))
 }
 
+/// Record a control-plane event (shows in Recent Activity / Activity / Audit),
+/// scoped to a project so it respects tenant filtering.
+fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) {
+    c.record(crate::state::Event {
+        ts_ms: now_ms(),
+        region: c.region.clone(),
+        method: "DELETE".into(),
+        host: format!("{project}.localhost"),
+        path: "/".into(),
+        status: 200,
+        action: action.to_string(),
+        detail: detail.to_string(),
+        project: project.to_string(),
+    });
+}
+
 /// Delete a single deployment (unregisters its functions).
 async fn dep_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
     let project = c.gw.remove(&id).await;
+    if let Some(p) = &project {
+        record_event(&c, p, "delete", &format!("deleted deployment {id}"));
+    }
     crate::persist::persist(&c);
     Json(json!({ "removed": id, "project": project }))
 }
@@ -270,8 +321,10 @@ async fn dep_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) ->
 /// Delete an entire project: all its deployments + settings.
 async fn project_delete(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
     let ids = c.gw.remove_project(&project).await;
+    record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
     c.projects.remove(&project);
     crate::persist::persist(&c);
+    crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
     Json(json!({ "project": project, "removed_deployments": ids }))
 }
 
@@ -353,9 +406,13 @@ struct LimitQ {
     q: Option<String>,
 }
 
-async fn logs(State(c): State<Arc<CloudState>>, Query(q): Query<LimitQ>) -> Json<Value> {
+async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<LimitQ>) -> Json<Value> {
     let limit = q.limit.unwrap_or(100);
+    let t = tenant(&headers);
     let mut evs = c.recent_events(2000);
+    // Tenant scope: only events for projects owned by this team. Infra events
+    // (empty project) are shown to everyone.
+    evs.retain(|e| e.project.is_empty() || norm(&c.projects.team_of(&e.project)) == t);
     if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
         let pl = p.to_lowercase();
         evs.retain(|e| {
@@ -664,6 +721,38 @@ async fn webhooks_all(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.webhooks.list(None)))
 }
 
+#[derive(Deserialize)]
+struct CreateTeamWebhook {
+    url: String,
+    #[serde(default)]
+    events: Vec<String>,
+    /// Empty or ["*"] = all projects; otherwise one webhook per project.
+    #[serde(default)]
+    projects: Vec<String>,
+}
+
+async fn webhook_create_team(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeamWebhook>) -> Json<Value> {
+    let targets: Vec<String> = if b.projects.is_empty() || b.projects.iter().any(|p| p == "*") {
+        vec!["*".into()]
+    } else {
+        b.projects.clone()
+    };
+    let mut created = Vec::new();
+    for p in targets {
+        created.push(c.webhooks.add(crate::webhooks::Webhook {
+            id: String::new(),
+            project: p,
+            url: b.url.clone(),
+            events: b.events.clone(),
+            secret: String::new(),
+            enabled: true,
+            created_ms: 0,
+        }));
+    }
+    crate::persist::persist(&c);
+    Json(json!(created))
+}
+
 async fn webhooks_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
     Json(json!(c.webhooks.list(Some(&project))))
 }
@@ -705,8 +794,15 @@ async fn webhook_deliveries(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 // ============================ Databases ============================
 
-async fn databases_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.databases.list(None)))
+async fn databases_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&headers);
+    let list: Vec<_> = c
+        .databases
+        .list(None)
+        .into_iter()
+        .filter(|d| norm(&d.team) == t)
+        .collect();
+    Json(json!(list))
 }
 
 async fn databases_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
@@ -723,9 +819,13 @@ async fn database_credentials(State(c): State<Arc<CloudState>>, Path(id): Path<S
 
 async fn database_create(
     State(c): State<Arc<CloudState>>,
-    Json(req): Json<crate::databases::ProvisionReq>,
+    headers: HeaderMap,
+    Json(mut req): Json<crate::databases::ProvisionReq>,
 ) -> Json<Value> {
     let cloud = c.clone();
+    if req.team.trim().is_empty() {
+        req.team = tenant(&headers);
+    }
     let project = req.project.clone();
     let db = crate::databases::provision(c.databases.clone(), c.region.clone(), req, move |d| {
         crate::persist::persist(&cloud);
@@ -921,6 +1021,46 @@ async fn ws_echo(ws: axum::extract::ws::WebSocketUpgrade) -> axum::response::Res
     })
 }
 
+// ====================== Secure compute (WireGuard) ======================
+
+async fn securelinks_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    Json(json!(c.securelinks.list(&tenant(&headers))))
+}
+
+async fn securelink_create(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Json(mut req): Json<crate::securelink::ProvisionReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if req.team.trim().is_empty() {
+        req.team = tenant(&headers);
+    }
+    let region = c.region.clone();
+    let rec = c.securelinks.provision(req, &region).await.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // Wire the function datapath: inject the connector's local address as a
+    // project env var, so deployed functions reach the private backend through
+    // the encrypted tunnel transparently.
+    if !rec.project.is_empty() && !rec.env_var.is_empty() {
+        c.projects.put_env(&rec.project, crate::project_settings::EnvVar {
+            key: rec.env_var.clone(),
+            value: rec.local_addr.clone(),
+            target: "all".into(),
+            sensitive: false,
+            updated_ms: now_ms(),
+        });
+        crate::persist::persist(&c);
+        let ev = c.event(&c.region, "SECURE", &rec.target, "/", 200, "deploy",
+            &format!("secure tunnel {} → {} wired to {}.{}", rec.local_addr, rec.target, rec.project, rec.env_var));
+        c.record(ev);
+    }
+    Ok(Json(json!(rec)))
+}
+
+async fn securelink_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+    c.securelinks.remove(&id);
+    Json(json!({ "removed": id }))
+}
+
 // ============================ Monitoring ============================
 
 #[derive(Deserialize)]
@@ -929,8 +1069,9 @@ struct MetricsQ {
     project: Option<String>,
 }
 
-async fn metrics_get(State(c): State<Arc<CloudState>>, Query(q): Query<MetricsQ>) -> Json<Value> {
+async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<MetricsQ>) -> Json<Value> {
     let minutes = q.minutes.unwrap_or(60).min(180);
+    let t = tenant(&headers);
     let project = q.project.as_deref().filter(|p| !p.is_empty());
     let series = c.metrics.series(minutes, now_ms(), project);
     let total_req: u64 = series.iter().map(|b| b.requests).sum();
@@ -951,7 +1092,9 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, Query(q): Query<MetricsQ>
         },
         "status_distribution": c.metrics.status_distribution(),
         "top_paths": c.metrics.top_paths(10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
-        "projects": c.metrics.project_totals(minutes, now_ms()).into_iter().map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
+        "projects": c.metrics.project_totals(minutes, now_ms()).into_iter()
+            .filter(|(p, _)| norm(&c.projects.team_of(p)) == t)
+            .map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
     }))
 }
 
@@ -996,7 +1139,7 @@ async fn admin_audit(State(c): State<Arc<CloudState>>) -> Json<Value> {
         .filter(|e| {
             matches!(
                 e.action.as_str(),
-                "deploy" | "domain-add" | "cron" | "waf-deny" | "throttled" | "redirect" | "rewrite"
+                "deploy" | "delete" | "domain-add" | "cron" | "waf-deny" | "throttled" | "redirect" | "rewrite"
             )
         })
         .take(200)

@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { Github, Search, Plus, GitBranch, CheckCheck } from "lucide-react";
+import { Github, Search, GitBranch, CheckCheck } from "lucide-react";
 import { Card, Button, Input, Triangle, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
 import { ProjectMenu } from "@/components/project-menu";
+import { WithIdentity } from "@/components/identity";
 import { usePoll, type Deployment, type Event, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { useState } from "react";
@@ -23,26 +24,35 @@ export default function OverviewPage() {
   );
 
   return (
-    <div>
+    <div className="pb-24">
       {/* Header row */}
-      <div className="mb-8 flex items-start justify-between">
-        <div className="flex items-center gap-4">
-          <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#0761d1] text-lg font-semibold text-white">
-            D
-          </div>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Dylan&apos;s Projects</h1>
-            <div className="mt-1 flex items-center gap-1.5 text-sm text-secondary">
-              <Github className="h-4 w-4" />
-              Connected to GitHub
-              <span className="text-muted">/</span>
-              <Link href="/integrations" className="text-link hover:underline">
-                Settings
-              </Link>
+      <WithIdentity>
+        {(id) => (
+          <div className="mb-8 flex items-start justify-between">
+            <div className="flex items-center gap-4">
+              {id.imageUrl ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={id.imageUrl} alt="" className="h-14 w-14 rounded-full object-cover" />
+              ) : (
+                <div className="flex h-14 w-14 items-center justify-center rounded-full bg-[#0761d1] text-lg font-semibold text-white">
+                  {id.initial}
+                </div>
+              )}
+              <div>
+                <h1 className="text-2xl font-semibold tracking-tight">{id.name}&apos;s Projects</h1>
+                <div className="mt-1 flex items-center gap-1.5 text-sm text-secondary">
+                  <Github className="h-4 w-4" />
+                  {id.email || "Connected to GitHub"}
+                  <span className="text-muted">/</span>
+                  <Link href="/integrations" className="text-link hover:underline">
+                    Settings
+                  </Link>
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-      </div>
+        )}
+      </WithIdentity>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_320px]">
         {/* Projects */}
@@ -68,14 +78,7 @@ export default function OverviewPage() {
             ))}
             {!list.length && (
               <Card className="col-span-full overflow-hidden p-8 text-center">
-                <GlobeEmptyState title="Deploy your first project" desc="Import a Git repository or a Dockerfile to deploy across your global mesh." />
-                <div className="relative z-10 -mt-24 flex justify-center">
-                  <Link href="/new">
-                    <Button>
-                      <Plus className="h-4 w-4" /> New Project
-                    </Button>
-                  </Link>
-                </div>
+                <GlobeEmptyState title="Deploy your first project" desc="Import a Git repository or a Dockerfile to deploy across your global mesh. Use “New Project” above to get started." />
               </Card>
             )}
           </div>

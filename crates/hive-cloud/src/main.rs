@@ -17,6 +17,7 @@ mod incidents;
 mod metrics;
 mod persist;
 mod project_settings;
+mod securelink;
 mod state;
 mod teams;
 mod webhooks;

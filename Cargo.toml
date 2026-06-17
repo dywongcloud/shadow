@@ -18,6 +18,7 @@ members = [
     "crates/hive-p2p",
     "crates/hive-edge",
     "crates/hive-cloud",
+    "crates/hive-wg",
 ]
 
 [workspace.package]
@@ -67,6 +68,7 @@ fluid-build = { path = "crates/fluid-build" }
 fluid-tunnel = { path = "crates/fluid-tunnel" }
 fluid-compute = { path = "crates/fluid-compute" }
 fluid-gateway = { path = "crates/fluid-gateway" }
+hive-wg = { path = "crates/hive-wg" }
 hive-edge = { path = "crates/hive-edge" }
 
 [profile.release]

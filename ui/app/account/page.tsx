@@ -4,6 +4,7 @@ import { useState } from "react";
 import { Copy, Plus, LogOut } from "lucide-react";
 import { SignOutButton } from "@clerk/nextjs";
 import { Button, Input, SettingCard, Badge } from "@/components/ui";
+import { WithIdentity } from "@/components/identity";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
@@ -29,7 +30,10 @@ export default function AccountPage() {
           footer="An avatar is optional but strongly recommended."
         >
           <div className="flex justify-end">
-            <div className="h-16 w-16 rounded-full bg-gradient-to-br from-indigo-400 to-purple-600" />
+            <WithIdentity>{(id) => id.imageUrl
+              // eslint-disable-next-line @next/next/no-img-element
+              ? <img src={id.imageUrl} alt="" className="h-16 w-16 rounded-full object-cover" />
+              : <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#0761d1] text-xl font-semibold text-white">{id.initial}</div>}</WithIdentity>
           </div>
         </SettingCard>
 
@@ -71,11 +75,13 @@ export default function AccountPage() {
           desc="Enter the email addresses you want to use to log in. Your primary email is used for account-related notifications."
           footer="Emails must be verified to be able to login with them or be used as primary email."
         >
-          <div className="rounded-md border border-border px-4 py-3 text-sm">
-            <div className="flex items-center gap-2">
-              dylanwong007@gmail.com <Badge tone="blue">Verified</Badge> <Badge tone="green">Primary</Badge>
+          <WithIdentity>{(id) => (
+            <div className="rounded-md border border-border px-4 py-3 text-sm">
+              <div className="flex items-center gap-2">
+                {id.email || "—"} <Badge tone="blue">Verified</Badge> <Badge tone="green">Primary</Badge>
+              </div>
             </div>
-          </div>
+          )}</WithIdentity>
           <div className="mt-3"><Button variant="outline"><Plus className="h-4 w-4" /> Add Another</Button></div>
         </SettingCard>
 

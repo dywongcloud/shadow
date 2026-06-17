@@ -1,37 +1,47 @@
 "use client";
 
-import { useState } from "react";
+import Link from "next/link";
+import { Webhook, Bell, ChevronRight } from "lucide-react";
 import { Card, PageHeader, Badge, Button } from "@/components/ui";
 import { ActivityFeed } from "@/components/activity-feed";
 import { usePoll, type Overview, type NodeInfo } from "@/lib/api";
-import { cn } from "@/lib/utils";
 
 export default function SettingsPage() {
   const { data: ov } = usePoll<Overview>("/v1/overview", 5000);
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 5000);
-  const [tab, setTab] = useState<"general" | "activity">("general");
 
   return (
     <div>
       <PageHeader title="Team Settings" desc="Team configuration, cloud, and activity" />
 
-      <div className="mb-6 flex gap-1 border-b border-border">
-        {(["general", "activity"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={cn(
-              "-mb-px border-b-2 px-3 pb-2.5 pt-1 text-sm capitalize transition-colors",
-              tab === t ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
-            )}
-          >
-            {t}
-          </button>
-        ))}
+      <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <NavCard href="/settings/webhooks" icon={<Webhook className="h-4 w-4" />} title="Webhooks" desc="Send signed events to your endpoints." />
+        <NavCard href="/settings/notifications" icon={<Bell className="h-4 w-4" />} title="Notifications" desc="Web, email, push & SMS preferences." />
       </div>
 
-      {tab === "activity" ? <ActivityFeed /> : <General ov={ov} nodes={nodes} />}
+      <General ov={ov} nodes={nodes} />
+      <div className="mt-10">
+        <h2 className="mb-4 text-xl font-semibold tracking-tight">Activity</h2>
+        <ActivityFeed />
+      </div>
     </div>
+  );
+}
+
+function NavCard({ href, icon, title, desc }: { href: string; icon: React.ReactNode; title: string; desc: string }) {
+  return (
+    <Link href={href}>
+      <Card className="flex items-center justify-between p-4 transition-shadow hover:shadow-pop">
+        <div className="flex items-center gap-3">
+          <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-subtle text-secondary">{icon}</span>
+          <div>
+            <div className="text-sm font-medium">{title}</div>
+            <div className="text-xs text-secondary">{desc}</div>
+          </div>
+        </div>
+        <ChevronRight className="h-4 w-4 text-muted" />
+      </Card>
+    </Link>
   );
 }
 

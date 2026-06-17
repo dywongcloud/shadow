@@ -6,11 +6,11 @@ import { useEffect, useRef, useState } from "react";
 import { Bell, ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, type Team } from "@/lib/api";
 
 const tabs = [
-  { href: "/", label: "Overview" },
-  { href: "/projects", label: "Projects" },
+  { href: "/", label: "Projects" },
   { href: "/storage", label: "Storage" },
   { href: "/observability", label: "Observability" },
   { href: "/cdn", label: "CDN" },
@@ -45,7 +45,7 @@ export function TopNav() {
         <div className="flex items-center gap-2 text-sm">
           <Link href="/" className="flex items-center"><VercelMark /></Link>
           <span className="px-1 text-2xl font-thin text-border-strong">/</span>
-          <TeamSwitcher />
+          <WithIdentity>{(id) => <TeamSwitcher identity={id} />}</WithIdentity>
         </div>
         <div className="flex items-center gap-2">
           <Link
@@ -98,7 +98,7 @@ export function TopNav() {
 const PERSONAL = "__personal__";
 
 /** Toggleable team switcher — a personal ("just my name") view plus any teams. */
-function TeamSwitcher() {
+function TeamSwitcher({ identity }: { identity: Identity }) {
   const { data: teams } = usePoll<Team[]>("/v1/teams", 10000);
   const [open, setOpen] = useState(false);
   const [sel, setSel] = useState<string>(PERSONAL);
@@ -118,12 +118,16 @@ function TeamSwitcher() {
 
   function choose(slug: string) {
     setSel(slug);
-    if (typeof window !== "undefined") localStorage.setItem("hive_team", slug);
+    if (typeof window !== "undefined") {
+      localStorage.setItem("hive_team", slug);
+      // Tell every usePoll to re-fetch with the new tenant immediately.
+      window.dispatchEvent(new Event("hive-team-changed"));
+    }
     setOpen(false);
   }
 
   const current = sel === PERSONAL ? null : (teams ?? []).find((t) => t.slug === sel);
-  const label = current ? current.name : "Dylan";
+  const label = current ? current.name : identity.name;
   const plan = current ? current.plan : "Hobby";
 
   return (
@@ -132,12 +136,17 @@ function TeamSwitcher() {
         onClick={() => setOpen((o) => !o)}
         className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-subtle"
       >
-        <span className={cn(
-          "flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold text-white",
-          current ? "bg-fg text-bg" : "bg-[#0761d1]"
-        )}>
-          {current ? label.slice(0, 1).toUpperCase() : "D"}
-        </span>
+        {!current && identity.imageUrl ? (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img src={identity.imageUrl} alt="" className="h-6 w-6 rounded-full object-cover" />
+        ) : (
+          <span className={cn(
+            "flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold text-white",
+            current ? "bg-fg text-bg" : "bg-[#0761d1]"
+          )}>
+            {current ? label.slice(0, 1).toUpperCase() : identity.initial}
+          </span>
+        )}
         <span className="font-medium">{label}</span>
         <span className="rounded-full border border-border px-1.5 py-0.5 text-[10px] capitalize text-secondary">{plan}</span>
         <ChevronsUpDown className="h-3.5 w-3.5 text-muted" />
@@ -146,7 +155,7 @@ function TeamSwitcher() {
       {open && (
         <div className="absolute left-0 top-full z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-border bg-card shadow-pop">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
-          <Option label="Dylan" hint="Hobby" icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
+          <Option label={identity.name} hint="Hobby" icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
           <div className="mt-1 border-t border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Teams</div>
           {(teams ?? []).filter((t) => t.slug !== "personal").map((t) => (
             <Option

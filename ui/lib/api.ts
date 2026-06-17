@@ -4,8 +4,19 @@ import { useEffect, useState, useCallback } from "react";
 
 const BASE = "/cloud";
 
+/** Current tenant (team) for scoping all dashboard reads/writes. */
+export function currentTeam(): string {
+  if (typeof window === "undefined") return "personal";
+  const t = localStorage.getItem("hive_team");
+  return !t || t === "__personal__" ? "personal" : t;
+}
+
+function teamHeaders(): Record<string, string> {
+  return { "x-hive-team": currentTeam() };
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
-  const r = await fetch(`${BASE}${path}`, { cache: "no-store" });
+  const r = await fetch(`${BASE}${path}`, { cache: "no-store", headers: teamHeaders() });
   if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
   return r.json();
 }
@@ -13,7 +24,7 @@ export async function apiGet<T>(path: string): Promise<T> {
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
     method,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...teamHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`${method} ${path} -> ${r.status}`);
@@ -41,7 +52,13 @@ export function usePoll<T>(path: string, intervalMs = 3000) {
   useEffect(() => {
     refresh();
     const id = setInterval(refresh, intervalMs);
-    return () => clearInterval(id);
+    // Re-fetch immediately when the active team changes.
+    const onTeam = () => refresh();
+    if (typeof window !== "undefined") window.addEventListener("hive-team-changed", onTeam);
+    return () => {
+      clearInterval(id);
+      if (typeof window !== "undefined") window.removeEventListener("hive-team-changed", onTeam);
+    };
   }, [refresh, intervalMs]);
 
   return { data, error, loading, refresh };
@@ -299,6 +316,21 @@ export interface AdminOverview {
   incidents_open: number;
   cluster: { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string };
   webhooks: number;
+}
+
+// ---- Secure compute (private backend tunnels) ----
+export interface SecureLink {
+  id: string;
+  target: string;
+  local_addr: string;
+  region: string;
+  status: string;
+  public_key: string;
+  created_ms: number;
+  expires_ms: number;
+  team: string;
+  project: string;
+  env_var: string;
 }
 
 export interface BuildLogLine {

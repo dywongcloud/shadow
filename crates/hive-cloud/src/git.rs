@@ -71,7 +71,21 @@ impl BuildStore {
     }
 }
 
-fn project_name_from_url(url: &str) -> String {
+/// Sanitize a string for use in a container image tag ([a-z0-9._-] only).
+fn sanitize_tag(s: &str) -> String {
+    let mut out: String = s
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    let out = out.trim_matches(|c| c == '-' || c == '.' || c == '_').to_string();
+    if out.is_empty() { "app".into() } else { out }
+}
+
+pub fn project_name_from_url(url: &str) -> String {
     url.trim_end_matches('/')
         .rsplit('/')
         .next()
@@ -193,7 +207,10 @@ async fn run_build(
     let mut manifest;
     if dockerfile.exists() {
         log("Detected Dockerfile — building container image.".into());
-        let image = format!("hive-{}-{}", project, &commit[..commit.len().min(7)]);
+        // Image tags only allow [a-z0-9._-]; sanitize the project name so names
+        // like "container-(dockerfile)" don't produce an invalid reference.
+        let safe_project = sanitize_tag(&project);
+        let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
         let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
         let t1 = now_ms();
         let out = Command::new("podman")
