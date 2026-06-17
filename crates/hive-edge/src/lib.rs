@@ -1,0 +1,22 @@
+//! `hive-edge` — the edge/platform features layered on top of Hive + Fluid:
+//! WAF, bot management, CDN cache, regions/node registry, cron, and workflows.
+//! These are the Vercel-style platform capabilities the `hive-cloud` node wires
+//! into one request pipeline + control surface.
+
+pub mod bot;
+pub mod cdn;
+pub mod cron;
+pub mod region;
+pub mod waf;
+pub mod workflows;
+
+pub(crate) fn default_true_pub() -> bool {
+    true
+}
+
+pub use bot::{BotClass, BotManager, BotPolicy};
+pub use cdn::CdnCache;
+pub use cron::{CronJob, CronScheduler};
+pub use region::{NodeInfo, NodeRegistry};
+pub use waf::{RequestCtx, Verdict, Waf, WafAction, WafMatch, WafRule};
+pub use workflows::{RunStatus, StepInvoker, WorkflowDef, WorkflowEngine, WorkflowRun, WorkflowStep};

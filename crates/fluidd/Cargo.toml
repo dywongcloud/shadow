@@ -1,0 +1,21 @@
+[package]
+name = "fluidd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "fluidd"
+path = "src/main.rs"
+
+[dependencies]
+hive-core = { workspace = true }
+hive-backend = { workspace = true }
+fluid-core = { workspace = true }
+fluid-compute = { workspace = true }
+fluid-gateway = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

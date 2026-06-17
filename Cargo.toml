@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hive-core",
+    "crates/hive-backend",
+    "crates/hive-controlplane",
+    "crates/hive-api",
+    "crates/hive-cell-agent",
+    "crates/hived",
+    "crates/hivectl",
+    "crates/fluid-core",
+    "crates/fluid-tunnel",
+    "crates/fluid-compute",
+    "crates/fluid-gateway",
+    "crates/fluidd",
+    "crates/fluidctl",
+    "crates/hive-p2p",
+    "crates/hive-edge",
+    "crates/hive-cloud",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Hive-rs reverse-engineering study"]
+repository = "local"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+futures = "0.3"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# web / client
+axum = { version = "0.7", features = ["macros"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# cli
+clap = { version = "4", features = ["derive", "env"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# misc
+anyhow = "1"
+thiserror = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+dashmap = "6"
+rand = "0.8"
+
+# internal crates
+hive-core = { path = "crates/hive-core" }
+hive-backend = { path = "crates/hive-backend" }
+hive-controlplane = { path = "crates/hive-controlplane" }
+hive-api = { path = "crates/hive-api" }
+fluid-core = { path = "crates/fluid-core" }
+fluid-tunnel = { path = "crates/fluid-tunnel" }
+fluid-compute = { path = "crates/fluid-compute" }
+fluid-gateway = { path = "crates/fluid-gateway" }
+hive-edge = { path = "crates/hive-edge" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,20 @@
+[package]
+name = "hived"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hived"
+path = "src/main.rs"
+
+[dependencies]
+hive-core = { workspace = true }
+hive-backend = { workspace = true }
+hive-controlplane = { workspace = true }
+hive-api = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

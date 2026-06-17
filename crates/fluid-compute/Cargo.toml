@@ -1,0 +1,15 @@
+[package]
+name = "fluid-compute"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-core = { workspace = true }
+hive-backend = { workspace = true }
+fluid-core = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+serde = { workspace = true }

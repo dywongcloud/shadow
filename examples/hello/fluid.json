@@ -1,0 +1,19 @@
+{
+  "project": "hello",
+  "static_dir": "public",
+  "functions": [
+    {
+      "name": "api",
+      "runtime": "python",
+      "start_cmd": ["python3", "server.py"],
+      "max_concurrency": 5,
+      "min_instances": 1,
+      "max_instances": 3,
+      "idle_ttl_secs": 8
+    }
+  ],
+  "routes": [
+    { "pattern": "/api", "target": { "function": "api" } },
+    { "pattern": "/", "target": "static" }
+  ]
+}

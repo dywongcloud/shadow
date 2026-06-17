@@ -1,0 +1,16 @@
+[package]
+name = "hive-p2p"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+fluid-tunnel = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+iroh = "1"
+
+[[bin]]
+name = "p2p-demo"
+path = "src/bin/p2p_demo.rs"

@@ -1,0 +1,18 @@
+[package]
+name = "hive-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hive-core = { workspace = true }
+fluid-tunnel = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

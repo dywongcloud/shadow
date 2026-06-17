@@ -1,0 +1,154 @@
+//! End-to-end-ish tests of the control plane driving the mock backend.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+use hive_backend::mock::{MockBackend, MockConfig};
+use hive_controlplane::{BoxConfig, Hive, HiveConfig};
+use hive_core::{BuildJob, JobId, JobState, ResourceSpec};
+
+fn test_hive(warm: BTreeMap<String, usize>, provision_ms: u64) -> Arc<Hive> {
+    let cfg = HiveConfig {
+        hive_id: "hive-test".into(),
+        boxes: vec![BoxConfig { vcpus: 8, mem_mib: 8192 }],
+        warm_targets: warm,
+        default_warm_target: 0,
+        warm_spec: ResourceSpec::default(),
+        warm_idle_ttl: Duration::from_secs(60),
+        max_concurrent_builds: 4,
+        autoscaler_interval: Duration::from_millis(50),
+    };
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("hive-test-{}", std::process::id())),
+        provision_latency: Duration::from_millis(provision_ms),
+        cache_root: std::env::temp_dir().join(format!("hive-test-cache-{}", std::process::id())),
+    }));
+    Hive::start(cfg, backend)
+}
+
+async fn wait_terminal(hive: &Hive, id: &JobId) -> JobState {
+    for _ in 0..400 {
+        if let Some(v) = hive.job_view(id) {
+            if v.state.is_terminal() {
+                return v.state;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("job {id} did not reach a terminal state");
+}
+
+#[tokio::test]
+async fn cold_build_succeeds() {
+    let hive = test_hive(BTreeMap::new(), 20);
+    let job = BuildJob::builder("img").command("exit 0").build();
+    let id = hive.submit(job);
+    assert_eq!(wait_terminal(&hive, &id).await, JobState::Succeeded);
+}
+
+#[tokio::test]
+async fn failing_command_marks_job_failed() {
+    let hive = test_hive(BTreeMap::new(), 5);
+    let job = BuildJob::builder("img")
+        .command("echo step1")
+        .command("exit 3")
+        .command("echo never-runs")
+        .build();
+    let id = hive.submit(job);
+    assert_eq!(wait_terminal(&hive, &id).await, JobState::Failed);
+    let v = hive.job_view(&id).unwrap();
+    assert_eq!(v.exit_code, Some(3));
+}
+
+#[tokio::test]
+async fn warm_pool_beats_cold_latency() {
+    let mut warm = BTreeMap::new();
+    warm.insert("hot".to_string(), 1usize);
+    let hive = test_hive(warm, 300); // expensive cold provision
+
+    // Let the autoscaler fill the warm pool.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let warm_job = BuildJob::builder("hot").command("exit 0").build();
+    let wid = hive.submit(warm_job);
+    assert_eq!(wait_terminal(&hive, &wid).await, JobState::Succeeded);
+    let warm_latency = hive.job_view(&wid).unwrap().provision_latency_ms.unwrap();
+
+    let cold_job = BuildJob::builder("cold-image").command("exit 0").build();
+    let cid = hive.submit(cold_job);
+    assert_eq!(wait_terminal(&hive, &cid).await, JobState::Succeeded);
+    let cold_latency = hive.job_view(&cid).unwrap().provision_latency_ms.unwrap();
+
+    // The whole point of the warm pool: a warm hit is dramatically faster.
+    assert!(
+        warm_latency + 100 < cold_latency,
+        "warm={warm_latency}ms should be well under cold={cold_latency}ms"
+    );
+}
+
+#[tokio::test]
+async fn build_cache_restores_between_builds() {
+    let hive = test_hive(BTreeMap::new(), 5);
+
+    // Build 1 creates node_modules and (on success) saves it to the cache.
+    let j1 = BuildJob::builder("img")
+        .command("mkdir -p node_modules && echo lib > node_modules/dep.txt")
+        .cache("lockhash-abc", vec!["node_modules".to_string()])
+        .build();
+    let id1 = hive.submit(j1);
+    assert_eq!(wait_terminal(&hive, &id1).await, JobState::Succeeded);
+
+    // Build 2 runs in a FRESH single-use cell, so node_modules exists only if it
+    // was restored from cache. The command exits 0 iff the restore worked.
+    let j2 = BuildJob::builder("img")
+        .command("test -f node_modules/dep.txt")
+        .cache("lockhash-abc", vec!["node_modules".to_string()])
+        .build();
+    let id2 = hive.submit(j2);
+    assert_eq!(
+        wait_terminal(&hive, &id2).await,
+        JobState::Succeeded,
+        "second build should restore node_modules from cache"
+    );
+
+    // A different cache key must NOT restore it.
+    let j3 = BuildJob::builder("img")
+        .command("test -f node_modules/dep.txt")
+        .cache("different-key", vec!["node_modules".to_string()])
+        .build();
+    let id3 = hive.submit(j3);
+    assert_eq!(
+        wait_terminal(&hive, &id3).await,
+        JobState::Failed,
+        "a different cache key should be a miss"
+    );
+}
+
+#[tokio::test]
+async fn capacity_is_released_after_builds() {
+    let hive = test_hive(BTreeMap::new(), 5);
+    // Box has 8 vcpus; submit 6 two-vcpu jobs -> must serialize but all finish.
+    let mut ids = Vec::new();
+    for _ in 0..6 {
+        let job = BuildJob::builder("img")
+            .command("exit 0")
+            .resources(ResourceSpec {
+                vcpus: 2,
+                mem_mib: 1024,
+                disk_mib: 1024,
+                timeout_secs: 60,
+            })
+            .build();
+        ids.push(hive.submit(job));
+    }
+    for id in &ids {
+        assert_eq!(wait_terminal(&hive, id).await, JobState::Succeeded);
+    }
+    // After everything drains, all box capacity should be free again.
+    let status = hive.cluster_status();
+    for b in status.boxes {
+        assert_eq!(b.vcpus_used, 0, "box {} leaked vcpus", b.id);
+        assert_eq!(b.cells, 0, "box {} leaked cells", b.id);
+    }
+}
