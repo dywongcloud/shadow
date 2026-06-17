@@ -1,0 +1,162 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { ChevronDown, ExternalLink } from "lucide-react";
+import { Button, Switch, Input, SettingCard } from "@/components/ui";
+import { apiGet, apiSend, type FunctionSettings, type RegionCatalog } from "@/lib/api";
+import { cn } from "@/lib/utils";
+
+export default function FunctionsSettings({ params }: { params: { project: string } }) {
+  const project = decodeURIComponent(params.project);
+  const [fs, setFs] = useState<FunctionSettings | null>(null);
+  const [catalog, setCatalog] = useState<RegionCatalog>({});
+  const [maxDur, setMaxDur] = useState("300");
+  const [open, setOpen] = useState<Record<string, boolean>>({ "North America": true });
+
+  async function load() {
+    const s = await apiGet<{ functions: FunctionSettings }>(`/v1/projects/${project}/settings`);
+    setFs(s.functions);
+    setMaxDur(String(s.functions.default_max_duration_secs));
+  }
+  useEffect(() => {
+    load();
+    apiGet<RegionCatalog>("/v1/regions/catalog").then(setCatalog).catch(() => {});
+  }, [project]);
+
+  async function save(next: FunctionSettings) {
+    setFs(next);
+    await apiSend("PUT", `/v1/projects/${project}/functions`, next);
+  }
+
+  if (!fs) return <div className="text-sm text-secondary">Loading…</div>;
+
+  function toggleRegion(id: string) {
+    const has = fs!.regions.includes(id);
+    const regions = has ? fs!.regions.filter((r) => r !== id) : [...fs!.regions, id];
+    save({ ...fs!, regions });
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      {/* Fluid Compute */}
+      <SettingCard
+        title="Fluid Compute"
+        desc="Enable Fluid compute for your functions to automatically manage concurrency and optimize performance. Hive handles the defaults to ensure the best experience for your workload."
+        footer="A new deployment is required for changes to take effect."
+        footerAction={<a className="text-sm text-link hover:underline" href="/usage">View Fluid compute metrics →</a>}
+      >
+        <div className="flex items-center gap-3">
+          <Switch checked={fs.fluid_enabled} onChange={(v) => save({ ...fs, fluid_enabled: v })} label="Fluid compute" />
+          <span className="text-sm font-medium">{fs.fluid_enabled ? "Enabled" : "Disabled"}</span>
+        </div>
+      </SettingCard>
+
+      {/* Function Max Duration */}
+      <SettingCard
+        title="Function Max Duration"
+        desc={
+          <>
+            This setting controls the default maximum duration for all functions in this project. You can
+            optionally override it at the function level. A new deployment is required for changes to take effect.
+          </>
+        }
+        footer="Default 300s · Pro max 800s · extended up to 1800s (beta)."
+        footerAction={
+          <Button
+            onClick={() => save({ ...fs, default_max_duration_secs: Math.max(1, parseInt(maxDur || "300", 10)) })}
+          >
+            Save
+          </Button>
+        }
+      >
+        <div className="rounded-lg border border-border bg-subtle p-4 text-sm text-secondary">
+          <span className="font-medium text-fg">Longer functions:</span> to run a function up to 30 minutes, set{" "}
+          <code className="font-mono text-xs">maxDuration</code> on that function in code or <code className="font-mono text-xs">fluid.json</code>.
+          Project-level defaults up to 800 seconds are supported.
+        </div>
+        <div className="mt-4">
+          <label className="mb-1.5 block text-sm text-secondary">Default Max Duration</label>
+          <div className="flex w-64 overflow-hidden rounded-md border border-border">
+            <input
+              value={maxDur}
+              onChange={(e) => setMaxDur(e.target.value.replace(/[^0-9]/g, ""))}
+              className="w-full bg-card px-3 py-2 text-sm focus:outline-none"
+            />
+            <span className="flex items-center border-l border-border bg-subtle px-3 text-sm text-secondary">seconds</span>
+          </div>
+        </div>
+      </SettingCard>
+
+      {/* Function Regions */}
+      <SettingCard
+        title="Function Regions"
+        desc="These are the regions on the Hive network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
+        footer={`${fs.regions.length}/5 regions selected`}
+      >
+        <div className="flex flex-col divide-y divide-border">
+          {Object.entries(catalog).map(([continent, regions]) => {
+            const expanded = open[continent] ?? false;
+            const selectedHere = regions.filter((r) => fs.regions.includes(r.id)).map((r) => r.id);
+            return (
+              <div key={continent} className="py-2">
+                <button
+                  className="flex w-full items-center justify-between py-1.5 text-sm font-medium"
+                  onClick={() => setOpen((o) => ({ ...o, [continent]: !expanded }))}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <ChevronDown className={cn("h-4 w-4 transition-transform", expanded ? "" : "-rotate-90")} />
+                    {continent}
+                  </span>
+                  {selectedHere.length > 0 && (
+                    <span className="rounded-full bg-subtle px-2 py-0.5 text-xs text-secondary">
+                      {selectedHere.join(", ")}
+                    </span>
+                  )}
+                </button>
+                {expanded && (
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    {regions.map((r) => {
+                      const sel = fs.regions.includes(r.id);
+                      return (
+                        <button
+                          key={r.id}
+                          onClick={() => toggleRegion(r.id)}
+                          className={cn(
+                            "flex items-center justify-between rounded-lg border px-3 py-2.5 text-left text-sm transition-colors",
+                            sel ? "border-link bg-link/5 text-link" : "border-border hover:bg-subtle"
+                          )}
+                        >
+                          <span>{r.label} - {r.aws} - {r.id}</span>
+                          <span
+                            className={cn(
+                              "flex h-4 w-4 items-center justify-center rounded border",
+                              sel ? "border-link bg-link text-white" : "border-border-strong"
+                            )}
+                          >
+                            {sel ? "✓" : ""}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </SettingCard>
+
+      {/* Function Failover */}
+      <SettingCard
+        title="Function Failover"
+        desc="Automatically failover functions to the nearest region. You can customize regions through fluid.json. A new deployment is required for changes to take effect."
+        footer="Multi-region failover."
+      >
+        <div className="flex items-center gap-3">
+          <Switch checked={fs.failover} onChange={(v) => save({ ...fs, failover: v })} label="Failover" />
+          <span className="text-sm font-medium">{fs.failover ? "Enabled" : "Disabled"}</span>
+        </div>
+      </SettingCard>
+    </div>
+  );
+}

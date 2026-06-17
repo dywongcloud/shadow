@@ -44,6 +44,9 @@ async fn main() -> anyhow::Result<()> {
             let req = DeployRequest {
                 root: dir.to_string_lossy().into_owned(),
                 manifest,
+                creator: Some("cli".into()),
+                git: None,
+                production: true,
             };
             let info: DeploymentInfo = http
                 .post(format!("{}/deployments", cli.admin))

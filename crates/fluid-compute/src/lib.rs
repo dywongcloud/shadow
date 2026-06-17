@@ -152,6 +152,11 @@ impl Fluid {
         );
     }
 
+    /// Max invocation duration configured for a function (seconds).
+    pub fn max_duration_secs(&self, key: &str) -> Option<u64> {
+        self.registry.lock().get(key).map(|p| p.cfg.max_duration_secs)
+    }
+
     pub fn stats(&self) -> Vec<FunctionStats> {
         let reg = self.registry.lock();
         let now = now_ms();

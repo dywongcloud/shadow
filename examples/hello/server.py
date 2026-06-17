@@ -30,6 +30,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path.startswith("/api/verylong"):
+            time.sleep(5.0)  # exceeds a small max_duration -> gateway 504
+            return self._send(200, {"verylong": True, "pid": PID})
+
+        if self.path.startswith("/api/boom"):
+            # Simulate a handler error; must NOT take down other requests.
+            raise RuntimeError("intentional boom")
+
         if self.path.startswith("/api/slow"):
             time.sleep(1.0)  # simulate an I/O-bound wait (e.g. an LLM call)
             return self._send(200, {"slow": True, "pid": PID, "host": HOST, "path": self.path})
@@ -49,6 +57,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(line)
                 self.wfile.flush()
                 time.sleep(0.2)
+            return
+
+        if self.path.startswith("/api/cached"):
+            # CDN-cacheable response (edge caches it for 60s).
+            body = json.dumps({"cached": True, "pid": PID, "ts": time.time()}).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("cache-control", "public, max-age=60")
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if self.path.startswith("/api/bg"):

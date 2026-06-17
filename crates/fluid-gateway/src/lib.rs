@@ -97,11 +97,22 @@ impl Gateway {
     /// Register a deployment: wire its functions into the Fluid pool and make it
     /// routable. Becomes the default (most-recent) deployment.
     pub fn deploy(&self, root: String, manifest: Manifest) -> DeploymentInfo {
+        self.deploy_full(root, manifest, "you".into(), None, true)
+    }
+
+    /// Full deploy with creator + git provenance + production flag.
+    pub fn deploy_full(
+        &self,
+        root: String,
+        manifest: Manifest,
+        creator: String,
+        git: Option<fluid_core::GitSource>,
+        production: bool,
+    ) -> DeploymentInfo {
         let id = DeploymentId::new();
         let workdir_root = root.clone();
         for f in &manifest.functions {
             let key = func_key(id.as_str(), &f.name);
-            // Function workdir = deployment root (mock backend reads from here).
             self.fluid
                 .register(key, f.clone(), self.image.clone(), workdir_root.clone());
         }
@@ -111,36 +122,71 @@ impl Gateway {
             root: PathBuf::from(root),
             manifest: manifest.clone(),
             created_at_ms: now_ms(),
+            state: fluid_core::DeployState::Ready,
+            creator,
+            git,
+            production,
         };
-        let info = DeploymentInfo {
-            id: id.clone(),
-            project: dep.project.clone(),
-            functions: manifest.functions.iter().map(|f| f.name.clone()).collect(),
-            created_at_ms: dep.created_at_ms,
-            alias: format!("{}.localhost", dep.project),
-        };
+        let info = view_of(&dep);
         let mut st = self.state.lock();
         st.aliases.insert(dep.project.clone(), id.clone());
+        // Per-deployment preview URL: <deployment-id>.localhost resolves to this
+        // exact deployment even after newer ones become the project default.
+        st.aliases.insert(id.as_str().to_string(), id.clone());
         st.deployments.insert(id.clone(), dep);
         st.default = Some(id);
         info
     }
 
-    fn list(&self) -> Vec<DeploymentInfo> {
+    pub fn list(&self) -> Vec<DeploymentInfo> {
         let st = self.state.lock();
-        let mut out: Vec<DeploymentInfo> = st
-            .deployments
-            .values()
-            .map(|d| DeploymentInfo {
-                id: d.id.clone(),
-                project: d.project.clone(),
-                functions: d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
-                created_at_ms: d.created_at_ms,
-                alias: format!("{}.localhost", d.project),
-            })
-            .collect();
-        out.sort_by_key(|d| d.created_at_ms);
+        let mut out: Vec<DeploymentInfo> = st.deployments.values().map(view_of).collect();
+        out.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
         out
+    }
+
+    /// Serializable snapshot of all deployments (for persistence).
+    pub fn deployment_records(&self) -> Vec<fluid_core::DeployRecord> {
+        let st = self.state.lock();
+        st.deployments
+            .values()
+            .map(|d| fluid_core::DeployRecord {
+                id: d.id.to_string(),
+                project: d.project.clone(),
+                root: d.root.to_string_lossy().into_owned(),
+                manifest: d.manifest.clone(),
+                created_at_ms: d.created_at_ms,
+                creator: d.creator.clone(),
+                git: d.git.clone(),
+                production: d.production,
+            })
+            .collect()
+    }
+
+    /// Restore a deployment from a persisted record (preserves its id), and
+    /// re-register its functions with the Fluid pool. Used on boot.
+    pub fn restore(&self, rec: fluid_core::DeployRecord) {
+        let id = DeploymentId::from(rec.id.clone());
+        for f in &rec.manifest.functions {
+            let key = func_key(id.as_str(), &f.name);
+            self.fluid.register(key, f.clone(), self.image.clone(), rec.root.clone());
+        }
+        let dep = Deployment {
+            id: id.clone(),
+            project: rec.project.clone(),
+            root: PathBuf::from(&rec.root),
+            manifest: rec.manifest,
+            created_at_ms: rec.created_at_ms,
+            state: fluid_core::DeployState::Ready,
+            creator: rec.creator,
+            git: rec.git,
+            production: rec.production,
+        };
+        let mut st = self.state.lock();
+        st.aliases.insert(dep.project.clone(), id.clone());
+        st.aliases.insert(id.as_str().to_string(), id.clone());
+        st.deployments.insert(id.clone(), dep);
+        st.default.get_or_insert(id);
     }
 
     /// Pick the deployment for a request: `<project>.<host>` subdomain, else the
@@ -308,6 +354,11 @@ async fn proxy_function(
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
         .collect();
 
+    // Per-function max duration (Vercel default 300s) — bounds the whole
+    // invocation; on timeout we return 504 without affecting other requests
+    // sharing the instance (error isolation).
+    let max_dur = Duration::from_secs(gw.fluid.max_duration_secs(&key).unwrap_or(300).max(1));
+
     const MAX_REROUTES: usize = 3;
     let mut last_err = String::from("unknown");
     for attempt in 0..MAX_REROUTES {
@@ -335,12 +386,19 @@ async fn proxy_function(
         };
 
         tracing::debug!(cell = %cell, reused, attempt, "dispatching request over tunnel");
-        match client.request(method.as_str(), path_q, hvec.clone(), &body).await {
-            Ok(resp) => {
+        let req_fut = client.request(method.as_str(), path_q, hvec.clone(), &body);
+        match tokio::time::timeout(max_dur, req_fut).await {
+            Err(_) => {
+                // Exceeded max duration — 504, do not reroute (the instance is
+                // fine; only this invocation is over budget).
+                drop(lease);
+                return (StatusCode::GATEWAY_TIMEOUT, "FUNCTION_INVOCATION_TIMEOUT").into_response();
+            }
+            Ok(Ok(resp)) => {
                 tracing::debug!(cell = %cell, status = resp.status, "got response head");
                 return build_response(lease, cell, reused, attempt, resp).await;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 last_err = e.to_string();
                 tracing::debug!(cell = %cell, reused, attempt, error = %last_err, "request failed");
                 drop(lease);
@@ -469,6 +527,29 @@ struct BodyState {
     body: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
     lease: Option<fluid_compute::Lease>,
     wait_until_ms: u64,
+}
+
+/// Build a `DeploymentInfo` view from a stored deployment.
+fn view_of(d: &Deployment) -> DeploymentInfo {
+    let has_static = d.manifest.static_dir.is_some();
+    let has_fn = !d.manifest.functions.is_empty();
+    let kind = match (has_static, has_fn) {
+        (true, true) => "fullstack",
+        (false, true) => "function",
+        _ => "static",
+    };
+    DeploymentInfo {
+        id: d.id.clone(),
+        project: d.project.clone(),
+        functions: d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
+        created_at_ms: d.created_at_ms,
+        alias: format!("{}.localhost", d.project),
+        state: d.state,
+        creator: d.creator.clone(),
+        git: d.git.clone(),
+        production: d.production,
+        kind: kind.to_string(),
+    }
 }
 
 fn is_within(base: &Path, candidate: &Path) -> bool {

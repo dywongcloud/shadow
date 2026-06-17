@@ -29,6 +29,11 @@ impl Default for DeploymentId {
         Self::new()
     }
 }
+impl From<String> for DeploymentId {
+    fn from(s: String) -> Self {
+        DeploymentId(s)
+    }
+}
 impl std::fmt::Display for DeploymentId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
@@ -66,6 +71,10 @@ pub struct FunctionConfig {
     /// Scale an idle instance down after this many seconds with no requests.
     #[serde(default = "default_idle_ttl")]
     pub idle_ttl_secs: u64,
+    /// Max wall-clock duration for a single invocation (Vercel default 300s).
+    /// Exceeding it returns 504 — error isolation keeps other requests alive.
+    #[serde(default = "default_max_duration")]
+    pub max_duration_secs: u64,
 }
 
 fn default_runtime() -> String {
@@ -82,6 +91,9 @@ fn default_max_instances() -> u32 {
 }
 fn default_idle_ttl() -> u64 {
     30
+}
+fn default_max_duration() -> u64 {
+    300 // Vercel Fluid default max duration (5 minutes)
 }
 
 /// What a route serves.
@@ -151,6 +163,38 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     }
 }
 
+/// Git provenance for a deployment (shown Vercel-style in the dashboard).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GitSource {
+    pub repo_url: String,
+    pub branch: String,
+    pub commit: String,
+    pub commit_message: String,
+}
+
+/// Lifecycle state of a deployment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DeployState {
+    Queued,
+    Building,
+    Ready,
+    Error,
+}
+
+/// Serializable snapshot of a deployment (for persistence + restore).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DeployRecord {
+    pub id: String,
+    pub project: String,
+    pub root: String,
+    pub manifest: Manifest,
+    pub created_at_ms: u64,
+    pub creator: String,
+    pub git: Option<GitSource>,
+    pub production: bool,
+}
+
 /// A registered deployment (manifest + where its files live).
 #[derive(Clone, Debug)]
 pub struct Deployment {
@@ -160,6 +204,11 @@ pub struct Deployment {
     pub root: std::path::PathBuf,
     pub manifest: Manifest,
     pub created_at_ms: u64,
+    pub state: DeployState,
+    pub creator: String,
+    pub git: Option<GitSource>,
+    /// Production deployment for the project (vs preview).
+    pub production: bool,
 }
 
 /// Admin API: request to create a deployment. For the mock backend the gateway
@@ -169,6 +218,29 @@ pub struct Deployment {
 pub struct DeployRequest {
     pub root: String,
     pub manifest: Manifest,
+    #[serde(default)]
+    pub creator: Option<String>,
+    #[serde(default)]
+    pub git: Option<GitSource>,
+    #[serde(default)]
+    pub production: bool,
+}
+
+/// Admin API: deploy directly from a git repository URL.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GitDeployRequest {
+    pub repo_url: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub creator: Option<String>,
+    #[serde(default = "default_prod")]
+    pub production: bool,
+}
+fn default_prod() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -179,6 +251,20 @@ pub struct DeploymentInfo {
     pub created_at_ms: u64,
     /// Convenience: the Host alias that resolves to this deployment.
     pub alias: String,
+    #[serde(default = "default_ready")]
+    pub state: DeployState,
+    #[serde(default)]
+    pub creator: String,
+    #[serde(default)]
+    pub git: Option<GitSource>,
+    #[serde(default)]
+    pub production: bool,
+    /// Type label for the UI: "static" | "function" | "fullstack".
+    #[serde(default)]
+    pub kind: String,
+}
+fn default_ready() -> DeployState {
+    DeployState::Ready
 }
 
 #[cfg(test)]

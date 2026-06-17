@@ -22,6 +22,61 @@ The platform is two layers that share one isolation backend (`CellBackend`):
   compute**: long-lived instances that each handle many concurrent requests,
   stay warm, autoscale, and scale to zero.
 
+## The unified cloud (`hive-cloud` + dashboard)
+
+Everything is wired into **one node binary** you can run across MacBooks as a
+single cloud, fronted by a **Vercel-style dashboard**.
+
+```bash
+# 1) Run a node (builds + Fluid serving + edge + cron + workflows + regions)
+cargo run -p hive-cloud -- --region sfo1 --name node-a   # public :8787, admin :8786
+
+# 2) Deploy an app (static + Python function)
+./target/debug/fluidctl deploy examples/hello            # FLUID_ADMIN=http://127.0.0.1:8786
+
+# 3) Run the dashboard (Next.js + Tremor, looks like Vercel)
+cd ui && npm install && npm run dev                       # http://localhost:3000
+
+# 4) Add another MacBook to the same cloud (different region)
+cargo run -p hive-cloud -- --region iad1 --name node-b --peer http://<mac-a-ip>:8786
+```
+
+One node serves, at `:8787` (public) and `:8786` (admin), the full surface:
+
+| Vercel feature | Here |
+| --- | --- |
+| Builds + Sandbox | Hive control plane + `POST /v1/sandbox` (run code in a cell) |
+| Fluid compute | multiplexed-tunnel instances, autoscale, scale-to-zero, cost meter |
+| In-function concurrency | many concurrent requests per instance (reuse before provision) |
+| Concurrency scaling | per-region **burst limit** (1000/10s) → `503 FUNCTION_THROTTLED`; plan caps 30k/100k (`/v1/concurrency`) |
+| Max duration | per-function `max_duration_secs` (Vercel default 300s) → 504 on over-budget |
+| Error isolation | one failing/over-budget request never takes down others on the instance |
+| WAF | managed SQLi/XSS/traversal signatures + custom rules (`/v1/waf`) |
+| Bot management | UA classification, allow good / block bad (`/v1/bot`) |
+| CDN | edge cache, states **`x-hive-cache: HIT/MISS/STALE/REVALIDATED`**, **stale-while-revalidate**, header precedence `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control` |
+| Routing | redirects (308) + rewrites before cache (`/v1/routing`) |
+| Cron | scheduled function invocations (`/v1/cron`) |
+| Workflows | durable multi-step runs (`/v1/workflows`) |
+| Previews | every deployment gets `<deployment-id>.localhost` |
+| Regions | `--region` label + multi-node HTTP-gossip mesh (`/v1/nodes`) |
+| P2P | `hive-p2p` runs the function tunnel over iroh QUIC |
+| Observability | live edge event log (`/v1/logs`) + Overview analytics |
+
+Edge request pipeline (per request, mirroring Vercel's CDN layering):
+**routing (redirects/rewrites) → firewall (WAF + bots) → concurrency admission →
+CDN cache (HIT/STALE/MISS + SWR) → compute**, tagged with `x-hive-region`.
+
+Verified live end-to-end: `/old`→**308**, `/blog/x` rewritten to the function,
+`/api/cached` **MISS→HIT**, SQLi & sqlmap UA → **403**, 15 concurrent vs
+burst-limit 5 → **3×200 / 12×503 FUNCTION_THROTTLED**, over-budget request →
+**504** while normal requests keep returning 200 (error isolation), sandbox runs
+code, cron fires on schedule. (Docs studied: concurrency-scaling, fluid-compute,
+how-vercel-cdn-works.)
+
+The dashboard (`ui/`) proxies `/cloud/*` to a node's admin API and has pages for
+Overview, Deployments, Functions, Regions, Firewall, Cron, Workflows,
+Observability, and Sandbox — dark/Geist, shadcn-style components, Tremor charts.
+
 ## Layout
 
 ```
@@ -41,6 +96,9 @@ crates/
   fluidd            serving daemon (gateway + pool + admin API)
   fluidctl          deploy CLI
   hive-p2p          distribute the infra over iroh QUIC peer-to-peer
+  hive-edge         WAF, bot management, CDN cache, cron, workflows, regions
+  hive-cloud        the unified node binary (one cloud across MacBooks)
+ui/                 Vercel-style dashboard (Next.js + TypeScript + Tremor)
 examples/hello/     a deployable app (static page + Python function)
 scripts/            Lima config + guest bootstrap for the Firecracker path
 ```

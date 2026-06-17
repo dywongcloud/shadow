@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
+:root {
+  --background: 0 0% 100%;
+  --subtle: 0 0% 98%;
+  --card: 0 0% 100%;
+  --foreground: 0 0% 4%;
+  --secondary: 0 0% 40%;
+  --muted: 0 0% 56%;
+  --border: 0 0% 92%;
+  --border-strong: 0 0% 80%;
+  --accent: 0 0% 0%;
+  --accent-foreground: 0 0% 100%;
+  --link: 212 100% 47%;
+  --green: 145 80% 42%;
+}
+
+.dark {
+  --background: 0 0% 4%;
+  --subtle: 0 0% 8%;
+  --card: 0 0% 7%;
+  --foreground: 0 0% 93%;
+  --secondary: 0 0% 63%;
+  --muted: 0 0% 50%;
+  --border: 0 0% 16%;
+  --border-strong: 0 0% 28%;
+  --accent: 0 0% 100%;
+  --accent-foreground: 0 0% 4%;
+  --link: 212 100% 62%;
+  --green: 145 65% 49%;
+}
+
+html,
+body {
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+::selection {
+  background: hsl(var(--foreground));
+  color: hsl(var(--background));
+}
+
+/* Prevent theme flash + smooth the swap. */
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border-strong));
+  border-radius: 8px;
+  border: 2px solid hsl(var(--background));
+}

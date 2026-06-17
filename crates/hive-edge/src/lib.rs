@@ -5,8 +5,10 @@
 
 pub mod bot;
 pub mod cdn;
+pub mod concurrency;
 pub mod cron;
 pub mod region;
+pub mod routing;
 pub mod waf;
 pub mod workflows;
 
@@ -15,8 +17,10 @@ pub(crate) fn default_true_pub() -> bool {
 }
 
 pub use bot::{BotClass, BotManager, BotPolicy};
-pub use cdn::CdnCache;
+pub use cdn::{CacheState, CdnCache, Lookup};
+pub use concurrency::{ConcurrencyLimiter, ConcurrencyStats, Plan};
 pub use cron::{CronJob, CronScheduler};
 pub use region::{NodeInfo, NodeRegistry};
+pub use routing::{Redirect, Rewrite, RouteOutcome, Router};
 pub use waf::{RequestCtx, Verdict, Waf, WafAction, WafMatch, WafRule};
 pub use workflows::{RunStatus, StepInvoker, WorkflowDef, WorkflowEngine, WorkflowRun, WorkflowStep};
