@@ -13,10 +13,27 @@ export default function FunctionsSettings({ params }: { params: { project: strin
   const [maxDur, setMaxDur] = useState("300");
   const [open, setOpen] = useState<Record<string, boolean>>({ "North America": true });
 
+  const [err, setErr] = useState("");
+
   async function load() {
-    const s = await apiGet<{ functions: FunctionSettings }>(`/v1/projects/${project}/settings`);
-    setFs(s.functions);
-    setMaxDur(String(s.functions.default_max_duration_secs));
+    try {
+      const s = await apiGet<{ functions: FunctionSettings }>(
+        `/v1/projects/${encodeURIComponent(project)}/settings`
+      );
+      const fallback: FunctionSettings = {
+        fluid_enabled: true,
+        default_max_duration_secs: 300,
+        regions: ["iad1"],
+        failover: false,
+        memory_mib: 512,
+      };
+      const fn = { ...fallback, ...(s.functions ?? {}) };
+      setFs(fn);
+      setMaxDur(String(fn.default_max_duration_secs));
+      setErr("");
+    } catch (e) {
+      setErr(String(e));
+    }
   }
   useEffect(() => {
     load();
@@ -28,6 +45,7 @@ export default function FunctionsSettings({ params }: { params: { project: strin
     await apiSend("PUT", `/v1/projects/${project}/functions`, next);
   }
 
+  if (err) return <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-4 text-sm text-red-500">Failed to load function settings: {err}</div>;
   if (!fs) return <div className="text-sm text-secondary">Loading…</div>;
 
   function toggleRegion(id: string) {
@@ -93,6 +111,16 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         desc="These are the regions on the Hive network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
         footer={`${fs.regions.length}/5 regions selected`}
       >
+        {/* Global region map — your functions run close to your users. */}
+        <div className="relative mb-6 overflow-hidden rounded-xl border border-border bg-black">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src="/world-map.png" alt="Hive global region network" className="w-full select-none object-cover opacity-95" />
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
+          <div className="absolute bottom-3 left-4 flex items-center gap-2 text-xs text-white/90">
+            <span className="flex h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
+            {fs.regions.length} active region{fs.regions.length === 1 ? "" : "s"} on the global network
+          </div>
+        </div>
         <div className="flex flex-col divide-y divide-border">
           {Object.entries(catalog).map(([continent, regions]) => {
             const expanded = open[continent] ?? false;

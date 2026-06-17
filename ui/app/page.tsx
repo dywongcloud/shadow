@@ -41,11 +41,6 @@ export default function OverviewPage() {
             </div>
           </div>
         </div>
-        <Link href="/new">
-          <Button>
-            New Project <span className="opacity-60">▾</span>
-          </Button>
-        </Link>
       </div>
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[1fr_320px]">

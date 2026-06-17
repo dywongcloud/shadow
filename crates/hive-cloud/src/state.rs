@@ -25,6 +25,8 @@ pub struct Event {
     pub status: u16,
     pub action: String, // allow | waf-deny | bot-block | cache-hit | cron | ...
     pub detail: String,
+    #[serde(default)]
+    pub project: String,
 }
 
 pub struct CloudState {
@@ -48,6 +50,14 @@ pub struct CloudState {
     pub http: reqwest::Client,
     pub projects: crate::project_settings::ProjectStore,
     pub builds: crate::git::BuildStore,
+    pub cluster: Arc<crate::cluster::Cluster>,
+    pub teams: crate::teams::TeamStore,
+    pub webhooks: Arc<crate::webhooks::WebhookStore>,
+    pub databases: Arc<crate::databases::DatabaseStore>,
+    pub metrics: crate::metrics::MetricsStore,
+    pub incidents: crate::incidents::IncidentStore,
+    /// Platform owner identity (seeds the default team; ops dashboard owner).
+    pub owner_email: String,
 
     events: Mutex<VecDeque<Event>>,
     req_count: Mutex<u64>,
@@ -72,6 +82,11 @@ impl CloudState {
         fluid: Arc<Fluid>,
         hive: Arc<Hive>,
     ) -> Arc<CloudState> {
+        let cluster = crate::cluster::Cluster::new(node_name.clone());
+        let owner_email =
+            std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
+        let teams = crate::teams::TeamStore::new();
+        teams.ensure_seed(&owner_email);
         Arc::new(CloudState {
             region,
             node_name,
@@ -91,6 +106,13 @@ impl CloudState {
             http: reqwest::Client::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
+            cluster,
+            teams,
+            webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
+            databases: Arc::new(crate::databases::DatabaseStore::new()),
+            metrics: crate::metrics::MetricsStore::new(),
+            incidents: crate::incidents::IncidentStore::new(),
+            owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),
             blocked_count: Mutex::new(0),
@@ -102,6 +124,7 @@ impl CloudState {
         if ev.action == "waf-deny" || ev.action == "bot-block" {
             *self.blocked_count.lock() += 1;
         }
+        self.metrics.record(&ev);
         let mut q = self.events.lock();
         if q.len() >= 500 {
             q.pop_front();
@@ -119,6 +142,12 @@ impl CloudState {
     }
 
     pub fn event(&self, region: &str, method: &str, host: &str, path: &str, status: u16, action: &str, detail: &str) -> Event {
+        // Resolve which project this event belongs to (from the request host),
+        // so project-scoped logs work regardless of how the request arrived.
+        let project = self
+            .gw
+            .project_for_host(host)
+            .unwrap_or_else(|| detail.to_string());
         Event {
             ts_ms: now_ms(),
             region: region.to_string(),
@@ -128,6 +157,7 @@ impl CloudState {
             status,
             action: action.to_string(),
             detail: detail.to_string(),
+            project,
         }
     }
 }

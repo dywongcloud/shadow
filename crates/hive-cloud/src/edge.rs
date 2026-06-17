@@ -97,6 +97,12 @@ pub async fn edge_pipeline(
         return resp;
     }
 
+    // 2.5) Preview protection: preview deployments are private to team members
+    // by default. Anonymous requests to a protected preview host get a 401.
+    if let Some(resp) = preview_gate(&cloud, &host, &headers_vec, &region, &method, &path) {
+        return resp;
+    }
+
     // 3) CDN cache (GET) — serve HIT directly, or STALE while revalidating.
     let cache_key = CdnCache::key(&host, &path_q);
     if method == "GET" {
@@ -247,6 +253,70 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Gate access to protected preview deployments. Returns `Some(401)` when the
+/// host is a team-private preview and the request carries no valid access
+/// credential; `None` to let the request proceed.
+fn preview_gate(
+    cloud: &Arc<CloudState>,
+    host: &str,
+    headers: &[(String, String)],
+    region: &str,
+    method: &str,
+    path: &str,
+) -> Option<Response> {
+    let subdomain = host.split(':').next().unwrap_or(host).split('.').next().unwrap_or("");
+    let project = cloud.gw.project_for_host(host)?;
+    // Production alias is `<project>.localhost`; anything else is a preview.
+    let is_preview = !subdomain.eq_ignore_ascii_case(&project);
+    if !is_preview || !cloud.projects.preview_protected(&project) {
+        return None;
+    }
+    let team = cloud.projects.team_of(&project);
+    if has_preview_access(headers, &team) {
+        return None;
+    }
+    let ev = cloud.event(region, method, host, path, 401, "preview-protected", &project);
+    cloud.record(ev);
+    let mut resp = (
+        StatusCode::UNAUTHORIZED,
+        format!("This preview deployment is private to the \"{team}\" team. Sign in to view it."),
+    )
+        .into_response();
+    set(&mut resp, "x-hive-region", region);
+    set(&mut resp, "x-hive-preview", "protected");
+    Some(resp)
+}
+
+fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
+    // 1) Bearer token (enforced mode): must be valid and scoped to the team.
+    if let Some(auth) = header(headers, "authorization") {
+        if let Some(tok) = auth.strip_prefix("Bearer ") {
+            if let Ok(claims) = crate::auth::verify(tok) {
+                if claims.tenant == team || claims.role == "owner" {
+                    return true;
+                }
+            }
+        }
+    }
+    // 2) Access cookie set by the dashboard after a member signs in.
+    if let Some(cookie) = header(headers, "cookie") {
+        for part in cookie.split(';') {
+            let kv = part.trim();
+            if let Some(val) = kv.strip_prefix("hive_access=") {
+                if crate::auth::enforced() {
+                    if let Ok(claims) = crate::auth::verify(val) {
+                        return claims.tenant == team || claims.role == "owner";
+                    }
+                } else {
+                    // Dev mode (no JWT secret): presence of the cookie grants access.
+                    return !val.is_empty();
+                }
+            }
+        }
+    }
+    false
 }
 
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {

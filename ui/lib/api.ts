@@ -94,6 +94,7 @@ export interface Event {
   status: number;
   action: string;
   detail: string;
+  project?: string;
 }
 
 export interface WafRule {
@@ -180,6 +181,9 @@ export interface ProjectSettings {
   env: EnvVar[];
   build: BuildConfig;
   functions: FunctionSettings;
+  domains?: string[];
+  team?: string;
+  preview_protection?: boolean;
 }
 
 export interface RegionEntry {
@@ -188,6 +192,113 @@ export interface RegionEntry {
   aws: string;
 }
 export type RegionCatalog = Record<string, RegionEntry[]>;
+
+// ---- Teams ----
+export type Role = "owner" | "admin" | "member" | "viewer";
+export interface Member {
+  email: string;
+  role: Role;
+  name: string;
+  added_ms: number;
+}
+export interface Team {
+  slug: string;
+  name: string;
+  plan: string;
+  created_ms: number;
+  members: Member[];
+}
+
+// ---- Webhooks ----
+export interface Webhook {
+  id: string;
+  project: string;
+  url: string;
+  events: string[];
+  secret: string;
+  enabled: boolean;
+  created_ms: number;
+}
+export interface Delivery {
+  id: string;
+  webhook_id: string;
+  event: string;
+  url: string;
+  status: number;
+  ok: boolean;
+  ts_ms: number;
+  error: string;
+}
+
+// ---- Databases / storage ----
+export type DbKind = "postgres" | "redis" | "blob" | "queue" | "vector";
+export type DbStatus = "provisioning" | "ready" | "error";
+export interface Database {
+  id: string;
+  name: string;
+  project: string;
+  team: string;
+  kind: DbKind;
+  region: string;
+  status: DbStatus;
+  mode: string;
+  created_ms: number;
+  connection: Record<string, string>;
+  container: string | null;
+  note: string;
+}
+
+// ---- Monitoring ----
+export interface MetricBucket {
+  t_ms: number;
+  requests: number;
+  errors: number;
+  client_err: number;
+  blocked: number;
+  cache_hits: number;
+  cache_miss: number;
+}
+export interface Metrics {
+  series: MetricBucket[];
+  totals: { requests: number; errors: number; blocked: number; error_rate: number; cache_hit_ratio: number };
+  status_distribution: Record<string, number>;
+  top_paths: { path: string; count: number }[];
+}
+
+// ---- Incidents / ops ----
+export type Severity = "minor" | "major" | "critical";
+export type IncidentStatus = "investigating" | "identified" | "monitoring" | "resolved";
+export interface IncidentUpdate {
+  ts_ms: number;
+  status: IncidentStatus;
+  message: string;
+}
+export interface Incident {
+  id: string;
+  title: string;
+  severity: Severity;
+  status: IncidentStatus;
+  affected: string[];
+  created_ms: number;
+  updated_ms: number;
+  updates: IncidentUpdate[];
+}
+export interface AdminOverview {
+  owner: string;
+  teams: number;
+  projects: number;
+  deployments: number;
+  databases: { total: number; live: number };
+  nodes: number;
+  regions: string[];
+  instances: number;
+  requests: number;
+  blocked: number;
+  error_rate_30m: number;
+  incidents_open: number;
+  cluster: { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string };
+  webhooks: number;
+}
 
 export interface BuildLogLine {
   ts_ms: number;

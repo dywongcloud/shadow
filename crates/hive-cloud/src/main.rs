@@ -7,13 +7,19 @@
 
 mod admin;
 mod auth;
+mod cluster;
+mod databases;
 mod edge;
 mod git;
 #[cfg(feature = "guardian")]
 mod guardian;
+mod incidents;
+mod metrics;
 mod persist;
 mod project_settings;
 mod state;
+mod teams;
+mod webhooks;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -140,8 +146,12 @@ async fn main() -> anyhow::Result<()> {
     // Restore persisted platform state from disk (deployments, settings, WAF…).
     persist::restore(&cloud, persist::load());
 
+    // Initial cluster reconcile (single-node: this node is leader).
+    cloud.cluster.reconcile(cloud.registry.nodes().into_iter().map(|n| n.id).collect());
+
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
+    spawn_cluster_loop(cloud.clone());
     if !args.peers.is_empty() {
         spawn_gossip_loop(cloud.clone(), args.peers.clone());
     }
@@ -200,6 +210,16 @@ pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
         });
         fut
     })
+}
+
+fn spawn_cluster_loop(cloud: Arc<CloudState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let members: Vec<String> = cloud.registry.nodes().into_iter().map(|n| n.id).collect();
+            cloud.cluster.reconcile(members);
+        }
+    });
 }
 
 fn spawn_cron_loop(cloud: Arc<CloudState>) {

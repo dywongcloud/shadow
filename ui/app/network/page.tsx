@@ -5,9 +5,12 @@ import { Card, Badge, PageHeader, Table, Th, Td } from "@/components/ui";
 import { usePoll, type NodeInfo, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
+interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
+
 export default function NetworkPage() {
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
+  const { data: cluster } = usePoll<ClusterStatus>("/v1/cluster", 3000);
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (
@@ -58,7 +61,17 @@ export default function NetworkPage() {
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
         <Arch icon={<Share2 className="h-4 w-4" />} title="P2P transport (iroh)" desc="Multiplexed function tunnels over QUIC; dialed by public-key endpoint id with relay fallback." />
         <Arch icon={<Database className="h-4 w-4" />} title="Replicated state" desc="Platform records persist to disk and replicate across the mesh (guardian-db, iroh-native)." />
-        <Arch icon={<ShieldCheck className="h-4 w-4" />} title="Coordinated cluster" desc="Nodes agree on cluster membership and routing so deployments stay consistent across regions." />
+        <Card>
+          <div className="mb-2 flex items-center gap-2 text-sm font-medium"><ShieldCheck className="h-4 w-4" /> Coordinated cluster</div>
+          <p className="text-sm text-secondary">Nodes agree on a leader so deployments stay consistent across regions.</p>
+          {cluster && (
+            <div className="mt-3 flex flex-col gap-1.5 text-xs">
+              <div className="flex justify-between"><span className="text-muted">Leader</span><span className="font-mono">{cluster.leader}{cluster.is_leader ? " (this)" : ""}</span></div>
+              <div className="flex justify-between"><span className="text-muted">Term</span><span className="font-mono">{cluster.term}</span></div>
+              <div className="flex justify-between"><span className="text-muted">Members</span><span className="font-mono">{cluster.members.length}</span></div>
+            </div>
+          )}
+        </Card>
       </div>
 
       <div className="mb-2 text-sm font-medium text-fg">Nodes</div>

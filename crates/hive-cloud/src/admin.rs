@@ -23,6 +23,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/overview", get(overview))
         .route("/v1/nodes", get(nodes))
+        .route("/v1/cluster", get(cluster_status))
         .route("/v1/regions", get(regions))
         .route("/v1/logs", get(logs))
         .route("/v1/functions", get(functions))
@@ -56,7 +57,38 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route("/v1/projects/:project/domains", post(project_domain_add))
+        .route("/v1/projects/:project/team", put(project_team_put))
         .route("/v1/domains", get(domains_list))
+        // ---- Teams ----
+        .route("/v1/teams", get(teams_list).post(team_create))
+        .route("/v1/teams/:slug", get(team_get))
+        .route("/v1/teams/:slug/members", post(team_add_member))
+        .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
+        // ---- Webhooks ----
+        .route("/v1/webhooks", get(webhooks_all))
+        .route("/v1/webhooks/events", get(webhook_events))
+        .route("/v1/webhooks/deliveries", get(webhook_deliveries))
+        .route("/v1/webhooks/:id", delete(webhook_delete))
+        .route("/v1/projects/:project/webhooks", get(webhooks_for_project).post(webhook_create))
+        // ---- Databases / storage ----
+        .route("/v1/databases", get(databases_list).post(database_create))
+        .route("/v1/databases/:id", get(database_get).delete(database_delete))
+        .route("/v1/databases/:id/credentials", get(database_credentials))
+        .route("/v1/projects/:project/databases", get(databases_for_project))
+        // Functional storage REST surface (Blob / Queue / Vector).
+        .route("/v1/storage/blob/:bucket", get(blob_list_keys))
+        .route("/v1/storage/blob/:bucket/:key", get(blob_get).put(blob_put))
+        .route("/v1/storage/queue/:queue", get(queue_depth).post(queue_push))
+        .route("/v1/storage/queue/:queue/pop", post(queue_pop))
+        .route("/v1/storage/vector/:index", post(vector_upsert))
+        .route("/v1/storage/vector/:index/query", post(vector_query))
+        // ---- Monitoring ----
+        .route("/v1/metrics", get(metrics_get))
+        // ---- Owner / ops dashboard ----
+        .route("/v1/admin/overview", get(admin_overview))
+        .route("/v1/admin/audit", get(admin_audit))
+        .route("/v1/incidents", get(incidents_list).post(incident_open))
+        .route("/v1/incidents/:id/updates", post(incident_update))
         .with_state(cloud)
 }
 
@@ -234,6 +266,11 @@ async fn nodes(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.registry.nodes()))
 }
 
+async fn cluster_status(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let members: Vec<String> = c.registry.nodes().into_iter().map(|n| n.id).collect();
+    Json(json!(c.cluster.status(members)))
+}
+
 async fn regions(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.registry.regions()))
 }
@@ -245,10 +282,34 @@ async fn functions(State(c): State<Arc<CloudState>>) -> Json<Value> {
 #[derive(Deserialize)]
 struct LimitQ {
     limit: Option<usize>,
+    /// Filter events to a project (matches the deployment host subdomain).
+    project: Option<String>,
+    /// Free-text search across path/host/detail.
+    q: Option<String>,
 }
 
 async fn logs(State(c): State<Arc<CloudState>>, Query(q): Query<LimitQ>) -> Json<Value> {
-    Json(json!(c.recent_events(q.limit.unwrap_or(100))))
+    let limit = q.limit.unwrap_or(100);
+    let mut evs = c.recent_events(2000);
+    if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
+        let pl = p.to_lowercase();
+        evs.retain(|e| {
+            e.project.to_lowercase() == pl
+                || e.host.to_lowercase().contains(&pl)
+                || e.detail.to_lowercase().contains(&pl)
+        });
+    }
+    if let Some(s) = q.q.as_ref().filter(|s| !s.is_empty()) {
+        let sl = s.to_lowercase();
+        evs.retain(|e| {
+            e.path.to_lowercase().contains(&sl)
+                || e.host.to_lowercase().contains(&sl)
+                || e.detail.to_lowercase().contains(&sl)
+                || e.action.to_lowercase().contains(&sl)
+        });
+    }
+    evs.truncate(limit);
+    Json(json!(evs))
 }
 
 // ---- WAF ----
@@ -431,4 +492,371 @@ async fn sandbox(State(c): State<Arc<CloudState>>, Json(req): Json<SandboxReq>) 
         logs,
         duration_ms: now_ms().saturating_sub(started),
     })
+}
+
+// ============================ Teams ============================
+
+#[derive(Deserialize)]
+struct CreateTeam {
+    name: String,
+    #[serde(default = "default_plan")]
+    plan: String,
+}
+fn default_plan() -> String {
+    "pro".into()
+}
+
+#[derive(Deserialize)]
+struct AddMember {
+    email: String,
+    #[serde(default = "default_member_role")]
+    role: crate::teams::Role,
+}
+fn default_member_role() -> crate::teams::Role {
+    crate::teams::Role::Member
+}
+
+async fn teams_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.teams.list()))
+}
+
+async fn team_get(State(c): State<Arc<CloudState>>, Path(slug): Path<String>) -> Result<Json<Value>, StatusCode> {
+    c.teams.get(&slug).map(|t| Json(json!(t))).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn team_create(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeam>) -> Json<Value> {
+    let t = c.teams.create(&b.name, &b.plan, &c.owner_email);
+    crate::persist::persist(&c);
+    Json(json!(t))
+}
+
+async fn team_add_member(
+    State(c): State<Arc<CloudState>>,
+    Path(slug): Path<String>,
+    Json(b): Json<AddMember>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = c.teams.add_member(&slug, &b.email, b.role).ok_or(StatusCode::NOT_FOUND)?;
+    crate::persist::persist(&c);
+    Ok(Json(json!(t)))
+}
+
+async fn team_remove_member(
+    State(c): State<Arc<CloudState>>,
+    Path((slug, email)): Path<(String, String)>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = c.teams.remove_member(&slug, &email).ok_or(StatusCode::NOT_FOUND)?;
+    crate::persist::persist(&c);
+    Ok(Json(json!(t)))
+}
+
+#[derive(Deserialize)]
+struct ProjectTeam {
+    team: String,
+    #[serde(default = "default_true_b")]
+    preview_protection: bool,
+}
+fn default_true_b() -> bool {
+    true
+}
+
+async fn project_team_put(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+    Json(b): Json<ProjectTeam>,
+) -> Json<Value> {
+    c.projects.set_team(&project, &b.team);
+    c.projects.set_preview_protection(&project, b.preview_protection);
+    crate::persist::persist(&c);
+    Json(json!(c.projects.get_masked(&project)))
+}
+
+// ============================ Webhooks ============================
+
+async fn webhook_events() -> Json<Value> {
+    Json(json!(crate::webhooks::ALL_EVENTS))
+}
+
+async fn webhooks_all(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.webhooks.list(None)))
+}
+
+async fn webhooks_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+    Json(json!(c.webhooks.list(Some(&project))))
+}
+
+#[derive(Deserialize)]
+struct CreateWebhook {
+    url: String,
+    #[serde(default)]
+    events: Vec<String>,
+}
+
+async fn webhook_create(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+    Json(b): Json<CreateWebhook>,
+) -> Json<Value> {
+    let wh = c.webhooks.add(crate::webhooks::Webhook {
+        id: String::new(),
+        project,
+        url: b.url,
+        events: b.events,
+        secret: String::new(),
+        enabled: true,
+        created_ms: 0,
+    });
+    crate::persist::persist(&c);
+    Json(json!(wh))
+}
+
+async fn webhook_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+    c.webhooks.remove(&id);
+    crate::persist::persist(&c);
+    Json(json!({ "removed": id }))
+}
+
+async fn webhook_deliveries(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.webhooks.deliveries(100)))
+}
+
+// ============================ Databases ============================
+
+async fn databases_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.databases.list(None)))
+}
+
+async fn databases_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+    Json(json!(c.databases.list(Some(&project))))
+}
+
+async fn database_get(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    c.databases.get(&id).map(|d| Json(json!(d))).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn database_credentials(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    c.databases.get_raw(&id).map(|d| Json(json!(d))).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn database_create(
+    State(c): State<Arc<CloudState>>,
+    Json(req): Json<crate::databases::ProvisionReq>,
+) -> Json<Value> {
+    let cloud = c.clone();
+    let project = req.project.clone();
+    let db = crate::databases::provision(c.databases.clone(), c.region.clone(), req, move |d| {
+        crate::persist::persist(&cloud);
+        crate::webhooks::dispatch(
+            &cloud.webhooks,
+            &project,
+            "database.ready",
+            json!({ "id": d.id, "name": d.name, "kind": d.kind, "status": d.status }),
+        );
+    });
+    crate::persist::persist(&c);
+    crate::webhooks::dispatch(
+        &c.webhooks,
+        &db.project,
+        "database.created",
+        json!({ "id": db.id, "name": db.name, "kind": db.kind }),
+    );
+    Json(json!(db))
+}
+
+async fn database_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+    if let Some(d) = c.databases.get_raw(&id) {
+        if let Some(container) = d.container {
+            // Best-effort teardown of the backing container.
+            let _ = tokio::process::Command::new("podman")
+                .args(["rm", "-f", &container])
+                .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default()))
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+    }
+    c.databases.remove_db(&id);
+    crate::persist::persist(&c);
+    Json(json!({ "removed": id }))
+}
+
+// ---- Functional storage REST (Blob / Queue / Vector) ----
+
+async fn blob_put(
+    State(c): State<Arc<CloudState>>,
+    Path((bucket, key)): Path<(String, String)>,
+    body: axum::body::Bytes,
+) -> Json<Value> {
+    let size = body.len();
+    c.databases.blob_put(&bucket, &key, body.to_vec());
+    Json(json!({ "bucket": bucket, "key": key, "size": size, "url": format!("/v1/storage/blob/{bucket}/{key}") }))
+}
+
+async fn blob_get(
+    State(c): State<Arc<CloudState>>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    match c.databases.blob_get(&bucket, &key) {
+        Some(data) => Ok(data.into_response()),
+        None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+async fn blob_list_keys(State(c): State<Arc<CloudState>>, Path(bucket): Path<String>) -> Json<Value> {
+    Json(json!({ "bucket": bucket, "keys": c.databases.blob_list(&bucket) }))
+}
+
+#[derive(Deserialize)]
+struct QueueMsg {
+    message: Value,
+}
+
+async fn queue_push(State(c): State<Arc<CloudState>>, Path(queue): Path<String>, Json(b): Json<QueueMsg>) -> Json<Value> {
+    let depth = c.databases.queue_push(&queue, b.message.to_string());
+    Json(json!({ "queue": queue, "depth": depth }))
+}
+
+async fn queue_pop(State(c): State<Arc<CloudState>>, Path(queue): Path<String>) -> Json<Value> {
+    let msg = c.databases.queue_pop(&queue);
+    let parsed = msg.as_ref().and_then(|m| serde_json::from_str::<Value>(m).ok());
+    Json(json!({ "queue": queue, "message": parsed.or(msg.map(Value::String)), "depth": c.databases.queue_depth(&queue) }))
+}
+
+async fn queue_depth(State(c): State<Arc<CloudState>>, Path(queue): Path<String>) -> Json<Value> {
+    Json(json!({ "queue": queue, "depth": c.databases.queue_depth(&queue) }))
+}
+
+#[derive(Deserialize)]
+struct VectorUpsert {
+    id: String,
+    vector: Vec<f32>,
+    #[serde(default)]
+    metadata: Value,
+}
+
+async fn vector_upsert(State(c): State<Arc<CloudState>>, Path(index): Path<String>, Json(b): Json<VectorUpsert>) -> Json<Value> {
+    c.databases.vector_upsert(&index, &b.id, b.vector, b.metadata);
+    Json(json!({ "index": index, "id": b.id, "upserted": true }))
+}
+
+#[derive(Deserialize)]
+struct VectorQuery {
+    vector: Vec<f32>,
+    #[serde(default = "default_topk")]
+    top_k: usize,
+}
+fn default_topk() -> usize {
+    5
+}
+
+async fn vector_query(State(c): State<Arc<CloudState>>, Path(index): Path<String>, Json(b): Json<VectorQuery>) -> Json<Value> {
+    Json(json!({ "index": index, "matches": c.databases.vector_query(&index, &b.vector, b.top_k) }))
+}
+
+// ============================ Monitoring ============================
+
+#[derive(Deserialize)]
+struct MetricsQ {
+    minutes: Option<usize>,
+    project: Option<String>,
+}
+
+async fn metrics_get(State(c): State<Arc<CloudState>>, Query(q): Query<MetricsQ>) -> Json<Value> {
+    let minutes = q.minutes.unwrap_or(60).min(180);
+    let project = q.project.as_deref().filter(|p| !p.is_empty());
+    let series = c.metrics.series(minutes, now_ms(), project);
+    let total_req: u64 = series.iter().map(|b| b.requests).sum();
+    let total_err: u64 = series.iter().map(|b| b.errors + b.client_err).sum();
+    let total_blocked: u64 = series.iter().map(|b| b.blocked).sum();
+    let hits: u64 = series.iter().map(|b| b.cache_hits).sum();
+    let miss: u64 = series.iter().map(|b| b.cache_miss).sum();
+    let cache_ratio = if hits + miss == 0 { 0.0 } else { hits as f64 / (hits + miss) as f64 };
+    let err_rate = if total_req == 0 { 0.0 } else { total_err as f64 / total_req as f64 };
+    Json(json!({
+        "series": series,
+        "totals": {
+            "requests": total_req,
+            "errors": total_err,
+            "blocked": total_blocked,
+            "error_rate": err_rate,
+            "cache_hit_ratio": cache_ratio,
+        },
+        "status_distribution": c.metrics.status_distribution(),
+        "top_paths": c.metrics.top_paths(10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
+    }))
+}
+
+// ============================ Owner / ops dashboard ============================
+
+async fn admin_overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let (reqs, blocked) = c.counters();
+    let fstats = c.fluid.stats();
+    let instances: usize = fstats.iter().map(|f| f.instances).sum();
+    let nodes = c.registry.nodes();
+    let dbs = c.databases.list(None);
+    let live_dbs = dbs.iter().filter(|d| d.mode == "live").count();
+    // Recent error rate from the metrics buckets (last 30m).
+    let series = c.metrics.series(30, now_ms(), None);
+    let req30: u64 = series.iter().map(|b| b.requests).sum();
+    let err30: u64 = series.iter().map(|b| b.errors).sum();
+    let err_rate = if req30 == 0 { 0.0 } else { err30 as f64 / req30 as f64 };
+    Json(json!({
+        "owner": c.owner_email,
+        "teams": c.teams.count(),
+        "projects": c.gw.list().iter().map(|d| d.project.clone()).collect::<std::collections::BTreeSet<_>>().len(),
+        "deployments": c.gw.list().len(),
+        "databases": { "total": dbs.len(), "live": live_dbs },
+        "nodes": nodes.len(),
+        "regions": c.registry.regions(),
+        "instances": instances,
+        "requests": reqs,
+        "blocked": blocked,
+        "error_rate_30m": err_rate,
+        "incidents_open": c.incidents.open_count(),
+        "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
+        "webhooks": c.webhooks.list(None).len(),
+    }))
+}
+
+async fn admin_audit(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    // Operational/audit feed = control-plane actions (deploys, domains, cron,
+    // WAF, incidents) drawn from the event stream.
+    let evs = c.recent_events(2000);
+    let audit: Vec<_> = evs
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.action.as_str(),
+                "deploy" | "domain-add" | "cron" | "waf-deny" | "throttled" | "redirect" | "rewrite"
+            )
+        })
+        .take(200)
+        .collect();
+    Json(json!(audit))
+}
+
+async fn incidents_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.incidents.list()))
+}
+
+async fn incident_open(State(c): State<Arc<CloudState>>, Json(req): Json<crate::incidents::OpenReq>) -> Json<Value> {
+    let inc = c.incidents.open(req);
+    crate::persist::persist(&c);
+    crate::webhooks::dispatch(&c.webhooks, "*", "incident.opened", json!({ "id": inc.id, "title": inc.title, "severity": inc.severity }));
+    Json(json!(inc))
+}
+
+async fn incident_update(
+    State(c): State<Arc<CloudState>>,
+    Path(id): Path<String>,
+    Json(req): Json<crate::incidents::UpdateReq>,
+) -> Result<Json<Value>, StatusCode> {
+    let resolved = matches!(req.status, crate::incidents::IncidentStatus::Resolved);
+    let inc = c.incidents.update(&id, req).ok_or(StatusCode::NOT_FOUND)?;
+    crate::persist::persist(&c);
+    if resolved {
+        crate::webhooks::dispatch(&c.webhooks, "*", "incident.resolved", json!({ "id": inc.id, "title": inc.title }));
+    }
+    Ok(Json(json!(inc)))
 }

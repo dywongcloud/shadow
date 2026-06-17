@@ -63,7 +63,7 @@ impl Default for FunctionSettings {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
     #[serde(default)]
     pub env: Vec<EnvVar>,
@@ -73,6 +73,32 @@ pub struct ProjectSettings {
     pub functions: FunctionSettings,
     #[serde(default)]
     pub domains: Vec<String>,
+    /// Team that owns this project (slug). Defaults to "personal".
+    #[serde(default = "default_team")]
+    pub team: String,
+    /// When true (default), preview deployments are only reachable by team
+    /// members — anonymous requests to a preview host get a 401.
+    #[serde(default = "default_true")]
+    pub preview_protection: bool,
+}
+fn default_team() -> String {
+    "personal".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        ProjectSettings {
+            env: Vec::new(),
+            build: BuildConfig::default(),
+            functions: FunctionSettings::default(),
+            domains: Vec::new(),
+            team: default_team(),
+            preview_protection: true,
+        }
+    }
 }
 
 /// Store keyed by project name.
@@ -136,6 +162,26 @@ impl ProjectStore {
         if let Some(s) = self.map.write().get_mut(project) {
             s.env.retain(|e| e.key != key);
         }
+    }
+
+    pub fn set_team(&self, project: &str, team: &str) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().team = team.to_string();
+    }
+
+    pub fn set_preview_protection(&self, project: &str, on: bool) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().preview_protection = on;
+    }
+
+    /// Team slug owning a project (defaults to "personal").
+    pub fn team_of(&self, project: &str) -> String {
+        self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(|| "personal".into())
+    }
+
+    /// Whether previews for a project are protected (defaults to true).
+    pub fn preview_protected(&self, project: &str) -> bool {
+        self.map.read().get(project).map(|s| s.preview_protection).unwrap_or(true)
     }
 
     pub fn add_domain(&self, project: &str, domain: String) {

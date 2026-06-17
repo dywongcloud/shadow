@@ -138,6 +138,12 @@ impl Gateway {
         info
     }
 
+    /// Resolve which project serves a given request host (the same way the
+    /// public router selects), so events can be attributed to a project.
+    pub fn project_for_host(&self, host: &str) -> Option<String> {
+        self.select(Some(host)).map(|d| d.project)
+    }
+
     /// Attach a custom domain to a project (its first label aliases to the
     /// project's current deployment). Returns true if the project exists.
     pub fn add_alias(&self, domain: &str, project: &str) -> bool {

@@ -39,6 +39,14 @@ pub struct PlatformSnapshot {
     pub redirects: Vec<Redirect>,
     #[serde(default)]
     pub rewrites: Vec<Rewrite>,
+    #[serde(default)]
+    pub teams: HashMap<String, crate::teams::Team>,
+    #[serde(default)]
+    pub webhooks: Vec<crate::webhooks::Webhook>,
+    #[serde(default)]
+    pub databases: Vec<crate::databases::Database>,
+    #[serde(default)]
+    pub incidents: Vec<crate::incidents::Incident>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -86,6 +94,10 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         cron: cloud.cron.list(),
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
+        teams: cloud.teams.snapshot(),
+        webhooks: cloud.webhooks.snapshot(),
+        databases: cloud.databases.snapshot(),
+        incidents: cloud.incidents.snapshot(),
     }
 }
 
@@ -118,6 +130,12 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     }
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
+    if !snap.teams.is_empty() {
+        cloud.teams.load(snap.teams);
+    }
+    cloud.webhooks.load(snap.webhooks);
+    cloud.databases.load(snap.databases);
+    cloud.incidents.load(snap.incidents);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

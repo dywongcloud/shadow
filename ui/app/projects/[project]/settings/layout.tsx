@@ -10,6 +10,8 @@ const sections = [
   { slug: "environment-variables", label: "Environment Variables" },
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },
+  { slug: "webhooks", label: "Webhooks" },
+  { slug: "team", label: "Team & Privacy" },
 ];
 
 export default function SettingsLayout({

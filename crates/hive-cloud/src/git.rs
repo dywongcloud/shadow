@@ -106,7 +106,15 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         lines: Vec::new(),
     });
 
+    crate::webhooks::dispatch(
+        &cloud.webhooks,
+        &project,
+        "deployment.created",
+        serde_json::json!({ "id": id, "project": project, "repo": req.repo_url, "state": "building" }),
+    );
+
     let bid = id.clone();
+    let wh_project = project.clone();
     tokio::spawn(async move {
         if let Err(e) = run_build(&cloud, &bid, req, project).await {
             cloud.builds.log(&bid, format!("Error: {e}"));
@@ -114,6 +122,12 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                 b.state = DeployState::Error;
                 b.finished_ms = Some(now_ms());
             });
+            crate::webhooks::dispatch(
+                &cloud.webhooks,
+                &wh_project,
+                "deployment.error",
+                serde_json::json!({ "id": bid, "project": wh_project, "error": e.to_string() }),
+            );
         }
     });
     id
@@ -294,6 +308,19 @@ async fn run_build(
     let ev = cloud.event(&cloud.region, "DEPLOY", &info.alias, "/", 200, "deploy", &format!("git {}", req.repo_url));
     cloud.record(ev);
     crate::persist::persist(cloud);
+    crate::webhooks::dispatch(
+        &cloud.webhooks,
+        &info.project,
+        if req.production { "deployment.promoted" } else { "deployment.ready" },
+        serde_json::json!({
+            "id": info.id.to_string(),
+            "project": info.project,
+            "url": format!("https://{}", info.alias),
+            "state": "ready",
+            "production": req.production,
+            "commit": commit,
+        }),
+    );
     Ok(())
 }
 

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, Github, Search, Loader2 } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
+import { GlobeEmptyState } from "@/components/globe";
 import { apiSend } from "@/lib/api";
 
 interface GhRepo {
@@ -159,6 +160,23 @@ export default function NewProjectPage() {
           </div>
         </div>
       </div>
+
+      {/* Deployment progress card — always sits below the configuration cards. */}
+      <Card className="mt-8 overflow-hidden p-6 sm:p-8">
+        <h2 className="text-2xl font-semibold tracking-tight">Deployment</h2>
+        <p className="mt-1.5 text-sm text-secondary">
+          {deploying ? "Starting your deployment…" : "Once you're ready, start deploying to see the progress here…"}
+        </p>
+        <div className="pointer-events-none mt-6 flex justify-center">
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <GlobeOnly />
+        </div>
+      </Card>
     </div>
   );
+}
+
+/** Just the globe wireframe graphic (no heading), themed for light/dark. */
+function GlobeOnly() {
+  return <GlobeEmptyState title="" desc={undefined} />;
 }

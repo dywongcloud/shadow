@@ -29,11 +29,19 @@ parking_lot = { workspace = true }
 uuid = { workspace = true }
 jsonwebtoken = "9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+hmac = "0.12"
+sha2 = "0.10"
 
 # Optional: iroh-native, P2P-replicated durable store. Enable with
 # `--features guardian` (its API is evolving, so kept off the default build).
 guardian-db = { version = "0.16", optional = true }
 
+# Optional: production-grade Raft consensus (full log + state machine). The
+# always-on lightweight coordinator in cluster.rs is the default; `--features
+# raft` routes cluster coordination through openraft.
+openraft = { version = "0.9", optional = true }
+
 [features]
 default = []
 guardian = ["dep:guardian-db"]
+raft = ["dep:openraft"]
