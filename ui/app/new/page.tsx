@@ -2,11 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Github, Search, Loader2 } from "lucide-react";
+import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
-import { apiSend } from "@/lib/api";
+import { apiSend, usePoll, type Team } from "@/lib/api";
+import { cachedJson } from "@/lib/cache";
 
 interface GhRepo {
   name: string;
@@ -16,12 +17,56 @@ interface GhRepo {
   private: boolean;
 }
 
-const TEMPLATES = [
-  { name: "HTML Starter", desc: "A clean static site, deployed instantly.", url: "https://github.com/mdn/beginner-html-site" },
-  { name: "Hello World", desc: "The smallest possible deploy.", url: "https://github.com/octocat/Hello-World" },
-  { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", url: "https://github.com/crccheck/docker-hello-world" },
-  { name: "Static Portfolio", desc: "A single-page static portfolio.", url: "https://github.com/github/personal-website" },
+interface Template {
+  name: string;
+  desc: string;
+  repo: string; // git URL
+  root?: string; // subdir for monorepo examples
+  branch?: string;
+  tag: string; // framework label for the monogram fallback
+  color: string;
+  icon?: string; // real logo path (in /public/frameworks)
+}
+
+// Vercel-style starters: official `vercel/vercel` examples (built from the
+// monorepo subdir) plus a few standalone static templates.
+const TEMPLATES: Template[] = [
+  { name: "Next.js Boilerplate", desc: "Get started with Next.js and React in seconds.", repo: "https://github.com/vercel/vercel", root: "examples/nextjs", tag: "N", color: "#000", icon: "/frameworks/nextjs.png" },
+  { name: "Vite + React", desc: "A lightning-fast Vite SPA, deployed to the edge.", repo: "https://github.com/vercel/vercel", root: "examples/vite", tag: "V", color: "#646cff", icon: "/frameworks/vite.png" },
+  { name: "React", desc: "The library for web and native user interfaces.", repo: "https://github.com/vercel/vercel", root: "examples/create-react-app", tag: "R", color: "#149eca", icon: "/frameworks/react.png" },
+  { name: "SvelteKit", desc: "Cybernetically enhanced web apps.", repo: "https://github.com/vercel/vercel", root: "examples/sveltekit-1", tag: "S", color: "#ff3e00", icon: "/frameworks/svelte.svg" },
+  { name: "Nuxt", desc: "The intuitive Vue framework.", repo: "https://github.com/vercel/vercel", root: "examples/nuxtjs", tag: "Nu", color: "#00dc82", icon: "/frameworks/nuxt.svg" },
+  { name: "Vue", desc: "The progressive JavaScript framework.", repo: "https://github.com/vercel/vercel", root: "examples/vue", tag: "Vu", color: "#42b883", icon: "/frameworks/vue-js.png" },
+  { name: "Angular", desc: "The web development framework for building modern apps.", repo: "https://github.com/vercel/vercel", root: "examples/angular", tag: "Ng", color: "#dd0031", icon: "/frameworks/angular.png" },
+  { name: "Express", desc: "Fast, unopinionated Node.js web server.", repo: "https://github.com/vercel/vercel", root: "examples/express", tag: "Ex", color: "#000", icon: "/frameworks/express-js.png" },
+  { name: "Remix", desc: "Full stack web framework, focused on web standards.", repo: "https://github.com/vercel/vercel", root: "examples/remix", tag: "Rx", color: "#000" },
+  { name: "Astro", desc: "Content-driven sites, fast by default.", repo: "https://github.com/vercel/vercel", root: "examples/astro", tag: "A", color: "#ff5d01" },
+  { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26" },
+  { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
 ];
+
+function slug(s: string) {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function ownerRepo(url: string) {
+  return url.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/\.git$/, "");
+}
+
+function Monogram({ t, className = "h-10 w-10" }: { t: Template; className?: string }) {
+  if (t.icon) {
+    return (
+      <span className={`flex ${className} shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-card`}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={t.icon} alt={t.name} className="h-2/3 w-2/3 object-contain" />
+      </span>
+    );
+  }
+  return (
+    <span className={`flex ${className} shrink-0 items-center justify-center rounded-lg text-sm font-bold text-white`} style={{ background: t.color }}>
+      {t.tag}
+    </span>
+  );
+}
 
 export default function NewProjectPage() {
   const router = useRouter();
@@ -31,15 +76,24 @@ export default function NewProjectPage() {
   const [gh, setGh] = useState<{ configured: boolean; connected: boolean }>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   const [repoQ, setRepoQ] = useState("");
+  const [selected, setSelected] = useState<Template | null>(null);
+  const [tplPage, setTplPage] = useState(0);
+
+  const TPL_PER = 5;
+  const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
+  const shownTemplates = TEMPLATES.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
 
   useEffect(() => {
-    fetch("/api/github/status").then((r) => r.json()).then((s) => {
+    cachedJson<{ configured: boolean; connected: boolean }>("/api/github/status", 30_000).then((s) => {
       setGh({ configured: !!s.configured, connected: !!s.connected });
-      if (s.connected) fetch("/api/github/repos").then((r) => r.json()).then((d) => setRepos(d.repos || []));
+      if (s.connected) {
+        // Repos cached for 5 min so re-opening "New Project" is instant.
+        cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000).then((d) => setRepos(d.repos || [])).catch(() => {});
+      }
     }).catch(() => {});
   }, []);
 
-  async function deploy(repoUrl: string, branch?: string, project?: string) {
+  async function deploy(repoUrl: string, branch?: string, project?: string, root?: string) {
     if (!repoUrl) return;
     setDeploying(true);
     setError("");
@@ -48,9 +102,9 @@ export default function NewProjectPage() {
         repo_url: repoUrl,
         branch,
         project,
+        root_dir: root,
         creator: "you",
       });
-      // Stream the build logs on the deploy screen.
       router.push(`/deploy/${res.build_id}`);
     } catch (e) {
       setError(String(e));
@@ -65,9 +119,12 @@ export default function NewProjectPage() {
     else setError(d.error || "Could not start GitHub connection");
   }
 
-  const filteredRepos = repos.filter((r) =>
-    r.full_name.toLowerCase().includes(repoQ.toLowerCase())
-  );
+  const filteredRepos = repos.filter((r) => r.full_name.toLowerCase().includes(repoQ.toLowerCase()));
+
+  // ----- Configure screen (after a template is selected) -----
+  if (selected) {
+    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name) => deploy(selected.repo, selected.branch, name, selected.root)} deploying={deploying} error={error} />;
+  }
 
   return (
     <div className="mx-auto max-w-4xl">
@@ -92,7 +149,7 @@ export default function NewProjectPage() {
         </div>
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
-        Paste any public Git repo URL — Hive clones, builds, and deploys it.
+        Paste any public Git repo URL — OpenEdge clones, builds, and deploys it.
       </p>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
@@ -144,39 +201,165 @@ export default function NewProjectPage() {
 
         {/* Clone Template */}
         <div>
-          <h2 className="mb-4 text-lg font-semibold">Clone Template</h2>
-          <div className="grid grid-cols-1 gap-3">
-            {TEMPLATES.map((t) => (
-              <Card key={t.name} className="flex items-center justify-between p-4">
-                <div>
-                  <div className="font-medium">{t.name}</div>
-                  <div className="text-sm text-secondary">{t.desc}</div>
-                </div>
-                <Button variant="outline" onClick={() => deploy(t.url, undefined, t.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, ""))} disabled={deploying}>
-                  Clone
-                </Button>
-              </Card>
-            ))}
+          <div className="mb-4 flex items-center justify-between">
+            <h2 className="text-lg font-semibold">Clone Template</h2>
+            {tplPages > 1 && (
+              <div className="flex items-center gap-1.5 text-xs text-muted">
+                <button
+                  onClick={() => setTplPage((p) => Math.max(0, p - 1))}
+                  disabled={tplPage === 0}
+                  className="rounded border border-border px-1.5 py-0.5 hover:bg-subtle disabled:opacity-40"
+                >‹</button>
+                <span className="tabular-nums">{tplPage + 1}/{tplPages}</span>
+                <button
+                  onClick={() => setTplPage((p) => Math.min(tplPages - 1, p + 1))}
+                  disabled={tplPage >= tplPages - 1}
+                  className="rounded border border-border px-1.5 py-0.5 hover:bg-subtle disabled:opacity-40"
+                >›</button>
+              </div>
+            )}
           </div>
+          <Card className="divide-y divide-border p-0">
+            {shownTemplates.map((t) => (
+              <div key={t.name} className="flex items-center justify-between gap-3 px-3 py-2.5">
+                <div className="flex min-w-0 items-center gap-2.5">
+                  <Monogram t={t} className="h-8 w-8" />
+                  <div className="min-w-0">
+                    <div className="truncate text-sm font-medium">{t.name}</div>
+                    <div className="truncate text-xs text-secondary">{t.desc}</div>
+                  </div>
+                </div>
+                <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => { setError(""); setSelected(t); }} disabled={deploying}>
+                  Use
+                </Button>
+              </div>
+            ))}
+          </Card>
         </div>
       </div>
 
-      {/* Deployment progress card — always sits below the configuration cards. */}
+      {/* Deployment progress placeholder */}
       <Card className="mt-8 overflow-hidden p-6 sm:p-8">
         <h2 className="text-2xl font-semibold tracking-tight">Deployment</h2>
         <p className="mt-1.5 text-sm text-secondary">
           {deploying ? "Starting your deployment…" : "Once you're ready, start deploying to see the progress here…"}
         </p>
         <div className="pointer-events-none mt-6 flex justify-center">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <GlobeOnly />
+          <GlobeEmptyState title="" desc={undefined} />
         </div>
       </Card>
     </div>
   );
 }
 
-/** Just the globe wireframe graphic (no heading), themed for light/dark. */
-function GlobeOnly() {
-  return <GlobeEmptyState title="" desc={undefined} />;
+/** The Vercel-style "New Project" configure screen shown after picking a template. */
+function ConfigureTemplate({
+  template,
+  onBack,
+  onCreate,
+  deploying,
+  error,
+}: {
+  template: Template;
+  onBack: () => void;
+  onCreate: (projectName: string) => void;
+  deploying: boolean;
+  error: string;
+}) {
+  const { data: teams } = usePoll<Team[]>("/v1/teams", 10000);
+  const [repoName, setRepoName] = useState(slug(template.name));
+  const [team, setTeam] = useState("personal");
+  const [scope] = useState("openedge");
+
+  return (
+    <div className="mx-auto max-w-2xl">
+      <button onClick={onBack} className="mb-6 inline-flex items-center gap-2 text-sm text-secondary hover:text-fg">
+        <ArrowLeft className="h-4 w-4" /> Back
+      </button>
+
+      <Card className="p-6 sm:p-8">
+        <h1 className="mb-6 text-2xl font-semibold tracking-tight">New Project</h1>
+
+        {/* Template summary */}
+        <div className="mb-6 flex items-start gap-4 rounded-xl border border-border bg-subtle/40 p-4">
+          <Monogram t={template} />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 font-semibold">
+              {template.name}
+              <a href={`${template.repo}${template.root ? `/tree/${template.branch || "main"}/${template.root}` : ""}`} target="_blank" rel="noreferrer">
+                <ExternalLink className="h-3.5 w-3.5 text-muted hover:text-fg" />
+              </a>
+            </div>
+            <div className="mt-0.5 text-sm text-secondary">{template.desc}</div>
+            <div className="mt-3 text-xs text-muted">Cloning from GitHub</div>
+            <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm">
+              <span className="flex items-center gap-1.5"><Github className="h-3.5 w-3.5" /> {ownerRepo(template.repo)}</span>
+              <span className="flex items-center gap-1.5 text-secondary"><GitBranch className="h-3.5 w-3.5" /> {template.branch || "main"}</span>
+              {template.root && <span className="flex items-center gap-1.5 text-secondary"><FolderGit2 className="h-3.5 w-3.5" /> {template.root}</span>}
+            </div>
+          </div>
+        </div>
+
+        <p className="mb-6 text-sm text-secondary">
+          Create a Git repository to easily update your project after deploying it. Every push to that
+          Git repository will be deployed automatically.
+        </p>
+
+        <div className="mb-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label className="mb-1.5 block text-sm text-secondary">Git Scope</label>
+            <div className="flex items-center justify-between rounded-md border border-border bg-card px-3 py-2 text-sm">
+              <span className="flex items-center gap-2"><Github className="h-4 w-4" /> {scope}</span>
+              <ChevronDown className="h-4 w-4 text-muted" />
+            </div>
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm text-secondary">Repository Name</label>
+            <div className="relative">
+              <Input value={repoName} onChange={(e) => setRepoName(slug(e.target.value))} />
+              <Lock className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+            </div>
+          </div>
+        </div>
+
+        <div className="mb-6">
+          <label className="mb-1.5 block text-sm text-secondary">Team</label>
+          <div className="relative">
+            <select
+              value={team}
+              onChange={(e) => setTeam(e.target.value)}
+              className="w-full appearance-none rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-border-strong focus:outline-none"
+            >
+              <option value="personal">Personal</option>
+              {(teams ?? []).filter((t) => t.slug !== "personal").map((t) => (
+                <option key={t.slug} value={t.slug}>{t.name} · {t.plan}</option>
+              ))}
+            </select>
+            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
+          </div>
+        </div>
+
+        {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
+
+        <Button
+          onClick={() => {
+            // Scope the new project to the chosen team (drives x-hive-team).
+            if (typeof window !== "undefined") {
+              localStorage.setItem("hive_team", team === "personal" ? "__personal__" : team);
+              window.dispatchEvent(new Event("hive-team-changed"));
+            }
+            onCreate(repoName || slug(template.name));
+          }}
+          disabled={deploying || !repoName}
+          className="w-full justify-center bg-fg py-2.5 text-bg"
+        >
+          {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : "Create"}
+        </Button>
+      </Card>
+
+      <div className="mt-6 text-center">
+        <Link href="/new" onClick={onBack} className="text-sm text-secondary hover:text-fg">Import a different Git Repository →</Link>
+      </div>
+    </div>
+  );
 }

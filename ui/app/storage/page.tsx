@@ -7,6 +7,7 @@ import {
   ChevronRight, ArrowLeft, Search, ExternalLink, Gauge,
 } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/components/ui";
+import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
 import { apiSend, usePoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
@@ -30,7 +31,7 @@ function kindBadge(kind: DbKind) {
   return <Badge tone={tone[kind] ?? "default"}>{KIND_NAME[kind] ?? kind}</Badge>;
 }
 
-// Hive-native primitives.
+// OpenEdge-native primitives.
 const NATIVE: { kind: DbKind; name: string; desc: string }[] = [
   { kind: "postgres", name: "Postgres", desc: "Managed Postgres — instant, branchable." },
   { kind: "redis", name: "Redis", desc: "Durable key-value, TCP + REST." },
@@ -54,6 +55,7 @@ const MARKETPLACE: Provider[] = [
   { id: "convex", name: "Convex", desc: "Reactive database", kind: "postgres", color: "#f3336b" },
   { id: "prisma", name: "Prisma Postgres", desc: "Instant Serverless Postgres", kind: "postgres", color: "#5a67d8" },
   { id: "turso", name: "Turso", desc: "Serverless SQLite", kind: "postgres", color: "#4ff8d2" },
+  { id: "drizzle", name: "Drizzle", desc: "TypeScript ORM (Postgres)", kind: "postgres", color: "#c5f74f" },
   { id: "mongodb", name: "MongoDB Atlas", desc: "Database for developers", kind: "blob", color: "#13aa52" },
 ];
 
@@ -116,13 +118,6 @@ function StatusBadge({ status, mode }: { status: string; mode: string }) {
   return <Badge tone="green">Ready{mode === "simulated" ? " · sim" : ""}</Badge>;
 }
 
-function Monogram({ name, color }: { name: string; color: string }) {
-  return (
-    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white" style={{ background: color }}>
-      {name.slice(0, 1)}
-    </span>
-  );
-}
 
 /** Vercel-style "Browse Storage" right-side slide-over. */
 function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
@@ -162,7 +157,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
           <div>
             <h2 className="text-xl font-semibold">{step === "browse" ? "Browse Storage" : "Configure"}</h2>
             <p className="mt-1 text-sm text-secondary">
-              {step === "browse" ? "Create databases and stores that you can connect to your projects." : `${sel?.provider} · backed by Hive ${sel ? KIND_NAME[sel.kind] : ""}`}
+              {step === "browse" ? "Create databases and stores that you can connect to your projects." : `${sel?.provider} · backed by OpenEdge ${sel ? KIND_NAME[sel.kind] : ""}`}
             </p>
           </div>
           <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-5 w-5" /></button>
@@ -180,11 +175,15 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
 
               {!!native.length && (
                 <>
-                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">Hive Native</div>
+                  <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">OpenEdge Native</div>
                   <div className="mb-6 flex flex-col gap-2">
                     {native.map((n) => (
                       <Row key={n.kind}
-                        icon={<span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary">{KIND_ICON[n.kind]}</span>}
+                        icon={nativePng(n.kind)
+                          ? <span className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg bg-white/5">{/* eslint-disable-next-line @next/next/no-img-element */}<img src={nativePng(n.kind)!} alt={n.name} className="h-7 w-7 object-contain" /></span>
+                          : n.kind === "blob"
+                          ? <span className="flex h-9 w-9 items-center justify-center"><BlobIcon /></span>
+                          : <span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary">{KIND_ICON[n.kind]}</span>}
                         name={n.name} desc={n.desc}
                         active={sel?.provider === n.name}
                         onClick={() => setSel({ kind: n.kind, provider: n.name })}
@@ -203,7 +202,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                   <div className="flex flex-col gap-2">
                     {market.map((m) => (
                       <Row key={m.id}
-                        icon={<Monogram name={m.name} color={m.color} />}
+                        icon={<BrandIcon id={m.id} name={m.name} color={m.color} />}
                         name={m.name} desc={m.desc}
                         active={sel?.provider === m.name}
                         onClick={() => setSel({ kind: m.kind, provider: m.name })}
@@ -219,7 +218,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                 <span className="text-secondary">{sel && KIND_ICON[sel.kind]}</span>
                 <div>
                   <div className="text-sm font-medium">{sel?.provider}</div>
-                  <div className="text-xs text-secondary">Backed by Hive {sel ? KIND_NAME[sel.kind] : ""}</div>
+                  <div className="text-xs text-secondary">Backed by OpenEdge {sel ? KIND_NAME[sel.kind] : ""}</div>
                 </div>
               </div>
               <div>

@@ -97,6 +97,11 @@ impl SecureLinkStore {
         Ok(rec)
     }
 
+    /// All secure links across teams (ops data browser).
+    pub fn all(&self) -> Vec<LinkRecord> {
+        self.links.read().clone()
+    }
+
     pub fn list(&self, team: &str) -> Vec<LinkRecord> {
         let now = now_ms();
         let mut l = self.links.write();

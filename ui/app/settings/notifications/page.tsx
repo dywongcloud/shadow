@@ -7,7 +7,7 @@ import { Card, Switch, Badge } from "@/components/ui";
 import { WithIdentity } from "@/components/identity";
 
 const CHANNELS = [
-  { key: "web", icon: <Bell className="h-4 w-4" />, title: "Web", desc: "Receive notifications in the Hive dashboard." },
+  { key: "web", icon: <Bell className="h-4 w-4" />, title: "Web", desc: "Receive notifications in the OpenEdge dashboard." },
   { key: "email", icon: <AtSign className="h-4 w-4" />, title: "Email", desc: "" },
   { key: "push", icon: <Smartphone className="h-4 w-4" />, title: "Push", desc: "Receive notifications on desktop or mobile." },
   { key: "sms", icon: <Phone className="h-4 w-4" />, title: "SMS", desc: "No phone number." },

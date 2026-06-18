@@ -52,10 +52,58 @@ pub fn preset(slug: &str) -> Option<&'static FrameworkPreset> {
     PRESETS.iter().find(|p| p.slug == slug)
 }
 
+/// Detect the JS package manager from lockfiles (Vercel's precedence:
+/// bun → pnpm → yarn → npm). Defaults to npm.
+pub fn package_manager(repo: &Path) -> &'static str {
+    if repo.join("bun.lockb").exists() || repo.join("bun.lock").exists() {
+        "bun"
+    } else if repo.join("pnpm-lock.yaml").exists() {
+        "pnpm"
+    } else if repo.join("yarn.lock").exists() {
+        "yarn"
+    } else {
+        "npm"
+    }
+}
+
+/// The install command for a package manager.
+fn install_for(pm: &str) -> &'static str {
+    match pm {
+        "bun" => "bun install",
+        "pnpm" => "pnpm install --no-frozen-lockfile",
+        "yarn" => "yarn install",
+        _ => "npm install",
+    }
+}
+
+/// Rewrite an `npm …` command to the detected package manager so script/binary
+/// invocations use the project's actual tool (`pnpm run build`, `yarn build`…).
+fn pmify(cmd: &str, pm: &str) -> String {
+    if pm == "npm" {
+        return cmd.to_string();
+    }
+    let c = cmd.trim();
+    if let Some(rest) = c.strip_prefix("npm run ") {
+        return match pm {
+            "yarn" => format!("yarn {rest}"),
+            _ => format!("{pm} run {rest}"),
+        };
+    }
+    if c == "npm install" || c == "npm i" {
+        return install_for(pm).to_string();
+    }
+    if let Some(rest) = c.strip_prefix("npm exec ") {
+        return format!("{pm} exec {rest}");
+    }
+    cmd.to_string()
+}
+
 /// Concrete plan for building one repo.
 #[derive(Clone, Debug, Serialize)]
 pub struct BuildPlan {
     pub framework: FrameworkPreset,
+    /// Detected package manager: npm | yarn | pnpm | bun.
+    pub package_manager: String,
     pub install_command: String,
     pub build_command: String,
     pub output_dir: String,
@@ -125,13 +173,19 @@ pub fn plan_build(
     output_override: Option<&str>,
 ) -> BuildPlan {
     let fw = detect(repo).clone();
+    let pm = package_manager(repo);
     let pick = |ov: Option<&str>, default: &str| {
         ov.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default).to_string()
     };
+    // Default install command follows the package manager; framework binary build
+    // commands (e.g. "next build") resolve via node_modules/.bin, while "npm run …"
+    // defaults are rewritten to the detected manager.
+    let install_default = install_for(pm);
     BuildPlan {
-        install_command: pick(install_override, fw.install_command),
-        build_command: pick(build_override, fw.build_command),
+        install_command: pick(install_override, install_default),
+        build_command: pmify(&pick(build_override, fw.build_command), pm),
         output_dir: pick(output_override, fw.output_dir),
+        package_manager: pm.to_string(),
         framework: fw,
     }
 }

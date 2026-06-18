@@ -111,8 +111,43 @@ pub struct Route {
     pub target: RouteTarget,
 }
 
-/// `fluid.json` — what a user writes to describe their deployment.
+/// A redirect rule mapped from the framework build (Next.js `redirects()`,
+/// Build Output API routes with a 3xx status). Evaluated by the gateway before
+/// routing — first match wins.
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Redirect {
+    pub source: String,
+    pub destination: String,
+    #[serde(default = "default_redirect_status")]
+    pub status: u16,
+}
+fn default_redirect_status() -> u16 {
+    308
+}
+
+/// A rewrite rule (path is rewritten server-side, client URL unchanged).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Rewrite {
+    pub source: String,
+    pub destination: String,
+}
+
+/// Middleware / proxy (`middleware.ts` / `proxy.ts`) detected in the build. Runs
+/// in the edge runtime ahead of routing; `matcher` lists the path patterns it
+/// applies to.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Middleware {
+    #[serde(default)]
+    pub matcher: Vec<String>,
+    #[serde(default = "default_edge_runtime")]
+    pub runtime: String,
+}
+fn default_edge_runtime() -> String {
+    "edge".into()
+}
+
+/// `fluid.json` — what a user writes to describe their deployment.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Manifest {
     pub project: String,
     /// Relative dir (within the deployment root) holding static assets.
@@ -122,6 +157,15 @@ pub struct Manifest {
     pub functions: Vec<FunctionConfig>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    /// Redirects mapped from the framework build (gateway honors these).
+    #[serde(default)]
+    pub redirects: Vec<Redirect>,
+    /// Server-side rewrites mapped from the framework build.
+    #[serde(default)]
+    pub rewrites: Vec<Rewrite>,
+    /// Edge middleware / proxy detected in the build, if any.
+    #[serde(default)]
+    pub middleware: Option<Middleware>,
 }
 
 impl Manifest {
@@ -147,6 +191,51 @@ impl Manifest {
         }
         best.map(|r| r.target.clone()).unwrap_or(RouteTarget::Static)
     }
+
+    /// The first matching redirect for `path`, as (location, status).
+    pub fn redirect_for(&self, path: &str) -> Option<(String, u16)> {
+        for r in &self.redirects {
+            if rule_match(&r.source, path) {
+                return Some((rule_target(&r.source, &r.destination, path), r.status));
+            }
+        }
+        None
+    }
+
+    /// Apply the first matching rewrite, returning the (possibly) rewritten path.
+    pub fn rewrite_path(&self, path: &str) -> String {
+        for r in &self.rewrites {
+            if rule_match(&r.source, path) {
+                return rule_target(&r.source, &r.destination, path);
+            }
+        }
+        path.to_string()
+    }
+
+    /// Count of edge-runtime functions in this deployment.
+    pub fn edge_function_count(&self) -> usize {
+        self.functions.iter().filter(|f| f.runtime == "edge").count()
+    }
+}
+
+/// Exact match, or prefix match when `source` ends with `/`.
+fn rule_match(source: &str, path: &str) -> bool {
+    if let Some(prefix) = source.strip_suffix('/') {
+        path == prefix || path.starts_with(source)
+    } else {
+        path == source
+    }
+}
+
+/// Build a redirect/rewrite target, preserving the remainder for prefix sources.
+fn rule_target(source: &str, destination: &str, path: &str) -> String {
+    if let Some(prefix) = source.strip_suffix('/') {
+        if let Some(rest) = path.strip_prefix(prefix) {
+            let dest = destination.trim_end_matches('/');
+            return format!("{dest}{rest}");
+        }
+    }
+    destination.to_string()
 }
 
 /// Prefix match with `/` boundary awareness. `"/api"` matches `/api` and
@@ -238,6 +327,10 @@ pub struct GitDeployRequest {
     pub creator: Option<String>,
     #[serde(default = "default_prod")]
     pub production: bool,
+    /// Subdirectory within the repo to build (for monorepo templates, e.g.
+    /// `examples/nextjs`). Empty/None = repo root.
+    #[serde(default)]
+    pub root_dir: Option<String>,
 }
 fn default_prod() -> bool {
     true
@@ -262,9 +355,23 @@ pub struct DeploymentInfo {
     /// Type label for the UI: "static" | "function" | "fullstack".
     #[serde(default)]
     pub kind: String,
+    /// Framework features mapped onto this deployment (redirects, middleware…).
+    #[serde(default)]
+    pub features: DeploymentFeatures,
 }
 fn default_ready() -> DeployState {
     DeployState::Ready
+}
+
+/// Summary of framework build features the platform mapped onto a deployment —
+/// surfaced in the dashboard (service graph, overview).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeploymentFeatures {
+    pub redirects: usize,
+    pub rewrites: usize,
+    pub middleware: bool,
+    pub edge_functions: usize,
+    pub serverless_functions: usize,
 }
 
 #[cfg(test)]
@@ -282,6 +389,7 @@ mod tests {
                 Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) },
                 Route { pattern: "/api/admin".into(), target: RouteTarget::Function("admin".into()) },
             ],
+            ..Default::default()
         };
         assert_eq!(m.resolve("/index.html"), RouteTarget::Static);
         assert_eq!(m.resolve("/api/users"), RouteTarget::Function("api".into()));

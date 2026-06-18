@@ -2,8 +2,11 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { AreaChart } from "@tremor/react";
+import dynamic from "next/dynamic";
 import { Calendar, ChevronDown, Search, MoreHorizontal, ChevronRight } from "lucide-react";
+
+// Lazy-load the Tremor chart bundle so it isn't in the initial page payload.
+const AreaChart = dynamic(() => import("@tremor/react").then((m) => m.AreaChart), { ssr: false });
 import { Card } from "@/components/ui";
 import { usePoll, type Metrics } from "@/lib/api";
 

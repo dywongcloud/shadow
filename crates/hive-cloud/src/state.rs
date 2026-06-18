@@ -60,6 +60,10 @@ pub struct CloudState {
     pub incidents: crate::incidents::IncidentStore,
     pub securelinks: crate::securelink::SecureLinkStore,
     pub apikeys: crate::apikeys::ApiKeyStore,
+    pub identity: crate::identity::IdentityStore,
+    pub billing: crate::billing::BillingStore,
+    pub audit: crate::audit::AuditLog,
+    pub notifications: crate::notifications::NotificationStore,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
 
@@ -119,6 +123,10 @@ impl CloudState {
             incidents: crate::incidents::IncidentStore::new(),
             securelinks: crate::securelink::SecureLinkStore::new(),
             apikeys: crate::apikeys::ApiKeyStore::new(),
+            identity: crate::identity::IdentityStore::new(),
+            billing: crate::billing::BillingStore::new(),
+            audit: crate::audit::AuditLog::new(crate::persist::data_dir().join("audit.jsonl")),
+            notifications: crate::notifications::NotificationStore::new(),
             owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),

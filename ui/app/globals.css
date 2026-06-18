@@ -2,6 +2,31 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ABC Diatype — the platform typeface (https://abcdinamo.com/typefaces/diatype).
+   It's a licensed font, so drop the woff2 files into /public/fonts/ to enable it;
+   until then the stack falls back to Geist automatically (see tailwind.config).
+   Files expected: ABCDiatype-{Regular,Medium,Bold}.woff2, ABCDiatypeMono-Regular.woff2 */
+@font-face {
+  font-family: "ABC Diatype";
+  src: url("/fonts/ABCDiatype-Regular.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "ABC Diatype";
+  src: url("/fonts/ABCDiatype-Medium.woff2") format("woff2");
+  font-weight: 500; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "ABC Diatype";
+  src: url("/fonts/ABCDiatype-Bold.woff2") format("woff2");
+  font-weight: 700; font-style: normal; font-display: swap;
+}
+@font-face {
+  font-family: "ABC Diatype Mono";
+  src: url("/fonts/ABCDiatypeMono-Regular.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+}
+
 /* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {
   --background: 0 0% 100%;
@@ -56,16 +81,16 @@ body {
    foreground channel at a tiny alpha so it adapts to light & dark automatically. */
 body {
   background-image:
-    linear-gradient(to right, hsl(var(--foreground) / 0.018) 1px, transparent 1px),
-    linear-gradient(to bottom, hsl(var(--foreground) / 0.018) 1px, transparent 1px);
-  background-size: 128px 128px;
+    linear-gradient(to right, hsl(var(--foreground) / 0.01) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--foreground) / 0.01) 1px, transparent 1px);
+  background-size: 140px 140px;
   background-position: -1px -1px;
   background-attachment: fixed;
 }
 .dark body {
   background-image:
-    linear-gradient(to right, hsl(var(--foreground) / 0.028) 1px, transparent 1px),
-    linear-gradient(to bottom, hsl(var(--foreground) / 0.028) 1px, transparent 1px);
+    linear-gradient(to right, hsl(var(--foreground) / 0.015) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(var(--foreground) / 0.015) 1px, transparent 1px);
 }
 
 * {

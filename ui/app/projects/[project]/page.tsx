@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
@@ -16,8 +16,24 @@ import {
   Activity,
   Loader2,
 } from "lucide-react";
+import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
-import { apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
+import { ProjectWorkflows } from "@/components/workflows";
+
+// Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
+// only fetched when the Service Graph tab is actually opened.
+const ServiceGraph = dynamic(
+  () => import("@/components/service-graph").then((m) => m.ServiceGraph),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-[600px] items-center justify-center rounded-xl border border-border bg-bg">
+        <Loader2 className="h-5 w-5 animate-spin text-muted" />
+      </div>
+    ),
+  }
+);
+import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function ProjectDetail({ params }: { params: { project: string } }) {
@@ -25,7 +41,12 @@ export default function ProjectDetail({ params }: { params: { project: string } 
   const router = useRouter();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
-  const [tab, setTab] = useState<"overview" | "deployments">("overview");
+  const [tab, setTab] = useState<"overview" | "graph" | "workflows" | "deployments">("overview");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const t = new URLSearchParams(window.location.search).get("tab");
+    if (t === "graph" || t === "deployments" || t === "overview" || t === "workflows") setTab(t);
+  }, []);
   const [busy, setBusy] = useState("");
 
   const mine = (deps ?? []).filter((d) => d.project === name);
@@ -103,13 +124,13 @@ export default function ProjectDetail({ params }: { params: { project: string } 
 
       {/* sub tabs */}
       <div className="mb-6 flex items-center gap-1 border-b border-border">
-        {(["overview", "deployments"] as const).map((t) => (
+        {(["overview", "graph", "workflows", "deployments"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
             className={`relative px-3 py-2 text-sm capitalize ${tab === t ? "text-fg" : "text-secondary hover:text-fg"}`}
           >
-            {t}
+            {t === "graph" ? "Service Graph" : t}
             {tab === t && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-fg" />}
           </button>
         ))}
@@ -127,7 +148,11 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         </Link>
       </div>
 
-      {tab === "overview" ? (
+      {tab === "graph" ? (
+        <ServiceGraph project={name} prod={prod} />
+      ) : tab === "workflows" ? (
+        <ProjectWorkflows project={name} />
+      ) : tab === "overview" ? (
         <>
           {/* Production Deployment */}
           <Card className="mb-6 p-0">
@@ -143,9 +168,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
               </div>
             </div>
             <div className="grid grid-cols-1 gap-6 p-5 md:grid-cols-2">
-              <div className="flex h-56 items-center justify-center rounded-lg border border-border bg-gradient-to-br from-orange-100/60 to-card dark:from-orange-500/10 dark:to-card">
-                <Triangle className="h-12 w-12" />
-              </div>
+              <DeploymentPreview project={name} prod={prod} />
               <div className="flex flex-col gap-4 text-sm">
                 <div>
                   <div className="text-muted">Deployment</div>
@@ -279,6 +302,82 @@ function Metric({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="mb-3 flex items-center justify-between">
       <span className="text-sm text-secondary">{label}</span>
       <span className="font-semibold tabular-nums">{value}</span>
+    </div>
+  );
+}
+
+interface Preview {
+  kind: "image" | "json" | "text" | "none";
+  url?: string;
+  body?: string;
+  status?: number;
+  content_type?: string;
+  alias?: string;
+}
+
+/** Production deployment preview: a live screenshot of the site for frontends,
+ *  or the JSON/text response for backend services. */
+function DeploymentPreview({ project, prod }: { project: string; prod: Deployment | undefined }) {
+  const [pv, setPv] = useState<Preview | null>(null);
+  const [imgError, setImgError] = useState(false);
+
+  useEffect(() => {
+    let stop = false;
+    setImgError(false);
+    setPv(null);
+    if (!prod) return;
+    apiGet<Preview>(`/v1/projects/${encodeURIComponent(project)}/preview`)
+      .then((d) => { if (!stop) setPv(d); })
+      .catch(() => { if (!stop) setPv({ kind: "none" }); });
+    return () => { stop = true; };
+  }, [project, prod?.id]);
+
+  const box = "relative h-56 overflow-hidden rounded-lg border border-border";
+
+  if (!prod || !pv) {
+    return (
+      <div className={`${box} flex items-center justify-center bg-gradient-to-br from-orange-100/60 to-card dark:from-orange-500/10 dark:to-card`}>
+        <Loader2 className="h-5 w-5 animate-spin text-muted" />
+      </div>
+    );
+  }
+
+  if (pv.kind === "image" && pv.url && !imgError) {
+    return (
+      <a href={prod ? `http://${prod.alias}:8787/` : "#"} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img
+          src={`/cloud${pv.url}`}
+          alt={`${project} preview`}
+          className="h-full w-full object-cover object-top transition-transform group-hover:scale-[1.02]"
+          onError={() => setImgError(true)}
+        />
+        <span className="absolute bottom-2 left-2 rounded-md border border-border bg-card/90 px-2 py-0.5 text-[11px] text-secondary backdrop-blur">
+          {pv.alias}
+        </span>
+      </a>
+    );
+  }
+
+  if (pv.kind === "json" || pv.kind === "text") {
+    let body = pv.body ?? "";
+    if (pv.kind === "json") {
+      try { body = JSON.stringify(JSON.parse(body), null, 2); } catch { /* keep raw */ }
+    }
+    return (
+      <div className={`${box} bg-[#0b0b0b]`}>
+        <div className="flex items-center justify-between border-b border-border bg-card/40 px-3 py-1.5 text-[11px]">
+          <span className="flex items-center gap-1.5 text-secondary"><Terminal className="h-3 w-3" /> Service response</span>
+          <span className="font-mono text-muted">{pv.content_type?.split(";")[0] || (pv.kind === "json" ? "application/json" : "text/plain")}{pv.status ? ` · ${pv.status}` : ""}</span>
+        </div>
+        <pre className="h-[calc(100%-30px)] overflow-auto p-3 font-mono text-[11px] leading-relaxed text-emerald-300/90">{body || "(empty response)"}</pre>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`${box} flex items-center justify-center bg-gradient-to-br from-orange-100/60 to-card dark:from-orange-500/10 dark:to-card`}>
+      <Triangle className="h-12 w-12" />
     </div>
   );
 }

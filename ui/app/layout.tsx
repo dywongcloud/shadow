@@ -8,7 +8,7 @@ import { Footer } from "@/components/footer";
 import { ThemeProvider } from "@/components/theme-provider";
 
 export const metadata: Metadata = {
-  title: "Hive Cloud",
+  title: "OpenEdge",
   description: "A unified, self-hosted cloud — builds, Fluid compute, edge, regions.",
 };
 

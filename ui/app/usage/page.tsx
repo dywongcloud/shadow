@@ -1,8 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { BarChart, SparkAreaChart } from "@tremor/react";
+import dynamic from "next/dynamic";
 import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide-react";
+
+// Lazy-load Tremor charts so the heavy charting bundle is split out of the page.
+const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), { ssr: false });
+const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.SparkAreaChart), { ssr: false });
 import { Card } from "@/components/ui";
 import { usePoll, type Overview, type FunctionStats } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -147,12 +151,12 @@ export default function UsagePage() {
             <span>Product</span><span className="text-right">Usage</span><span className="text-right">Charge</span>
           </div>
 
-          <GroupHeader name="Hive Delivery Network" />
+          <GroupHeader name="OpenEdge Delivery Network" />
           <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={`${fmt(requests)} / 10M`} charge={edgeCharge} />
           <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={`${fmt(cacheHits)}`} charge={0} />
           <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={series(blocked)} usage={`${fmt(blocked)}`} charge={wafCharge} />
 
-          <GroupHeader name="Hive Functions" />
+          <GroupHeader name="OpenEdge Functions" />
           <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
           <Row color="bg-purple-500" name="Active CPU (Fluid)" spark={series(fluidMs)} usage={`${(fluidMs / 1000).toFixed(1)} s`} charge={fnCharge} />
           <Row color="bg-cyan-500" name="Provisioned Instances" spark={series((ov?.instances ?? 0) * 100)} usage={`${ov?.instances ?? 0}`} charge={0} />

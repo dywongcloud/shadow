@@ -56,6 +56,9 @@ impl BuildStore {
     pub fn get(&self, id: &str) -> Option<Build> {
         self.map.lock().get(id).cloned()
     }
+    pub fn list(&self) -> Vec<Build> {
+        self.map.lock().values().cloned().collect()
+    }
     fn insert(&self, b: Build) {
         self.map.lock().insert(b.id.clone(), b);
     }
@@ -201,51 +204,71 @@ async fn run_build(
         b.branch = actual_branch.clone();
     });
 
-    // Container path (Railway-style): a Dockerfile is built with podman and run
-    // as the deployment's process (listening on $PORT, proxied by the gateway).
-    let dockerfile = dir.join("Dockerfile");
-    let mut manifest;
-    if dockerfile.exists() {
-        log("Detected Dockerfile — building container image.".into());
-        // Image tags only allow [a-z0-9._-]; sanitize the project name so names
-        // like "container-(dockerfile)" don't produce an invalid reference.
-        let safe_project = sanitize_tag(&project);
-        let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
-        let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
-        let t1 = now_ms();
-        let out = Command::new("podman")
-            .arg("build")
-            .arg("-t")
-            .arg(&image)
-            .arg(".")
-            .current_dir(&dir)
-            .output()
-            .await?;
-        // Stream a few build lines.
-        for line in String::from_utf8_lossy(&out.stderr)
-            .lines()
-            .chain(String::from_utf8_lossy(&out.stdout).lines())
-            .filter(|l| !l.trim().is_empty())
-            .take(40)
-        {
-            log(format!("  {line}"));
+    // Build from a subdirectory for monorepo templates (e.g. `examples/nextjs`).
+    let build_dir = match req.root_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(root) => {
+            log(format!("Root directory: {root}"));
+            dir.join(root)
         }
-        anyhow::ensure!(out.status.success(), "podman build failed");
-        log(format!("Image built: {image} ({}ms), EXPOSE {exposed}", now_ms().saturating_sub(t1)));
-        manifest = container_manifest(&project, &image, exposed);
-    } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
-        let mut m = Manifest::from_json(&s)?;
-        if m.project.is_empty() {
-            m.project = project.clone();
+        None => dir.clone(),
+    };
+    anyhow::ensure!(build_dir.exists(), "root directory '{}' not found in repo", req.root_dir.clone().unwrap_or_default());
+
+    // Produce the deployment manifest. A build failure must NOT abort the
+    // deploy — Vercel still records the deployment/project — so on error we fall
+    // back to a "build failed" page and keep going (build state ends as Error).
+    let mut build_failed = false;
+    let mut manifest = match produce_manifest(cloud, bid, &build_dir, &project, &commit).await {
+        Ok(m) => m,
+        Err(e) => {
+            build_failed = true;
+            log(format!("Build failed: {e}"));
+            log("Keeping the deployment — serving a build-status page so the project still exists.".into());
+            let index = build_dir.join("index.html");
+            let _ = tokio::fs::create_dir_all(&build_dir).await;
+            let _ = tokio::fs::write(
+                &index,
+                build_failed_page(&project, &commit, &e.to_string(), &req.repo_url),
+            )
+            .await;
+            static_manifest(&project, ".")
         }
-        log("Detected fluid.json — using project configuration.".into());
-        manifest = m;
-    } else {
-        // Framework-Defined Infrastructure: detect the framework, run its real
-        // install + build, and normalize the result into the Build Output API.
-        manifest = build_via_fdi(cloud, bid, &dir, &project).await?;
-    }
+    };
     manifest.project = project.clone();
+
+    // Map framework build features (redirects/rewrites/middleware/edge) onto the
+    // deployment so the gateway honors them and the UI can surface them.
+    if !build_failed {
+        let feats = fluid_build::detect_features(&build_dir);
+        if !feats.is_empty() {
+            manifest.redirects = feats
+                .redirects
+                .iter()
+                .map(|r| fluid_core::Redirect { source: r.source.clone(), destination: r.destination.clone(), status: r.status })
+                .collect();
+            manifest.rewrites = feats
+                .rewrites
+                .iter()
+                .map(|r| fluid_core::Rewrite { source: r.source.clone(), destination: r.destination.clone() })
+                .collect();
+            if let Some(mw) = &feats.middleware {
+                manifest.middleware = Some(fluid_core::Middleware { matcher: mw.matcher.clone(), runtime: mw.runtime.clone() });
+            }
+            // Mark edge-runtime functions so the service graph / overview can show them.
+            if !feats.edge_functions.is_empty() {
+                for f in manifest.functions.iter_mut() {
+                    f.runtime = "edge".into();
+                }
+            }
+            log(format!(
+                "Mapped framework features: {} redirect(s), {} rewrite(s), middleware: {}, {} edge fn(s).",
+                manifest.redirects.len(),
+                manifest.rewrites.len(),
+                manifest.middleware.is_some(),
+                feats.edge_functions.len(),
+            ));
+        }
+    }
 
     // Inject project env vars + function settings.
     let env = cloud.projects.env_map(&manifest.project);
@@ -266,7 +289,7 @@ async fn run_build(
     // page so the deployed URL returns 200 instead of 404.
     if manifest.functions.is_empty() {
         let static_dir = manifest.static_dir.clone().unwrap_or_else(|| ".".into());
-        let base = if static_dir == "." { dir.clone() } else { dir.join(&static_dir) };
+        let base = if static_dir == "." { build_dir.clone() } else { build_dir.join(&static_dir) };
         let index = base.join("index.html");
         if !index.exists() {
             let _ = tokio::fs::create_dir_all(&base).await;
@@ -287,22 +310,34 @@ async fn run_build(
         commit_message: commit_message.clone(),
     };
     let info = cloud.gw.deploy_full(
-        dir.to_string_lossy().into_owned(),
+        build_dir.to_string_lossy().into_owned(),
         manifest,
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
         req.production,
     );
 
-    log(format!("Deployment ready. Aliased to {}", info.alias));
+    if build_failed {
+        log(format!("Deployment created (build failed). Aliased to {}", info.alias));
+    } else {
+        log(format!("Deployment ready. Aliased to {}", info.alias));
+    }
     cloud.builds.update(bid, |b| {
-        b.state = DeployState::Ready;
+        b.state = if build_failed { DeployState::Error } else { DeployState::Ready };
         b.finished_ms = Some(now_ms());
         b.deployment_id = Some(info.id.to_string());
         b.alias = Some(info.alias.clone());
     });
     let ev = cloud.event(&cloud.region, "DEPLOY", &info.alias, "/", 200, "deploy", &format!("git {}", req.repo_url));
     cloud.record(ev);
+    cloud.audit.record(
+        &cloud.projects.team_of(&info.project),
+        &req.creator.clone().unwrap_or_else(|| "you".into()),
+        if build_failed { "create_failed" } else { "create" },
+        "deployment",
+        &info.id.to_string(),
+        &format!("{} → {}", info.project, info.alias),
+    );
     crate::persist::persist(cloud);
     crate::webhooks::dispatch(
         &cloud.webhooks,
@@ -331,6 +366,55 @@ fn region_label(region: &str) -> String {
     .to_string()
 }
 
+/// Produce the deployment manifest from a cloned repo: Dockerfile (podman),
+/// explicit `fluid.json`, or Framework-Defined Infrastructure. Any error here is
+/// recoverable by the caller (the deployment is still created with a fallback).
+async fn produce_manifest(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    dir: &Path,
+    project: &str,
+    commit: &str,
+) -> anyhow::Result<Manifest> {
+    let log = |s: String| cloud.builds.log(bid, s);
+    let dockerfile = dir.join("Dockerfile");
+    if dockerfile.exists() {
+        log("Detected Dockerfile — building container image.".into());
+        let safe_project = sanitize_tag(project);
+        let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
+        let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
+        let t1 = now_ms();
+        let out = Command::new("podman")
+            .arg("build")
+            .arg("-t")
+            .arg(&image)
+            .arg(".")
+            .current_dir(dir)
+            .output()
+            .await?;
+        for line in String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .chain(String::from_utf8_lossy(&out.stdout).lines())
+            .filter(|l| !l.trim().is_empty())
+            .take(40)
+        {
+            log(format!("  {line}"));
+        }
+        anyhow::ensure!(out.status.success(), "podman build failed");
+        log(format!("Image built: {image} ({}ms), EXPOSE {exposed}", now_ms().saturating_sub(t1)));
+        Ok(container_manifest(project, &image, exposed))
+    } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
+        let mut m = Manifest::from_json(&s)?;
+        if m.project.is_empty() {
+            m.project = project.to_string();
+        }
+        log("Detected fluid.json — using project configuration.".into());
+        Ok(m)
+    } else {
+        build_via_fdi(cloud, bid, dir, project).await
+    }
+}
+
 /// Framework-Defined Infrastructure: detect the framework, run its real install
 /// + build commands (streamed), then normalize the output into a Manifest —
 /// either static assets or a serverless server. This is the executor that turns
@@ -356,8 +440,8 @@ async fn build_via_fdi(
 
     let plan = fluid_build::plan_build(dir, inst.as_deref(), bld.as_deref(), outd.as_deref());
     log(format!(
-        "Detected framework: {} — primitive: {:?}",
-        plan.framework.name, plan.framework.primitive
+        "Detected framework: {} — primitive: {:?}, package manager: {}",
+        plan.framework.name, plan.framework.primitive, plan.package_manager
     ));
 
     // npm/yarn/pnpm commands require a package.json; skip them if absent so plain
@@ -413,6 +497,7 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
         static_dir: Some(if static_dir.is_empty() { ".".into() } else { static_dir.to_string() }),
         functions: vec![],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
+        ..Default::default()
     }
 }
 
@@ -439,8 +524,12 @@ async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // Put the project's local CLIs (node_modules/.bin) first so framework binaries
+    // like `next`, `vite`, `astro` resolve to the installed versions.
+    let local_bin = dir.join("node_modules/.bin");
     let path = format!(
-        "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        local_bin.to_string_lossy(),
         std::env::var("PATH").unwrap_or_default()
     );
     let mut child = Command::new("/bin/sh")
@@ -525,6 +614,7 @@ fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
             max_duration_secs: 300,
         }],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
+        ..Default::default()
     }
 }
 
@@ -545,10 +635,11 @@ fn function_manifest(project: &str, start_cmd: Vec<String>) -> Manifest {
             max_duration_secs: 300,
         }],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("api".into()) }],
+        ..Default::default()
     }
 }
 
-/// A minimal "Deployed on Hive" landing page for static deploys with no index.
+/// A minimal "Deployed on OpenEdge" landing page for static deploys with no index.
 fn landing_page(project: &str, commit: &str, msg: &str, repo: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -556,7 +647,7 @@ fn landing_page(project: &str, commit: &str, msg: &str, repo: &str) -> String {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{project} · Hive Cloud</title>
+  <title>{project} · OpenEdge</title>
   <style>
     :root {{ color-scheme: light dark; }}
     * {{ box-sizing: border-box; }}
@@ -578,13 +669,51 @@ fn landing_page(project: &str, commit: &str, msg: &str, repo: &str) -> String {
   <div class="card">
     <svg class="tri" viewBox="0 0 24 22" aria-hidden><path d="M12 0 L24 22 L0 22 Z" fill="currentColor"/></svg>
     <h1>{project}</h1>
-    <p class="muted">Deployed on <strong>Hive Cloud</strong> — your unified, self-hosted cloud.</p>
+    <p class="muted">Deployed on <strong>OpenEdge</strong> — your unified, self-hosted cloud.</p>
     <div class="row">
       <span class="badge">● Ready</span>
       <span class="badge">commit <code>{commit}</code></span>
     </div>
     <p class="muted" style="margin-top:16px">{msg}</p>
     <p class="muted" style="margin-top:6px">Source: <code>{repo}</code></p>
+  </div>
+</body>
+</html>"#
+    )
+}
+
+/// A "build failed" status page so a failed deployment still serves something
+/// (the project/deployment is created either way, like Vercel).
+fn build_failed_page(project: &str, commit: &str, err: &str, repo: &str) -> String {
+    let safe_err = err.replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{project} · Build failed · OpenEdge</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background:#fafafa; color:#111; }}
+    @media (prefers-color-scheme: dark) {{ body {{ background:#0a0a0a; color:#ededed; }} .card {{ background:#111 !important; border-color:#222 !important; }} .muted {{ color:#888 !important; }} pre {{ background:#000 !important; }} }}
+    .card {{ background:#fff; border:1px solid #ebebeb; border-radius:16px; padding:36px 40px; max-width:560px; }}
+    h1 {{ font-size:22px; margin:14px 0 6px; letter-spacing:-0.02em; }}
+    .muted {{ color:#666; font-size:14px; line-height:1.6; }}
+    .dot {{ display:inline-block; width:9px; height:9px; border-radius:999px; background:#f5454f; margin-right:7px; }}
+    pre {{ background:#f6f6f6; border-radius:8px; padding:12px; overflow:auto; font-size:12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1><span class="dot"></span>Build failed</h1>
+    <p class="muted">The latest deployment of <strong>{project}</strong> ({commit}) did not build successfully, but the project was still created. Fix the error and redeploy.</p>
+    <pre>{safe_err}</pre>
+    <p class="muted">Source: {repo}</p>
   </div>
 </body>
 </html>"#

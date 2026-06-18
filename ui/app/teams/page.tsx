@@ -1,9 +1,17 @@
 "use client";
 
 import { useState } from "react";
-import { Users, Plus, X, Trash2, Crown, Shield, User as UserIcon, Eye } from "lucide-react";
+import {
+  OrganizationProfile,
+  OrganizationSwitcher,
+  useOrganization,
+} from "@clerk/nextjs";
+import { Users, Plus, Trash2, Crown, Shield, User as UserIcon, Eye } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader } from "@/components/ui";
+import { useClerkAppearance } from "@/components/clerk-appearance";
 import { apiSend, usePoll, type Team, type Role } from "@/lib/api";
+
+const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 const ROLE_META: Record<Role, { icon: React.ReactNode; tone: "amber" | "blue" | "green" | "default" }> = {
   owner: { icon: <Crown className="h-3 w-3" />, tone: "amber" },
@@ -13,6 +21,57 @@ const ROLE_META: Record<Role, { icon: React.ReactNode; tone: "amber" | "blue" | 
 };
 
 export default function TeamsPage() {
+  return clerkOn ? <ClerkTeams /> : <LocalTeams />;
+}
+
+/* ------------------------------------------------------------------ */
+/* Clerk-native team & member management (invites, roles, pending…).  */
+/* ------------------------------------------------------------------ */
+function ClerkTeams() {
+  const { organization } = useOrganization();
+  const appearance = useClerkAppearance();
+
+  return (
+    <div>
+      <PageHeader
+        title="Teams"
+        desc="Teams own projects, databases and deployments. Members, roles and invitations are managed through your identity provider."
+        action={
+          <OrganizationSwitcher
+            hidePersonal={false}
+            afterCreateOrganizationUrl="/teams"
+            afterSelectOrganizationUrl="/teams"
+            afterLeaveOrganizationUrl="/teams"
+            appearance={appearance}
+          />
+        }
+      />
+
+      {organization ? (
+        <div className="overflow-hidden rounded-xl border border-border bg-card shadow-card [&_.cl-rootBox]:w-full [&_.cl-cardBox]:w-full [&_.cl-cardBox]:shadow-none">
+          <OrganizationProfile routing="hash" appearance={appearance} />
+        </div>
+      ) : (
+        <Card className="flex flex-col items-center gap-3 py-16 text-center">
+          <span className="flex h-11 w-11 items-center justify-center rounded-xl bg-fg text-bg">
+            <Users className="h-5 w-5" />
+          </span>
+          <div className="text-base font-semibold">No team selected</div>
+          <p className="max-w-md text-sm text-secondary">
+            You&apos;re on your personal account. Use the account switcher in the top-left and choose
+            <span className="font-medium text-fg"> Create organization</span> at the bottom to start a
+            team — then manage members &amp; invites here.
+          </p>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Local fallback (no Clerk key) — backend TeamStore.                 */
+/* ------------------------------------------------------------------ */
+function LocalTeams() {
   const { data: teams, refresh } = usePoll<Team[]>("/v1/teams", 4000);
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");

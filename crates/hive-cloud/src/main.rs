@@ -7,15 +7,19 @@
 
 mod admin;
 mod apikeys;
+mod audit;
 mod auth;
+mod billing;
 mod cluster;
 mod databases;
 mod edge;
 mod git;
 #[cfg(feature = "guardian")]
 mod guardian;
+mod identity;
 mod incidents;
 mod metrics;
+mod notifications;
 mod persist;
 mod project_settings;
 mod securelink;

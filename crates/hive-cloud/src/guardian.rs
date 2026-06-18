@@ -16,15 +16,24 @@
 use crate::persist::PlatformSnapshot;
 
 /// Replicate a snapshot into the guardian-db document store (best-effort).
+///
+/// State is partitioned by **tenant namespace** ([`crate::persist::namespaced`])
+/// and each namespace is replicated under its own document key
+/// (`ns/<namespace>/state`), so every org/team's projects, deployments and
+/// databases are scoped and isolated in the replicated store — not commingled in
+/// one global blob.
 pub fn replicate(snap: &PlatformSnapshot) {
-    let json = match serde_json::to_vec(snap) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
+    let docs = crate::persist::namespaced(snap);
+    let payloads: Vec<(String, Vec<u8>)> = docs
+        .into_iter()
+        .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
+        .collect();
     // Spawn so persistence is never blocked on replication.
     tokio::spawn(async move {
-        if let Err(e) = put("platform/state", json).await {
-            tracing::debug!(error = %e, "guardian-db replicate failed");
+        for (ns, json) in payloads {
+            if let Err(e) = put(&format!("ns/{ns}/state"), json).await {
+                tracing::debug!(namespace = %ns, error = %e, "guardian-db replicate failed");
+            }
         }
     });
 }

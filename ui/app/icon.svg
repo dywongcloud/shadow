@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="1000"><metadata><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:Description><dc:creator>RealFaviconGenerator</dc:creator><dc:source>https://realfavicongenerator.net</dc:source></rdf:Description></rdf:RDF></metadata><style>
+    #light-icon {
+      display: inline;
+    }
+    #dark-icon {
+      display: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      #light-icon {
+        display: none;
+      }
+      #dark-icon {
+        display: inline;
+      }
+    }
+  </style><g id="light-icon"><svg xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="1000"><g><g transform="matrix(8.695652173913043,0,0,8.695652173913043,0,65.21739130434787)"><svg xmlns="http://www.w3.org/2000/svg" width="115" height="100" fill="none" viewBox="0 0 115 100"><path fill="black" fill-rule="evenodd" d="M57.5 0 115 100H0z" clip-rule="evenodd" style="fill:black;fill-opacity:1;"></path></svg></g></g></svg></g><g id="dark-icon"><svg xmlns="http://www.w3.org/2000/svg" version="1.1" xmlns:xlink="http://www.w3.org/1999/xlink" width="1000" height="1000"><g><g transform="matrix(8.695652173913043,0,0,8.695652173913043,0,65.21739130434787)"><svg xmlns="http://www.w3.org/2000/svg" width="115" height="100" fill="none" viewBox="0 0 115 100"><path fill="white" fill-rule="evenodd" d="M57.5 0 115 100H0z" clip-rule="evenodd" style="fill:white;fill-opacity:1;"></path></svg></g></g></svg></g></svg>

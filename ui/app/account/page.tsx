@@ -48,12 +48,12 @@ export default function AccountPage() {
 
         <SettingCard
           title="Username"
-          desc="This is your URL namespace within Hive Cloud."
+          desc="This is your URL namespace within OpenEdge."
           footer="Please use 48 characters at maximum."
           footerAction={<Button>Save</Button>}
         >
           <div className="flex max-w-sm overflow-hidden rounded-md border border-border">
-            <span className="flex items-center bg-subtle px-3 text-sm text-muted">hive.cloud/</span>
+            <span className="flex items-center bg-subtle px-3 text-sm text-muted">openedge.cloud/</span>
             <input value={username} onChange={(e) => setUsername(e.target.value)} className="w-full bg-card px-3 py-2 text-sm focus:outline-none" />
           </div>
         </SettingCard>
@@ -94,7 +94,7 @@ export default function AccountPage() {
           <Input placeholder="(201) 555-0123" className="max-w-sm" />
         </SettingCard>
 
-        <SettingCard title="User ID" desc="This is your user ID within Hive Cloud." footer="Used when interacting with the Hive API.">
+        <SettingCard title="User ID" desc="This is your user ID within OpenEdge." footer="Used when interacting with the OpenEdge API.">
           <button
             onClick={() => navigator.clipboard?.writeText(userId)}
             className="flex max-w-sm items-center gap-2 rounded-md border border-border bg-subtle px-3 py-2 font-mono text-sm hover:bg-card"

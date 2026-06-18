@@ -14,10 +14,12 @@
 
 pub mod build_output;
 pub mod framework;
+pub mod nextjs;
 pub mod parser;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
-pub use framework::{detect, plan_build, BuildPlan, FrameworkPreset, Primitive, PRESETS};
+pub use framework::{detect, package_manager, plan_build, BuildPlan, FrameworkPreset, Primitive, PRESETS};
+pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
 
 use serde::Serialize;
@@ -32,6 +34,7 @@ pub struct Analysis {
     pub primitive: Primitive,
     /// Whether the repo already ships a Build Output (`.vercel/output`).
     pub has_build_output: bool,
+    pub package_manager: String,
     pub install_command: String,
     pub build_command: String,
     pub output_dir: String,
@@ -45,6 +48,7 @@ pub fn analyze(repo: &Path) -> Analysis {
         framework_name: plan.framework.name.to_string(),
         primitive: plan.framework.primitive,
         has_build_output: has_build_output(repo),
+        package_manager: plan.package_manager,
         install_command: plan.install_command,
         build_command: plan.build_command,
         output_dir: plan.output_dir,

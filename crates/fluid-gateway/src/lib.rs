@@ -395,6 +395,19 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         None => return (StatusCode::NOT_FOUND, "no deployment").into_response(),
     };
 
+    // 1) Redirects mapped from the framework build run first (respond immediately).
+    if let Some((location, status)) = dep.manifest.redirect_for(&path) {
+        let code = StatusCode::from_u16(status).unwrap_or(StatusCode::TEMPORARY_REDIRECT);
+        return Response::builder()
+            .status(code)
+            .header(header::LOCATION, location)
+            .body(Body::empty())
+            .unwrap()
+            .into_response();
+    }
+    // 2) Rewrites map the public path to an internal one (client URL unchanged).
+    let path = dep.manifest.rewrite_path(&path);
+
     match dep.manifest.resolve(&path) {
         RouteTarget::Static => serve_static(&dep, &path).await,
         RouteTarget::Function(name) => {
@@ -654,6 +667,13 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         git: d.git.clone(),
         production: d.production,
         kind: kind.to_string(),
+        features: fluid_core::DeploymentFeatures {
+            redirects: d.manifest.redirects.len(),
+            rewrites: d.manifest.rewrites.len(),
+            middleware: d.manifest.middleware.is_some(),
+            edge_functions: d.manifest.edge_function_count(),
+            serverless_functions: d.manifest.functions.iter().filter(|f| f.runtime != "edge").count(),
+        },
     }
 }
 

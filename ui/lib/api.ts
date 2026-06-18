@@ -52,8 +52,14 @@ export function usePoll<T>(path: string, intervalMs = 3000) {
   useEffect(() => {
     refresh();
     const id = setInterval(refresh, intervalMs);
-    // Re-fetch immediately when the active team changes.
-    const onTeam = () => refresh();
+    // On team/account switch (or logout), drop the previous tenant's data
+    // IMMEDIATELY so it can never flash, then re-fetch for the new tenant.
+    const onTeam = () => {
+      setData(null);
+      setError(null);
+      setLoading(true);
+      refresh();
+    };
     if (typeof window !== "undefined") window.addEventListener("hive-team-changed", onTeam);
     return () => {
       clearInterval(id);
@@ -184,6 +190,15 @@ export interface Deployment {
   git: GitSource | null;
   production: boolean;
   kind: string;
+  features?: DeploymentFeatures;
+}
+
+export interface DeploymentFeatures {
+  redirects: number;
+  rewrites: number;
+  middleware: boolean;
+  edge_functions: number;
+  serverless_functions: number;
 }
 
 export interface EnvVar {
@@ -360,6 +375,98 @@ export interface SecureLink {
   team: string;
   project: string;
   env_var: string;
+}
+
+// ---- Workflows ----
+export type RunStatus = "pending" | "running" | "succeeded" | "failed" | "cancelled";
+export interface WorkflowStep {
+  name: string;
+  deployment: string;
+  path: string;
+}
+export interface WorkflowDef {
+  id: string;
+  name: string;
+  project: string;
+  steps: WorkflowStep[];
+}
+export interface StepRun {
+  name: string;
+  status: RunStatus;
+  output: string;
+  started_ms: number;
+  finished_ms: number | null;
+}
+export interface WorkflowRun {
+  id: string;
+  def_id: string;
+  name: string;
+  project: string;
+  status: RunStatus;
+  steps: StepRun[];
+  started_ms: number;
+  finished_ms: number | null;
+}
+export interface WorkflowSummaryRow {
+  project: string;
+  created: number;
+  completed: number;
+  failed: number;
+  active: number;
+}
+
+// ---- Billing & compute credits ----
+export interface PlanSpec {
+  id: string;
+  name: string;
+  price_cents: number;
+  included_cents: number;
+  overage: boolean;
+  features: string[];
+}
+export interface BillingAccount {
+  tenant: string;
+  plan: string;
+  status: string;
+  included_cents: number;
+  used_cents: number;
+  balance_cents: number;
+  stripe_customer: string;
+  period_start_ms: number;
+  period_end_ms: number;
+  updated_ms: number;
+}
+export interface BillingInfo {
+  account: BillingAccount;
+  plans: PlanSpec[];
+  stripe: boolean;
+}
+export interface LedgerEntry {
+  id: string;
+  tenant: string;
+  ts_ms: number;
+  kind: string;
+  amount_cents: number;
+  balance_after_cents: number;
+  note: string;
+}
+
+// ---- Notifications (inbox bell) ----
+export interface Notification {
+  id: string;
+  severity: "error" | "warning" | "info";
+  category: string;
+  project: string;
+  environment: string;
+  message: string;
+  ts_ms: number;
+  read: boolean;
+  archived: boolean;
+}
+export interface NotificationFeed {
+  unread: number;
+  inbox: number;
+  items: Notification[];
 }
 
 export interface BuildLogLine {

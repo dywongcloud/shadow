@@ -7,5 +7,9 @@ export const dynamic = "force-dynamic";
 export async function GET() {
   const entity = cookies().get("hive_entity")?.value || "default";
   const repos = await githubRepos(entity);
-  return NextResponse.json({ repos });
+  // Private to the browser, cached briefly so the page is instant on revisit.
+  return NextResponse.json(
+    { repos },
+    { headers: { "Cache-Control": "private, max-age=300, stale-while-revalidate=600" } }
+  );
 }

@@ -23,15 +23,21 @@ pub struct WorkflowStep {
 pub struct WorkflowDef {
     pub id: String,
     pub name: String,
+    /// Project this workflow belongs to (drives multi-tenant scoping).
+    #[serde(default)]
+    pub project: String,
     pub steps: Vec<WorkflowStep>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    /// Queued but not started.
+    Pending,
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +53,11 @@ pub struct StepRun {
 pub struct WorkflowRun {
     pub id: String,
     pub def_id: String,
+    /// Workflow name + project, denormalized so listing a run is self-contained.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub project: String,
     pub status: RunStatus,
     pub steps: Vec<StepRun>,
     pub started_ms: u64,
@@ -100,10 +111,12 @@ impl WorkflowEngine {
             .get(def_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no such workflow '{def_id}'"))?;
-        let run_id = format!("run-{}", &Uuid::new_v4().simple().to_string()[..10]);
+        let run_id = format!("wrun_{}", Uuid::new_v4().simple().to_string()[..26].to_uppercase());
         let run = WorkflowRun {
             id: run_id.clone(),
             def_id: def.id.clone(),
+            name: def.name.clone(),
+            project: def.project.clone(),
             status: RunStatus::Running,
             steps: Vec::new(),
             started_ms: now_ms(),
@@ -170,6 +183,7 @@ mod tests {
         eng.define(WorkflowDef {
             id: "wf".into(),
             name: "demo".into(),
+            project: "demo-project".into(),
             steps: vec![
                 WorkflowStep { name: "a".into(), deployment: "d".into(), path: "/a".into() },
                 WorkflowStep { name: "b".into(), deployment: "d".into(), path: "/b".into() },

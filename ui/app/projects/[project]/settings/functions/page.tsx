@@ -59,7 +59,7 @@ export default function FunctionsSettings({ params }: { params: { project: strin
       {/* Fluid Compute */}
       <SettingCard
         title="Fluid Compute"
-        desc="Enable Fluid compute for your functions to automatically manage concurrency and optimize performance. Hive handles the defaults to ensure the best experience for your workload."
+        desc="Enable Fluid compute for your functions to automatically manage concurrency and optimize performance. OpenEdge handles the defaults to ensure the best experience for your workload."
         footer="A new deployment is required for changes to take effect."
         footerAction={<a className="text-sm text-link hover:underline" href="/usage">View Fluid compute metrics →</a>}
       >
@@ -108,13 +108,13 @@ export default function FunctionsSettings({ params }: { params: { project: strin
       {/* Function Regions */}
       <SettingCard
         title="Function Regions"
-        desc="These are the regions on the Hive network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
+        desc="These are the regions on the OpenEdge network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
         footer={`${fs.regions.length}/5 regions selected`}
       >
         {/* Global region map — your functions run close to your users. */}
         <div className="relative mb-6 overflow-hidden rounded-xl border border-border bg-black">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/world-map.png" alt="Hive global region network" className="w-full select-none object-cover opacity-95" />
+          <img src="/world-map.png" alt="OpenEdge global region network" className="w-full select-none object-cover opacity-95" />
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
           <div className="absolute bottom-3 left-4 flex items-center gap-2 text-xs text-white/90">
             <span className="flex h-2 w-2 animate-pulse rounded-full bg-emerald-400" />

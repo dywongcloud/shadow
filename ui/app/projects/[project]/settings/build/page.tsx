@@ -41,7 +41,7 @@ export default function BuildSettings({ params }: { params: { project: string } 
               {FRAMEWORKS.map((f) => <option key={f}>{f}</option>)}
             </select>
           </Field>
-          <Field label="Build Command" hint="The command Hive runs to build your app.">
+          <Field label="Build Command" hint="The command OpenEdge runs to build your app.">
             <Input value={b.build_command} onChange={(e) => setB({ ...b, build_command: e.target.value })} className="font-mono" />
           </Field>
           <Field label="Output Directory" hint="Directory of build output served as static assets.">

@@ -61,6 +61,7 @@ async fn gateway_handles_concurrent_requests() {
             pattern: "/api".into(),
             target: RouteTarget::Function("api".into()),
         }],
+        ..Default::default()
     };
     gw.deploy(hello_dir, manifest);
 
@@ -138,6 +139,7 @@ async fn max_duration_504_and_error_isolation() {
                 max_duration_secs: 1, // tiny budget so /api/verylong (5s) trips it
             }],
             routes: vec![Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) }],
+            ..Default::default()
         },
     );
 

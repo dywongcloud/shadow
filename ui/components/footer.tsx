@@ -53,7 +53,7 @@ export function Footer() {
           <div className="col-span-2 flex flex-col gap-3 sm:col-span-1">
             <Link href="/" className="flex items-center gap-2">
               <VercelMark />
-              <span className="text-sm font-semibold">Hive Cloud</span>
+              <span className="text-sm font-semibold">OpenEdge</span>
             </Link>
             <p className="text-xs text-secondary">
               A unified, self-hosted cloud — builds, Fluid compute, edge & data, meshed over iroh P2P.
@@ -82,7 +82,7 @@ export function Footer() {
           ))}
         </div>
         <div className="mt-10 flex flex-col items-center justify-between gap-3 border-t border-border pt-6 text-xs text-muted sm:flex-row">
-          <span>© {new Date().getFullYear()} Hive Cloud. Built on a Vercel-style platform.</span>
+          <span>© {new Date().getFullYear()} OpenEdge. Built on a Vercel-style platform.</span>
           <div className="flex items-center gap-4">
             <Link href="/network" className="hover:text-fg">Status</Link>
             <Link href="/settings" className="hover:text-fg">Privacy</Link>

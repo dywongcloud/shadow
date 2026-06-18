@@ -3,13 +3,14 @@
 import { useUser } from "@clerk/nextjs";
 
 export interface Identity {
+  id: string;
   name: string;
   email: string;
   initial: string;
   imageUrl?: string;
 }
 
-export const LOCAL_IDENTITY: Identity = { name: "You", email: "", initial: "Y" };
+export const LOCAL_IDENTITY: Identity = { id: "local", name: "You", email: "", initial: "Y" };
 
 function derive(user: ReturnType<typeof useUser>["user"]): Identity {
   const name =
@@ -19,6 +20,7 @@ function derive(user: ReturnType<typeof useUser>["user"]): Identity {
     user?.primaryEmailAddress?.emailAddress?.split("@")[0] ||
     "You";
   return {
+    id: user?.id ?? "local",
     name,
     email: user?.primaryEmailAddress?.emailAddress ?? "",
     initial: (name?.[0] || "Y").toUpperCase(),

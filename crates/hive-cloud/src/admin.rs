@@ -15,6 +15,7 @@ use hive_edge::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::process::Command;
 
 use crate::state::CloudState;
 
@@ -45,8 +46,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/cron", get(cron_list).post(cron_add))
         .route("/v1/cron/:id", delete(cron_del))
         .route("/v1/workflows", get(wf_list).post(wf_define))
-        .route("/v1/workflows/:id/run", post(wf_run))
+        .route("/v1/workflows/summary", get(wf_summary))
         .route("/v1/workflows/runs", get(wf_runs))
+        .route("/v1/workflows/runs/:id", get(wf_run_detail))
+        .route("/v1/workflows/:id/run", post(wf_run))
         .route("/v1/sandbox", post(sandbox))
         .route("/deployments", get(dep_list).post(dep_create))
         .route("/v1/deployments/:id", delete(dep_delete))
@@ -103,11 +106,30 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- Secure compute (private backend tunnels) ----
         .route("/v1/securelinks", get(securelinks_list).post(securelink_create))
         .route("/v1/securelinks/:id", delete(securelink_delete))
+        // ---- Notifications (inbox bell) ----
+        .route("/v1/notifications", get(notifications_list))
+        .route("/v1/notifications/read", post(notifications_read))
+        .route("/v1/notifications/archive-all", post(notifications_archive_all))
+        .route("/v1/notifications/:id/archive", post(notification_archive))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/admin/audit", get(admin_audit))
+        .route("/v1/admin/data", get(data_collections))
+        .route("/v1/admin/data/:collection", get(data_rows))
+        .route("/v1/admin/namespaces", get(data_namespaces))
+        .route("/v1/identity/sync", post(identity_sync))
+        // ---- Billing & compute credits ----
+        .route("/v1/billing", get(billing_get))
+        .route("/v1/billing/ledger", get(billing_ledger))
+        .route("/v1/billing/checkout", post(billing_checkout))
+        .route("/v1/billing/checkout/:id", get(billing_checkout_get))
+        .route("/v1/billing/confirm", post(billing_confirm))
+        .route("/v1/billing/charge", post(billing_charge))
+        // ---- Deployment preview / thumbnail ----
+        .route("/v1/projects/:project/preview", get(project_preview))
+        .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
         .route("/v1/incidents", get(incidents_list).post(incident_open))
         .route("/v1/incidents/:id/updates", post(incident_update))
         .with_state(cloud)
@@ -211,9 +233,14 @@ async fn project_domain_add(
     Ok(Json(json!({ "domain": b.domain, "project": project, "attached": true })))
 }
 
-async fn domains_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn domains_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
     let pairs = c.projects.all_domains();
-    Json(json!(pairs.into_iter().map(|(p, d)| json!({ "project": p, "domain": d })).collect::<Vec<_>>()))
+    Json(json!(pairs
+        .into_iter()
+        .filter(|(p, _)| norm(&c.projects.team_of(p)) == t)
+        .map(|(p, d)| json!({ "project": p, "domain": d }))
+        .collect::<Vec<_>>()))
 }
 
 // ---- Git deploy (Import Git Repository) ----
@@ -279,6 +306,10 @@ fn norm(team: &str) -> &str {
 }
 
 async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    // STRICT multi-tenant isolation: a request only ever sees the deployments for
+    // its active tenant (the Clerk org slug / team via `x-hive-team`, or an API
+    // key's team). Projects in other tenants are never returned — this is what
+    // prevents data bleeding across accounts when switching teams.
     let t = tenant(&c, &headers);
     let list: Vec<_> = c
         .gw
@@ -359,6 +390,7 @@ async fn project_redeploy(
         project: Some(project),
         creator: Some("you".into()),
         production: true,
+        root_dir: None,
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -597,8 +629,27 @@ async fn cron_del(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> J
 
 // ---- Workflows ----
 
-async fn wf_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.workflows.defs()))
+#[derive(Deserialize)]
+struct WfQuery {
+    /// Restrict to a single project.
+    project: Option<String>,
+}
+
+/// Does this workflow's project belong to the requesting team?
+fn wf_in_team(c: &Arc<CloudState>, project: &str, team: &str) -> bool {
+    norm(&c.projects.team_of(project)) == norm(team)
+}
+
+async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
+    let team = tenant(&c, &headers);
+    let defs: Vec<_> = c
+        .workflows
+        .defs()
+        .into_iter()
+        .filter(|d| wf_in_team(&c, &d.project, &team))
+        .filter(|d| q.project.as_deref().map(|p| p == d.project).unwrap_or(true))
+        .collect();
+    Json(json!(defs))
 }
 
 async fn wf_define(State(c): State<Arc<CloudState>>, Json(def): Json<WorkflowDef>) -> Json<Value> {
@@ -606,8 +657,50 @@ async fn wf_define(State(c): State<Arc<CloudState>>, Json(def): Json<WorkflowDef
     Json(json!(c.workflows.defs()))
 }
 
-async fn wf_runs(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.workflows.runs()))
+async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
+    let team = tenant(&c, &headers);
+    let runs: Vec<_> = c
+        .workflows
+        .runs()
+        .into_iter()
+        .filter(|r| wf_in_team(&c, &r.project, &team))
+        .filter(|r| q.project.as_deref().map(|p| p == r.project).unwrap_or(true))
+        .collect();
+    Json(json!(runs))
+}
+
+/// One run with full step detail (for the trace timeline).
+async fn wf_run_detail(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    c.workflows.run(&id).map(|r| Json(json!(r))).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Per-project rollup for the global "All Projects" workflows view.
+async fn wf_summary(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    use std::collections::BTreeMap;
+    let team = tenant(&c, &headers);
+    // project -> (created, completed, failed, active)
+    let mut agg: BTreeMap<String, (u64, u64, u64, u64)> = BTreeMap::new();
+    for r in c.workflows.runs() {
+        if !wf_in_team(&c, &r.project, &team) {
+            continue;
+        }
+        let proj = if r.project.is_empty() { "default".to_string() } else { r.project.clone() };
+        let e = agg.entry(proj).or_insert((0, 0, 0, 0));
+        e.0 += 1; // created
+        match r.status {
+            hive_edge::workflows::RunStatus::Succeeded => e.1 += 1,
+            hive_edge::workflows::RunStatus::Failed => e.2 += 1,
+            hive_edge::workflows::RunStatus::Running | hive_edge::workflows::RunStatus::Pending => e.3 += 1,
+            _ => {}
+        }
+    }
+    let rows: Vec<Value> = agg
+        .into_iter()
+        .map(|(project, (created, completed, failed, active))| {
+            json!({ "project": project, "created": created, "completed": completed, "failed": failed, "active": active })
+        })
+        .collect();
+    Json(json!(rows))
 }
 
 async fn wf_run(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
@@ -884,7 +977,12 @@ async fn databases_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) ->
     Json(json!(list))
 }
 
-async fn databases_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+async fn databases_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(project): Path<String>) -> Json<Value> {
+    // Only expose databases for a project the caller's tenant actually owns.
+    let t = tenant(&c, &headers);
+    if norm(&c.projects.team_of(&project)) != t {
+        return Json(json!([]));
+    }
     Json(json!(c.databases.list(Some(&project))))
 }
 
@@ -1210,20 +1308,8 @@ async fn admin_overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
 }
 
 async fn admin_audit(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    // Operational/audit feed = control-plane actions (deploys, domains, cron,
-    // WAF, incidents) drawn from the event stream.
-    let evs = c.recent_events(2000);
-    let audit: Vec<_> = evs
-        .into_iter()
-        .filter(|e| {
-            matches!(
-                e.action.as_str(),
-                "deploy" | "delete" | "domain-add" | "cron" | "waf-deny" | "throttled" | "redirect" | "rewrite"
-            )
-        })
-        .take(200)
-        .collect();
-    Json(json!(audit))
+    // The durable, append-only audit log of every state mutation (newest first).
+    Json(json!(c.audit.recent(300, None)))
 }
 
 async fn incidents_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
@@ -1249,4 +1335,516 @@ async fn incident_update(
         crate::webhooks::dispatch(&c.webhooks, "*", "incident.resolved", json!({ "id": inc.id, "title": inc.title }));
     }
     Ok(Json(json!(inc)))
+}
+
+// ---- Notifications (inbox bell) ----
+
+/// Compute the live notification list for a team from real platform signals
+/// (failed deploys, 5xx error anomalies, blocked-traffic usage anomalies),
+/// applying the user's read/archived state. Archived items keep their `archived`
+/// flag so the client can render an Archive tab.
+fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notifications::Notification> {
+    use crate::notifications::Notification;
+    use std::collections::HashMap;
+    let team = norm(team).to_string();
+    let mut out: Vec<Notification> = Vec::new();
+
+    // 1) Failed deployments.
+    for d in c.gw.list() {
+        if norm(&c.projects.team_of(&d.project)) != team {
+            continue;
+        }
+        if d.state == fluid_core::DeployState::Error {
+            let env = if d.production { "Production" } else { "Preview" };
+            out.push(Notification {
+                id: format!("deploy-{}", d.id.0),
+                severity: "warning".into(),
+                category: "deploy".into(),
+                project: d.project.clone(),
+                environment: env.into(),
+                message: format!("{} failed to deploy in the {} environment", d.project, env),
+                ts_ms: d.created_at_ms,
+                read: false,
+                archived: false,
+            });
+        }
+    }
+
+    // 1b) Failed builds (git deploys that errored before going live).
+    for b in c.builds.list() {
+        if norm(&c.projects.team_of(&b.project)) != team {
+            continue;
+        }
+        if b.state == fluid_core::DeployState::Error {
+            out.push(Notification {
+                id: format!("build-{}", b.id),
+                severity: "warning".into(),
+                category: "deploy".into(),
+                project: b.project.clone(),
+                environment: "Production".into(),
+                message: format!("{} failed to deploy in the Production environment", b.project),
+                ts_ms: b.started_ms,
+                read: false,
+                archived: false,
+            });
+        }
+    }
+
+    // 2) Error / usage anomalies from recent edge events, grouped per project.
+    let mut err5xx: HashMap<String, u64> = HashMap::new();
+    let mut blocked: HashMap<String, u64> = HashMap::new();
+    for ev in c.recent_events(300) {
+        if ev.project.is_empty() {
+            continue;
+        }
+        if norm(&c.projects.team_of(&ev.project)) != team {
+            continue;
+        }
+        if ev.status >= 500 {
+            let e = err5xx.entry(ev.project.clone()).or_insert(0);
+            *e = (*e).max(ev.ts_ms);
+        }
+        if ev.action == "waf-deny" || ev.action == "bot-block" {
+            let e = blocked.entry(ev.project.clone()).or_insert(0);
+            *e = (*e).max(ev.ts_ms);
+        }
+    }
+    for (proj, ts) in err5xx {
+        out.push(Notification {
+            id: format!("anom-5xx-{proj}"),
+            severity: "error".into(),
+            category: "anomaly".into(),
+            environment: "Production".into(),
+            message: format!("error anomaly detected for {proj}: 5xx status codes"),
+            project: proj,
+            ts_ms: ts,
+            read: false,
+            archived: false,
+        });
+    }
+    for (proj, ts) in blocked {
+        out.push(Notification {
+            id: format!("usage-blocked-{proj}"),
+            severity: "error".into(),
+            category: "usage".into(),
+            environment: "Production".into(),
+            message: format!("usage anomaly detected for {proj}: blocked requests"),
+            project: proj,
+            ts_ms: ts,
+            read: false,
+            archived: false,
+        });
+    }
+
+    for n in out.iter_mut() {
+        n.read = c.notifications.is_read(&n.id);
+        n.archived = c.notifications.is_archived(&n.id);
+    }
+    out.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
+    out
+}
+
+async fn notifications_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let team = tenant(&c, &headers);
+    let items = build_notifications(&c, &team);
+    let inbox = items.iter().filter(|n| !n.archived).count();
+    let unread = items.iter().filter(|n| !n.archived && !n.read).count();
+    Json(json!({ "unread": unread, "inbox": inbox, "items": items }))
+}
+
+async fn notification_archive(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+    c.notifications.archive(&id);
+    Json(json!({ "archived": id }))
+}
+
+async fn notifications_archive_all(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let team = tenant(&c, &headers);
+    let ids: Vec<String> = build_notifications(&c, &team)
+        .into_iter()
+        .filter(|n| !n.archived)
+        .map(|n| n.id)
+        .collect();
+    c.notifications.archive_all(&ids);
+    Json(json!({ "archived": ids.len() }))
+}
+
+async fn notifications_read(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let team = tenant(&c, &headers);
+    let ids: Vec<String> = build_notifications(&c, &team).into_iter().map(|n| n.id).collect();
+    c.notifications.mark_read(&ids);
+    Json(json!({ "read": ids.len() }))
+}
+
+// ============================ Identity sync (orgs & users) ============================
+
+#[derive(Deserialize)]
+struct SyncOrg {
+    id: String,
+    #[serde(default)]
+    slug: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    image_url: String,
+}
+
+#[derive(Deserialize)]
+struct SyncUser {
+    id: String,
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    image_url: String,
+}
+
+#[derive(Deserialize)]
+struct IdentitySyncReq {
+    user: SyncUser,
+    #[serde(default)]
+    org: Option<SyncOrg>,
+}
+
+/// The dashboard syncs the signed-in user + active org from the identity provider
+/// (Clerk). We index them into the store, scoped to the active tenant namespace.
+async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<IdentitySyncReq>) -> Json<Value> {
+    let (tenant, org_slug) = match &req.org {
+        Some(o) => {
+            let slug = if o.slug.is_empty() { o.id.clone() } else { o.slug.clone() };
+            c.identity.upsert_org(&o.id, &slug, &o.name, &o.image_url);
+            (slug.clone(), Some(slug))
+        }
+        None => ("personal".to_string(), None),
+    };
+    c.identity.upsert_user(
+        &req.user.id,
+        &req.user.email,
+        &req.user.name,
+        &req.user.image_url,
+        &tenant,
+        org_slug.as_deref(),
+    );
+    crate::persist::persist(&c);
+    Json(json!({ "ok": true, "tenant": tenant }))
+}
+
+// ============================ Billing & compute credits ============================
+
+async fn billing_get(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let acc = c.billing.account(&t);
+    Json(json!({
+        "account": acc,
+        "plans": crate::billing::PLANS,
+        "stripe": crate::billing::stripe_configured(),
+    }))
+}
+
+async fn billing_ledger(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    Json(json!(c.billing.ledger(&t)))
+}
+
+#[derive(Deserialize)]
+struct CheckoutReq {
+    /// "plan" | "credits"
+    #[serde(default = "default_kind")]
+    kind: String,
+    #[serde(default)]
+    plan: Option<String>,
+    /// For credit top-ups, the amount in cents.
+    #[serde(default)]
+    amount_cents: Option<u64>,
+}
+fn default_kind() -> String {
+    "plan".into()
+}
+
+async fn billing_checkout(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(req): Json<CheckoutReq>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let (plan, amount, label) = if req.kind == "credits" {
+        let amt = req.amount_cents.unwrap_or(1000);
+        ("".to_string(), amt, format!("OpenEdge credits (${:.2})", amt as f64 / 100.0))
+    } else {
+        let plan = req.plan.unwrap_or_else(|| "pro".into());
+        let spec = crate::billing::plan_spec(&plan);
+        (plan, spec.price_cents, format!("OpenEdge {} plan", spec.name))
+    };
+    let co = c.billing.open_checkout(&t, &req.kind, &plan, amount);
+
+    // Real Stripe Checkout when configured; otherwise the local mock checkout.
+    if crate::billing::stripe_configured() {
+        let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
+        let success = format!("{base}/billing?success={}", co.id);
+        let cancel = format!("{base}/billing?canceled=1");
+        match crate::billing::stripe_checkout(&c.http, amount, &label, &success, &cancel).await {
+            Ok(url) => return Json(json!({ "url": url, "mock": false, "session": co.id })),
+            Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
+        }
+    }
+    Json(json!({ "url": format!("/billing/checkout?session={}", co.id), "mock": true, "session": co.id }))
+}
+
+async fn billing_checkout_get(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    c.billing.get_checkout(&id).map(|co| Json(json!(co))).ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(Deserialize)]
+struct ConfirmReq {
+    session: String,
+}
+
+async fn billing_confirm(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(req): Json<ConfirmReq>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    let (co, acc) = c.billing.confirm_checkout(&req.session).ok_or(StatusCode::NOT_FOUND)?;
+    c.audit.record(&t, "user", "charge", "billing", &co.id, &format!("checkout {} {} ${:.2}", co.kind, co.plan, co.amount_cents as f64 / 100.0));
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "ok": true, "account": acc })))
+}
+
+#[derive(Deserialize)]
+struct ChargeReq {
+    cents: u64,
+    #[serde(default)]
+    note: String,
+}
+
+async fn billing_charge(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(req): Json<ChargeReq>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers);
+    let note = if req.note.is_empty() { "Compute usage".to_string() } else { req.note.clone() };
+    match c.billing.charge(&t, req.cents, &note) {
+        Ok(acc) => {
+            c.audit.record(&t, "system", "charge", "billing", "compute", &format!("{} ¢ — {}", req.cents, note));
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "ok": true, "account": acc })))
+        }
+        Err(e) => Err((StatusCode::PAYMENT_REQUIRED, e)),
+    }
+}
+
+// ============================ Ops data browser ============================
+//
+// Exposes the platform's own data — the persisted PlatformSnapshot collections
+// plus live in-memory stores — so the owner can query/view/explore the state
+// that rides the iroh/guardian-db replication mesh.
+
+/// All collections the platform stores, with row data. Ordered for the UI.
+fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
+    let mut projects: Vec<Value> = c
+        .projects
+        .snapshot()
+        .into_iter()
+        .map(|(k, v)| json!({ "project": k, "team": v.team, "domains": v.domains, "env_count": v.env.len(), "build": v.build, "functions": v.functions, "preview_protection": v.preview_protection }))
+        .collect();
+    projects.sort_by(|a, b| a["project"].as_str().unwrap_or("").cmp(b["project"].as_str().unwrap_or("")));
+
+    let wf_runs: Vec<Value> = c.workflows.runs().into_iter().map(|r| json!(r)).collect();
+    let wf_defs: Vec<Value> = c.workflows.defs().into_iter().map(|d| json!(d)).collect();
+
+    vec![
+        ("deployments", c.gw.list().into_iter().map(|d| json!(d)).collect()),
+        ("projects", projects),
+        ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
+        ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
+        ("teams", c.teams.list().into_iter().map(|t| json!(t)).collect()),
+        ("databases", c.databases.snapshot().into_iter().map(|d| json!(d)).collect()),
+        ("secure_links", c.securelinks.all().into_iter().map(|l| json!(l)).collect()),
+        ("api_keys", c.apikeys.snapshot().into_iter().map(|k| json!(k)).collect()),
+        ("builds", c.builds.list().into_iter().map(|b| json!({ "id": b.id, "project": b.project, "state": b.state, "branch": b.branch, "commit": b.commit, "commit_message": b.commit_message, "alias": b.alias, "started_ms": b.started_ms, "finished_ms": b.finished_ms, "log_lines": b.lines.len() })).collect()),
+        ("workflow_defs", wf_defs),
+        ("workflow_runs", wf_runs),
+        ("incidents", c.incidents.snapshot().into_iter().map(|i| json!(i)).collect()),
+        ("webhooks", c.webhooks.snapshot().into_iter().map(|w| json!(w)).collect()),
+        ("billing", c.billing.all_accounts().into_iter().map(|a| json!(a)).collect()),
+        ("billing_ledger", c.billing.snapshot().1.into_iter().map(|l| json!(l)).collect()),
+        ("audit_log", c.audit.recent(2000, None).into_iter().map(|a| json!(a)).collect()),
+        ("events", c.recent_events(200).into_iter().map(|e| json!(e)).collect()),
+    ]
+}
+
+/// The tenant namespaces the platform store is partitioned into, with per-record
+/// counts — the multi-tenant schema of the guardian-db / snapshot.
+async fn data_namespaces(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let snap = crate::persist::capture(&c);
+    let docs = crate::persist::namespaced(&snap);
+    let rows: Vec<Value> = docs
+        .into_iter()
+        .map(|(ns, doc)| {
+            let count = |k: &str| doc.get(k).and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+            json!({
+                "namespace": ns,
+                "projects": count("projects"),
+                "deployments": count("deployments"),
+                "databases": count("databases"),
+                "api_keys": count("api_keys"),
+                "webhooks": count("webhooks"),
+            })
+        })
+        .collect();
+    Json(json!({ "namespaces": rows }))
+}
+
+async fn data_collections(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let cols: Vec<Value> = all_collections(&c)
+        .into_iter()
+        .map(|(name, rows)| json!({ "name": name, "count": rows.len() }))
+        .collect();
+    Json(json!({ "collections": cols, "store": "guardian-db (iroh) · local snapshot" }))
+}
+
+#[derive(Deserialize)]
+struct DataQ {
+    q: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn data_rows(
+    State(c): State<Arc<CloudState>>,
+    Path(collection): Path<String>,
+    Query(q): Query<DataQ>,
+) -> Result<Json<Value>, StatusCode> {
+    let cols = all_collections(&c);
+    let rows = cols
+        .into_iter()
+        .find(|(name, _)| *name == collection)
+        .map(|(_, r)| r)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let needle = q.q.unwrap_or_default().to_lowercase();
+    let total = rows.len();
+    let mut filtered: Vec<Value> = rows
+        .into_iter()
+        .filter(|r| needle.is_empty() || r.to_string().to_lowercase().contains(&needle))
+        .collect();
+    let matched = filtered.len();
+    let limit = q.limit.unwrap_or(200).min(2000);
+    filtered.truncate(limit);
+    Ok(Json(json!({ "collection": collection, "total": total, "matched": matched, "rows": filtered })))
+}
+
+// ============================ Deployment preview / thumbnail ============================
+
+/// Preview metadata for a project's production deployment: a site thumbnail for
+/// frontends, or the JSON/text body for backend services.
+async fn project_preview(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+) -> Json<Value> {
+    let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
+        .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
+    let Some(dep) = dep else {
+        return Json(json!({ "kind": "none" }));
+    };
+    let alias = dep.alias.clone();
+    let is_frontend = dep.kind == "static" || dep.kind == "fullstack";
+    if is_frontend {
+        return Json(json!({
+            "kind": "image",
+            "url": format!("/v1/projects/{}/thumbnail", urlencode(&project)),
+            "alias": alias,
+        }));
+    }
+    // Backend service: fetch "/" through the gateway and return the body.
+    let base = c.public_base.clone();
+    let resp = c.http.get(format!("{base}/")).header("host", &alias).send().await;
+    match resp {
+        Ok(r) => {
+            let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+            let status = r.status().as_u16();
+            let body = r.text().await.unwrap_or_default();
+            let trimmed: String = body.chars().take(4000).collect();
+            let kind = if ct.contains("json") || trimmed.trim_start().starts_with('{') || trimmed.trim_start().starts_with('[') {
+                "json"
+            } else {
+                "text"
+            };
+            Json(json!({ "kind": kind, "status": status, "content_type": ct, "body": trimmed, "alias": alias }))
+        }
+        Err(e) => Json(json!({ "kind": "text", "body": format!("(no response: {e})"), "alias": alias })),
+    }
+}
+
+fn urlencode(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') { c.to_string() } else { format!("%{:02X}", c as u32) })
+        .collect()
+}
+
+/// A PNG thumbnail of the deployed site, captured with headless Chrome and
+/// cached per deployment. Falls back to a generated SVG card if capture fails.
+async fn project_thumbnail(
+    State(c): State<Arc<CloudState>>,
+    Path(project): Path<String>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
+        .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
+    let Some(dep) = dep else {
+        return (StatusCode::NOT_FOUND, "no deployment").into_response();
+    };
+    let cache = crate::persist::data_dir().join("thumbnails");
+    let _ = tokio::fs::create_dir_all(&cache).await;
+    let png = cache.join(format!("{}.png", dep.id.as_str()));
+
+    if !png.exists() {
+        let _ = capture_thumbnail(&dep.alias, &png).await;
+    }
+    if let Ok(bytes) = tokio::fs::read(&png).await {
+        return ([(axum::http::header::CONTENT_TYPE, "image/png"), (axum::http::header::CACHE_CONTROL, "public, max-age=60")], bytes).into_response();
+    }
+    // Fallback: a simple SVG placeholder card.
+    let svg = thumbnail_placeholder(&project);
+    ([(axum::http::header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
+}
+
+/// Capture a screenshot of `http://<alias>:<gateway-port>/` with headless Chrome.
+async fn capture_thumbnail(alias: &str, out: &std::path::Path) -> anyhow::Result<()> {
+    // The gateway serves on the public port; derive it from public_base later if
+    // needed — default 8787 for the local mesh.
+    let port = std::env::var("HIVE_PUBLIC_PORT").unwrap_or_else(|_| "8787".into());
+    let url = format!("http://{alias}:{port}/");
+    let chrome = chrome_path();
+    let status = tokio::time::timeout(
+        Duration::from_secs(20),
+        Command::new(&chrome)
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg("--no-sandbox")
+            .arg("--hide-scrollbars")
+            .arg("--window-size=1280,800")
+            .arg(format!("--screenshot={}", out.to_string_lossy()))
+            .arg(&url)
+            .output(),
+    )
+    .await??;
+    anyhow::ensure!(status.status.success() && out.exists(), "chrome screenshot failed");
+    Ok(())
+}
+
+fn chrome_path() -> String {
+    if let Ok(p) = std::env::var("CHROME_PATH") {
+        return p;
+    }
+    for p in [
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+    ] {
+        if std::path::Path::new(p).exists() {
+            return p.to_string();
+        }
+    }
+    "google-chrome".into()
+}
+
+fn thumbnail_placeholder(project: &str) -> String {
+    format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="800" viewBox="0 0 1280 800">
+  <rect width="1280" height="800" fill="#0a0a0a"/>
+  <polygon points="640,330 700,430 580,430" fill="#ededed"/>
+  <text x="640" y="500" fill="#ededed" font-family="sans-serif" font-size="40" text-anchor="middle">{project}</text>
+  <text x="640" y="548" fill="#888" font-family="sans-serif" font-size="22" text-anchor="middle">Deployed on OpenEdge</text>
+</svg>"##
+    )
 }

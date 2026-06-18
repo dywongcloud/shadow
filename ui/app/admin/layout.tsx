@@ -10,6 +10,7 @@ import {
   Server,
   ScrollText,
   ArrowLeft,
+  Table2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
@@ -19,6 +20,7 @@ const nav = [
   { href: "/admin/incidents", label: "Incidents", icon: Siren },
   { href: "/admin/teams", label: "Teams", icon: Users },
   { href: "/admin/databases", label: "Databases", icon: Database },
+  { href: "/admin/data", label: "Data Browser", icon: Table2 },
   { href: "/admin/nodes", label: "Infrastructure", icon: Server },
   { href: "/admin/audit", label: "Audit log", icon: ScrollText },
 ];
