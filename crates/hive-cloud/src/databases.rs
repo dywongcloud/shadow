@@ -364,6 +364,13 @@ pub fn provision(
             match outcome {
                 Ok((mode, conn, container)) => {
                     d.status = DbStatus::Ready;
+                    // Make the fallback explicit: a "simulated" DB has no real
+                    // backing engine (e.g. podman unavailable). The record's `mode`
+                    // surfaces this in the UI; log it so it's never silent.
+                    if mode == "simulated" {
+                        tracing::warn!(db = %id, kind = ?req.kind, "database provisioned in SIMULATED mode (no live backing engine — install podman for a real instance)");
+                        d.note = "Simulated: no live backing engine available (install podman for a real instance).".into();
+                    }
                     d.mode = mode;
                     d.connection = conn;
                     d.container = container;

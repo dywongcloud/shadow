@@ -70,6 +70,7 @@ fluid-compute = { path = "crates/fluid-compute" }
 fluid-gateway = { path = "crates/fluid-gateway" }
 hive-wg = { path = "crates/hive-wg" }
 hive-edge = { path = "crates/hive-edge" }
+hive-p2p = { path = "crates/hive-p2p" }
 
 [profile.release]
 opt-level = 3

@@ -309,6 +309,21 @@ impl Gateway {
         }
         st.default.as_ref().and_then(|id| st.deployments.get(id).cloned())
     }
+
+    /// Does THIS node actually have a deployment aliased for `host`'s subdomain?
+    /// Exact alias match (no default fallback) — used by mesh routing to decide
+    /// whether to serve locally or proxy to the peer that really hosts it.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let h = host.split(':').next().unwrap_or(host);
+        let sub = h.split('.').next().unwrap_or(h);
+        self.state.lock().aliases.contains_key(sub)
+    }
+
+    /// All host subdomains this node serves (project aliases + deployment ids),
+    /// published to peers so the mesh knows where each deployment lives.
+    pub fn served_hosts(&self) -> Vec<String> {
+        self.state.lock().aliases.keys().cloned().collect()
+    }
 }
 
 // ---- routers ---------------------------------------------------------------

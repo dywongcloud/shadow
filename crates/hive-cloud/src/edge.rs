@@ -55,6 +55,89 @@ pub async fn edge_pipeline(
         return next.run(req).await;
     }
 
+    // ---- Cross-node mesh routing ------------------------------------------------
+    // If this node doesn't host the requested deployment but a peer in the mesh
+    // does, reverse-proxy the request to the best peer: same-region first, then
+    // lowest latency (anycast), failing over to the next peer on a connection
+    // error. `x-hive-proxied` breaks loops. This is what turns N nodes into one
+    // cloud — hit any node, the request reaches wherever the deployment lives.
+    let already_proxied = header(&headers_vec, "x-hive-proxied").is_some();
+    if !already_proxied && !host.is_empty() && !cloud.gw.serves_host(&host) {
+        let sub = host
+            .split(':').next().unwrap_or(&host)
+            .split('.').next().unwrap_or(&host)
+            .to_string();
+        let mut cands: Vec<crate::state::PeerRoute> = cloud
+            .peer_routes
+            .read()
+            .get(&sub)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.healthy)
+            .collect();
+        if !cands.is_empty() {
+            cands.sort_by_key(|r| (if r.region == region { 0u8 } else { 1u8 }, r.latency_ms));
+            let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+            let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+            let (_parts, body) = req.into_parts();
+            let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+            for cand in &cands {
+                let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
+                let mut rb = cloud
+                    .http
+                    .request(rmethod.clone(), &url)
+                    .header("host", &host)
+                    .header("x-hive-proxied", "1")
+                    .timeout(std::time::Duration::from_secs(30))
+                    .body(body_bytes.clone());
+                for (k, v) in &headers_vec {
+                    let lk = k.to_lowercase();
+                    if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied") {
+                        continue;
+                    }
+                    rb = rb.header(k, v);
+                }
+                match rb.send().await {
+                    Ok(r) => {
+                        let status = r.status();
+                        let rheaders = r.headers().clone();
+                        let bytes = r.bytes().await.unwrap_or_default();
+                        let mut builder = Response::builder().status(status.as_u16());
+                        for (k, v) in rheaders.iter() {
+                            let lk = k.as_str().to_lowercase();
+                            // Skip hop-by-hop headers — the body length is re-derived.
+                            if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
+                                continue;
+                            }
+                            if let (Ok(name), Ok(val)) = (
+                                HeaderName::from_bytes(k.as_str().as_bytes()),
+                                HeaderValue::from_bytes(v.as_bytes()),
+                            ) {
+                                builder = builder.header(name, val);
+                            }
+                        }
+                        let mut out = builder
+                            .body(Body::from(bytes))
+                            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                        set(&mut out, "x-hive-routed-to", &cand.node_id);
+                        set(&mut out, "x-hive-region", &region);
+                        let ev = cloud.event(&region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
+                        cloud.record(ev);
+                        return out;
+                    }
+                    Err(_) => continue, // peer down → fail over to the next candidate
+                }
+            }
+            // Every candidate peer failed.
+            let ev = cloud.event(&region, &method, &host, &path, 502, "mesh-route-fail", &sub);
+            cloud.record(ev);
+            let mut resp = (StatusCode::BAD_GATEWAY, "no healthy node could serve this deployment").into_response();
+            set(&mut resp, "x-hive-region", &region);
+            return resp;
+        }
+    }
+
     // -1) L7 DDoS mitigation: shed per-IP floods before any compute work.
     if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
         let ev = cloud.event(&region, &method, &host, &path, 429, "rate-limited", &ip);

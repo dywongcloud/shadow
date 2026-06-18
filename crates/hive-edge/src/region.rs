@@ -18,6 +18,10 @@ pub struct NodeInfo {
     pub public_url: String,
     /// iroh endpoint id, for P2P reachability across networks.
     pub peer_id: Option<String>,
+    /// iroh dialable address (JSON: direct socket addrs + relay), so peers can
+    /// open a QUIC tunnel to this node directly. Populated when P2P is bound.
+    #[serde(default)]
+    pub iroh_addr: Option<String>,
     pub last_seen_ms: u64,
     #[serde(default)]
     pub is_self: bool,
@@ -37,6 +41,13 @@ pub struct NodeInfo {
     pub city: Option<String>,
     #[serde(default)]
     pub country: Option<String>,
+    /// Static host capacity (for real cluster resource totals = sum over nodes).
+    #[serde(default)]
+    pub cpu_cores: u32,
+    #[serde(default)]
+    pub mem_total_mb: u64,
+    #[serde(default)]
+    pub disk_total_gb: u64,
 }
 
 pub struct NodeRegistry {
@@ -151,6 +162,7 @@ mod tests {
             region: region.into(),
             public_url: format!("http://{id}:8787"),
             peer_id: None,
+            iroh_addr: None,
             last_seen_ms: now_ms(),
             is_self: false,
             latency_ms: latency,
@@ -159,6 +171,9 @@ mod tests {
             lon: None,
             city: None,
             country: None,
+            cpu_cores: 0,
+            mem_total_mb: 0,
+            disk_total_gb: 0,
         }
     }
 

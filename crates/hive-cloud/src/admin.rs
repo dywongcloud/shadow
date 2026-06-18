@@ -24,6 +24,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/overview", get(overview))
         .route("/v1/nodes", get(nodes))
+        .route("/v1/serve-hosts", get(serve_hosts))
+        .route("/v1/resources", get(resources_get))
         .route("/v1/cluster", get(cluster_status))
         .route("/v1/anycast", get(anycast_table))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
@@ -563,6 +565,43 @@ async fn build_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     c.builds.get(&id).map(|b| Json(json!(b))).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Publish the host subdomains this node serves + its gateway URL, so peers can
+/// build their cross-node routing tables (the mesh routes requests to wherever a
+/// deployment actually lives).
+async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!({
+        "node": c.node_name,
+        "region": c.region,
+        "gateway": c.public_base,
+        "hosts": c.gw.served_hosts(),
+    }))
+}
+
+/// REAL cluster resource accounting: this node's live CPU/mem/disk/network usage
+/// (sysinfo) plus cluster TOTALS = sum of every live node's capacity (gossiped via
+/// NodeInfo). Answers "available compute / storage / bandwidth across the mesh".
+async fn resources_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let nodes = c.registry.nodes();
+    let cpu_cores: u64 = nodes.iter().map(|n| n.cpu_cores as u64).sum();
+    let mem_total_mb: u64 = nodes.iter().map(|n| n.mem_total_mb).sum();
+    let disk_total_gb: u64 = nodes.iter().map(|n| n.disk_total_gb).sum();
+    let usage = crate::resources::live().await;
+    Json(json!({
+        "cluster": {
+            "nodes": nodes.len(),
+            "cpu_cores": cpu_cores,
+            "mem_total_mb": mem_total_mb,
+            "disk_total_gb": disk_total_gb,
+        },
+        "node": serde_json::to_value(&usage).unwrap_or_default(),
+        "nodes": nodes.iter().map(|n| json!({
+            "name": n.name, "region": n.region,
+            "cpu_cores": n.cpu_cores, "mem_total_mb": n.mem_total_mb, "disk_total_gb": n.disk_total_gb,
+            "city": n.city, "country": n.country, "healthy": n.healthy,
+        })).collect::<Vec<_>>(),
+    }))
 }
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
@@ -1903,6 +1942,12 @@ async fn admin_overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
         "incidents_open": c.incidents.open_count(),
         "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
         "webhooks": c.webhooks.list(None).len(),
+        // Real cluster capacity = sum of every live node's host resources.
+        "resources": {
+            "cpu_cores": nodes.iter().map(|n| n.cpu_cores as u64).sum::<u64>(),
+            "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
+            "disk_total_gb": nodes.iter().map(|n| n.disk_total_gb).sum::<u64>(),
+        },
     }))
 }
 

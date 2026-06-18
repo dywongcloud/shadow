@@ -13,11 +13,51 @@
 //!   byte stream a [`fluid_tunnel::TunnelClient`] can drive (the gateway side).
 
 use anyhow::Result;
-use iroh::{endpoint::presets::N0, Endpoint, EndpointAddr};
+use iroh::{endpoint::presets::N0, EndpointAddr};
 use tokio::io::{AsyncRead, AsyncWrite};
+
+// Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
+pub use iroh::Endpoint;
 
 /// ALPN identifying the Hive function-tunnel protocol over iroh.
 pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
+
+/// Serialize this endpoint's dialable address (direct socket addrs + relay url) to
+/// JSON, so peers can learn it via gossip and dial directly — no DNS/relay
+/// discovery round-trip required.
+pub fn addr_json(ep: &Endpoint) -> Option<String> {
+    serde_json::to_string(&ep.addr()).ok()
+}
+
+/// A response collected from a single P2P tunnel request (gateway side).
+pub struct TunnelResp {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// High-level gateway-side call: dial a peer from its gossiped `addr_json`, send
+/// ONE HTTP request over a fresh P2P (iroh QUIC) tunnel, and return the full
+/// response. This is what lets node A serve node B's deployment over the mesh.
+pub async fn dial_request(
+    ep: &Endpoint,
+    addr_json: &str,
+    method: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: &[u8],
+) -> Result<TunnelResp> {
+    let addr: EndpointAddr = serde_json::from_str(addr_json)?;
+    let stream = dial(ep, addr).await?;
+    let client = fluid_tunnel::TunnelClient::new(stream);
+    let resp = client.request(method, path, headers, body).await?;
+    let mut buf = Vec::new();
+    let mut rx = resp.body;
+    while let Some(chunk) = rx.recv().await {
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(TunnelResp { status: resp.status, headers: resp.headers, body: buf })
+}
 
 /// Bind an iroh endpoint that can accept Hive tunnels (N0 preset = relay + DNS
 /// discovery so peers are reachable by endpoint id from anywhere).

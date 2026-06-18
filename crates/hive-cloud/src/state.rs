@@ -14,6 +14,18 @@ use hive_edge::{
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
+/// A peer node that serves a given deployment (for mesh routing/load-balancing).
+#[derive(Clone, Serialize)]
+pub struct PeerRoute {
+    pub node_id: String,
+    pub region: String,
+    /// The peer's public gateway base URL (e.g. http://192.168.1.20:8787).
+    pub gateway: String,
+    /// Last-known round-trip latency (ms) for anycast ordering.
+    pub latency_ms: u64,
+    pub healthy: bool,
+}
+
 /// One observed request/event, for the dashboard's live log + analytics.
 #[derive(Clone, Serialize)]
 pub struct Event {
@@ -57,6 +69,10 @@ pub struct CloudState {
     pub gitops: crate::gitops::GitOpsStore,
     /// Mesh peer admin URLs (for P2P build-cache pulls).
     pub peers: RwLock<Vec<String>>,
+    /// Cross-node routing table: deployment subdomain -> peer nodes that serve it
+    /// (learned via gossip). Lets any node route/load-balance requests to the node
+    /// that actually hosts a deployment.
+    pub peer_routes: RwLock<std::collections::HashMap<String, Vec<PeerRoute>>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
@@ -124,6 +140,7 @@ impl CloudState {
             teams,
             gitops: crate::gitops::GitOpsStore::new(),
             peers: RwLock::new(Vec::new()),
+            peer_routes: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),

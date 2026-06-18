@@ -10,6 +10,7 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 iroh = "1"
+serde_json = { workspace = true }
 
 [[bin]]
 name = "p2p-demo"

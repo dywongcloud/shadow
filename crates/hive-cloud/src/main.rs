@@ -25,6 +25,7 @@ mod metrics;
 mod notifications;
 mod persist;
 mod project_settings;
+mod resources;
 mod securelink;
 mod state;
 mod teams;
@@ -39,6 +40,7 @@ use std::time::Duration;
 use clap::Parser;
 use fluid_compute::{Fluid, FluidConfig};
 use fluid_gateway::Gateway;
+use hive_backend::firecracker::{FirecrackerBackend, FirecrackerConfig};
 use hive_backend::mock::{MockBackend, MockConfig};
 use hive_backend::CellBackend;
 use hive_controlplane::{BoxConfig, Hive, HiveConfig};
@@ -89,12 +91,28 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let args = Args::parse();
 
-    // Shared isolation backend (mock here; swap for firecracker inside Lima).
-    let backend: Arc<dyn CellBackend> = Arc::new(MockBackend::new(MockConfig {
-        root: std::env::temp_dir().join("hive-cloud-cells"),
-        provision_latency: Duration::from_millis(200),
-        cache_root: std::env::temp_dir().join("hive-cloud-cache"),
-    }));
+    // Shared isolation backend. The ONLY component that is allowed to be mocked
+    // (and only when a real microVM host isn't available): we auto-select the real
+    // Firecracker microVM backend whenever the host supports it (Linux + /dev/kvm),
+    // and fall back to the sandboxed child-process MockBackend otherwise (e.g. local
+    // dev on macOS). `HIVE_FORCE_MOCK=1` forces the mock for local development.
+    let force_mock = std::env::var("HIVE_FORCE_MOCK").map(|v| v == "1").unwrap_or(false);
+    let firecracker = FirecrackerBackend::new(FirecrackerConfig::default());
+    let backend: Arc<dyn CellBackend> = if firecracker.is_supported() && !force_mock {
+        tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
+        Arc::new(firecracker)
+    } else {
+        if force_mock {
+            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
+        } else {
+            tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
+        }
+        Arc::new(MockBackend::new(MockConfig {
+            root: std::env::temp_dir().join("hive-cloud-cells"),
+            provision_latency: Duration::from_millis(200),
+            cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+        }))
+    };
 
     // Serving (Fluid) + builds (Hive control plane).
     let fluid = Fluid::start(backend.clone(), FluidConfig::default());
@@ -130,12 +148,32 @@ async fn main() -> anyhow::Result<()> {
     if let Some(g) = &geo {
         tracing::info!(city = %g.2, country = %g.3, lat = g.0, lon = g.1, "node geolocated");
     }
+    let cap = resources::capacity();
+    // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
+    // node has a real peer id and can serve/accept Hive tunnels across networks.
+    // Best-effort with a timeout: if it can't bind (offline), the node still boots
+    // and the HTTP mesh keeps working.
+    let iroh_ep = match tokio::time::timeout(Duration::from_secs(8), hive_p2p::bind()).await {
+        Ok(Ok(ep)) => {
+            tracing::info!(peer_id = %ep.id(), "iroh P2P endpoint bound (real QUIC mesh)");
+            Some(ep)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "iroh bind failed — P2P transport disabled (HTTP mesh still routes)");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("iroh bind timed out — P2P transport disabled (HTTP mesh still routes)");
+            None
+        }
+    };
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
         region: args.region.clone(),
         public_url: public_base.clone(),
-        peer_id: None,
+        peer_id: iroh_ep.as_ref().map(|e| e.id().to_string()),
+        iroh_addr: iroh_ep.as_ref().and_then(hive_p2p::addr_json),
         last_seen_ms: now_ms(),
         is_self: true,
         latency_ms: 0,
@@ -144,7 +182,11 @@ async fn main() -> anyhow::Result<()> {
         lon: geo.as_ref().map(|g| g.1),
         city: geo.as_ref().map(|g| g.2.clone()),
         country: geo.as_ref().map(|g| g.3.clone()),
+        cpu_cores: cap.0,
+        mem_total_mb: cap.1,
+        disk_total_gb: cap.2,
     };
+    tracing::info!(cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, "node host capacity");
     let registry = NodeRegistry::new(me);
 
     let cloud = CloudState::new(
@@ -319,8 +361,12 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
 }
 
 fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
+    use std::collections::HashMap;
     tokio::spawn(async move {
         loop {
+            // Rebuild the cross-node routing table from scratch each cycle so stale
+            // routes (peers that no longer host a deployment) age out.
+            let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
             for peer in &peers {
                 // Announce ourselves, and learn the peer's view of the cloud.
                 let me = cloud.registry.me();
@@ -332,6 +378,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                     .send()
                     .await;
                 let t0 = now_ms();
+                let mut rtt = 0u64;
                 if let Ok(resp) = cloud
                     .http
                     .get(format!("{peer}/v1/nodes"))
@@ -340,7 +387,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                     .await
                 {
                     // Round-trip latency to this peer (for anycast selection).
-                    let rtt = now_ms().saturating_sub(t0);
+                    rtt = now_ms().saturating_sub(t0);
                     if let Ok(nodes) = resp.json::<Vec<NodeInfo>>().await {
                         // The peer lists itself first (its `me()`); record its latency.
                         let peer_self_id = nodes.first().map(|n| n.id.clone());
@@ -354,7 +401,35 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                         }
                     }
                 }
+                // Learn which deployments this peer serves → routing table.
+                if let Ok(resp) = cloud
+                    .http
+                    .get(format!("{peer}/v1/serve-hosts"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let region = v.get("region").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        let gateway = v.get("gateway").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        if !gateway.is_empty() && node_id != cloud.node_name {
+                            if let Some(hosts) = v.get("hosts").and_then(|x| x.as_array()) {
+                                for h in hosts.iter().filter_map(|x| x.as_str()) {
+                                    routes.entry(h.to_string()).or_default().push(crate::state::PeerRoute {
+                                        node_id: node_id.clone(),
+                                        region: region.clone(),
+                                        gateway: gateway.clone(),
+                                        latency_ms: rtt,
+                                        healthy: true,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
             }
+            *cloud.peer_routes.write() = routes;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
