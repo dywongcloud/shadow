@@ -12,8 +12,13 @@ export default function FunctionsSettings({ params }: { params: { project: strin
   const [catalog, setCatalog] = useState<RegionCatalog>({});
   const [maxDur, setMaxDur] = useState("300");
   const [open, setOpen] = useState<Record<string, boolean>>({ "North America": true });
+  const [plan, setPlan] = useState("hobby");
 
   const [err, setErr] = useState("");
+
+  // Plan-tier limits (mirror the backend: billing::plan_max_duration_secs etc.).
+  const planMax = plan === "enterprise" ? 3600 : plan === "pro" ? 800 : 300;
+  const canFailover = plan === "enterprise";
 
   async function load() {
     try {
@@ -38,6 +43,7 @@ export default function FunctionsSettings({ params }: { params: { project: strin
   useEffect(() => {
     load();
     apiGet<RegionCatalog>("/v1/regions/catalog").then(setCatalog).catch(() => {});
+    apiGet<{ account?: { plan?: string } }>("/v1/billing").then((d) => setPlan(d.account?.plan || "hobby")).catch(() => {});
   }, [project]);
 
   async function save(next: FunctionSettings) {
@@ -78,19 +84,19 @@ export default function FunctionsSettings({ params }: { params: { project: strin
             optionally override it at the function level. A new deployment is required for changes to take effect.
           </>
         }
-        footer="Default 300s · Pro max 800s · extended up to 1800s (beta)."
+        footer={`Hobby max 300s · Pro max 800s · Enterprise max 3600s (1 hour). Your plan (${plan}) allows up to ${planMax}s.`}
         footerAction={
           <Button
-            onClick={() => save({ ...fs, default_max_duration_secs: Math.max(1, parseInt(maxDur || "300", 10)) })}
+            onClick={() => save({ ...fs, default_max_duration_secs: Math.min(planMax, Math.max(1, parseInt(maxDur || "300", 10))) })}
           >
             Save
           </Button>
         }
       >
         <div className="rounded-lg border border-border bg-subtle p-4 text-sm text-secondary">
-          <span className="font-medium text-fg">Longer functions:</span> to run a function up to 30 minutes, set{" "}
-          <code className="font-mono text-xs">maxDuration</code> on that function in code or <code className="font-mono text-xs">fluid.json</code>.
-          Project-level defaults up to 800 seconds are supported.
+          <span className="font-medium text-fg">Longer functions:</span> {plan === "enterprise"
+            ? "your Enterprise plan supports function runtimes up to 1 hour (3600s)."
+            : <>upgrade to <span className="font-medium text-fg">Enterprise</span> for 1-hour (3600s) function runtimes. Your current cap is {planMax}s.</>}
         </div>
         <div className="mt-4">
           <label className="mb-1.5 block text-sm text-secondary">Default Max Duration</label>
@@ -114,7 +120,7 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         {/* Global region map — your functions run close to your users. */}
         <div className="relative mb-6 overflow-hidden rounded-xl border border-border bg-black">
           {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/world-map.png" alt="OpenEdge global region network" className="w-full select-none object-cover opacity-95" />
+          <img src="/world-dots.png" alt="OpenEdge global region network" className="w-full select-none object-cover opacity-95" />
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
           <div className="absolute bottom-3 left-4 flex items-center gap-2 text-xs text-white/90">
             <span className="flex h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
@@ -174,15 +180,23 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         </div>
       </SettingCard>
 
-      {/* Function Failover */}
+      {/* Function Failover — automatic multi-region fail-over is Enterprise-only. */}
       <SettingCard
-        title="Function Failover"
-        desc="Automatically failover functions to the nearest region. You can customize regions through fluid.json. A new deployment is required for changes to take effect."
-        footer="Multi-region failover."
+        title="Automatic Region Fail-over"
+        desc="Automatically fail functions over to the nearest healthy region when one becomes unavailable. A new deployment is required for changes to take effect."
+        footer={canFailover ? "Enterprise: automatic multi-region fail-over." : "Available on the Enterprise plan."}
       >
         <div className="flex items-center gap-3">
-          <Switch checked={fs.failover} onChange={(v) => save({ ...fs, failover: v })} label="Failover" />
+          <Switch
+            checked={fs.failover}
+            disabled={!canFailover}
+            onChange={(v) => canFailover && save({ ...fs, failover: v })}
+            label="Failover"
+          />
           <span className="text-sm font-medium">{fs.failover ? "Enabled" : "Disabled"}</span>
+          {!canFailover && (
+            <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-medium text-amber-600 dark:text-amber-400">Enterprise</span>
+          )}
         </div>
       </SettingCard>
     </div>

@@ -43,8 +43,8 @@ function VercelMark() {
 
 export function Footer() {
   const pathname = usePathname();
-  // The ops console + auth pages render their own minimal chrome.
-  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up")) return null;
+  // The ops console + auth + public status pages render their own chrome.
+  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status")) return null;
 
   return (
     <footer className="mt-16 border-t border-border bg-subtle/40">

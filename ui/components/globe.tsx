@@ -22,7 +22,7 @@ export function GlobeEmptyState({ title, desc }: { title: string; desc?: string 
       )}
       <div className="pointer-events-none mt-6 flex justify-center">
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={src} alt="" className="w-full max-w-[688px] select-none opacity-90" />
+        <img src={src} alt="" className="w-full select-none opacity-90" />
       </div>
     </div>
   );

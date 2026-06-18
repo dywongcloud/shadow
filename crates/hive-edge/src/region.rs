@@ -27,6 +27,16 @@ pub struct NodeInfo {
     /// Health (responding to probes). Anycast skips unhealthy nodes.
     #[serde(default = "crate::default_true_pub")]
     pub healthy: bool,
+    /// Auto-detected geographic location (from IP geolocation at startup), so the
+    /// node reports its real-world position for the regions map + region picker.
+    #[serde(default)]
+    pub lat: Option<f64>,
+    #[serde(default)]
+    pub lon: Option<f64>,
+    #[serde(default)]
+    pub city: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 pub struct NodeRegistry {
@@ -127,5 +137,60 @@ impl NodeRegistry {
             }
         }
         nodes.into_iter().next()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: &str, region: &str, latency: u64, healthy: bool) -> NodeInfo {
+        NodeInfo {
+            id: id.into(),
+            name: id.into(),
+            region: region.into(),
+            public_url: format!("http://{id}:8787"),
+            peer_id: None,
+            last_seen_ms: now_ms(),
+            is_self: false,
+            latency_ms: latency,
+            healthy,
+            lat: None,
+            lon: None,
+            city: None,
+            country: None,
+        }
+    }
+
+    #[test]
+    fn registry_tracks_self_and_peers() {
+        let reg = NodeRegistry::new(node("self", "iad1", 0, true));
+        assert_eq!(reg.nodes().len(), 1);
+        reg.upsert_peer(node("peer-sfo", "sfo1", 20, true));
+        reg.upsert_peer(node("peer-fra", "fra1", 80, true));
+        assert_eq!(reg.nodes().len(), 3);
+        assert_eq!(reg.regions(), vec!["fra1", "iad1", "sfo1"]);
+    }
+
+    #[test]
+    fn anycast_prefers_region_then_lowest_latency() {
+        let reg = NodeRegistry::new(node("self", "iad1", 0, true));
+        reg.upsert_peer(node("sfo", "sfo1", 10, true));
+        reg.upsert_peer(node("fra", "fra1", 5, true));
+        // Preferred region wins even if not the lowest latency.
+        assert_eq!(reg.anycast(Some("sfo1")).unwrap().region, "sfo1");
+        // No preference → lowest latency healthy node (self at 0ms).
+        assert_eq!(reg.anycast(None).unwrap().id, "self");
+    }
+
+    #[test]
+    fn anycast_fails_over_past_unhealthy_nodes() {
+        let reg = NodeRegistry::new(node("self", "iad1", 0, true));
+        reg.upsert_peer(node("sfo", "sfo1", 10, true));
+        // Mark the preferred region's node unhealthy → anycast skips it.
+        reg.set_health("sfo", 10, false);
+        let pick = reg.anycast(Some("sfo1")).unwrap();
+        assert!(pick.healthy);
+        assert_ne!(pick.id, "sfo");
     }
 }

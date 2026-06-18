@@ -285,7 +285,7 @@ export default function DeployPage({ params }: { params: { id: string } }) {
 
         {/* Footer */}
         <div className="flex flex-col gap-3 border-t border-border px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
-          <div className="flex items-center gap-2 text-sm text-secondary">
+          <div className="flex min-w-0 items-center gap-2 text-sm text-secondary">
             {build?.commit_message ? (
               <>
                 <GitBranch className="h-3.5 w-3.5" />
@@ -297,14 +297,14 @@ export default function DeployPage({ params }: { params: { id: string } }) {
             )}
           </div>
           {ready && build?.alias ? (
-            <div className="flex gap-2">
+            <div className="flex shrink-0 gap-2">
               <a href={`http://${build.alias}:8787/`} target="_blank" rel="noreferrer">
-                <Button variant="outline">
+                <Button variant="outline" className="whitespace-nowrap">
                   Visit <ExternalLink className="h-3.5 w-3.5" />
                 </Button>
               </a>
               <Link href={`/projects/${encodeURIComponent(build.project)}`}>
-                <Button>Continue to Project</Button>
+                <Button className="whitespace-nowrap">Continue to Project</Button>
               </Link>
             </div>
           ) : errored ? (

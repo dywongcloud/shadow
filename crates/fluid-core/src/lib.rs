@@ -270,6 +270,9 @@ pub enum DeployState {
     Ready,
     Error,
 }
+impl Default for DeployState {
+    fn default() -> Self { DeployState::Ready }
+}
 
 /// Serializable snapshot of a deployment (for persistence + restore).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -282,6 +285,10 @@ pub struct DeployRecord {
     pub creator: String,
     pub git: Option<GitSource>,
     pub production: bool,
+    /// Final lifecycle state (so a failed build stays "error" across restarts).
+    /// Defaults to `ready` for back-compat with snapshots written before this field.
+    #[serde(default)]
+    pub state: DeployState,
 }
 
 /// A registered deployment (manifest + where its files live).
@@ -395,5 +402,49 @@ mod tests {
         assert_eq!(m.resolve("/api/users"), RouteTarget::Function("api".into()));
         assert_eq!(m.resolve("/api/admin/x"), RouteTarget::Function("admin".into()));
         assert!(!path_matches("/api", "/apixyz"));
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    #[test]
+    fn deploy_state_defaults_to_ready() {
+        assert_eq!(DeployState::default(), DeployState::Ready);
+    }
+
+    #[test]
+    fn manifest_resolve_longest_prefix_wins() {
+        let m = Manifest {
+            routes: vec![
+                Route { pattern: "/".into(), target: RouteTarget::Static },
+                Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(m.resolve("/api/users"), RouteTarget::Function("api".into()));
+        assert_eq!(m.resolve("/index.html"), RouteTarget::Static);
+    }
+
+    #[test]
+    fn manifest_redirect_and_rewrite() {
+        let m = Manifest {
+            redirects: vec![Redirect { source: "/old".into(), destination: "/new".into(), status: 308 }],
+            rewrites: vec![Rewrite { source: "/proxy".into(), destination: "/internal".into() }],
+            ..Default::default()
+        };
+        assert_eq!(m.redirect_for("/old"), Some(("/new".to_string(), 308)));
+        assert_eq!(m.redirect_for("/nope"), None);
+        assert_eq!(m.rewrite_path("/proxy"), "/internal");
+        assert_eq!(m.rewrite_path("/untouched"), "/untouched");
+    }
+
+    #[test]
+    fn deploy_record_state_defaults_when_absent() {
+        // Snapshots written before `state` existed deserialize to Ready.
+        let json = r#"{"id":"d1","project":"p","root":"/tmp","manifest":{"project":"p"},"created_at_ms":0,"creator":"you","git":null,"production":true}"#;
+        let rec: DeployRecord = serde_json::from_str(json).expect("deserializes without state");
+        assert_eq!(rec.state, DeployState::Ready);
     }
 }

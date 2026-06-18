@@ -97,7 +97,7 @@ impl Gateway {
     /// Register a deployment: wire its functions into the Fluid pool and make it
     /// routable. Becomes the default (most-recent) deployment.
     pub fn deploy(&self, root: String, manifest: Manifest) -> DeploymentInfo {
-        self.deploy_full(root, manifest, "you".into(), None, true)
+        self.deploy_full(root, manifest, "you".into(), None, true, fluid_core::DeployState::Ready)
     }
 
     /// Full deploy with creator + git provenance + production flag.
@@ -108,6 +108,7 @@ impl Gateway {
         creator: String,
         git: Option<fluid_core::GitSource>,
         production: bool,
+        state: fluid_core::DeployState,
     ) -> DeploymentInfo {
         let id = DeploymentId::new();
         let workdir_root = root.clone();
@@ -122,7 +123,7 @@ impl Gateway {
             root: PathBuf::from(root),
             manifest: manifest.clone(),
             created_at_ms: now_ms(),
-            state: fluid_core::DeployState::Ready,
+            state,
             creator,
             git,
             production,
@@ -264,6 +265,7 @@ impl Gateway {
                 creator: d.creator.clone(),
                 git: d.git.clone(),
                 production: d.production,
+                state: d.state,
             })
             .collect()
     }
@@ -282,7 +284,7 @@ impl Gateway {
             root: PathBuf::from(&rec.root),
             manifest: rec.manifest,
             created_at_ms: rec.created_at_ms,
-            state: fluid_core::DeployState::Ready,
+            state: rec.state,
             creator: rec.creator,
             git: rec.git,
             production: rec.production,
@@ -390,6 +392,16 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
 
+    // Vercel analytics / speed-insights compatibility: the `@vercel/analytics`
+    // and `@vercel/speed-insights` packages load a same-origin script and beacon
+    // their data here. Handle these before deployment routing so any deployed app
+    // using the official packages works unchanged.
+    if path.starts_with("/_vercel/") {
+        if let Some(resp) = vercel_insights(&parts.method, &path) {
+            return resp;
+        }
+    }
+
     let dep = match gw.select(host.as_deref()) {
         Some(d) => d,
         None => return (StatusCode::NOT_FOUND, "no deployment").into_response(),
@@ -418,6 +430,48 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             proxy_function(&gw, &dep, &name, &parts.method, &path_q, &parts.headers, body_bytes)
                 .await
         }
+    }
+}
+
+/// Vercel Web Analytics + Speed Insights endpoints.
+///
+/// * `GET  /_vercel/insights/script.js`        — analytics loader (sends pageviews/events)
+/// * `POST /_vercel/insights/view|event`       — beacon sink (202)
+/// * `GET  /_vercel/speed-insights/script.js`  — web-vitals collector
+/// * `POST /_vercel/speed-insights/vitals`     — beacon sink (202)
+fn vercel_insights(method: &Method, path: &str) -> Option<Response> {
+    const ANALYTICS_JS: &str = r#"(function(){function send(t,d){try{navigator.sendBeacon('/_vercel/insights/'+t,JSON.stringify(d||{}))}catch(e){}}
+function va(){var a=[].slice.call(arguments),k=a[0];if(k==='event')send('event',a[1]||{});else send('view',a[1]||{})}
+var q=window.vaq||[];window.va=va;window.vaq={push:function(args){va.apply(null,args)}};
+q.forEach(function(args){va.apply(null,args)});send('view',{u:location.pathname});})();"#;
+
+    const SPEED_JS: &str = r#"(function(){var v={};function send(){try{navigator.sendBeacon('/_vercel/speed-insights/vitals',JSON.stringify({href:location.href,vitals:v}))}catch(e){}}
+try{new PerformanceObserver(function(l){l.getEntries().forEach(function(e){if(e.name==='first-contentful-paint')v.FCP=e.startTime})}).observe({type:'paint',buffered:true});
+new PerformanceObserver(function(l){var es=l.getEntries();v.LCP=es[es.length-1].startTime}).observe({type:'largest-contentful-paint',buffered:true});
+var cls=0;new PerformanceObserver(function(l){l.getEntries().forEach(function(e){if(!e.hadRecentInput)cls+=e.value});v.CLS=cls}).observe({type:'layout-shift',buffered:true});
+new PerformanceObserver(function(l){l.getEntries().forEach(function(e){v.INP=Math.max(v.INP||0,e.duration)})}).observe({type:'event',buffered:true,durationThreshold:40})}catch(e){}
+try{var n=performance.getEntriesByType('navigation')[0];if(n)v.TTFB=n.responseStart}catch(e){}
+addEventListener('visibilitychange',function(){if(document.visibilityState==='hidden')send()});addEventListener('pagehide',send);})();"#;
+
+    let js = |body: &'static str| -> Response {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+            .header(header::CACHE_CONTROL, "public, max-age=3600")
+            .body(Body::from(body))
+            .unwrap()
+            .into_response()
+    };
+    let accepted = || (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, "text/plain")], "ok").into_response();
+
+    match (method, path) {
+        (&Method::GET, "/_vercel/insights/script.js") => Some(js(ANALYTICS_JS)),
+        (&Method::GET, "/_vercel/speed-insights/script.js") => Some(js(SPEED_JS)),
+        (&Method::POST, "/_vercel/insights/view")
+        | (&Method::POST, "/_vercel/insights/event")
+        | (&Method::POST, "/_vercel/speed-insights/vitals") => Some(accepted()),
+        // Unknown _vercel path: 204 so the client never sees a hard 404.
+        _ => Some((StatusCode::NO_CONTENT, "").into_response()),
     }
 }
 

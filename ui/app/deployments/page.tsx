@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { RotateCcw, RefreshCw, Trash2, Loader2 } from "lucide-react";
+import { RotateCcw, RefreshCw, Trash2, Loader2, Plus } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
@@ -40,6 +41,7 @@ export default function DeploymentsPage() {
       <PageHeader
         title="Deployments"
         desc="Every deployment gets an immutable URL. Promote any build to production instantly (rollback), redeploy from git, or delete."
+        action={<Link href="/new"><Button><Plus className="h-4 w-4" /> New Deployment</Button></Link>}
       />
       <Table>
         <thead><tr><Th>Project</Th><Th>Deployment</Th><Th>Status</Th><Th>URL</Th><Th>Source</Th><Th>Created</Th><Th></Th></tr></thead>

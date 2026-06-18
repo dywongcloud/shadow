@@ -59,6 +59,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
         .route("/v1/git/deploy", post(git_deploy))
         .route("/v1/builds/:id", get(build_get))
+        .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
         .route("/v1/nodes/announce", post(node_announce))
         .route("/v1/token", post(mint_token))
@@ -83,6 +84,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/teams/:slug", get(team_get))
         .route("/v1/teams/:slug/members", post(team_add_member))
         .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
+        .route("/v1/teams/:slug/plan", put(team_set_plan))
+        .route("/v1/teams/:slug/sso", put(team_set_sso))
+        // ---- GitOps (config repo link + inbound CI webhook) ----
+        .route("/v1/gitops", get(gitops_get).put(gitops_put).delete(gitops_unlink))
+        .route("/v1/gitops/synced", post(gitops_synced))
+        .route("/v1/gitops/projects", get(gitops_projects))
+        .route("/v1/git/webhook", post(git_webhook))
         // ---- API keys (tenant-scoped platform tokens) ----
         .route("/v1/apikeys", get(apikeys_list).post(apikey_create))
         .route("/v1/apikeys/:id", delete(apikey_revoke))
@@ -94,6 +102,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/webhooks", get(webhooks_for_project).post(webhook_create))
         // ---- Databases / storage ----
         .route("/v1/databases", get(databases_list).post(database_create))
+        .route("/v1/admin/databases", get(admin_databases_all))
         .route("/v1/databases/:id", get(database_get).delete(database_delete))
         .route("/v1/databases/:id/credentials", get(database_credentials))
         .route("/v1/projects/:project/databases", get(databases_for_project))
@@ -171,8 +180,32 @@ async fn mint_token(Json(req): Json<TokenReq>) -> Result<Json<Value>, (StatusCod
 
 // ---- Project settings (env vars, build config, function settings) ----
 
-async fn region_catalog() -> Json<Value> {
-    Json(crate::project_settings::region_catalog())
+async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let mut cat = crate::project_settings::region_catalog();
+    // Surface the live mesh nodes' AUTO-DETECTED real-world locations as selectable
+    // regions, so a project can run functions on the actual nodes in the network.
+    let live: Vec<Value> = c
+        .registry
+        .nodes()
+        .into_iter()
+        .filter_map(|n| {
+            let city = n.city.clone()?;
+            let country = n.country.clone()?;
+            Some(json!({
+                "id": n.region,
+                "label": format!("{city}, {country} · {}", n.name),
+                "aws": "self-hosted",
+                "lat": n.lat,
+                "lon": n.lon,
+            }))
+        })
+        .collect();
+    if !live.is_empty() {
+        if let Some(obj) = cat.as_object_mut() {
+            obj.insert("Your Network (detected)".to_string(), json!(live));
+        }
+    }
+    Json(cat)
 }
 
 async fn project_settings_get(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
@@ -189,11 +222,25 @@ async fn project_build_put(
     Json(json!(c.projects.get_masked(&project)))
 }
 
+/// The tier (hobby/pro/enterprise) of the team owning a project.
+fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
+    let team = norm(&c.projects.team_of(project)).to_string();
+    c.teams.get(&team).map(|t| t.plan).unwrap_or_else(|| "hobby".into())
+}
+
 async fn project_functions_put(
     State(c): State<Arc<CloudState>>,
     Path(project): Path<String>,
-    Json(f): Json<crate::project_settings::FunctionSettings>,
+    Json(mut f): Json<crate::project_settings::FunctionSettings>,
 ) -> Json<Value> {
+    // Enforce plan limits: runtime cap (Enterprise = 1h) and Enterprise-only
+    // automatic multi-region fail-over.
+    let plan = team_plan(&c, &project);
+    let max_dur = crate::billing::plan_max_duration_secs(&plan);
+    f.default_max_duration_secs = f.default_max_duration_secs.clamp(1, max_dur);
+    if !crate::billing::plan_allows_failover(&plan) {
+        f.failover = false;
+    }
     c.projects.set_functions(&project, f);
     crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
@@ -456,15 +503,50 @@ async fn domain_renew_ssl(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
 
 // ---- Git deploy (Import Git Repository) ----
 
+/// Pick a globally-unique project name. Deployment aliases are `<project>.localhost`
+/// (global), so two projects can't share a name. A genuine redeploy (same name +
+/// same repo + same tenant) keeps its name; anything else gets a `-N` suffix.
+fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenant: &str) -> String {
+    let existing = c.projects.snapshot();
+    let base = if desired.trim().is_empty() {
+        crate::git::project_name_from_url(repo_url)
+    } else {
+        desired.trim().to_string()
+    };
+    let Some(cur) = existing.get(&base) else {
+        return base; // free — use it
+    };
+    // Redeploy of the same project (same repo + tenant) → keep the name.
+    let same_tenant = norm(&cur.team) == tenant;
+    let same_repo = c
+        .gw
+        .git_for_project(&base)
+        .map(|g| crate::gitops::norm_repo(&g.repo_url) == crate::gitops::norm_repo(repo_url))
+        .unwrap_or(false);
+    if same_tenant && same_repo {
+        return base;
+    }
+    // Otherwise find the next free `-N`.
+    for i in 2..1000 {
+        let cand = format!("{base}-{i}");
+        if !existing.contains_key(&cand) {
+            return cand;
+        }
+    }
+    format!("{base}-{}", now_ms())
+}
+
 async fn git_deploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
-    Json(req): Json<fluid_core::GitDeployRequest>,
+    Json(mut req): Json<fluid_core::GitDeployRequest>,
 ) -> Json<Value> {
     // Assign the (new) project to the requesting tenant so it shows under their
-    // team only.
+    // team only — with a globally-unique name (auto-generated when none given).
     let t = tenant(&c, &headers);
-    let project = req.project.clone().unwrap_or_else(|| crate::git::project_name_from_url(&req.repo_url));
+    let requested = req.project.clone().unwrap_or_default();
+    let project = unique_project_name(&c, &requested, &req.repo_url, &t);
+    req.project = Some(project.clone());
     c.projects.set_team(&project, &t);
     // Persist the subdirectory so future redeploys keep building it.
     if let Some(root) = req.root_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -473,7 +555,7 @@ async fn git_deploy(
     crate::persist::persist(&c);
     // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
     let build_id = crate::git::start_build(c.clone(), req);
-    Json(json!({ "build_id": build_id }))
+    Json(json!({ "build_id": build_id, "project": project }))
 }
 
 async fn build_get(
@@ -481,6 +563,21 @@ async fn build_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     c.builds.get(&id).map(|b| Json(json!(b))).ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
+/// Read-only; peers pull `node_modules` tarballs by content-addressed key.
+async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    // Key is a hex content hash — reject anything else (path-traversal guard).
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let path = crate::git::cache_root().join(format!("{key}.tar"));
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => Ok(([(axum::http::header::CONTENT_TYPE, "application/x-tar")], bytes).into_response()),
+        Err(_) => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 /// Framework-Defined Infrastructure: the catalog of frameworks the builder can
@@ -610,6 +707,240 @@ async fn project_redeploy(
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
+}
+
+// ---- GitOps ----
+
+/// All projects owned by a tenant plus their settings + git source — the data the
+/// dashboard serializes into the committed `openedge.yaml`.
+async fn gitops_projects(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let mut out = Vec::new();
+    for (project, settings) in c.projects.snapshot() {
+        if norm(&settings.team) != t {
+            continue;
+        }
+        let git = c.gw.git_for_project(&project);
+        let prod = c.gw.list().into_iter().find(|d| d.project == project && d.production);
+        out.push(json!({
+            "project": project,
+            "settings": c.projects.get_masked(&project),
+            "git": git,
+            "production": prod,
+            "root_dir": settings.build.root_dir,
+        }));
+    }
+    out.sort_by(|a, b| a["project"].as_str().unwrap_or("").cmp(b["project"].as_str().unwrap_or("")));
+    Json(json!(out))
+}
+
+async fn gitops_get(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    Json(json!(c.gitops.get(&t)))
+}
+
+#[derive(Deserialize)]
+struct GitOpsLinkReq {
+    repo: String,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    scope: String,
+}
+
+async fn gitops_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Json(b): Json<GitOpsLinkReq>,
+) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let link = c.gitops.set_link(&t, &b.repo, &b.branch, &b.path, &b.scope);
+    crate::persist::persist(&c);
+    Json(json!(link))
+}
+
+async fn gitops_unlink(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.gitops.unlink(&t);
+    crate::persist::persist(&c);
+    Json(json!({ "unlinked": t }))
+}
+
+#[derive(Deserialize)]
+struct GitOpsSynced {
+    #[serde(default)]
+    commit: String,
+    #[serde(default)]
+    hash: String,
+}
+
+async fn gitops_synced(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Json(b): Json<GitOpsSynced>,
+) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let link = c.gitops.record_sync(&t, &b.commit, &b.hash);
+    crate::persist::persist(&c);
+    Json(json!(link))
+}
+
+/// Inbound GitHub webhook: on a push (or merged/updated PR) to a repo that backs
+/// one or more existing projects, trigger a fresh production build+deploy from the
+/// pushed commit — repos become deployable workflows (taubyte-style GitOps CI).
+///
+/// Auth: this route is in the `open` allowlist (GitHub can't present a platform
+/// JWT). When `GITHUB_WEBHOOK_SECRET` is set the HMAC-SHA256 signature is verified;
+/// with no secret configured it accepts unsigned deliveries (dev-open default).
+async fn git_webhook(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Verify the GitHub signature when a secret is configured.
+    if let Ok(secret) = std::env::var("GITHUB_WEBHOOK_SECRET") {
+        if !secret.is_empty() {
+            let sig = headers
+                .get("x-hub-signature-256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !verify_github_sig(secret.as_bytes(), &body, sig) {
+                return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
+            }
+        }
+    }
+
+    let event = headers
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("push")
+        .to_string();
+    let payload: Value = serde_json::from_slice(&body)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
+
+    // Extract the repo + branch + head commit, supporting `push` and
+    // `pull_request` (opened/synchronize/closed-merged) events.
+    let repo_full = payload["repository"]["full_name"].as_str().unwrap_or("").to_string();
+    let mut production = true;
+    let (branch, commit) = match event.as_str() {
+        "pull_request" => {
+            let action = payload["action"].as_str().unwrap_or("");
+            let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
+            // Merged PR -> production; opened/synchronize -> preview deploy.
+            production = action == "closed" && merged;
+            if action == "closed" && !merged {
+                return Ok(Json(json!({ "ignored": "pr closed without merge" })));
+            }
+            let head_ref = payload["pull_request"]["head"]["ref"].as_str().unwrap_or("").to_string();
+            let sha = payload["pull_request"]["head"]["sha"].as_str().unwrap_or("").to_string();
+            (head_ref, sha)
+        }
+        "ping" => return Ok(Json(json!({ "pong": true }))),
+        _ => {
+            // push event
+            let r = payload["ref"].as_str().unwrap_or("");
+            let branch = r.rsplit('/').next().unwrap_or("").to_string();
+            let sha = payload["after"].as_str().unwrap_or("").to_string();
+            (branch, sha)
+        }
+    };
+
+    if repo_full.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "missing repository".into()));
+    }
+    let want = crate::gitops::norm_repo(&repo_full);
+
+    // Find every existing project (with at least one deployment) whose git source
+    // points at this repo, and redeploy the ones on the pushed branch.
+    let mut triggered = Vec::new();
+    for (project, _settings) in c.projects.snapshot() {
+        let Some(git) = c.gw.git_for_project(&project) else { continue };
+        if crate::gitops::norm_repo(&git.repo_url) != want {
+            continue;
+        }
+        // If we know the project's branch, only redeploy when it matches the push.
+        if !branch.is_empty() && !git.branch.is_empty() && git.branch != branch {
+            continue;
+        }
+        let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+        let req = fluid_core::GitDeployRequest {
+            repo_url: git.repo_url.clone(),
+            branch: Some(if branch.is_empty() { git.branch.clone() } else { branch.clone() }).filter(|b| !b.is_empty()),
+            project: Some(project.clone()),
+            creator: Some("github".into()),
+            production,
+            root_dir,
+        };
+        let build_id = crate::git::start_build(c.clone(), req);
+        let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github push {} @ {}", want, &commit.chars().take(7).collect::<String>()));
+        c.record(ev);
+        triggered.push(json!({ "project": project, "build_id": build_id, "production": production }));
+    }
+
+    Ok(Json(json!({
+        "repo": want,
+        "branch": branch,
+        "event": event,
+        "triggered": triggered.len(),
+        "builds": triggered,
+    })))
+}
+
+/// Constant-time-ish verification of GitHub's `sha256=<hex>` HMAC signature.
+fn verify_github_sig(secret: &[u8], body: &[u8], header: &str) -> bool {
+    let Some(hex) = header.strip_prefix("sha256=") else { return false };
+    let expected = hmac_sha256(secret, body);
+    let expected_hex = hex_lower(&expected);
+    // length-independent compare
+    if hex.len() != expected_hex.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in hex.bytes().zip(expected_hex.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// Minimal HMAC-SHA256 (avoids pulling a new crate). SHA-256 from `sha2` which is
+/// already in the dependency tree.
+fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    const BLOCK: usize = 64;
+    let mut k = [0u8; BLOCK];
+    if key.len() > BLOCK {
+        let h = Sha256::digest(key);
+        k[..32].copy_from_slice(&h);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad);
+    inner.update(msg);
+    let inner = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(opad);
+    outer.update(inner);
+    let out = outer.finalize();
+    let mut res = [0u8; 32];
+    res.copy_from_slice(&out);
+    res
 }
 
 // ---- Mesh: a peer announces itself to us ----
@@ -1048,6 +1379,52 @@ async fn team_remove_member(
 }
 
 #[derive(Deserialize)]
+struct SetPlan {
+    plan: String,
+}
+
+/// Change a team's tier (hobby | pro | enterprise). Keeps the billing account in
+/// sync so the compute allowance + plan label update together.
+async fn team_set_plan(
+    State(c): State<Arc<CloudState>>,
+    Path(slug): Path<String>,
+    Json(b): Json<SetPlan>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let plan = b.plan.to_lowercase();
+    if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
+        return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
+    }
+    c.teams.set_plan(&slug, &plan).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    c.billing.set_plan(&slug, &plan);
+    // Downgrades drop Enterprise-only SSO.
+    if !crate::billing::plan_allows_sso(&plan) {
+        c.teams.set_sso(&slug, false);
+    }
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.teams.get(&slug))))
+}
+
+#[derive(Deserialize)]
+struct SetSso {
+    enabled: bool,
+}
+
+/// Toggle team/org SSO — Enterprise only.
+async fn team_set_sso(
+    State(c): State<Arc<CloudState>>,
+    Path(slug): Path<String>,
+    Json(b): Json<SetSso>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = c.teams.get(&slug).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    if !crate::billing::plan_allows_sso(&team.plan) {
+        return Err((StatusCode::FORBIDDEN, "SSO requires the Enterprise plan".into()));
+    }
+    let t = c.teams.set_sso(&slug, b.enabled).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    crate::persist::persist(&c);
+    Ok(Json(json!(t)))
+}
+
+#[derive(Deserialize)]
 struct ProjectTeam {
     team: String,
     #[serde(default = "default_true_b")]
@@ -1191,6 +1568,12 @@ async fn databases_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) ->
         .filter(|d| norm(&d.team) == t)
         .collect();
     Json(json!(list))
+}
+
+/// Platform-owner view: ALL databases across every tenant (the ops Database Fleet
+/// is global, unlike the tenant-scoped `/v1/databases`).
+async fn admin_databases_all(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.databases.list(None)))
 }
 
 async fn databases_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(project): Path<String>) -> Json<Value> {

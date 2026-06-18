@@ -47,6 +47,14 @@ pub async fn edge_pipeline(
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let region = cloud.region.clone();
 
+    // Vercel Web Analytics / Speed Insights beacons are infrastructure endpoints
+    // served by the gateway itself — let them pass straight through, bypassing the
+    // WAF / rate-limit / preview gates, so any deployed app using @vercel/analytics
+    // or @vercel/speed-insights works regardless of the deployment's protection.
+    if path.starts_with("/_vercel/") {
+        return next.run(req).await;
+    }
+
     // -1) L7 DDoS mitigation: shed per-IP floods before any compute work.
     if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
         let ev = cloud.event(&region, &method, &host, &path, 429, "rate-limited", &ip);

@@ -16,6 +16,7 @@ mod dns;
 mod docstore;
 mod edge;
 mod git;
+mod gitops;
 #[cfg(feature = "guardian")]
 mod guardian;
 mod identity;
@@ -123,6 +124,12 @@ async fn main() -> anyhow::Result<()> {
     let cron = Arc::new(CronScheduler::new());
     let workflows = WorkflowEngine::new();
     let public_base = format!("http://{}", args.listen);
+    // Auto-detect this node's real-world location (IP geolocation) so it reports
+    // its true position for the regions map + the function-region picker.
+    let geo = geolocate().await;
+    if let Some(g) = &geo {
+        tracing::info!(city = %g.2, country = %g.3, lat = g.0, lon = g.1, "node geolocated");
+    }
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
@@ -133,6 +140,10 @@ async fn main() -> anyhow::Result<()> {
         is_self: true,
         latency_ms: 0,
         healthy: true,
+        lat: geo.as_ref().map(|g| g.0),
+        lon: geo.as_ref().map(|g| g.1),
+        city: geo.as_ref().map(|g| g.2.clone()),
+        country: geo.as_ref().map(|g| g.3.clone()),
     };
     let registry = NodeRegistry::new(me);
 
@@ -155,6 +166,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore persisted platform state from disk (deployments, settings, WAF…).
     persist::restore(&cloud, persist::load());
+
+    // Record mesh peers so the build cache can be pulled P2P from other nodes.
+    *cloud.peers.write() = args.peers.clone();
 
     // Initial cluster reconcile (single-node: this node is leader).
     cloud.cluster.reconcile(cloud.registry.nodes().into_iter().map(|n| n.id).collect());
@@ -183,10 +197,61 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Best-effort IP geolocation at startup → (lat, lon, city, country). Uses the
+/// free ip-api.com endpoint with a short timeout; returns None on any failure so
+/// a node always boots even offline. Override with HIVE_GEO="lat,lon,city,country".
+async fn geolocate() -> Option<(f64, f64, String, String)> {
+    if let Ok(manual) = std::env::var("HIVE_GEO") {
+        let parts: Vec<&str> = manual.splitn(4, ',').collect();
+        if parts.len() == 4 {
+            if let (Ok(lat), Ok(lon)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
+                return Some((lat, lon, parts[2].trim().to_string(), parts[3].trim().to_string()));
+            }
+        }
+    }
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("http://ip-api.com/json/?fields=status,lat,lon,city,country")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = resp.json().await.ok()?;
+    if v.get("status").and_then(|s| s.as_str()) != Some("success") {
+        return None;
+    }
+    Some((
+        v.get("lat")?.as_f64()?,
+        v.get("lon")?.as_f64()?,
+        v.get("city")?.as_str()?.to_string(),
+        v.get("country")?.as_str()?.to_string(),
+    ))
+}
+
 async fn serve(router: axum::Router, addr: SocketAddr, label: &str) -> anyhow::Result<()> {
-    let l = tokio::net::TcpListener::bind(addr).await?;
+    let mut listeners = vec![tokio::net::TcpListener::bind(addr).await?];
     tracing::info!(%addr, "{label} listening");
-    axum::serve(l, router).await?;
+    // For loopback, ALSO bind the other IP family on the same port. Browsers
+    // resolve `*.localhost` to ::1 (IPv6) first, so a v4-only bind makes deploys
+    // unreachable in the browser even though 127.0.0.1 works for curl/CLI.
+    if addr.ip().is_loopback() {
+        let alt: SocketAddr = match addr.ip() {
+            std::net::IpAddr::V4(_) => (std::net::Ipv6Addr::LOCALHOST, addr.port()).into(),
+            std::net::IpAddr::V6(_) => (std::net::Ipv4Addr::LOCALHOST, addr.port()).into(),
+        };
+        match tokio::net::TcpListener::bind(alt).await {
+            Ok(l) => { tracing::info!(%alt, "{label} also listening (dual-stack loopback)"); listeners.push(l); }
+            Err(e) => tracing::warn!(%alt, error=%e, "{label} could not bind alt loopback address"),
+        }
+    }
+    let mut tasks = Vec::new();
+    for l in listeners {
+        let r = router.clone();
+        tasks.push(tokio::spawn(async move { axum::serve(l, r).await }));
+    }
+    for t in tasks {
+        t.await??;
+    }
     Ok(())
 }
 

@@ -7,6 +7,7 @@ const isPublic = createRouteMatcher([
   "/sign-up(.*)",
   "/cloud(.*)", // dashboard <-> node admin API proxy
   "/api(.*)",
+  "/status(.*)", // public, user-facing incident/status board
 ]);
 
 // Dev-only escape hatch: set HIVE_AUTH_BYPASS=1 to disable login gating entirely

@@ -52,10 +52,43 @@ pub const PLANS: &[PlanSpec] = &[
             "Email support & higher limits",
         ],
     },
+    PlanSpec {
+        id: "enterprise",
+        name: "Enterprise",
+        price_cents: 50000,
+        included_cents: 100000,
+        overage: true,
+        features: &[
+            "$1,000 of included compute / month",
+            "Automatic multi-region fail-over",
+            "1-hour function runtime (3600s)",
+            "Team / Org SSO (SAML & OIDC)",
+            "100k concurrency · priority support",
+        ],
+    },
 ];
 
 pub fn plan_spec(id: &str) -> &'static PlanSpec {
     PLANS.iter().find(|p| p.id == id).unwrap_or(&PLANS[0])
+}
+
+/// Max function runtime (seconds) allowed on a plan. Enterprise unlocks 1 hour.
+pub fn plan_max_duration_secs(plan: &str) -> u64 {
+    match plan {
+        "enterprise" => 3600,
+        "pro" => 800,
+        _ => 300,
+    }
+}
+
+/// Automatic multi-region fail-over is an Enterprise capability.
+pub fn plan_allows_failover(plan: &str) -> bool {
+    plan == "enterprise"
+}
+
+/// Optional team/org SSO is an Enterprise capability.
+pub fn plan_allows_sso(plan: &str) -> bool {
+    plan == "enterprise"
 }
 
 #[derive(Clone, Serialize, Deserialize)]

@@ -10,7 +10,9 @@ const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> =
 };
 
 export default function AdminDatabasesPage() {
-  const { data: dbs } = usePoll<Database[]>("/v1/databases", 3000);
+  // Platform-owner view → ALL databases across every tenant (global endpoint).
+  const { data: dbs } = usePoll<Database[]>("/v1/admin/databases", 3000);
+  const active = (dbs ?? []).filter((d) => d.status === "ready").length;
   const live = (dbs ?? []).filter((d) => d.mode === "live").length;
   const byKind = (dbs ?? []).reduce<Record<string, number>>((a, d) => { a[d.kind] = (a[d.kind] ?? 0) + 1; return a; }, {});
 
@@ -18,7 +20,7 @@ export default function AdminDatabasesPage() {
     <div>
       <div className="mb-6">
         <h1 className="text-2xl font-semibold tracking-tight">Database Fleet</h1>
-        <p className="mt-1 text-sm text-secondary">{dbs?.length ?? 0} provisioned · {live} live · across all teams and projects.</p>
+        <p className="mt-1 text-sm text-secondary">{dbs?.length ?? 0} provisioned · {active} active · {live} live · across all teams and projects.</p>
       </div>
 
       <div className="mb-6 flex flex-wrap gap-2">

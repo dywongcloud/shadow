@@ -45,8 +45,8 @@ function Slash() {
 
 export function TopNav() {
   const pathname = usePathname();
-  // The owner/ops dashboard + auth pages render their own minimal chrome.
-  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up")) return null;
+  // The owner/ops dashboard + auth + public status pages render their own chrome.
+  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status")) return null;
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
@@ -154,6 +154,26 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
 
   const memberships = userMemberships?.data ?? [];
   const orgBySlug = (s: string) => memberships.find((m) => (m.organization.slug || m.organization.id) === s)?.organization;
+
+  // Reset per-account view state when a DIFFERENT user signs in (someone logged
+  // out, someone else logged in) — so the previous account's active team, the
+  // breadcrumb team/org label + dropdown, favorites, onboarding, etc. never leak
+  // into the new session. Runs BEFORE init so the cleared state is re-derived
+  // from the new user's own Clerk active org.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const prev = localStorage.getItem("hive_uid");
+    if (prev && prev !== identity.id) {
+      for (const k of ["hive_team", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
+        localStorage.removeItem(k);
+      }
+      initDone.current = false;
+      setSelected(PERSONAL);
+      window.dispatchEvent(new Event("hive-team-changed"));
+    }
+    localStorage.setItem("hive_uid", identity.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [identity.id]);
 
   // Initialize the selection ONCE: restore the user's saved choice if any,
   // otherwise adopt Clerk's active org the first time it loads. After init, the

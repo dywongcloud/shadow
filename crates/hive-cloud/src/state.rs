@@ -54,6 +54,9 @@ pub struct CloudState {
     pub builds: crate::git::BuildStore,
     pub cluster: Arc<crate::cluster::Cluster>,
     pub teams: crate::teams::TeamStore,
+    pub gitops: crate::gitops::GitOpsStore,
+    /// Mesh peer admin URLs (for P2P build-cache pulls).
+    pub peers: RwLock<Vec<String>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
@@ -119,6 +122,8 @@ impl CloudState {
             builds: crate::git::BuildStore::new(),
             cluster,
             teams,
+            gitops: crate::gitops::GitOpsStore::new(),
+            peers: RwLock::new(Vec::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),

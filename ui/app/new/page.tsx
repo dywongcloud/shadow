@@ -39,9 +39,13 @@ const TEMPLATES: Template[] = [
   { name: "Vue", desc: "The progressive JavaScript framework.", repo: "https://github.com/vercel/vercel", root: "examples/vue", tag: "Vu", color: "#42b883", icon: "/frameworks/vue-js.png" },
   { name: "Angular", desc: "The web development framework for building modern apps.", repo: "https://github.com/vercel/vercel", root: "examples/angular", tag: "Ng", color: "#dd0031", icon: "/frameworks/angular.png" },
   { name: "Express", desc: "Fast, unopinionated Node.js web server.", repo: "https://github.com/vercel/vercel", root: "examples/express", tag: "Ex", color: "#000", icon: "/frameworks/express-js.png" },
-  { name: "Remix", desc: "Full stack web framework, focused on web standards.", repo: "https://github.com/vercel/vercel", root: "examples/remix", tag: "Rx", color: "#000" },
-  { name: "Astro", desc: "Content-driven sites, fast by default.", repo: "https://github.com/vercel/vercel", root: "examples/astro", tag: "A", color: "#ff5d01" },
-  { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26" },
+  { name: "Remix", desc: "Full stack web framework, focused on web standards.", repo: "https://github.com/vercel/vercel", root: "examples/remix", tag: "Rx", color: "#000", icon: "/frameworks/remix.png" },
+  { name: "Astro", desc: "Content-driven sites, fast by default.", repo: "https://github.com/vercel/vercel", root: "examples/astro", tag: "A", color: "#000", icon: "/frameworks/astro.png" },
+  { name: "Node.js", desc: "A minimal Node.js server, deployed to Fluid compute.", repo: "https://github.com/vercel/vercel", root: "examples/node", tag: "No", color: "#539e43", icon: "/frameworks/node.png" },
+  { name: "Bun", desc: "Incredibly fast all-in-one JavaScript runtime.", repo: "https://github.com/oven-sh/bun", root: "examples/bun-http", tag: "Bu", color: "#fbf0df", icon: "/frameworks/bun.png" },
+  { name: "Deno", desc: "Secure runtime for JavaScript and TypeScript.", repo: "https://github.com/denoland/examples", root: "http-server", tag: "De", color: "#000", icon: "/frameworks/deno.png" },
+  { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-typescript-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
+  { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26", icon: "/frameworks/html5.png" },
   { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
 ];
 
@@ -52,12 +56,25 @@ function ownerRepo(url: string) {
   return url.replace(/^https?:\/\/(www\.)?github\.com\//, "").replace(/\.git$/, "");
 }
 
+/** Wrap an imported repo as a Template so it flows through the same configure
+ *  screen — letting the user assign a project name before deploying. */
+function repoToTemplate(r: GhRepo): Template {
+  return {
+    name: r.name,
+    desc: r.full_name,
+    repo: r.clone_url,
+    branch: r.default_branch,
+    tag: (r.name[0] || "R").toUpperCase(),
+    color: "#000",
+  };
+}
+
 function Monogram({ t, className = "h-10 w-10" }: { t: Template; className?: string }) {
   if (t.icon) {
     return (
-      <span className={`flex ${className} shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-card`}>
+      <span className={`flex ${className} shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-white`}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={t.icon} alt={t.name} className="h-2/3 w-2/3 object-contain" />
+        <img src={t.icon} alt={t.name} className="h-3/4 w-3/4 object-contain" />
       </span>
     );
   }
@@ -105,6 +122,13 @@ export default function NewProjectPage() {
         root_dir: root,
         creator: "you",
       });
+      // Install the OpenEdge deploy workflow + webhook variable into the source
+      // repo so future pushes auto-deploy (no-ops if GitHub isn't connected).
+      fetch("/api/gitops/project-ci", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: repoUrl }),
+      }).catch(() => {});
       router.push(`/deploy/${res.build_id}`);
     } catch (e) {
       setError(String(e));
@@ -172,7 +196,7 @@ export default function NewProjectPage() {
                         <span className="font-medium">{r.name}</span>
                         {r.private ? <Badge>private</Badge> : null}
                       </div>
-                      <Button onClick={() => deploy(r.clone_url, r.default_branch, r.name)} disabled={deploying}>
+                      <Button onClick={() => { setError(""); setSelected(repoToTemplate(r)); }} disabled={deploying}>
                         Import
                       </Button>
                     </div>
@@ -314,11 +338,12 @@ function ConfigureTemplate({
             </div>
           </div>
           <div>
-            <label className="mb-1.5 block text-sm text-secondary">Repository Name</label>
+            <label className="mb-1.5 block text-sm text-secondary">Project Name</label>
             <div className="relative">
-              <Input value={repoName} onChange={(e) => setRepoName(slug(e.target.value))} />
+              <Input value={repoName} placeholder="auto-generated if blank" onChange={(e) => setRepoName(slug(e.target.value))} />
               <Lock className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
             </div>
+            <p className="mt-1 text-xs text-muted">Must be unique. Leave blank and we&apos;ll generate one.</p>
           </div>
         </div>
 
@@ -350,7 +375,7 @@ function ConfigureTemplate({
             }
             onCreate(repoName || slug(template.name));
           }}
-          disabled={deploying || !repoName}
+          disabled={deploying}
           className="w-full justify-center bg-fg py-2.5 text-bg"
         >
           {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : "Create"}

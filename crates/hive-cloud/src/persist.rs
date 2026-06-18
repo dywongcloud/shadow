@@ -62,6 +62,8 @@ pub struct PlatformSnapshot {
     pub domains: Vec<crate::dns::DomainRecord>,
     #[serde(default)]
     pub docs: Vec<crate::docstore::Doc>,
+    #[serde(default)]
+    pub gitops: Vec<crate::gitops::GitOpsLink>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -157,6 +159,9 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for d in &snap.domains {
         push(ns_norm(&d.tenant), "domains", json!(d));
     }
+    for g in &snap.gitops {
+        push(ns_norm(&g.tenant), "gitops", json!(g));
+    }
     // Note: teams are intentionally NOT a guardian-db collection — orgs/users
     // (synced from the identity provider) are the source of truth for tenancy.
 
@@ -216,6 +221,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         billing_ledger: cloud.billing.snapshot().1,
         domains: cloud.domains.snapshot(),
         docs: cloud.docs.snapshot(),
+        gitops: cloud.gitops.snapshot(),
     }
 }
 
@@ -259,6 +265,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.billing.load(snap.billing, snap.billing_ledger);
     cloud.domains.load(snap.domains);
     cloud.docs.load(snap.docs);
+    cloud.gitops.load(snap.gitops);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

@@ -56,6 +56,9 @@ pub struct Team {
     pub created_ms: u64,
     #[serde(default)]
     pub members: Vec<Member>,
+    /// Optional team/org SSO (SAML/OIDC) — an Enterprise capability.
+    #[serde(default)]
+    pub sso_enabled: bool,
 }
 fn default_plan() -> String {
     "pro".into()
@@ -95,6 +98,7 @@ impl TeamStore {
                         name: "Owner".into(),
                         added_ms: now_ms(),
                     }],
+                    sso_enabled: false,
                 },
             );
         }
@@ -137,9 +141,26 @@ impl TeamStore {
                 name: String::new(),
                 added_ms: now_ms(),
             }],
+            sso_enabled: false,
         };
         m.insert(slug, team.clone());
         team
+    }
+
+    /// Toggle team/org SSO (Enterprise-only — caller enforces the plan gate).
+    pub fn set_sso(&self, slug: &str, enabled: bool) -> Option<Team> {
+        let mut m = self.teams.write();
+        let t = m.get_mut(slug)?;
+        t.sso_enabled = enabled;
+        Some(t.clone())
+    }
+
+    /// Update a team's plan/tier (hobby | pro | enterprise).
+    pub fn set_plan(&self, slug: &str, plan: &str) -> Option<Team> {
+        let mut m = self.teams.write();
+        let t = m.get_mut(slug)?;
+        t.plan = plan.to_string();
+        Some(t.clone())
     }
 
     pub fn add_member(&self, slug: &str, email: &str, role: Role) -> Option<Team> {
@@ -204,5 +225,40 @@ pub fn slugify(s: &str) -> String {
         "team".into()
     } else {
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slugify_makes_url_safe_slugs() {
+        assert_eq!(slugify("My Team!"), "my-team");
+        assert_eq!(slugify("  Acme   Corp  "), "acme-corp");
+        assert_eq!(slugify("---"), "team");
+        assert_eq!(slugify(""), "team");
+        assert_eq!(slugify("Block/Offsets"), "block-offsets");
+    }
+
+    #[test]
+    fn team_create_dedupes_slugs() {
+        let store = TeamStore::new();
+        let a = store.create("Acme", "pro", "owner@x.com");
+        let b = store.create("Acme", "pro", "owner@x.com");
+        assert_eq!(a.slug, "acme");
+        assert_ne!(a.slug, b.slug, "duplicate name must get a unique slug");
+        assert_eq!(store.count(), 2);
+        // Owner is a member with the Owner role.
+        assert!(store.is_member("acme", "owner@x.com"));
+    }
+
+    #[test]
+    fn ensure_seed_creates_personal_once() {
+        let store = TeamStore::new();
+        store.ensure_seed("owner@x.com");
+        store.ensure_seed("owner@x.com");
+        assert_eq!(store.count(), 1);
+        assert!(store.get("personal").is_some());
     }
 }

@@ -16,6 +16,9 @@ import {
   usePoll, apiSend, type Deployment, type Overview, type Database, type SecureLink,
   type FunctionStats, type ProjectSettings,
 } from "@/lib/api";
+import { triggerGitopsSync } from "@/components/gitops";
+
+interface GitOpsLink { connected: boolean; repo: string }
 
 interface Cdn { hits: number; entries: number }
 interface Waf { managed: boolean }
@@ -244,6 +247,12 @@ function AdderNode({ data }: { data: any }) {
 
 const nodeTypes = { ingress: IngressNode, service: ServiceNode, resource: ResourceNode, adder: AdderNode };
 
+/** Fit the graph, then zoom out 6% for a calmer default framing. */
+function fitOut(i: ReactFlowInstance) {
+  i.fitView({ padding: 0.2 });
+  i.zoomTo(i.getZoom() * 0.94, { duration: 0 });
+}
+
 export function ServiceGraph({ project, prod }: { project: string; prod: Deployment | undefined }) {
   const { resolvedTheme } = useTheme();
   const { data: ov } = usePoll<Overview>("/v1/overview", 6000);
@@ -254,11 +263,15 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
   const { data: links } = usePoll<SecureLink[]>("/v1/securelinks", 6000);
   const { data: fnstats } = usePoll<FunctionStats[]>("/v1/functions", 6000);
   const { data: settings } = usePoll<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`, 10000);
+  const { data: gitopsLink } = usePoll<GitOpsLink>("/v1/gitops", 30000);
+  const gitops = !!(gitopsLink?.connected && gitopsLink?.repo);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
   const lastKey = useRef("");
   const rf = useRef<ReactFlowInstance | null>(null);
+  // Canvas locked by default (no pan/zoom/drag); unlock via the Controls lock button.
+  const [locked, setLocked] = useState(true);
 
   const kind = prod?.kind ?? "static";
   const ddos = !!(rl?.enabled || waf?.managed);
@@ -286,10 +299,12 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     } finally {
       // Let the new resource node appear without waiting for the 6s poll.
       refreshDbs();
+      // Reflect the new resource in the committed GitOps config (no-op if unlinked).
+      triggerGitopsSync();
     }
   }, [project, refreshDbs]);
 
-  const key = JSON.stringify([prod?.id, prod?.state, kind, instances, memory, ddos, cdnActive, conns.map((c) => c.id)]);
+  const key = JSON.stringify([prod?.id, prod?.state, kind, instances, memory, ddos, cdnActive, conns.map((c) => c.id), gitops]);
 
   useEffect(() => {
     if (key === lastKey.current) return;
@@ -317,7 +332,7 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
       {
         id: "adder", type: "adder" as const,
         position: { x: 760, y: conns.length * 92 + (conns.length ? 8 : 0) },
-        data: { project, onAdd },
+        data: { project, onAdd, gitops },
       },
     ];
     const es: Edge[] = [
@@ -333,9 +348,9 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     ];
     setNodes(ns);
     setEdges(es);
-    // Refit once the (async-loaded) nodes are in place.
-    setTimeout(() => rf.current?.fitView({ padding: 0.2, duration: 300 }), 80);
-  }, [key, project, kind, prod, instances, memory, ddos, cdnActive, conns, onAdd, setNodes, setEdges]);
+    // Refit (zoomed out 6%) once the (async-loaded) nodes are in place.
+    setTimeout(() => rf.current && fitOut(rf.current), 80);
+  }, [key, project, kind, prod, instances, memory, ddos, cdnActive, conns, gitops, onAdd, setNodes, setEdges]);
 
   const dark = resolvedTheme === "dark";
 
@@ -346,7 +361,7 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
-        onInit={(i) => { rf.current = i; setTimeout(() => i.fitView({ padding: 0.2 }), 60); }}
+        onInit={(i) => { rf.current = i; setTimeout(() => fitOut(i), 60); }}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}
@@ -354,9 +369,18 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         maxZoom={1.75}
         proOptions={{ hideAttribution: true }}
         defaultEdgeOptions={{ animated: true, type: "smoothstep" }}
+        // Locked by default: no panning/zoom/drag until the user clicks the lock
+        // toggle in the Controls (which flips `locked` via onInteractiveChange).
+        nodesConnectable={false}
+        nodesDraggable={!locked}
+        elementsSelectable={!locked}
+        panOnDrag={!locked}
+        zoomOnScroll={!locked}
+        zoomOnPinch={!locked}
+        zoomOnDoubleClick={!locked}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={2} color={dark ? "#3a3a3a" : "#c9c9c9"} />
-        <Controls showInteractive={false} className="!border-border !bg-card" />
+        <Controls showInteractive onInteractiveChange={(i) => setLocked(!i)} className="!border-border !bg-card" />
         <MiniMap pannable zoomable className="!border !border-border !bg-card" maskColor={dark ? "rgba(0,0,0,0.4)" : "rgba(255,255,255,0.5)"} />
       </ReactFlow>
       <div className="pointer-events-none absolute bottom-3 right-3 z-10 rounded-md border border-border bg-card/90 px-2 py-1 text-xs text-muted">

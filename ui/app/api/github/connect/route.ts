@@ -15,7 +15,13 @@ export async function POST(req: NextRequest) {
   let entity = c.get("hive_entity")?.value;
   if (!entity) entity = "user-" + Math.random().toString(36).slice(2, 10);
   const origin = req.nextUrl.origin;
-  const redirectUrl = `${origin}/new?connected=github`;
+  // Allow callers (e.g. the onboarding modal) to return to where they started.
+  const body = await req.json().catch(() => ({} as any));
+  const returnToRaw = typeof body?.returnTo === "string" ? body.returnTo : "/new";
+  // Only accept same-origin relative paths to avoid open-redirects.
+  const returnTo = returnToRaw.startsWith("/") ? returnToRaw : "/new";
+  const sep = returnTo.includes("?") ? "&" : "?";
+  const redirectUrl = `${origin}${returnTo}${sep}connected=github`;
   const result = await githubConnect(entity, redirectUrl);
   const res = result.redirectUrl
     ? NextResponse.json({ redirectUrl: result.redirectUrl })

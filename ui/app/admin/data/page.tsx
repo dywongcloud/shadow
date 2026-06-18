@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { Search, Database, RefreshCw, ChevronRight, Code2, Plus, Trash2, Save } from "lucide-react";
+import { Search, Database, RefreshCw, ChevronRight, Code2, Plus, Trash2, Save, Pencil } from "lucide-react";
 import { apiGet, apiSend } from "@/lib/api";
 
 interface Collection { name: string; count: number; editable?: boolean }
@@ -40,9 +40,59 @@ export default function DataBrowserPage() {
   const [newOpen, setNewOpen] = useState(false);
   const [newCollection, setNewCollection] = useState("documents");
   const [newBody, setNewBody] = useState('{\n  "name": "",\n  "value": ""\n}');
+  // Inline cell editing (editable collections only).
+  const [editCell, setEditCell] = useState<{ id: string; col: string } | null>(null);
+  const [cellDraft, setCellDraft] = useState("");
+  // "Edit mode": all editable fields become inputs at once, saved together.
+  const [editMode, setEditMode] = useState(false);
+  const [drafts, setDrafts] = useState<Record<string, Record<string, string>>>({});
 
   const editable = !!rows?.editable;
   const deletable = editable || DELETABLE_TYPED.has(active);
+
+  // System/metadata fields are never user-editable (the docstore ignores id /
+  // collection / created_ms on patch; tenant + updated_ms are managed too).
+  const SYS_FIELDS = new Set(["id", "collection", "tenant", "created_ms", "updated_ms"]);
+
+  function isScalar(v: any): boolean {
+    return v == null || typeof v === "string" || typeof v === "number" || typeof v === "boolean";
+  }
+
+  function beginCell(row: any, col: string) {
+    if (!editable || SYS_FIELDS.has(col) || !isScalar(row?.[col])) return;
+    setEditCell({ id: row.id, col });
+    setCellDraft(row?.[col] == null ? "" : String(row[col]));
+    setErr("");
+  }
+
+  /** Coerce the textual draft into a JSON scalar (number/bool/null/string). */
+  function coerce(raw: string): any {
+    const t = raw.trim();
+    if (t === "") return "";
+    if (t === "true") return true;
+    if (t === "false") return false;
+    if (t === "null") return null;
+    if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+    return raw;
+  }
+
+  async function saveCell() {
+    if (!editCell) return;
+    setBusy(true);
+    setErr("");
+    try {
+      // data_patch MERGES, so sending just this field is non-destructive.
+      await apiSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(editCell.id)}`, {
+        [editCell.col]: coerce(cellDraft),
+      });
+      setEditCell(null);
+      loadRows(active, q);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
 
   function loadCollections() {
     apiGet<CollectionsResp>("/v1/admin/data").then(setMeta).catch(() => {});
@@ -58,7 +108,26 @@ export default function DataBrowserPage() {
       .catch(() => setRows({ collection: col, total: 0, matched: 0, rows: [] }))
       .finally(() => setLoading(false));
   }
-  useEffect(() => { loadRows(active, ""); setQ(""); }, [active]);
+  useEffect(() => { loadRows(active, ""); setQ(""); setEditMode(false); setDrafts({}); setEditCell(null); }, [active]);
+
+  function setDraft(rowId: string, col: string, val: string) {
+    setDrafts((d) => ({ ...d, [rowId]: { ...(d[rowId] || {}), [col]: val } }));
+  }
+  async function saveAll() {
+    setBusy(true); setErr("");
+    try {
+      for (const id of Object.keys(drafts)) {
+        const patch: Record<string, any> = {};
+        for (const [col, raw] of Object.entries(drafts[id])) patch[col] = coerce(raw);
+        if (Object.keys(patch).length) {
+          await apiSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(id)}`, patch);
+        }
+      }
+      setDrafts({}); setEditMode(false); loadRows(active, q);
+    } catch (e) { setErr(String(e)); } finally { setBusy(false); }
+  }
+  function cancelEdit() { setDrafts({}); setEditMode(false); }
+  const draftCount = Object.values(drafts).reduce((n, m) => n + Object.keys(m).length, 0);
 
   // Derive table columns from the union of keys across rows (scalars first).
   const columns = useMemo(() => {
@@ -68,10 +137,18 @@ export default function DataBrowserPage() {
       if (row && typeof row === "object") Object.keys(row).forEach((k) => keys.add(k));
     }
     const all = Array.from(keys);
-    // Put common id/name fields first.
+    // Identity fields first, then real data fields, then doc metadata last — so
+    // user data (e.g. `value`) is never crowded out by created_ms/tenant/etc.
     const pri = ["id", "name", "project", "slug", "team", "kind", "status", "state"];
-    all.sort((a, b) => (pri.indexOf(a) + 1 || 99) - (pri.indexOf(b) + 1 || 99) || a.localeCompare(b));
-    return all.slice(0, 7);
+    const sys = ["collection", "tenant", "created_ms", "updated_ms"];
+    const rank = (k: string) => {
+      const p = pri.indexOf(k);
+      if (p >= 0) return p;
+      if (sys.includes(k)) return 90;
+      return 50;
+    };
+    all.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+    return all.slice(0, 8);
   }, [rows]);
 
   function cell(v: any): string {
@@ -88,7 +165,9 @@ export default function DataBrowserPage() {
   }
 
   async function createDoc() {
-    setErr(""); setBusy(true);
+    setErr("");
+    if (!newCollection.trim()) { setErr("Enter a collection name."); return; }
+    setBusy(true);
     try {
       const body = JSON.parse(newBody);
       await apiSend("POST", `/v1/admin/data/${encodeURIComponent(newCollection)}`, body);
@@ -172,6 +251,12 @@ export default function DataBrowserPage() {
             </button>
           ))}
           {!meta && <div className="px-3 py-2 text-sm text-muted">Loading…</div>}
+          <button
+            onClick={() => { setNewCollection(""); setNewBody('{\n  "name": "",\n  "value": ""\n}'); setErr(""); setNewOpen(true); }}
+            className="mt-1 flex items-center gap-2 rounded-md border border-dashed border-border-strong px-3 py-2 text-sm text-secondary hover:bg-card hover:text-fg"
+          >
+            <Plus className="h-3.5 w-3.5" /> New collection
+          </button>
         </aside>
 
         {/* Rows */}
@@ -189,10 +274,41 @@ export default function DataBrowserPage() {
             />
           </form>
 
-          <div className="mb-2 flex items-center gap-3 text-xs text-muted">
-            <Code2 className="h-3.5 w-3.5" />
-            {rows ? `${rows.matched} of ${rows.total} rows${rows.matched > rows.rows.length ? ` (showing ${rows.rows.length})` : ""}` : "—"}
-            {loading && <RefreshCw className="h-3 w-3 animate-spin" />}
+          <div className="mb-2 flex items-center justify-between gap-3 text-xs text-muted">
+            <span className="flex items-center gap-2">
+              <Code2 className="h-3.5 w-3.5" />
+              {rows ? `${rows.matched} of ${rows.total} rows${rows.matched > rows.rows.length ? ` (showing ${rows.rows.length})` : ""}` : "—"}
+              {loading && <RefreshCw className="h-3 w-3 animate-spin" />}
+            </span>
+            <span className="flex items-center gap-2">
+              {editable ? (
+                editMode ? (
+                  <>
+                    <span className="text-amber-500">{draftCount} unsaved field{draftCount === 1 ? "" : "s"}</span>
+                    <button onClick={cancelEdit} disabled={busy} className="flex items-center gap-1 rounded-md border border-border-strong px-2 py-1 text-xs hover:bg-subtle">
+                      Cancel
+                    </button>
+                    <button onClick={saveAll} disabled={busy || draftCount === 0} className="flex items-center gap-1 rounded-md bg-accent px-2 py-1 text-xs font-medium text-accent-fg hover:opacity-90 disabled:opacity-50">
+                      <Save className="h-3 w-3" /> Save changes
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button onClick={() => { setEditMode(true); setEditCell(null); }} className="flex items-center gap-1 rounded-md border border-border-strong px-2 py-1 text-xs hover:bg-subtle">
+                      <Pencil className="h-3 w-3" /> Edit mode
+                    </button>
+                    <button
+                      onClick={() => { setNewCollection(active); setNewBody('{\n  "name": "",\n  "value": ""\n}'); setErr(""); setNewOpen(true); }}
+                      className="flex items-center gap-1 rounded-md border border-border-strong px-2 py-1 text-xs hover:bg-subtle"
+                    >
+                      <Plus className="h-3 w-3" /> Add document
+                    </button>
+                  </>
+                )
+              ) : (
+                <span className="text-muted">Read-only managed collection</span>
+              )}
+            </span>
           </div>
 
           <div className="overflow-x-auto rounded-xl border border-border bg-card">
@@ -202,16 +318,73 @@ export default function DataBrowserPage() {
                   {columns.map((c) => (
                     <th key={c} className="whitespace-nowrap border-b border-border px-3 py-2 text-left text-xs font-medium uppercase tracking-wide text-muted">{c}</th>
                   ))}
-                  <th className="border-b border-border px-3 py-2"></th>
+                  <th className="border-b border-border px-3 py-2 text-right text-xs font-medium uppercase tracking-wide text-muted">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {(rows?.rows ?? []).map((row, i) => (
-                  <tr key={i} className="cursor-pointer hover:bg-subtle/50" onClick={() => openRow(row)}>
-                    {columns.map((c) => (
-                      <td key={c} className="whitespace-nowrap border-b border-border px-3 py-2 font-mono text-xs text-fg">{cell(row?.[c])}</td>
-                    ))}
-                    <td className="border-b border-border px-3 py-2 text-right"><ChevronRight className="h-3.5 w-3.5 text-muted" /></td>
+                  <tr key={row?.id ?? i} className="group hover:bg-subtle/50">
+                    {columns.map((c) => {
+                      const isEditing = editable && editCell?.id === row?.id && editCell?.col === c;
+                      const canInline = editable && !SYS_FIELDS.has(c) && isScalar(row?.[c]);
+                      // In edit mode, every editable cell is an input bound to drafts.
+                      if (editMode && canInline && row?.id) {
+                        const cur = drafts[row.id]?.[c];
+                        return (
+                          <td key={c} className="whitespace-nowrap border-b border-border px-2 py-1.5">
+                            <input
+                              value={cur ?? (row?.[c] == null ? "" : String(row[c]))}
+                              onChange={(e) => setDraft(row.id, c, e.target.value)}
+                              className={`w-full min-w-[90px] rounded border bg-bg px-1.5 py-0.5 font-mono text-xs outline-none focus:border-accent ${cur !== undefined ? "border-amber-500/60" : "border-border-strong"}`}
+                            />
+                          </td>
+                        );
+                      }
+                      return (
+                        <td
+                          key={c}
+                          onClick={() => (editMode ? null : canInline ? beginCell(row, c) : openRow(row))}
+                          className={`whitespace-nowrap border-b border-border px-3 py-2 font-mono text-xs text-fg ${!editMode && canInline ? "cursor-text hover:bg-accent/5" : !editMode ? "cursor-pointer" : ""}`}
+                        >
+                          {isEditing ? (
+                            <input
+                              autoFocus
+                              value={cellDraft}
+                              onChange={(e) => setCellDraft(e.target.value)}
+                              onClick={(e) => e.stopPropagation()}
+                              onBlur={saveCell}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") saveCell();
+                                if (e.key === "Escape") setEditCell(null);
+                              }}
+                              className="w-full min-w-[80px] rounded border border-border-strong bg-bg px-1.5 py-0.5 font-mono text-xs outline-none focus:border-accent"
+                            />
+                          ) : (
+                            cell(row?.[c])
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="border-b border-border px-3 py-2">
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          title="View / edit JSON"
+                          onClick={(e) => { e.stopPropagation(); openRow(row); }}
+                          className="flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-subtle hover:text-fg"
+                        >
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        </button>
+                        {deletable && row?.id ? (
+                          <button
+                            title="Delete entry"
+                            onClick={(e) => { e.stopPropagation(); deleteRow(row.id); }}
+                            className="flex h-7 w-7 items-center justify-center rounded-md text-muted hover:bg-red-500/10 hover:text-red-500"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        ) : null}
+                      </div>
+                    </td>
                   </tr>
                 ))}
                 {rows && rows.rows.length === 0 && (
@@ -264,7 +437,7 @@ export default function DataBrowserPage() {
           <div className="w-full max-w-lg rounded-xl border border-border bg-card p-5" onClick={(e) => e.stopPropagation()}>
             <div className="mb-3 text-base font-semibold">New document</div>
             <label className="mb-1 block text-xs text-secondary">Collection</label>
-            <input value={newCollection} onChange={(e) => setNewCollection(e.target.value.replace(/[^a-z0-9_-]/gi, "_"))} className="mb-3 w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-border-strong focus:outline-none" />
+            <input value={newCollection} placeholder="collection-name" onChange={(e) => setNewCollection(e.target.value.replace(/[^a-z0-9_-]/gi, "_"))} className="mb-3 w-full rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-border-strong focus:outline-none" />
             <label className="mb-1 block text-xs text-secondary">JSON body</label>
             <textarea value={newBody} onChange={(e) => setNewBody(e.target.value)} spellCheck={false} rows={8} className="w-full resize-none rounded-md border border-border bg-subtle/40 p-3 font-mono text-xs focus:border-border-strong focus:outline-none" />
             {err && <p className="mt-2 text-xs text-red-500">{err}</p>}

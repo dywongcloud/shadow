@@ -7,6 +7,7 @@ import {
   Github,
   RotateCcw,
   RefreshCw,
+  Plus,
   Trash2,
   ExternalLink,
   Code2,
@@ -252,6 +253,22 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           </div>
         </>
       ) : (
+        <div className="space-y-3">
+        {/* Deployments toolbar: create / redeploy / instant rollback */}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-sm text-secondary">{mine.length} deployment{mine.length === 1 ? "" : "s"}</span>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
+              <RotateCcw className="h-4 w-4" /> Instant Rollback
+            </Button>
+            <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
+              {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
+            </Button>
+            <Link href={`/new?repo=${encodeURIComponent(prod?.git?.repo_url ?? "")}`}>
+              <Button><Plus className="h-4 w-4" /> New Deployment</Button>
+            </Link>
+          </div>
+        </div>
         <Table>
           <thead>
             <tr><Th>Deployment</Th><Th>Status</Th><Th>Environment</Th><Th>Source</Th><Th>Created</Th><Th>By</Th><Th></Th></tr>
@@ -283,7 +300,10 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                     ) : (
                       <>
                         {!d.production && (
-                          <button title="Promote to production" onClick={() => promote(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RotateCcw className="h-3.5 w-3.5" /></button>
+                          <button title="Promote to production (rollback)" onClick={() => promote(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RotateCcw className="h-3.5 w-3.5" /></button>
+                        )}
+                        {d.git && (
+                          <button title="Redeploy from git" onClick={redeploy} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RefreshCw className="h-3.5 w-3.5" /></button>
                         )}
                         <button title="Delete deployment" onClick={() => removeDeployment(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
                       </>
@@ -295,6 +315,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
             {!mine.length && <tr><Td className="text-secondary">No deployments.</Td></tr>}
           </tbody>
         </Table>
+        </div>
       )}
     </div>
   );

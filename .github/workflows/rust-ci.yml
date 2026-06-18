@@ -1,0 +1,67 @@
+name: Rust CI
+
+# Automated tests for the OpenEdge Rust backend — core deployment model, gateway,
+# edge (P2P node registry, WAF, rate-limit, concurrency, cron, workflows), the
+# build/runtime pipeline, GitOps, and the cloud node — on every push and PR.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Hard gate: the whole workspace must compile and all unit tests must pass.
+      - name: Build (workspace)
+        run: cargo build --workspace --locked --verbose
+
+      - name: Unit tests (workspace)
+        run: cargo test --workspace --locked --verbose
+
+      # Informational quality checks — reported but non-blocking so pre-existing
+      # style/lint nits don't wedge the pipeline.
+      - name: rustfmt (check)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+  # A focused, fast feedback job for just the deployment/runtime + edge crates the
+  # build/serve path depends on (P2P node registry, gateway, build pipeline).
+  core-tests:
+    name: core (deploy + edge + build) tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test deployment model, edge mesh, builds, cloud node
+        run: |
+          cargo test -p fluid-core --locked
+          cargo test -p fluid-build --locked
+          cargo test -p hive-edge --locked
+          cargo test -p hive-cloud --locked

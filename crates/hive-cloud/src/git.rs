@@ -174,7 +174,6 @@ async fn run_build(
         "Cloning {short_repo} (Branch: {}, Commit: HEAD)",
         if branch.is_empty() { "main" } else { &branch }
     ));
-    log("Previous build caches not available.".into());
 
     let t0 = now_ms();
     let mut cmd = Command::new("git");
@@ -325,6 +324,7 @@ async fn run_build(
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
         req.production,
+        if build_failed { DeployState::Error } else { DeployState::Ready },
     );
 
     if build_failed {
@@ -485,8 +485,13 @@ async fn build_via_fdi(
         plan.framework.name, plan.framework.primitive, pm,
         if is_monorepo { " (workspace monorepo — installing at root)" } else { "" }
     ));
+    if let Some(nd) = preferred_node_bin() {
+        log(format!("Node runtime: {nd}"));
+    }
 
     let has_pkg = install_dir.join("package.json").exists();
+    // Build cache key (lockfile + package manager) for restore/save.
+    let cache_key = compute_cache_key(install_dir, pm).await;
 
     // For a pnpm workspace, scope the install to just this package + its deps
     // (`--filter`) so we don't install the entire monorepo.
@@ -509,7 +514,12 @@ async fn build_via_fdi(
         plan.build_command.clone()
     };
 
-    // 1) Install dependencies at the install dir (root for monorepos).
+    // 0) Restore cached dependencies (local, else pull from a mesh peer).
+    if let Some(k) = &cache_key {
+        restore_cache(cloud, bid, install_dir, k).await;
+    }
+    // 1) Install dependencies at the install dir (root for monorepos). With a
+    // restored node_modules this is a fast verify; otherwise a clean install.
     if has_pkg && !install_cmd.trim().is_empty() {
         log(format!("Running \"{}\"{}", install_cmd, if is_monorepo { " (workspace root)" } else { "" }));
         run_streamed(install_dir, &install_cmd, cloud, bid)
@@ -522,6 +532,10 @@ async fn build_via_fdi(
         run_streamed(dir, &build_cmd, cloud, bid)
             .await
             .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
+    }
+    // 3) Save the warm cache for the next build (and for peers to pull).
+    if let Some(k) = &cache_key {
+        save_cache(cloud, bid, install_dir, k).await;
     }
 
     let has_bo = fluid_build::has_build_output(dir);
@@ -575,27 +589,73 @@ async fn detect_start_cmd(dir: &Path) -> Vec<String> {
     vec!["npm".into(), "start".into()]
 }
 
+/// Find a STABLE Node 20–24 bin dir, preferring it over an unstable system node
+/// (e.g. Homebrew's node v26 canary) so framework builds (SvelteKit, etc.) don't
+/// fail engine checks. Looks at nvm-installed versions first, then `node@NN` kegs.
+pub fn preferred_node_bin() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let nvm = PathBuf::from(&home).join(".nvm/versions/node");
+    let mut best: Option<(u32, PathBuf)> = None;
+    if let Ok(rd) = std::fs::read_dir(&nvm) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if let Some(major) = name.trim_start_matches('v').split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+                if (20..=24).contains(&major) {
+                    let bin = e.path().join("bin");
+                    if bin.join("node").exists() && best.as_ref().map(|(m, _)| major > *m).unwrap_or(true) {
+                        best = Some((major, bin));
+                    }
+                }
+            }
+        }
+    }
+    if let Some((_, bin)) = best {
+        return Some(bin.to_string_lossy().into_owned());
+    }
+    for major in [24u32, 22, 20] {
+        for base in ["/opt/homebrew/opt", "/usr/local/opt"] {
+            let bin = PathBuf::from(format!("{base}/node@{major}/bin"));
+            if bin.join("node").exists() {
+                return Some(bin.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 /// Run a shell command in `dir`, streaming stdout+stderr into the build log.
 async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &str) -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    // Put the project's local CLIs (node_modules/.bin) first so framework binaries
-    // like `next`, `vite`, `astro` resolve to the installed versions.
+    // Put the project's local CLIs (node_modules/.bin) first, then a STABLE Node
+    // 20–24, then system paths. This ensures `node`/`npm` are a supported version
+    // (not Homebrew's node 26 canary) so engine-gated frameworks build.
     let local_bin = dir.join("node_modules/.bin");
+    let mut prefix = local_bin.to_string_lossy().into_owned();
+    if let Some(nd) = preferred_node_bin() {
+        prefix.push(':');
+        prefix.push_str(&nd);
+    }
     let path = format!(
-        "{}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
-        local_bin.to_string_lossy(),
+        "{prefix}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
         std::env::var("PATH").unwrap_or_default()
     );
+    // Non-login shell (`-c`, not `-lc`): a login shell re-runs macOS `path_helper`
+    // / profile scripts which reorder PATH and shove Homebrew's node (v26 canary)
+    // back in front of our chosen stable Node 20–24. `-c` preserves our PATH.
     let mut child = Command::new("/bin/sh")
-        .arg("-lc")
+        .arg("-c")
         .arg(command)
         .current_dir(dir)
         .env("PATH", &path)
         .env("HOME", dir)
         .env("CI", "1")
         .env("NEXT_TELEMETRY_DISABLED", "1")
+        // Never fail a build on EBADENGINE — warn-only — and quiet npm noise.
+        .env("npm_config_engine_strict", "false")
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
@@ -620,6 +680,118 @@ async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &
     let _ = tokio::join!(t1, t2);
     anyhow::ensure!(status.success(), "exited with {status}");
     Ok(())
+}
+
+// ---- Build cache (content-addressed, P2P, fault-tolerant) ----
+//
+// Dependencies are the slow part of a build. We cache `node_modules` (+ framework
+// caches) as a tarball keyed by a content hash of the lockfile + package manager,
+// stored under `$HIVE_DATA/build-cache/<key>.tar`. Restore before install; save
+// after a successful build. On a LOCAL miss we pull the blob from a mesh peer
+// (`GET /v1/buildcache/:key`) — the P2P paradigm: any node that has built these
+// deps can serve them to the others. Every step is best-effort: a cache error
+// (missing, corrupt, peer down) never fails the build — it just falls back to a
+// clean install.
+
+pub fn cache_root() -> PathBuf {
+    crate::persist::data_dir().join("build-cache")
+}
+
+/// Content hash of the lockfile + package manager → cache key. None if there's
+/// nothing installable to key on.
+async fn compute_cache_key(install_dir: &Path, pm: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pm.as_bytes());
+    let mut found = false;
+    for name in ["pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package-lock.json", "package.json"] {
+        if let Ok(bytes) = tokio::fs::read(install_dir.join(name)).await {
+            hasher.update(name.as_bytes());
+            hasher.update(&bytes);
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        return None;
+    }
+    let digest = hasher.finalize();
+    Some(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+}
+
+/// Try to fetch a cache blob from a mesh peer; write it to `dest`. Returns true on
+/// success. Best-effort: any error is swallowed.
+async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool {
+    let peers = cloud.peers.read().clone();
+    for peer in peers {
+        let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
+        if let Ok(resp) = cloud.http.get(&url).timeout(Duration::from_secs(20)).send().await {
+            if resp.status().is_success() {
+                if let Ok(bytes) = resp.bytes().await {
+                    if tokio::fs::create_dir_all(cache_root()).await.is_ok()
+                        && tokio::fs::write(dest, &bytes).await.is_ok()
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Restore node_modules from the cache (local, else peer). Returns true if restored.
+async fn restore_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key: &str) -> bool {
+    let tar = cache_root().join(format!("{key}.tar"));
+    if !tar.exists() && try_peer_fetch(cloud, key, &tar).await {
+        cloud.builds.log(bid, format!("Pulled build cache from peer (key {key})."));
+    }
+    if !tar.exists() {
+        cloud.builds.log(bid, "No build cache for these dependencies — installing fresh.");
+        return false;
+    }
+    let out = Command::new("tar").arg("-xf").arg(&tar).current_dir(install_dir).output().await;
+    match out {
+        Ok(o) if o.status.success() => {
+            cloud.builds.log(bid, format!("Restored build cache (key {key})."));
+            true
+        }
+        _ => {
+            // Corrupt/incompatible archive → drop it and install clean.
+            let _ = tokio::fs::remove_file(&tar).await;
+            cloud.builds.log(bid, "Build cache was unreadable — discarded; installing fresh.");
+            false
+        }
+    }
+}
+
+/// Save node_modules (+ framework cache if present) to the content-addressed cache.
+/// Best-effort, atomic (write temp + rename).
+async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key: &str) {
+    if !install_dir.join("node_modules").exists() {
+        return;
+    }
+    let dir = cache_root();
+    if tokio::fs::create_dir_all(&dir).await.is_err() {
+        return;
+    }
+    let tmp = dir.join(format!("{key}.tar.tmp"));
+    let final_ = dir.join(format!("{key}.tar"));
+    // Include the framework's incremental cache too when it lives under the
+    // install dir (e.g. node_modules/.cache); .next/cache lives in node_modules
+    // for many setups but we keep this list conservative for portability.
+    let mut args: Vec<String> = vec!["-cf".into(), tmp.to_string_lossy().into_owned(), "node_modules".into()];
+    if install_dir.join(".next/cache").exists() {
+        args.push(".next/cache".into());
+    }
+    let out = Command::new("tar").args(&args).current_dir(install_dir).output().await;
+    if let Ok(o) = out {
+        if o.status.success() && tokio::fs::rename(&tmp, &final_).await.is_ok() {
+            cloud.builds.log(bid, "Saved build cache for next time.");
+            return;
+        }
+    }
+    let _ = tokio::fs::remove_file(&tmp).await;
 }
 
 /// Parse the container's listen port from a Dockerfile: prefer `EXPOSE`, else
@@ -782,5 +954,95 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_name_from_url_sanitizes() {
+        assert_eq!(project_name_from_url("https://github.com/vercel/next.js.git"), "next-js");
+        assert_eq!(project_name_from_url("https://github.com/Owner/My_Repo"), "my-repo");
+        assert_eq!(project_name_from_url("git@github.com:acme/cool-app.git"), "cool-app");
+        assert_eq!(project_name_from_url("https://example.com/a/b/"), "b");
+    }
+
+    #[test]
+    fn sanitize_tag_is_docker_safe() {
+        assert_eq!(sanitize_tag("My App!!"), "my-app");
+        assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
+        assert_eq!(sanitize_tag(""), "app");
+        // Only [a-z0-9._-] survive.
+        assert!(sanitize_tag("Foo/Bar:Baz").chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'));
+    }
+
+    #[test]
+    fn preferred_node_bin_never_panics() {
+        // May be Some or None depending on the host; must not panic and, if Some,
+        // must point at an existing `node`.
+        if let Some(dir) = preferred_node_bin() {
+            assert!(std::path::Path::new(&dir).join("node").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_key_is_deterministic_and_content_sensitive() {
+        let base = std::env::temp_dir().join(format!("oe-cachekey-{}", now_ms()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":1}").await.unwrap();
+
+        let k1 = compute_cache_key(&base, "npm").await;
+        let k2 = compute_cache_key(&base, "npm").await;
+        assert!(k1.is_some());
+        assert_eq!(k1, k2, "same lockfile+pm must yield the same key");
+
+        // Different package manager → different key.
+        let k_pnpm = compute_cache_key(&base, "pnpm").await;
+        assert_ne!(k1, k_pnpm);
+
+        // Changed lockfile → different key.
+        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":2}").await.unwrap();
+        let k3 = compute_cache_key(&base, "npm").await;
+        assert_ne!(k1, k3, "changed lockfile must change the key");
+
+        // No lockfile/package.json → None.
+        let empty = std::env::temp_dir().join(format!("oe-cachekey-empty-{}", now_ms()));
+        tokio::fs::create_dir_all(&empty).await.unwrap();
+        assert_eq!(compute_cache_key(&empty, "npm").await, None);
+
+        let _ = tokio::fs::remove_dir_all(&base).await;
+        let _ = tokio::fs::remove_dir_all(&empty).await;
+    }
+
+    #[test]
+    fn build_store_insert_log_update() {
+        let store = BuildStore::new();
+        store.insert(Build {
+            id: "dpl-test".into(),
+            project: "demo".into(),
+            repo_url: "https://github.com/a/b".into(),
+            branch: "main".into(),
+            commit: String::new(),
+            commit_message: String::new(),
+            state: DeployState::Building,
+            started_ms: now_ms(),
+            finished_ms: None,
+            deployment_id: None,
+            alias: None,
+            lines: Vec::new(),
+        });
+        store.log("dpl-test", "building…");
+        store.update("dpl-test", |b| {
+            b.state = DeployState::Ready;
+            b.finished_ms = Some(now_ms());
+        });
+        let b = store.get("dpl-test").expect("build exists");
+        assert!(matches!(b.state, DeployState::Ready));
+        assert_eq!(b.lines.len(), 1);
+        assert_eq!(b.lines[0].line, "building…");
+        assert!(b.finished_ms.is_some());
+        assert_eq!(store.list().len(), 1);
     }
 }

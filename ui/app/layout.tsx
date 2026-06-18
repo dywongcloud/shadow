@@ -6,6 +6,7 @@ import "./globals.css";
 import { TopNav } from "@/components/topnav";
 import { Footer } from "@/components/footer";
 import { ThemeProvider } from "@/components/theme-provider";
+import { GitOps } from "@/components/gitops";
 
 export const metadata: Metadata = {
   title: "OpenEdge",
@@ -28,6 +29,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <TopNav />
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
           <Footer />
+          <GitOps />
         </ThemeProvider>
       </body>
     </html>

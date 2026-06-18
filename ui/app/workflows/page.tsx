@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
-import { Button, Input, Triangle } from "@/components/ui";
+import { Button, Input, Triangle, PageHeader } from "@/components/ui";
 import { apiSend, usePoll, type WorkflowRun, type WorkflowSummaryRow, type WorkflowDef } from "@/lib/api";
 import { StatusChips, RunsTable } from "@/components/workflows";
 
@@ -50,19 +50,19 @@ export default function WorkflowsPage() {
 
   return (
     <div className="pb-20">
-      {/* Header */}
-      <div className="mb-6 flex items-center justify-between">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <span className="flex items-center gap-1.5"><Triangle className="h-5 w-5" /> All Projects</span>
-        </div>
-        <h1 className="absolute left-1/2 -translate-x-1/2 text-base font-medium">Workflows</h1>
-        <div className="flex items-center gap-2">
-          <Pill icon={<Calendar className="h-3.5 w-3.5" />} label={range} options={Object.keys(RANGES)} onSelect={setRange} />
-          <Button variant="outline" onClick={() => setCreating((v) => !v)}>
-            {creating ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />} {creating ? "Close" : "New Workflow"}
-          </Button>
-        </div>
-      </div>
+      {/* Header — consistent with every other page (PageHeader). */}
+      <PageHeader
+        title="Workflows"
+        desc="Compose multi-step pipelines across your deployments and run them on demand or on a schedule."
+        action={
+          <div className="flex items-center gap-2">
+            <Pill icon={<Calendar className="h-3.5 w-3.5" />} label={range} options={Object.keys(RANGES)} onSelect={setRange} />
+            <Button variant="outline" onClick={() => setCreating((v) => !v)}>
+              {creating ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />} {creating ? "Close" : "New Workflow"}
+            </Button>
+          </div>
+        }
+      />
 
       {creating && <WorkflowDefiner onDone={() => setCreating(false)} />}
 

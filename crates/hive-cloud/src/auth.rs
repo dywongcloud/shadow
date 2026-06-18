@@ -70,7 +70,9 @@ pub async fn require_auth(req: Request, next: Next) -> Response {
     let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
     // Allow the token-mint + health endpoints unauthenticated.
     let path = req.uri().path();
-    let open = path == "/healthz" || path == "/v1/token";
+    // GitHub webhooks can't present a platform JWT — they are authenticated by
+    // their own HMAC signature inside the handler (GITHUB_WEBHOOK_SECRET).
+    let open = path == "/healthz" || path == "/v1/token" || path == "/v1/git/webhook";
     if !is_mutation || open {
         return next.run(req).await;
     }

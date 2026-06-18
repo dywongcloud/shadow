@@ -9,6 +9,8 @@ import { Calendar, ChevronDown, Search, MoreHorizontal, ChevronRight } from "luc
 const AreaChart = dynamic(() => import("@tremor/react").then((m) => m.AreaChart), { ssr: false });
 import { Card } from "@/components/ui";
 import { usePoll, type Metrics } from "@/lib/api";
+import { SpeedInsights } from "@/components/speed-insights";
+import { cn } from "@/lib/utils";
 
 const RANGES = [
   { m: 60, label: "Last 1 hour" },
@@ -33,8 +35,44 @@ function fmtBytes(n: number): string {
 export default function ObservabilityPage() {
   const [range, setRange] = useState(720);
   const [q, setQ] = useState("");
+  const [tab, setTab] = useState<"overview" | "speed">(() => {
+    if (typeof window === "undefined") return "overview";
+    return new URLSearchParams(window.location.search).get("tab") === "speed-insights" ? "speed" : "overview";
+  });
   const { data } = usePoll<Metrics>(`/v1/metrics?minutes=${range}`, 5000);
   const rangeLabel = RANGES.find((r) => r.m === range)?.label ?? "Last 12 hours";
+
+  const tabBar = (
+    <div className="mb-6 flex gap-5 border-b border-border text-sm">
+      {([["overview", "Overview"], ["speed", "Speed Insights"]] as const).map(([id, label]) => (
+        <button
+          key={id}
+          onClick={() => {
+            setTab(id);
+            const u = new URL(window.location.href);
+            if (id === "speed") u.searchParams.set("tab", "speed-insights");
+            else u.searchParams.delete("tab");
+            window.history.replaceState({}, "", u.toString());
+          }}
+          className={cn(
+            "-mb-px border-b-2 pb-3 transition-colors",
+            tab === id ? "border-fg font-medium text-fg" : "border-transparent text-secondary hover:text-fg"
+          )}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+
+  if (tab === "speed") {
+    return (
+      <div>
+        {tabBar}
+        <SpeedInsights />
+      </div>
+    );
+  }
 
   const series = data?.series ?? [];
   const reqSeries = series.map((b) => ({
@@ -61,6 +99,7 @@ export default function ObservabilityPage() {
 
   return (
     <div>
+      {tabBar}
       {/* Top controls */}
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-lg font-semibold">Observability</h1>

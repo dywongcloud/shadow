@@ -21,6 +21,11 @@ export async function apiGet<T>(path: string): Promise<T> {
   return r.json();
 }
 
+// Mutations to these paths change the declarative config, so they should reflect
+// in the committed GitOps YAML. We fire a debounced sync event the GitOps loop
+// listens for (server-side it's a no-op when unlinked / nothing changed).
+const CONFIG_PATHS = /^\/v1\/(projects\/|teams\/?$|teams\/|databases|securelinks|gitops)/;
+
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
     method,
@@ -28,6 +33,10 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   if (!r.ok) throw new Error(`${method} ${path} -> ${r.status}`);
+  const isMutation = method !== "GET" && method !== "HEAD";
+  if (typeof window !== "undefined" && isMutation && CONFIG_PATHS.test(path) && path !== "/v1/gitops") {
+    window.dispatchEvent(new Event("gitops-sync"));
+  }
   return r.json();
 }
 
@@ -108,6 +117,10 @@ export interface NodeInfo {
   is_self: boolean;
   latency_ms?: number;
   healthy?: boolean;
+  lat?: number | null;
+  lon?: number | null;
+  city?: string | null;
+  country?: string | null;
 }
 
 export interface AnycastTable {
@@ -255,6 +268,7 @@ export interface Team {
   plan: string;
   created_ms: number;
   members: Member[];
+  sso_enabled?: boolean;
 }
 
 // ---- Webhooks ----
