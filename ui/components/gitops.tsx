@@ -74,14 +74,18 @@ export function GitOps() {
         if (justConnected && s.connected) {
           setStep("repo");
           loadRepos();
+        } else if (s.connected) {
+          // GitHub is already linked (here or via Integrations/New Project) — the
+          // user has effectively set up GitOps, so never nag again. Mark done.
+          localStorage.setItem("hive_onboarded", "1");
         } else if (!onboarded) {
-          // Always prompt once: the intro offers GitHub (if configured) or the
-          // personal-scope path, so it's useful even without Composio wired.
+          // First run with no GitHub link: prompt once (offers GitHub OAuth or the
+          // personal-scope path). finishOnboarding() persists hive_onboarded.
           setStep("intro");
         }
       })
       .catch(() => {
-        // Status fetch failed — still prompt once so onboarding isn't skipped.
+        // Status fetch failed — only prompt if we've never onboarded.
         if (localStorage.getItem("hive_onboarded") !== "1") setStep("intro");
       });
   }, []);

@@ -129,7 +129,7 @@ export default function OverviewPage() {
           )}
 
           {!list.length ? (
-            <Card className="mx-[5%] overflow-hidden p-8 text-center">
+            <Card className="overflow-hidden p-8 text-center">
               <GlobeEmptyState title="Deploy your first project" desc="Import a Git repository or a Dockerfile to deploy across your global mesh. Use “New Project” above to get started." />
             </Card>
           ) : view === "grid" ? (

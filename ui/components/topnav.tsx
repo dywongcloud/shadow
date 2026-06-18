@@ -162,6 +162,11 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
   // from the new user's own Clerk active org.
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // IMPORTANT: ignore the transient "local" placeholder identity that appears
+    // while Clerk's useUser() is still loading (or signed out). Treating it as a
+    // user change would spuriously wipe onboarding/gitops/team state on EVERY load
+    // (e.g. re-prompting the GitOps setup modal after it was already completed).
+    if (!identity.id || identity.id === "local") return;
     const prev = localStorage.getItem("hive_uid");
     if (prev && prev !== identity.id) {
       for (const k of ["hive_team", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
