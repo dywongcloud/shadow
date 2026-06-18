@@ -58,6 +58,8 @@ pub struct PlatformSnapshot {
     pub billing: Vec<crate::billing::BillingAccount>,
     #[serde(default)]
     pub billing_ledger: Vec<crate::billing::LedgerEntry>,
+    #[serde(default)]
+    pub domains: Vec<crate::dns::DomainRecord>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -150,6 +152,9 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for u in &snap.users {
         push(ns_norm(&u.tenant), "users", json!(u));
     }
+    for d in &snap.domains {
+        push(ns_norm(&d.tenant), "domains", json!(d));
+    }
     for (slug, t) in &snap.teams {
         docs.entry(ns_norm(slug)).or_default().insert("team".into(), json!(t));
     }
@@ -208,6 +213,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         users: cloud.identity.users(),
         billing: cloud.billing.snapshot().0,
         billing_ledger: cloud.billing.snapshot().1,
+        domains: cloud.domains.snapshot(),
     }
 }
 
@@ -249,6 +255,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.apikeys.load(snap.apikeys);
     cloud.identity.load(snap.orgs, snap.users);
     cloud.billing.load(snap.billing, snap.billing_ledger);
+    cloud.domains.load(snap.domains);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }
