@@ -8,7 +8,7 @@ import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide
 const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), { ssr: false });
 const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.SparkAreaChart), { ssr: false });
 import { Card } from "@/components/ui";
-import { usePoll, type Overview, type FunctionStats } from "@/lib/api";
+import { usePoll, type Overview, type FunctionStats, type BillingInfo } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const DAYS = 18;
@@ -36,6 +36,7 @@ function fmt(n: number) {
 export default function UsagePage() {
   const { data: ov } = usePoll<Overview>("/v1/overview", 3000);
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 3000);
+  const { data: billing } = usePoll<BillingInfo>("/v1/billing", 5000);
   const [gran, setGran] = useState<"Daily" | "Weekly" | "Monthly">("Daily");
   const [cumulative, setCumulative] = useState(true);
 
@@ -45,12 +46,17 @@ export default function UsagePage() {
   const fluidMs = (fns ?? []).reduce((a, f) => a + f.fluid_ms, 0);
   const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
 
-  // Pretend cost model.
+  // Real billing data drives the credit figures (so issued/purchased credits
+  // and actual compute charges reflect here), falling back to an estimate model.
   const edgeCharge = (requests / 1_000_000) * 2.0;
   const fnCharge = (fluidMs / 1000 / 3600) * 0.18;
   const wafCharge = (blocked / 1_000_000) * 0.6;
-  const onDemand = edgeCharge + fnCharge + wafCharge;
-  const includedUsed = Math.min(20, onDemand);
+  const acc = billing?.account;
+  const includedTotal = acc ? acc.included_cents / 100 : 20;
+  const includedUsed = acc ? acc.used_cents / 100 : Math.min(includedTotal, edgeCharge + fnCharge + wafCharge);
+  const onDemand = acc ? Math.max(0, -acc.balance_cents) / 100 : edgeCharge + fnCharge + wafCharge;
+  const creditBalance = acc ? acc.balance_cents / 100 : 0;
+  const planName = (acc?.plan ?? (ov?.concurrency.plan === "enterprise" ? "enterprise" : "hobby"));
 
   // Stacked chart data.
   const edgeS = series(requests);
@@ -70,11 +76,11 @@ export default function UsagePage() {
     };
   });
 
-  const pct = Math.min(100, (includedUsed / 20) * 100);
+  const pct = Math.min(100, includedTotal ? (includedUsed / includedTotal) * 100 : 0);
 
   return (
     <div>
-      <h1 className="mb-5 text-2xl font-semibold tracking-tight">{ov?.concurrency.plan === "enterprise" ? "Enterprise" : "Hobby"} Plan Usage</h1>
+      <h1 className="mb-5 text-2xl font-semibold capitalize tracking-tight">{planName} Plan Usage</h1>
 
       {/* Filter row */}
       <div className="mb-4 flex flex-wrap items-center gap-2 text-sm">
@@ -93,7 +99,11 @@ export default function UsagePage() {
             <span className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-500/10 text-blue-500"><Coins className="h-4 w-4" /></span>
             <div>
               <div className="text-sm text-secondary">Included Credit</div>
-              <div className="text-lg font-semibold tabular-nums">${includedUsed.toFixed(2)} / $20.00</div>
+              <div className="text-lg font-semibold tabular-nums">${includedUsed.toFixed(2)} / ${includedTotal.toFixed(2)}</div>
+            </div>
+            <div className="ml-6 border-l border-border pl-6">
+              <div className="text-sm text-secondary">Credit Balance</div>
+              <div className={cn("text-lg font-semibold tabular-nums", creditBalance < 0 && "text-red-500")}>${creditBalance.toFixed(2)}</div>
             </div>
           </div>
           <div className="flex items-center gap-3 text-right">

@@ -19,6 +19,7 @@ import {
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
 import { ProjectWorkflows } from "@/components/workflows";
+import { DeploymentResources } from "@/components/deployment-resources";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -41,11 +42,11 @@ export default function ProjectDetail({ params }: { params: { project: string } 
   const router = useRouter();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
-  const [tab, setTab] = useState<"overview" | "graph" | "workflows" | "deployments">("overview");
+  const [tab, setTab] = useState<"overview" | "graph" | "workflows" | "resources" | "deployments">("overview");
   useEffect(() => {
     if (typeof window === "undefined") return;
     const t = new URLSearchParams(window.location.search).get("tab");
-    if (t === "graph" || t === "deployments" || t === "overview" || t === "workflows") setTab(t);
+    if (t === "graph" || t === "deployments" || t === "overview" || t === "workflows" || t === "resources") setTab(t);
   }, []);
   const [busy, setBusy] = useState("");
 
@@ -124,7 +125,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
 
       {/* sub tabs */}
       <div className="mb-6 flex items-center gap-1 border-b border-border">
-        {(["overview", "graph", "workflows", "deployments"] as const).map((t) => (
+        {(["overview", "graph", "workflows", "resources", "deployments"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -152,6 +153,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         <ServiceGraph project={name} prod={prod} />
       ) : tab === "workflows" ? (
         <ProjectWorkflows project={name} />
+      ) : tab === "resources" ? (
+        <DeploymentResources deploymentId={prod?.id} />
       ) : tab === "overview" ? (
         <>
           {/* Production Deployment */}

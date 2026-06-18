@@ -33,12 +33,16 @@ pub struct BuildConfig {
 }
 impl Default for BuildConfig {
     fn default() -> Self {
+        // Empty = "use framework/package-manager detection". Non-empty values are
+        // treated as explicit overrides by the builder, so defaults MUST be empty
+        // (otherwise a freshly-created project would force `npm install` and
+        // override detected pnpm/yarn — and break monorepo workspaces).
         BuildConfig {
-            framework: "Other".into(),
-            install_command: "npm install".into(),
-            build_command: "npm run build".into(),
-            output_dir: "dist".into(),
-            root_dir: "./".into(),
+            framework: String::new(),
+            install_command: String::new(),
+            build_command: String::new(),
+            output_dir: String::new(),
+            root_dir: String::new(),
         }
     }
 }
@@ -178,6 +182,17 @@ impl ProjectStore {
     pub fn set_team(&self, project: &str, team: &str) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().team = team.to_string();
+    }
+
+    /// Persist the monorepo subdirectory so redeploys keep building it.
+    pub fn set_root_dir(&self, project: &str, root_dir: &str) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().build.root_dir = root_dir.to_string();
+    }
+
+    /// The configured root/subdirectory for a project ("" if none).
+    pub fn root_dir_of(&self, project: &str) -> String {
+        self.map.read().get(project).map(|s| s.build.root_dir.clone()).unwrap_or_default()
     }
 
     pub fn set_preview_protection(&self, project: &str, on: bool) {

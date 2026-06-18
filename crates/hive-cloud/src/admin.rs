@@ -53,6 +53,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/sandbox", post(sandbox))
         .route("/deployments", get(dep_list).post(dep_create))
         .route("/v1/deployments/:id", delete(dep_delete))
+        .route("/v1/deployments/:id/resources", get(deployment_resources))
         .route("/v1/deployments/:id/promote", post(dep_promote))
         .route("/v1/projects/:project", delete(project_delete))
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
@@ -71,6 +72,12 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/domains", post(project_domain_add))
         .route("/v1/projects/:project/team", put(project_team_put))
         .route("/v1/domains", get(domains_list))
+        .route("/v1/domains/:domain", get(domain_get))
+        .route("/v1/domains/:domain/records", post(domain_add_record))
+        .route("/v1/domains/:domain/records/:id", delete(domain_delete_record))
+        .route("/v1/domains/:domain/nameservers", put(domain_set_nameservers))
+        .route("/v1/domains/:domain/auto-renew", put(domain_set_auto_renew))
+        .route("/v1/domains/:domain/ssl/renew", post(domain_renew_ssl))
         // ---- Teams ----
         .route("/v1/teams", get(teams_list).post(team_create))
         .route("/v1/teams/:slug", get(team_get))
@@ -117,7 +124,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/admin/audit", get(admin_audit))
         .route("/v1/admin/data", get(data_collections))
-        .route("/v1/admin/data/:collection", get(data_rows))
+        .route("/v1/admin/data/:collection", get(data_rows).post(data_create))
+        .route("/v1/admin/data/:collection/:id", put(data_patch).delete(data_delete))
         .route("/v1/admin/namespaces", get(data_namespaces))
         .route("/v1/identity/sync", post(identity_sync))
         // ---- Billing & compute credits ----
@@ -243,6 +251,209 @@ async fn domains_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> J
         .collect::<Vec<_>>()))
 }
 
+// ---- Deployment resources (functions + static assets, build artifacts) ----
+
+fn asset_kind(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "html" | "htm" => "HTML",
+        "js" | "mjs" | "cjs" => "JS",
+        "css" => "CSS",
+        "json" | "webmanifest" => "JSON",
+        "png" | "jpg" | "jpeg" | "gif" | "svg" | "webp" | "ico" | "avif" => "Image",
+        "woff" | "woff2" | "ttf" | "otf" => "Font",
+        "txt" | "xml" | "map" => "Text",
+        _ => "Misc",
+    }
+}
+
+/// Walk a build output directory into a flat asset list (path, size, type),
+/// skipping heavy/irrelevant dirs. Capped to keep the response light.
+fn walk_assets(base: &std::path::Path, cap: usize) -> Vec<Value> {
+    let mut out = Vec::new();
+    fn rec(base: &std::path::Path, dir: &std::path::Path, out: &mut Vec<Value>, cap: usize) {
+        if out.len() >= cap {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            if out.len() >= cap {
+                return;
+            }
+            let p = e.path();
+            let name = e.file_name().to_string_lossy().to_string();
+            // Skip dependencies, VCS, and build caches/internals (incl. dotfiles)
+            // so only real shipped assets show up.
+            if name == "node_modules" || name.starts_with('.') || name == "cache" {
+                continue;
+            }
+            if p.is_dir() {
+                rec(base, &p, out, cap);
+            } else if let Ok(rel) = p.strip_prefix(base) {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                let path = format!("/{}", rel.to_string_lossy().replace('\\', "/"));
+                out.push(json!({ "path": path, "size": size, "type": asset_kind(&path) }));
+            }
+        }
+    }
+    rec(base, base, &mut out, cap);
+    out.sort_by(|a, b| a["path"].as_str().unwrap_or("").cmp(b["path"].as_str().unwrap_or("")));
+    out
+}
+
+/// Functions + static assets for a deployment — the build artifacts/resources.
+async fn deployment_resources(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let Some(rec) = c.gw.deployment_records().into_iter().find(|r| r.id == id) else {
+        return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
+    };
+    if norm(&c.projects.team_of(&rec.project)) != t {
+        return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
+    }
+    let functions: Vec<Value> = rec
+        .manifest
+        .functions
+        .iter()
+        .map(|f| {
+            json!({
+                "name": f.name,
+                "runtime": if f.runtime == "edge" { "Edge" } else if f.runtime == "container" { "Container" } else { "Node" },
+                "region": c.region,
+                "memory_mib": f.memory_mib,
+                "max_duration_secs": f.max_duration_secs,
+                "edge": f.runtime == "edge",
+            })
+        })
+        .collect();
+
+    let root = std::path::PathBuf::from(&rec.root);
+    // Walk the build OUTPUT, not the source tree: an explicit static_dir, else a
+    // recognized framework output dir. Avoids listing source files + tool caches.
+    let base = match rec.manifest.static_dir.as_deref() {
+        Some(sd) if sd != "." && !sd.is_empty() => Some(root.join(sd)),
+        _ => [".vercel/output/static", ".next/static", "dist", "build", "out", "public"]
+            .iter()
+            .map(|c| root.join(c))
+            .find(|p| p.is_dir()),
+    };
+    let (mut assets, total_static) = match base {
+        Some(b) => {
+            let a = walk_assets(&b, 800);
+            let n = a.len();
+            (a, n)
+        }
+        None => (Vec::new(), 0),
+    };
+    assets.truncate(500);
+
+    Json(json!({
+        "functions": functions,
+        "static_assets": assets,
+        "total_static": total_static,
+        "kind": if rec.manifest.functions.is_empty() { "static" } else { "functions" },
+    }))
+}
+
+// ---- Domain detail: DNS records, nameservers, SSL ----
+
+/// Full domain record (DNS records, nameservers, free SSL cert, metadata).
+/// Creates a sensible default on first view.
+async fn domain_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    // Connected projects: projects in this tenant whose domain ends with this one.
+    let connected: Vec<Value> = c
+        .projects
+        .all_domains()
+        .into_iter()
+        .filter(|(p, d)| norm(&c.projects.team_of(p)) == t && (d == &domain || d.ends_with(&format!(".{domain}"))))
+        .map(|(p, d)| json!({ "project": p, "domain": d }))
+        .collect();
+    Json(json!({ "domain": c.domains.ensure(&domain, &t), "connected": connected }))
+}
+
+#[derive(Deserialize)]
+struct AddRecordReq {
+    #[serde(default)]
+    name: String,
+    #[serde(rename = "type")]
+    kind: String,
+    value: String,
+    #[serde(default = "default_dns_ttl")]
+    ttl: u32,
+    #[serde(default)]
+    priority: Option<u32>,
+    #[serde(default)]
+    comment: String,
+}
+fn default_dns_ttl() -> u32 {
+    60
+}
+
+async fn domain_add_record(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>, Json(r): Json<AddRecordReq>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    let rec = crate::dns::DnsRecord {
+        id: String::new(),
+        name: r.name,
+        kind: r.kind.to_uppercase(),
+        value: r.value,
+        ttl: r.ttl,
+        priority: r.priority,
+        comment: r.comment,
+        created_ms: 0,
+        system: false,
+    };
+    let added = c.domains.add_record(&domain, rec).ok_or(StatusCode::NOT_FOUND)?;
+    c.audit.record(&t, "user", "create", "dns_record", &added.id, &format!("{} {} → {} ({domain})", added.kind, added.name, added.value));
+    crate::persist::persist(&c);
+    Ok(Json(json!(added)))
+}
+
+async fn domain_delete_record(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path((domain, id)): Path<(String, String)>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    let ok = c.domains.delete_record(&domain, &id);
+    if ok {
+        c.audit.record(&t, "user", "delete", "dns_record", &id, &domain);
+        crate::persist::persist(&c);
+    }
+    Json(json!({ "deleted": ok }))
+}
+
+#[derive(Deserialize)]
+struct NameserversReq {
+    nameservers: Vec<String>,
+}
+
+async fn domain_set_nameservers(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>, Json(r): Json<NameserversReq>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    c.domains.set_nameservers(&domain, r.nameservers);
+    c.audit.record(&t, "user", "update", "nameservers", &domain, "");
+    crate::persist::persist(&c);
+    Json(json!(c.domains.get(&domain)))
+}
+
+#[derive(Deserialize)]
+struct AutoRenewReq {
+    on: bool,
+}
+
+async fn domain_set_auto_renew(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>, Json(r): Json<AutoRenewReq>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    c.domains.set_auto_renew(&domain, r.on);
+    crate::persist::persist(&c);
+    Json(json!(c.domains.get(&domain)))
+}
+
+async fn domain_renew_ssl(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    let cert = c.domains.renew_ssl(&domain);
+    c.audit.record(&t, "user", "update", "ssl_cert", &domain, "reissued free certificate");
+    crate::persist::persist(&c);
+    Json(json!(cert))
+}
+
 // ---- Git deploy (Import Git Repository) ----
 
 async fn git_deploy(
@@ -255,6 +466,10 @@ async fn git_deploy(
     let t = tenant(&c, &headers);
     let project = req.project.clone().unwrap_or_else(|| crate::git::project_name_from_url(&req.repo_url));
     c.projects.set_team(&project, &t);
+    // Persist the subdirectory so future redeploys keep building it.
+    if let Some(root) = req.root_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        c.projects.set_root_dir(&project, root);
+    }
     crate::persist::persist(&c);
     // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
     let build_id = crate::git::start_build(c.clone(), req);
@@ -384,13 +599,14 @@ async fn project_redeploy(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let git = c.gw.git_for_project(&project).ok_or(StatusCode::NOT_FOUND)?;
+    let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
     let req = fluid_core::GitDeployRequest {
         repo_url: git.repo_url,
         branch: Some(git.branch).filter(|b| !b.is_empty()),
         project: Some(project),
         creator: Some("you".into()),
         production: true,
-        root_dir: None,
+        root_dir,
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -1647,8 +1863,8 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
         ("projects", projects),
         ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
         ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
-        ("teams", c.teams.list().into_iter().map(|t| json!(t)).collect()),
         ("databases", c.databases.snapshot().into_iter().map(|d| json!(d)).collect()),
+        ("domains", c.domains.snapshot().into_iter().map(|d| json!(d)).collect()),
         ("secure_links", c.securelinks.all().into_iter().map(|l| json!(l)).collect()),
         ("api_keys", c.apikeys.snapshot().into_iter().map(|k| json!(k)).collect()),
         ("builds", c.builds.list().into_iter().map(|b| json!({ "id": b.id, "project": b.project, "state": b.state, "branch": b.branch, "commit": b.commit, "commit_message": b.commit_message, "alias": b.alias, "started_ms": b.started_ms, "finished_ms": b.finished_ms, "log_lines": b.lines.len() })).collect()),
@@ -1686,10 +1902,14 @@ async fn data_namespaces(State(c): State<Arc<CloudState>>) -> Json<Value> {
 }
 
 async fn data_collections(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    let cols: Vec<Value> = all_collections(&c)
+    let mut cols: Vec<Value> = all_collections(&c)
         .into_iter()
-        .map(|(name, rows)| json!({ "name": name, "count": rows.len() }))
+        .map(|(name, rows)| json!({ "name": name, "count": rows.len(), "editable": false }))
         .collect();
+    // Editable document collections (full CRUD).
+    for (name, count) in c.docs.collections() {
+        cols.push(json!({ "name": name, "count": count, "editable": true }));
+    }
     Json(json!({ "collections": cols, "store": "guardian-db (iroh) · local snapshot" }))
 }
 
@@ -1699,17 +1919,22 @@ struct DataQ {
     limit: Option<usize>,
 }
 
+fn doc_rows(c: &Arc<CloudState>, collection: &str) -> Option<Vec<Value>> {
+    let docs = c.docs.list(collection);
+    if docs.is_empty() {
+        return None;
+    }
+    Some(docs.into_iter().map(|d| json!(d)).collect())
+}
+
 async fn data_rows(
     State(c): State<Arc<CloudState>>,
     Path(collection): Path<String>,
     Query(q): Query<DataQ>,
 ) -> Result<Json<Value>, StatusCode> {
-    let cols = all_collections(&c);
-    let rows = cols
-        .into_iter()
-        .find(|(name, _)| *name == collection)
-        .map(|(_, r)| r)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let typed = all_collections(&c).into_iter().find(|(name, _)| *name == collection).map(|(_, r)| r);
+    let editable = typed.is_none();
+    let rows = typed.or_else(|| doc_rows(&c, &collection)).ok_or(StatusCode::NOT_FOUND)?;
     let needle = q.q.unwrap_or_default().to_lowercase();
     let total = rows.len();
     let mut filtered: Vec<Value> = rows
@@ -1719,7 +1944,66 @@ async fn data_rows(
     let matched = filtered.len();
     let limit = q.limit.unwrap_or(200).min(2000);
     filtered.truncate(limit);
-    Ok(Json(json!({ "collection": collection, "total": total, "matched": matched, "rows": filtered })))
+    Ok(Json(json!({ "collection": collection, "total": total, "matched": matched, "rows": filtered, "editable": editable })))
+}
+
+/// Create a document in an editable collection (DocStore).
+async fn data_create(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(collection): Path<String>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers);
+    // Don't let custom docs shadow a typed platform collection.
+    if all_collections(&c).iter().any(|(n, _)| *n == collection) {
+        return Err((StatusCode::CONFLICT, format!("'{collection}' is a managed collection — create custom docs in a new collection name")));
+    }
+    let doc = c.docs.create(&collection, &t, body);
+    c.audit.record(&t, "user", "create", "document", &doc.id, &collection);
+    crate::persist::persist(&c);
+    Ok(Json(json!(doc)))
+}
+
+/// Patch a document by id (editable collections only).
+async fn data_patch(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path((collection, id)): Path<(String, String)>,
+    Json(body): Json<serde_json::Map<String, Value>>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    let doc = c.docs.patch(&id, body).ok_or(StatusCode::NOT_FOUND)?;
+    c.audit.record(&t, "user", "update", "document", &id, &collection);
+    crate::persist::persist(&c);
+    Ok(Json(json!(doc)))
+}
+
+/// Delete a row: a custom document, or a typed entry via its owning store.
+async fn data_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path((collection, id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers);
+    if c.docs.delete(&id) {
+        c.audit.record(&t, "user", "delete", "document", &id, &collection);
+        crate::persist::persist(&c);
+        return Ok(Json(json!({ "deleted": id })));
+    }
+    let ok = match collection.as_str() {
+        "deployments" => c.gw.remove(&id).await.is_some(),
+        "databases" => { c.databases.remove_db(&id); true }
+        "secure_links" => { c.securelinks.remove(&id); true }
+        "webhooks" => { c.webhooks.remove(&id); true }
+        _ => return Err((StatusCode::BAD_REQUEST, format!("'{collection}' rows are managed and can't be deleted here"))),
+    };
+    if !ok {
+        return Err((StatusCode::NOT_FOUND, "not found".into()));
+    }
+    c.audit.record(&t, "user", "delete", &collection, &id, "");
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "deleted": id })))
 }
 
 // ============================ Deployment preview / thumbnail ============================

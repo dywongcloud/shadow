@@ -205,20 +205,30 @@ async fn run_build(
     });
 
     // Build from a subdirectory for monorepo templates (e.g. `examples/nextjs`).
-    let build_dir = match req.root_dir.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    // Use the request's root_dir, falling back to the project's persisted one so
+    // redeploys keep building the right subdirectory.
+    let persisted_root = cloud.projects.root_dir_of(&project);
+    let effective_root = req
+        .root_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| Some(persisted_root.clone()).filter(|s| !s.trim().is_empty() && s != "./"));
+    let build_dir = match effective_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(root) => {
             log(format!("Root directory: {root}"));
             dir.join(root)
         }
         None => dir.clone(),
     };
-    anyhow::ensure!(build_dir.exists(), "root directory '{}' not found in repo", req.root_dir.clone().unwrap_or_default());
+    anyhow::ensure!(build_dir.exists(), "root directory '{}' not found in repo", effective_root.unwrap_or_default());
 
     // Produce the deployment manifest. A build failure must NOT abort the
     // deploy — Vercel still records the deployment/project — so on error we fall
     // back to a "build failed" page and keep going (build state ends as Error).
     let mut build_failed = false;
-    let mut manifest = match produce_manifest(cloud, bid, &build_dir, &project, &commit).await {
+    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit).await {
         Ok(m) => m,
         Err(e) => {
             build_failed = true;
@@ -372,6 +382,7 @@ fn region_label(region: &str) -> String {
 async fn produce_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
+    repo_root: &Path,
     dir: &Path,
     project: &str,
     commit: &str,
@@ -411,8 +422,27 @@ async fn produce_manifest(
         log("Detected fluid.json — using project configuration.".into());
         Ok(m)
     } else {
-        build_via_fdi(cloud, bid, dir, project).await
+        build_via_fdi(cloud, bid, repo_root, dir, project).await
     }
+}
+
+/// Does a package.json in `dir` reference workspace-protocol deps (`workspace:*`)
+/// — i.e. it's a package inside a monorepo workspace that must be installed from
+/// the workspace root?
+async fn uses_workspace_protocol(dir: &Path) -> bool {
+    let Ok(s) = tokio::fs::read_to_string(dir.join("package.json")).await else { return false };
+    s.contains("\"workspace:") || s.contains("workspace:*")
+}
+
+/// Is `root` a workspace root (pnpm-workspace.yaml or a `workspaces` field)?
+async fn is_workspace_root(root: &Path) -> bool {
+    if root.join("pnpm-workspace.yaml").exists() {
+        return true;
+    }
+    if let Ok(s) = tokio::fs::read_to_string(root.join("package.json")).await {
+        return s.contains("\"workspaces\"");
+    }
+    false
 }
 
 /// Framework-Defined Infrastructure: detect the framework, run its real install
@@ -422,14 +452,14 @@ async fn produce_manifest(
 async fn build_via_fdi(
     cloud: &Arc<CloudState>,
     bid: &str,
+    repo_root: &Path,
     dir: &Path,
     project: &str,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
 
-    // Build-config overrides ONLY when the project was explicitly configured —
-    // a fresh deploy uses pure framework detection (the generic BuildConfig
-    // default of "npm install"/"npm run build" is not treated as an override).
+    // Build-config overrides ONLY when the user explicitly set a non-empty value
+    // (defaults are empty — see BuildConfig::default). Detection drives the rest.
     let bc = cloud.projects.get_if_set(project).map(|s| s.build);
     let pick = |f: fn(&crate::project_settings::BuildConfig) -> &String| {
         bc.as_ref().map(f).filter(|s| !s.trim().is_empty()).cloned()
@@ -439,31 +469,57 @@ async fn build_via_fdi(
     let outd = pick(|b| &b.output_dir);
 
     let plan = fluid_build::plan_build(dir, inst.as_deref(), bld.as_deref(), outd.as_deref());
+
+    // Monorepo detection: only when THIS package actually uses `workspace:*` deps
+    // (which resolve only from a root install). A standalone example that merely
+    // lives inside a workspace repo (e.g. vercel/vercel's examples/* have normal
+    // deps) is installed in place — installing at the root would match no project.
+    let is_monorepo = dir != repo_root
+        && uses_workspace_protocol(dir).await
+        && is_workspace_root(repo_root).await;
+    let install_dir = if is_monorepo { repo_root } else { dir };
+    let pm = fluid_build::package_manager(install_dir);
+
     log(format!(
-        "Detected framework: {} — primitive: {:?}, package manager: {}",
-        plan.framework.name, plan.framework.primitive, plan.package_manager
+        "Detected framework: {} — primitive: {:?}, package manager: {}{}",
+        plan.framework.name, plan.framework.primitive, pm,
+        if is_monorepo { " (workspace monorepo — installing at root)" } else { "" }
     ));
 
-    // npm/yarn/pnpm commands require a package.json; skip them if absent so plain
-    // static repos don't fail on `npm install`.
-    let has_pkg = dir.join("package.json").exists();
-    let is_node_cmd = |c: &str| {
-        let c = c.trim_start();
-        ["npm", "yarn", "pnpm", "bun", "next", "vite", "astro"].iter().any(|p| c.starts_with(p))
-    };
-    let runnable = |c: &str| !c.is_empty() && !(is_node_cmd(c) && !has_pkg);
+    let has_pkg = install_dir.join("package.json").exists();
 
-    // 1) Install dependencies (real, streamed).
-    if runnable(&plan.install_command) {
-        log(format!("Running \"{}\"", plan.install_command));
-        run_streamed(dir, &plan.install_command, cloud, bid)
+    // For a pnpm workspace, scope the install to just this package + its deps
+    // (`--filter`) so we don't install the entire monorepo.
+    let rel = dir.strip_prefix(repo_root).ok().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+    let pnpm_filter = if is_monorepo && !rel.is_empty() { format!(" --filter \"{{./{rel}}}...\"") } else { String::new() };
+
+    // Install command: honor an explicit override, else the right command for the
+    // detected package manager (pnpm/yarn via corepack so the binary is present).
+    let install_cmd: String = inst.unwrap_or_else(|| match pm {
+        "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm install --no-frozen-lockfile{pnpm_filter}"),
+        "yarn" => "corepack enable >/dev/null 2>&1; yarn install --network-timeout 600000".into(),
+        "bun" => "bun install".into(),
+        _ => "npm install --no-audit --no-fund".into(),
+    });
+    // Build command: detected framework default (already package-manager aware),
+    // re-pointed to the install PM if it's a generic `npm run` script.
+    let build_cmd = if plan.build_command.starts_with("npm ") && pm != "npm" {
+        plan.build_command.replacen("npm", pm, 1)
+    } else {
+        plan.build_command.clone()
+    };
+
+    // 1) Install dependencies at the install dir (root for monorepos).
+    if has_pkg && !install_cmd.trim().is_empty() {
+        log(format!("Running \"{}\"{}", install_cmd, if is_monorepo { " (workspace root)" } else { "" }));
+        run_streamed(install_dir, &install_cmd, cloud, bid)
             .await
             .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
     }
-    // 2) Build (real, streamed).
-    if runnable(&plan.build_command) {
-        log(format!("Running \"{}\"", plan.build_command));
-        run_streamed(dir, &plan.build_command, cloud, bid)
+    // 2) Build in the project directory.
+    if has_pkg && !build_cmd.trim().is_empty() {
+        log(format!("Running \"{}\"", build_cmd));
+        run_streamed(dir, &build_cmd, cloud, bid)
             .await
             .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
     }

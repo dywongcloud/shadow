@@ -3,7 +3,7 @@
 import Link from "next/link";
 import {
   Github, Search, GitBranch, CheckCheck, LayoutGrid, List,
-  ChevronDown, ShieldCheck, CircleCheck, EyeOff,
+  ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star,
 } from "lucide-react";
 import { Card, Button, Input, Triangle } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -12,7 +12,7 @@ import {
   usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 type View = "grid" | "list";
 
@@ -37,12 +37,37 @@ export default function OverviewPage() {
     if (typeof window !== "undefined") localStorage.setItem("oe_projects_view", v);
   }
 
+  // Favorites (starred projects) — persisted client-side; collapsible section.
+  const [favorites, setFavorites] = useState<string[]>([]);
+  const [favOpen, setFavOpen] = useState(true);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try { const f = localStorage.getItem("oe_favorites"); if (f) setFavorites(JSON.parse(f)); } catch { /* ignore */ }
+    if (localStorage.getItem("oe_fav_open") === "0") setFavOpen(false);
+  }, []);
+  function toggleFav(project: string) {
+    setFavorites((prev) => {
+      const next = prev.includes(project) ? prev.filter((p) => p !== project) : [...prev, project];
+      if (typeof window !== "undefined") localStorage.setItem("oe_favorites", JSON.stringify(next));
+      return next;
+    });
+  }
+  function toggleFavOpen() {
+    setFavOpen((o) => {
+      const n = !o;
+      if (typeof window !== "undefined") localStorage.setItem("oe_fav_open", n ? "1" : "0");
+      return n;
+    });
+  }
+
   // Group deployments by project (latest per project = the project card).
   const projects = new Map<string, Deployment>();
   for (const d of deps ?? []) if (!projects.has(d.project)) projects.set(d.project, d);
   const list = Array.from(projects.values()).filter((p) =>
     p.project.toLowerCase().includes(q.toLowerCase())
   );
+
+  const favoriteProjects = list.filter((p) => favorites.includes(p.project));
 
   // Paginate so large fleets stay navigable.
   const PAGE = view === "list" ? 12 : 6;
@@ -71,12 +96,11 @@ export default function OverviewPage() {
             <List className="h-4 w-4" />
           </ViewButton>
         </div>
-        <Link href="/new">
-          <Button>New Project</Button>
-        </Link>
+        <AddNewMenu />
       </div>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[340px_1fr]">
+      {/* Left column slimmed ~15% (340 → 290). */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-[290px_1fr]">
         {/* LEFT: Vercel-style dashboard boxes */}
         <div className="order-2 flex flex-col gap-6 lg:order-1">
           <UsageBox billing={billing} ledger={ledger ?? []} />
@@ -86,6 +110,24 @@ export default function OverviewPage() {
 
         {/* RIGHT: projects */}
         <div className="order-1 lg:order-2">
+          {/* Your Favorites — collapsible, aligned adjacent to Usage. */}
+          <button onClick={toggleFavOpen} className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
+            <ChevronDown className={`h-4 w-4 transition-transform ${favOpen ? "" : "-rotate-90"}`} /> Your Favorites
+          </button>
+          {favOpen && (
+            favoriteProjects.length ? (
+              <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                {favoriteProjects.map((p) => (
+                  <ProjectCard key={`fav-${p.id}`} p={p} onChange={refresh} isFav onToggleFav={() => toggleFav(p.project)} />
+                ))}
+              </div>
+            ) : (
+              <Card className="mb-6 p-6 text-center text-sm text-secondary">
+                Star a project (the ☆ on a card) to pin it to your favorites.
+              </Card>
+            )
+          )}
+
           {!list.length ? (
             <Card className="overflow-hidden p-8 text-center">
               <GlobeEmptyState title="Deploy your first project" desc="Import a Git repository or a Dockerfile to deploy across your global mesh. Use “New Project” above to get started." />
@@ -93,13 +135,13 @@ export default function OverviewPage() {
           ) : view === "grid" ? (
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               {shown.map((p) => (
-                <ProjectCard key={p.id} p={p} onChange={refresh} />
+                <ProjectCard key={p.id} p={p} onChange={refresh} isFav={favorites.includes(p.project)} onToggleFav={() => toggleFav(p.project)} />
               ))}
             </div>
           ) : (
             <div className="overflow-hidden rounded-xl border border-border bg-card">
               {shown.map((p) => (
-                <ProjectRow key={p.id} p={p} onChange={refresh} />
+                <ProjectRow key={p.id} p={p} onChange={refresh} isFav={favorites.includes(p.project)} onToggleFav={() => toggleFav(p.project)} />
               ))}
             </div>
           )}
@@ -251,6 +293,40 @@ function RecentPreviewsBox({ deps }: { deps: Deployment[] }) {
   );
 }
 
+/** Vercel-style "Add New…" split dropdown. */
+function AddNewMenu() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const f = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", f);
+    return () => document.removeEventListener("mousedown", f);
+  }, []);
+  const items = [
+    { label: "Project", href: "/new" },
+    { label: "Domain", href: "/domains" },
+    { label: "Storage", href: "/storage" },
+    { label: "Integration", href: "/integrations" },
+    { label: "Team Member", href: "/teams" },
+  ];
+  return (
+    <div className="relative" ref={ref}>
+      <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg hover:opacity-90">
+        Add New… <ChevronDown className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full z-40 mt-1.5 w-48 overflow-hidden rounded-lg border border-border bg-card py-1 shadow-pop">
+          {items.map((it) => (
+            <Link key={it.label} href={it.href} onClick={() => setOpen(false)} className="block px-3 py-2 text-sm hover:bg-subtle">
+              {it.label}
+            </Link>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ViewButton({ active, onClick, label, children }: { active: boolean; onClick: () => void; label: string; children: React.ReactNode }) {
   return (
     <button
@@ -287,7 +363,20 @@ function StatusRing({ state }: { state: string }) {
 
 /** Card view — the whole card is a link (stretched-link pattern) while the
  *  status ring + ⋯ menu stay clickable on top. */
-function ProjectCard({ p, onChange }: { p: Deployment; onChange?: () => void }) {
+function StarBtn({ isFav, onToggle }: { isFav?: boolean; onToggle?: () => void }) {
+  if (!onToggle) return null;
+  return (
+    <button
+      onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggle(); }}
+      aria-label={isFav ? "Unfavorite" : "Favorite"}
+      className={`pointer-events-auto flex h-7 w-7 items-center justify-center rounded-md hover:bg-subtle ${isFav ? "text-amber-400" : "text-muted hover:text-fg"}`}
+    >
+      <Star className="h-4 w-4" fill={isFav ? "currentColor" : "none"} />
+    </button>
+  );
+}
+
+function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChange?: () => void; isFav?: boolean; onToggleFav?: () => void }) {
   const hasGit = !!p.git;
   return (
     <Card className="relative p-5 transition-shadow hover:shadow-pop">
@@ -306,6 +395,7 @@ function ProjectCard({ p, onChange }: { p: Deployment; onChange?: () => void }) 
             </div>
           </div>
           <div className="pointer-events-auto z-20 flex shrink-0 items-center gap-1">
+            <StarBtn isFav={isFav} onToggle={onToggleFav} />
             <StatusRing state={p.state} />
             <ProjectMenu project={p.project} alias={p.alias} onChange={onChange} />
           </div>
@@ -340,7 +430,7 @@ function ProjectCard({ p, onChange }: { p: Deployment; onChange?: () => void }) 
 }
 
 /** List/row view — a full-width clickable row like Vercel's list layout. */
-function ProjectRow({ p, onChange }: { p: Deployment; onChange?: () => void }) {
+function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChange?: () => void; isFav?: boolean; onToggleFav?: () => void }) {
   const hasGit = !!p.git;
   return (
     <div className="relative flex items-center gap-4 border-b border-border px-4 py-3.5 transition-colors last:border-0 hover:bg-subtle/50">
@@ -376,6 +466,7 @@ function ProjectRow({ p, onChange }: { p: Deployment; onChange?: () => void }) {
           </span>
         )}
         <div className="pointer-events-auto z-20 flex shrink-0 items-center gap-1">
+          <StarBtn isFav={isFav} onToggle={onToggleFav} />
           <StatusRing state={p.state} />
           <ProjectMenu project={p.project} alias={p.alias} onChange={onChange} />
         </div>

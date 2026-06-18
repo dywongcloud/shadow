@@ -6,7 +6,8 @@ import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/u
 import { cachedJson } from "@/lib/cache";
 
 function Logo({ kind }: { kind: string }) {
-  const wrap = "flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-subtle";
+  // White tile behind every icon (glyphs forced dark so they read on white in dark mode).
+  const wrap = "flex h-10 w-10 items-center justify-center rounded-lg border border-border bg-white text-neutral-800 shadow-sm";
   if (kind === "github") return <span className={wrap}><Github className="h-5 w-5" /></span>;
   if (kind === "postgres") return <span className={wrap}><Database className="h-5 w-5" /></span>;
   if (kind === "kv") return <span className={wrap}><Box className="h-5 w-5" /></span>;
@@ -31,48 +32,62 @@ const HIDDEN_SLUGS = new Set(["github"]);
 
 function ToolkitLogo({ tk }: { tk: Toolkit }) {
   const [broken, setBroken] = useState(false);
-  const wrap = "flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-subtle";
+  // White circular tile behind the logo image (Vercel-style), so transparent
+  // PNGs/SVGs always sit on white in both light and dark mode.
+  const wrap = "flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-full border border-border bg-white shadow-sm";
   if (tk.logo && !broken) {
     return (
       <span className={wrap}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={tk.logo} alt={tk.name} className="h-10 w-10 object-contain" onError={() => setBroken(true)} />
+        <img src={tk.logo} alt={tk.name} className="h-8 w-8 object-contain" onError={() => setBroken(true)} />
       </span>
     );
   }
   return (
     <span className={wrap}>
-      <span className="text-sm font-semibold text-secondary">{(tk.name || tk.slug).charAt(0).toUpperCase()}</span>
+      <span className="text-base font-semibold text-neutral-700">{(tk.name || tk.slug).charAt(0).toUpperCase()}</span>
     </span>
   );
 }
 
 function ToolkitCard({ tk, configured, onConnect, connecting }: { tk: Toolkit; configured: boolean; onConnect: (s: string) => void; connecting: boolean }) {
   return (
-    <Card className="flex h-full flex-col p-4">
-      <div className="mb-3 flex items-start gap-3">
+    <button
+      onClick={() => configured && !connecting && onConnect(tk.slug)}
+      disabled={!configured || connecting}
+      className="group relative flex h-44 w-full flex-col rounded-xl border border-border bg-card p-5 text-left transition-colors hover:border-border-strong hover:bg-subtle/40 disabled:cursor-default"
+    >
+      {/* Category badge, top-left */}
+      <span className="self-start rounded-md bg-subtle px-2 py-0.5 text-[11px] font-medium capitalize text-secondary">
+        {tk.categories[0] || "Integration"}
+      </span>
+      {/* Centered logo + name */}
+      <div className="flex flex-1 flex-col items-center justify-center gap-2.5">
         <ToolkitLogo tk={tk} />
-        <div className="min-w-0 flex-1">
-          <div className="truncate font-semibold" title={tk.name}>{tk.name}</div>
-          {tk.description ? (
-            <p className="mt-0.5 line-clamp-2 text-xs text-secondary">{tk.description}</p>
-          ) : (
-            <p className="mt-0.5 text-xs text-muted">{tk.slug}</p>
-          )}
-        </div>
+        <div className="max-w-full truncate text-center text-[15px] font-semibold" title={tk.name}>{tk.name}</div>
       </div>
-      {tk.categories.length > 0 ? (
-        <div className="mb-3 flex flex-wrap gap-1">
-          {tk.categories.slice(0, 2).map((c) => <Badge key={c} tone="blue">{c}</Badge>)}
-        </div>
-      ) : null}
-      <div className="mt-auto pt-1">
-        <Button variant="outline" className="w-full" disabled={!configured || connecting} onClick={() => onConnect(tk.slug)}>
-          {connecting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
-          {connecting ? "Connecting…" : "Connect"}
-        </Button>
+      {/* Description */}
+      <p className="line-clamp-2 min-h-[2.25rem] text-center text-xs leading-snug text-secondary">
+        {connecting ? "Connecting…" : tk.description || tk.slug}
+      </p>
+    </button>
+  );
+}
+
+/** Decorative wavy line-art tile (matches Vercel's marketplace promo card). */
+function MarketplaceArtCard({ count }: { count: number }) {
+  return (
+    <div className="relative flex h-44 flex-col justify-end overflow-hidden rounded-xl border border-border bg-card p-5">
+      <div className="absolute inset-0 z-0 overflow-hidden rounded">
+        <svg width="100%" height="100%" viewBox="0 0 306 220" fill="none" xmlns="http://www.w3.org/2000/svg" className="absolute inset-0" preserveAspectRatio="none">
+          <path d="M-72.6319 0.914097C-72.7551 0.842564 -72.8476 0.788746 -72.9092 0.752964C-72.9398 0.735172 -72.9632 0.721806 -72.9785 0.712925C-72.9861 0.70853 -72.9923 0.705357 -72.9961 0.703159C-72.9979 0.702122 -72.9991 0.700779 -73 0.70023C-73.001 0.699665 -73.0008 0.697788 -72.8135 0.375034L-72.8047 3.43034e-05C-72.8038 4.95621e-05 -72.8024 3.78558e-06 -72.8008 3.4303e-05C-72.7978 9.53379e-05 -72.7901 0.000888794 -72.7832 0.00101086C-72.768 0.00128552 -72.7444 0.00142285 -72.7139 0.00198742C-72.6523 0.00313182 -72.5597 0.00459666 -72.4365 0.00687021L-49.1192 0.437532C-33.3275 0.729462 -9.63991 1.16812 21.9433 1.75198L306.193 7.00684L306.187 7.38184L306.18 7.75586C179.846 5.42042 85.0963 3.6697 21.9297 2.50198C-8.54546 1.93861 -31.6692 1.51138 -47.4414 1.21976C-31.6687 1.97789 -8.53658 3.08919 21.9541 4.55471C85.1207 7.59079 179.871 12.1446 306.204 18.2168L306.187 18.5918L306.169 18.9658C179.836 12.8937 85.0856 8.33982 21.9189 5.30374C-8.52391 3.84051 -31.6313 2.72977 -47.4024 1.97171L306.216 29.4277L306.157 30.1758L-47.3516 2.72855C-31.5803 4.41954 -8.4709 6.89654 21.9765 10.1612L306.227 40.6387L306.146 41.3848L21.8965 10.9073C-8.44054 7.65448 -31.4927 5.18375 -47.2598 3.4932C-31.4905 5.65039 -8.40798 8.80681 21.9873 12.9649C85.1539 21.6061 179.904 34.5682 306.237 51.8506L306.187 52.2217L306.136 52.5938C179.802 35.3114 85.0524 22.3492 21.8857 13.708C-8.37935 9.56778 -31.3941 6.42018 -47.1582 4.2637L306.248 63.0625L306.125 63.8027C179.792 42.7836 85.0416 27.0184 21.875 16.5088L-47.0469 5.04202L22.0088 18.5742C85.1754 30.9522 179.926 49.5186 306.259 74.2744L306.114 75.0107C179.781 50.2549 85.0309 31.6875 21.8642 19.3096C-8.21697 13.415 -31.1357 8.92439 -46.8916 5.83695L22.0195 21.3789C85.1861 35.6252 179.936 56.9949 306.269 85.4873L306.187 85.8525L306.104 86.2188L21.8545 22.1104L-46.7422 6.63968L306.279 96.6992L306.187 97.0625L306.094 97.4268C179.76 65.1975 85.0104 41.0248 21.8437 24.9102L-46.5469 7.46292C-30.7963 11.947 -7.93425 18.4561 22.039 26.9893C85.2057 44.9723 179.956 71.9461 306.289 107.912L306.187 108.273L306.084 108.634L21.834 27.71L-46.3506 8.29886C-30.6062 13.2468 -7.80629 20.4114 22.0488 29.794C85.2155 49.6453 179.966 79.4232 306.299 119.126L306.074 119.841L21.8242 30.5098C-7.74208 21.218 -30.389 14.1009 -46.1162 9.15824C-30.3799 14.5691 -7.65489 22.3827 22.0586 32.5996C85.2252 54.3194 179.975 86.8994 306.309 130.339L306.064 131.048L-45.8574 10.041C-30.1308 15.9138 -7.48909 24.3691 22.0674 35.4063L306.317 141.553L306.187 141.903L306.056 142.255L21.8056 36.1084C-7.4218 25.1941 -29.888 16.8056 -45.5918 10.9414C-29.8759 17.2751 -7.31911 26.3651 22.0771 38.2119C85.2438 63.6684 179.994 101.853 306.327 152.766L306.187 153.114L306.046 153.462L-45.3369 11.8526C-29.632 18.6464 -7.15785 28.3686 22.0849 41.0186C85.2515 68.3434 180.002 109.33 306.335 163.979L306.187 164.324L306.038 164.668L21.7881 41.7061C-7.09944 29.2098 -29.3819 19.5715 -45.0586 12.7901C-29.3665 20.0423 -6.98213 30.3865 22.0937 43.8242C85.2604 73.0174 180.01 116.808 306.344 175.194L306.187 175.534L306.029 175.875C179.696 117.489 84.9459 73.6981 21.7793 44.5049C-6.89497 31.2528 -29.0611 21.0088 -44.7188 13.7725L306.352 186.408L306.187 186.744L306.021 187.081L-44.4072 14.7618C-28.7484 22.9249 -6.57542 34.4831 22.1103 49.4375L306.36 197.622L306.187 197.955L306.013 198.287L21.7637 50.1026C-6.48659 35.3752 -28.4203 23.9416 -44.0362 15.8008L22.1172 52.2442C85.2838 87.0424 180.034 139.239 306.367 208.836L306.187 209.165L306.006 209.493C179.673 139.897 84.9225 87.6997 21.7558 52.9014L-43.6787 16.8535L306.375 220.051L305.998 220.699L-72.6319 0.914097Z" className="fill-[#EBEBEB] dark:fill-[#2a2a2a]" />
+        </svg>
       </div>
-    </Card>
+      <div className="relative z-10">
+        <div className="text-base font-semibold">Marketplace</div>
+        <p className="mt-0.5 text-xs text-secondary">{count.toLocaleString()} integrations to connect your stack.</p>
+      </div>
+    </div>
   );
 }
 
@@ -221,6 +236,7 @@ export default function IntegrationsPage() {
       ) : (
         <>
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {safePage === 0 && !q && <MarketplaceArtCard count={toolkits.length} />}
             {shown.map((tk) => (
               <ToolkitCard key={tk.slug} tk={tk} configured={tkConfigured} connecting={connecting === tk.slug} onConnect={connectToolkit} />
             ))}

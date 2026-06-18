@@ -149,9 +149,26 @@ const ADDER_OPTIONS: { kind: AddKind; label: string; provider: string; suffix: s
   { kind: "blob", label: "Blob store", provider: "OpenEdge Blob", suffix: "blob", icon: <HardDrive className="h-4 w-4" /> },
 ];
 
+type AdderOption = (typeof ADDER_OPTIONS)[number];
+
 function AdderNode({ data }: { data: any }) {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
+  // The option the user picked but has not yet confirmed. Nothing is provisioned
+  // until they click "Add & deploy" in the confirmation dialog.
+  const [pending, setPending] = useState<AdderOption | null>(null);
+
+  async function confirm() {
+    if (!pending) return;
+    setBusy(true);
+    try {
+      await data.onAdd(pending.kind, pending.provider, pending.suffix);
+      setPending(null);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="relative w-[220px]">
       <button
@@ -163,23 +180,14 @@ function AdderNode({ data }: { data: any }) {
         <Plus className="h-4 w-4" /> {busy ? "Adding…" : "Add a Service"}
       </button>
       <Handle type="target" id="in" position={Position.Left} style={handleStyle} />
-      {open ? (
+      {open && !pending ? (
         <div className="absolute left-0 top-full z-20 mt-1 w-full overflow-hidden rounded-lg border border-border bg-card text-sm shadow-card">
           {ADDER_OPTIONS.map((opt) => (
             <button
               key={opt.kind}
               type="button"
-              disabled={busy}
-              onClick={async () => {
-                setBusy(true);
-                setOpen(false);
-                try {
-                  await data.onAdd(opt.kind, opt.provider, opt.suffix);
-                } finally {
-                  setBusy(false);
-                }
-              }}
-              className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-bg disabled:opacity-60"
+              onClick={() => { setOpen(false); setPending(opt); }}
+              className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-bg"
             >
               <span className="text-muted">{opt.icon}</span> {opt.label}
             </button>
@@ -190,6 +198,44 @@ function AdderNode({ data }: { data: any }) {
           >
             <Lock className="h-4 w-4 text-muted" /> Connect existing
           </Link>
+        </div>
+      ) : null}
+
+      {/* Confirmation gate — provisioning a resource is a real, committed change
+          (it mutates env + the GitOps config), so never auto-apply on a click. */}
+      {pending ? (
+        <div className="absolute left-0 top-full z-30 mt-1 w-[260px] overflow-hidden rounded-lg border border-border bg-card text-sm shadow-card">
+          <div className="flex items-center gap-2 border-b border-border px-3 py-2.5 font-medium">
+            <span className="text-muted">{pending.icon}</span> Add {pending.label}?
+          </div>
+          <div className="px-3 py-2.5 text-xs text-secondary">
+            This provisions <span className="font-medium text-fg">{pending.provider}</span> as{" "}
+            <span className="font-mono text-fg">{data.project}-{pending.suffix}</span>
+            {envKeyForKind(pending.kind) ? (
+              <> and sets <span className="font-mono text-fg">{envKeyForKind(pending.kind)}</span> in production.</>
+            ) : "."}
+            {data.gitops ? (
+              <div className="mt-1.5 text-muted">The change will be committed to your linked GitHub config.</div>
+            ) : null}
+          </div>
+          <div className="flex items-center justify-end gap-2 border-t border-border px-3 py-2">
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => setPending(null)}
+              className="rounded-md px-2.5 py-1.5 text-xs text-secondary hover:bg-bg disabled:opacity-60"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={confirm}
+              className="rounded-md bg-fg px-2.5 py-1.5 text-xs font-medium text-bg hover:opacity-90 disabled:opacity-60"
+            >
+              {busy ? "Adding…" : "Add & deploy"}
+            </button>
+          </div>
         </div>
       ) : null}
     </div>
@@ -275,13 +321,13 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
       },
     ];
     const es: Edge[] = [
-      { id: "e-ingress", source: "ingress", sourceHandle: "out", target: "service", targetHandle: "in", animated: true, style: { stroke: "#f5a623", strokeWidth: 2 } },
+      { id: "e-ingress", type: "smoothstep", source: "ingress", sourceHandle: "out", target: "service", targetHandle: "in", animated: true, style: { stroke: "#f5a623", strokeWidth: 2 } },
       ...conns.map((c) => ({
-        id: `e-${c.id}`, source: "service", sourceHandle: "svc-out", target: `res-${c.id}`, targetHandle: "in",
+        id: `e-${c.id}`, type: "smoothstep" as const, source: "service", sourceHandle: "svc-out", target: `res-${c.id}`, targetHandle: "in",
         animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 },
       })),
       {
-        id: "e-adder", source: "service", sourceHandle: "svc-out", target: "adder", targetHandle: "in",
+        id: "e-adder", type: "smoothstep", source: "service", sourceHandle: "svc-out", target: "adder", targetHandle: "in",
         animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 1.5, strokeDasharray: "5 5" },
       },
     ];
@@ -307,9 +353,9 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         minZoom={0.3}
         maxZoom={1.75}
         proOptions={{ hideAttribution: true }}
-        defaultEdgeOptions={{ animated: true }}
+        defaultEdgeOptions={{ animated: true, type: "smoothstep" }}
       >
-        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color={dark ? "#151515" : "#eee"} />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={2} color={dark ? "#3a3a3a" : "#c9c9c9"} />
         <Controls showInteractive={false} className="!border-border !bg-card" />
         <MiniMap pannable zoomable className="!border !border-border !bg-card" maskColor={dark ? "rgba(0,0,0,0.4)" : "rgba(255,255,255,0.5)"} />
       </ReactFlow>

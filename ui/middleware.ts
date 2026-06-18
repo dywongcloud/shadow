@@ -23,5 +23,11 @@ const clerk = clerkMiddleware((auth, req) => {
 export default bypass ? () => NextResponse.next() : clerk;
 
 export const config = {
-  matcher: ["/((?!_next|.*\\..*).*)", "/"],
+  // Run on app routes. Skip Next internals + static FILES (extension at the end),
+  // but still gate app routes that legitimately contain dots (e.g. a domain
+  // detail page like /domains/example.com) — otherwise they'd bypass auth.
+  matcher: [
+    "/((?!_next)(?!.*\\.(?:ico|png|jpg|jpeg|gif|svg|webp|woff2?|ttf|css|js|map|txt|xml|webmanifest)$).*)",
+    "/",
+  ],
 };

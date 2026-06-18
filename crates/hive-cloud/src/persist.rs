@@ -60,6 +60,8 @@ pub struct PlatformSnapshot {
     pub billing_ledger: Vec<crate::billing::LedgerEntry>,
     #[serde(default)]
     pub domains: Vec<crate::dns::DomainRecord>,
+    #[serde(default)]
+    pub docs: Vec<crate::docstore::Doc>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -155,9 +157,8 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for d in &snap.domains {
         push(ns_norm(&d.tenant), "domains", json!(d));
     }
-    for (slug, t) in &snap.teams {
-        docs.entry(ns_norm(slug)).or_default().insert("team".into(), json!(t));
-    }
+    // Note: teams are intentionally NOT a guardian-db collection — orgs/users
+    // (synced from the identity provider) are the source of truth for tenancy.
 
     // Platform-level config under the reserved global namespace.
     let global = docs.entry("_global".into()).or_default();
@@ -214,6 +215,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         billing: cloud.billing.snapshot().0,
         billing_ledger: cloud.billing.snapshot().1,
         domains: cloud.domains.snapshot(),
+        docs: cloud.docs.snapshot(),
     }
 }
 
@@ -256,6 +258,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.identity.load(snap.orgs, snap.users);
     cloud.billing.load(snap.billing, snap.billing_ledger);
     cloud.domains.load(snap.domains);
+    cloud.docs.load(snap.docs);
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

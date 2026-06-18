@@ -13,6 +13,7 @@ mod billing;
 mod cluster;
 mod databases;
 mod dns;
+mod docstore;
 mod edge;
 mod git;
 #[cfg(feature = "guardian")]

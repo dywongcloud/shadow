@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2 } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
+import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { NotificationBell } from "@/components/notifications";
 import { WithIdentity, type Identity } from "@/components/identity";
@@ -37,6 +38,11 @@ function VercelMark() {
   );
 }
 
+/** Thin breadcrumb separator matching the brand slash. */
+function Slash() {
+  return <span className="px-1 text-2xl font-thin text-border-strong">/</span>;
+}
+
 export function TopNav() {
   const pathname = usePathname();
   // The owner/ops dashboard + auth pages render their own minimal chrome.
@@ -44,14 +50,32 @@ export function TopNav() {
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
+  // When a project is selected, scope the breadcrumb to it:
+  //   LOGO / Team / Project
+  const projectSeg = pathname.startsWith("/projects/")
+    ? decodeURIComponent(pathname.split("/")[2] ?? "")
+    : "";
+
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
-        <div className="flex items-center gap-2 text-sm">
+        <div className="flex min-w-0 items-center gap-2 text-sm">
           <Link href="/" className="flex items-center"><VercelMark /></Link>
-          <span className="px-1 text-2xl font-thin text-border-strong">/</span>
+          <Slash />
           <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
+          {projectSeg && (
+            <>
+              <Slash />
+              <Link
+                href={`/projects/${encodeURIComponent(projectSeg)}`}
+                className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
+              >
+                <Triangle className="h-5 w-5 shrink-0" />
+                <span className="truncate">{projectSeg}</span>
+              </Link>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <Link

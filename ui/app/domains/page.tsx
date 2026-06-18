@@ -1,8 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { Search, Filter, RotateCw, Plus } from "lucide-react";
-import { Card, Button, Input, Badge, Triangle } from "@/components/ui";
+import Link from "next/link";
+import { Search, Filter, RotateCw, Plus, ChevronRight } from "lucide-react";
+import { Card, Button, Input, Badge } from "@/components/ui";
 import { apiSend, usePoll, type Deployment } from "@/lib/api";
 
 interface DomainEntry { project: string; domain: string }
@@ -55,13 +56,17 @@ export default function DomainsPage() {
       <Card className="p-0">
         <div className="flex items-center gap-2 border-b border-border px-4 py-2.5 text-sm font-medium text-secondary">Select all</div>
         {all.map((d) => (
-          <div key={d.domain} className="flex items-center justify-between border-b border-border px-4 py-3 last:border-0">
+          <Link
+            key={d.domain}
+            href={`/domains/${encodeURIComponent(d.domain)}`}
+            className="flex items-center justify-between border-b border-border px-4 py-3 transition-colors last:border-0 hover:bg-subtle/50"
+          >
             <div>
               <div className="flex items-center gap-2 font-medium">{d.domain} {d.kind === "custom" ? <Badge tone="blue">custom</Badge> : <Badge>managed</Badge>}</div>
               <div className="flex items-center gap-1 text-xs text-secondary"><RotateCw className="h-3 w-3" /> {d.project} · auto-renews</div>
             </div>
-            <div className="flex items-center gap-3"><Badge tone="green">Active</Badge><Triangle className="h-6 w-6" /></div>
-          </div>
+            <div className="flex items-center gap-3"><Badge tone="green">Active</Badge><ChevronRight className="h-4 w-4 text-muted" /></div>
+          </Link>
         ))}
         {!all.length && <div className="px-4 py-10 text-center text-sm text-secondary">No domains yet — deploy a project, then attach a domain.</div>}
       </Card>

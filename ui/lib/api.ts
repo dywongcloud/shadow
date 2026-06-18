@@ -415,6 +415,44 @@ export interface WorkflowSummaryRow {
   active: number;
 }
 
+// ---- Domains / DNS ----
+export interface DnsRecord {
+  id: string;
+  name: string;
+  type: string;
+  value: string;
+  ttl: number;
+  priority?: number | null;
+  comment: string;
+  created_ms: number;
+  system: boolean;
+}
+export interface SslCert {
+  id: string;
+  cns: string[];
+  renewal: string;
+  issued_ms: number;
+  expires_ms: number;
+  provider: string;
+}
+export interface DomainRecord {
+  domain: string;
+  tenant: string;
+  registrar: string;
+  renewal_price: string;
+  auto_renew: boolean;
+  cdn_active: boolean;
+  created_ms: number;
+  expires_ms: number;
+  nameservers: string[];
+  ssl: SslCert;
+  records: DnsRecord[];
+}
+export interface DomainDetail {
+  domain: DomainRecord;
+  connected: { project: string; domain: string }[];
+}
+
 // ---- Billing & compute credits ----
 export interface PlanSpec {
   id: string;
