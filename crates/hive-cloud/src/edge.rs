@@ -82,7 +82,57 @@ pub async fn edge_pipeline(
             let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
             let (_parts, body) = req.into_parts();
             let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+
+            // For the iroh transport: this node's endpoint + a map of peer node id
+            // -> its gossiped iroh dial address. Headers forwarded over the tunnel.
+            let iroh_self = cloud.iroh.read().clone();
+            let node_iroh: std::collections::HashMap<String, String> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter_map(|n| n.iroh_addr.map(|a| (n.id, a)))
+                .collect();
+            let mut fwd_headers: Vec<(String, String)> =
+                vec![("host".into(), host.clone()), ("x-hive-proxied".into(), "1".into())];
+            for (k, v) in &headers_vec {
+                let lk = k.to_lowercase();
+                if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied") {
+                    continue;
+                }
+                fwd_headers.push((k.clone(), v.clone()));
+            }
+
             for cand in &cands {
+                // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
+                // works across NATs. Fall through to HTTP on any failure.
+                if let (Some(ep), Some(addr_json)) = (&iroh_self, node_iroh.get(&cand.node_id)) {
+                    match hive_p2p::dial_request(ep, addr_json, &method, &path_q, fwd_headers.clone(), &body_bytes).await {
+                        Ok(tr) => {
+                            let mut builder = Response::builder().status(tr.status);
+                            for (k, v) in &tr.headers {
+                                let lk = k.to_lowercase();
+                                if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
+                                    continue;
+                                }
+                                if let (Ok(name), Ok(val)) =
+                                    (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
+                                {
+                                    builder = builder.header(name, val);
+                                }
+                            }
+                            let mut out = builder
+                                .body(Body::from(tr.body))
+                                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                            set(&mut out, "x-hive-routed-to", &cand.node_id);
+                            set(&mut out, "x-hive-transport", "iroh-p2p");
+                            set(&mut out, "x-hive-region", &region);
+                            let ev = cloud.event(&region, &method, &host, &path, tr.status, "mesh-route-p2p", &cand.node_id);
+                            cloud.record(ev);
+                            return out;
+                        }
+                        Err(_) => { /* iroh failed → try HTTP for this candidate */ }
+                    }
+                }
                 let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
                 let mut rb = cloud
                     .http

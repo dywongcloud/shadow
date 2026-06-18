@@ -212,6 +212,16 @@ async fn main() -> anyhow::Result<()> {
     // Record mesh peers so the build cache can be pulled P2P from other nodes.
     *cloud.peers.write() = args.peers.clone();
 
+    // Tier 4: store the iroh endpoint for outbound dialing, and accept inbound P2P
+    // tunnels — serving each to THIS node's gateway (so the request is routed to the
+    // right local deployment). This makes deployments reachable over QUIC across NATs.
+    if let Some(ep) = iroh_ep.clone() {
+        *cloud.iroh.write() = Some(ep.clone());
+        let gateway_addr = args.listen.to_string();
+        tokio::spawn(hive_p2p::serve_tunnels(ep, gateway_addr, 256));
+        tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections");
+    }
+
     // Initial cluster reconcile (single-node: this node is leader).
     cloud.cluster.reconcile(cloud.registry.nodes().into_iter().map(|n| n.id).collect());
 

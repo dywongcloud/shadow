@@ -73,6 +73,9 @@ pub struct CloudState {
     /// (learned via gossip). Lets any node route/load-balance requests to the node
     /// that actually hosts a deployment.
     pub peer_routes: RwLock<std::collections::HashMap<String, Vec<PeerRoute>>>,
+    /// This node's iroh P2P endpoint (real QUIC mesh transport), if bound. Used to
+    /// dial peers and tunnel cross-node requests over QUIC (with HTTP fallback).
+    pub iroh: RwLock<Option<hive_p2p::Endpoint>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
@@ -141,6 +144,7 @@ impl CloudState {
             gitops: crate::gitops::GitOpsStore::new(),
             peers: RwLock::new(Vec::new()),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
+            iroh: RwLock::new(None),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),
