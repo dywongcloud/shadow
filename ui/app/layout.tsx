@@ -13,9 +13,9 @@ import { GitOps } from "@/components/gitops";
 const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display", display: "swap" });
 
 export const metadata: Metadata = {
-  title: "Shadow — the peer-to-peer cloud",
+  title: "shadw — Beyond the Edge are Shadows",
   description:
-    "Shadow is a self-hosted cloud that runs on a peer-to-peer mesh (Iroh QUIC): serverless functions, containers, edge & durable data — deployed from git, served from anywhere.",
+    "shadw is a peer-to-peer cloud: seamlessly connect, collaborate, and conquer. Serverless functions, containers, edge & durable data over a P2P mesh (Iroh QUIC).",
 };
 
 // Clerk is enabled when a publishable key is present; otherwise the app runs in

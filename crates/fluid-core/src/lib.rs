@@ -338,6 +338,11 @@ pub struct GitDeployRequest {
     /// `examples/nextjs`). Empty/None = repo root.
     #[serde(default)]
     pub root_dir: Option<String>,
+    /// Environment variables to set on the project at creation, injected into
+    /// BOTH the build (install/build commands) and the runtime (functions /
+    /// containers). Set from the "New Project" screen.
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 fn default_prod() -> bool {
     true

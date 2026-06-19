@@ -14,12 +14,32 @@ import {
 import { timeAgo } from "@/lib/utils";
 import { deploymentHost } from "@/lib/deploy-url";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { SignedIn, SignedOut } from "@clerk/nextjs";
+import { Landing } from "@/components/landing";
 
 type View = "grid" | "list";
 
 const usd = (cents: number) => `$${(cents / 100).toFixed(2)}`;
 
-export default function OverviewPage() {
+const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
+// The root route: the public Shadow landing for signed-out visitors, the
+// dashboard for signed-in users. In local (no-Clerk) mode it's just the dashboard.
+export default function Home() {
+  if (!clerkEnabled) return <Dashboard />;
+  return (
+    <>
+      <SignedOut>
+        <Landing />
+      </SignedOut>
+      <SignedIn>
+        <Dashboard />
+      </SignedIn>
+    </>
+  );
+}
+
+function Dashboard() {
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 8000);
   const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 8000);

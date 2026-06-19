@@ -8,6 +8,7 @@ import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { Logo } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, type Team } from "@/lib/api";
@@ -30,14 +31,6 @@ const tabs = [
 ];
 
 /** The Vercel triangle mark — inverts with the theme (black on light, white on dark). */
-function VercelMark() {
-  return (
-    <svg height="20" viewBox="0 0 76 65" fill="none" aria-label="Vercel" className="text-fg">
-      <path d="M37.59.25l36.95 64H.64l36.95-64z" fill="currentColor" />
-    </svg>
-  );
-}
-
 /** Thin breadcrumb separator matching the brand slash. */
 function Slash() {
   return <span className="px-1 text-2xl font-thin text-border-strong">/</span>;
@@ -61,7 +54,7 @@ export function TopNav() {
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">
-          <Link href="/" className="flex items-center"><VercelMark /></Link>
+          <Link href="/" className="flex items-center"><Logo className="h-6 w-auto" /></Link>
           <Slash />
           <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
           {projectSeg && (

@@ -762,6 +762,7 @@ async fn project_redeploy(
         creator: Some("you".into()),
         production: true,
         root_dir,
+        env: None, // redeploy: existing project env is read from the store at build time
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -930,6 +931,7 @@ async fn git_webhook(
             creator: Some("github".into()),
             production,
             root_dir,
+            env: None, // git push redeploy: env comes from the project store
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github push {} @ {}", want, &commit.chars().take(7).collect::<String>()));

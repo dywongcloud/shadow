@@ -172,6 +172,31 @@ async fn run_build(
     let region_label = region_label(region);
     let log = |s: String| cloud.builds.log(bid, s);
 
+    // Persist any env vars supplied with the deploy (e.g. from the New Project
+    // screen) onto the project BEFORE building, so they're available to BOTH the
+    // build commands (via env_map below) and the runtime (function configs).
+    if let Some(env) = &req.env {
+        for (k, v) in env {
+            if k.trim().is_empty() {
+                continue;
+            }
+            cloud.projects.put_env(
+                &project,
+                crate::project_settings::EnvVar {
+                    key: k.trim().to_string(),
+                    value: v.clone(),
+                    target: "all".into(),
+                    sensitive: false,
+                    updated_ms: 0,
+                },
+            );
+        }
+        if !env.is_empty() {
+            log(format!("Set {} environment variable(s) for the project.", env.iter().filter(|(k, _)| !k.trim().is_empty()).count()));
+            crate::persist::persist(cloud);
+        }
+    }
+
     log(format!("Running build in {region_label} - {region}"));
     log("Build machine configuration: 4 cores, 8 GB".into());
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -407,10 +432,13 @@ async fn produce_manifest(
         let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
         let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
         let t1 = now_ms();
-        let out = Command::new("podman")
-            .arg("build")
-            .arg("-t")
-            .arg(&image)
+        let mut build = Command::new("podman");
+        build.arg("build").arg("-t").arg(&image);
+        // Pass project env as --build-arg so a Dockerfile `ARG`/`ENV` can use them.
+        for (k, v) in cloud.projects.env_map(project) {
+            build.arg("--build-arg").arg(format!("{k}={v}"));
+        }
+        let out = build
             .arg(".")
             .current_dir(dir)
             .output()
@@ -530,18 +558,21 @@ async fn build_via_fdi(
     if let Some(k) = &cache_key {
         restore_cache(cloud, bid, install_dir, k).await;
     }
+    // Project env vars (already persisted at build start) — injected into both
+    // the install and build steps so framework builds can read them.
+    let proj_env = cloud.projects.env_map(project);
     // 1) Install dependencies at the install dir (root for monorepos). With a
     // restored node_modules this is a fast verify; otherwise a clean install.
     if has_pkg && !install_cmd.trim().is_empty() {
         log(format!("Running \"{}\"{}", install_cmd, if is_monorepo { " (workspace root)" } else { "" }));
-        run_streamed(install_dir, &install_cmd, cloud, bid)
+        run_streamed(install_dir, &install_cmd, cloud, bid, &proj_env)
             .await
             .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
     }
     // 2) Build in the project directory.
     if has_pkg && !build_cmd.trim().is_empty() {
         log(format!("Running \"{}\"", build_cmd));
-        run_streamed(dir, &build_cmd, cloud, bid)
+        run_streamed(dir, &build_cmd, cloud, bid, &proj_env)
             .await
             .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
     }
@@ -636,7 +667,15 @@ pub fn preferred_node_bin() -> Option<String> {
 }
 
 /// Run a shell command in `dir`, streaming stdout+stderr into the build log.
-async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &str) -> anyhow::Result<()> {
+/// `env` is the project's environment variables, injected into the build so
+/// install/build steps (e.g. Next.js reading NEXT_PUBLIC_*, Vite VITE_*) see them.
+async fn run_streamed(
+    dir: &Path,
+    command: &str,
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
     use std::process::Stdio;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -668,6 +707,8 @@ async fn run_streamed(dir: &Path, command: &str, cloud: &Arc<CloudState>, bid: &
         .env("npm_config_engine_strict", "false")
         .env("npm_config_fund", "false")
         .env("npm_config_audit", "false")
+        // Project env vars — injected so the build can read them (last so they win).
+        .envs(env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;

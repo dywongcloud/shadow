@@ -27,6 +27,7 @@ mod notifications;
 mod persist;
 mod project_settings;
 mod resources;
+mod secrets;
 mod securelink;
 mod state;
 mod teams;

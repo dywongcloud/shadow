@@ -38,6 +38,8 @@ sysinfo = "0.32"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ring = "0.17"
+base64 = "0.22"
 
 # Always-on: iroh-native, P2P-replicated durable store (iroh-docs + iroh-blobs).
 # Every platform snapshot is replicated here, in local/dev and production alike.

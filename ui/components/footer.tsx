@@ -2,14 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-
-function VercelMark() {
-  return (
-    <svg height="18" viewBox="0 0 76 65" fill="none" className="text-fg" aria-label="Vercel">
-      <path d="M37.59.25l36.95 64H.64l36.95-64z" fill="currentColor" />
-    </svg>
-  );
-}
+import { Logo } from "@/components/logo";
 
 export function Footer() {
   const pathname = usePathname();
@@ -20,9 +13,8 @@ export function Footer() {
     <footer className="mt-16 border-t border-border bg-subtle/40">
       <div className="mx-auto flex max-w-[1400px] flex-col items-center justify-between gap-3 px-4 py-6 text-xs text-muted sm:flex-row sm:px-6">
         <div className="flex items-center gap-3">
-          <Link href="/" className="flex items-center gap-2">
-            <VercelMark />
-            <span className="text-sm font-semibold text-fg">OpenEdge</span>
+          <Link href="/" className="flex items-center">
+            <Logo className="h-5 w-auto" />
           </Link>
           <span className="inline-flex items-center gap-1.5 text-secondary">
             <span className="relative flex h-2 w-2">

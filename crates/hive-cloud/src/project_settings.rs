@@ -164,9 +164,14 @@ impl ProjectStore {
         m.entry(project.to_string()).or_default().functions = f;
     }
 
-    /// Add or update an env var (by key+target).
+    /// Add or update an env var (by key+target). Sensitive values are sealed
+    /// (encrypted at rest) before storing, so they're persisted as secrets — never
+    /// written to disk / the replicated snapshot in plaintext.
     pub fn put_env(&self, project: &str, mut v: EnvVar) {
         v.updated_ms = now_ms();
+        if v.sensitive && !v.value.is_empty() {
+            v.value = crate::secrets::encrypt(&v.value);
+        }
         let mut m = self.map.write();
         let s = m.entry(project.to_string()).or_default();
         if let Some(existing) = s.env.iter_mut().find(|e| e.key == v.key && e.target == v.target) {
@@ -230,11 +235,12 @@ impl ProjectStore {
     }
 
     /// Env vars to inject into a function at deploy time (decrypted values).
+    /// Sealed (sensitive) values are opened here; plaintext passes through.
     pub fn env_map(&self, project: &str) -> std::collections::BTreeMap<String, String> {
         self.get(project)
             .env
             .into_iter()
-            .map(|e| (e.key, e.value))
+            .map(|e| (e.key, crate::secrets::decrypt(&e.value)))
             .collect()
     }
 }

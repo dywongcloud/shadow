@@ -2,12 +2,14 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown } from "lucide-react";
+import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
-import { apiSend, usePoll, currentTeam, type Team } from "@/lib/api";
+import { apiSend, currentTeam } from "@/lib/api";
+import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
+import { cn } from "@/lib/utils";
 
 interface GhRepo {
   name: string;
@@ -110,7 +112,7 @@ export default function NewProjectPage() {
     }).catch(() => {});
   }, []);
 
-  async function deploy(repoUrl: string, branch?: string, project?: string, root?: string) {
+  async function deploy(repoUrl: string, branch?: string, project?: string, root?: string, env?: Record<string, string>) {
     if (!repoUrl) return;
     setDeploying(true);
     setError("");
@@ -121,6 +123,7 @@ export default function NewProjectPage() {
         project,
         root_dir: root,
         creator: "you",
+        env: env && Object.keys(env).length ? env : undefined,
       });
       // Install the OpenEdge deploy workflow + webhook variable into the source
       // repo so future pushes auto-deploy (no-ops if GitHub isn't connected).
@@ -147,7 +150,7 @@ export default function NewProjectPage() {
 
   // ----- Configure screen (after a template is selected) -----
   if (selected) {
-    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name) => deploy(selected.repo, selected.branch, name, selected.root)} deploying={deploying} error={error} />;
+    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo, selected.branch, name, selected.root, env)} deploying={deploying} error={error} />;
   }
 
   return (
@@ -286,12 +289,42 @@ function ConfigureTemplate({
 }: {
   template: Template;
   onBack: () => void;
-  onCreate: (projectName: string) => void;
+  onCreate: (projectName: string, env: Record<string, string>) => void;
   deploying: boolean;
   error: string;
 }) {
-  const { data: teams } = usePoll<Team[]>("/v1/teams", 10000);
   const [repoName, setRepoName] = useState(slug(template.name));
+  // Environment variables to inject into the build + runtime (collapsible).
+  const [envOpen, setEnvOpen] = useState(false);
+  const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>([{ key: "", value: "" }]);
+  const setEnvAt = (i: number, patch: Partial<{ key: string; value: string }>) =>
+    setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+  const addEnvRow = () => setEnvVars((rows) => [...rows, { key: "", value: "" }]);
+  const removeEnvRow = (i: number) => setEnvVars((rows) => (rows.length <= 1 ? [{ key: "", value: "" }] : rows.filter((_, j) => j !== i)));
+  // Paste a `.env` blob: split KEY=VALUE lines into rows.
+  const pasteDotenv = (text: string) => {
+    const parsed = text
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#") && l.includes("="))
+      .map((l) => {
+        const idx = l.indexOf("=");
+        let value = l.slice(idx + 1).trim();
+        if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) value = value.slice(1, -1);
+        return { key: l.slice(0, idx).trim().replace(/^export\s+/, ""), value };
+      })
+      .filter((r) => r.key);
+    if (parsed.length) setEnvVars((rows) => [...rows.filter((r) => r.key.trim()), ...parsed]);
+  };
+  const envCount = envVars.filter((r) => r.key.trim()).length;
+  const buildEnv = () => {
+    const out: Record<string, string> = {};
+    for (const { key, value } of envVars) {
+      const k = key.trim();
+      if (k) out[k] = value;
+    }
+    return out;
+  };
   // Default the Team field to the team/org the user is CURRENTLY viewing (the
   // navbar breadcrumb selection) instead of always "personal", and keep it in
   // sync if they switch the active team while this screen is open.
@@ -357,19 +390,75 @@ function ConfigureTemplate({
 
         <div className="mb-6">
           <label className="mb-1.5 block text-sm text-secondary">Team</label>
-          <div className="relative">
-            <select
-              value={team}
-              onChange={(e) => setTeam(e.target.value)}
-              className="w-full appearance-none rounded-md border border-border bg-card px-3 py-2 text-sm focus:border-border-strong focus:outline-none"
-            >
-              <option value="personal">Personal</option>
-              {(teams ?? []).filter((t) => t.slug !== "personal").map((t) => (
-                <option key={t.slug} value={t.slug}>{t.name} · {t.plan}</option>
-              ))}
-            </select>
-            <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
-          </div>
+          <TeamSelect value={team} onChange={setTeam} />
+          <p className="mt-1 text-xs text-muted">The project is created under this team — matches your current view.</p>
+        </div>
+
+        {/* Environment Variables (collapsible) — injected into the build & runtime. */}
+        <div className="mb-6 rounded-md border border-border">
+          <button
+            type="button"
+            onClick={() => setEnvOpen((o) => !o)}
+            className="flex w-full items-center justify-between px-3 py-2.5 text-sm"
+          >
+            <span className="flex items-center gap-2 font-medium">
+              <KeyRound className="h-4 w-4 text-muted" /> Environment Variables
+              {envCount > 0 && (
+                <span className="rounded-full bg-subtle px-2 py-0.5 text-xs text-secondary">{envCount}</span>
+              )}
+            </span>
+            <ChevronDown className={cn("h-4 w-4 text-muted transition-transform", envOpen ? "" : "-rotate-90")} />
+          </button>
+
+          {envOpen && (
+            <div className="border-t border-border p-3">
+              <p className="mb-3 text-xs text-muted">
+                Set keys available during the build (e.g. <span className="font-mono">NEXT_PUBLIC_*</span>,{" "}
+                <span className="font-mono">VITE_*</span>) and at runtime. Pasting a <span className="font-mono">.env</span> into any
+                key field expands it into rows.
+              </p>
+              <div className="flex flex-col gap-2">
+                {envVars.map((row, i) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <Input
+                      value={row.key}
+                      placeholder="KEY"
+                      onChange={(e) => setEnvAt(i, { key: e.target.value })}
+                      onPaste={(e) => {
+                        const t = e.clipboardData.getData("text");
+                        if (t.includes("=") && (t.includes("\n") || /^\s*export\s/.test(t))) {
+                          e.preventDefault();
+                          pasteDotenv(t);
+                        }
+                      }}
+                      className="flex-1 font-mono text-xs"
+                    />
+                    <Input
+                      value={row.value}
+                      placeholder="value"
+                      onChange={(e) => setEnvAt(i, { value: e.target.value })}
+                      className="flex-1 font-mono text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => removeEnvRow(i)}
+                      className="shrink-0 rounded-md p-2 text-muted hover:bg-subtle hover:text-fg"
+                      aria-label="Remove variable"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={addEnvRow}
+                className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-secondary hover:bg-subtle"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add Variable
+              </button>
+            </div>
+          )}
         </div>
 
         {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
@@ -381,7 +470,7 @@ function ConfigureTemplate({
               localStorage.setItem("hive_team", team === "personal" ? "__personal__" : team);
               window.dispatchEvent(new Event("hive-team-changed"));
             }
-            onCreate(repoName || slug(template.name));
+            onCreate(repoName || slug(template.name), buildEnv());
           }}
           disabled={deploying}
           className="w-full justify-center bg-fg py-2.5 text-bg"

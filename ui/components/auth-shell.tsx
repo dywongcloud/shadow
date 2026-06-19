@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { clerkAppearance } from "@/lib/clerk-appearance";
+import { Logo } from "@/components/logo";
 
 const FEATURES = [
   "Global edge network across every region",
@@ -38,11 +39,8 @@ export function AuthShell({
               "radial-gradient(60% 50% at 30% 20%, hsl(var(--foreground) / 0.06), transparent 70%), radial-gradient(50% 40% at 80% 90%, hsl(var(--foreground) / 0.05), transparent 70%)",
           }}
         />
-        <div className="relative flex items-center gap-2">
-          <svg height="24" viewBox="0 0 76 65" fill="none" className="text-fg" aria-label="OpenEdge">
-            <path d="M37.59.25l36.95 64H.64l36.95-64z" fill="currentColor" />
-          </svg>
-          <span className="text-lg font-semibold tracking-tight">OpenEdge</span>
+        <div className="relative flex items-center">
+          <Logo className="h-7 w-auto" />
         </div>
         <div className="relative">
           <h1 className="max-w-md text-3xl font-semibold leading-tight tracking-tight">
@@ -62,17 +60,14 @@ export function AuthShell({
             ))}
           </ul>
         </div>
-        <div className="relative text-xs text-muted">© {2026} OpenEdge · Built on a Vercel-style platform.</div>
+        <div className="relative text-xs text-muted">© {2026} shadw · The peer-to-peer cloud.</div>
       </div>
 
       {/* Auth panel */}
       <div className="relative flex flex-col items-center justify-center px-4 py-10">
         <div className="absolute right-4 top-4"><ThemeToggle /></div>
-        <div className="mb-6 flex items-center gap-2 lg:hidden">
-          <svg height="22" viewBox="0 0 76 65" fill="none" className="text-fg" aria-label="OpenEdge">
-            <path d="M37.59.25l36.95 64H.64l36.95-64z" fill="currentColor" />
-          </svg>
-          <span className="text-lg font-semibold">OpenEdge</span>
+        <div className="mb-6 flex items-center lg:hidden">
+          <Logo className="h-6 w-auto" />
         </div>
         <div className="w-full max-w-[400px]">
           {mounted && render(clerkAppearance(dark))}

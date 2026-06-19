@@ -1,7 +1,13 @@
-# hive-rs
+# shadw.cloud
 
-A Rust reverse-engineering of **Hive**, Vercel's builds infrastructure
-([blog post](https://vercel.com/blog/a-deep-dive-into-hive-vercels-builds-infrastructure)).
+**shadw.cloud** is a self-hosted, peer-to-peer cloud: deploy serverless
+functions, containers and static sites to a mesh of your own machines, connected
+over **Iroh QUIC**. No data center, no public IPs — nodes find each other and
+serve the world.
+
+Under the hood it's a Rust reverse-engineering of **Hive** (Vercel's builds
+infrastructure, [blog post](https://vercel.com/blog/a-deep-dive-into-hive-vercels-builds-infrastructure))
+plus **Fluid** compute, wired into one node binary and a Vercel-style dashboard.
 
 It reproduces Hive's components — Control Plane, per-Hive API, Box Daemon, Cell
 Daemon, warm pools, scheduler, autoscaler, and the cell lifecycle — behind a
@@ -15,17 +21,17 @@ pluggable isolation backend:
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the concept→code map and the build
 lifecycle.
 
-The platform is two layers that share one isolation backend (`CellBackend`):
+shadw.cloud is two layers that share one isolation backend (`CellBackend`):
 
 - **Hive** (builds) — turn a git repo into build output.
 - **Fluid** (serving) — deploy static assets + functions, served with **Fluid
   compute**: long-lived instances that each handle many concurrent requests,
   stay warm, autoscale, and scale to zero.
 
-## The unified cloud (`hive-cloud` + dashboard)
+## The unified cloud (the `hive-cloud` node + dashboard)
 
-Everything is wired into **one node binary** you can run across MacBooks as a
-single cloud, fronted by a **Vercel-style dashboard**.
+Everything is wired into **one node binary** (the `hive-cloud` crate) you can run
+across machines as a single shadw.cloud, fronted by a **Vercel-style dashboard**.
 
 ```bash
 # 1) Run a node (builds + Fluid serving + edge + cron + workflows + regions)
@@ -301,4 +307,7 @@ Gotchas worth knowing if you reproduce it:
 --max-concurrent N              max concurrent builds
 --mock-provision-ms N           (mock) simulated cold-boot latency
 ```
-# hive
+
+---
+
+**shadw.cloud** — the peer-to-peer cloud.

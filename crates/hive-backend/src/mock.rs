@@ -214,11 +214,20 @@ impl CellBackend for MockBackend {
             let name = format!("hive-{}", cell.id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
             let _ = std::process::Command::new("podman").args(["rm", "-f", &name]).output();
             let port = func.port;
+            let mut args: Vec<String> = vec![
+                "run".into(), "-d".into(), "--name".into(), name.clone(),
+                "-e".into(), format!("PORT={internal}"),
+            ];
+            // Inject the project's env vars into the container runtime.
+            for (k, v) in &func.env {
+                args.push("-e".into());
+                args.push(format!("{k}={v}"));
+            }
+            args.push("-p".into());
+            args.push(format!("127.0.0.1:{port}:{internal}"));
+            args.push(image.clone());
             let status = Command::new("podman")
-                .args([
-                    "run", "-d", "--name", &name, "-e", &format!("PORT={internal}"),
-                    "-p", &format!("127.0.0.1:{port}:{internal}"), &image,
-                ])
+                .args(&args)
                 .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
                 .output()
                 .await?;
