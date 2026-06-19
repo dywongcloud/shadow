@@ -32,9 +32,13 @@ export function Landing() {
         <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
           <Link href="/"><Logo className="h-6" /></Link>
           <nav className="hidden items-center gap-8 text-[15px] text-zinc-300 lg:flex">
-            {NAV.map((n) => (
-              <a key={n} href="#features" className="transition-colors hover:text-white">{n}</a>
-            ))}
+            {NAV.map((n) =>
+              n === "Docs" ? (
+                <Link key={n} href="/docs" className="transition-colors hover:text-white">{n}</Link>
+              ) : (
+                <a key={n} href="#features" className="transition-colors hover:text-white">{n}</a>
+              )
+            )}
           </nav>
           <Link
             href="/sign-in"
@@ -153,11 +157,14 @@ export function Landing() {
               <div key={col.title}>
                 <div className="text-sm font-semibold text-white">{col.title}</div>
                 <ul className="mt-4 space-y-3">
-                  {col.links.map((l) => (
-                    <li key={l}>
-                      <a href="#" className="text-sm text-zinc-500 transition-colors hover:text-zinc-200">{l}</a>
-                    </li>
-                  ))}
+                  {col.links.map((l) => {
+                    const href = l === "Documentation" || l === "API Reference" || l === "Guides" ? "/docs" : "#";
+                    return (
+                      <li key={l}>
+                        <Link href={href} className="text-sm text-zinc-500 transition-colors hover:text-zinc-200">{l}</Link>
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             ))}

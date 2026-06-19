@@ -7,7 +7,7 @@ import { Logo } from "@/components/logo";
 export function Footer() {
   const pathname = usePathname();
   // The ops console + auth + public status pages render their own chrome.
-  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status")) return null;
+  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status") || pathname.startsWith("/docs")) return null;
 
   return (
     <footer className="mt-16 border-t border-border bg-subtle/40">

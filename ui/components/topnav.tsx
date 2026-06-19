@@ -39,7 +39,7 @@ function Slash() {
 export function TopNav() {
   const pathname = usePathname();
   // The owner/ops dashboard + auth + public status pages render their own chrome.
-  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status")) return null;
+  if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status") || pathname.startsWith("/docs")) return null;
   const isActive = (href: string) =>
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 

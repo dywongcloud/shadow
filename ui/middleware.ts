@@ -4,6 +4,9 @@ import { NextResponse } from "next/server";
 // Public routes (no auth required): sign-in/up + the node API proxy + static.
 const isPublic = createRouteMatcher([
   "/", // public Shadow landing (the dashboard renders here only when signed in)
+  "/docs(.*)", // public developer documentation
+  "/offline.html", // PWA offline fallback (precached by the service worker)
+  "/sw.js", // service worker
   "/sign-in(.*)",
   "/sign-up(.*)",
   "/cloud(.*)", // dashboard <-> node admin API proxy

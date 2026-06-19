@@ -103,11 +103,20 @@ function Dashboard() {
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
           <Input
-            placeholder="Search Projects…"
+            placeholder="Search Projects…  (⌘K for commands)"
             value={q}
             onChange={(e) => { setQ(e.target.value); setPage(0); }}
-            className="pl-9"
+            className="pl-9 pr-14"
           />
+          {/* Doubles as the platform command bar — open with ⌘K or by clicking. */}
+          <button
+            type="button"
+            onClick={() => window.dispatchEvent(new Event("open-command-bar"))}
+            title="Open command bar (⌘K)"
+            className="absolute right-2 top-1/2 -translate-y-1/2 rounded border border-border bg-subtle px-1.5 py-0.5 font-mono text-[11px] text-muted hover:text-fg"
+          >
+            ⌘K
+          </button>
         </div>
         <div className="flex items-center rounded-md border border-border-strong p-0.5">
           <ViewButton active={view === "grid"} onClick={() => chooseView("grid")} label="Card view">

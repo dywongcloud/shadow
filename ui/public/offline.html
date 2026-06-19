@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>shadw — offline</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center; text-align: center;
+      background: #06060a; color: #ededed;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background-image:
+        radial-gradient(40% 35% at 30% 20%, rgba(124,58,237,0.25), transparent 70%),
+        radial-gradient(40% 35% at 75% 80%, rgba(8,145,178,0.18), transparent 70%);
+    }
+    .card { padding: 40px; max-width: 420px; }
+    img { height: 34px; width: auto; margin-bottom: 24px; opacity: 0.95; }
+    h1 { font-size: 22px; margin: 0 0 8px; letter-spacing: -0.02em; }
+    p { color: #9a9aa2; font-size: 14px; line-height: 1.6; margin: 0 0 24px; }
+    button {
+      border: 0; border-radius: 999px; padding: 10px 20px; font-size: 14px; font-weight: 600;
+      background: #34d399; color: #000; cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <img src="/shadw-logo-dark.png" alt="shadw" />
+    <h1>You&rsquo;re offline</h1>
+    <p>shadw can&rsquo;t reach the network right now. Check your connection and try again — your cached pages still work.</p>
+    <button onclick="location.reload()">Retry</button>
+  </div>
+</body>
+</html>
