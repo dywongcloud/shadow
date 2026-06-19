@@ -50,6 +50,11 @@ guardian-db = { version = "0.16" }
 # raft` routes cluster coordination through openraft.
 openraft = { version = "0.9", optional = true }
 
+# Optional EXPERIMENT: anonymous team/role membership demo endpoints (`zkauth`
+# feature). Off by default; mounts /v1/zkauth/* and is not part of real auth.
+hive-zkauth = { workspace = true, optional = true }
+
 [features]
 default = []
 raft = ["dep:openraft"]
+zkauth = ["dep:hive-zkauth"]

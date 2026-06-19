@@ -20,7 +20,7 @@ use tokio::process::Command;
 use crate::state::CloudState;
 
 pub fn router(cloud: Arc<CloudState>) -> Router {
-    Router::new()
+    let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/v1/overview", get(overview))
         .route("/v1/nodes", get(nodes))
@@ -153,7 +153,11 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
         .route("/v1/incidents", get(incidents_list).post(incident_open))
         .route("/v1/incidents/:id/updates", post(incident_update))
-        .with_state(cloud)
+        .with_state(cloud);
+    // EXPERIMENT: anonymous team/role membership demo (only with `--features zkauth`).
+    #[cfg(feature = "zkauth")]
+    let app = app.merge(crate::zkauth_demo::routes());
+    app
 }
 
 // ---- Auth (JWT) ----

@@ -2512,6 +2512,7 @@ dependencies = [
  "hive-edge",
  "hive-p2p",
  "hive-wg",
+ "hive-zkauth",
  "hmac",
  "jsonwebtoken",
  "openraft",
@@ -2595,6 +2596,15 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "snow",
+]
+
+[[package]]
+name = "hive-zkauth"
+version = "0.1.0"
+dependencies = [
+ "curve25519-dalek 4.1.3",
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
 ]
 
 [[package]]

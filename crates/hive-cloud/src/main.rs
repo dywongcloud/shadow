@@ -29,6 +29,8 @@ mod project_settings;
 mod resources;
 mod secrets;
 mod securelink;
+#[cfg(feature = "zkauth")]
+mod zkauth_demo;
 mod state;
 mod teams;
 mod webhooks;

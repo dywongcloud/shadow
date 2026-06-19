@@ -19,6 +19,7 @@ members = [
     "crates/hive-edge",
     "crates/hive-cloud",
     "crates/hive-wg",
+    "crates/hive-zkauth",
 ]
 
 [workspace.package]
@@ -71,6 +72,7 @@ fluid-gateway = { path = "crates/fluid-gateway" }
 hive-wg = { path = "crates/hive-wg" }
 hive-edge = { path = "crates/hive-edge" }
 hive-p2p = { path = "crates/hive-p2p" }
+hive-zkauth = { path = "crates/hive-zkauth" }
 
 [profile.release]
 opt-level = 3

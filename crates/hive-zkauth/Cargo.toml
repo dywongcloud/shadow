@@ -1,0 +1,15 @@
+[package]
+name = "hive-zkauth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EXPERIMENT: anonymous team/role membership proofs (linkable ring signatures over Ristretto255). Standalone — not wired into the platform yet."
+
+[dependencies]
+curve25519-dalek = { version = "4", features = ["rand_core"] }
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[[example]]
+name = "membership"
+path = "examples/membership.rs"
