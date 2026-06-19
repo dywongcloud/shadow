@@ -28,7 +28,7 @@ fn set(resp: &mut Response, name: &'static str, val: &str) {
 
 pub async fn edge_pipeline(
     State(cloud): State<Arc<CloudState>>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let method = req.method().as_str().to_string();
@@ -39,7 +39,22 @@ pub async fn edge_pipeline(
         .iter()
         .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
         .collect();
-    let host = header(&headers_vec, "host").unwrap_or_default();
+    // Host resolution: HTTP/1.1 carries it in the `Host` header, but HTTP/2 (used
+    // by our TLS listener after ALPN negotiates h2) carries it in the `:authority`
+    // pseudo-header instead — exposed by hyper as the request URI's authority, with
+    // no synthesized `Host` header. Fall back to that so h2 clients route correctly.
+    let host = header(&headers_vec, "host")
+        .filter(|s| !s.is_empty())
+        .or_else(|| req.uri().authority().map(|a| a.host().to_string()))
+        .unwrap_or_default();
+    // Normalize: ensure a `Host` header is present for all downstream consumers
+    // (the gateway router reads `header::HOST` directly). Under HTTP/2 it would
+    // otherwise be absent. No-op for HTTP/1.1 where the header already exists.
+    if !host.is_empty() && req.headers().get(axum::http::header::HOST).is_none() {
+        if let Ok(v) = HeaderValue::from_str(&host) {
+            req.headers_mut().insert(axum::http::header::HOST, v);
+        }
+    }
     let ua = header(&headers_vec, "user-agent").unwrap_or_default();
     let ip = header(&headers_vec, "x-forwarded-for")
         .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
@@ -62,11 +77,23 @@ pub async fn edge_pipeline(
     // error. `x-hive-proxied` breaks loops. This is what turns N nodes into one
     // cloud — hit any node, the request reaches wherever the deployment lives.
     let already_proxied = header(&headers_vec, "x-hive-proxied").is_some();
-    if !already_proxied && !host.is_empty() && !cloud.gw.serves_host(&host) {
-        let sub = host
-            .split(':').next().unwrap_or(&host)
-            .split('.').next().unwrap_or(&host)
-            .to_string();
+    let serve_local = cloud.gw.serves_host(&host);
+    let sub = host
+        .split(':').next().unwrap_or(&host)
+        .split('.').next().unwrap_or(&host)
+        .to_string();
+    // CONTAINER single-owner enforcement: even if THIS node has the container
+    // locally, only the lease owner may serve it — so route to the owner (prevents
+    // split-brain double-running of a stateful container). Functions are unaffected.
+    let container_owner: Option<String> = if serve_local && cloud.gw.is_container_host(&host) {
+        match cloud.leases.owner_of(&sub) {
+            Some(owner) if owner != cloud.node_name => Some(owner),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if !already_proxied && !host.is_empty() && (!serve_local || container_owner.is_some()) {
         let mut cands: Vec<crate::state::PeerRoute> = cloud
             .peer_routes
             .read()
@@ -76,6 +103,10 @@ pub async fn edge_pipeline(
             .into_iter()
             .filter(|r| r.healthy)
             .collect();
+        // For container enforcement, route ONLY to the elected owner.
+        if let Some(owner) = &container_owner {
+            cands.retain(|c| &c.node_id == owner);
+        }
         if !cands.is_empty() {
             cands.sort_by_key(|r| (if r.region == region { 0u8 } else { 1u8 }, r.latency_ms));
             let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
@@ -266,8 +297,17 @@ pub async fn edge_pipeline(
     }
 
     // 3) CDN cache (GET) — serve HIT directly, or STALE while revalidating.
+    //
+    // RSC bypass: Next.js App Router fetches the SAME url with an `RSC` header to
+    // get a React-Server-Components payload instead of the HTML document (its
+    // responses set `Vary: rsc`). Our cache keys on host+path only, so without
+    // this an RSC request and a document request for `/` collide — the browser
+    // gets HTML where it expects an RSC payload (or vice-versa) and the app
+    // renders blank/gray. Treat RSC requests as non-cacheable so each always
+    // reaches the function; the HTML document still caches for normal requests.
+    let is_rsc = header(&headers_vec, "rsc").is_some();
     let cache_key = CdnCache::key(&host, &path_q);
-    if method == "GET" {
+    if method == "GET" && !is_rsc {
         match cloud.cdn.lookup(&cache_key) {
             Lookup::Hit(c) => {
                 let ev = cloud.event(&region, &method, &host, &path, c.status, "cache-hit", "");
@@ -300,7 +340,7 @@ pub async fn edge_pipeline(
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
 
-    let cacheable = method == "GET" && status == 200 && is_cacheable(resp.headers());
+    let cacheable = method == "GET" && !is_rsc && status == 200 && is_cacheable(resp.headers());
     let action = if cacheable { "cache-store" } else { "allow" };
     let ev = cloud.event(&region, &method, &host, &path, status, action, "");
     cloud.record(ev);

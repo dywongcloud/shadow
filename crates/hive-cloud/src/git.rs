@@ -133,7 +133,19 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     let bid = id.clone();
     let wh_project = project.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_build(&cloud, &bid, req, project).await {
+        // First-deploy only: serve a "Building…" page at the domain immediately so
+        // the URL resolves throughout the build (a slow Next.js build no longer
+        // 404s). The real deployment supersedes it; we then remove the placeholder.
+        let placeholder = register_building_placeholder(&cloud, &project, &req).await;
+        let result = run_build(&cloud, &bid, req, project).await;
+        if let Some(pid) = &placeholder {
+            // The real deploy (or the build-failed page) has taken over the alias;
+            // drop the placeholder so it doesn't linger. On a hard error this also
+            // clears the "Building…" page (matching prior no-deployment behavior).
+            let _ = cloud.gw.remove(pid).await;
+            crate::persist::persist(&cloud);
+        }
+        if let Err(e) = result {
             cloud.builds.log(&bid, format!("Error: {e}"));
             cloud.builds.update(&bid, |b| {
                 b.state = DeployState::Error;
@@ -946,6 +958,73 @@ fn build_failed_page(project: &str, commit: &str, err: &str, repo: &str) -> Stri
 </body>
 </html>"#
     )
+}
+
+/// A self-refreshing "Building…" placeholder, served at the project's domain the
+/// moment a FIRST deploy starts — so the URL always resolves instead of 404'ing
+/// for the whole build. It reloads every few seconds and flips to the real app
+/// automatically once the deployment is ready.
+fn building_page(project: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="refresh" content="3" />
+  <title>{project} · Building · OpenEdge</title>
+  <style>
+    :root {{ color-scheme: light dark; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin:0; min-height:100vh; display:grid; place-items:center;
+      font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      background:#fafafa; color:#111; }}
+    @media (prefers-color-scheme: dark) {{ body {{ background:#0a0a0a; color:#ededed; }} .card {{ background:#111 !important; border-color:#222 !important; }} .muted {{ color:#888 !important; }} }}
+    .card {{ background:#fff; border:1px solid #ebebeb; border-radius:16px; padding:36px 40px; max-width:520px; text-align:center; }}
+    h1 {{ font-size:22px; margin:18px 0 6px; letter-spacing:-0.02em; }}
+    .muted {{ color:#666; font-size:14px; line-height:1.6; }}
+    .spinner {{ width:34px; height:34px; border-radius:999px; border:3px solid #ddd; border-top-color:#111;
+      animation:spin .8s linear infinite; margin:0 auto; }}
+    @media (prefers-color-scheme: dark) {{ .spinner {{ border-color:#333; border-top-color:#ededed; }} }}
+    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h1>Building {project}…</h1>
+    <p class="muted">Your deployment is building. This page refreshes automatically and will load your app as soon as it's ready.</p>
+  </div>
+</body>
+</html>"#
+    )
+}
+
+/// First-deploy only: register the project's host immediately with a "Building…"
+/// page, so the domain resolves during the build. Returns the placeholder
+/// deployment id (removed once the real deployment is live). A redeploy returns
+/// None — the current version stays live until the new build is ready.
+async fn register_building_placeholder(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    req: &GitDeployRequest,
+) -> Option<String> {
+    if cloud.gw.serves_host(&format!("{project}.localhost")) {
+        return None; // redeploy — keep the live version serving until ready
+    }
+    let dir = deploy_root().join(format!("{project}-building-{}", now_ms()));
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    tokio::fs::write(dir.join("index.html"), building_page(project)).await.ok()?;
+    let info = cloud.gw.deploy_full(
+        dir.to_string_lossy().into_owned(),
+        static_manifest(project, "."),
+        req.creator.clone().unwrap_or_else(|| "you".into()),
+        None,
+        false, // not production — superseded by the real deploy when it's ready
+        DeployState::Building,
+    );
+    crate::persist::persist(cloud);
+    Some(info.id.to_string())
 }
 
 async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { Search, Filter, RotateCw, Plus, ChevronRight } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { apiSend, usePoll, type Deployment } from "@/lib/api";
+import { deploymentHost } from "@/lib/deploy-url";
 
 interface DomainEntry { project: string; domain: string }
 
@@ -19,7 +20,7 @@ export default function DomainsPage() {
 
   const projects = Array.from(new Set((deps ?? []).map((d) => d.project)));
   // managed subdomains (one per project) + custom domains
-  const managed = projects.map((p) => ({ domain: `${p}.localhost`, project: p, kind: "managed" as const }));
+  const managed = projects.map((p) => ({ domain: deploymentHost(`${p}.localhost`), project: p, kind: "managed" as const }));
   const customList = (custom ?? []).map((c) => ({ ...c, kind: "custom" as const }));
   const all = [...customList, ...managed].filter((d) => d.domain.toLowerCase().includes(q.toLowerCase()));
 

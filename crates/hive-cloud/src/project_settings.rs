@@ -60,7 +60,10 @@ impl Default for FunctionSettings {
         FunctionSettings {
             fluid_enabled: true,
             default_max_duration_secs: 300,
-            regions: vec!["iad1".into()],
+            // No hard-coded region. Empty = "run on the nearest available node"
+            // (anycast). Real regions come from the live mesh; the dashboard's
+            // region picker is populated from where nodes actually are.
+            regions: vec![],
             failover: false,
             memory_mib: 512,
         }
@@ -242,33 +245,6 @@ impl Default for ProjectStore {
     }
 }
 
-/// Static catalog of Hive regions (Vercel-style), grouped by continent, for the
-/// Function Regions selector.
-pub fn region_catalog() -> serde_json::Value {
-    serde_json::json!({
-        "North America": [
-            {"id": "iad1", "label": "Washington, D.C., USA (East)", "aws": "us-east-1"},
-            {"id": "cle1", "label": "Cleveland, USA (East)", "aws": "us-east-2"},
-            {"id": "sfo1", "label": "San Francisco, USA (West)", "aws": "us-west-1"},
-            {"id": "pdx1", "label": "Portland, USA (West)", "aws": "us-west-2"},
-            {"id": "yul1", "label": "Montréal, Canada (East)", "aws": "ca-central-1"}
-        ],
-        "South America": [
-            {"id": "gru1", "label": "São Paulo, Brazil (East)", "aws": "sa-east-1"}
-        ],
-        "Europe": [
-            {"id": "fra1", "label": "Frankfurt, Germany", "aws": "eu-central-1"},
-            {"id": "lhr1", "label": "London, UK", "aws": "eu-west-2"},
-            {"id": "cdg1", "label": "Paris, France", "aws": "eu-west-3"},
-            {"id": "arn1", "label": "Stockholm, Sweden", "aws": "eu-north-1"}
-        ],
-        "Asia": [
-            {"id": "hnd1", "label": "Tokyo, Japan", "aws": "ap-northeast-1"},
-            {"id": "sin1", "label": "Singapore", "aws": "ap-southeast-1"},
-            {"id": "bom1", "label": "Mumbai, India", "aws": "ap-south-1"}
-        ],
-        "Oceania": [
-            {"id": "syd1", "label": "Sydney, Australia", "aws": "ap-southeast-2"}
-        ]
-    })
-}
+// NOTE: the Function Regions catalog is no longer a static Vercel-style table.
+// It is built dynamically in `admin::region_catalog` from the live mesh — the
+// real regions where P2P nodes report their lat/lon, auto-grouped by continent.

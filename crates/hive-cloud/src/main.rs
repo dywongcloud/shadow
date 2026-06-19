@@ -13,11 +13,12 @@ mod billing;
 mod cluster;
 mod databases;
 mod dns;
+mod dnsserver;
 mod docstore;
 mod edge;
 mod git;
 mod gitops;
-#[cfg(feature = "guardian")]
+mod lease;
 mod guardian;
 mod identity;
 mod incidents;
@@ -55,8 +56,10 @@ use state::CloudState;
 #[derive(Parser, Debug)]
 #[command(name = "hive-cloud", about = "A unified cloud node (builds + serving + edge + cron + workflows)")]
 struct Args {
-    /// Region label, e.g. sfo1, iad1, fra1.
-    #[arg(long, default_value = "dev1")]
+    /// Region id for this node. Default "auto" derives it from the node's real
+    /// geolocation (e.g. a node in Los Angeles → "los-angeles"); pass an explicit
+    /// value to override.
+    #[arg(long, default_value = "auto")]
     region: String,
     /// Unique node name across the cloud.
     #[arg(long, default_value = "node-a")]
@@ -114,12 +117,28 @@ async fn main() -> anyhow::Result<()> {
         }))
     };
 
+    // Auto-detect this node's real-world location (IP geolocation) so it reports
+    // its true position for the regions map + the function-region picker.
+    let geo = geolocate().await;
+    if let Some(g) = &geo {
+        tracing::info!(city = %g.2, country = %g.3, lat = g.0, lon = g.1, "node geolocated");
+    }
+    // The node's REGION reflects where it actually is. When `--region` is left at
+    // the default ("auto"), derive a stable id from the geolocation (e.g. a node
+    // in Los Angeles → "los-angeles") instead of a hard-coded label like "iad1".
+    // Co-located nodes share the id (same region, multiple nodes).
+    let region = if args.region == "auto" {
+        region_id_from_geo(geo.as_ref())
+    } else {
+        args.region.clone()
+    };
+
     // Serving (Fluid) + builds (Hive control plane).
     let fluid = Fluid::start(backend.clone(), FluidConfig::default());
     let gw = Gateway::new(fluid.clone(), args.image.clone());
     let hive = Hive::start(
         HiveConfig {
-            hive_id: format!("hive-{}", args.region).into(),
+            hive_id: format!("hive-{}", region).into(),
             boxes: vec![BoxConfig::default(), BoxConfig::default()],
             ..HiveConfig::default()
         },
@@ -136,18 +155,12 @@ async fn main() -> anyhow::Result<()> {
         _ => Plan::Pro,
     };
     let limiter = Arc::new(
-        ConcurrencyLimiter::new(args.region.clone(), plan).with_burst(args.burst_limit, 10_000),
+        ConcurrencyLimiter::new(region.clone(), plan).with_burst(args.burst_limit, 10_000),
     );
     let router = Router::new();
     let cron = Arc::new(CronScheduler::new());
     let workflows = WorkflowEngine::new();
     let public_base = format!("http://{}", args.listen);
-    // Auto-detect this node's real-world location (IP geolocation) so it reports
-    // its true position for the regions map + the function-region picker.
-    let geo = geolocate().await;
-    if let Some(g) = &geo {
-        tracing::info!(city = %g.2, country = %g.3, lat = g.0, lon = g.1, "node geolocated");
-    }
     let cap = resources::capacity();
     // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
     // node has a real peer id and can serve/accept Hive tunnels across networks.
@@ -170,7 +183,7 @@ async fn main() -> anyhow::Result<()> {
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
-        region: args.region.clone(),
+        region: region.clone(),
         public_url: public_base.clone(),
         peer_id: iroh_ep.as_ref().map(|e| e.id().to_string()),
         iroh_addr: iroh_ep.as_ref().and_then(hive_p2p::addr_json),
@@ -190,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
     let registry = NodeRegistry::new(me);
 
     let cloud = CloudState::new(
-        args.region.clone(),
+        region.clone(),
         args.name.clone(),
         public_base.clone(),
         waf,
@@ -228,6 +241,26 @@ async fn main() -> anyhow::Result<()> {
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
     spawn_cluster_loop(cloud.clone());
+    spawn_lease_loop(cloud.clone());
+
+    // Warm the always-on GuardianDB (durable, iroh-replicated state store) so it
+    // is live before the first snapshot. Best-effort; never blocks boot.
+    guardian::init_background();
+
+    // Authoritative DNS server (answers the platform's own records). Non-privileged
+    // port by default so it runs without root; set HIVE_DNS_ADDR=0.0.0.0:53 in prod.
+    {
+        let dns_addr: SocketAddr = std::env::var("HIVE_DNS_ADDR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "127.0.0.1:5354".parse().unwrap());
+        let c = cloud.clone();
+        tokio::spawn(async move {
+            if let Err(e) = dnsserver::serve(c, dns_addr).await {
+                tracing::warn!(error=%e, %dns_addr, "DNS server failed to bind (continuing without it)");
+            }
+        });
+    }
     if !args.peers.is_empty() {
         spawn_gossip_loop(cloud.clone(), args.peers.clone());
     }
@@ -241,11 +274,77 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
 
-    tracing::info!(region=%args.region, node=%args.name, public=%args.listen, admin=%args.admin, "hive-cloud node up");
+    // Production TLS: terminate HTTPS on the gateway (same edge pipeline). Uses a
+    // real cert from HIVE_TLS_CERT/HIVE_TLS_KEY (PEM paths) when set, else a
+    // generated self-signed cert for local dev. Runs ALONGSIDE plain HTTP.
+    let tls_public = public.clone();
+    let tls_addr: SocketAddr = std::env::var("HIVE_TLS_ADDR")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| "127.0.0.1:8443".parse().unwrap());
+    tokio::spawn(async move {
+        if let Err(e) = serve_tls(tls_public, tls_addr).await {
+            tracing::warn!(error=%e, %tls_addr, "TLS listener failed (continuing with HTTP)");
+        }
+    });
+
+    tracing::info!(region=%region, node=%args.name, public=%args.listen, admin=%args.admin, tls=%tls_addr, "hive-cloud node up");
 
     let pub_srv = serve(public, args.listen, "public");
     let adm_srv = serve(admin_router, args.admin, "admin");
     tokio::try_join!(pub_srv, adm_srv)?;
+    Ok(())
+}
+
+/// Derive a stable, human-readable region id from a node's geolocation, so a
+/// node's region reflects where it actually is (e.g. "los-angeles") rather than a
+/// hard-coded label. Co-located nodes resolve to the same id (one region, many
+/// nodes). Falls back to "local" when geolocation is unavailable (offline).
+fn region_id_from_geo(geo: Option<&(f64, f64, String, String)>) -> String {
+    let slug = |s: &str| {
+        s.trim()
+            .to_lowercase()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    };
+    if let Some((_, _, city, _country)) = geo {
+        let c = slug(city);
+        if !c.is_empty() {
+            return c;
+        }
+    }
+    "local".to_string()
+}
+
+/// Terminate HTTPS for the gateway. Loads a real cert/key (PEM) from
+/// HIVE_TLS_CERT + HIVE_TLS_KEY when both are set (production), otherwise
+/// generates a self-signed cert for `localhost`/`*.localhost` (local dev).
+async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
+    use axum_server::tls_rustls::RustlsConfig;
+    // Install the ring crypto provider for rustls (idempotent).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let config = match (std::env::var("HIVE_TLS_CERT"), std::env::var("HIVE_TLS_KEY")) {
+        (Ok(cert_path), Ok(key_path)) if !cert_path.is_empty() && !key_path.is_empty() => {
+            tracing::info!(cert=%cert_path, "TLS using provided certificate");
+            RustlsConfig::from_pem_file(cert_path, key_path).await?
+        }
+        _ => {
+            let names = vec!["localhost".to_string(), "*.localhost".to_string()];
+            let certified = rcgen::generate_simple_self_signed(names)?;
+            let cert_pem = certified.cert.pem();
+            let key_pem = certified.key_pair.serialize_pem();
+            tracing::info!("TLS using generated self-signed certificate (dev; set HIVE_TLS_CERT/KEY for production)");
+            RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?
+        }
+    };
+    tracing::info!(%addr, "HTTPS (TLS) gateway listening");
+    axum_server::bind_rustls(addr, config)
+        .serve(app.into_make_service())
+        .await?;
     Ok(())
 }
 
@@ -339,6 +438,52 @@ pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
     })
 }
 
+/// Container placement: every few seconds, for each container deployment this node
+/// holds, compute the preferred owner (rendezvous hash over LIVE holders) and
+/// either acquire/renew our fenced lease (if we're preferred) or release it (so the
+/// preferred node can take over). A short liveness window gives fast failover.
+fn spawn_lease_loop(cloud: Arc<CloudState>) {
+    use std::collections::HashSet;
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let self_id = cloud.node_name.clone();
+            let region = cloud.region.clone();
+            let now = now_ms();
+            // Live nodes = self + peers seen within 12s (fast failover detection).
+            let live: HashSet<String> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| n.is_self || now.saturating_sub(n.last_seen_ms) < 12_000)
+                .map(|n| n.id)
+                .collect();
+            let holders = cloud.container_holders.read().clone();
+            for key in cloud.gw.container_projects() {
+                // The live nodes that can actually run this container (self + peers
+                // that gossiped they hold it).
+                let mut h: Vec<String> = holders.get(&key).cloned().unwrap_or_default();
+                if !h.contains(&self_id) {
+                    h.push(self_id.clone());
+                }
+                h.retain(|n| live.contains(n));
+                if h.is_empty() {
+                    h.push(self_id.clone());
+                }
+                match crate::lease::hrw_owner(&key, &h) {
+                    Some(pref) if pref == self_id => {
+                        if let Some(l) = cloud.leases.acquire_or_renew(&key, &self_id, &region, 10_000) {
+                            tracing::debug!(key=%key, epoch=l.epoch, "holding container lease");
+                        }
+                    }
+                    Some(_) => cloud.leases.release(&key, &self_id),
+                    None => {}
+                }
+            }
+        }
+    });
+}
+
 fn spawn_cluster_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
@@ -377,6 +522,11 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
             // Rebuild the cross-node routing table from scratch each cycle so stale
             // routes (peers that no longer host a deployment) age out.
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
+            // Container holders, seeded with this node's own container deployments.
+            let mut holders: HashMap<String, Vec<String>> = HashMap::new();
+            for key in cloud.gw.container_projects() {
+                holders.entry(key).or_default().push(cloud.node_name.clone());
+            }
             for peer in &peers {
                 // Announce ourselves, and learn the peer's view of the cloud.
                 let me = cloud.registry.me();
@@ -435,11 +585,32 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                                     });
                                 }
                             }
+                            // Which container deployments this peer holds → lease election set.
+                            if let Some(cs) = v.get("containers").and_then(|x| x.as_array()) {
+                                for k in cs.iter().filter_map(|x| x.as_str()) {
+                                    holders.entry(k.to_string()).or_default().push(node_id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+                // Converge container leases (highest fencing epoch wins).
+                if let Ok(resp) = cloud
+                    .http
+                    .get(format!("{peer}/v1/leases"))
+                    .timeout(Duration::from_secs(3))
+                    .send()
+                    .await
+                {
+                    if let Ok(leases) = resp.json::<Vec<crate::lease::ContainerLease>>().await {
+                        for l in leases {
+                            cloud.leases.merge(l);
                         }
                     }
                 }
             }
             *cloud.peer_routes.write() = routes;
+            *cloud.container_holders.write() = holders;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });

@@ -130,6 +130,18 @@ impl Gateway {
         };
         let info = view_of(&dep);
         let mut st = self.state.lock();
+        // Invariant: at most ONE production deployment per project. Promoting this
+        // one to production demotes any prior production deployment of the same
+        // project, so the project alias can't later resolve to a stale deployment
+        // after a restart (which would serve the OLD build).
+        if production {
+            let proj = dep.project.clone();
+            for d in st.deployments.values_mut() {
+                if d.project == proj {
+                    d.production = false;
+                }
+            }
+        }
         st.aliases.insert(dep.project.clone(), id.clone());
         // Per-deployment preview URL: <deployment-id>.localhost resolves to this
         // exact deployment even after newer ones become the project default.
@@ -290,7 +302,21 @@ impl Gateway {
             production: rec.production,
         };
         let mut st = self.state.lock();
-        st.aliases.insert(dep.project.clone(), id.clone());
+        // The project alias must resolve to the project's CURRENT deployment, not
+        // whichever record happens to be restored last. Prefer the production
+        // deployment, and among equals the newest — so a stale prior deployment
+        // (e.g. a superseded build) never wins the alias after a reboot.
+        let should_alias = match st.aliases.get(&dep.project) {
+            None => true,
+            Some(existing_id) => match st.deployments.get(existing_id) {
+                None => true,
+                Some(ex) => (dep.production, dep.created_at_ms) > (ex.production, ex.created_at_ms),
+            },
+        };
+        if should_alias {
+            st.aliases.insert(dep.project.clone(), id.clone());
+        }
+        // The per-deployment preview URL always points at this exact deployment.
         st.aliases.insert(id.as_str().to_string(), id.clone());
         st.deployments.insert(id.clone(), dep);
         st.default.get_or_insert(id);
@@ -310,6 +336,15 @@ impl Gateway {
         st.default.as_ref().and_then(|id| st.deployments.get(id).cloned())
     }
 
+    /// The deployment id a request `host` resolves to (its subdomain alias), if
+    /// any. Exposes the same alias resolution `select` uses — handy for debugging
+    /// and for asserting which deployment a project host points at.
+    pub fn host_deployment_id(&self, host: &str) -> Option<String> {
+        let h = host.split(':').next().unwrap_or(host);
+        let sub = h.split('.').next().unwrap_or(h);
+        self.state.lock().aliases.get(sub).map(|id| id.as_str().to_string())
+    }
+
     /// Does THIS node actually have a deployment aliased for `host`'s subdomain?
     /// Exact alias match (no default fallback) — used by mesh routing to decide
     /// whether to serve locally or proxy to the peer that really hosts it.
@@ -323,6 +358,34 @@ impl Gateway {
     /// published to peers so the mesh knows where each deployment lives.
     pub fn served_hosts(&self) -> Vec<String> {
         self.state.lock().aliases.keys().cloned().collect()
+    }
+
+    /// Projects this node hosts that are **container** deployments (a function with
+    /// the `container` runtime) — these are the stateful workloads coordinated by a
+    /// single-owner lease. Functions/static sites are excluded (stateless).
+    pub fn container_projects(&self) -> Vec<String> {
+        let st = self.state.lock();
+        let mut out: Vec<String> = st
+            .deployments
+            .values()
+            .filter(|d| d.manifest.functions.iter().any(|f| f.runtime == "container"))
+            .map(|d| d.project.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Is the deployment behind `host` a container deployment?
+    pub fn is_container_host(&self, host: &str) -> bool {
+        let h = host.split(':').next().unwrap_or(host);
+        let sub = h.split('.').next().unwrap_or(h);
+        let st = self.state.lock();
+        st.aliases
+            .get(sub)
+            .and_then(|id| st.deployments.get(id))
+            .map(|d| d.manifest.functions.iter().any(|f| f.runtime == "container"))
+            .unwrap_or(false)
     }
 }
 

@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { composioConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable } from "@/lib/composio";
+import { composioConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/composio";
 import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
@@ -27,9 +26,7 @@ export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => ({} as any));
   const team = body?.team || req.headers.get("x-hive-team") || "personal";
   const scope = body?.scope === "org" ? "org" : "personal";
-  const entity = cookies().get("hive_entity")?.value;
-  if (!entity) return NextResponse.json({ ok: false, error: "GitHub not connected." }, { status: 400 });
-
+  const entity = await resolveEntity();
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ ok: false, error: "GitHub not connected." }, { status: 400 });
 

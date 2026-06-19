@@ -1,17 +1,13 @@
 import { NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { composioConfigured, githubStatus } from "@/lib/composio";
+import { composioConfigured, githubStatus, resolveEntity } from "@/lib/composio";
 
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  const c = cookies();
-  let entity = c.get("hive_entity")?.value;
-  const res = NextResponse.json({ configured: composioConfigured(), connected: false, entity: entity ?? null });
-  if (!entity) {
-    entity = "user-" + Math.random().toString(36).slice(2, 10);
-    res.cookies.set("hive_entity", entity, { httpOnly: true, sameSite: "lax", path: "/" });
+  const entity = await resolveEntity();
+  if (!composioConfigured()) {
+    return NextResponse.json({ configured: false, connected: false, entity });
   }
   const status = await githubStatus(entity);
-  return NextResponse.json({ ...status, entity }, { headers: res.headers });
+  return NextResponse.json({ ...status, entity });
 }

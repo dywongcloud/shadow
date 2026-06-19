@@ -129,3 +129,12 @@ html.dark {
   border-radius: 8px;
   border: 2px solid hsl(var(--background));
 }
+
+/* Scrollable but with no visible scrollbar (still scrolls via wheel/touch). */
+.no-scrollbar {
+  -ms-overflow-style: none; /* IE / old Edge */
+  scrollbar-width: none; /* Firefox */
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none; /* Chrome / Safari / WebKit */
+}

@@ -7,6 +7,7 @@ import { RotateCcw, RefreshCw, Trash2, Loader2, Plus } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
 export default function DeploymentsPage() {
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
@@ -57,7 +58,7 @@ export default function DeploymentsPage() {
                     ? <Badge tone="green"><span className="h-1.5 w-1.5 rounded-full bg-green" /> Production</Badge>
                     : <Badge>Preview</Badge>}
                 </Td>
-                <Td className="font-mono text-xs"><a className="text-link hover:underline" href={`http://${d.alias}:8787/`} target="_blank" rel="noreferrer">{d.alias}</a></Td>
+                <Td className="font-mono text-xs"><a className="text-link hover:underline" href={deploymentUrl(d.alias)} target="_blank" rel="noreferrer">{deploymentHost(d.alias)}</a></Td>
                 <Td className="text-xs text-secondary">
                   {d.git ? <span className="font-mono">{d.git.branch}@{d.git.commit || "—"}</span> : <span className="text-muted">CLI</span>}
                 </Td>

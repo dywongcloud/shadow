@@ -66,6 +66,11 @@ export function GitOps() {
       window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
     }
     const onboarded = localStorage.getItem("hive_onboarded") === "1";
+    // Already linked a config repo in a prior session → setup is done, never nag.
+    if (!justConnected && localStorage.getItem("hive_gitops_linked") === "1") {
+      localStorage.setItem("hive_onboarded", "1");
+      return;
+    }
 
     fetch("/api/github/status")
       .then((r) => r.json())
@@ -235,7 +240,7 @@ export function GitOps() {
                   href={`https://github.com/${result.repo}`}
                   target="_blank"
                   rel="noreferrer"
-                  className="mt-1 inline-flex items-center gap-1 text-xs text-blue-500 hover:underline"
+                  className="mt-1 inline-flex items-center gap-1 text-xs text-link hover:underline"
                 >
                   View on GitHub <ExternalLink className="h-3 w-3" />
                 </a>

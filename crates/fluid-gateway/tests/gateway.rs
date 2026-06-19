@@ -177,3 +177,46 @@ async fn max_duration_504_and_error_isolation() {
     assert!(boom_status >= 500, "failing handler should error, got {boom_status}");
     assert_eq!(normal_ok, 10, "normal requests must survive (error isolation)");
 }
+
+/// Regression: after a restart, a project's host alias must resolve to its
+/// PRODUCTION deployment — never to a stale prior deployment that happens to be
+/// restored last. (This caused `ctr-demo.localhost` to serve the old broken
+/// build after a reboot even though a newer working deployment existed.)
+#[tokio::test]
+async fn restore_prefers_production_deployment_for_alias() {
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("gw-restore-{}", std::process::id())),
+        provision_latency: Duration::from_millis(1),
+        cache_root: std::env::temp_dir().join(format!("gw-restore-cache-{}", std::process::id())),
+    }));
+    let fluid = Fluid::start(backend, FluidConfig::default());
+    let gw = Gateway::new(fluid, "default".into());
+
+    let mk = |id: &str, created: u64, production: bool| fluid_core::DeployRecord {
+        id: id.into(),
+        project: "ctr-demo".into(),
+        root: "/nonexistent".into(),
+        manifest: Manifest { project: "ctr-demo".into(), ..Default::default() },
+        created_at_ms: created,
+        creator: "you".into(),
+        git: None,
+        production,
+        state: fluid_core::DeployState::Ready,
+    };
+
+    // Restore the NEWER production deployment first, then the OLDER non-production
+    // one LAST — the order that used to make the stale one win the alias.
+    gw.restore(mk("dpl-new", 2000, true));
+    gw.restore(mk("dpl-old", 1000, false));
+
+    // The project host alias must point at the PRODUCTION deployment, regardless
+    // of restore order — this is the regression being guarded.
+    assert_eq!(
+        gw.host_deployment_id("ctr-demo.localhost").as_deref(),
+        Some("dpl-new"),
+        "project alias must resolve to the production deployment, not the stale one"
+    );
+    // Per-deployment preview URLs still resolve each exact deployment.
+    assert_eq!(gw.host_deployment_id("dpl-old.localhost").as_deref(), Some("dpl-old"));
+    assert_eq!(gw.host_deployment_id("dpl-new.localhost").as_deref(), Some("dpl-new"));
+}

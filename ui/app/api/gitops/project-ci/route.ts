@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { composioConfigured, githubStatus, commitFile, setRepoVariable } from "@/lib/composio";
+import { composioConfigured, githubStatus, commitFile, setRepoVariable, resolveEntity } from "@/lib/composio";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
 export const dynamic = "force-dynamic";
@@ -29,8 +28,7 @@ export async function POST(req: NextRequest) {
   const parsed = parseRepo(String(body?.repo || ""));
   if (!parsed) return NextResponse.json({ skipped: true, reason: "bad-repo" });
 
-  const entity = cookies().get("hive_entity")?.value;
-  if (!entity) return NextResponse.json({ skipped: true, reason: "no-entity" });
+  const entity = await resolveEntity();
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
 

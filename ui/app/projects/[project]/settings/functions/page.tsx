@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, ExternalLink } from "lucide-react";
 import { Button, Switch, Input, SettingCard } from "@/components/ui";
+import { RegionMap } from "@/components/region-map";
 import { apiGet, apiSend, type FunctionSettings, type RegionCatalog } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +29,8 @@ export default function FunctionsSettings({ params }: { params: { project: strin
       const fallback: FunctionSettings = {
         fluid_enabled: true,
         default_max_duration_secs: 300,
-        regions: ["iad1"],
+        // No hard-coded region — real regions come from the live mesh catalog.
+        regions: [],
         failover: false,
         memory_mib: 512,
       };
@@ -59,6 +61,22 @@ export default function FunctionsSettings({ params }: { params: { project: strin
     const regions = has ? fs!.regions.filter((r) => r !== id) : [...fs!.regions, id];
     save({ ...fs!, regions });
   }
+
+  // Coordinates for every catalog region, so selected regions plot on the map at
+  // their REAL location (driven by where the backing node actually is).
+  const coordById: Record<string, { lat: number; lon: number; label: string }> = {};
+  Object.values(catalog).forEach((regions) =>
+    regions.forEach((r) => {
+      if (typeof r.lat === "number" && typeof r.lon === "number") {
+        coordById[r.id] = { lat: r.lat, lon: r.lon, label: r.label };
+      }
+    })
+  );
+  const labelById: Record<string, string> = {};
+  Object.values(catalog).forEach((regions) => regions.forEach((r) => { labelById[r.id] = r.label; }));
+  const mapMarkers = fs.regions
+    .map((id) => (coordById[id] ? { id, ...coordById[id] } : null))
+    .filter((m): m is { id: string; lat: number; lon: number; label: string } => Boolean(m));
 
   return (
     <div className="flex flex-col gap-6">
@@ -117,19 +135,43 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         desc="These are the regions on the OpenEdge network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
         footer={`${fs.regions.length}/5 regions selected`}
       >
-        {/* Global region map — your functions run close to your users. */}
-        <div className="relative mb-6 overflow-hidden rounded-xl border border-border bg-black">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src="/world-dots.png" alt="OpenEdge global region network" className="w-full select-none object-cover opacity-95" />
-          <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent" />
-          <div className="absolute bottom-3 left-4 flex items-center gap-2 text-xs text-white/90">
-            <span className="flex h-2 w-2 animate-pulse rounded-full bg-emerald-400" />
-            {fs.regions.length} active region{fs.regions.length === 1 ? "" : "s"} on the global network
+        {/* Global region map — dots mark the regions you've selected. Background and
+            land follow the current UI theme (light/dark) rather than being hard-black. */}
+        <div className="mx-auto mb-6 w-1/2">
+          <div className="relative overflow-hidden rounded-xl border border-border bg-slate-50 dark:bg-[#070b14]">
+            <RegionMap markers={mapMarkers} />
+            <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
+              <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+              {fs.regions.length} active region{fs.regions.length === 1 ? "" : "s"} on your network
+            </div>
           </div>
         </div>
+
+        {/* Selected regions (so any selected-but-offline region is still visible
+            and removable, even when no live node currently backs it). */}
+        {fs.regions.length > 0 && (
+          <div className="mb-4 flex flex-wrap gap-2">
+            {fs.regions.map((id) => (
+              <button
+                key={id}
+                onClick={() => toggleRegion(id)}
+                className="group inline-flex items-center gap-1.5 rounded-full border border-link/30 bg-link/5 px-2.5 py-1 text-xs text-link"
+                title="Remove region"
+              >
+                {labelById[id] || id}
+                <span className="text-link/60 group-hover:text-link">✕</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {Object.keys(catalog).length === 0 && (
+          <div className="mb-4 rounded-lg border border-border bg-subtle p-3 text-sm text-secondary">
+            No regions detected yet — regions appear here as P2P nodes join the mesh and report their location.
+          </div>
+        )}
         <div className="flex flex-col divide-y divide-border">
           {Object.entries(catalog).map(([continent, regions]) => {
-            const expanded = open[continent] ?? false;
+            const expanded = open[continent] ?? true;
             const selectedHere = regions.filter((r) => fs.regions.includes(r.id)).map((r) => r.id);
             return (
               <div key={continent} className="py-2">
@@ -160,7 +202,10 @@ export default function FunctionsSettings({ params }: { params: { project: strin
                             sel ? "border-link bg-link/5 text-link" : "border-border hover:bg-subtle"
                           )}
                         >
-                          <span>{r.label} - {r.aws} - {r.id}</span>
+                          <span>
+                            {r.label} <span className="text-muted">· {r.id}</span>
+                            {r.nodes ? <span className="text-muted"> · {r.nodes} node{r.nodes === 1 ? "" : "s"}</span> : null}
+                          </span>
                           <span
                             className={cn(
                               "flex h-4 w-4 items-center justify-center rounded border",

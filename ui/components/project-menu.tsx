@@ -5,6 +5,7 @@ import { createPortal } from "react-dom";
 import { useRouter } from "next/navigation";
 import { MoreHorizontal, ExternalLink, Settings, Trash2, Loader2 } from "lucide-react";
 import { apiSend } from "@/lib/api";
+import { deploymentUrl } from "@/lib/deploy-url";
 
 /** The "⋯" menu on a project card/row — Visit / Settings / Delete Project.
  *
@@ -88,7 +89,7 @@ export function ProjectMenu({
             onClick={stop}
           >
             {alias && (
-              <a href={`http://${alias}:8787/`} target="_blank" rel="noreferrer" className={item}>
+              <a href={deploymentUrl(alias)} target="_blank" rel="noreferrer" className={item}>
                 <ExternalLink className="h-3.5 w-3.5" /> Visit
               </a>
             )}

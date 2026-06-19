@@ -175,6 +175,7 @@ async fn proxy_local(
     let mut headers = Vec::new();
     let mut wait_until_ms = 0u64;
     let mut content_length: Option<usize> = None;
+    let mut chunked = false;
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
             let k = k.trim();
@@ -182,6 +183,14 @@ async fn proxy_local(
             let kl = k.to_ascii_lowercase();
             if kl == "content-length" {
                 content_length = v.parse().ok();
+            }
+            // The function may stream its response with chunked transfer-encoding
+            // (Next.js does this, especially for gzipped responses). We must DECODE
+            // the chunk framing here — `transfer-encoding` is hop-by-hop and is
+            // dropped, so the framing bytes would otherwise be forwarded as part of
+            // the body and corrupt it (e.g. break a gzip Content-Encoding).
+            if kl == "transfer-encoding" && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
             }
             if kl == "x-fluid-wait-until-ms" {
                 wait_until_ms = v.parse().unwrap_or(0);
@@ -205,36 +214,71 @@ async fn proxy_local(
         FrameKind::RespHead,
         serde_json::to_vec(&meta)?,
     ))?;
-    // Stream the body. Prefer content-length (read EXACTLY n bytes — never wait
-    // for EOF, which can hang if the function keeps the socket open); otherwise
-    // fall back to reading until the function closes.
-    let mut sent = 0usize;
-    if !leftover.is_empty() {
-        let take = match content_length {
-            Some(n) => leftover.len().min(n),
-            None => leftover.len(),
-        };
-        leftover.truncate(take);
-        sent += leftover.len();
-        out.send(Frame::new(id, FrameKind::RespBody, Bytes::from(leftover)))?;
-    }
-    match content_length {
-        Some(n) => {
-            while sent < n {
-                let want = (n - sent).min(tmp.len());
-                let r = conn.read(&mut tmp[..want]).await?;
-                anyhow::ensure!(r > 0, "function closed mid-body");
-                out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
-                sent += r;
+    // Stream the body.
+    if chunked {
+        // Decode HTTP/1.1 chunked framing and forward ONLY the payload bytes, so
+        // any Content-Encoding (gzip/br) stays valid for the client. Each chunk is
+        // "<hex-size>[;ext]\r\n<data>\r\n", terminated by a zero-size chunk.
+        let mut buf = leftover;
+        loop {
+            // Read until we have a full chunk-size line.
+            let line_end = loop {
+                if let Some(pos) = buf.windows(2).position(|w| w == b"\r\n") {
+                    break pos;
+                }
+                let r = conn.read(&mut tmp).await?;
+                anyhow::ensure!(r > 0, "function closed before chunk size");
+                buf.extend_from_slice(&tmp[..r]);
+                anyhow::ensure!(buf.len() < 64 * 1024, "chunk size line too long");
+            };
+            let line = &buf[..line_end];
+            let hex = line.split(|&b| b == b';').next().unwrap_or(line);
+            let size = usize::from_str_radix(std::str::from_utf8(hex)?.trim(), 16)
+                .map_err(|_| anyhow::anyhow!("invalid chunk size"))?;
+            buf.drain(..line_end + 2); // consume "<size>\r\n"
+            if size == 0 {
+                break; // last chunk (any trailers are ignored)
             }
+            // Ensure the full chunk data + its trailing CRLF are buffered.
+            while buf.len() < size + 2 {
+                let r = conn.read(&mut tmp).await?;
+                anyhow::ensure!(r > 0, "function closed mid-chunk");
+                buf.extend_from_slice(&tmp[..r]);
+            }
+            out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&buf[..size])))?;
+            buf.drain(..size + 2); // consume data + trailing CRLF
         }
-        None => loop {
-            let r = conn.read(&mut tmp).await?;
-            if r == 0 {
-                break;
+    } else {
+        // Prefer content-length (read EXACTLY n bytes — never wait for EOF, which
+        // can hang if the function keeps the socket open); otherwise read to close.
+        let mut sent = 0usize;
+        if !leftover.is_empty() {
+            let take = match content_length {
+                Some(n) => leftover.len().min(n),
+                None => leftover.len(),
+            };
+            leftover.truncate(take);
+            sent += leftover.len();
+            out.send(Frame::new(id, FrameKind::RespBody, Bytes::from(leftover)))?;
+        }
+        match content_length {
+            Some(n) => {
+                while sent < n {
+                    let want = (n - sent).min(tmp.len());
+                    let r = conn.read(&mut tmp[..want]).await?;
+                    anyhow::ensure!(r > 0, "function closed mid-body");
+                    out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
+                    sent += r;
+                }
             }
-            out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
-        },
+            None => loop {
+                let r = conn.read(&mut tmp).await?;
+                if r == 0 {
+                    break;
+                }
+                out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
+            },
+        }
     }
     out.send(Frame::new(id, FrameKind::RespEnd, Bytes::new()))?;
     Ok(())

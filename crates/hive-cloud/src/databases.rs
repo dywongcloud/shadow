@@ -110,10 +110,77 @@ fn mask(v: &str) -> String {
 
 // ---- In-process backing stores for Blob / Queue / Vector ----
 
-#[derive(Default)]
+/// DURABLE blob store: objects are written to disk (content survives restarts),
+/// under `$HIVE_DATA/blob/<bucket>/<hex(key)>.bin` with atomic temp+rename writes.
+/// (Replaces the old in-memory map that was labelled "live" but lost on restart.)
 struct BlobStore {
-    // bucket -> key -> bytes
-    objects: RwLock<HashMap<String, HashMap<String, Vec<u8>>>>,
+    root: std::path::PathBuf,
+}
+impl BlobStore {
+    fn new(root: std::path::PathBuf) -> BlobStore {
+        let _ = std::fs::create_dir_all(&root);
+        BlobStore { root }
+    }
+    fn bucket_dir(&self, bucket: &str) -> std::path::PathBuf {
+        let safe: String = bucket
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        self.root.join(if safe.is_empty() { "_".to_string() } else { safe })
+    }
+    fn put(&self, bucket: &str, key: &str, data: &[u8]) {
+        let dir = self.bucket_dir(bucket);
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let h = hex_encode(key.as_bytes());
+        let tmp = dir.join(format!("{h}.tmp"));
+        let file = dir.join(format!("{h}.bin"));
+        if std::fs::write(&tmp, data).is_ok() {
+            let _ = std::fs::rename(&tmp, &file);
+        }
+    }
+    fn get(&self, bucket: &str, key: &str) -> Option<Vec<u8>> {
+        std::fs::read(self.bucket_dir(bucket).join(format!("{}.bin", hex_encode(key.as_bytes())))).ok()
+    }
+    fn list(&self, bucket: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(self.bucket_dir(bucket)) {
+            for e in rd.flatten() {
+                if let Some(name) = e.file_name().to_str() {
+                    if let Some(stem) = name.strip_suffix(".bin") {
+                        if let Some(k) = hex_decode(stem) {
+                            out.push(k);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+fn hex_decode(s: &str) -> Option<String> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    let raw = s.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hi = (raw[i] as char).to_digit(16)?;
+        let lo = (raw[i + 1] as char).to_digit(16)?;
+        bytes.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    String::from_utf8(bytes).ok()
 }
 #[derive(Default)]
 struct QueueStore {
@@ -170,7 +237,7 @@ impl DatabaseStore {
         DatabaseStore {
             dbs: RwLock::new(Vec::new()),
             port: AtomicU32::new(0),
-            blob: BlobStore::default(),
+            blob: BlobStore::new(crate::persist::data_dir().join("blob")),
             queue: QueueStore::default(),
             vector: VectorStore::default(),
             broker: Broker::default(),
@@ -245,15 +312,15 @@ impl DatabaseStore {
         self.dbs.write().push(d);
     }
 
-    // ---- Blob ops ----
+    // ---- Blob ops (durable, disk-backed) ----
     pub fn blob_put(&self, bucket: &str, key: &str, data: Vec<u8>) {
-        self.blob.objects.write().entry(bucket.to_string()).or_default().insert(key.to_string(), data);
+        self.blob.put(bucket, key, &data);
     }
     pub fn blob_get(&self, bucket: &str, key: &str) -> Option<Vec<u8>> {
-        self.blob.objects.read().get(bucket)?.get(key).cloned()
+        self.blob.get(bucket, key)
     }
     pub fn blob_list(&self, bucket: &str) -> Vec<String> {
-        self.blob.objects.read().get(bucket).map(|m| m.keys().cloned().collect()).unwrap_or_default()
+        self.blob.list(bucket)
     }
 
     // ---- Queue ops ----

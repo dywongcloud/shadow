@@ -76,6 +76,12 @@ pub struct CloudState {
     /// This node's iroh P2P endpoint (real QUIC mesh transport), if bound. Used to
     /// dial peers and tunnel cross-node requests over QUIC (with HTTP fallback).
     pub iroh: RwLock<Option<hive_p2p::Endpoint>>,
+    /// Single-owner placement leases for stateful CONTAINER deployments (fenced,
+    /// consensus-free). See `lease.rs`.
+    pub leases: crate::lease::LeaseStore,
+    /// Which nodes hold each container deployment (gossiped), so lease election
+    /// (rendezvous hashing) only considers nodes that can actually run it.
+    pub container_holders: RwLock<std::collections::HashMap<String, Vec<String>>>,
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
@@ -145,6 +151,8 @@ impl CloudState {
             peers: RwLock::new(Vec::new()),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),
+            leases: crate::lease::LeaseStore::new(),
+            container_holders: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),

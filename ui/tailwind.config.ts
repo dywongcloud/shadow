@@ -37,6 +37,8 @@ const config: Config = {
         // until the licensed woff2 files are added to /public/fonts.
         sans: ["ABC Diatype", "var(--font-geist-sans)", "ui-sans-serif", "system-ui", "sans-serif"],
         mono: ["ABC Diatype Mono", "var(--font-geist-mono)", "ui-monospace", "SFMono-Regular", "Menlo", "monospace"],
+        // Display typeface for the Shadow brand wordmark + landing headlines.
+        display: ["var(--font-display)", "var(--font-geist-sans)", "ui-sans-serif", "system-ui", "sans-serif"],
       },
       boxShadow: {
         card: "0 1px 2px rgba(0,0,0,0.04), 0 1px 1px rgba(0,0,0,0.03)",

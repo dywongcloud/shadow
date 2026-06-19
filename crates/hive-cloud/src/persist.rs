@@ -107,7 +107,7 @@ pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
     std::fs::rename(&tmp, state_path())?;
     // Write per-tenant namespace documents (the multi-tenant schema partition).
     let _ = save_namespaces(snap);
-    #[cfg(feature = "guardian")]
+    // Replicate into the always-on GuardianDB (durable + peer-replicated copy).
     crate::guardian::replicate(snap);
     Ok(())
 }
@@ -240,8 +240,12 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     deployments.sort_by_key(|d| d.created_at_ms);
     let n = deployments.len();
     for rec in deployments {
-        // Only restore deployments whose files still exist on disk.
-        if std::path::Path::new(&rec.root).exists() {
+        // Container deployments run from a pre-built image (podman/Firecracker),
+        // not from files under `root` — their root may be empty or absent, so
+        // never prune them on that basis. Other (static/serverless) deployments
+        // serve from disk, so only restore them if their build output survives.
+        let is_container = rec.manifest.functions.iter().any(|f| f.runtime == "container");
+        if is_container || std::path::Path::new(&rec.root).exists() {
             cloud.gw.restore(rec);
         }
     }

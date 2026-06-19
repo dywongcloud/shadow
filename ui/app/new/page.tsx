@@ -6,7 +6,7 @@ import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, Extern
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
-import { apiSend, usePoll, type Team } from "@/lib/api";
+import { apiSend, usePoll, currentTeam, type Team } from "@/lib/api";
 import { cachedJson } from "@/lib/cache";
 
 interface GhRepo {
@@ -292,7 +292,15 @@ function ConfigureTemplate({
 }) {
   const { data: teams } = usePoll<Team[]>("/v1/teams", 10000);
   const [repoName, setRepoName] = useState(slug(template.name));
-  const [team, setTeam] = useState("personal");
+  // Default the Team field to the team/org the user is CURRENTLY viewing (the
+  // navbar breadcrumb selection) instead of always "personal", and keep it in
+  // sync if they switch the active team while this screen is open.
+  const [team, setTeam] = useState<string>(() => currentTeam());
+  useEffect(() => {
+    const sync = () => setTeam(currentTeam());
+    window.addEventListener("hive-team-changed", sync);
+    return () => window.removeEventListener("hive-team-changed", sync);
+  }, []);
   const [scope] = useState("openedge");
 
   return (

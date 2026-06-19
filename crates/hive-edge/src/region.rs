@@ -50,6 +50,43 @@ pub struct NodeInfo {
     pub disk_total_gb: u64,
 }
 
+/// Classify a geographic coordinate into a continent name. Used to auto-assign a
+/// node's region/zone to the right continent (e.g. a node in Los Angeles → "North
+/// America") for the regions catalog, purely from the lat/lon the node reports —
+/// no hard-coded region tables. Coarse bounding boxes, ordered most-specific
+/// first; good enough to bucket a real node into the correct continent.
+pub fn continent_of(lat: f64, lon: f64) -> &'static str {
+    // Antarctica: everything far south.
+    if lat < -60.0 {
+        return "Antarctica";
+    }
+    // Oceania: Australia / New Zealand / Pacific (south of the equator, east of ~110°E).
+    if lat < 0.0 && lon >= 110.0 && lon <= 180.0 {
+        return "Oceania";
+    }
+    // Europe: includes western Russia; north of the Mediterranean.
+    if lat >= 36.0 && lat <= 72.0 && lon >= -25.0 && lon <= 60.0 {
+        return "Europe";
+    }
+    // Africa + Middle East band below Europe.
+    if lat >= -35.0 && lat < 36.0 && lon >= -20.0 && lon <= 52.0 {
+        return "Africa";
+    }
+    // Asia: east of Europe/Africa.
+    if lon > 52.0 && lon <= 180.0 {
+        return "Asia";
+    }
+    // South America: south of ~13°N in the western hemisphere.
+    if lat < 13.0 && lon >= -82.0 && lon <= -34.0 {
+        return "South America";
+    }
+    // North America: the rest of the western hemisphere.
+    if lon >= -170.0 && lon <= -34.0 {
+        return "North America";
+    }
+    "Other"
+}
+
 pub struct NodeRegistry {
     me: NodeInfo,
     peers: RwLock<HashMap<String, NodeInfo>>,
@@ -196,6 +233,20 @@ mod tests {
         assert_eq!(reg.anycast(Some("sfo1")).unwrap().region, "sfo1");
         // No preference → lowest latency healthy node (self at 0ms).
         assert_eq!(reg.anycast(None).unwrap().id, "self");
+    }
+
+    #[test]
+    fn continent_classification() {
+        assert_eq!(continent_of(34.05, -118.24), "North America"); // Los Angeles
+        assert_eq!(continent_of(38.9, -77.0), "North America"); // Washington, D.C.
+        assert_eq!(continent_of(51.5, -0.1), "Europe"); // London
+        assert_eq!(continent_of(50.1, 8.7), "Europe"); // Frankfurt
+        assert_eq!(continent_of(35.7, 139.7), "Asia"); // Tokyo
+        assert_eq!(continent_of(1.35, 103.8), "Asia"); // Singapore
+        assert_eq!(continent_of(-23.5, -46.6), "South America"); // São Paulo
+        assert_eq!(continent_of(-33.9, 151.2), "Oceania"); // Sydney
+        assert_eq!(continent_of(-1.3, 36.8), "Africa"); // Nairobi
+        assert_eq!(continent_of(-82.0, 0.0), "Antarctica");
     }
 
     #[test]

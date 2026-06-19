@@ -6,12 +6,45 @@
 // always works.
 import "server-only";
 import { randomBytes } from "crypto";
+import { cookies } from "next/headers";
+import { auth } from "@clerk/nextjs/server";
 
 const BASE = "https://backend.composio.dev/api/v3";
 export const GITHUB_SLUG = "github";
 
 export function composioConfigured(): boolean {
   return !!process.env.COMPOSIO_API_KEY;
+}
+
+const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
+
+/**
+ * Resolve the Composio "entity" (user_id) for the current request.
+ *
+ * The entity scopes a user's GitHub connection + repo access. It MUST be stable
+ * for a given user so the connection survives reloads, new tabs and other
+ * devices — otherwise the GitOps modal re-prompts and the repo list comes back
+ * empty even though GitHub is linked.
+ *
+ * - Signed-in (Clerk) user  -> `gh_<clerkUserId>` (stable, per-account).
+ * - Local / no-auth mode    -> the existing `hive_entity` cookie if present,
+ *                              else a single stable `default` entity.
+ *
+ * This replaces the old per-route random `user-<random>` cookie, which differed
+ * between routes (status/connect generated random, repos fell back to "default")
+ * and was lost whenever cookies cleared.
+ */
+export async function resolveEntity(): Promise<string> {
+  if (clerkEnabled) {
+    try {
+      const { userId } = auth();
+      if (userId) return `gh_${userId}`;
+    } catch {
+      /* auth() unavailable (e.g. outside request scope) — fall through */
+    }
+  }
+  const cookieEntity = cookies().get("hive_entity")?.value;
+  return cookieEntity || "default";
 }
 
 function key(): string {

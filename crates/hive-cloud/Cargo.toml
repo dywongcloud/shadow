@@ -35,10 +35,13 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hmac = "0.12"
 sha2 = "0.10"
 sysinfo = "0.32"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
-# Optional: iroh-native, P2P-replicated durable store. Enable with
-# `--features guardian` (its API is evolving, so kept off the default build).
-guardian-db = { version = "0.16", optional = true }
+# Always-on: iroh-native, P2P-replicated durable store (iroh-docs + iroh-blobs).
+# Every platform snapshot is replicated here, in local/dev and production alike.
+guardian-db = { version = "0.16" }
 
 # Optional: production-grade Raft consensus (full log + state machine). The
 # always-on lightweight coordinator in cluster.rs is the default; `--features
@@ -47,5 +50,4 @@ openraft = { version = "0.9", optional = true }
 
 [features]
 default = []
-guardian = ["dep:guardian-db"]
 raft = ["dep:openraft"]

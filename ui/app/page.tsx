@@ -12,6 +12,7 @@ import {
   usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { deploymentHost } from "@/lib/deploy-url";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 type View = "grid" | "list";
@@ -281,7 +282,7 @@ function RecentPreviewsBox({ deps }: { deps: Deployment[] }) {
                 <Triangle className="h-7 w-7 shrink-0" />
                 <div className="min-w-0 flex-1">
                   <div className="truncate font-medium">{d.project}</div>
-                  <div className="truncate text-xs text-muted">{d.alias}</div>
+                  <div className="truncate text-xs text-muted">{deploymentHost(d.alias)}</div>
                 </div>
                 <span className="shrink-0 text-xs text-muted">{timeAgo(d.created_at_ms)} ago</span>
               </Link>
@@ -391,7 +392,7 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
             <Triangle />
             <div className="min-w-0">
               <div className="truncate font-semibold">{p.project}</div>
-              <div className="truncate text-sm text-secondary">{p.alias}</div>
+              <div className="truncate text-sm text-secondary">{deploymentHost(p.alias)}</div>
             </div>
           </div>
           <div className="pointer-events-auto z-20 flex shrink-0 items-center gap-1">
@@ -443,7 +444,7 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChan
         <Triangle />
         <div className="min-w-0 shrink-0 basis-52">
           <div className="truncate font-semibold">{p.project}</div>
-          <div className="truncate text-xs text-secondary">{p.alias}</div>
+          <div className="truncate text-xs text-secondary">{deploymentHost(p.alias)}</div>
         </div>
         <div className="hidden min-w-0 flex-1 md:block">
           {hasGit ? (

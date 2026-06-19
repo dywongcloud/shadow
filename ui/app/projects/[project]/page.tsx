@@ -21,6 +21,7 @@ import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
 import { ProjectWorkflows } from "@/components/workflows";
 import { DeploymentResources } from "@/components/deployment-resources";
+import { DeploymentRowMenu } from "@/components/deployment-menu";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -37,6 +38,7 @@ const ServiceGraph = dynamic(
 );
 import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
 export default function ProjectDetail({ params }: { params: { project: string } }) {
   const name = decodeURIComponent(params.project);
@@ -102,8 +104,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
               <h1 className="text-xl font-semibold">{name}</h1>
             </div>
             {prod && (
-              <a className="text-sm text-link hover:underline" href={`http://${prod.alias}:8787/`}>
-                {prod.alias} <ExternalLink className="inline h-3 w-3" />
+              <a className="text-sm text-link hover:underline" href={deploymentUrl(prod.alias)} target="_blank" rel="noreferrer">
+                {deploymentHost(prod.alias)} <ExternalLink className="inline h-3 w-3" />
               </a>
             )}
           </div>
@@ -118,7 +120,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           <Button variant="danger" onClick={deleteProject} disabled={busy === "project"}>
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
-          <a href={prod ? `http://${prod.alias}:8787/` : "#"} target="_blank" rel="noreferrer">
+          <a href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer">
             <Button>Visit</Button>
           </a>
         </div>
@@ -180,8 +182,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 </div>
                 <div>
                   <div className="text-muted">Domains</div>
-                  <a className="text-link hover:underline" href={prod ? `http://${prod.alias}:8787/` : "#"}>
-                    {prod?.alias ?? "—"} <ExternalLink className="inline h-3 w-3" />
+                  <a className="text-link hover:underline" href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer">
+                    {prod ? deploymentHost(prod.alias) : "—"} <ExternalLink className="inline h-3 w-3" />
                   </a>
                 </div>
                 <div className="flex gap-12">
@@ -254,16 +256,11 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         </>
       ) : (
         <div className="space-y-3">
-        {/* Deployments toolbar: create / redeploy / instant rollback */}
+        {/* Deployments toolbar: per-deployment actions (rollback / redeploy / delete)
+            now live in the "⋯" menu at the end of each row. */}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-secondary">{mine.length} deployment{mine.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
-              <RotateCcw className="h-4 w-4" /> Instant Rollback
-            </Button>
-            <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
-              {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
-            </Button>
             <Link href={`/new?repo=${encodeURIComponent(prod?.git?.repo_url ?? "")}`}>
               <Button><Plus className="h-4 w-4" /> New Deployment</Button>
             </Link>
@@ -271,44 +268,37 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         </div>
         <Table>
           <thead>
-            <tr><Th>Deployment</Th><Th>Status</Th><Th>Environment</Th><Th>Source</Th><Th>Created</Th><Th>By</Th><Th></Th></tr>
+            <tr><Th className="px-2">Deployment</Th><Th className="px-2">Status</Th><Th className="px-2">Environment</Th><Th className="px-2">Source</Th><Th className="px-2">Created</Th><Th className="px-2">By</Th><Th className="px-2"></Th></tr>
           </thead>
           <tbody>
             {mine.map((d) => (
               <tr key={d.id}>
-                <Td className="font-mono text-xs">{d.id}</Td>
-                <Td>
+                <Td className="px-2 font-mono text-xs">{d.id}</Td>
+                <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">
                     <span className={`h-2 w-2 rounded-full ${d.state === "ready" ? "bg-green" : d.state === "building" ? "bg-amber-400" : "bg-red-400"}`} />
                     {d.state}
                   </span>
                 </Td>
-                <Td>{d.production ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}</Td>
-                <Td className="font-mono text-xs text-secondary">
+                <Td className="px-2">{d.production ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}</Td>
+                <Td className="px-2 font-mono text-xs text-secondary">
                   {d.git ? (
                     <span className="inline-flex items-center gap-1"><Code2 className="h-3.5 w-3.5" /> {d.git.branch} {d.git.commit}</span>
                   ) : (
                     <span className="inline-flex items-center gap-1"><Terminal className="h-3.5 w-3.5" /> hive deploy</span>
                   )}
                 </Td>
-                <Td className="text-secondary">{timeAgo(d.created_at_ms)} ago</Td>
-                <Td className="text-secondary">{d.creator}</Td>
-                <Td>
-                  <div className="flex items-center justify-end gap-1">
-                    {busy === d.id ? (
-                      <Loader2 className="h-4 w-4 animate-spin text-muted" />
-                    ) : (
-                      <>
-                        {!d.production && (
-                          <button title="Promote to production (rollback)" onClick={() => promote(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RotateCcw className="h-3.5 w-3.5" /></button>
-                        )}
-                        {d.git && (
-                          <button title="Redeploy from git" onClick={redeploy} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-fg"><RefreshCw className="h-3.5 w-3.5" /></button>
-                        )}
-                        <button title="Delete deployment" onClick={() => removeDeployment(d.id)} className="flex h-7 w-7 items-center justify-center rounded-md text-secondary hover:bg-subtle hover:text-red-500"><Trash2 className="h-3.5 w-3.5" /></button>
-                      </>
-                    )}
-                  </div>
+                <Td className="px-2 text-secondary">{timeAgo(d.created_at_ms)} ago</Td>
+                <Td className="px-2 text-secondary">{d.creator}</Td>
+                <Td className="px-2">
+                  <DeploymentRowMenu
+                    canRollback={!d.production}
+                    canRedeploy={!!d.git}
+                    busy={busy === d.id}
+                    onRollback={() => promote(d.id)}
+                    onRedeploy={redeploy}
+                    onDelete={() => removeDeployment(d.id)}
+                  />
                 </Td>
               </tr>
             ))}
@@ -368,7 +358,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
 
   if (pv.kind === "image" && pv.url && !imgError) {
     return (
-      <a href={prod ? `http://${prod.alias}:8787/` : "#"} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
+      <a href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={`/cloud${pv.url}`}
@@ -394,7 +384,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
           <span className="flex items-center gap-1.5 text-secondary"><Terminal className="h-3 w-3" /> Service response</span>
           <span className="font-mono text-muted">{pv.content_type?.split(";")[0] || (pv.kind === "json" ? "application/json" : "text/plain")}{pv.status ? ` · ${pv.status}` : ""}</span>
         </div>
-        <pre className="h-[calc(100%-30px)] overflow-auto p-3 font-mono text-[11px] leading-relaxed text-emerald-300/90">{body || "(empty response)"}</pre>
+        <pre className="no-scrollbar h-[calc(100%-30px)] overflow-auto p-3 font-mono text-[11px] leading-relaxed text-emerald-300/90">{body || "(empty response)"}</pre>
       </div>
     );
   }

@@ -17,6 +17,7 @@ import {
 import { Button, Card } from "@/components/ui";
 import { apiGet, type Build } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
 function fmtTime(ms: number) {
   const d = new Date(ms);
@@ -298,7 +299,7 @@ export default function DeployPage({ params }: { params: { id: string } }) {
           </div>
           {ready && build?.alias ? (
             <div className="flex shrink-0 gap-2">
-              <a href={`http://${build.alias}:8787/`} target="_blank" rel="noreferrer">
+              <a href={deploymentUrl(build.alias)} target="_blank" rel="noreferrer">
                 <Button variant="outline" className="whitespace-nowrap">
                   Visit <ExternalLink className="h-3.5 w-3.5" />
                 </Button>
@@ -319,7 +320,7 @@ export default function DeployPage({ params }: { params: { id: string } }) {
 
       {ready && (
         <p className="mt-4 text-center text-sm text-secondary">
-          Tip: open <span className="font-mono">{build?.alias}</span> on port 8787, or continue to the project for logs & settings.
+          Tip: open <span className="font-mono">{deploymentHost(build?.alias)}</span>, or continue to the project for logs &amp; settings.
         </p>
       )}
     </div>

@@ -26,6 +26,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/nodes", get(nodes))
         .route("/v1/serve-hosts", get(serve_hosts))
         .route("/v1/resources", get(resources_get))
+        .route("/v1/leases", get(leases_get))
         .route("/v1/cluster", get(cluster_status))
         .route("/v1/anycast", get(anycast_table))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
@@ -138,6 +139,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/admin/data/:collection", get(data_rows).post(data_create))
         .route("/v1/admin/data/:collection/:id", put(data_patch).delete(data_delete))
         .route("/v1/admin/namespaces", get(data_namespaces))
+        .route("/v1/admin/guardian", get(guardian_status))
         .route("/v1/identity/sync", post(identity_sync))
         // ---- Billing & compute credits ----
         .route("/v1/billing", get(billing_get))
@@ -182,32 +184,37 @@ async fn mint_token(Json(req): Json<TokenReq>) -> Result<Json<Value>, (StatusCod
 
 // ---- Project settings (env vars, build config, function settings) ----
 
+/// The function-region catalog is built **from the live mesh** — the actual
+/// regions in which P2P nodes report their longitude/latitude. Each region is
+/// auto-assigned to its real continent (from lat/lon), so a node in Los Angeles
+/// appears under "North America". No hard-coded region table.
 async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    let mut cat = crate::project_settings::region_catalog();
-    // Surface the live mesh nodes' AUTO-DETECTED real-world locations as selectable
-    // regions, so a project can run functions on the actual nodes in the network.
-    let live: Vec<Value> = c
-        .registry
-        .nodes()
-        .into_iter()
-        .filter_map(|n| {
-            let city = n.city.clone()?;
-            let country = n.country.clone()?;
-            Some(json!({
-                "id": n.region,
-                "label": format!("{city}, {country} · {}", n.name),
-                "aws": "self-hosted",
-                "lat": n.lat,
-                "lon": n.lon,
-            }))
-        })
-        .collect();
-    if !live.is_empty() {
-        if let Some(obj) = cat.as_object_mut() {
-            obj.insert("Your Network (detected)".to_string(), json!(live));
-        }
+    use std::collections::BTreeMap;
+    // continent -> (region id -> entry). Dedupe a region across co-located nodes,
+    // counting how many nodes back it.
+    let mut by_continent: BTreeMap<String, BTreeMap<String, Value>> = BTreeMap::new();
+    for n in c.registry.nodes() {
+        let continent = match (n.lat, n.lon) {
+            (Some(lat), Some(lon)) => hive_edge::continent_of(lat, lon).to_string(),
+            _ => "Unknown".to_string(),
+        };
+        let label = match (&n.city, &n.country) {
+            (Some(city), Some(country)) => format!("{city}, {country}"),
+            (Some(city), None) => city.clone(),
+            _ => n.region.clone(),
+        };
+        let regions = by_continent.entry(continent).or_default();
+        let entry = regions.entry(n.region.clone()).or_insert_with(|| {
+            json!({ "id": n.region, "label": label, "aws": "", "lat": n.lat, "lon": n.lon, "nodes": 0 })
+        });
+        let count = entry.get("nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+        entry["nodes"] = json!(count + 1);
     }
-    Json(cat)
+    let out: serde_json::Map<String, Value> = by_continent
+        .into_iter()
+        .map(|(continent, regions)| (continent, json!(regions.into_values().collect::<Vec<_>>())))
+        .collect();
+    Json(json!(out))
 }
 
 async fn project_settings_get(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
@@ -576,7 +583,16 @@ async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
         "region": c.region,
         "gateway": c.public_base,
         "hosts": c.gw.served_hosts(),
+        // Container deployments this node holds → feeds mesh lease election.
+        "containers": c.gw.container_projects(),
     }))
+}
+
+/// Current container placement leases across the mesh (owner + fencing epoch +
+/// expiry). The single owner of each stateful container, for visibility + the
+/// edge router (container requests go to the owner).
+async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.leases.list()))
 }
 
 /// REAL cluster resource accounting: this node's live CPU/mem/disk/network usage
@@ -676,6 +692,9 @@ async fn dep_create(
     Json(req): Json<fluid_core::DeployRequest>,
 ) -> Json<Value> {
     let info = c.gw.deploy(req.root, req.manifest);
+    // Persist so the deployment survives a node restart (without this it lived
+    // only in memory and was lost on reboot).
+    crate::persist::persist(&c);
     Json(json!(info))
 }
 
@@ -2327,6 +2346,32 @@ async fn data_namespaces(State(c): State<Arc<CloudState>>) -> Json<Value> {
         })
         .collect();
     Json(json!({ "namespaces": rows }))
+}
+
+/// Live status of the always-on GuardianDB durable store: the keys currently
+/// held in the iroh-docs `hive-state` KV (one per tenant namespace) plus a
+/// content sample proving data round-trips through the replicated store — not a
+/// mock. `online` is true once the iroh-backed store has opened.
+async fn guardian_status() -> Json<Value> {
+    let mut keys = crate::guardian::keys().await;
+    keys.sort();
+    // Round-trip the first key to prove reads come back from GuardianDB itself.
+    let sample = match keys.first() {
+        Some(k) => crate::guardian::get(k)
+            .await
+            .map(|b| json!({ "key": k, "bytes": b.len() }))
+            .unwrap_or(Value::Null),
+        None => Value::Null,
+    };
+    Json(json!({
+        "store": "guardian-db",
+        "engine": "iroh-docs (BLAKE3 · QUIC · Willow reconciliation)",
+        "kv": "hive-state",
+        "online": !keys.is_empty(),
+        "key_count": keys.len(),
+        "keys": keys,
+        "sample": sample,
+    }))
 }
 
 async fn data_collections(State(c): State<Arc<CloudState>>) -> Json<Value> {

@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { cookies } from "next/headers";
-import { composioConfigured, githubStatus, commitFiles } from "@/lib/composio";
+import { composioConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/composio";
 import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
@@ -16,9 +15,7 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   if (!composioConfigured()) return NextResponse.json({ skipped: true, reason: "composio-not-configured" });
   const team = (await req.json().catch(() => ({})))?.team || req.headers.get("x-hive-team") || "personal";
-  const entity = cookies().get("hive_entity")?.value;
-  if (!entity) return NextResponse.json({ skipped: true, reason: "no-entity" });
-
+  const entity = await resolveEntity();
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
 

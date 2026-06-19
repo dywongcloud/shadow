@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 
 // Public routes (no auth required): sign-in/up + the node API proxy + static.
 const isPublic = createRouteMatcher([
+  "/", // public Shadow landing (the dashboard renders here only when signed in)
   "/sign-in(.*)",
   "/sign-up(.*)",
   "/cloud(.*)", // dashboard <-> node admin API proxy

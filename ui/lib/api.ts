@@ -251,6 +251,11 @@ export interface RegionEntry {
   id: string;
   label: string;
   aws: string;
+  /** Real geographic coordinates of the region (from the node that backs it). */
+  lat?: number | null;
+  lon?: number | null;
+  /** How many live nodes back this region. */
+  nodes?: number;
 }
 export type RegionCatalog = Record<string, RegionEntry[]>;
 

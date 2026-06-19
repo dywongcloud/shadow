@@ -1,47 +1,131 @@
-//! guardian-db backend (cargo feature `guardian`).
+//! GuardianDB backend — **always on**, in local/dev and production alike.
 //!
-//! [guardian-db] is an iroh-native, OrbitDB-style content-addressed store. When
-//! the `guardian` feature is on, we replicate each platform snapshot into a
-//! guardian-db document store keyed by node so state propagates across the iroh
-//! P2P mesh. The local file snapshot ([`crate::persist`]) remains the bootstrap
-//! source of truth; guardian-db adds durable, peer-replicated copies.
+//! [guardian-db] is an iroh-native, content-addressed store (iroh-docs +
+//! iroh-blobs, BLAKE3, QUIC). Every platform snapshot is written into a real
+//! GuardianDB key/value store: persisted on disk under `$HIVE_DATA/guardian` and
+//! replicated across the iroh mesh via Willow range-based reconciliation. This is
+//! NOT a mock — it is the durable, peer-replicated copy of platform state.
 //!
-//! The crate's API is still evolving, so this lives behind a feature flag and is
-//! intentionally best-effort (failures are logged, never fatal).
+//! The local file snapshot ([`crate::persist`]) remains the bootstrap source of
+//! truth for fast cold start; GuardianDB adds durability + replication on top.
+//! Init and writes are best-effort: any failure is logged and never breaks the
+//! request path or the on-disk snapshot, so a node always boots and serves.
+//!
+//! State is partitioned by **tenant namespace** ([`crate::persist::namespaced`])
+//! and each namespace is stored under its own key (`ns/<namespace>/state`), so
+//! every org/team's projects, deployments and databases stay scoped and isolated
+//! in the replicated store — never commingled in one global blob.
 //!
 //! [guardian-db]: https://github.com/wmaslonek/guardian-db
 
-#![cfg(feature = "guardian")]
+use std::sync::Arc;
+
+use guardian_db::guardian::core::NewGuardianDBOptions;
+use guardian_db::guardian::error::GuardianError;
+use guardian_db::guardian::GuardianDB;
+use guardian_db::p2p::network::client::IrohClient;
+use guardian_db::p2p::network::config::ClientConfig;
+use guardian_db::traits::KeyValueStore;
+use tokio::sync::OnceCell;
 
 use crate::persist::PlatformSnapshot;
 
-/// Replicate a snapshot into the guardian-db document store (best-effort).
-///
-/// State is partitioned by **tenant namespace** ([`crate::persist::namespaced`])
-/// and each namespace is replicated under its own document key
-/// (`ns/<namespace>/state`), so every org/team's projects, deployments and
-/// databases are scoped and isolated in the replicated store — not commingled in
-/// one global blob.
+/// Live GuardianDB handle: the database (kept alive so its backend / iroh
+/// endpoint stays running) plus the opened key/value store.
+struct Handle {
+    _db: GuardianDB,
+    kv: Arc<dyn KeyValueStore<Error = GuardianError>>,
+}
+
+static HANDLE: OnceCell<Handle> = OnceCell::const_new();
+
+/// Lazily open (once) the GuardianDB KV store, retrying on a previous failure.
+async fn handle() -> anyhow::Result<&'static Handle> {
+    HANDLE
+        .get_or_try_init(|| async {
+            let dir = crate::persist::data_dir().join("guardian");
+            std::fs::create_dir_all(&dir).ok();
+
+            // Its own iroh endpoint (random UDP port, n0 discovery) — independent
+            // of the request-routing mesh in hive-p2p. Persisted store on disk.
+            let cfg = ClientConfig {
+                data_store_path: Some(dir.join("iroh")),
+                enable_discovery_n0: true,
+                port: 0,
+                ..ClientConfig::default()
+            };
+            let client = IrohClient::new(cfg)
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian iroh client: {e}"))?;
+            let node_id = client.node_id();
+
+            // The database must share the client's iroh backend (its endpoint,
+            // blobs + docs stores) — pass it explicitly in the options.
+            let opts = NewGuardianDBOptions {
+                directory: Some(dir.clone()),
+                backend: Some(client.backend().clone()),
+                ..Default::default()
+            };
+            let db = GuardianDB::new(client, Some(opts))
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian open: {e}"))?;
+            let kv = db
+                .key_value("hive-state", None)
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian kv open: {e}"))?;
+
+            tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
+            Ok::<Handle, anyhow::Error>(Handle { _db: db, kv })
+        })
+        .await
+}
+
+/// Warm the GuardianDB connection at startup so it is live before the first
+/// snapshot. Best-effort and non-blocking; failures are logged.
+pub fn init_background() {
+    tokio::spawn(async move {
+        match handle().await {
+            Ok(h) => tracing::info!(keys = h.kv.all().len(), "GuardianDB online"),
+            Err(e) => tracing::warn!(error = %e, "GuardianDB init failed (snapshot kept on disk); will retry"),
+        }
+    });
+}
+
+/// Replicate a snapshot into GuardianDB, one document per tenant namespace.
+/// Spawned so persistence is never blocked on replication.
 pub fn replicate(snap: &PlatformSnapshot) {
     let docs = crate::persist::namespaced(snap);
     let payloads: Vec<(String, Vec<u8>)> = docs
         .into_iter()
         .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
         .collect();
-    // Spawn so persistence is never blocked on replication.
     tokio::spawn(async move {
+        let h = match handle().await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!(error = %e, "GuardianDB unavailable; snapshot kept on disk only");
+                return;
+            }
+        };
         for (ns, json) in payloads {
-            if let Err(e) = put(&format!("ns/{ns}/state"), json).await {
-                tracing::debug!(namespace = %ns, error = %e, "guardian-db replicate failed");
+            let key = format!("ns/{ns}/state");
+            if let Err(e) = h.kv.put(&key, json).await {
+                tracing::debug!(namespace = %ns, error = %e, "GuardianDB put failed");
             }
         }
     });
 }
 
-async fn put(key: &str, value: Vec<u8>) -> anyhow::Result<()> {
-    // NOTE: guardian-db's document/kv API is wired here. Construction shares the
-    // node's iroh endpoint so replication rides the existing P2P mesh.
-    // Kept minimal + best-effort while the upstream API stabilizes.
-    let _ = (key, value);
-    Ok(())
+/// Read a key back from GuardianDB (the durable, replicated copy).
+pub async fn get(key: &str) -> Option<Vec<u8>> {
+    let h = handle().await.ok()?;
+    h.kv.get(key).await.ok().flatten()
+}
+
+/// Snapshot of all keys currently stored in GuardianDB (durable copy).
+pub async fn keys() -> Vec<String> {
+    match handle().await {
+        Ok(h) => h.kv.all().into_keys().collect(),
+        Err(_) => Vec::new(),
+    }
 }
