@@ -5,6 +5,15 @@ import { NextResponse } from "next/server";
 const isPublic = createRouteMatcher([
   "/", // public Shadow landing (the dashboard renders here only when signed in)
   "/docs(.*)", // public developer documentation
+  // Public marketing pages (landing nav).
+  "/product(.*)",
+  "/solutions(.*)",
+  "/features(.*)",
+  "/pricing(.*)",
+  "/blog(.*)",
+  "/case-studies(.*)",
+  "/contact(.*)",
+  "/privacy(.*)",
   "/offline.html", // PWA offline fallback (precached by the service worker)
   "/sw.js", // service worker
   "/sign-in(.*)",

@@ -10,6 +10,8 @@ import { ThemeProvider } from "@/components/theme-provider";
 import { GitOps } from "@/components/gitops";
 import { CommandBar } from "@/components/command-bar";
 import { PwaRegister } from "@/components/pwa-register";
+import { ZkPreviewAuth } from "@/components/zk-preview-auth";
+import { Toaster } from "@/components/toast";
 
 // Sleek geometric tech typeface for the Shadow brand wordmark + landing.
 const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display", display: "swap" });
@@ -62,6 +64,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     >
       <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
         <PwaRegister />
+        <Toaster />
         <ThemeProvider>
           {/* Dashboard chrome (top nav + footer) is for signed-in users. The
               signed-out landing page renders its own nav/footer full-bleed. In
@@ -87,6 +90,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <SignedIn>
               <GitOps />
               <CommandBar />
+              <ZkPreviewAuth />
             </SignedIn>
           ) : (
             <>

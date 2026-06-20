@@ -10,10 +10,14 @@ import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 export default function GeneralSettings({ params }: { params: { project: string } }) {
   const project = decodeURIComponent(params.project);
   const [dep, setDep] = useState<Deployment | null>(null);
+  const [prodBranch, setProdBranch] = useState<string>("");
 
   useEffect(() => {
     apiGet<Deployment[]>("/deployments")
       .then((all) => setDep(all.find((d) => d.project === project) ?? null))
+      .catch(() => {});
+    apiGet<{ production_branch?: string }>(`/v1/projects/${encodeURIComponent(project)}/settings`)
+      .then((s) => setProdBranch(s?.production_branch || ""))
       .catch(() => {});
   }, [project]);
 
@@ -35,6 +39,10 @@ export default function GeneralSettings({ params }: { params: { project: string 
           <Row
             label="Git"
             value={dep?.git ? <span className="font-mono text-xs">{dep.git.repo_url} @ {dep.git.branch}</span> : <Badge>Not connected</Badge>}
+          />
+          <Row
+            label="Production Branch"
+            value={prodBranch ? <span className="font-mono text-xs">{prodBranch}</span> : "—"}
           />
           <Row label="Last deployed" value={dep ? `${timeAgo(dep.created_at_ms)} ago by ${dep.creator}` : "—"} />
         </div>

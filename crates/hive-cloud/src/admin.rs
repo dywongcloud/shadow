@@ -78,7 +78,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/domains", get(domains_list))
         .route("/v1/domains/:domain", get(domain_get))
         .route("/v1/domains/:domain/records", post(domain_add_record))
-        .route("/v1/domains/:domain/records/:id", delete(domain_delete_record))
+        .route("/v1/domains/:domain/records/:id", delete(domain_delete_record).put(domain_update_record))
+        .route("/v1/domains/:domain/import", post(domain_import_records))
+        .route("/v1/domains/:domain/scan", get(domain_scan_dns))
         .route("/v1/domains/:domain/nameservers", put(domain_set_nameservers))
         .route("/v1/domains/:domain/auto-renew", put(domain_set_auto_renew))
         .route("/v1/domains/:domain/ssl/renew", post(domain_renew_ssl))
@@ -154,9 +156,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/incidents", get(incidents_list).post(incident_open))
         .route("/v1/incidents/:id/updates", post(incident_update))
         .with_state(cloud);
-    // EXPERIMENT: anonymous team/role membership demo (only with `--features zkauth`).
+    // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
-    let app = app.merge(crate::zkauth_demo::routes());
+    let app = app.merge(crate::zkauth::routes());
     app
 }
 
@@ -478,6 +480,197 @@ async fn domain_delete_record(State(c): State<Arc<CloudState>>, headers: HeaderM
     Json(json!({ "deleted": ok }))
 }
 
+/// Edit an existing DNS record (system records are immutable).
+async fn domain_update_record(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path((domain, id)): Path<(String, String)>,
+    Json(r): Json<AddRecordReq>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    let updated = c
+        .domains
+        .update_record(&domain, &id, r.name, r.kind.to_uppercase(), r.value, r.ttl, r.priority, r.comment)
+        .ok_or(StatusCode::NOT_FOUND)?;
+    c.audit.record(&t, "user", "update", "dns_record", &updated.id, &format!("{} {} → {} ({domain})", updated.kind, updated.name, updated.value));
+    crate::persist::persist(&c);
+    Ok(Json(json!(updated)))
+}
+
+#[derive(Deserialize)]
+struct ImportReq {
+    /// Structured records (e.g. from the DNS scanner / record editor).
+    #[serde(default)]
+    records: Vec<AddRecordReq>,
+    /// Raw BIND-style zone text to parse (the "paste your zone file" path).
+    #[serde(default)]
+    zone: String,
+}
+
+/// Bulk-import DNS records — the "migrate existing DNS" flow. Accepts a list of
+/// structured records and/or a pasted BIND-style zone file. Idempotent: exact
+/// duplicates (type+name+value) are skipped.
+async fn domain_import_records(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(domain): Path<String>,
+    Json(req): Json<ImportReq>,
+) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    let mut recs: Vec<crate::dns::DnsRecord> = req
+        .records
+        .into_iter()
+        .map(|r| crate::dns::DnsRecord {
+            id: String::new(),
+            name: r.name,
+            kind: r.kind.to_uppercase(),
+            value: r.value,
+            ttl: r.ttl,
+            priority: r.priority,
+            comment: r.comment,
+            created_ms: 0,
+            system: false,
+        })
+        .collect();
+    if !req.zone.trim().is_empty() {
+        recs.extend(parse_zone(&req.zone, &domain));
+    }
+    let added = c.domains.import_records(&domain, recs);
+    if !added.is_empty() {
+        c.audit.record(&t, "user", "import", "dns_record", &domain, &format!("imported {} record(s)", added.len()));
+        crate::persist::persist(&c);
+    }
+    Json(json!({ "imported": added.len(), "records": added }))
+}
+
+/// Detect a domain's CURRENT public DNS records (via DNS-over-HTTPS) so a user can
+/// migrate them into the console with one click. Best-effort: returns whatever
+/// resolves. Records are NOT added — the client imports the ones it wants.
+async fn domain_scan_dns(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(domain): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers);
+    c.domains.ensure(&domain, &t);
+    let mut found: Vec<Value> = Vec::new();
+    // (query host suffix, record type) — apex + a few common subdomains.
+    let queries: &[(&str, &str)] = &[
+        ("", "A"), ("", "AAAA"), ("", "MX"), ("", "TXT"), ("", "NS"), ("", "CAA"),
+        ("www", "CNAME"), ("www", "A"),
+    ];
+    for (sub, qtype) in queries {
+        let qname = if sub.is_empty() { domain.clone() } else { format!("{sub}.{domain}") };
+        let url = format!("https://cloudflare-dns.com/dns-query?name={qname}&type={qtype}");
+        let resp = c
+            .http
+            .get(&url)
+            .header("accept", "application/dns-json")
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await;
+        let Ok(resp) = resp else { continue };
+        let Ok(v) = resp.json::<Value>().await else { continue };
+        let Some(ans) = v.get("Answer").and_then(|a| a.as_array()) else { continue };
+        for a in ans {
+            let rtype = a.get("type").and_then(|x| x.as_u64()).unwrap_or(0);
+            let kind = dns_type_name(rtype);
+            if kind != *qtype {
+                continue; // skip e.g. CNAME chains returned for an A query
+            }
+            let raw = a.get("data").and_then(|x| x.as_str()).unwrap_or("").trim().trim_end_matches('.').to_string();
+            if raw.is_empty() {
+                continue;
+            }
+            let ttl = a.get("TTL").and_then(|x| x.as_u64()).unwrap_or(3600) as u32;
+            // MX (and SRV) prefix a numeric priority in the data field.
+            let (priority, value) = if (kind == "MX" || kind == "SRV") && raw.split_whitespace().count() >= 2 {
+                let mut it = raw.splitn(2, char::is_whitespace);
+                let p = it.next().unwrap_or("").parse::<u32>().ok();
+                (p, it.next().unwrap_or("").trim().trim_end_matches('.').to_string())
+            } else {
+                (None, raw.clone())
+            };
+            // Don't suggest records we already have, or shadw's own anycast.
+            found.push(json!({
+                "name": *sub,
+                "type": kind,
+                "value": value,
+                "ttl": ttl,
+                "priority": priority,
+            }));
+        }
+    }
+    // De-dupe identical suggestions.
+    found.dedup_by(|a, b| a.to_string() == b.to_string());
+    Json(json!({ "domain": domain, "records": found }))
+}
+
+/// DoH numeric record type → name (the subset we surface).
+fn dns_type_name(t: u64) -> &'static str {
+    match t {
+        1 => "A",
+        2 => "NS",
+        5 => "CNAME",
+        15 => "MX",
+        16 => "TXT",
+        28 => "AAAA",
+        33 => "SRV",
+        257 => "CAA",
+        _ => "",
+    }
+}
+
+/// Tolerant BIND-style zone parser for the "paste your zone file" import. Handles
+/// lines like `www 3600 IN A 76.76.21.21`, `@ IN MX 10 mail.example.com`, and the
+/// minimal `www A 1.2.3.4`. Unknown/blank/comment lines are skipped.
+fn parse_zone(text: &str, domain: &str) -> Vec<crate::dns::DnsRecord> {
+    const TYPES: &[&str] = &["A", "AAAA", "CNAME", "ALIAS", "MX", "TXT", "CAA", "NS", "SRV"];
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.split(';').next().unwrap_or("").trim(); // strip ; comments
+        if line.is_empty() {
+            continue;
+        }
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        // Find the record TYPE token; everything before is name/ttl/class, after is value.
+        let Some(ti) = toks.iter().position(|t| TYPES.contains(&t.to_uppercase().as_str())) else { continue };
+        let kind = toks[ti].to_uppercase();
+        // name = first token if it isn't a ttl/class keyword, else apex.
+        let mut name = String::new();
+        if ti > 0 {
+            let first = toks[0];
+            if !first.eq_ignore_ascii_case("IN") && first.parse::<u32>().is_err() {
+                name = if first == "@" { String::new() } else { first.trim_end_matches(&format!(".{domain}")).trim_end_matches('.').to_string() };
+            }
+        }
+        // ttl = a numeric token before the type, if any.
+        let ttl = toks[..ti].iter().find_map(|t| t.parse::<u32>().ok()).unwrap_or(3600);
+        let rest: Vec<&str> = toks[ti + 1..].to_vec();
+        if rest.is_empty() {
+            continue;
+        }
+        let (priority, value) = if (kind == "MX" || kind == "SRV") && rest.len() >= 2 && rest[0].parse::<u32>().is_ok() {
+            (rest[0].parse::<u32>().ok(), rest[1..].join(" "))
+        } else {
+            (None, rest.join(" "))
+        };
+        let value = value.trim().trim_matches('"').trim_end_matches('.').to_string();
+        if value.is_empty() {
+            continue;
+        }
+        out.push(crate::dns::DnsRecord {
+            id: String::new(),
+            name,
+            kind,
+            value,
+            ttl,
+            priority,
+            comment: "Imported".into(),
+            created_ms: 0,
+            system: false,
+        });
+    }
+    out
+}
+
 #[derive(Deserialize)]
 struct NameserversReq {
     nameservers: Vec<String>,
@@ -752,19 +945,39 @@ async fn project_delete(State(c): State<Arc<CloudState>>, Path(project): Path<St
     Json(json!({ "project": project, "removed_deployments": ids }))
 }
 
+/// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
+/// a bare `{}` still works). `target` chooses the environment (production /
+/// preview); `use_cache` toggles the existing build cache.
+#[derive(Deserialize, Default)]
+struct RedeployBody {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default = "default_true_b")]
+    use_cache: bool,
+}
+
 /// Redeploy a project's newest git source (create a fresh deployment).
 async fn project_redeploy(
     State(c): State<Arc<CloudState>>,
     Path(project): Path<String>,
+    Json(body): Json<RedeployBody>,
 ) -> Result<Json<Value>, StatusCode> {
     let git = c.gw.git_for_project(&project).ok_or(StatusCode::NOT_FOUND)?;
     let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+    // Environment chosen in the modal: "production" | "preview". When absent the
+    // branch decides (Vercel's classification).
+    let target = body
+        .target
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| t == "production" || t == "preview");
     let req = fluid_core::GitDeployRequest {
         repo_url: git.repo_url,
         branch: Some(git.branch).filter(|b| !b.is_empty()),
         project: Some(project),
         creator: Some("you".into()),
         production: true,
+        target,
+        use_cache: body.use_cache,
         root_dir,
         env: None, // redeploy: existing project env is read from the store at build time
     };
@@ -884,25 +1097,33 @@ async fn git_webhook(
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad json: {e}")))?;
 
     // Extract the repo + branch + head commit, supporting `push` and
-    // `pull_request` (opened/synchronize/closed-merged) events.
+    // `pull_request` (opened/synchronize/reopened/closed) events. The deploy
+    // TARGET follows Vercel's model: a PR always builds a PREVIEW; a push is
+    // classified per-project from its branch (None => the production branch wins).
     let repo_full = payload["repository"]["full_name"].as_str().unwrap_or("").to_string();
-    let mut production = true;
+    let mut target: Option<String> = None;
+    let mut pr_number: Option<u64> = None;
     let (branch, commit) = match event.as_str() {
         "pull_request" => {
             let action = payload["action"].as_str().unwrap_or("");
-            let merged = payload["pull_request"]["merged"].as_bool().unwrap_or(false);
-            // Merged PR -> production; opened/synchronize -> preview deploy.
-            production = action == "closed" && merged;
-            if action == "closed" && !merged {
-                return Ok(Json(json!({ "ignored": "pr closed without merge" })));
+            // A closed PR has nothing to (re)build. A merge fires a separate push
+            // to the base branch, which is what produces the production deployment.
+            if action == "closed" {
+                return Ok(Json(json!({ "ignored": "pr closed" })));
             }
+            // opened / synchronize / reopened / ready_for_review -> preview.
+            target = Some("preview".into());
+            pr_number = payload["number"].as_u64().or_else(|| payload["pull_request"]["number"].as_u64());
             let head_ref = payload["pull_request"]["head"]["ref"].as_str().unwrap_or("").to_string();
             let sha = payload["pull_request"]["head"]["sha"].as_str().unwrap_or("").to_string();
             (head_ref, sha)
         }
         "ping" => return Ok(Json(json!({ "pong": true }))),
         _ => {
-            // push event
+            // push event -> classified from the branch at build time.
+            if payload["deleted"].as_bool().unwrap_or(false) {
+                return Ok(Json(json!({ "ignored": "branch deleted" })));
+            }
             let r = payload["ref"].as_str().unwrap_or("");
             let branch = r.rsplit('/').next().unwrap_or("").to_string();
             let sha = payload["after"].as_str().unwrap_or("").to_string();
@@ -915,38 +1136,45 @@ async fn git_webhook(
     }
     let want = crate::gitops::norm_repo(&repo_full);
 
-    // Find every existing project (with at least one deployment) whose git source
-    // points at this repo, and redeploy the ones on the pushed branch.
+    // Deploy every project pointing at this repo for the pushed/PR branch. We do
+    // NOT filter by branch: a push to a non-production branch (or a PR) is exactly
+    // how preview deployments are created — the branch decides production vs
+    // preview at build time (or `target` forces a preview for PRs).
     let mut triggered = Vec::new();
     for (project, _settings) in c.projects.snapshot() {
         let Some(git) = c.gw.git_for_project(&project) else { continue };
         if crate::gitops::norm_repo(&git.repo_url) != want {
             continue;
         }
-        // If we know the project's branch, only redeploy when it matches the push.
-        if !branch.is_empty() && !git.branch.is_empty() && git.branch != branch {
-            continue;
-        }
+        let deploy_branch = if branch.is_empty() { git.branch.clone() } else { branch.clone() };
         let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
         let req = fluid_core::GitDeployRequest {
             repo_url: git.repo_url.clone(),
-            branch: Some(if branch.is_empty() { git.branch.clone() } else { branch.clone() }).filter(|b| !b.is_empty()),
+            branch: Some(deploy_branch).filter(|b| !b.is_empty()),
             project: Some(project.clone()),
             creator: Some("github".into()),
-            production,
+            production: true, // legacy field; classification uses `target`/branch
+            target: target.clone(),
+            use_cache: true, // git push redeploy: reuse the warm dependency cache
             root_dir,
             env: None, // git push redeploy: env comes from the project store
         };
         let build_id = crate::git::start_build(c.clone(), req);
-        let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github push {} @ {}", want, &commit.chars().take(7).collect::<String>()));
+        let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));
         c.record(ev);
-        triggered.push(json!({ "project": project, "build_id": build_id, "production": production }));
+        triggered.push(json!({
+            "project": project,
+            "build_id": build_id,
+            "target": target.clone().unwrap_or_else(|| "auto".into()),
+            "branch": branch,
+        }));
     }
 
     Ok(Json(json!({
         "repo": want,
         "branch": branch,
         "event": event,
+        "pr": pr_number,
         "triggered": triggered.len(),
         "builds": triggered,
     })))
@@ -2610,4 +2838,43 @@ fn thumbnail_placeholder(project: &str) -> String {
   <text x="640" y="548" fill="#888" font-family="sans-serif" font-size="22" text-anchor="middle">Deployed on OpenEdge</text>
 </svg>"##
     )
+}
+
+#[cfg(test)]
+mod dns_import_tests {
+    use super::parse_zone;
+
+    #[test]
+    fn parses_bind_style_records() {
+        let zone = r#"
+; example zone
+@        3600  IN  A      76.76.21.21
+www      3600  IN  CNAME  app.example.com.
+@              IN  MX     10 mail.example.com.
+mail           IN  A      1.2.3.4
+@        3600  IN  TXT    "v=spf1 include:_spf.example.com ~all"
+sub      A      9.9.9.9
+"#;
+        let recs = parse_zone(zone, "example.com");
+        // apex A
+        assert!(recs.iter().any(|r| r.kind == "A" && r.name.is_empty() && r.value == "76.76.21.21"));
+        // www CNAME (trailing dot stripped)
+        assert!(recs.iter().any(|r| r.kind == "CNAME" && r.name == "www" && r.value == "app.example.com"));
+        // MX with priority
+        let mx = recs.iter().find(|r| r.kind == "MX").expect("mx");
+        assert_eq!(mx.priority, Some(10));
+        assert_eq!(mx.value, "mail.example.com");
+        // TXT keeps content (quotes stripped)
+        assert!(recs.iter().any(|r| r.kind == "TXT" && r.value.contains("v=spf1")));
+        // minimal "name TYPE value" form
+        assert!(recs.iter().any(|r| r.kind == "A" && r.name == "sub" && r.value == "9.9.9.9"));
+    }
+
+    #[test]
+    fn skips_blank_and_comment_and_unknown_lines() {
+        let zone = "; just a comment\n\nfoo bar baz\n@ IN A 1.1.1.1\n";
+        let recs = parse_zone(zone, "x.com");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].value, "1.1.1.1");
+    }
 }

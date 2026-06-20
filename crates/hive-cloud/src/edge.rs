@@ -70,6 +70,13 @@ pub async fn edge_pipeline(
         return next.run(req).await;
     }
 
+    // EXPERIMENT (feature `zkauth`): anonymous preview-access bootstrap. Verifies
+    // a membership proof and drops a short-lived access cookie, then redirects.
+    #[cfg(feature = "zkauth")]
+    if path.starts_with("/_shadw/zk") {
+        return crate::zkauth::bootstrap(&cloud, &host, &query);
+    }
+
     // ---- Cross-node mesh routing ------------------------------------------------
     // If this node doesn't host the requested deployment but a peer in the mesh
     // does, reverse-proxy the request to the best peer: same-region first, then
@@ -114,9 +121,10 @@ pub async fn edge_pipeline(
             let (_parts, body) = req.into_parts();
             let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
 
-            // For the iroh transport: this node's endpoint + a map of peer node id
-            // -> its gossiped iroh dial address. Headers forwarded over the tunnel.
-            let iroh_self = cloud.iroh.read().clone();
+            // For the iroh transport: the pooled mesh client (reuses one QUIC
+            // connection per peer) + a map of peer node id -> its gossiped iroh dial
+            // address. Headers forwarded over the tunnel.
+            let mesh = cloud.mesh.read().clone();
             let node_iroh: std::collections::HashMap<String, String> = cloud
                 .registry
                 .nodes()
@@ -136,8 +144,8 @@ pub async fn edge_pipeline(
             for cand in &cands {
                 // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
                 // works across NATs. Fall through to HTTP on any failure.
-                if let (Some(ep), Some(addr_json)) = (&iroh_self, node_iroh.get(&cand.node_id)) {
-                    match hive_p2p::dial_request(ep, addr_json, &method, &path_q, fwd_headers.clone(), &body_bytes).await {
+                if let (Some(pool), Some(addr_json)) = (&mesh, node_iroh.get(&cand.node_id)) {
+                    match pool.request(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
                         Ok(tr) => {
                             let mut builder = Response::builder().status(tr.status);
                             for (k, v) in &tr.headers {
@@ -488,6 +496,14 @@ fn preview_gate(
     }
     let team = cloud.projects.team_of(&project);
     if has_preview_access(headers, &team) {
+        return None;
+    }
+    // EXPERIMENT (feature `zkauth`): opt-in anonymous membership access. Honour a
+    // valid ZK access cookie (dropped by the bootstrap after verifying a proof),
+    // so a member can view a protected preview without revealing identity to this
+    // (possibly peer) node. Additive — falls through to the 401 below if absent.
+    #[cfg(feature = "zkauth")]
+    if crate::zkauth::cookie_access(&project, headers) {
         return None;
     }
     let ev = cloud.event(region, method, host, path, 401, "preview-protected", &project);

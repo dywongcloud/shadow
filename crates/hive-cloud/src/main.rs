@@ -30,7 +30,7 @@ mod resources;
 mod secrets;
 mod securelink;
 #[cfg(feature = "zkauth")]
-mod zkauth_demo;
+mod zkauth;
 mod state;
 mod teams;
 mod webhooks;
@@ -233,6 +233,9 @@ async fn main() -> anyhow::Result<()> {
     // right local deployment). This makes deployments reachable over QUIC across NATs.
     if let Some(ep) = iroh_ep.clone() {
         *cloud.iroh.write() = Some(ep.clone());
+        // Pooled cross-node transport: reuse one QUIC connection per peer, a new
+        // stream per request (built here, alongside the endpoint it dials with).
+        *cloud.mesh.write() = Some(hive_p2p::PeerPool::new(ep.clone()));
         let gateway_addr = args.listen.to_string();
         tokio::spawn(hive_p2p::serve_tunnels(ep, gateway_addr, 256));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections");

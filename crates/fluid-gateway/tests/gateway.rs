@@ -201,6 +201,7 @@ async fn restore_prefers_production_deployment_for_alias() {
         creator: "you".into(),
         git: None,
         production,
+        target: if production { "production".into() } else { "preview".into() },
         state: fluid_core::DeployState::Ready,
     };
 
@@ -219,4 +220,107 @@ async fn restore_prefers_production_deployment_for_alias() {
     // Per-deployment preview URLs still resolve each exact deployment.
     assert_eq!(gw.host_deployment_id("dpl-old.localhost").as_deref(), Some("dpl-old"));
     assert_eq!(gw.host_deployment_id("dpl-new.localhost").as_deref(), Some("dpl-new"));
+}
+
+fn test_gw() -> Arc<Gateway> {
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("gw-alias-{}-{:p}", std::process::id(), &0u8)),
+        provision_latency: Duration::from_millis(1),
+        cache_root: std::env::temp_dir().join(format!("gw-alias-cache-{}", std::process::id())),
+    }));
+    let fluid = Fluid::start(backend, FluidConfig::default());
+    Gateway::new(fluid, "default".into())
+}
+
+fn git(branch: &str, commit: &str) -> fluid_core::GitSource {
+    fluid_core::GitSource {
+        repo_url: "https://github.com/acme/app".into(),
+        branch: branch.into(),
+        commit: commit.into(),
+        commit_message: "msg".into(),
+    }
+}
+
+/// Vercel's 3 URL types: a production deploy must be reachable at the production
+/// domain (`app`), the immutable commit URL (`app-<sha>`), the branch URL
+/// (`app-git-<branch>`) and its per-deployment id URL — all at once.
+#[tokio::test]
+async fn deploy_assigns_commit_branch_and_production_urls() {
+    let gw = test_gw();
+    let m = Manifest { project: "app".into(), ..Default::default() };
+    let info = gw.deploy_full("/nonexistent".into(), m, "you".into(), Some(git("main", "abc1234def")), true, fluid_core::DeployState::Ready);
+    let id = info.id.to_string();
+
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(id.as_str()), "production domain");
+    assert_eq!(gw.host_deployment_id("app-abc1234.localhost").as_deref(), Some(id.as_str()), "commit URL (short sha)");
+    assert_eq!(gw.host_deployment_id("app-git-main.localhost").as_deref(), Some(id.as_str()), "branch URL");
+    assert_eq!(gw.host_deployment_id(&format!("{id}.localhost")).as_deref(), Some(id.as_str()), "per-deployment id URL");
+}
+
+/// A PREVIEW deploy (non-production branch) must get its own commit + branch URLs
+/// but must NOT steal the production domain from the live production deployment.
+#[tokio::test]
+async fn preview_deploy_does_not_hijack_production_domain() {
+    let gw = test_gw();
+    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "aaaaaaa")), true, fluid_core::DeployState::Ready);
+    let prod_id = prod.id.to_string();
+    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("feature/login", "bbbbbbb")), false, fluid_core::DeployState::Ready);
+    let prev_id = prev.id.to_string();
+
+    // Production domain stays on the production deployment.
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(prod_id.as_str()), "preview must not hijack prod");
+    // Each has its own immutable + branch URLs (branch name slugified).
+    assert_eq!(gw.host_deployment_id("app-git-main.localhost").as_deref(), Some(prod_id.as_str()));
+    assert_eq!(gw.host_deployment_id("app-git-feature-login.localhost").as_deref(), Some(prev_id.as_str()));
+    assert_eq!(gw.host_deployment_id("app-bbbbbbb.localhost").as_deref(), Some(prev_id.as_str()));
+}
+
+/// The branch URL must always track the LATEST deployment on that branch (a new
+/// commit on `main` re-points `app-git-main` while old commit URLs stay pinned).
+#[tokio::test]
+async fn branch_url_tracks_latest_commit_on_branch() {
+    let gw = test_gw();
+    let d1 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "1111111")), true, fluid_core::DeployState::Ready);
+    let d2 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "2222222")), true, fluid_core::DeployState::Ready);
+    let (id1, id2) = (d1.id.to_string(), d2.id.to_string());
+
+    assert_eq!(gw.host_deployment_id("app-git-main.localhost").as_deref(), Some(id2.as_str()), "branch tracks newest");
+    assert_eq!(gw.host_deployment_id("app-1111111.localhost").as_deref(), Some(id1.as_str()), "old commit URL stays pinned");
+    assert_eq!(gw.host_deployment_id("app-2222222.localhost").as_deref(), Some(id2.as_str()));
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(id2.as_str()), "prod domain follows newest production");
+}
+
+/// Promotion / rollback is pure alias reassignment — promoting an older preview
+/// makes it production WITHOUT a rebuild, re-pointing the production domain.
+#[tokio::test]
+async fn promote_is_alias_reassignment() {
+    let gw = test_gw();
+    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "ccccccc")), true, fluid_core::DeployState::Ready);
+    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("hotfix", "ddddddd")), false, fluid_core::DeployState::Ready);
+    let (prod_id, prev_id) = (prod.id.to_string(), prev.id.to_string());
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(prod_id.as_str()));
+
+    // Promote the preview → it becomes production; same deployment, no rebuild.
+    let promoted = gw.promote(&prev_id).expect("promote");
+    assert_eq!(promoted.id.to_string(), prev_id);
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(prev_id.as_str()), "prod domain re-points on promote");
+    // The promoted deployment keeps its own commit + branch URLs.
+    assert_eq!(gw.host_deployment_id("app-ddddddd.localhost").as_deref(), Some(prev_id.as_str()));
+    assert_eq!(gw.host_deployment_id("app-git-hotfix.localhost").as_deref(), Some(prev_id.as_str()));
+}
+
+/// The build `target` (environment) is IMMUTABLE: a production build that gets
+/// superseded by a newer production deploy keeps target="production" even though
+/// it is no longer the promoted deployment (Vercel separates env from promotion).
+#[tokio::test]
+async fn target_environment_is_immutable_across_promotion() {
+    let gw = test_gw();
+    let old = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "eeeeeee")), true, fluid_core::DeployState::Ready);
+    let _new = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "fffffff")), true, fluid_core::DeployState::Ready);
+    let old_id = old.id.to_string();
+
+    let list = gw.list();
+    let old_view = list.iter().find(|d| d.id.to_string() == old_id).unwrap();
+    assert!(!old_view.production, "superseded build is no longer promoted");
+    assert_eq!(old_view.target, "production", "but its build environment stays production");
 }

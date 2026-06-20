@@ -285,6 +285,11 @@ pub struct DeployRecord {
     pub creator: String,
     pub git: Option<GitSource>,
     pub production: bool,
+    /// Environment the deployment was built for: "production" | "preview".
+    /// Immutable; `production` only reflects whether it currently holds the prod
+    /// alias. Defaults to empty (derive from `production`) for old snapshots.
+    #[serde(default)]
+    pub target: String,
     /// Final lifecycle state (so a failed build stays "error" across restarts).
     /// Defaults to `ready` for back-compat with snapshots written before this field.
     #[serde(default)]
@@ -303,8 +308,15 @@ pub struct Deployment {
     pub state: DeployState,
     pub creator: String,
     pub git: Option<GitSource>,
-    /// Production deployment for the project (vs preview).
+    /// Whether this deployment currently holds the project's PRODUCTION alias
+    /// (Vercel's "promoted" flag). Flips on promote/rollback — it does NOT change
+    /// `target`.
     pub production: bool,
+    /// The environment the deployment was BUILT for: "production" | "preview".
+    /// Immutable for the life of the deployment (a superseded production build
+    /// keeps target=production even after a newer one is promoted). Empty string
+    /// means "derive from `production`" (back-compat for old in-memory values).
+    pub target: String,
 }
 
 /// Admin API: request to create a deployment. For the mock backend the gateway
@@ -334,6 +346,19 @@ pub struct GitDeployRequest {
     pub creator: Option<String>,
     #[serde(default = "default_prod")]
     pub production: bool,
+    /// Explicit deploy target: "production" | "preview". When None (the default),
+    /// the target is CLASSIFIED from the branch — a push to the project's
+    /// production branch is production, every other branch / PR is a preview
+    /// (Vercel's model). Webhooks set this to "preview" for PR events; the import
+    /// + redeploy flows leave it None so the branch decides.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Whether to reuse the existing dependency build cache. Defaults to true.
+    /// A redeploy can set this false ("Use existing Build Cache" unchecked) to
+    /// force a clean install — when a package-lock.json is present that means
+    /// `npm ci` instead of `npm install`, and the cached node_modules is skipped.
+    #[serde(default = "default_prod")]
+    pub use_cache: bool,
     /// Subdirectory within the repo to build (for monorepo templates, e.g.
     /// `examples/nextjs`). Empty/None = repo root.
     #[serde(default)]
@@ -354,8 +379,24 @@ pub struct DeploymentInfo {
     pub project: String,
     pub functions: Vec<String>,
     pub created_at_ms: u64,
-    /// Convenience: the Host alias that resolves to this deployment.
+    /// Convenience: the project (production-domain) Host alias `<project>.localhost`.
     pub alias: String,
+    /// Immutable per-commit Host alias `<project>-<shortsha>.localhost` (Vercel's
+    /// commit URL). Empty when the deployment has no git commit. Always resolves
+    /// to THIS exact deployment.
+    #[serde(default)]
+    pub commit_alias: String,
+    /// Per-branch Host alias `<project>-git-<branch>.localhost` (Vercel's branch
+    /// URL) — resolves to the latest deployment on that branch. Empty without git.
+    #[serde(default)]
+    pub branch_alias: String,
+    /// Immutable per-deployment Host alias `<id>.localhost`, always this deployment.
+    #[serde(default)]
+    pub id_alias: String,
+    /// Build environment: "production" | "preview" — IMMUTABLE (unlike
+    /// `production`, which is the live "is currently promoted" flag).
+    #[serde(default)]
+    pub target: String,
     #[serde(default = "default_ready")]
     pub state: DeployState,
     #[serde(default)]

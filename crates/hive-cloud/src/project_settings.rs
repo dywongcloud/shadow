@@ -83,6 +83,12 @@ pub struct ProjectSettings {
     /// Team that owns this project (slug). Defaults to "personal".
     #[serde(default = "default_team")]
     pub team: String,
+    /// The Git branch whose deployments are PRODUCTION (Vercel's "Production
+    /// Branch"). Set to the imported branch on first deploy. Pushes to this branch
+    /// deploy to production; every other branch / PR deploys a preview. Empty until
+    /// the project's first git deploy classifies it.
+    #[serde(default)]
+    pub production_branch: String,
     /// When true (default), preview deployments are only reachable by team
     /// members — anonymous requests to a preview host get a 401.
     #[serde(default = "default_true")]
@@ -103,6 +109,7 @@ impl Default for ProjectSettings {
             functions: FunctionSettings::default(),
             domains: Vec::new(),
             team: default_team(),
+            production_branch: String::new(),
             preview_protection: true,
         }
     }
@@ -201,6 +208,18 @@ impl ProjectStore {
     /// The configured root/subdirectory for a project ("" if none).
     pub fn root_dir_of(&self, project: &str) -> String {
         self.map.read().get(project).map(|s| s.build.root_dir.clone()).unwrap_or_default()
+    }
+
+    /// The project's production branch ("" if not yet classified).
+    pub fn production_branch_of(&self, project: &str) -> String {
+        self.map.read().get(project).map(|s| s.production_branch.clone()).unwrap_or_default()
+    }
+
+    /// Set the production branch (Vercel "Production Branch"). Called once on the
+    /// project's first git deploy, or explicitly from project settings.
+    pub fn set_production_branch(&self, project: &str, branch: &str) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().production_branch = branch.to_string();
     }
 
     pub fn set_preview_protection(&self, project: &str, on: bool) {

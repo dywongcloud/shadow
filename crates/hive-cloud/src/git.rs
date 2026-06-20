@@ -133,11 +133,15 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     let bid = id.clone();
     let wh_project = project.clone();
     tokio::spawn(async move {
+        // Whether this is the project's FIRST deployment — captured BEFORE the
+        // placeholder registers an alias (which would otherwise make it look like a
+        // redeploy). Drives `npm ci` on the initial build (Task 1).
+        let first_deploy = !cloud.gw.serves_host(&format!("{project}.localhost"));
         // First-deploy only: serve a "Building…" page at the domain immediately so
         // the URL resolves throughout the build (a slow Next.js build no longer
         // 404s). The real deployment supersedes it; we then remove the placeholder.
         let placeholder = register_building_placeholder(&cloud, &project, &req).await;
-        let result = run_build(&cloud, &bid, req, project).await;
+        let result = run_build(&cloud, &bid, req, project, first_deploy).await;
         if let Some(pid) = &placeholder {
             // The real deploy (or the build-failed page) has taken over the alias;
             // drop the placeholder so it doesn't linger. On a hard error this also
@@ -167,6 +171,7 @@ async fn run_build(
     bid: &str,
     req: GitDeployRequest,
     project: String,
+    first_deploy: bool,
 ) -> anyhow::Result<()> {
     let region = &cloud.region;
     let region_label = region_label(region);
@@ -228,7 +233,16 @@ async fn run_build(
     log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
 
     let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
+    // Full SHA for GitHub commit-status reporting (the statuses API needs it).
+    let full_sha = run_git(&dir, &["rev-parse", "HEAD"]).await.unwrap_or_else(|| commit.clone());
     let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"]).await.unwrap_or_default();
+    // Best-effort "pending" check on the commit (no-op without GITHUB_TOKEN).
+    {
+        let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
+        tokio::spawn(async move {
+            report_github_status(&repo, &sha, "pending", "", "Build in progress…").await;
+        });
+    }
     let actual_branch = if branch.is_empty() {
         run_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|| "main".into())
     } else {
@@ -264,7 +278,7 @@ async fn run_build(
     // deploy — Vercel still records the deployment/project — so on error we fall
     // back to a "build failed" page and keep going (build state ends as Error).
     let mut build_failed = false;
-    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit).await {
+    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit, first_deploy, req.use_cache).await {
         Ok(m) => m,
         Err(e) => {
             build_failed = true;
@@ -348,6 +362,29 @@ async fn run_build(
     log("Uploading build outputs…".into());
     log(format!("Functions: {}, Static assets prepared.", manifest.functions.len()));
 
+    // ---- Classify production vs preview (Vercel's model) ----
+    // A project's production branch is recorded on its first deploy (the imported
+    // branch). Pushes to it are PRODUCTION; every other branch / PR is a PREVIEW.
+    // An explicit target on the request (webhook PR events) overrides the branch.
+    let mut prod_branch = cloud.projects.production_branch_of(&project);
+    if prod_branch.is_empty() && !actual_branch.is_empty() {
+        prod_branch = actual_branch.clone();
+        cloud.projects.set_production_branch(&project, &prod_branch);
+        log(format!("Production branch set to '{prod_branch}'."));
+    }
+    let is_production = match req.target.as_deref().map(str::trim) {
+        Some("preview") => false,
+        Some("production") => true,
+        // No explicit target -> classify from the branch.
+        _ => !actual_branch.is_empty() && actual_branch == prod_branch,
+    };
+    log(format!(
+        "Target: {} (branch '{}' vs production branch '{}')",
+        if is_production { "Production" } else { "Preview" },
+        actual_branch,
+        prod_branch
+    ));
+
     // Register the routable deployment.
     let git = GitSource {
         repo_url: req.repo_url.clone(),
@@ -360,7 +397,7 @@ async fn run_build(
         manifest,
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
-        req.production,
+        is_production,
         if build_failed { DeployState::Error } else { DeployState::Ready },
     );
 
@@ -386,20 +423,87 @@ async fn run_build(
         &format!("{} → {}", info.project, info.alias),
     );
     crate::persist::persist(cloud);
+    // Best-effort final GitHub commit status (success/failure). No-op without a
+    // GITHUB_TOKEN; points the check at the live deployment URL.
+    {
+        let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
+        let url = format!("https://{}", info.alias);
+        let (state, desc) = if build_failed {
+            ("failure", "Build failed")
+        } else if is_production {
+            ("success", "Production deployment ready")
+        } else {
+            ("success", "Preview deployment ready")
+        };
+        let (state, desc) = (state.to_string(), desc.to_string());
+        tokio::spawn(async move {
+            report_github_status(&repo, &sha, &state, &url, &desc).await;
+        });
+    }
     crate::webhooks::dispatch(
         &cloud.webhooks,
         &info.project,
-        if req.production { "deployment.promoted" } else { "deployment.ready" },
+        if is_production { "deployment.promoted" } else { "deployment.ready" },
         serde_json::json!({
             "id": info.id.to_string(),
             "project": info.project,
             "url": format!("https://{}", info.alias),
             "state": "ready",
-            "production": req.production,
+            "production": is_production,
+            "target": if is_production { "production" } else { "preview" },
             "commit": commit,
         }),
     );
     Ok(())
+}
+
+/// Best-effort GitHub Commit Status report (Vercel-style "shadw — Deployment
+/// ready" check on the commit/PR). No-op unless `GITHUB_TOKEN` is set in the
+/// node's environment and the repo is on github.com. All failures are swallowed
+/// so deploys never depend on GitHub being reachable.
+async fn report_github_status(repo_url: &str, sha: &str, state: &str, target_url: &str, description: &str) {
+    let token = match std::env::var("GITHUB_TOKEN") {
+        Ok(t) if !t.is_empty() => t,
+        _ => return,
+    };
+    if sha.is_empty() {
+        return;
+    }
+    let Some((owner, repo)) = parse_owner_repo(repo_url) else { return };
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/statuses/{sha}");
+    let mut body = serde_json::json!({
+        "state": state, // pending | success | failure | error
+        "description": description,
+        "context": "shadw",
+    });
+    if !target_url.is_empty() {
+        body["target_url"] = serde_json::Value::String(target_url.to_string());
+    }
+    let client = reqwest::Client::new();
+    let _ = client
+        .post(&url)
+        .header(reqwest::header::USER_AGENT, "shadw")
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .json(&body)
+        .send()
+        .await;
+}
+
+/// Parse `owner/repo` from a github.com URL (https or ssh form). Returns None for
+/// non-github or malformed URLs.
+fn parse_owner_repo(repo_url: &str) -> Option<(String, String)> {
+    let s = repo_url.trim().trim_end_matches('/');
+    let s = s.strip_suffix(".git").unwrap_or(s);
+    let tail = s.rsplit("github.com").next()?;
+    let tail = tail.trim_start_matches(['/', ':']);
+    let mut parts = tail.split('/').filter(|p| !p.is_empty());
+    let owner = parts.next()?.to_string();
+    let repo = parts.next()?.to_string();
+    if owner.is_empty() || repo.is_empty() {
+        return None;
+    }
+    Some((owner, repo))
 }
 
 fn region_label(region: &str) -> String {
@@ -423,6 +527,8 @@ async fn produce_manifest(
     dir: &Path,
     project: &str,
     commit: &str,
+    first_deploy: bool,
+    use_cache: bool,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let dockerfile = dir.join("Dockerfile");
@@ -462,7 +568,7 @@ async fn produce_manifest(
         log("Detected fluid.json — using project configuration.".into());
         Ok(m)
     } else {
-        build_via_fdi(cloud, bid, repo_root, dir, project).await
+        build_via_fdi(cloud, bid, repo_root, dir, project, first_deploy, use_cache).await
     }
 }
 
@@ -485,6 +591,15 @@ async fn is_workspace_root(root: &Path) -> bool {
     false
 }
 
+/// Whether to use `npm ci` (a clean, lockfile-exact install) instead of
+/// `npm install`. Restricted to npm projects that have a committed
+/// `package-lock.json` (yarn/pnpm have their own lockfiles), and only when this
+/// is the project's first deployment (Task 1) or the build cache was explicitly
+/// disabled on a redeploy (Task 2). All other builds use `npm install` + cache.
+fn should_use_npm_ci(pm: &str, has_package_lock: bool, first_deploy: bool, use_cache: bool) -> bool {
+    pm == "npm" && has_package_lock && (first_deploy || !use_cache)
+}
+
 /// Framework-Defined Infrastructure: detect the framework, run its real install
 /// + build commands (streamed), then normalize the output into a Manifest —
 /// either static assets or a serverless server. This is the executor that turns
@@ -495,6 +610,8 @@ async fn build_via_fdi(
     repo_root: &Path,
     dir: &Path,
     project: &str,
+    first_deploy: bool,
+    use_cache: bool,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
 
@@ -538,14 +655,29 @@ async fn build_via_fdi(
     let rel = dir.strip_prefix(repo_root).ok().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
     let pnpm_filter = if is_monorepo && !rel.is_empty() { format!(" --filter \"{{./{rel}}}...\"") } else { String::new() };
 
+    // `npm ci` is the clean, lockfile-exact install. We use it ONLY for an npm
+    // project with a committed package-lock.json (never yarn/pnpm — those have
+    // their own lockfiles), and ONLY when:
+    //   • this is the project's FIRST deployment (Task 1 — clean initial build), or
+    //   • the redeploy explicitly disabled the build cache (Task 2 — fresh install).
+    // Every other build uses `npm install` + the warm node_modules cache (fast).
+    // `npm ci` wipes node_modules, so it never benefits from a restored cache.
+    let use_npm_ci = should_use_npm_ci(pm, install_dir.join("package-lock.json").exists(), first_deploy, use_cache);
     // Install command: honor an explicit override, else the right command for the
     // detected package manager (pnpm/yarn via corepack so the binary is present).
     let install_cmd: String = inst.unwrap_or_else(|| match pm {
         "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm install --no-frozen-lockfile{pnpm_filter}"),
         "yarn" => "corepack enable >/dev/null 2>&1; yarn install --network-timeout 600000".into(),
         "bun" => "bun install".into(),
+        _ if use_npm_ci => "npm ci --no-audit --no-fund".into(),
         _ => "npm install --no-audit --no-fund".into(),
     });
+    if use_npm_ci {
+        log(format!(
+            "Using `npm ci` (package-lock.json present, {}).",
+            if first_deploy { "first deployment" } else { "build cache disabled" }
+        ));
+    }
     // Build command: detected framework default (already package-manager aware),
     // re-pointed to the install PM if it's a generic `npm run` script.
     let build_cmd = if plan.build_command.starts_with("npm ") && pm != "npm" {
@@ -554,9 +686,15 @@ async fn build_via_fdi(
         plan.build_command.clone()
     };
 
-    // 0) Restore cached dependencies (local, else pull from a mesh peer).
-    if let Some(k) = &cache_key {
-        restore_cache(cloud, bid, install_dir, k).await;
+    // 0) Restore cached dependencies (local, else pull from a mesh peer). Skipped
+    // when the cache is disabled (redeploy opt-out) or when `npm ci` will wipe
+    // node_modules anyway — a restore would just be thrown away.
+    if use_cache && !use_npm_ci {
+        if let Some(k) = &cache_key {
+            restore_cache(cloud, bid, install_dir, k).await;
+        }
+    } else if !use_cache {
+        log("Build cache disabled — installing dependencies fresh.".into());
     }
     // Project env vars (already persisted at build start) — injected into both
     // the install and build steps so framework builds can read them.
@@ -1087,6 +1225,23 @@ mod tests {
         assert_eq!(project_name_from_url("https://github.com/Owner/My_Repo"), "my-repo");
         assert_eq!(project_name_from_url("git@github.com:acme/cool-app.git"), "cool-app");
         assert_eq!(project_name_from_url("https://example.com/a/b/"), "b");
+    }
+
+    #[test]
+    fn npm_ci_only_first_deploy_or_cache_disabled_with_package_lock() {
+        // First deploy + package-lock.json (npm) -> npm ci (Task 1).
+        assert!(should_use_npm_ci("npm", true, true, true));
+        // Redeploy (not first) with cache enabled -> npm install (warm cache).
+        assert!(!should_use_npm_ci("npm", true, false, true));
+        // Redeploy with cache DISABLED + package-lock.json -> npm ci (Task 2).
+        assert!(should_use_npm_ci("npm", true, false, false));
+        // No package-lock.json -> never npm ci (it would hard-fail).
+        assert!(!should_use_npm_ci("npm", false, true, true));
+        assert!(!should_use_npm_ci("npm", false, false, false));
+        // Non-npm package managers never use npm ci, regardless of flags.
+        assert!(!should_use_npm_ci("yarn", true, true, false));
+        assert!(!should_use_npm_ci("pnpm", true, true, false));
+        assert!(!should_use_npm_ci("bun", true, false, false));
     }
 
     #[test]

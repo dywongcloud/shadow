@@ -10,6 +10,12 @@ import { apiSend, currentTeam } from "@/lib/api";
 import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
+import { PreparingDeployment } from "@/components/clone-animation";
+
+// How long the "Preparing Git Repository" clone animation plays before the view
+// transitions to the live build logs (the build itself runs async on the node).
+const PREPARING_MS = 2800;
+const GIT_SCOPE = "openedge";
 
 interface GhRepo {
   name: string;
@@ -97,6 +103,9 @@ export default function NewProjectPage() {
   const [repoQ, setRepoQ] = useState("");
   const [selected, setSelected] = useState<Template | null>(null);
   const [tplPage, setTplPage] = useState(0);
+  // Set once Create succeeds: drives the "Preparing Git Repository" animation
+  // shown between Create and the build-logs view.
+  const [preparing, setPreparing] = useState<{ template: Template | null; team: string; src: string; dest: string } | null>(null);
 
   const TPL_PER = 5;
   const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
@@ -112,7 +121,7 @@ export default function NewProjectPage() {
     }).catch(() => {});
   }, []);
 
-  async function deploy(repoUrl: string, branch?: string, project?: string, root?: string, env?: Record<string, string>) {
+  async function deploy(repoUrl: string, branch?: string, project?: string, root?: string, env?: Record<string, string>, template?: Template) {
     if (!repoUrl) return;
     setDeploying(true);
     setError("");
@@ -132,7 +141,13 @@ export default function NewProjectPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ repo: repoUrl }),
       }).catch(() => {});
-      router.push(`/deploy/${res.build_id}`);
+      // Show the "Preparing Git Repository" clone animation, then transition to
+      // the live build logs. The build is already running async on the node.
+      const src = ownerRepo(repoUrl) + (root ? `/${root}` : "");
+      const fallbackName = slug(template?.name || ownerRepo(repoUrl).split("/").pop() || "project");
+      const dest = `${GIT_SCOPE}/${project || fallbackName}`;
+      setPreparing({ template: template ?? null, team: currentTeam(), src, dest });
+      setTimeout(() => router.push(`/deploy/${res.build_id}`), PREPARING_MS);
     } catch (e) {
       setError(String(e));
       setDeploying(false);
@@ -148,9 +163,14 @@ export default function NewProjectPage() {
 
   const filteredRepos = repos.filter((r) => r.full_name.toLowerCase().includes(repoQ.toLowerCase()));
 
+  // ----- Preparing Git Repository (after Create, before build logs) -----
+  if (preparing) {
+    return <PreparingDeployment template={preparing.template} team={preparing.team} src={preparing.src} dest={preparing.dest} />;
+  }
+
   // ----- Configure screen (after a template is selected) -----
   if (selected) {
-    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo, selected.branch, name, selected.root, env)} deploying={deploying} error={error} />;
+    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo, selected.branch, name, selected.root, env, selected)} deploying={deploying} error={error} />;
   }
 
   return (
@@ -475,7 +495,7 @@ function ConfigureTemplate({
           disabled={deploying}
           className="w-full justify-center bg-fg py-2.5 text-bg"
         >
-          {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : "Create"}
+          {deploying ? <><Loader2 className="h-4 w-4 animate-spin" /> Creating…</> : "Create"}
         </Button>
       </Card>
 

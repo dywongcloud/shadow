@@ -197,7 +197,16 @@ export interface Deployment {
   project: string;
   functions: string[];
   created_at_ms: number;
+  /** Production-domain host alias `<project>.localhost`. */
   alias: string;
+  /** Immutable per-commit host `<project>-<sha>.localhost` (Vercel commit URL). */
+  commit_alias?: string;
+  /** Per-branch host `<project>-git-<branch>.localhost` (latest on the branch). */
+  branch_alias?: string;
+  /** Immutable per-deployment host `<id>.localhost` (always this deployment). */
+  id_alias?: string;
+  /** "production" | "preview" (mirrors `production`). */
+  target?: string;
   state: "queued" | "building" | "ready" | "error";
   creator: string;
   git: GitSource | null;

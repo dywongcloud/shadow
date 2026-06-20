@@ -2,17 +2,18 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { RotateCcw, RefreshCw, Trash2, Loader2, Plus } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+import { RedeployModal } from "@/components/redeploy-modal";
 
 export default function DeploymentsPage() {
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
-  const router = useRouter();
   const [busy, setBusy] = useState<string>("");
+  // The deployment whose Redeploy modal is open (null = closed).
+  const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
 
   async function promote(d: Deployment) {
     setBusy(d.id);
@@ -20,13 +21,6 @@ export default function DeploymentsPage() {
       await apiSend("POST", `/v1/deployments/${d.id}/promote`);
       await refresh();
     } catch (e) { alert(String(e)); } finally { setBusy(""); }
-  }
-  async function redeploy(d: Deployment) {
-    setBusy(d.id);
-    try {
-      const r = await apiSend<{ build_id: string }>("POST", `/v1/projects/${encodeURIComponent(d.project)}/redeploy`);
-      router.push(`/deploy/${r.build_id}`);
-    } catch (e) { alert(String(e)); setBusy(""); }
   }
   async function remove(d: Deployment) {
     if (!confirm(`Delete deployment ${d.id}? This cannot be undone.`)) return;
@@ -54,11 +48,25 @@ export default function DeploymentsPage() {
                 <Td className="font-medium">{d.project}</Td>
                 <Td className="font-mono text-xs text-muted">{d.id}</Td>
                 <Td>
-                  {d.production
-                    ? <Badge tone="green"><span className="h-1.5 w-1.5 rounded-full bg-green" /> Production</Badge>
-                    : <Badge>Preview</Badge>}
+                  {/* Environment is the immutable build target; the green dot marks
+                      the deployment currently promoted to the production domain. */}
+                  {(() => {
+                    const env = d.target || (d.production ? "production" : "preview");
+                    return (
+                      <span className="inline-flex items-center gap-1.5">
+                        {env === "production" ? <Badge tone="green">Production</Badge> : <Badge>Preview</Badge>}
+                        {d.production && <span title="Currently promoted to production" className="h-1.5 w-1.5 rounded-full bg-green" />}
+                      </span>
+                    );
+                  })()}
                 </Td>
-                <Td className="font-mono text-xs"><a className="text-link hover:underline" href={deploymentUrl(d.alias)} target="_blank" rel="noreferrer">{deploymentHost(d.alias)}</a></Td>
+                {/* Each deployment links to its OWN immutable URL (the commit URL,
+                    or the per-deployment id URL) — never the shared production
+                    domain, so a preview row opens that preview, not production. */}
+                <Td className="font-mono text-xs">
+                  {(() => { const self = d.commit_alias || d.id_alias || d.alias;
+                    return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer">{deploymentHost(self)}</a>; })()}
+                </Td>
                 <Td className="text-xs text-secondary">
                   {d.git ? <span className="font-mono">{d.git.branch}@{d.git.commit || "—"}</span> : <span className="text-muted">CLI</span>}
                 </Td>
@@ -73,7 +81,7 @@ export default function DeploymentsPage() {
                           <IconBtn title="Promote to production (rollback)" onClick={() => promote(d)}><RotateCcw className="h-3.5 w-3.5" /></IconBtn>
                         )}
                         {d.git && (
-                          <IconBtn title="Redeploy from git (new deployment)" onClick={() => redeploy(d)}><RefreshCw className="h-3.5 w-3.5" /></IconBtn>
+                          <IconBtn title="Redeploy from git (new deployment)" onClick={() => setRedeployFor(d)}><RefreshCw className="h-3.5 w-3.5" /></IconBtn>
                         )}
                         <IconBtn title="Delete deployment" danger onClick={() => remove(d)}><Trash2 className="h-3.5 w-3.5" /></IconBtn>
                       </>
@@ -86,6 +94,15 @@ export default function DeploymentsPage() {
           {!deps?.length && <tr><Td className="text-muted">No deployments yet — <a className="text-link hover:underline" href="/new">create one</a>.</Td></tr>}
         </tbody>
       </Table>
+
+      {redeployFor && (
+        <RedeployModal
+          deployment={redeployFor}
+          prodAlias={`${redeployFor.project}.localhost`}
+          onClose={() => setRedeployFor(null)}
+          onDone={() => refresh()}
+        />
+      )}
     </div>
   );
 }

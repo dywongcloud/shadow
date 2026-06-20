@@ -6,6 +6,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Search, ChevronRight, Sparkles } from "lucide-react";
 import { Logo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { ApiSidebar } from "@/components/api-sidebar";
 
 interface NavItem { label: string; href: string; badge?: string }
 const NAV: { group: string; items: NavItem[] }[] = [
@@ -32,7 +33,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
     items: [
       { label: "Regions & the mesh", href: "/docs/getting-started#regions" },
       { label: "CLI", href: "/docs/getting-started#cli" },
-      { label: "API reference", href: "/docs/getting-started#api" },
+      { label: "API reference", href: "/docs/api-reference" },
       { label: "Self-hosting", href: "/docs/getting-started#self-hosting", badge: "Ops" },
     ],
   },
@@ -40,6 +41,7 @@ const NAV: { group: string; items: NavItem[] }[] = [
 
 export default function DocsLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  const isApi = pathname.startsWith("/docs/api-reference");
   const [q, setQ] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
 
@@ -61,9 +63,46 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
     return NAV.map((g) => ({ ...g, items: g.items.filter((i) => i.label.toLowerCase().includes(s)) })).filter((g) => g.items.length);
   }, [q]);
 
+  // Track the active hash so only ONE sidebar item highlights. Without this, every
+  // item sharing a base path (e.g. all the /docs/getting-started#… anchors) lit up
+  // at once because we only compared the path. Synced on hashchange + scrollspy.
+  const [hash, setHash] = useState("");
+  useEffect(() => {
+    setHash(window.location.hash);
+    const onHash = () => setHash(window.location.hash);
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, [pathname]);
+
+  // Scrollspy: on a page with #fragment anchors, highlight whichever section is in
+  // view as you scroll (so the sidebar follows the reader, not just clicks).
+  useEffect(() => {
+    const frags = NAV.flatMap((g) => g.items)
+      .filter((i) => i.href.split("#")[0] === pathname && i.href.includes("#"))
+      .map((i) => i.href.split("#")[1]);
+    const els = frags
+      .map((f) => document.getElementById(f))
+      .filter((el): el is HTMLElement => !!el);
+    if (!els.length) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        const visible = entries
+          .filter((e) => e.isIntersecting)
+          .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+        if (visible[0]) setHash(`#${visible[0].target.id}`);
+      },
+      { rootMargin: "-80px 0px -70% 0px", threshold: 0 }
+    );
+    els.forEach((el) => obs.observe(el));
+    return () => obs.disconnect();
+  }, [pathname]);
+
   const isActive = (href: string) => {
-    const base = href.split("#")[0];
-    return pathname === base && (href === "/docs" ? pathname === "/docs" : true);
+    const [base, frag] = href.split("#");
+    if (pathname !== base) return false;
+    // A fragment link is active only when its hash matches; a plain page link is
+    // active only when no section hash is selected.
+    return frag ? hash === `#${frag}` : hash === "" || hash === "#";
   };
 
   return (
@@ -77,7 +116,7 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
             <Link href="/docs" className="text-[15px] font-semibold">Docs</Link>
             <nav className="ml-6 hidden items-center gap-6 text-sm text-secondary md:flex">
               <Link href="/docs/getting-started" className="hover:text-fg">Guides</Link>
-              <Link href="/docs/getting-started#api" className="hover:text-fg">API</Link>
+              <Link href="/docs/api-reference" className="hover:text-fg">API</Link>
               <Link href="/docs/getting-started" className="hover:text-fg">Getting Started</Link>
             </nav>
           </div>
@@ -95,8 +134,12 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
       </header>
 
       <div className="mx-auto flex max-w-[1600px]">
-        {/* Sidebar */}
+        {/* Sidebar — the API Reference uses its own collapsible endpoint tree. */}
         <aside className="sticky top-14 hidden h-[calc(100vh-3.5rem)] w-72 shrink-0 overflow-y-auto border-r border-border px-4 py-6 lg:block">
+          {isApi ? (
+            <ApiSidebar />
+          ) : (
+          <>
           <div className="relative mb-5">
             <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
             <input
@@ -132,6 +175,8 @@ export default function DocsLayout({ children }: { children: React.ReactNode }) 
             </div>
           ))}
           {!groups.length && <div className="px-3 py-8 text-center text-sm text-muted">No matches.</div>}
+          </>
+          )}
         </aside>
 
         {/* Content */}

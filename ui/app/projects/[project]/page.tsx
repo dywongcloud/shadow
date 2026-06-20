@@ -22,6 +22,7 @@ import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
 import { ProjectWorkflows } from "@/components/workflows";
 import { DeploymentResources } from "@/components/deployment-resources";
 import { DeploymentRowMenu } from "@/components/deployment-menu";
+import { RedeployModal } from "@/components/redeploy-modal";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -38,7 +39,7 @@ const ServiceGraph = dynamic(
 );
 import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
 
 export default function ProjectDetail({ params }: { params: { project: string } }) {
   const name = decodeURIComponent(params.project);
@@ -52,6 +53,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
     if (t === "graph" || t === "deployments" || t === "overview" || t === "workflows" || t === "resources") setTab(t);
   }, []);
   const [busy, setBusy] = useState("");
+  // The deployment whose Redeploy modal is open (null = closed).
+  const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
 
   const mine = (deps ?? []).filter((d) => d.project === name);
   const prod = mine.find((d) => d.production) ?? mine[0];
@@ -62,13 +65,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
     try { await apiSend("POST", `/v1/deployments/${id}/promote`); await refresh(); }
     catch (e) { alert(String(e)); } finally { setBusy(""); }
   }
-  async function redeploy() {
-    setBusy("redeploy");
-    try {
-      const r = await apiSend<{ build_id: string }>("POST", `/v1/projects/${encodeURIComponent(name)}/redeploy`);
-      router.push(`/deploy/${r.build_id}`);
-    } catch (e) { alert(String(e)); setBusy(""); }
-  }
+  // Redeploy now goes through the confirmation modal (environment + build cache).
+  // Opening it for a specific deployment makes that the source/current build.
   async function removeDeployment(id: string) {
     if (!confirm(`Delete deployment ${id}?`)) return;
     setBusy(id);
@@ -111,7 +109,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           </div>
         </div>
         <div className="flex gap-2">
-          <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
+          <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
             {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
           </Button>
           <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
@@ -120,7 +118,19 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           <Button variant="danger" onClick={deleteProject} disabled={busy === "project"}>
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
-          <a href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer">
+          <a
+            href={deploymentUrl(prod?.alias)}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => {
+              // With the zkauth experiment on, mint an anonymous proof + bootstrap
+              // the preview instead of a plain open. Otherwise the link proceeds.
+              if (zkEnabled && prod) {
+                e.preventDefault();
+                openDeployment(prod.alias, name);
+              }
+            }}
+          >
             <Button>Visit</Button>
           </a>
         </div>
@@ -165,8 +175,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
             <div className="flex items-center justify-between border-b border-border px-5 py-3">
               <span className="font-medium">Production Deployment</span>
               <div className="flex gap-2">
-                <Button variant="outline" onClick={redeploy} disabled={busy === "redeploy" || !prod?.git}>
-                  {busy === "redeploy" ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4" />} Redeploy
+                <Button variant="outline" onClick={() => prod && setRedeployFor(prod)} disabled={!prod?.git}>
+                  <RefreshCw className="h-4 w-4" /> Redeploy
                 </Button>
                 <Button variant="outline" onClick={() => rollbackTarget && promote(rollbackTarget.id)} disabled={!rollbackTarget || !!busy}>
                   <RotateCcw className="h-4 w-4" /> Instant Rollback
@@ -273,14 +283,30 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           <tbody>
             {mine.map((d) => (
               <tr key={d.id}>
-                <Td className="px-2 font-mono text-xs">{d.id}</Td>
+                {/* Link to this deployment's OWN immutable URL (commit URL / id
+                    URL), so a preview row opens that preview — not production. */}
+                <Td className="px-2 font-mono text-xs">
+                  <a className="text-link hover:underline" href={deploymentUrl(d.commit_alias || d.id_alias || d.alias)} target="_blank" rel="noreferrer">{d.id}</a>
+                </Td>
                 <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">
                     <span className={`h-2 w-2 rounded-full ${d.state === "ready" ? "bg-green" : d.state === "building" ? "bg-amber-400" : "bg-red-400"}`} />
                     {d.state}
                   </span>
                 </Td>
-                <Td className="px-2">{d.production ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}</Td>
+                <Td className="px-2">
+                  {/* Immutable build environment + a marker for the deployment
+                      currently promoted to the production domain. */}
+                  {(() => {
+                    const env = d.target || (d.production ? "production" : "preview");
+                    return (
+                      <span className="inline-flex items-center gap-1.5">
+                        {env === "production" ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}
+                        {d.production && <span title="Currently promoted to production" className="h-1.5 w-1.5 rounded-full bg-green" />}
+                      </span>
+                    );
+                  })()}
+                </Td>
                 <Td className="px-2 font-mono text-xs text-secondary">
                   {d.git ? (
                     <span className="inline-flex items-center gap-1"><Code2 className="h-3.5 w-3.5" /> {d.git.branch} {d.git.commit}</span>
@@ -296,7 +322,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                     canRedeploy={!!d.git}
                     busy={busy === d.id}
                     onRollback={() => promote(d.id)}
-                    onRedeploy={redeploy}
+                    onRedeploy={() => setRedeployFor(d)}
                     onDelete={() => removeDeployment(d.id)}
                   />
                 </Td>
@@ -306,6 +332,15 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           </tbody>
         </Table>
         </div>
+      )}
+
+      {redeployFor && (
+        <RedeployModal
+          deployment={redeployFor}
+          prodAlias={prod?.alias || `${name}.localhost`}
+          onClose={() => setRedeployFor(null)}
+          onDone={() => refresh()}
+        />
       )}
     </div>
   );

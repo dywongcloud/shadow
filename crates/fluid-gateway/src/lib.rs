@@ -127,27 +127,42 @@ impl Gateway {
             creator,
             git,
             production,
+            // The build target is immutable; `production` (promoted) may later flip.
+            target: if production { "production".into() } else { "preview".into() },
         };
         let info = view_of(&dep);
+        let project = dep.project.clone();
         let mut st = self.state.lock();
+        // Does this project already have a (different) production deployment? If
+        // not, this deploy claims the bare production domain even when it isn't
+        // itself a production deploy — so the very first deploy and the "Building…"
+        // placeholder are reachable at <project>.<host> right away.
+        let has_production = st
+            .deployments
+            .values()
+            .any(|d| d.project == project && d.production && d.id != id);
         // Invariant: at most ONE production deployment per project. Promoting this
         // one to production demotes any prior production deployment of the same
-        // project, so the project alias can't later resolve to a stale deployment
+        // project, so the production alias can't later resolve to a stale deployment
         // after a restart (which would serve the OLD build).
         if production {
-            let proj = dep.project.clone();
             for d in st.deployments.values_mut() {
-                if d.project == proj {
+                if d.project == project {
                     d.production = false;
                 }
             }
         }
-        st.aliases.insert(dep.project.clone(), id.clone());
-        // Per-deployment preview URL: <deployment-id>.localhost resolves to this
-        // exact deployment even after newer ones become the project default.
-        st.aliases.insert(id.as_str().to_string(), id.clone());
         st.deployments.insert(id.clone(), dep);
-        st.default = Some(id);
+        // Vercel's 3 URL types: the immutable per-deployment + commit URLs and the
+        // mutable branch URL (latest on that branch).
+        insert_deploy_aliases(&mut st, &id);
+        // Production domain (<project>) + default fallback move only on a production
+        // deploy — a preview deploy of an existing project must NOT hijack prod.
+        // Exception: the project's first-ever deploy claims it so the URL resolves.
+        if production || !has_production {
+            st.aliases.insert(project, id.clone());
+            st.default = Some(id.clone());
+        }
         info
     }
 
@@ -277,6 +292,7 @@ impl Gateway {
                 creator: d.creator.clone(),
                 git: d.git.clone(),
                 production: d.production,
+                target: d.target.clone(),
                 state: d.state,
             })
             .collect()
@@ -300,25 +316,24 @@ impl Gateway {
             creator: rec.creator,
             git: rec.git,
             production: rec.production,
-        };
-        let mut st = self.state.lock();
-        // The project alias must resolve to the project's CURRENT deployment, not
-        // whichever record happens to be restored last. Prefer the production
-        // deployment, and among equals the newest — so a stale prior deployment
-        // (e.g. a superseded build) never wins the alias after a reboot.
-        let should_alias = match st.aliases.get(&dep.project) {
-            None => true,
-            Some(existing_id) => match st.deployments.get(existing_id) {
-                None => true,
-                Some(ex) => (dep.production, dep.created_at_ms) > (ex.production, ex.created_at_ms),
+            // Old snapshots have no target — derive it from the production flag.
+            target: if rec.target.is_empty() {
+                if rec.production { "production".into() } else { "preview".into() }
+            } else {
+                rec.target
             },
         };
-        if should_alias {
-            st.aliases.insert(dep.project.clone(), id.clone());
-        }
-        // The per-deployment preview URL always points at this exact deployment.
-        st.aliases.insert(id.as_str().to_string(), id.clone());
+        let project = dep.project.clone();
+        let mut st = self.state.lock();
         st.deployments.insert(id.clone(), dep);
+        // The project (production) alias must resolve to the project's CURRENT
+        // deployment, not whichever record happens to restore last. Prefer the
+        // production deployment, and among equals the newest — so a stale prior
+        // deployment (e.g. a superseded build) never wins the alias after a reboot.
+        set_alias_if_newer(&mut st, &project, &id);
+        // The per-deployment preview URL + commit/branch URLs (branch tracks the
+        // newest deployment on that branch — set_alias_if_newer handles ordering).
+        insert_deploy_aliases(&mut st, &id);
         st.default.get_or_insert(id);
     }
 
@@ -780,6 +795,60 @@ struct BodyState {
 }
 
 /// Build a `DeploymentInfo` view from a stored deployment.
+/// DNS-safe subdomain slug: lowercase, only `[a-z0-9-]`, no leading/trailing or
+/// repeated dashes. Used to build branch/commit alias labels from arbitrary
+/// branch names (e.g. `feature/Login` -> `feature-login`).
+fn slug(s: &str) -> String {
+    let mapped: String = s
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
+    mapped.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// Immutable commit URL label: `<project>-<shortsha>` (Vercel's per-commit URL).
+fn commit_alias(project: &str, commit: &str) -> String {
+    let short: String = commit.chars().take(7).collect();
+    format!("{}-{}", slug(project), slug(&short))
+}
+
+/// Branch URL label: `<project>-git-<branch>` — always points at the latest
+/// deployment on that branch (Vercel's per-branch URL).
+fn branch_alias(project: &str, branch: &str) -> String {
+    format!("{}-git-{}", slug(project), slug(branch))
+}
+
+/// Point `key` at deployment `id` only if `id` is "newer" than whatever the alias
+/// currently resolves to — ranked by (production, created_at). Keeps branch/commit
+/// aliases tracking the right deployment even when records restore out of order.
+fn set_alias_if_newer(st: &mut GwState, key: &str, id: &DeploymentId) {
+    let Some(cand) = st.deployments.get(id).map(|d| (d.production, d.created_at_ms)) else {
+        return;
+    };
+    let win = match st.aliases.get(key).and_then(|cur| st.deployments.get(cur)) {
+        None => true,
+        Some(ex) => cand > (ex.production, ex.created_at_ms),
+    };
+    if win {
+        st.aliases.insert(key.to_string(), id.clone());
+    }
+}
+
+/// Insert the immutable per-deployment alias plus the commit + branch URL aliases
+/// for a deployment already present in `st.deployments`.
+fn insert_deploy_aliases(st: &mut GwState, id: &DeploymentId) {
+    st.aliases.insert(id.as_str().to_string(), id.clone());
+    let meta = st.deployments.get(id).map(|d| (d.project.clone(), d.git.clone()));
+    if let Some((project, Some(g))) = meta {
+        if !g.commit.is_empty() {
+            set_alias_if_newer(st, &commit_alias(&project, &g.commit), id);
+        }
+        if !g.branch.is_empty() {
+            set_alias_if_newer(st, &branch_alias(&project, &g.branch), id);
+        }
+    }
+}
+
 fn view_of(d: &Deployment) -> DeploymentInfo {
     let has_static = d.manifest.static_dir.is_some();
     let has_fn = !d.manifest.functions.is_empty();
@@ -788,12 +857,35 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         (false, true) => "function",
         _ => "static",
     };
+    // Vercel's 3 URL types, surfaced so the dashboard can link each deployment to
+    // its own immutable commit URL + branch URL (not just the production domain).
+    let commit_alias = d
+        .git
+        .as_ref()
+        .filter(|g| !g.commit.is_empty())
+        .map(|g| format!("{}.localhost", commit_alias(&d.project, &g.commit)))
+        .unwrap_or_default();
+    let branch_alias = d
+        .git
+        .as_ref()
+        .filter(|g| !g.branch.is_empty())
+        .map(|g| format!("{}.localhost", branch_alias(&d.project, &g.branch)))
+        .unwrap_or_default();
     DeploymentInfo {
         id: d.id.clone(),
         project: d.project.clone(),
         functions: d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
         created_at_ms: d.created_at_ms,
         alias: format!("{}.localhost", d.project),
+        commit_alias,
+        branch_alias,
+        id_alias: format!("{}.localhost", d.id.as_str()),
+        // Immutable build environment (a superseded prod build stays "production").
+        target: if d.target.is_empty() {
+            if d.production { "production".into() } else { "preview".into() }
+        } else {
+            d.target.clone()
+        },
         state: d.state,
         creator: d.creator.clone(),
         git: d.git.clone(),

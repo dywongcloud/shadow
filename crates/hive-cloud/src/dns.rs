@@ -130,6 +130,60 @@ impl DomainStore {
         d.records.len() != before
     }
 
+    /// Edit a non-system record's mutable fields. Returns the updated record.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_record(
+        &self,
+        domain: &str,
+        id: &str,
+        name: String,
+        kind: String,
+        value: String,
+        ttl: u32,
+        priority: Option<u32>,
+        comment: String,
+    ) -> Option<DnsRecord> {
+        let mut m = self.map.write();
+        let d = m.get_mut(domain)?;
+        let r = d.records.iter_mut().find(|r| r.id == id && !r.system)?;
+        r.name = name;
+        r.kind = kind.to_uppercase();
+        r.value = value;
+        r.ttl = ttl;
+        r.priority = priority;
+        r.comment = comment;
+        Some(r.clone())
+    }
+
+    /// Bulk-import records (DNS migration). Skips exact duplicates (same
+    /// type + name + value) so re-importing is idempotent. Returns the records
+    /// actually added.
+    pub fn import_records(&self, domain: &str, recs: Vec<DnsRecord>) -> Vec<DnsRecord> {
+        let mut m = self.map.write();
+        let Some(d) = m.get_mut(domain) else { return Vec::new() };
+        let mut added = Vec::new();
+        for mut rec in recs {
+            let kind = rec.kind.to_uppercase();
+            if kind.is_empty() || rec.value.trim().is_empty() {
+                continue;
+            }
+            let dup = d
+                .records
+                .iter()
+                .any(|e| e.kind.eq_ignore_ascii_case(&kind) && e.name == rec.name && e.value == rec.value);
+            if dup {
+                continue;
+            }
+            rec.id = rec_id();
+            rec.created_ms = now_ms();
+            rec.system = false;
+            rec.kind = kind;
+            d.records.push(rec.clone());
+            added.push(rec);
+        }
+        added
+    }
+
     pub fn set_nameservers(&self, domain: &str, ns: Vec<String>) -> bool {
         let mut m = self.map.write();
         let Some(d) = m.get_mut(domain) else { return false };
