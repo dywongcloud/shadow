@@ -521,7 +521,7 @@ fn preview_gate(
             let dash = dash.trim_end_matches('/');
             if !dash.is_empty() {
                 let url = format!(
-                    "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
+                    "{dash}/api/preview-unlock?host={}&project={}&team={}&next={}",
                     pct(host), pct(&project), pct(&team), pct(path),
                 );
                 let mut resp = axum::response::Redirect::temporary(&url).into_response();

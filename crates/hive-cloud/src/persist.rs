@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fluid_core::DeployRecord;
-use hive_edge::{CronJob, Redirect, Rewrite, WafRule};
+use hive_edge::{CronJob, Redirect, Rewrite, WafRule, WorkflowDef};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -64,6 +64,11 @@ pub struct PlatformSnapshot {
     pub docs: Vec<crate::docstore::Doc>,
     #[serde(default)]
     pub gitops: Vec<crate::gitops::GitOpsLink>,
+    /// Workflow definitions (incl. WDK-ingested ones with their graphs). Persisted
+    /// so a deployed app's workflows survive node restarts — the manifest is only
+    /// ingested during a live deploy, so without this they vanished on reboot.
+    #[serde(default)]
+    pub workflow_defs: Vec<WorkflowDef>,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -222,6 +227,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         domains: cloud.domains.snapshot(),
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
+        workflow_defs: cloud.workflows.defs(),
     }
 }
 
@@ -270,6 +276,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.domains.load(snap.domains);
     cloud.docs.load(snap.docs);
     cloud.gitops.load(snap.gitops);
+    for def in snap.workflow_defs {
+        cloud.workflows.define(def);
+    }
     if n > 0 {
         tracing::info!(deployments = n, "restored platform state from disk");
     }

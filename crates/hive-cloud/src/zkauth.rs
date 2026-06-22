@@ -297,11 +297,31 @@ struct RegisterReq {
     #[serde(default)]
     role: Option<String>,
 }
-async fn register(headers: HeaderMap, Json(req): Json<RegisterReq>) -> Json<Value> {
+/// Enrollment + proof-minting are SECURITY-SENSITIVE: whoever can call them can
+/// join a team's roster and mint a membership proof. The node can't verify Clerk
+/// org membership itself, so these endpoints must only be reachable from the
+/// trusted dashboard server (which DOES verify membership) — proven by a shared
+/// `HIVE_INTERNAL_TOKEN` in `x-hive-internal`. When the token is unset (dev) the
+/// guard is open; set it in any multi-user/production deployment.
+fn internal_ok(headers: &HeaderMap) -> bool {
+    match std::env::var("HIVE_INTERNAL_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => headers
+            .get("x-hive-internal")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == t)
+            .unwrap_or(false),
+        _ => true, // dev-open (no token configured)
+    }
+}
+
+async fn register(headers: HeaderMap, Json(req): Json<RegisterReq>) -> Result<Json<Value>, (StatusCode, String)> {
+    if !internal_ok(&headers) {
+        return Err((StatusCode::FORBIDDEN, "enrollment is server-only".into()));
+    }
     let team = team_of(&headers);
     let role = req.role.as_deref().map(parse_role).unwrap_or(Role::Member);
     let pk = ensure_member(&team, &req.user_id, role);
-    Json(json!({ "ok": true, "team": team, "public_key": hex(&pk.to_bytes()), "role": role_name(role) }))
+    Ok(Json(json!({ "ok": true, "team": team, "public_key": hex(&pk.to_bytes()), "role": role_name(role) })))
 }
 
 #[derive(Deserialize)]
@@ -310,6 +330,9 @@ struct ProveReq {
     project: String,
 }
 async fn preview_proof(headers: HeaderMap, Json(req): Json<ProveReq>) -> Result<Json<Value>, (StatusCode, String)> {
+    if !internal_ok(&headers) {
+        return Err((StatusCode::FORBIDDEN, "proof minting is server-only".into()));
+    }
     let team = team_of(&headers);
     match mint(&team, &req.user_id, &req.project) {
         Some((proof, message)) => Ok(Json(json!({ "proof": proof, "message": message, "team": team }))),
