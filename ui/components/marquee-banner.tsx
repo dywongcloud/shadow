@@ -10,7 +10,7 @@
  * below before the device showcase.
  * ------------------------------------------------------------------ */
 
-const PHRASE = "Own Your Cloud.";
+const PHRASE = "Own Your Cloud";
 
 // The banner silhouette (matches /public/banner-shape.svg).
 const SHAPE =
@@ -21,16 +21,21 @@ const SHAPE =
 const STRIP_TOP = "33.33%"; // 23 / 69
 const STRIP_HEIGHT = "46.38%"; // 32 / 69
 
-/** One copy of the ticker. Two sit side-by-side so the -50% translate loops seamlessly. */
+/** One copy of the ticker. Two sit side-by-side so the -50% translate loops seamlessly.
+ *  Each phrase is followed by a perfectly round, centred bold black bullet (a real
+ *  circle, not a glyph, so it's symmetric at any size) → "OWN YOUR CLOUD • …". */
 function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
   return (
     <div className="flex shrink-0 items-center" aria-hidden={ariaHidden}>
-      {Array.from({ length: 10 }).map((_, i) => (
+      {Array.from({ length: 12 }).map((_, i) => (
         <span key={i} className="flex items-center">
-          <span className="whitespace-nowrap px-8 font-mono font-bold uppercase tracking-[0.22em] text-black">
+          <span
+            className="whitespace-nowrap px-8 font-bold uppercase tracking-[0.22em] text-black"
+            style={{ WebkitTextStroke: "0.7px #000" }}
+          >
             {PHRASE}
           </span>
-          <span className="text-black/70">&middot;</span>
+          <span aria-hidden className="inline-block shrink-0 rounded-full bg-black" style={{ width: "0.42em", height: "0.42em" }} />
         </span>
       ))}
     </div>
@@ -39,7 +44,7 @@ function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
 
 export function MarqueeBanner() {
   return (
-    <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-16 pb-28 sm:pt-24 sm:pb-36">
+    <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 pb-12 sm:pt-6 sm:pb-16">
       {/* The element keeps the shape's native aspect ratio so the tabs aren't distorted. */}
       <div className="relative w-full" style={{ aspectRatio: "2048 / 69" }}>
         {/* White banner with a clean thin black outline. */}
@@ -53,10 +58,10 @@ export function MarqueeBanner() {
         </svg>
 
         {/* Scrolling ticker, confined to the solid strip band (full-width, no tabs).
-            Font is 30% smaller than before and black. */}
+            Bold black text + round bullets; sized to fill the strip without bleeding. */}
         <div
           className="absolute inset-x-0 overflow-hidden"
-          style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(6px, 0.64vw, 10px)" }}
+          style={{ top: STRIP_TOP, height: STRIP_HEIGHT, fontSize: "clamp(3px, 0.8vw, 12px)" }}
         >
           <div className="flex h-full w-max items-center animate-[marquee_30s_linear_infinite] motion-reduce:animate-none">
             <Track />

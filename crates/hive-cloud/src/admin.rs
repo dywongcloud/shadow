@@ -886,9 +886,21 @@ async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<
 
 async fn dep_create(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     Json(req): Json<fluid_core::DeployRequest>,
 ) -> Json<Value> {
-    let info = c.gw.deploy(req.root, req.manifest);
+    // Tag the deployment (and the cells it spawns) with the caller's tenant so
+    // compute is partitioned per team — mirrors gw.deploy()'s defaults otherwise.
+    let t = tenant(&c, &headers);
+    let info = c.gw.deploy_full(
+        req.root,
+        req.manifest,
+        "you".into(),
+        None,
+        true,
+        fluid_core::DeployState::Ready,
+        t,
+    );
     // Persist so the deployment survives a node restart (without this it lived
     // only in memory and was lost on reboot).
     crate::persist::persist(&c);
@@ -926,23 +938,36 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
 }
 
 /// Delete a single deployment (unregisters its functions).
-async fn dep_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn dep_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    // Ownership: a deployment belongs to its project's team. If it exists but
+    // isn't ours, 404 (don't disclose another tenant's resource). If it doesn't
+    // exist, fall through to the idempotent no-op remove (unchanged behavior).
+    if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
+        if norm(&c.projects.team_of(&d.project)) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
     let project = c.gw.remove(&id).await;
     if let Some(p) = &project {
         record_event(&c, p, "delete", &format!("deleted deployment {id}"));
     }
     crate::persist::persist(&c);
-    Json(json!({ "removed": id, "project": project }))
+    Ok(Json(json!({ "removed": id, "project": project })))
 }
 
 /// Delete an entire project: all its deployments + settings.
-async fn project_delete(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+async fn project_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(project): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    if norm(&c.projects.team_of(&project)) != t {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let ids = c.gw.remove_project(&project).await;
     record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
     c.projects.remove(&project);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
-    Json(json!({ "project": project, "removed_deployments": ids }))
+    Ok(Json(json!({ "project": project, "removed_deployments": ids })))
 }
 
 /// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
@@ -1774,8 +1799,12 @@ async fn webhook_events() -> Json<Value> {
     Json(json!(crate::webhooks::ALL_EVENTS))
 }
 
-async fn webhooks_all(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.webhooks.list(None)))
+async fn webhooks_all(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+    // Only the caller's own webhooks (the payload includes signing secrets, so
+    // this must be tenant-scoped).
+    let t = tenant(&c, &headers);
+    let list: Vec<_> = c.webhooks.snapshot().into_iter().filter(|w| norm(&w.team) == t).collect();
+    Json(json!(list))
 }
 
 #[derive(Deserialize)]
@@ -1788,7 +1817,8 @@ struct CreateTeamWebhook {
     projects: Vec<String>,
 }
 
-async fn webhook_create_team(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeamWebhook>) -> Json<Value> {
+async fn webhook_create_team(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(b): Json<CreateTeamWebhook>) -> Json<Value> {
+    let t = tenant(&c, &headers);
     let targets: Vec<String> = if b.projects.is_empty() || b.projects.iter().any(|p| p == "*") {
         vec!["*".into()]
     } else {
@@ -1798,6 +1828,7 @@ async fn webhook_create_team(State(c): State<Arc<CloudState>>, Json(b): Json<Cre
     for p in targets {
         created.push(c.webhooks.add(crate::webhooks::Webhook {
             id: String::new(),
+            team: t.clone(),
             project: p,
             url: b.url.clone(),
             events: b.events.clone(),
@@ -1810,7 +1841,12 @@ async fn webhook_create_team(State(c): State<Arc<CloudState>>, Json(b): Json<Cre
     Json(json!(created))
 }
 
-async fn webhooks_for_project(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
+async fn webhooks_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(project): Path<String>) -> Json<Value> {
+    // Don't expose another tenant's project webhooks (incl. their secrets).
+    let t = tenant(&c, &headers);
+    if norm(&c.projects.team_of(&project)) != t {
+        return Json(json!([]));
+    }
     Json(json!(c.webhooks.list(Some(&project))))
 }
 
@@ -1823,11 +1859,18 @@ struct CreateWebhook {
 
 async fn webhook_create(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     Path(project): Path<String>,
     Json(b): Json<CreateWebhook>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
+    // A webhook may only be attached to a project the caller owns.
+    let t = tenant(&c, &headers);
+    if norm(&c.projects.team_of(&project)) != t {
+        return Err(StatusCode::NOT_FOUND);
+    }
     let wh = c.webhooks.add(crate::webhooks::Webhook {
         id: String::new(),
+        team: t,
         project,
         url: b.url,
         events: b.events,
@@ -1836,13 +1879,19 @@ async fn webhook_create(
         created_ms: 0,
     });
     crate::persist::persist(&c);
-    Json(json!(wh))
+    Ok(Json(json!(wh)))
 }
 
-async fn webhook_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn webhook_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    if let Some(w) = c.webhooks.snapshot().into_iter().find(|w| w.id == id) {
+        if norm(&w.team) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
     c.webhooks.remove(&id);
     crate::persist::persist(&c);
-    Json(json!({ "removed": id }))
+    Ok(Json(json!({ "removed": id })))
 }
 
 async fn webhook_deliveries(State(c): State<Arc<CloudState>>) -> Json<Value> {
@@ -1877,12 +1926,23 @@ async fn databases_for_project(State(c): State<Arc<CloudState>>, headers: Header
     Json(json!(c.databases.list(Some(&project))))
 }
 
-async fn database_get(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
-    c.databases.get(&id).map(|d| Json(json!(d))).ok_or(StatusCode::NOT_FOUND)
+async fn database_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    let d = c.databases.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if norm(&d.team) != t {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!(d)))
 }
 
-async fn database_credentials(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
-    c.databases.get_raw(&id).map(|d| Json(json!(d))).ok_or(StatusCode::NOT_FOUND)
+async fn database_credentials(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    // Returns unmasked connection secrets — must be strictly tenant-scoped.
+    let t = tenant(&c, &headers);
+    let d = c.databases.get_raw(&id).ok_or(StatusCode::NOT_FOUND)?;
+    if norm(&d.team) != t {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!(d)))
 }
 
 async fn database_create(
@@ -1914,8 +1974,12 @@ async fn database_create(
     Json(json!(db))
 }
 
-async fn database_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn database_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
     if let Some(d) = c.databases.get_raw(&id) {
+        if norm(&d.team) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
         if let Some(container) = d.container {
             // Best-effort teardown of the backing container.
             let _ = tokio::process::Command::new("podman")
@@ -1929,7 +1993,7 @@ async fn database_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String
     }
     c.databases.remove_db(&id);
     crate::persist::persist(&c);
-    Json(json!({ "removed": id }))
+    Ok(Json(json!({ "removed": id })))
 }
 
 // ---- Functional storage REST (Blob / Queue / Vector) ----
@@ -2124,9 +2188,15 @@ async fn securelink_create(
     Ok(Json(json!(rec)))
 }
 
-async fn securelink_delete(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn securelink_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers);
+    if let Some(l) = c.securelinks.all().into_iter().find(|l| l.id == id) {
+        if norm(&l.team) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
     c.securelinks.remove(&id);
-    Json(json!({ "removed": id }))
+    Ok(Json(json!({ "removed": id })))
 }
 
 // ============================ Monitoring ============================
@@ -2719,8 +2789,14 @@ async fn data_delete(
 /// frontends, or the JSON/text body for backend services.
 async fn project_preview(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     Path(project): Path<String>,
 ) -> Json<Value> {
+    // Don't render another tenant's app content as a preview.
+    let t = tenant(&c, &headers);
+    if norm(&c.projects.team_of(&project)) != t {
+        return Json(json!({ "kind": "none" }));
+    }
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
         .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {

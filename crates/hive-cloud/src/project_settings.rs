@@ -273,3 +273,73 @@ impl Default for ProjectStore {
 // NOTE: the Function Regions catalog is no longer a static Vercel-style table.
 // It is built dynamically in `admin::region_catalog` from the live mesh — the
 // real regions where P2P nodes report their lat/lon, auto-grouped by continent.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ev(key: &str, value: &str, sensitive: bool) -> EnvVar {
+        EnvVar { key: key.into(), value: value.into(), target: "all".into(), sensitive, updated_ms: 0 }
+    }
+
+    #[test]
+    fn put_env_then_read_and_replace() {
+        let s = ProjectStore::new();
+        s.put_env("app", ev("FOO", "bar", false));
+        let m = s.env_map("app");
+        assert_eq!(m.get("FOO").map(|v| v.as_str()), Some("bar"));
+        // Same key+target replaces rather than duplicates.
+        s.put_env("app", ev("FOO", "baz", false));
+        assert_eq!(s.get("app").env.iter().filter(|e| e.key == "FOO").count(), 1);
+        assert_eq!(s.env_map("app").get("FOO").map(|v| v.as_str()), Some("baz"));
+    }
+
+    #[test]
+    fn sensitive_value_is_encrypted_at_rest_masked_and_decrypted_for_runtime() {
+        let s = ProjectStore::new();
+        s.put_env("app", ev("API_TOKEN", "supersecret", true));
+        // Stored at rest: not plaintext (encrypted blob).
+        let stored = s.get("app").env.iter().find(|e| e.key == "API_TOKEN").unwrap().value.clone();
+        assert_ne!(stored, "supersecret");
+        assert!(crate::secrets::is_encrypted(&stored), "sensitive env sealed at rest");
+        // Masked view blanks the value.
+        let masked = s.get_masked("app").env.iter().find(|e| e.key == "API_TOKEN").unwrap().value.clone();
+        assert_eq!(masked, "");
+        // Runtime injection decrypts back to plaintext.
+        assert_eq!(s.env_map("app").get("API_TOKEN").map(|v| v.as_str()), Some("supersecret"));
+    }
+
+    #[test]
+    fn delete_env_removes_key() {
+        let s = ProjectStore::new();
+        s.put_env("app", ev("A", "1", false));
+        s.put_env("app", ev("B", "2", false));
+        s.delete_env("app", "A");
+        let keys: Vec<_> = s.get("app").env.iter().map(|e| e.key.clone()).collect();
+        assert_eq!(keys, vec!["B"]);
+    }
+
+    #[test]
+    fn root_dir_production_branch_and_team_accessors() {
+        let s = ProjectStore::new();
+        assert_eq!(s.root_dir_of("app"), "");
+        s.set_root_dir("app", "examples/nextjs");
+        assert_eq!(s.root_dir_of("app"), "examples/nextjs");
+        s.set_production_branch("app", "main");
+        assert_eq!(s.production_branch_of("app"), "main");
+        // default team is "personal" until set.
+        assert_eq!(s.team_of("app"), "personal");
+        s.set_team("app", "acme");
+        assert_eq!(s.team_of("app"), "acme");
+    }
+
+    #[test]
+    fn snapshot_load_roundtrip_preserves_sealed_env() {
+        let s = ProjectStore::new();
+        s.put_env("app", ev("SECRET", "v", true));
+        let snap = s.snapshot();
+        let s2 = ProjectStore::new();
+        s2.load(snap);
+        assert_eq!(s2.env_map("app").get("SECRET").map(|v| v.as_str()), Some("v"));
+    }
+}

@@ -1,10 +1,13 @@
 /* shadw service worker — makes the app installable + resilient offline.
  *
  * Deliberately conservative: API / proxy / auth requests are NEVER cached
- * (always hit the network), navigations are network-first with an offline
- * fallback, and only static assets are cached (stale-while-revalidate). */
+ * (always hit the network), navigations AND app code (JS/CSS) are network-first
+ * — so the latest build always loads and a stale cached bundle can never pin an
+ * old UI (which previously left mobile showing an outdated dashboard). Only
+ * media/fonts are cached stale-while-revalidate. Cache is the offline fallback.
+ * Bump VERSION to evict every prior cache on activate. */
 
-const VERSION = "shadw-v1";
+const VERSION = "shadw-v2";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
 const PRECACHE = [
   "/offline.html",
@@ -50,12 +53,32 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Static assets: serve from cache fast, refresh in the background.
-  const isStatic =
-    url.pathname.startsWith("/_next/static/") ||
+  // App CODE (JS/CSS/source-maps): NETWORK-FIRST. The freshest build always wins
+  // when online; the cache is only an offline fallback. This stops a stale cached
+  // bundle from rendering an outdated UI when chunk URLs aren't content-hashed
+  // (e.g. on the dev/preview server).
+  const isCode = /\.(?:js|css|map)$/.test(url.pathname);
+  if (isCode) {
+    event.respondWith(
+      caches.open(STATIC_CACHE).then(async (cache) => {
+        try {
+          const res = await fetch(req);
+          if (res && res.status === 200 && res.type === "basic") cache.put(req, res.clone());
+          return res;
+        } catch {
+          const cached = await cache.match(req);
+          return cached || Response.error();
+        }
+      })
+    );
+    return;
+  }
+
+  // Media / fonts: stale-while-revalidate (safe to serve fast, refresh in bg).
+  const isMedia =
     url.pathname.startsWith("/fonts/") ||
-    /\.(?:png|svg|jpg|jpeg|webp|gif|ico|woff2?|css|js|map)$/.test(url.pathname);
-  if (isStatic) {
+    /\.(?:png|svg|jpg|jpeg|webp|gif|ico|woff2?)$/.test(url.pathname);
+  if (isMedia) {
     event.respondWith(
       caches.open(STATIC_CACHE).then(async (cache) => {
         const cached = await cache.match(req);

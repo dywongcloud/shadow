@@ -41,6 +41,10 @@ struct Instance {
 /// Everything needed to (re)launch instances of one function.
 struct FunctionPool {
     cfg: FunctionConfig,
+    /// Owning team/tenant (normalized; empty => "personal"). Every cell this pool
+    /// spawns is tagged with it, and per-tenant instance quotas sum across all
+    /// pools sharing this tenant.
+    tenant: String,
     /// Image / rootfs name for cells of this function.
     image: String,
     /// Working dir for the function process (host path for mock backend).
@@ -80,6 +84,8 @@ pub struct FunctionStats {
     pub max_concurrency: u32,
     pub min_instances: u32,
     pub max_instances: u32,
+    /// Owning team/tenant (normalized; "personal" when unset).
+    pub tenant: String,
     // ---- cost metering ----
     pub requests: u64,
     /// What traditional 1:1 serverless would bill (instance-seconds).
@@ -96,6 +102,11 @@ pub struct FluidConfig {
     pub autoscaler_interval: Duration,
     /// How long `lease` waits for a slot before giving up (backpressure).
     pub lease_timeout: Duration,
+    /// Max total live instances ONE tenant may hold across all of its function
+    /// pools (multi-tenant fairness — stops a single team monopolizing a node).
+    /// 0 = unlimited. Over-quota leases get backpressure (Saturated), never a
+    /// cross-tenant eviction.
+    pub max_instances_per_tenant: u32,
 }
 
 impl Default for FluidConfig {
@@ -103,6 +114,7 @@ impl Default for FluidConfig {
         FluidConfig {
             autoscaler_interval: Duration::from_millis(500),
             lease_timeout: Duration::from_secs(20),
+            max_instances_per_tenant: 0,
         }
     }
 }
@@ -116,6 +128,11 @@ pub struct Fluid {
 /// Compose the per-function key.
 pub fn func_key(deployment: &str, function: &str) -> String {
     format!("{deployment}/{function}")
+}
+
+/// Normalize an owner slug: empty => "personal" (matches the control layer).
+fn norm_tenant(t: String) -> String {
+    if t.trim().is_empty() { "personal".into() } else { t }
 }
 
 impl Fluid {
@@ -132,14 +149,17 @@ impl Fluid {
         fluid
     }
 
-    /// Register (or replace) a function pool. Does not provision yet; the
-    /// autoscaler will bring up `min_instances`.
-    pub fn register(&self, key: String, cfg: FunctionConfig, image: String, workdir: String) {
+    /// Register (or replace) a function pool owned by `tenant` (empty =>
+    /// "personal"). Does not provision yet; the autoscaler will bring up
+    /// `min_instances`.
+    pub fn register(&self, key: String, cfg: FunctionConfig, image: String, workdir: String, tenant: String) {
+        let tenant = norm_tenant(tenant);
         let mut reg = self.registry.lock();
         reg.insert(
             key,
             FunctionPool {
                 cfg,
+                tenant,
                 image,
                 workdir,
                 instances: Vec::new(),
@@ -150,6 +170,18 @@ impl Fluid {
                 dead_reaped: 0,
             },
         );
+    }
+
+    /// The owning tenant of a function pool (normalized), if registered.
+    pub fn tenant_of(&self, key: &str) -> Option<String> {
+        self.registry.lock().get(key).map(|p| p.tenant.clone())
+    }
+
+    /// Total live instances (running + provisioning) a tenant currently holds
+    /// across all of its function pools.
+    pub fn tenant_live_instances(&self, tenant: &str) -> u32 {
+        let t = norm_tenant(tenant.to_string());
+        self.registry.lock().values().filter(|p| p.tenant == t).map(|p| p.live_count()).sum()
     }
 
     /// Max invocation duration configured for a function (seconds).
@@ -184,6 +216,7 @@ impl Fluid {
                     max_concurrency: p.cfg.max_concurrency,
                     min_instances: p.cfg.min_instances,
                     max_instances: p.cfg.max_instances,
+                    tenant: p.tenant.clone(),
                     requests: p.requests,
                     traditional_ms,
                     fluid_ms,
@@ -245,38 +278,51 @@ impl Fluid {
 
     fn decide_lease(&self, key: &str) -> anyhow::Result<LeaseDecision> {
         let mut reg = self.registry.lock();
-        let pool = match reg.get_mut(key) {
-            Some(p) => p,
+        // Existence + per-function knobs (we re-`get` below to dodge borrow
+        // conflicts; the registry lock is held throughout, so the key can't vanish).
+        let (max_c, max_instances) = match reg.get(key) {
+            Some(p) => (p.cfg.max_concurrency, p.cfg.max_instances),
             None => return Ok(LeaseDecision::NotFound),
         };
-        let max_c = pool.cfg.max_concurrency;
-        // Least-loaded instance with a free slot.
-        let pick = pool
-            .instances
-            .iter_mut()
-            .filter(|i| !i.draining && i.inflight < max_c)
-            .min_by_key(|i| i.inflight);
-        if let Some(inst) = pick {
-            inst.inflight += 1;
-            inst.last_active_ms = now_ms();
-            return Ok(LeaseDecision::Ready {
-                cell_id: inst.cell_id.clone(),
-                endpoint: inst.endpoint.clone(),
-            });
+        // Reuse the least-loaded instance with a free slot.
+        {
+            let pool = reg.get_mut(key).expect("key present under held lock");
+            if let Some(inst) = pool
+                .instances
+                .iter_mut()
+                .filter(|i| !i.draining && i.inflight < max_c)
+                .min_by_key(|i| i.inflight)
+            {
+                inst.inflight += 1;
+                inst.last_active_ms = now_ms();
+                return Ok(LeaseDecision::Ready {
+                    cell_id: inst.cell_id.clone(),
+                    endpoint: inst.endpoint.clone(),
+                });
+            }
         }
-        // All full: cold-start if under the ceiling.
-        if pool.live_count() < pool.cfg.max_instances {
-            pool.provisioning += 1;
-            Ok(LeaseDecision::ColdStart)
-        } else {
-            Ok(LeaseDecision::Saturated)
+        // All full: this pool must be under its OWN ceiling to cold-start.
+        if reg.get(key).expect("present").live_count() >= max_instances {
+            return Ok(LeaseDecision::Saturated);
         }
+        // ...and the owning tenant must be under its cross-pool instance quota.
+        // Backpressure (Saturated), never a cross-tenant eviction, so one team
+        // can't starve another off a shared node.
+        if self.cfg.max_instances_per_tenant > 0 {
+            let tenant = reg.get(key).expect("present").tenant.clone();
+            let tenant_live: u32 = reg.values().filter(|p| p.tenant == tenant).map(|p| p.live_count()).sum();
+            if tenant_live >= self.cfg.max_instances_per_tenant {
+                return Ok(LeaseDecision::Saturated);
+            }
+        }
+        reg.get_mut(key).expect("present").provisioning += 1;
+        Ok(LeaseDecision::ColdStart)
     }
 
     /// Provision a cell and start the function in it. `provisioning` was already
     /// incremented by the caller; on success we add the instance with inflight=1.
     async fn cold_start(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
-        let (image, launch, mem) = {
+        let (image, launch, mem, tenant) = {
             let reg = self.registry.lock();
             let pool = reg.get(key).ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
             let port = free_port()?;
@@ -287,7 +333,7 @@ impl Fluid {
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
             };
-            (pool.image.clone(), launch, pool.cfg.memory_mib)
+            (pool.image.clone(), launch, pool.cfg.memory_mib, pool.tenant.clone())
         };
 
         let spec = CellSpec {
@@ -299,6 +345,7 @@ impl Fluid {
                 disk_mib: 1024,
                 timeout_secs: 0,
             },
+            tenant,
         };
         debug!(func = %key, cell = %spec.id, "cold-starting function instance");
         let handle = self.backend.provision(&spec).await?;

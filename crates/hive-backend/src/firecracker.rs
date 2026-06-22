@@ -110,7 +110,12 @@ impl CellBackend for FirecrackerBackend {
             self.cfg.firecracker_bin.display()
         );
 
-        let run_dir = self.cfg.run_dir.join(spec.id.as_str());
+        // Per-tenant run dir (`<run_dir>/<tenant>/<cell-id>`) so each team's VM
+        // sockets / overlays / console logs are isolated on the host. (The VM
+        // itself is already isolated by its own kernel + per-cell vsock; this
+        // partitions the host-side artifacts too.) Empty tenant => "personal".
+        let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
+        let run_dir = self.cfg.run_dir.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
         tokio::fs::create_dir_all(&run_dir).await?;
 
         let api_sock = run_dir.join("api.sock");

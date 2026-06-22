@@ -37,7 +37,7 @@ const ServiceGraph = dynamic(
     ),
   }
 );
-import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
+import { apiGet, apiSend, usePoll, type Build, type Deployment, type Overview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
 
@@ -55,8 +55,50 @@ export default function ProjectDetail({ params }: { params: { project: string } 
   const [busy, setBusy] = useState("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
+  // A redeploy doesn't create a deployment row until its build FINISHES (the live
+  // version keeps serving meanwhile), so the table looked frozen after pressing
+  // Redeploy. Show an immediate optimistic "Building" row keyed by the build id;
+  // when that build reaches ready/error we refresh (the REAL deployment row — a
+  // DIFFERENT id from the build id — appears) and drop the optimistic one.
+  const [pending, setPending] = useState<{ id: string; env: "production" | "preview"; at: number }[]>([]);
+  const pendingKey = pending.map((p) => p.id).join(",");
 
   const mine = (deps ?? []).filter((d) => d.project === name);
+  const pendingRows = pending;
+
+  // Poll each in-flight redeploy build; on completion refresh the table (so the
+  // real deployment row lands) and remove the optimistic row.
+  useEffect(() => {
+    if (!pendingKey) return;
+    let stop = false;
+    const ids = pendingKey.split(",");
+    const poll = async () => {
+      for (const id of ids) {
+        try {
+          const b = await apiGet<Build>(`/v1/builds/${id}`);
+          if (!stop && (b.state === "ready" || b.state === "error")) {
+            await refresh();
+            if (!stop) setPending((cur) => cur.filter((x) => x.id !== id));
+          }
+        } catch {
+          /* build record not visible yet — keep polling */
+        }
+      }
+    };
+    poll();
+    const t = setInterval(poll, 1500);
+    return () => {
+      stop = true;
+      clearInterval(t);
+    };
+  }, [pendingKey, refresh]);
+
+  // Safety valve: drop any optimistic row that never resolved within 5 min.
+  useEffect(() => {
+    if (!pending.length) return;
+    const t = setInterval(() => setPending((cur) => cur.filter((x) => Date.now() - x.at < 5 * 60_000)), 30_000);
+    return () => clearInterval(t);
+  }, [pending.length]);
   const prod = mine.find((d) => d.production) ?? mine[0];
   const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
 
@@ -269,7 +311,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         {/* Deployments toolbar: per-deployment actions (rollback / redeploy / delete)
             now live in the "⋯" menu at the end of each row. */}
         <div className="flex flex-wrap items-center justify-between gap-2">
-          <span className="text-sm text-secondary">{mine.length} deployment{mine.length === 1 ? "" : "s"}</span>
+          <span className="text-sm text-secondary">{mine.length + pendingRows.length} deployment{mine.length + pendingRows.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
             <Link href={`/new?repo=${encodeURIComponent(prod?.git?.repo_url ?? "")}`}>
               <Button><Plus className="h-4 w-4" /> New Deployment</Button>
@@ -281,6 +323,27 @@ export default function ProjectDetail({ params }: { params: { project: string } 
             <tr><Th className="px-2">Deployment</Th><Th className="px-2">Status</Th><Th className="px-2">Environment</Th><Th className="px-2">Source</Th><Th className="px-2">Created</Th><Th className="px-2">By</Th><Th className="px-2"></Th></tr>
           </thead>
           <tbody>
+            {/* Optimistic "Building" rows for in-flight redeploys (immediate
+                feedback). Replaced by the real row once the build finishes. */}
+            {pendingRows.map((p) => (
+              <tr key={p.id} className="animate-pulse">
+                <Td className="px-2 font-mono text-xs">
+                  <a className="text-link hover:underline" href={`/deploy/${p.id}`}>{p.id}</a>
+                </Td>
+                <Td className="px-2">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" /> building
+                  </span>
+                </Td>
+                <Td className="px-2">{p.env === "production" ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}</Td>
+                <Td className="px-2 font-mono text-xs text-secondary">
+                  <span className="inline-flex items-center gap-1"><RefreshCw className="h-3.5 w-3.5" /> redeploy</span>
+                </Td>
+                <Td className="px-2 text-secondary">just now</Td>
+                <Td className="px-2 text-secondary">you</Td>
+                <Td className="px-2"></Td>
+              </tr>
+            ))}
             {mine.map((d) => (
               <tr key={d.id}>
                 {/* Link to this deployment's OWN immutable URL (commit URL / id
@@ -328,7 +391,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 </Td>
               </tr>
             ))}
-            {!mine.length && <tr><Td className="text-secondary">No deployments.</Td></tr>}
+            {!mine.length && !pendingRows.length && <tr><Td className="text-secondary">No deployments.</Td></tr>}
           </tbody>
         </Table>
         </div>
@@ -339,7 +402,13 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           deployment={redeployFor}
           prodAlias={prod?.alias || `${name}.localhost`}
           onClose={() => setRedeployFor(null)}
-          onDone={() => refresh()}
+          onDone={(buildId, env) => {
+            // Show the building row immediately, jump to the deployments tab so
+            // it's visible, and refresh (the real row replaces it when ready).
+            setPending((p) => [{ id: buildId, env, at: Date.now() }, ...p]);
+            setTab("deployments");
+            refresh();
+          }}
         />
       )}
     </div>

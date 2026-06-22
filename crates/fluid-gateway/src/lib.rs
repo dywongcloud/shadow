@@ -97,10 +97,13 @@ impl Gateway {
     /// Register a deployment: wire its functions into the Fluid pool and make it
     /// routable. Becomes the default (most-recent) deployment.
     pub fn deploy(&self, root: String, manifest: Manifest) -> DeploymentInfo {
-        self.deploy_full(root, manifest, "you".into(), None, true, fluid_core::DeployState::Ready)
+        self.deploy_full(root, manifest, "you".into(), None, true, fluid_core::DeployState::Ready, String::new())
     }
 
-    /// Full deploy with creator + git provenance + production flag.
+    /// Full deploy with creator + git provenance + production flag + owning tenant.
+    /// `tenant` (empty = "personal") tags the deployment and every function pool /
+    /// cell it spawns, so compute is partitioned and quota'd per team.
+    #[allow(clippy::too_many_arguments)]
     pub fn deploy_full(
         &self,
         root: String,
@@ -109,13 +112,17 @@ impl Gateway {
         git: Option<fluid_core::GitSource>,
         production: bool,
         state: fluid_core::DeployState,
+        tenant: String,
     ) -> DeploymentInfo {
+        // Normalize the owner once at the boundary so the stored record, the
+        // function pools, and every cell agree on the tenant (empty => "personal").
+        let tenant = if tenant.trim().is_empty() { "personal".to_string() } else { tenant };
         let id = DeploymentId::new();
         let workdir_root = root.clone();
         for f in &manifest.functions {
             let key = func_key(id.as_str(), &f.name);
             self.fluid
-                .register(key, f.clone(), self.image.clone(), workdir_root.clone());
+                .register(key, f.clone(), self.image.clone(), workdir_root.clone(), tenant.clone());
         }
         let dep = Deployment {
             id: id.clone(),
@@ -129,6 +136,7 @@ impl Gateway {
             production,
             // The build target is immutable; `production` (promoted) may later flip.
             target: if production { "production".into() } else { "preview".into() },
+            tenant,
         };
         let info = view_of(&dep);
         let project = dep.project.clone();
@@ -294,6 +302,7 @@ impl Gateway {
                 production: d.production,
                 target: d.target.clone(),
                 state: d.state,
+                tenant: d.tenant.clone(),
             })
             .collect()
     }
@@ -304,7 +313,7 @@ impl Gateway {
         let id = DeploymentId::from(rec.id.clone());
         for f in &rec.manifest.functions {
             let key = func_key(id.as_str(), &f.name);
-            self.fluid.register(key, f.clone(), self.image.clone(), rec.root.clone());
+            self.fluid.register(key, f.clone(), self.image.clone(), rec.root.clone(), rec.tenant.clone());
         }
         let dep = Deployment {
             id: id.clone(),
@@ -322,6 +331,7 @@ impl Gateway {
             } else {
                 rec.target
             },
+            tenant: rec.tenant,
         };
         let project = dep.project.clone();
         let mut st = self.state.lock();
@@ -898,6 +908,7 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
             edge_functions: d.manifest.edge_function_count(),
             serverless_functions: d.manifest.functions.iter().filter(|f| f.runtime != "edge").count(),
         },
+        tenant: d.tenant.clone(),
     }
 }
 

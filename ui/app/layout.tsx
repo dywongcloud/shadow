@@ -1,7 +1,7 @@
 import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
-import { Space_Grotesk } from "next/font/google";
+import { Space_Grotesk, Electrolize } from "next/font/google";
 import { ClerkProvider, SignedIn } from "@clerk/nextjs";
 import "./globals.css";
 import { TopNav } from "@/components/topnav";
@@ -15,6 +15,8 @@ import { Toaster } from "@/components/toast";
 
 // Sleek geometric tech typeface for the Shadow brand wordmark + landing.
 const display = Space_Grotesk({ subsets: ["latin"], variable: "--font-display", display: "swap" });
+// Electrolize — the marketing/landing surface's primary typeface (single 400 weight).
+const electrolize = Electrolize({ subsets: ["latin"], weight: "400", variable: "--font-electrolize", display: "swap" });
 
 export const metadata: Metadata = {
   title: "shadw — Beyond the Edge are Shadows",
@@ -39,6 +41,14 @@ export const viewport: Viewport = {
   ],
 };
 
+// Render per-request (never statically). The layout's chrome is auth-dependent
+// (`<SignedIn>` TopNav/Footer) and the home route flips Landing↔Dashboard on auth,
+// so static rendering would SSR a signed-OUT page for everyone — producing the
+// landing→dashboard flash, a hydration mismatch, and a missing TopNav until the
+// client re-rendered. Forcing dynamic makes Clerk's SSR use the real request auth,
+// so the server renders the correct, already-signed-in chrome + content.
+export const dynamic = "force-dynamic";
+
 // Clerk is enabled when a publishable key is present; otherwise the app runs in
 // local mode (no auth) so it still works without keys.
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
@@ -60,7 +70,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     <html
       lang="en"
       suppressHydrationWarning
-      className={`${GeistSans.variable} ${GeistMono.variable} ${display.variable}`}
+      className={`${GeistSans.variable} ${GeistMono.variable} ${display.variable} ${electrolize.variable}`}
     >
       <body className="flex min-h-screen flex-col bg-bg font-sans text-fg antialiased">
         <PwaRegister />

@@ -6,6 +6,7 @@ import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
 import { Button, Input, Triangle, PageHeader } from "@/components/ui";
 import { apiSend, usePoll, type WorkflowRun, type WorkflowSummaryRow, type WorkflowDef } from "@/lib/api";
 import { StatusChips, RunsTable } from "@/components/workflows";
+import { WorkflowDefGraph } from "@/components/workflow-graph";
 
 const RANGES: Record<string, number> = {
   "Last 1 hour": 3600_000,
@@ -125,27 +126,49 @@ export default function WorkflowsPage() {
 
 type WdkView = "runs" | "workflows" | "hooks";
 
-/** The "Workflows" definitions view (enabled + visible, unlike WDK's default). */
+/** The "Workflows" definitions view (enabled + visible, unlike WDK's default).
+ *  Workflows ingested from a deployed app's Vercel WDK manifest carry a `graph`,
+ *  which we render on the canvas (Vercel web-dashboard style) via "Diagram". */
 function WorkflowsView({ defs }: { defs: WorkflowDef[] }) {
+  const [openId, setOpenId] = useState<string | null>(null);
   async function run(id: string) {
     await apiSend("POST", `/v1/workflows/${encodeURIComponent(id)}/run`).catch(() => {});
   }
+  const open = defs.find((d) => d.id === openId) || null;
   return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
-      <div className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-        <span>Workflow</span><span>Project</span><span>Steps</span><span></span>
+    <div className="space-y-4">
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
+          <span>Workflow</span><span>Project</span><span>Steps</span><span></span>
+        </div>
+        {defs.length === 0 ? (
+          <div className="px-4 py-12 text-center text-sm text-secondary">No workflows defined yet — deploy an app using the Vercel WDK, or use “New Workflow”.</div>
+        ) : (
+          defs.map((d) => {
+            const hasGraph = !!(d.graph && d.graph.nodes && d.graph.nodes.length);
+            return (
+              <div key={d.id} className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] items-center gap-3 border-b border-border px-4 py-3 text-sm last:border-0">
+                <span className="truncate font-mono font-medium">{d.name}</span>
+                <span className="truncate text-secondary">{d.project || "default"}</span>
+                <span className="truncate font-mono text-xs text-muted">{d.steps.map((s) => s.name).join(" → ") || (hasGraph ? `${d.graph!.nodes.length} node(s)` : "—")}</span>
+                <div className="flex gap-2">
+                  {hasGraph && (
+                    <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => setOpenId(openId === d.id ? null : d.id)}>
+                      {openId === d.id ? "Hide" : "Diagram"}
+                    </Button>
+                  )}
+                  <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => run(d.id)}>Run</Button>
+                </div>
+              </div>
+            );
+          })
+        )}
       </div>
-      {defs.length === 0 ? (
-        <div className="px-4 py-12 text-center text-sm text-secondary">No workflows defined yet. Use “New Workflow”.</div>
-      ) : (
-        defs.map((d) => (
-          <div key={d.id} className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] items-center gap-3 border-b border-border px-4 py-3 text-sm last:border-0">
-            <span className="truncate font-mono font-medium">{d.name}</span>
-            <span className="truncate text-secondary">{d.project || "default"}</span>
-            <span className="truncate font-mono text-xs text-muted">{d.steps.map((s) => s.name).join(" → ")}</span>
-            <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => run(d.id)}>Run</Button>
-          </div>
-        ))
+      {open && open.graph && (
+        <div>
+          <div className="mb-2 text-sm font-medium">{open.name} — workflow graph</div>
+          <WorkflowDefGraph def={open} />
+        </div>
       )}
     </div>
   );

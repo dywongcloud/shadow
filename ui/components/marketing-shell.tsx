@@ -2,7 +2,11 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Twitter, Github, Linkedin, Dribbble } from "lucide-react";
+import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
+import { Twitter, Github, Linkedin, Dribbble, Menu, X } from "lucide-react";
+
+const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
 
 /* ------------------------------------------------------------------ *
  * Shared chrome for the public marketing pages (Product, Solutions,
@@ -52,21 +56,45 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
 ];
 
 /* eslint-disable @next/next/no-img-element */
-function Logo({ className = "h-6" }: { className?: string }) {
-  return <img src="/shadw-logo-dark.png" alt="shadw" className={`${className} w-auto select-none`} />;
+function Logo({ className = "h-7" }: { className?: string }) {
+  // Wordmark is 1826×407 (≈ 4.49:1). Sized by height so it always fits the nav row
+  // and scales responsively; `w-auto` preserves the aspect ratio.
+  return <img src="/shadw-logo-wordmark.png" alt="shadw" className={`${className} w-auto select-none`} />;
 }
 
 export function MarketingShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
+  // Mobile nav menu (below lg, where the inline nav is hidden).
+  const [menuOpen, setMenuOpen] = useState(false);
+  // Close the menu on navigation.
+  useEffect(() => setMenuOpen(false), [pathname]);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setMenuOpen(false);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  // Lock background scroll while the full-screen menu overlay is open.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [menuOpen]);
+
   return (
-    <div className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-black text-white">
-      {/* Top nav */}
-      <header className="relative z-20 border-b border-cyan-400/40 bg-black/80 backdrop-blur">
+    <div
+      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-black text-white"
+      style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
+    >
+      {/* Top nav — blue lining matches the SVG globe's blue streaks (#218CFF). */}
+      <header className="relative z-30 border-b border-[#218cff]/50 bg-black/80 backdrop-blur">
         <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
-          <Link href="/"><Logo className="h-6" /></Link>
-          <nav className="hidden items-center gap-8 text-[15px] text-zinc-300 lg:flex">
+          <Link href="/" className="shrink-0"><Logo className="h-7 sm:h-8" /></Link>
+          <nav className="hidden items-center gap-8 font-semibold uppercase text-[18px] text-zinc-300 lg:flex">
             {MARKETING_NAV.map((n) => (
               <Link
                 key={n.href}
@@ -77,35 +105,99 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
               </Link>
             ))}
           </nav>
-          <Link
-            href="/sign-in"
-            className="rounded-full border border-white/30 px-5 py-2 text-sm text-white transition-colors hover:bg-white/10"
-          >
-            Login
-          </Link>
+          {/* Desktop: Login. Mobile/tablet: a hamburger toggling the menu below. */}
+          <div className="flex items-center gap-3">
+            <Link
+              href="/sign-in"
+              className="hidden rounded-full border border-white/30 px-5 py-2 font-semibold uppercase text-[16.8px] text-white transition-colors hover:bg-white/10 lg:inline-flex"
+            >
+              Login
+            </Link>
+            <button
+              type="button"
+              aria-label={menuOpen ? "Close menu" : "Open menu"}
+              aria-expanded={menuOpen}
+              onClick={() => setMenuOpen((o) => !o)}
+              className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10 lg:hidden"
+            >
+              {menuOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            </button>
+          </div>
         </div>
+
       </header>
+
+      {/* Mobile/tablet menu — FULL-SCREEN overlay with a close (X) top-right.
+          Portaled to <body> so it escapes the shell's `transform` ancestor (which
+          would otherwise make `position: fixed` resolve to the shell, not the
+          viewport) and covers the entire screen. */}
+      {menuOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div className="fixed inset-0 z-[200] flex flex-col bg-black text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
+            {/* Top bar: logo + close button (mirrors the navbar). */}
+            <div className="flex items-center justify-between border-b border-[#218cff]/50 px-6 py-4">
+              <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
+                <Logo className="h-7" />
+              </Link>
+              <button
+                type="button"
+                aria-label="Close menu"
+                onClick={() => setMenuOpen(false)}
+                className="inline-flex h-10 w-10 items-center justify-center rounded-md border border-white/20 text-white transition-colors hover:bg-white/10"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            {/* Links fill the rest of the screen. */}
+            <nav className="flex flex-1 flex-col overflow-y-auto px-6 py-6">
+              <ul className="flex flex-col">
+                {MARKETING_NAV.map((n) => (
+                  <li key={n.href}>
+                    <Link
+                      href={n.href}
+                      onClick={() => setMenuOpen(false)}
+                      className={`block border-b border-white/5 py-4 font-semibold uppercase text-[18px] transition-colors hover:text-white ${
+                        active(n.href) ? "text-white" : "text-zinc-300"
+                      }`}
+                    >
+                      {n.label}
+                    </Link>
+                  </li>
+                ))}
+              </ul>
+              <Link
+                href="/sign-in"
+                onClick={() => setMenuOpen(false)}
+                className="mt-8 inline-flex w-full items-center justify-center rounded-full border border-white/30 px-5 py-3 font-semibold uppercase text-[18px] text-white transition-colors hover:bg-white/10"
+              >
+                Login
+              </Link>
+            </nav>
+          </div>,
+          document.body
+        )}
 
       {children}
 
       {/* Footer */}
       <footer className="relative overflow-hidden bg-black">
         {/* Aurora glows rising from the bottom edge — light blue, aqua, turquoise,
-            indigo and pink fuchsia. */}
+            indigo and pink fuchsia. Dimmer + slightly larger radii for softer wash. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]">
-          <div className="absolute -bottom-44 left-[6%] h-96 w-96 rounded-full bg-teal-400/25 blur-[120px]" />
-          <div className="absolute -bottom-52 left-[33%] h-[30rem] w-[30rem] rounded-full bg-indigo-600/30 blur-[130px]" />
-          <div className="absolute -bottom-44 left-[55%] h-96 w-96 rounded-full bg-fuchsia-600/20 blur-[120px]" />
-          <div className="absolute -bottom-48 right-[6%] h-[26rem] w-[26rem] rounded-full bg-cyan-400/20 blur-[120px]" />
+          <div className="absolute -bottom-44 left-[6%] h-[25.2rem] w-[25.2rem] rounded-full bg-teal-400/36 blur-[126px]" />
+          <div className="absolute -bottom-52 left-[33%] h-[31.5rem] w-[31.5rem] rounded-full bg-indigo-600/45 blur-[137px]" />
+          <div className="absolute -bottom-44 left-[55%] h-[25.2rem] w-[25.2rem] rounded-full bg-fuchsia-600/30 blur-[126px]" />
+          <div className="absolute -bottom-48 right-[6%] h-[27.3rem] w-[27.3rem] rounded-full bg-cyan-400/30 blur-[126px]" />
         </div>
         {/* Giant brand watermark — sits at the very bottom of the page, bleeding off
             the bottom edge, behind the footer content and lit by the glows. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center overflow-hidden">
           <span
-            className="select-none whitespace-nowrap bg-clip-text font-display font-bold leading-[0.78] tracking-tighter text-transparent"
+            className="select-none whitespace-nowrap bg-clip-text font-bold leading-[0.78] tracking-tighter text-transparent"
             style={{
               fontSize: "clamp(7rem, 30vw, 28rem)",
-              opacity: 0.25,
+              opacity: 0.16,
               transform: "translateY(26%)",
               backgroundImage: "linear-gradient(100deg, #5eead4 0%, #22d3ee 30%, #818cf8 60%, #e879f9 100%)",
               maskImage: "linear-gradient(to top, black 30%, transparent 95%)",
@@ -118,7 +210,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
         <div className="relative z-10 mx-auto max-w-[1500px] px-6 pt-14 lg:px-10">
           <div className="grid grid-cols-2 gap-10 md:grid-cols-5">
             <div className="col-span-2 md:col-span-2">
-              <Logo className="h-6" />
+              <Logo className="h-7" />
               <p className="mt-4 max-w-xs text-sm leading-relaxed text-zinc-500">
                 Unleash the Power of Peer-to-Peer: Seamlessly Connect, Collaborate, and Conquer.
               </p>

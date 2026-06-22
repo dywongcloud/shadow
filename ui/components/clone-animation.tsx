@@ -1,7 +1,8 @@
 "use client";
 
-import { ExternalLink, FolderGit2, GitBranch } from "lucide-react";
+import { Check, ExternalLink, FolderGit2, GitBranch } from "lucide-react";
 import { Card } from "@/components/ui";
+import { cn } from "@/lib/utils";
 
 // Structural shape of a New Project template (matches app/new/page.tsx's Template
 // so the page can pass its `selected` template straight through).
@@ -111,44 +112,109 @@ export function PreparingDeployment({
         </div>
       </Card>
 
-      {/* Deployment — Preparing Git Repository */}
-      <Card className="p-6 sm:p-8">
-        <h2 className="text-2xl font-semibold tracking-tight">Deployment</h2>
-        <p className="mt-1.5 flex items-center gap-2 text-sm text-secondary">
-          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-fg" />
-          Preparing Git Repository…
-        </p>
+      {/* Deployment — Preparing Git Repository (live animation) */}
+      <CloneCard src={src} dest={dest} />
+    </div>
+  );
+}
 
-        <div className="mt-6 rounded-xl border border-border bg-subtle/30">
-          {/* source → build-env flow */}
-          <div className="flex items-center justify-center py-12">
-            {/* Destination: the build environment (a new repo/folder) */}
-            <div className="flex h-14 w-14 items-center justify-center rounded-full border border-border bg-card shadow-sm animate-[clone-breathe_2.4s_ease-in-out_infinite]">
-              <FolderGit2 className="h-6 w-6 text-secondary" />
-            </div>
+/**
+ * The source-clone visualization card: a GitHub source flowing a data packet
+ * along a dashed connector into the destination build folder.
+ *
+ * Two modes:
+ *  • **active** (`idle=false`, default): the live "Preparing Git Repository…"
+ *    animation shown on /new right after Create.
+ *  • **idle** (`idle=true`): a STILL, successful "Git repository cloned" state —
+ *    every animation is removed and a green check marks the completed clone. Used
+ *    on the build-logs page, stacked underneath the logs, so the totem reads
+ *    "logs → (already) cloned source".
+ */
+export function CloneCard({
+  src,
+  dest,
+  idle = false,
+  className = "",
+}: {
+  src: string;
+  dest: string;
+  idle?: boolean;
+  className?: string;
+}) {
+  return (
+    <Card className={cn("p-6 sm:p-8", className)}>
+      <div className="flex items-center justify-between gap-3">
+        <h2 className="text-2xl font-semibold tracking-tight">{idle ? "Source" : "Deployment"}</h2>
+        {idle && (
+          <span className="inline-flex items-center gap-1.5 rounded-full border border-green/30 bg-green/10 px-2.5 py-1 text-xs font-medium text-green">
+            <Check className="h-3.5 w-3.5" /> Cloned
+          </span>
+        )}
+      </div>
+      <p className="mt-1.5 flex items-center gap-2 text-sm text-secondary">
+        {idle ? (
+          <>
+            <Check className="h-4 w-4 text-green" /> Git repository cloned
+          </>
+        ) : (
+          <>
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-fg" /> Preparing Git Repository…
+          </>
+        )}
+      </p>
 
-            {/* Dashed connector with a traveling data packet (source → dest). */}
-            <div className="relative mx-1 h-px w-20 sm:w-28">
-              <div className="absolute inset-x-0 top-1/2 -translate-y-1/2 border-t border-dashed border-border-strong" />
-              <span className="absolute top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-fg shadow-[0_0_6px_hsl(var(--foreground))] animate-[clone-flow_2s_ease-in-out_infinite]" />
-            </div>
-
-            {/* Source: the GitHub repository, with a radar ripple. */}
-            <div className="relative flex items-center justify-center">
-              <span className="absolute h-14 w-14 rounded-full border border-border-strong animate-[clone-ripple_2s_ease-out_infinite]" />
-              <span className="absolute h-14 w-14 rounded-full border border-border-strong animate-[clone-ripple_2s_ease-out_infinite] [animation-delay:1s]" />
-              <div className="relative z-10 flex h-14 w-14 items-center justify-center rounded-full border border-border bg-card shadow-sm">
-                <GitHubMark className="h-7 w-7" />
-              </div>
-            </div>
+      <div className="mt-6 rounded-xl border border-border bg-subtle/30">
+        {/* source → build-env flow */}
+        <div className="flex items-center justify-center py-12">
+          {/* Destination: the build environment (a new repo/folder). When idle, a
+              green check badge marks the completed clone. */}
+          <div
+            className={cn(
+              "relative flex h-14 w-14 items-center justify-center rounded-full border border-border bg-card shadow-sm",
+              !idle && "animate-[clone-breathe_2.4s_ease-in-out_infinite]",
+            )}
+          >
+            <FolderGit2 className="h-6 w-6 text-secondary" />
+            {idle && (
+              <span className="absolute -bottom-1 -right-1 flex h-5 w-5 items-center justify-center rounded-full border-2 border-card bg-green text-white">
+                <Check className="h-3 w-3" strokeWidth={3} />
+              </span>
+            )}
           </div>
 
-          <div className="border-t border-border px-6 py-4 text-center text-sm text-secondary">
-            Cloning <GitHubInline /> <span className="font-medium text-fg">{src}</span> to{" "}
-            <GitHubInline /> <span className="font-medium text-fg">{dest}</span>
+          {/* Dashed connector. The traveling data packet only animates when active. */}
+          <div className="relative mx-1 h-px w-20 sm:w-28">
+            <div
+              className={cn(
+                "absolute inset-x-0 top-1/2 -translate-y-1/2 border-t border-dashed",
+                idle ? "border-green/40" : "border-border-strong",
+              )}
+            />
+            {!idle && (
+              <span className="absolute top-1/2 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-fg shadow-[0_0_6px_hsl(var(--foreground))] animate-[clone-flow_2s_ease-in-out_infinite]" />
+            )}
+          </div>
+
+          {/* Source: the GitHub repository. The radar ripple only pulses when active. */}
+          <div className="relative flex items-center justify-center">
+            {!idle && (
+              <>
+                <span className="absolute h-14 w-14 rounded-full border border-border-strong animate-[clone-ripple_2s_ease-out_infinite]" />
+                <span className="absolute h-14 w-14 rounded-full border border-border-strong animate-[clone-ripple_2s_ease-out_infinite] [animation-delay:1s]" />
+              </>
+            )}
+            <div className="relative z-10 flex h-14 w-14 items-center justify-center rounded-full border border-border bg-card shadow-sm">
+              <GitHubMark className="h-7 w-7" />
+            </div>
           </div>
         </div>
-      </Card>
-    </div>
+
+        <div className="border-t border-border px-6 py-4 text-center text-sm text-secondary">
+          {idle ? "Cloned " : "Cloning "}
+          <GitHubInline /> <span className="font-medium text-fg">{src}</span> to{" "}
+          <GitHubInline /> <span className="font-medium text-fg">{dest}</span>
+        </div>
+      </div>
+    </Card>
   );
 }

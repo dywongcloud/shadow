@@ -33,6 +33,7 @@ fn test_fluid(lease_timeout_ms: u64) -> Arc<Fluid> {
         FluidConfig {
             autoscaler_interval: Duration::from_millis(50),
             lease_timeout: Duration::from_millis(lease_timeout_ms),
+            max_instances_per_tenant: 0,
         },
     )
 }
@@ -68,7 +69,7 @@ async fn concurrency_reuse_autoscale_and_saturation() {
     };
     let fluid = test_fluid(400);
     let key = func_key("dpl-test", "api");
-    fluid.register(key.clone(), func(2, 2, 0, &py), "default".into(), ".".into());
+    fluid.register(key.clone(), func(2, 2, 0, &py), "default".into(), ".".into(), "personal".into());
 
     // Two leases pack onto ONE instance (in-function concurrency = 2).
     let l1 = fluid.lease(&key).await.expect("lease 1");
@@ -106,7 +107,7 @@ async fn cost_meter_shows_savings_under_concurrency() {
     let fluid = test_fluid(3000);
     let key = func_key("dpl-cost", "api");
     // One instance, up to 5 concurrent requests.
-    fluid.register(key.clone(), func(5, 1, 0, &py), "default".into(), ".".into());
+    fluid.register(key.clone(), func(5, 1, 0, &py), "default".into(), ".".into(), "personal".into());
 
     // 5 concurrent requests all packed onto a single instance.
     let mut leases = Vec::new();
@@ -141,7 +142,7 @@ async fn mark_dead_reaps_and_reroutes() {
     };
     let fluid = test_fluid(2000);
     let key = func_key("dpl-dead", "api");
-    fluid.register(key.clone(), func(2, 3, 0, &py), "default".into(), ".".into());
+    fluid.register(key.clone(), func(2, 3, 0, &py), "default".into(), ".".into(), "personal".into());
 
     let l1 = fluid.lease(&key).await.expect("lease 1");
     let cid1 = l1.cell_id().clone();
@@ -169,7 +170,7 @@ async fn scales_to_zero_when_idle() {
     let fluid = test_fluid(400);
     let key = func_key("dpl-test2", "api");
     // min_instances = 0 -> can scale fully to zero.
-    fluid.register(key.clone(), func(4, 3, 0, &py), "default".into(), ".".into());
+    fluid.register(key.clone(), func(4, 3, 0, &py), "default".into(), ".".into(), "personal".into());
 
     let l = fluid.lease(&key).await.expect("lease");
     assert_eq!(fluid.stats()[0].instances, 1);
@@ -185,4 +186,67 @@ async fn scales_to_zero_when_idle() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(zeroed, "idle instance should scale to zero");
+}
+
+// ---- Multi-tenancy --------------------------------------------------------
+
+/// A pool records its owning tenant (normalized; empty => "personal"), and the
+/// tenant surfaces in stats. No backend traffic — pure registration.
+#[tokio::test]
+async fn register_tags_pool_tenant_and_normalizes_empty() {
+    let fluid = test_fluid(100);
+    let ka = func_key("dpl-acme", "api");
+    fluid.register(ka.clone(), func(1, 1, 0, "python"), "img".into(), ".".into(), "acme".into());
+    assert_eq!(fluid.tenant_of(&ka).as_deref(), Some("acme"));
+
+    let kp = func_key("dpl-blank", "api");
+    fluid.register(kp.clone(), func(1, 1, 0, "python"), "img".into(), ".".into(), String::new());
+    assert_eq!(fluid.tenant_of(&kp).as_deref(), Some("personal"), "empty tenant => personal");
+
+    assert!(fluid.stats().iter().any(|s| s.key == ka && s.tenant == "acme"));
+}
+
+/// A per-tenant instance quota caps ONE tenant's total live instances across all
+/// its function pools — and never starves another tenant (backpressure, not
+/// cross-tenant eviction). Boots real mock cells, so skips without python3.
+#[tokio::test]
+async fn per_tenant_instance_quota_is_isolated() {
+    let Some(py) = python3() else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("fluid-quota-{}", std::process::id())),
+        provision_latency: Duration::from_millis(10),
+        cache_root: std::env::temp_dir().join(format!("fluid-quota-cache-{}", std::process::id())),
+    }));
+    let fluid = Fluid::start(
+        backend,
+        FluidConfig {
+            autoscaler_interval: Duration::from_millis(50),
+            lease_timeout: Duration::from_millis(300),
+            max_instances_per_tenant: 2, // alpha may hold at most 2 live instances
+        },
+    );
+    // concurrency=1 so each held lease pins its own instance.
+    let ka = func_key("dpl-alpha", "api");
+    fluid.register(ka.clone(), func(1, 10, 0, &py), "default".into(), ".".into(), "alpha".into());
+    let kb = func_key("dpl-beta", "api");
+    fluid.register(kb.clone(), func(1, 10, 0, &py), "default".into(), ".".into(), "beta".into());
+
+    // alpha brings up its 2 allowed instances and holds them.
+    let _l1 = fluid.lease(&ka).await.expect("alpha lease 1");
+    let _l2 = fluid.lease(&ka).await.expect("alpha lease 2");
+    assert_eq!(fluid.tenant_live_instances("alpha"), 2, "alpha should hold 2 live instances");
+
+    // A 3rd alpha instance is over quota -> refused (backpressure -> timeout).
+    assert!(
+        fluid.lease(&ka).await.is_err(),
+        "alpha exceeded its per-tenant instance quota but a 3rd instance was allowed"
+    );
+
+    // beta has its OWN budget and must not be starved by alpha's saturation.
+    let lb = fluid.lease(&kb).await;
+    assert!(lb.is_ok(), "beta was starved by alpha's quota (cross-tenant interference)");
+    assert_eq!(fluid.tenant_live_instances("beta"), 1);
 }

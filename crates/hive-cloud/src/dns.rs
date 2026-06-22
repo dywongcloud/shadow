@@ -216,3 +216,107 @@ impl DomainStore {
         *self.map.write() = list.into_iter().map(|d| (d.domain.clone(), d)).collect();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(kind: &str, name: &str, value: &str) -> DnsRecord {
+        DnsRecord { id: String::new(), name: name.into(), kind: kind.into(), value: value.into(), ttl: 3600, priority: None, comment: String::new(), created_ms: 0, system: false }
+    }
+
+    #[test]
+    fn ensure_creates_default_and_is_idempotent() {
+        let s = DomainStore::new();
+        let d = s.ensure("acme.com", "personal");
+        assert_eq!(d.domain, "acme.com");
+        assert_eq!(d.tenant, "personal");
+        // Default system records: a CAA (managed-SSL issuer) + the anycast A.
+        assert!(d.records.iter().any(|r| r.kind == "CAA" && r.system));
+        assert!(d.records.iter().any(|r| r.kind == "A" && r.system));
+        let n = d.records.len();
+        // ensure again must NOT recreate / duplicate.
+        let d2 = s.ensure("acme.com", "personal");
+        assert_eq!(d2.records.len(), n, "ensure is idempotent");
+    }
+
+    #[test]
+    fn add_record_assigns_id_and_marks_non_system() {
+        let s = DomainStore::new();
+        s.ensure("acme.com", "t");
+        let added = s.add_record("acme.com", rec("A", "www", "1.2.3.4")).expect("added");
+        assert!(added.id.starts_with("rec_"));
+        assert!(!added.system);
+        let got = s.get("acme.com").unwrap();
+        assert!(got.records.iter().any(|r| r.id == added.id && r.value == "1.2.3.4"));
+    }
+
+    #[test]
+    fn system_records_are_immutable_and_undeletable() {
+        let s = DomainStore::new();
+        let d = s.ensure("acme.com", "t");
+        let sys = d.records.iter().find(|r| r.system).unwrap().id.clone();
+        // update of a system record returns None.
+        assert!(s.update_record("acme.com", &sys, "@".into(), "A".into(), "9.9.9.9".into(), 60, None, String::new()).is_none());
+        // delete of a system record is refused; it stays.
+        assert!(!s.delete_record("acme.com", &sys));
+        assert!(s.get("acme.com").unwrap().records.iter().any(|r| r.id == sys));
+    }
+
+    #[test]
+    fn update_and_delete_user_record() {
+        let s = DomainStore::new();
+        s.ensure("acme.com", "t");
+        let id = s.add_record("acme.com", rec("A", "www", "1.1.1.1")).unwrap().id;
+        let up = s.update_record("acme.com", &id, "www".into(), "A".into(), "2.2.2.2".into(), 120, None, "edited".into()).unwrap();
+        assert_eq!(up.value, "2.2.2.2");
+        assert_eq!(up.ttl, 120);
+        assert!(s.delete_record("acme.com", &id));
+        assert!(!s.get("acme.com").unwrap().records.iter().any(|r| r.id == id));
+    }
+
+    #[test]
+    fn import_is_idempotent_skips_exact_duplicates() {
+        let s = DomainStore::new();
+        s.ensure("acme.com", "t");
+        let batch = vec![rec("A", "www", "1.2.3.4"), rec("MX", "", "mail.acme.com")];
+        let first = s.import_records("acme.com", batch.clone());
+        assert_eq!(first.len(), 2, "both imported");
+        let second = s.import_records("acme.com", batch);
+        assert_eq!(second.len(), 0, "exact duplicates are skipped");
+    }
+
+    #[test]
+    fn nameservers_autorenew_and_ssl_renew() {
+        let s = DomainStore::new();
+        s.ensure("acme.com", "t");
+        assert!(s.set_nameservers("acme.com", vec!["ns1.shadw.cloud".into(), "ns2.shadw.cloud".into()]));
+        assert_eq!(s.get("acme.com").unwrap().nameservers, vec!["ns1.shadw.cloud", "ns2.shadw.cloud"]);
+        assert!(s.set_auto_renew("acme.com", false));
+        assert!(!s.get("acme.com").unwrap().auto_renew);
+        let before = s.get("acme.com").unwrap().ssl.id;
+        let cert = s.renew_ssl("acme.com").unwrap();
+        assert_ne!(cert.id, before, "renew reissues a new cert id");
+    }
+
+    #[test]
+    fn snapshot_load_roundtrip() {
+        let s = DomainStore::new();
+        s.ensure("acme.com", "t");
+        s.add_record("acme.com", rec("TXT", "@", "v=spf1 ~all"));
+        let snap = s.snapshot();
+        let s2 = DomainStore::new();
+        s2.load(snap);
+        assert!(s2.get("acme.com").unwrap().records.iter().any(|r| r.kind == "TXT"));
+    }
+
+    #[test]
+    fn ops_on_unknown_domain_are_safe() {
+        let s = DomainStore::new();
+        assert!(s.get("nope.com").is_none());
+        assert!(s.add_record("nope.com", rec("A", "@", "1.1.1.1")).is_none());
+        assert!(!s.delete_record("nope.com", "rec_x"));
+        assert!(!s.set_nameservers("nope.com", vec![]));
+        assert!(s.renew_ssl("nope.com").is_none());
+    }
+}

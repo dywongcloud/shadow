@@ -27,6 +27,11 @@ pub struct WorkflowDef {
     #[serde(default)]
     pub project: String,
     pub steps: Vec<WorkflowStep>,
+    /// When ingested from a Vercel WDK `manifest.json`, the workflow's React-Flow
+    /// graph (`{ nodes, edges }`) so the dashboard can draw it on the canvas
+    /// exactly as the WDK defined it. `None` for engine-defined workflows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -188,6 +193,7 @@ mod tests {
                 WorkflowStep { name: "a".into(), deployment: "d".into(), path: "/a".into() },
                 WorkflowStep { name: "b".into(), deployment: "d".into(), path: "/b".into() },
             ],
+            graph: None,
         });
         let invoker: StepInvoker = Arc::new(|step: WorkflowStep| {
             Box::pin(async move { Ok(format!("ran {}", step.name)) })

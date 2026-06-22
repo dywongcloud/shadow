@@ -15,6 +15,7 @@ members = [
     "crates/fluid-gateway",
     "crates/fluidd",
     "crates/fluidctl",
+    "crates/shadw-cli",
     "crates/hive-p2p",
     "crates/hive-edge",
     "crates/hive-cloud",

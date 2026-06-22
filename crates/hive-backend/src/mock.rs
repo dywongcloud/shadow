@@ -3,9 +3,11 @@
 //! / Apple Silicon without any virtualization, while presenting the exact same
 //! [`CellBackend`] contract as the real Firecracker backend.
 //!
-//! Isolation here is intentionally lighter than a microVM — a work-dir jail,
-//! a hard wall-clock timeout, and best-effort `rlimit`s (CPU seconds + address
-//! space) on Unix. Real multi-tenant isolation is the Firecracker backend's job.
+//! Isolation here is intentionally lighter than a microVM — a per-tenant work-dir
+//! jail (cells live under `<root>/<tenant>/<cell-id>`, so tenants never share a
+//! subtree), a hard wall-clock timeout, and best-effort `rlimit`s (CPU seconds +
+//! address space) on Unix. Stronger isolation (separate kernels) is the
+//! Firecracker backend's job; tenant tagging flows identically through both.
 
 use crate::{CellBackend, CellEndpoint, CellHandle, CellSpec, FunctionLaunch, LogSink};
 use async_trait::async_trait;
@@ -84,7 +86,12 @@ impl CellBackend for MockBackend {
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
-        let root = self.cfg.root.join(spec.id.as_str());
+        // Per-tenant isolation: every cell's sandbox lives under its tenant's
+        // subtree (`<root>/<tenant>/<cell-id>`), so one tenant's cells can never
+        // see another's working files — the host-level analogue of the
+        // per-microVM rootfs boundary. Empty tenant => "personal".
+        let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
+        let root = self.cfg.root.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
         tokio::fs::create_dir_all(&root).await?;
         // Simulate the cold-boot + image-load cost the warm pool exists to hide.
         tokio::time::sleep(self.cfg.provision_latency).await;
@@ -516,5 +523,59 @@ impl GitRefArg for BuildJob {
         } else {
             format!("--branch {}", self.git_ref)
         }
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    use hive_core::ResourceSpec;
+
+    fn spec(tenant: &str) -> CellSpec {
+        CellSpec {
+            id: CellId::new(),
+            image: "img".into(),
+            resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
+            tenant: tenant.into(),
+        }
+    }
+
+    /// Every cell's sandbox lives under its tenant's subtree, so two tenants'
+    /// cells are on disjoint host paths; an empty tenant normalizes to "personal".
+    #[tokio::test]
+    async fn provision_isolates_cell_workdirs_by_tenant() {
+        let root = std::env::temp_dir().join(format!("mock-tenant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let be = MockBackend::new(MockConfig {
+            root: root.clone(),
+            provision_latency: Duration::from_millis(0),
+            cache_root: root.join("cache"),
+        });
+
+        let a = be.provision(&spec("alpha")).await.unwrap();
+        let b = be.provision(&spec("beta")).await.unwrap();
+        let p = be.provision(&spec("")).await.unwrap();
+
+        assert!(a.root.starts_with(root.join("alpha")), "alpha cell not under its tenant dir: {:?}", a.root);
+        assert!(b.root.starts_with(root.join("beta")), "beta cell not under its tenant dir: {:?}", b.root);
+        assert!(p.root.starts_with(root.join("personal")), "empty tenant should map to personal: {:?}", p.root);
+        assert_ne!(a.root.parent(), b.root.parent(), "tenants must not share a cell parent dir");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A hostile tenant slug can't escape the cells root via path traversal.
+    #[tokio::test]
+    async fn provision_sanitizes_traversal_in_tenant() {
+        let root = std::env::temp_dir().join(format!("mock-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let be = MockBackend::new(MockConfig {
+            root: root.clone(),
+            provision_latency: Duration::from_millis(0),
+            cache_root: root.join("cache"),
+        });
+        let h = be.provision(&spec("../../etc")).await.unwrap();
+        assert!(h.root.starts_with(&root), "tenant slug escaped the cells root: {:?}", h.root);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

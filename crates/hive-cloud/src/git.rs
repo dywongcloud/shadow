@@ -392,6 +392,9 @@ async fn run_build(
         commit: commit.clone(),
         commit_message: commit_message.clone(),
     };
+    // Tenant = the project's team; tags the deployment + every cell it spawns so
+    // compute is partitioned and quota'd per team (same resolver billing/audit use).
+    let tenant = cloud.projects.team_of(&manifest.project);
     let info = cloud.gw.deploy_full(
         build_dir.to_string_lossy().into_owned(),
         manifest,
@@ -399,7 +402,16 @@ async fn run_build(
         Some(git),
         is_production,
         if build_failed { DeployState::Error } else { DeployState::Ready },
+        tenant,
     );
+
+    // Ingest any Vercel WDK manifest the app emitted (`.well-known/workflow/v1/
+    // manifest.json`) so its workflows + step graphs appear in the Workflows tab
+    // and render on the canvas. Best-effort: a non-WDK app simply has none.
+    let ingested = ingest_workflow_manifest(cloud, &info.project, &build_dir).await;
+    if ingested > 0 {
+        log(format!("Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."));
+    }
 
     if build_failed {
         log(format!("Deployment created (build failed). Aliased to {}", info.alias));
@@ -631,11 +643,17 @@ async fn build_via_fdi(
     // (which resolve only from a root install). A standalone example that merely
     // lives inside a workspace repo (e.g. vercel/vercel's examples/* have normal
     // deps) is installed in place — installing at the root would match no project.
-    let is_monorepo = dir != repo_root
-        && uses_workspace_protocol(dir).await
-        && is_workspace_root(repo_root).await;
+    let root_is_workspace = is_workspace_root(repo_root).await;
+    let is_monorepo = dir != repo_root && uses_workspace_protocol(dir).await && root_is_workspace;
     let install_dir = if is_monorepo { repo_root } else { dir };
-    let pm = fluid_build::package_manager(install_dir);
+    // A standalone app that merely LIVES inside a workspace repo it is NOT a member
+    // of (e.g. vercel/vercel's `examples/*`): the workspace package manager
+    // (pnpm/yarn) walks UP to the repo root and installs the workspace WITHOUT this
+    // subdir's deps — so its framework binary (`vite`, …) is never installed and the
+    // build dies with "command not found". Force npm here: npm doesn't traverse up
+    // to a pnpm/yarn workspace, so it installs THIS dir's package.json in place.
+    let foreign_subdir = !is_monorepo && dir != repo_root && root_is_workspace;
+    let pm = if foreign_subdir { "npm" } else { fluid_build::package_manager(install_dir) };
 
     log(format!(
         "Detected framework: {} — primitive: {:?}, package manager: {}{}",
@@ -678,12 +696,31 @@ async fn build_via_fdi(
             if first_deploy { "first deployment" } else { "build cache disabled" }
         ));
     }
-    // Build command: detected framework default (already package-manager aware),
-    // re-pointed to the install PM if it's a generic `npm run` script.
-    let build_cmd = if plan.build_command.starts_with("npm ") && pm != "npm" {
-        plan.build_command.replacen("npm", pm, 1)
-    } else {
-        plan.build_command.clone()
+    // Build command. Framework presets give a RAW binary invocation, e.g.
+    // "vite build" / "next build". For npm that resolves via the project's
+    // node_modules/.bin (which run_streamed puts on PATH). But for a pnpm/yarn
+    // WORKSPACE install (e.g. the vercel/vercel monorepo's examples), the binary
+    // is NOT linked into the package's local .bin, so a raw `vite build` dies with
+    // "vite: command not found" (exit 127). Run framework build commands through
+    // the package manager's `exec` so it resolves the bin from the hoisted/virtual
+    // store. A `npm run …` style command is just re-pointed to the active PM.
+    let build_cmd = {
+        let bc = plan.build_command.clone();
+        let first = bc.split_whitespace().next().unwrap_or("");
+        let is_pm_invocation = matches!(first, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx" | "corepack");
+        if first == "npm" && pm != "npm" {
+            bc.replacen("npm", pm, 1)
+        } else if !bc.trim().is_empty() && !is_pm_invocation {
+            match pm {
+                "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm exec {bc}"),
+                "yarn" => format!("corepack enable >/dev/null 2>&1; yarn exec {bc}"),
+                "bun" => format!("bunx {bc}"),
+                // npm: the raw binary resolves via node_modules/.bin on PATH.
+                _ => bc,
+            }
+        } else {
+            bc
+        }
     };
 
     // 0) Restore cached dependencies (local, else pull from a mesh peer). Skipped
@@ -807,6 +844,88 @@ pub fn preferred_node_bin() -> Option<String> {
 /// Run a shell command in `dir`, streaming stdout+stderr into the build log.
 /// `env` is the project's environment variables, injected into the build so
 /// install/build steps (e.g. Next.js reading NEXT_PUBLIC_*, Vite VITE_*) see them.
+/// Ingest a Vercel WDK manifest (`.well-known/workflow/v1/manifest.json`) emitted
+/// by a built app: register each workflow — with its React-Flow `graph` — in the
+/// engine so it shows up in the Workflows tab/table and renders on the canvas.
+/// Returns the number registered. Best-effort (a non-WDK app simply has none).
+async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &Path) -> usize {
+    let Some(path) = find_workflow_manifest(dir) else { return 0 };
+    let Ok(text) = tokio::fs::read_to_string(&path).await else { return 0 };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return 0 };
+    let Some(workflows) = manifest.get("workflows").and_then(|v| v.as_object()) else { return 0 };
+    let mut count = 0usize;
+    for defs in workflows.values() {
+        let Some(defs) = defs.as_object() else { continue };
+        for (name, wf) in defs {
+            let id = wf.get("workflowId").and_then(|v| v.as_str()).unwrap_or(name).to_string();
+            let graph = wf.get("graph").cloned();
+            // Steps for the table = graph nodes minus the synthetic start/end markers.
+            let steps: Vec<hive_edge::WorkflowStep> = graph
+                .as_ref()
+                .and_then(|g| g.get("nodes"))
+                .and_then(|n| n.as_array())
+                .map(|nodes| {
+                    nodes
+                        .iter()
+                        .filter(|node| {
+                            let kind = node.get("data").and_then(|d| d.get("nodeKind")).and_then(|k| k.as_str()).unwrap_or("");
+                            kind != "workflow_start" && kind != "workflow_end"
+                        })
+                        .map(|node| {
+                            let label = node
+                                .get("data")
+                                .and_then(|d| d.get("label"))
+                                .and_then(|l| l.as_str())
+                                .or_else(|| node.get("id").and_then(|i| i.as_str()))
+                                .unwrap_or("step")
+                                .to_string();
+                            hive_edge::WorkflowStep { name: label, deployment: project.to_string(), path: String::new() }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            cloud.workflows.define(hive_edge::WorkflowDef {
+                id,
+                name: name.clone(),
+                project: project.to_string(),
+                steps,
+                graph,
+            });
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Locate a WDK `manifest.json` under a build dir (bounded walk; skips vendored /
+/// build-output trees that would duplicate it). Prefers the canonical relative
+/// path at each level.
+fn find_workflow_manifest(dir: &Path) -> Option<std::path::PathBuf> {
+    fn walk(dir: &Path, depth: usize) -> Option<std::path::PathBuf> {
+        let direct = dir.join(".well-known/workflow/v1/manifest.json");
+        if direct.is_file() {
+            return Some(direct);
+        }
+        if depth >= 6 {
+            return None;
+        }
+        for e in std::fs::read_dir(dir).ok()?.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(name, "node_modules" | ".git" | ".next" | "dist" | "build" | ".svelte-kit" | ".vercel") {
+                    continue;
+                }
+                if let Some(hit) = walk(&p, depth + 1) {
+                    return Some(hit);
+                }
+            }
+        }
+        None
+    }
+    walk(dir, 0)
+}
+
 async fn run_streamed(
     dir: &Path,
     command: &str,
@@ -1201,6 +1320,7 @@ async fn register_building_placeholder(
         None,
         false, // not production — superseded by the real deploy when it's ready
         DeployState::Building,
+        cloud.projects.team_of(project),
     );
     crate::persist::persist(cloud);
     Some(info.id.to_string())

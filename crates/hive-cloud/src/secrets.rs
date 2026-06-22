@@ -150,3 +150,39 @@ mod tests {
         assert_eq!(encrypt(&sealed), sealed);
     }
 }
+
+#[cfg(test)]
+mod tests_ext {
+    use super::*;
+
+    #[test]
+    fn encrypt_decrypt_roundtrip_and_passthrough() {
+        let sealed = encrypt("hunter2");
+        assert!(is_encrypted(&sealed));
+        assert_ne!(sealed, "hunter2");
+        assert_eq!(decrypt(&sealed), "hunter2");
+        // Non-sealed input is passthrough (back-compat) and not "encrypted".
+        assert!(!is_encrypted("plain"));
+        assert_eq!(decrypt("plain"), "plain");
+        // Empty stays empty (never sealed).
+        assert_eq!(encrypt(""), "");
+    }
+
+    #[test]
+    fn double_encrypt_is_noop() {
+        let once = encrypt("x");
+        let twice = encrypt(&once);
+        assert_eq!(once, twice, "already-sealed values are not re-sealed");
+        assert_eq!(decrypt(&twice), "x");
+    }
+
+    #[test]
+    fn distinct_nonces_produce_distinct_ciphertexts() {
+        // Same plaintext, different sealed blobs (random nonce), both decrypt back.
+        let a = encrypt("same");
+        let b = encrypt("same");
+        assert_ne!(a, b);
+        assert_eq!(decrypt(&a), "same");
+        assert_eq!(decrypt(&b), "same");
+    }
+}

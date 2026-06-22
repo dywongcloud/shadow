@@ -37,8 +37,9 @@ export function RedeployModal({
   /** The project's production-domain alias (for "Assigned domains"). */
   prodAlias: string;
   onClose: () => void;
-  /** Called after the redeploy build has started, with its build id. */
-  onDone?: (buildId: string) => void;
+  /** Called after the redeploy build has started, with its build id + the chosen
+   *  environment (so the caller can show an optimistic "Building" row). */
+  onDone?: (buildId: string, env: Env) => void;
 }) {
   const initialEnv: Env = deployment.target === "preview" || (!deployment.production && deployment.target !== "production") ? "preview" : "production";
   const [env, setEnv] = useState<Env>(initialEnv);
@@ -66,7 +67,7 @@ export function RedeployModal({
         use_cache: useCache,
       });
       toast("New Deployment Created");
-      onDone?.(r.build_id);
+      onDone?.(r.build_id, env);
       onClose();
     } catch (e) {
       setError(String(e));

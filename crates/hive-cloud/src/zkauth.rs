@@ -236,8 +236,10 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Handle `GET /_shadw/zk?p=<proof>&m=<message>&t=<team>` on a preview host:
-/// verify the anonymous proof, set a short-lived access cookie, redirect to `/`.
+/// Handle `GET /_shadw/zk?p=<proof>&m=<message>&t=<team>&next=<path>` on a preview
+/// host: verify the anonymous proof, set a short-lived access cookie, then redirect
+/// to `next` (default `/`) — completing the one-and-done unlock. `next` is forced
+/// to a same-site path (must start with a single `/`) to prevent open redirects.
 pub fn bootstrap(cloud: &std::sync::Arc<crate::state::CloudState>, host: &str, query: &str) -> Response {
     let Some(project) = cloud.gw.project_for_host(host) else {
         return (StatusCode::NOT_FOUND, "unknown deployment").into_response();
@@ -245,16 +247,39 @@ pub fn bootstrap(cloud: &std::sync::Arc<crate::state::CloudState>, host: &str, q
     let team = query_param(query, "t").unwrap_or_else(|| "personal".into());
     let proof = query_param(query, "p").unwrap_or_default();
     let message = query_param(query, "m").unwrap_or_default();
+    let next = query_param(query, "next")
+        .map(|n| urldecode(&n))
+        .filter(|n| n.starts_with('/') && !n.starts_with("//"))
+        .unwrap_or_else(|| "/".into());
     if verify_access(&team, &project, &proof, &message) {
         Response::builder()
             .status(StatusCode::FOUND)
-            .header(header::LOCATION, "/")
+            .header(header::LOCATION, next)
             .header(header::SET_COOKIE, issue_cookie(&project))
             .body(Body::empty())
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
     } else {
         (StatusCode::UNAUTHORIZED, "invalid membership proof").into_response()
     }
+}
+
+/// Minimal percent-decoding for the `next` redirect target.
+fn urldecode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ----------------------------- admin routes -----------------------------

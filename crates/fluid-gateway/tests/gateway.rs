@@ -203,6 +203,7 @@ async fn restore_prefers_production_deployment_for_alias() {
         production,
         target: if production { "production".into() } else { "preview".into() },
         state: fluid_core::DeployState::Ready,
+        tenant: "personal".into(),
     };
 
     // Restore the NEWER production deployment first, then the OLDER non-production
@@ -248,7 +249,7 @@ fn git(branch: &str, commit: &str) -> fluid_core::GitSource {
 async fn deploy_assigns_commit_branch_and_production_urls() {
     let gw = test_gw();
     let m = Manifest { project: "app".into(), ..Default::default() };
-    let info = gw.deploy_full("/nonexistent".into(), m, "you".into(), Some(git("main", "abc1234def")), true, fluid_core::DeployState::Ready);
+    let info = gw.deploy_full("/nonexistent".into(), m, "you".into(), Some(git("main", "abc1234def")), true, fluid_core::DeployState::Ready, "personal".into());
     let id = info.id.to_string();
 
     assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(id.as_str()), "production domain");
@@ -262,9 +263,9 @@ async fn deploy_assigns_commit_branch_and_production_urls() {
 #[tokio::test]
 async fn preview_deploy_does_not_hijack_production_domain() {
     let gw = test_gw();
-    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "aaaaaaa")), true, fluid_core::DeployState::Ready);
+    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "aaaaaaa")), true, fluid_core::DeployState::Ready, "personal".into());
     let prod_id = prod.id.to_string();
-    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("feature/login", "bbbbbbb")), false, fluid_core::DeployState::Ready);
+    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("feature/login", "bbbbbbb")), false, fluid_core::DeployState::Ready, "personal".into());
     let prev_id = prev.id.to_string();
 
     // Production domain stays on the production deployment.
@@ -280,8 +281,8 @@ async fn preview_deploy_does_not_hijack_production_domain() {
 #[tokio::test]
 async fn branch_url_tracks_latest_commit_on_branch() {
     let gw = test_gw();
-    let d1 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "1111111")), true, fluid_core::DeployState::Ready);
-    let d2 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "2222222")), true, fluid_core::DeployState::Ready);
+    let d1 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "1111111")), true, fluid_core::DeployState::Ready, "personal".into());
+    let d2 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "2222222")), true, fluid_core::DeployState::Ready, "personal".into());
     let (id1, id2) = (d1.id.to_string(), d2.id.to_string());
 
     assert_eq!(gw.host_deployment_id("app-git-main.localhost").as_deref(), Some(id2.as_str()), "branch tracks newest");
@@ -295,8 +296,8 @@ async fn branch_url_tracks_latest_commit_on_branch() {
 #[tokio::test]
 async fn promote_is_alias_reassignment() {
     let gw = test_gw();
-    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "ccccccc")), true, fluid_core::DeployState::Ready);
-    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("hotfix", "ddddddd")), false, fluid_core::DeployState::Ready);
+    let prod = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "ccccccc")), true, fluid_core::DeployState::Ready, "personal".into());
+    let prev = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("hotfix", "ddddddd")), false, fluid_core::DeployState::Ready, "personal".into());
     let (prod_id, prev_id) = (prod.id.to_string(), prev.id.to_string());
     assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(prod_id.as_str()));
 
@@ -315,8 +316,8 @@ async fn promote_is_alias_reassignment() {
 #[tokio::test]
 async fn target_environment_is_immutable_across_promotion() {
     let gw = test_gw();
-    let old = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "eeeeeee")), true, fluid_core::DeployState::Ready);
-    let _new = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "fffffff")), true, fluid_core::DeployState::Ready);
+    let old = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "eeeeeee")), true, fluid_core::DeployState::Ready, "personal".into());
+    let _new = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "fffffff")), true, fluid_core::DeployState::Ready, "personal".into());
     let old_id = old.id.to_string();
 
     let list = gw.list();

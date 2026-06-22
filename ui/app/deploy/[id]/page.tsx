@@ -15,9 +15,20 @@ import {
   CircleX,
 } from "lucide-react";
 import { Button, Card } from "@/components/ui";
+import { CloneCard } from "@/components/clone-animation";
 import { apiGet, type Build } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+
+// `https://github.com/owner/repo(.git)` (or scp-style) → `owner/repo` for display.
+function ownerRepo(url: string): string {
+  if (!url) return "";
+  return url
+    .replace(/^git@[^:]+:/, "")
+    .replace(/^https?:\/\/[^/]+\//, "")
+    .replace(/\.git$/, "")
+    .replace(/^\/+|\/+$/g, "");
+}
 
 function fmtTime(ms: number) {
   const d = new Date(ms);
@@ -317,6 +328,18 @@ export default function DeployPage({ params }: { params: { id: string } }) {
           )}
         </div>
       </Card>
+
+      {/* Totem-pole: the source-clone card sits UNDERNEATH the build/deploy logs,
+          idle (no animation) showing the already-successful clone. Standard
+          padding (mt-6) separates the stacked cards. Only for git-backed builds. */}
+      {build?.repo_url && (
+        <CloneCard
+          idle
+          src={ownerRepo(build.repo_url) || build.project}
+          dest={build.project ? `openedge/${build.project}` : ""}
+          className="mt-6"
+        />
+      )}
 
       {ready && (
         <p className="mt-4 text-center text-sm text-secondary">

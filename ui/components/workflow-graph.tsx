@@ -110,3 +110,91 @@ export function WorkflowGraph({ run, now }: { run: WorkflowRun; now: number }) {
     </div>
   );
 }
+
+/* ------------------------------------------------------------------ *
+ * WDK manifest graph viewer — renders a workflow's DECLARED graph (from
+ * `.well-known/workflow/v1/manifest.json`, ingested at deploy) on the canvas,
+ * mirroring Vercel's web dashboard. WDK graph nodes carry no coordinates, so we
+ * compute a simple layered (longest-path) layout from the edges.
+ * ------------------------------------------------------------------ */
+import type { WorkflowDef } from "@/lib/api";
+
+function layoutWdk(graph: { nodes: any[]; edges: any[] }): { nodes: Node[]; edges: Edge[] } {
+  const gnodes = graph?.nodes ?? [];
+  const gedges = graph?.edges ?? [];
+  const ids = gnodes.map((n) => n.id);
+  const indeg: Record<string, number> = Object.fromEntries(ids.map((i) => [i, 0]));
+  const adj: Record<string, string[]> = Object.fromEntries(ids.map((i) => [i, []]));
+  for (const e of gedges) {
+    if (adj[e.source]) adj[e.source].push(e.target);
+    if (e.target in indeg) indeg[e.target]++;
+  }
+  // Longest-path depth (layer) per node via Kahn-style relaxation.
+  const depth: Record<string, number> = Object.fromEntries(ids.map((i) => [i, 0]));
+  const queue = ids.filter((i) => indeg[i] === 0);
+  const seen = new Set<string>(queue);
+  let head = 0;
+  while (head < queue.length) {
+    const u = queue[head++];
+    for (const v of adj[u] ?? []) {
+      depth[v] = Math.max(depth[v], depth[u] + 1);
+      if (!seen.has(v)) { seen.add(v); queue.push(v); }
+    }
+  }
+  const perLayer: Record<number, number> = {};
+  const nodes: Node[] = gnodes.map((n) => {
+    const d = depth[n.id] ?? 0;
+    const x = (perLayer[d] = (perLayer[d] ?? 0) + 1);
+    const kind = n.data?.nodeKind || n.type || "";
+    const rfType = kind.includes("start") ? "input" : kind.includes("end") ? "output" : "default";
+    return {
+      id: n.id,
+      type: rfType,
+      position: { x: (x - 1) * 240, y: d * 120 },
+      data: { label: n.data?.label || n.id },
+    };
+  });
+  const edges: Edge[] = gedges.map((e, i) => ({
+    id: e.id || `e${i}`,
+    source: e.source,
+    target: e.target,
+    type: "smoothstep",
+    animated: false,
+  }));
+  return { nodes, edges };
+}
+
+export function WorkflowDefGraph({ def }: { def: WorkflowDef }) {
+  const { resolvedTheme } = useTheme();
+  const dark = resolvedTheme === "dark";
+  const laid = useMemo(() => layoutWdk(def.graph ?? { nodes: [], edges: [] }), [def.id, def.graph]);
+  const [nodes, , onNodesChange] = useNodesState(laid.nodes);
+  const [edges, , onEdgesChange] = useEdgesState(laid.edges);
+
+  if (!def.graph || !(def.graph.nodes?.length)) {
+    return (
+      <div className="flex h-[360px] w-full items-center justify-center rounded-xl border border-border bg-bg text-sm text-secondary">
+        No graph in this workflow&apos;s manifest.
+      </div>
+    );
+  }
+  return (
+    <div className="relative h-[460px] w-full overflow-hidden rounded-xl border border-border bg-bg">
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        fitView
+        fitViewOptions={{ padding: 0.25 }}
+        minZoom={0.3}
+        maxZoom={1.6}
+        proOptions={{ hideAttribution: true }}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={22} size={1} color={dark ? "#151515" : "#eee"} />
+        <Controls showInteractive={false} className="!border-border !bg-card" />
+        <MiniMap pannable zoomable className="!border !border-border !bg-card" maskColor={dark ? "rgba(0,0,0,0.4)" : "rgba(255,255,255,0.5)"} />
+      </ReactFlow>
+    </div>
+  );
+}

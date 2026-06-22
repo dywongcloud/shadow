@@ -294,6 +294,11 @@ pub struct DeployRecord {
     /// Defaults to `ready` for back-compat with snapshots written before this field.
     #[serde(default)]
     pub state: DeployState,
+    /// Owning team/tenant. `#[serde(default)]` keeps pre-tenancy snapshots
+    /// loadable (they normalize to "personal"); on restore this re-registers the
+    /// deployment's function pools under the correct tenant.
+    #[serde(default)]
+    pub tenant: String,
 }
 
 /// A registered deployment (manifest + where its files live).
@@ -317,6 +322,10 @@ pub struct Deployment {
     /// keeps target=production even after a newer one is promoted). Empty string
     /// means "derive from `production`" (back-compat for old in-memory values).
     pub target: String,
+    /// Owning team/tenant slug (empty = "personal"). Set at deploy time from the
+    /// project's team; flows into each cell's `CellSpec` and the Fluid pool so
+    /// compute is partitioned and quota'd per tenant.
+    pub tenant: String,
 }
 
 /// Admin API: request to create a deployment. For the mock backend the gateway
@@ -411,6 +420,9 @@ pub struct DeploymentInfo {
     /// Framework features mapped onto this deployment (redirects, middleware…).
     #[serde(default)]
     pub features: DeploymentFeatures,
+    /// Owning team/tenant slug (empty = "personal").
+    #[serde(default)]
+    pub tenant: String,
 }
 fn default_ready() -> DeployState {
     DeployState::Ready

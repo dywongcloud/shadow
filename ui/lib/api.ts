@@ -412,11 +412,16 @@ export interface WorkflowStep {
   deployment: string;
   path: string;
 }
+export interface WdkGraphNode { id: string; type?: string; data?: { label?: string; nodeKind?: string } }
+export interface WdkGraphEdge { id: string; source: string; target: string; type?: string }
 export interface WorkflowDef {
   id: string;
   name: string;
   project: string;
   steps: WorkflowStep[];
+  /** Present when ingested from a Vercel WDK manifest: the workflow's node/edge
+   *  graph (React-Flow shape) for canvas visualization. */
+  graph?: { nodes: WdkGraphNode[]; edges: WdkGraphEdge[] } | null;
 }
 export interface StepRun {
   name: string;

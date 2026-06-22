@@ -508,6 +508,30 @@ fn preview_gate(
     }
     let ev = cloud.event(region, method, host, path, 401, "preview-protected", &project);
     cloud.record(ev);
+
+    // One-and-done unlock: for a BROWSER navigation (Accept: text/html) we bounce to
+    // the dashboard's `/preview-unlock`, which (using the signed-in session) mints a
+    // membership proof and redirects back through `/_shadw/zk` to drop the access
+    // cookie ON THIS deployment domain — solving the cross-domain cookie problem.
+    // Needs HIVE_DASHBOARD_URL (the dashboard origin); without it we fall back to the
+    // plain 401 so nothing breaks.
+    let wants_html = header(headers, "accept").map(|a| a.contains("text/html")).unwrap_or(false);
+    if wants_html && method.eq_ignore_ascii_case("GET") {
+        if let Ok(dash) = std::env::var("HIVE_DASHBOARD_URL") {
+            let dash = dash.trim_end_matches('/');
+            if !dash.is_empty() {
+                let url = format!(
+                    "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
+                    pct(host), pct(&project), pct(&team), pct(path),
+                );
+                let mut resp = axum::response::Redirect::temporary(&url).into_response();
+                set(&mut resp, "x-hive-region", region);
+                set(&mut resp, "x-hive-preview", "unlock-redirect");
+                return Some(resp);
+            }
+        }
+    }
+
     let mut resp = (
         StatusCode::UNAUTHORIZED,
         format!("This preview deployment is private to the \"{team}\" team. Sign in to view it."),
@@ -516,6 +540,16 @@ fn preview_gate(
     set(&mut resp, "x-hive-region", region);
     set(&mut resp, "x-hive-preview", "protected");
     Some(resp)
+}
+
+/// Percent-encode a query-parameter value (RFC 3986 unreserved kept verbatim).
+fn pct(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
 }
 
 fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {

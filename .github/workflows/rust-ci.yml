@@ -2,7 +2,8 @@ name: Rust CI
 
 # Automated tests for the OpenEdge Rust backend — core deployment model, gateway,
 # edge (P2P node registry, WAF, rate-limit, concurrency, cron, workflows), the
-# build/runtime pipeline, GitOps, and the cloud node — on every push and PR.
+# build/runtime pipeline, GitOps, the cloud node, and the `shadw` platform CLI
+# (unit + integration + full end-to-end acceptance) — on every push and PR.
 
 on:
   push:
@@ -65,3 +66,44 @@ jobs:
           cargo test -p fluid-build --locked
           cargo test -p hive-edge --locked
           cargo test -p hive-cloud --locked
+
+  # The `shadw` platform CLI, end to end: unit + integration tests, a strict lint
+  # gate on the crate itself, and a full acceptance run of the REAL compiled CLI
+  # against a REAL hive-cloud node — through the control API, the in-memory stores,
+  # and the on-disk persistence layer (including survival across a node restart).
+  cli:
+    name: shadw CLI (unit + integration + acceptance)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Unit tests (config precedence, deploy-body builder, masking, output) +
+      # the integration test that drives the real binary over real HTTP, plus the
+      # dependency stores the CLI exercises (API keys, project env, DNS, secrets).
+      - name: CLI unit + integration tests
+        run: |
+          cargo test -p shadw-cli --locked --verbose
+          cargo test -p hive-cloud --locked --verbose
+
+      # Strict lint gate for the CLI crate specifically — it must stay warning-free.
+      # (The workspace-wide clippy in the `test` job stays informational so the
+      # pre-existing nits in other crates don't wedge the pipeline.)
+      - name: clippy (shadw-cli, strict)
+        run: cargo clippy -p shadw-cli --all-targets --locked -- -D warnings
+
+      # Full system/acceptance test: spawns a throwaway node on isolated ports with
+      # a temp data dir, issues an API key, logs the CLI in, then exercises the
+      # whole lifecycle (deploy → env/DNS CRUD → key revoke → restart-persistence →
+      # delete). Hermetic: deploys a local file:// repo, no network egress.
+      - name: End-to-end acceptance (real node + real CLI)
+        run: |
+          chmod +x scripts/cli-acceptance.sh
+          ./scripts/cli-acceptance.sh

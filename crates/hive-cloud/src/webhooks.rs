@@ -54,6 +54,11 @@ pub const ALL_EVENTS: &[&str] = &[
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Webhook {
     pub id: String,
+    /// Owning team/tenant. `#[serde(default)]` keeps pre-existing persisted
+    /// webhooks loadable (they normalize to "personal"), so adding tenant
+    /// ownership is backward-compatible with on-disk state.
+    #[serde(default)]
+    pub team: String,
     /// Project this webhook belongs to ("*" = all projects in the team).
     pub project: String,
     pub url: String,

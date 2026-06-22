@@ -82,6 +82,21 @@ pub struct CellSpec {
     /// Logical image / rootfs name (warm pools are keyed on this).
     pub image: String,
     pub resources: ResourceSpec,
+    /// Owning team/tenant slug (empty = "personal"). Lets a backend partition a
+    /// cell's host resources per tenant (the mock backend nests cell workdirs
+    /// under the tenant; Firecracker nests its per-cell run dir likewise).
+    pub tenant: String,
+}
+
+/// Make a tenant slug safe to use as a single host path component (no traversal,
+/// no separators) so an odd/hostile team name can't escape a backend's cells
+/// root. Empty / dot-only normalizes to "personal".
+pub(crate) fn sanitize_tenant(t: &str) -> String {
+    let s: String = t
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .collect();
+    if s.is_empty() || s.chars().all(|c| c == '.') { "personal".into() } else { s }
 }
 
 /// A live, backend-specific handle to a provisioned cell.

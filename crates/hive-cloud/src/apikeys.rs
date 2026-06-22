@@ -127,3 +127,79 @@ mod tests {
         assert!(s.verify(&token).is_none());
     }
 }
+
+#[cfg(test)]
+mod tests_ext {
+    use super::*;
+
+    #[test]
+    fn create_then_verify_roundtrips_and_scopes_team() {
+        let s = ApiKeyStore::new();
+        let (key, token) = s.create("ci", "acme", "owner");
+        assert!(token.starts_with("hive_"), "token is prefixed");
+        assert_eq!(key.team, "acme");
+        assert_eq!(key.role, "owner");
+        // The presented plaintext token resolves back to the key.
+        let got = s.verify(&token).expect("token verifies");
+        assert_eq!(got.id, key.id);
+        assert_eq!(got.team, "acme");
+        // A wrong token never verifies.
+        assert!(s.verify("hive_wrongtoken").is_none());
+    }
+
+    #[test]
+    fn defaults_empty_team_and_role() {
+        let s = ApiKeyStore::new();
+        let (key, _) = s.create("k", "", "");
+        assert_eq!(key.team, "personal");
+        assert_eq!(key.role, "member");
+    }
+
+    #[test]
+    fn public_view_never_leaks_the_hash() {
+        let s = ApiKeyStore::new();
+        let (key, _) = s.create("k", "t", "owner");
+        let v = key.public();
+        assert!(v.get("hash").is_none(), "hash must not be in the public view");
+        assert!(v.get("token").is_none(), "token is never stored/returned here");
+        assert_eq!(v["team"], "t");
+        assert!(v["prefix"].as_str().unwrap().starts_with("hive_"));
+    }
+
+    #[test]
+    fn list_is_team_scoped_and_revoke_respects_team() {
+        let s = ApiKeyStore::new();
+        let (a, _) = s.create("a", "team1", "owner");
+        s.create("b", "team1", "member");
+        s.create("c", "team2", "owner");
+        assert_eq!(s.list("team1").len(), 2);
+        assert_eq!(s.list("team2").len(), 1);
+        // Cannot revoke a key from the wrong team.
+        assert!(!s.revoke(&a.id, "team2"));
+        assert_eq!(s.list("team1").len(), 2);
+        // Correct team revokes it.
+        assert!(s.revoke(&a.id, "team1"));
+        assert_eq!(s.list("team1").len(), 1);
+        // Revoking a now-missing id is a no-op.
+        assert!(!s.revoke(&a.id, "team1"));
+    }
+
+    #[test]
+    fn distinct_tokens_have_distinct_hashes() {
+        let s = ApiKeyStore::new();
+        let (k1, _) = s.create("x", "t", "owner");
+        let (k2, _) = s.create("y", "t", "owner");
+        assert_ne!(k1.hash, k2.hash);
+        assert_ne!(k1.id, k2.id);
+    }
+
+    #[test]
+    fn snapshot_load_roundtrip_preserves_verification() {
+        let s = ApiKeyStore::new();
+        let (_k, token) = s.create("k", "t", "owner");
+        let snap = s.snapshot();
+        let s2 = ApiKeyStore::new();
+        s2.load(snap);
+        assert!(s2.verify(&token).is_some(), "restored key still verifies");
+    }
+}
