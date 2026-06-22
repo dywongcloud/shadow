@@ -180,6 +180,15 @@ impl Gateway {
         self.select(Some(host)).map(|d| d.project)
     }
 
+    /// The full deployment a request `host` resolves to (same alias resolution the
+    /// public router uses). Exposes `target`/`production` so the preview gate can
+    /// decide protection by the deployment's ACTUAL environment — not by guessing
+    /// from the subdomain (which wrongly flags a production deployment's commit/id
+    /// URLs as previews).
+    pub fn deployment_for_host(&self, host: &str) -> Option<DeploymentInfo> {
+        self.select(Some(host)).map(|d| view_of(&d))
+    }
+
     /// Attach a custom domain to a project (its first label aliases to the
     /// project's current deployment). Returns true if the project exists.
     pub fn add_alias(&self, domain: &str, project: &str) -> bool {

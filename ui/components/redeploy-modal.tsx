@@ -75,7 +75,7 @@ export function RedeployModal({
     }
   }
 
-  const selfHost = deploymentHost(deployment.commit_alias || deployment.id_alias || deployment.alias);
+  const selfHost = deploymentHost(deployment.id_alias || deployment.commit_alias || deployment.alias);
   const domainHost = deploymentHost(prodAlias);
   const commitMsg = deployment.git?.commit_message || "Latest commit";
 

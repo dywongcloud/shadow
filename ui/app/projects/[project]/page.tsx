@@ -349,7 +349,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 {/* Link to this deployment's OWN immutable URL (commit URL / id
                     URL), so a preview row opens that preview — not production. */}
                 <Td className="px-2 font-mono text-xs">
-                  <a className="text-link hover:underline" href={deploymentUrl(d.commit_alias || d.id_alias || d.alias)} target="_blank" rel="noreferrer">{d.id}</a>
+                  <a className="text-link hover:underline" href={deploymentUrl(d.id_alias || d.commit_alias || d.alias)} target="_blank" rel="noreferrer">{d.id}</a>
                 </Td>
                 <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">

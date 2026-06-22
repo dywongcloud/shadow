@@ -64,7 +64,7 @@ export default function DeploymentsPage() {
                     or the per-deployment id URL) — never the shared production
                     domain, so a preview row opens that preview, not production. */}
                 <Td className="font-mono text-xs">
-                  {(() => { const self = d.commit_alias || d.id_alias || d.alias;
+                  {(() => { const self = d.id_alias || d.commit_alias || d.alias;
                     return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer">{deploymentHost(self)}</a>; })()}
                 </Td>
                 <Td className="text-xs text-secondary">

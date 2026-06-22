@@ -585,10 +585,19 @@ fn preview_gate(
     method: &str,
     path: &str,
 ) -> Option<Response> {
-    let subdomain = host.split(':').next().unwrap_or(host).split('.').next().unwrap_or("");
-    let project = cloud.gw.project_for_host(host)?;
-    // Production alias is `<project>.localhost`; anything else is a preview.
-    let is_preview = !subdomain.eq_ignore_ascii_case(&project);
+    // Gate by the deployment's ACTUAL environment, not the subdomain. A production
+    // deployment is never preview-protected — via its production domain OR its
+    // commit/id URLs. Only PREVIEW deployments (target=preview) are gated. (The
+    // old `subdomain != project` heuristic wrongly gated production deployments
+    // reached through their commit/id aliases.)
+    let dep = cloud.gw.deployment_for_host(host)?;
+    let project = dep.project.clone();
+    let target = if dep.target.is_empty() {
+        if dep.production { "production" } else { "preview" }
+    } else {
+        dep.target.as_str()
+    };
+    let is_preview = !target.eq_ignore_ascii_case("production");
     if !is_preview || !cloud.projects.preview_protected(&project) {
         return None;
     }

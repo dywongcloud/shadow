@@ -325,3 +325,34 @@ async fn target_environment_is_immutable_across_promotion() {
     assert!(!old_view.production, "superseded build is no longer promoted");
     assert_eq!(old_view.target, "production", "but its build environment stays production");
 }
+
+/// Regression: the preview gate must key on a deployment's ACTUAL target, so
+/// `deployment_for_host` has to resolve the right deployment (and its target) for
+/// EVERY alias type — production domain, commit URL, and id URL. A production
+/// deployment reached via its commit/id URL must still report target=production
+/// (else the gate would wrongly preview-protect it); a preview reports preview.
+#[tokio::test]
+async fn deployment_for_host_resolves_target_for_every_alias() {
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("gw-target-{}", std::process::id())),
+        provision_latency: Duration::from_millis(1),
+        cache_root: std::env::temp_dir().join(format!("gw-target-cache-{}", std::process::id())),
+    }));
+    let gw = Gateway::new(Fluid::start(backend, FluidConfig::default()), "default".into());
+    let m = || Manifest { project: "app".into(), ..Default::default() };
+
+    // A production deploy (claims app.localhost) + a later preview deploy.
+    let prod = gw.deploy_full("/nonexistent".into(), m(), "you".into(), Some(git("main", "aaaaaaa")), true, fluid_core::DeployState::Ready, "personal".into());
+    let prev = gw.deploy_full("/nonexistent".into(), m(), "you".into(), Some(git("feature", "bbbbbbb")), false, fluid_core::DeployState::Ready, "personal".into());
+
+    let target = |host: &str| gw.deployment_for_host(host).expect("resolves").target;
+
+    // Production: open via ALL of its URLs.
+    assert_eq!(target("app.localhost"), "production", "production domain");
+    assert_eq!(target(&prod.commit_alias), "production", "production via commit URL");
+    assert_eq!(target(&prod.id_alias), "production", "production via id URL");
+
+    // Preview: gated — its URLs must report preview, never production.
+    assert_eq!(target(&prev.commit_alias), "preview", "preview via commit URL");
+    assert_eq!(target(&prev.id_alias), "preview", "preview via id URL");
+}
