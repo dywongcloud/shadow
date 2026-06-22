@@ -227,6 +227,17 @@ pub async fn edge_pipeline(
         }
     }
 
+    // No deployment is aliased for this host (exact match) and no peer in the mesh
+    // serves it either → the deployment genuinely doesn't exist on the wildcard
+    // domain. Render the Vercel-style DEPLOYMENT_NOT_FOUND page (region-aware id)
+    // instead of silently falling back to the default deployment / preview gate.
+    // (`_vercel/*` + `/_shadw/zk` were already handled above.)
+    if !serve_local && !already_proxied && !host.is_empty() {
+        let ev = cloud.event(&region, &method, &host, &path, 404, "deployment-not-found", &host);
+        cloud.record(ev);
+        return deployment_not_found(&region);
+    }
+
     // -1) L7 DDoS mitigation: shed per-IP floods before any compute work.
     if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
         let ev = cloud.event(&region, &method, &host, &path, 429, "rate-limited", &ip);
@@ -376,6 +387,93 @@ pub async fn edge_pipeline(
     }
 }
 
+/// Map a node region (city slug) to a short region-instance code, Vercel-style
+/// (`sfo1`, `iad1`, …). Falls back to a slug-derived code for unknown regions.
+fn region_code(region: &str) -> String {
+    let r = region.to_lowercase();
+    let code = match r.replace(' ', "-").as_str() {
+        "san-francisco" | "san-jose" | "norcal" => "sfo1",
+        "los-angeles" | "socal" => "lax1",
+        "seattle" => "sea1",
+        "portland" => "pdx1",
+        "chicago" => "ord1",
+        "dallas" | "texas" => "dfw1",
+        "new-york" | "newark" | "virginia" | "us-east" | "washington" => "iad1",
+        "miami" => "mia1",
+        "toronto" => "yyz1",
+        "london" => "lhr1",
+        "dublin" => "dub1",
+        "frankfurt" => "fra1",
+        "paris" => "cdg1",
+        "amsterdam" => "ams1",
+        "stockholm" => "arn1",
+        "singapore" => "sin1",
+        "tokyo" => "hnd1",
+        "osaka" => "kix1",
+        "seoul" => "icn1",
+        "sydney" => "syd1",
+        "mumbai" => "bom1",
+        "sao-paulo" | "sao paulo" => "gru1",
+        _ => "",
+    };
+    if !code.is_empty() {
+        return code.to_string();
+    }
+    let slug: String = r.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
+    if slug.is_empty() { "dev1".into() } else { format!("{slug}1") }
+}
+
+/// Vercel-style `404: NOT_FOUND` / `DEPLOYMENT_NOT_FOUND` page. The id encodes the
+/// serving region instance: `<region-code>::<rand>-<timestamp>-<hash>`.
+fn deployment_not_found(region: &str) -> Response {
+    let u = uuid::Uuid::new_v4().simple().to_string();
+    let id = format!(
+        "{}::{}-{}-{}",
+        region_code(region),
+        &u[0..5],
+        hive_core::now_ms(),
+        &u[8..20],
+    );
+    let docs = std::env::var("HIVE_DASHBOARD_URL")
+        .ok()
+        .map(|d| format!("{}/docs", d.trim_end_matches('/')))
+        .unwrap_or_else(|| "/docs".into());
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404: NOT_FOUND</title>
+<style>
+  html,body{{height:100%}}
+  body{{margin:0;background:#fff;color:#000;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+  .wrap{{max-width:780px;margin:0 auto;padding:34vh 24px 0}}
+  .card{{border:1px solid #eaeaea;border-radius:8px;padding:26px 30px}}
+  .card h1{{font-size:15px;font-weight:400;margin:0 0 20px}}
+  .card h1 b{{font-weight:700}}
+  .row{{font-size:15px;margin:13px 0;line-height:1.5}}
+  code{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:14px}}
+  .info{{margin-top:22px;border:1px solid #0070f3;border-radius:8px;padding:18px 22px;text-align:center;font-size:15px;color:#0070f3}}
+  .info a{{color:#0070f3;text-decoration:none}}
+  .info a:hover{{text-decoration:underline}}
+</style></head>
+<body><div class="wrap">
+  <div class="card">
+    <h1><b>404</b>: NOT_FOUND</h1>
+    <div class="row">Code: <code>`DEPLOYMENT_NOT_FOUND`</code></div>
+    <div class="row">ID: <code>`{id}`</code></div>
+  </div>
+  <div class="info">This deployment cannot be found. For more information and troubleshooting, see <a href="{docs}">our documentation</a>.</div>
+</div></body></html>"#,
+        id = id,
+        docs = docs,
+    );
+    let mut resp = Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response());
+    set(&mut resp, "x-hive-region", region);
+    set(&mut resp, "x-hive-error", "DEPLOYMENT_NOT_FOUND");
+    resp
+}
+
 /// Stamp the anycast routing decision onto a response for observability.
 fn set_anycast(resp: &mut Response, node: &Option<hive_edge::NodeInfo>) {
     if let Some(n) = node {
@@ -521,7 +619,7 @@ fn preview_gate(
             let dash = dash.trim_end_matches('/');
             if !dash.is_empty() {
                 let url = format!(
-                    "{dash}/api/preview-unlock?host={}&project={}&team={}&next={}",
+                    "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
                     pct(host), pct(&project), pct(&team), pct(path),
                 );
                 let mut resp = axum::response::Redirect::temporary(&url).into_response();
