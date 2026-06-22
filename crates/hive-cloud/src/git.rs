@@ -392,6 +392,21 @@ async fn run_build(
         commit: commit.clone(),
         commit_message: commit_message.clone(),
     };
+    // For an isolated backend (Firecracker), a serving microVM cannot see the
+    // host build dir the mock backend serves from. Pack the build output into a
+    // per-deployment artifact the cell mounts at /build, and point this
+    // deployment's function pool at that image. No-op for the same-host mock.
+    if !build_failed && cloud.gw.backend_name() == "firecracker" {
+        let image = format!("dpl-{}", sanitize_tag(bid));
+        match cloud.gw.deliver_build(&image, &build_dir).await {
+            Ok(()) => {
+                log("Delivered build output to a microVM image (Firecracker).".into());
+                manifest.image = Some(image);
+            }
+            Err(e) => log(format!("WARN: could not deliver build to microVM ({e}); serving may fail.")),
+        }
+    }
+
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
     let tenant = cloud.projects.team_of(&manifest.project);

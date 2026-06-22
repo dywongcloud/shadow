@@ -63,7 +63,47 @@ mod linux {
         mount("sysfs", "/sys", "sysfs");
         mount("devtmpfs", "/dev", "devtmpfs");
         mount("tmpfs", "/tmp", "tmpfs");
-        // The virtio-vsock transport is in-kernel; no IP networking required.
+        // Bring up the loopback interface. The function server binds 0.0.0.0:$PORT
+        // (works without lo), but we reach it over 127.0.0.1 to bridge it to vsock
+        // — and 127.0.0.1 is unreachable until `lo` is UP. Without this every
+        // function looks like it "did not bind its port".
+        bring_up_loopback();
+        // If a second drive (the delivered build output) is attached, mount it at
+        // /build so the function server runs against the deployment's artifacts.
+        // Best-effort: build cells have no second drive and this simply no-ops.
+        if std::path::Path::new("/dev/vdb").exists() {
+            mount("/dev/vdb", "/build", "ext4");
+        }
+    }
+
+    /// Set IFF_UP on the loopback interface via SIOCSIFFLAGS (no `ip`/iproute2
+    /// dependency in the guest rootfs). Best-effort.
+    fn bring_up_loopback() {
+        // Mirrors `struct ifreq` for the flags ioctls: 16-byte name + flags.
+        #[repr(C)]
+        struct IfReqFlags {
+            name: [libc::c_char; 16],
+            flags: libc::c_short,
+            _pad: [u8; 22],
+        }
+        // ioctl request arg type differs by libc (c_ulong on glibc, c_int on
+        // musl); `as _` coerces to whichever this target expects.
+        const SIOCGIFFLAGS: u64 = 0x8913;
+        const SIOCSIFFLAGS: u64 = 0x8914;
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+            if fd < 0 {
+                return;
+            }
+            let mut req: IfReqFlags = std::mem::zeroed();
+            req.name[0] = b'l' as libc::c_char;
+            req.name[1] = b'o' as libc::c_char;
+            if libc::ioctl(fd, SIOCGIFFLAGS as _, &mut req) == 0 {
+                req.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+                let _ = libc::ioctl(fd, SIOCSIFFLAGS as _, &req);
+            }
+            libc::close(fd);
+        }
     }
 
     fn mount(src: &str, target: &str, fstype: &str) {
@@ -164,7 +204,7 @@ mod linux {
 
         // Wait for the function to bind its port.
         let fport = launch.port;
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             if TcpStream::connect(("127.0.0.1", fport)).is_ok() {
                 break;
@@ -178,34 +218,45 @@ mod linux {
             std::thread::sleep(Duration::from_millis(50));
         }
 
-        // Bridge vsock CELL_FUNCTION_PORT -> 127.0.0.1:fport, one thread/conn.
-        let lfd = vsock_listen(CELL_FUNCTION_PORT)?;
-        std::thread::spawn(move || loop {
-            let cfd = unsafe { libc::accept(lfd, std::ptr::null_mut(), std::ptr::null_mut()) };
-            if cfd < 0 {
-                continue;
-            }
-            std::thread::spawn(move || {
-                let vs = unsafe { UnixStream::from_raw_fd(cfd) };
-                if let Ok(tcp) = TcpStream::connect(("127.0.0.1", fport)) {
-                    bridge(vs, tcp);
+        // Front the function with the SAME multiplexed tunnel protocol the
+        // gateway speaks to instances (the mock backend fronts its functions with
+        // `TunnelServer` too) — served over an async vsock listener on
+        // CELL_FUNCTION_PORT. A dedicated current-thread tokio runtime owns this;
+        // the agent's control channel above stays synchronous. Each accepted
+        // tunnel connection multiplexes many requests onto 127.0.0.1:<fport>.
+        let max_conc = launch.max_concurrency.max(1);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("tunnel runtime build failed: {e}");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let addr = tokio_vsock::VsockAddr::new(libc::VMADDR_CID_ANY, CELL_FUNCTION_PORT);
+                let mut listener = match tokio_vsock::VsockListener::bind(addr) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!("vsock listen on {CELL_FUNCTION_PORT} failed: {e}");
+                        return;
+                    }
+                };
+                let local = format!("127.0.0.1:{fport}");
+                loop {
+                    match listener.accept().await {
+                        Ok((stream, _)) => {
+                            let local = local.clone();
+                            tokio::spawn(async move {
+                                fluid_tunnel::TunnelServer::serve(stream, local, max_conc).await;
+                            });
+                        }
+                        Err(_) => break,
+                    }
                 }
             });
         });
         Ok(())
-    }
-
-    /// Pipe a vsock stream and a TCP stream both ways until either closes.
-    fn bridge(vs: UnixStream, tcp: TcpStream) {
-        let (mut vr, mut vw) = (vs.try_clone().unwrap(), vs);
-        let (mut tr, mut tw) = (tcp.try_clone().unwrap(), tcp);
-        let t1 = std::thread::spawn(move || {
-            let _ = std::io::copy(&mut vr, &mut tw);
-            let _ = tw.shutdown(std::net::Shutdown::Write);
-        });
-        let _ = std::io::copy(&mut tr, &mut vw);
-        let _ = vw.shutdown(std::net::Shutdown::Write);
-        let _ = t1.join();
     }
 
     fn run_build(stream: &mut UnixStream, job: &BuildJob) -> std::io::Result<BuildResult> {

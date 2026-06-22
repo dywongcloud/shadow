@@ -43,6 +43,10 @@ pub struct FirecrackerConfig {
     pub rootfs_dir: PathBuf,
     /// Per-cell runtime state (api sockets, overlay disks, vsock) lives here.
     pub run_dir: PathBuf,
+    /// Logical name of the shared base rootfs to boot when an image has no
+    /// dedicated `<image>.ext4` (the common case: every deployment boots the same
+    /// runtime base and gets its build output from the attached data drive).
+    pub base_image: String,
     /// Host-side build cache directory (tarballs keyed by cache key). Survives
     /// the ephemeral microVMs — the cross-build cache the agent restores from.
     pub cache_dir: PathBuf,
@@ -56,6 +60,7 @@ impl Default for FirecrackerConfig {
             kernel_image: PathBuf::from("/var/lib/hive/vmlinux"),
             rootfs_dir: PathBuf::from("/var/lib/hive/rootfs"),
             run_dir: PathBuf::from("/var/lib/hive/run"),
+            base_image: "default".to_string(),
             cache_dir: PathBuf::from("/var/lib/hive/cache"),
             // The agent runs as PID1 (init=). The rootfs drive is the first
             // virtio-blk device, so the kernel finds it at /dev/vda.
@@ -89,12 +94,26 @@ impl FirecrackerBackend {
     }
 
     fn rootfs_for(&self, image: &str) -> PathBuf {
-        let safe: String = image
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
-            .collect();
-        self.cfg.rootfs_dir.join(format!("{safe}.ext4"))
+        self.cfg.rootfs_dir.join(format!("{}.ext4", sanitize_image(image)))
     }
+
+    /// Per-deployment build-output ext4 (the artifact `deliver_build` packs and
+    /// `provision` attaches as the cell's second drive). Lives alongside the
+    /// base rootfs images, keyed by the same logical image name.
+    fn data_image_for(&self, image: &str) -> PathBuf {
+        self.cfg.rootfs_dir.join(format!("{}.data.ext4", sanitize_image(image)))
+    }
+}
+
+/// Guest path the per-deployment build output is mounted at (the agent mounts
+/// `/dev/vdb` here; the function server runs with this as its working dir).
+pub const DELIVERED_WORKDIR: &str = "/build";
+
+fn sanitize_image(image: &str) -> String {
+    image
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect()
 }
 
 #[async_trait]
@@ -124,15 +143,31 @@ impl CellBackend for FirecrackerBackend {
         let overlay = run_dir.join("rootfs.ext4");
 
         // Per-cell writable rootfs. Real Hive uses CoW; a copy is the simple,
-        // correct equivalent for a study implementation.
-        let base = self.rootfs_for(&spec.image);
+        // correct equivalent for a study implementation. Prefer a dedicated
+        // `<image>.ext4` but fall back to the shared base runtime rootfs — most
+        // deployments boot the base and get their code from the data drive below.
+        let base = {
+            let per_image = self.rootfs_for(&spec.image);
+            if per_image.exists() { per_image } else { self.rootfs_for(&self.cfg.base_image) }
+        };
         anyhow::ensure!(
             base.exists(),
-            "base rootfs missing for image '{}': {}",
+            "rootfs missing for image '{}' and base '{}': {}",
             spec.image,
+            self.cfg.base_image,
             base.display()
         );
         tokio::fs::copy(&base, &overlay).await?;
+
+        // If this image has a delivered build artifact (packed by `deliver_build`),
+        // give the cell a private writable copy to attach as its second drive.
+        // The in-guest agent mounts it at DELIVERED_WORKDIR (/dev/vdb -> /build).
+        let data_src = self.data_image_for(&spec.image);
+        let data_overlay = run_dir.join("data.ext4");
+        let has_data = data_src.exists();
+        if has_data {
+            tokio::fs::copy(&data_src, &data_overlay).await?;
+        }
 
         // Spawn the Firecracker process bound to a fresh API socket.
         let _ = tokio::fs::remove_file(&api_sock).await;
@@ -181,6 +216,20 @@ impl CellBackend for FirecrackerBackend {
             }),
         )
         .await?;
+        // Second drive: the delivered build output (/dev/vdb in the guest).
+        if has_data {
+            fc_put(
+                &api_sock,
+                "/drives/data",
+                &serde_json::json!({
+                    "drive_id": "data",
+                    "path_on_host": data_overlay,
+                    "is_root_device": false,
+                    "is_read_only": false,
+                }),
+            )
+            .await?;
+        }
         // vsock device: the host endpoint is `vsock_uds`; the guest agent
         // listens on CELL_AGENT_PORT and we host-initiate a CONNECT later.
         fc_put(
@@ -192,6 +241,13 @@ impl CellBackend for FirecrackerBackend {
             }),
         )
         .await?;
+        // virtio-rng entropy device. Without a hardware RNG the guest's entropy
+        // pool starts empty, so anything that calls getrandom() at startup (e.g.
+        // Node's crypto init) BLOCKS for many seconds until the pool fills — long
+        // enough that the function misses its readiness window. Feeding the guest
+        // entropy makes cold starts fast and deterministic. Best-effort: older
+        // Firecracker without the device simply 400s and we proceed.
+        let _ = fc_put(&api_sock, "/entropy", &serde_json::json!({})).await;
         fc_put(
             &api_sock,
             "/actions",
@@ -304,6 +360,12 @@ impl CellBackend for FirecrackerBackend {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
 
+        // The control plane registers the pool's workdir as its own host build
+        // dir (correct for the same-host mock backend). Inside the guest that
+        // path doesn't exist; the delivered build is mounted at DELIVERED_WORKDIR.
+        let mut func = func.clone();
+        func.workdir = Some(DELIVERED_WORKDIR.to_string());
+
         let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
         let req = serde_json::to_vec(&AgentRequest::StartFunction(func.clone()))?;
         write_frame(&mut stream, &req).await?;
@@ -321,6 +383,49 @@ impl CellBackend for FirecrackerBackend {
             uds: uds.clone(),
             port: CELL_FUNCTION_PORT,
         })
+    }
+
+    fn delivered_workdir(&self) -> Option<&'static str> {
+        Some(DELIVERED_WORKDIR)
+    }
+
+    async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            build_dir.is_dir(),
+            "deliver_build: build dir does not exist: {}",
+            build_dir.display()
+        );
+        tokio::fs::create_dir_all(&self.cfg.rootfs_dir).await?;
+        let out = self.data_image_for(image);
+        let tmp = out.with_extension("ext4.tmp");
+
+        // Pack the host build dir into an ext4 image WITHOUT a privileged loop
+        // mount: `mkfs.ext4 -d <dir>` populates the filesystem from a directory
+        // directly. Size it to the build dir plus generous headroom (node_modules
+        // etc.). Written to a temp path then atomically renamed so a serving cell
+        // never attaches a half-written image.
+        let script = format!(
+            r#"set -e
+            sz=$(du -sm "$BUILD" | cut -f1)
+            sz=$(( sz * 3 / 2 + 512 ))
+            rm -f "$OUT"
+            truncate -s "${{sz}}M" "$OUT"
+            mkfs.ext4 -F -q -d "$BUILD" "$OUT"
+            "#,
+        );
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .env("BUILD", build_dir)
+            .env("OUT", &tmp)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        anyhow::ensure!(status.success(), "mkfs.ext4 -d failed packing build output for image '{image}'");
+        tokio::fs::rename(&tmp, &out).await?;
+        Ok(())
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {

@@ -100,6 +100,17 @@ impl Gateway {
         self.deploy_full(root, manifest, "you".into(), None, true, fluid_core::DeployState::Ready, String::new())
     }
 
+    /// Name of the active isolation backend ("mock" | "firecracker").
+    pub fn backend_name(&self) -> &'static str {
+        self.fluid.backend_name()
+    }
+
+    /// Pack a built deployment's output so the serving cells can reach it (only
+    /// meaningful for an isolated backend; a no-op for the same-host mock).
+    pub async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+        self.fluid.deliver_build(image, build_dir).await
+    }
+
     /// Full deploy with creator + git provenance + production flag + owning tenant.
     /// `tenant` (empty = "personal") tags the deployment and every function pool /
     /// cell it spawns, so compute is partitioned and quota'd per team.
@@ -119,10 +130,11 @@ impl Gateway {
         let tenant = if tenant.trim().is_empty() { "personal".to_string() } else { tenant };
         let id = DeploymentId::new();
         let workdir_root = root.clone();
+        let cell_image = manifest.image.clone().unwrap_or_else(|| self.image.clone());
         for f in &manifest.functions {
             let key = func_key(id.as_str(), &f.name);
             self.fluid
-                .register(key, f.clone(), self.image.clone(), workdir_root.clone(), tenant.clone());
+                .register(key, f.clone(), cell_image.clone(), workdir_root.clone(), tenant.clone());
         }
         let dep = Deployment {
             id: id.clone(),
@@ -320,9 +332,10 @@ impl Gateway {
     /// re-register its functions with the Fluid pool. Used on boot.
     pub fn restore(&self, rec: fluid_core::DeployRecord) {
         let id = DeploymentId::from(rec.id.clone());
+        let cell_image = rec.manifest.image.clone().unwrap_or_else(|| self.image.clone());
         for f in &rec.manifest.functions {
             let key = func_key(id.as_str(), &f.name);
-            self.fluid.register(key, f.clone(), self.image.clone(), rec.root.clone(), rec.tenant.clone());
+            self.fluid.register(key, f.clone(), cell_image.clone(), rec.root.clone(), rec.tenant.clone());
         }
         let dep = Deployment {
             id: id.clone(),

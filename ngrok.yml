@@ -27,5 +27,8 @@ endpoints:
 
   - name: gateway
     url: https://*.deployment.shadow.ngrok.pizza
+    # Pool with the Bangkok bare-metal node's endpoint (same wildcard) so both
+    # can bind it and ngrok load-balances requests across them.
+    pooling_enabled: true
     upstream:
       url: 8787

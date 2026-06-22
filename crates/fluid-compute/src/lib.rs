@@ -64,6 +64,13 @@ struct FunctionPool {
     instance_ms_retired: u64,
     /// Instances reaped because they became unreachable (health/nack).
     dead_reaped: u64,
+    /// Keep-warm failure backoff: the autoscaler won't attempt to warm this
+    /// pool again until `now_ms()` reaches this. Prevents a pool whose cold
+    /// starts keep failing (e.g. host out of locks/processes) from retrying
+    /// every autoscaler tick and pinning the host.
+    warm_backoff_until_ms: u64,
+    /// Consecutive keep-warm failures; drives the exponential backoff above.
+    warm_fail_streak: u32,
 }
 
 impl FunctionPool {
@@ -123,7 +130,15 @@ pub struct Fluid {
     backend: Arc<dyn CellBackend>,
     cfg: FluidConfig,
     registry: Mutex<HashMap<String, FunctionPool>>,
+    /// Bounds how many cold starts run concurrently across ALL pools. A burst of
+    /// keep-warm reconciles (e.g. every deployment warming at once on boot) or a
+    /// traffic spike would otherwise spawn unbounded backend containers in
+    /// parallel and saturate the host's process table / container lock pool.
+    cold_start_sem: Arc<tokio::sync::Semaphore>,
 }
+
+/// Max cold starts in flight at once across the whole node.
+const MAX_CONCURRENT_COLD_STARTS: usize = 4;
 
 /// Compose the per-function key.
 pub fn func_key(deployment: &str, function: &str) -> String {
@@ -141,6 +156,7 @@ impl Fluid {
             backend,
             cfg,
             registry: Mutex::new(HashMap::new()),
+            cold_start_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_COLD_STARTS)),
         });
         let f = fluid.clone();
         tokio::spawn(async move { f.autoscaler_loop().await });
@@ -168,6 +184,8 @@ impl Fluid {
                 served_ms_sum: 0,
                 instance_ms_retired: 0,
                 dead_reaped: 0,
+                warm_backoff_until_ms: 0,
+                warm_fail_streak: 0,
             },
         );
     }
@@ -175,6 +193,17 @@ impl Fluid {
     /// The owning tenant of a function pool (normalized), if registered.
     pub fn tenant_of(&self, key: &str) -> Option<String> {
         self.registry.lock().get(key).map(|p| p.tenant.clone())
+    }
+
+    /// Name of the active isolation backend ("mock" | "firecracker").
+    pub fn backend_name(&self) -> &'static str {
+        self.backend.name()
+    }
+
+    /// Make a built deployment available to the cells that will serve it (see
+    /// [`hive_backend::CellBackend::deliver_build`]). No-op for same-host backends.
+    pub async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+        self.backend.deliver_build(image, build_dir).await
     }
 
     /// Total live instances (running + provisioning) a tenant currently holds
@@ -322,6 +351,9 @@ impl Fluid {
     /// Provision a cell and start the function in it. `provisioning` was already
     /// incremented by the caller; on success we add the instance with inflight=1.
     async fn cold_start(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
+        // Bound concurrent provisioning so a burst can't saturate the host. Held
+        // for the whole provision+start; dropped when this fn returns.
+        let _permit = self.cold_start_sem.clone().acquire_owned().await;
         let (image, launch, mem, tenant) = {
             let reg = self.registry.lock();
             let pool = reg.get(key).ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
@@ -349,7 +381,16 @@ impl Fluid {
         };
         debug!(func = %key, cell = %spec.id, "cold-starting function instance");
         let handle = self.backend.provision(&spec).await?;
-        let endpoint = self.backend.start_function(&handle, &launch).await?;
+        // If starting the function fails, the cell was already provisioned —
+        // tear it back down so it doesn't leak (a leaked "Created" container
+        // still holds a lock + process slot on the host).
+        let endpoint = match self.backend.start_function(&handle, &launch).await {
+            Ok(ep) => ep,
+            Err(e) => {
+                let _ = self.backend.terminate(&handle).await;
+                return Err(e);
+            }
+        };
 
         let cell_id = spec.id.clone();
         let added = {
@@ -468,9 +509,11 @@ impl Fluid {
         {
             let mut reg = self.registry.lock();
             for (key, pool) in reg.iter_mut() {
-                // Keep-warm: bring live count up to min_instances.
+                // Keep-warm: bring live count up to min_instances — unless this
+                // pool is in failure backoff (its cold starts keep failing, so
+                // don't hammer the host every tick).
                 let live = pool.live_count();
-                if live < pool.cfg.min_instances {
+                if live < pool.cfg.min_instances && now >= pool.warm_backoff_until_ms {
                     for _ in 0..(pool.cfg.min_instances - live) {
                         pool.provisioning += 1;
                         to_warm.push(key.clone());
@@ -510,12 +553,20 @@ impl Fluid {
                                 inst.inflight = 0;
                                 inst.last_active_ms = now_ms();
                             }
+                            // Healthy again — clear the failure backoff.
+                            pool.warm_fail_streak = 0;
+                            pool.warm_backoff_until_ms = 0;
                         }
                         debug!(func = %key, "warm instance ready");
                     }
                     Err(e) => {
                         if let Some(pool) = f.registry.lock().get_mut(&key) {
                             pool.provisioning = pool.provisioning.saturating_sub(1);
+                            // Exponential backoff: 2s, 4s, 8s … capped at ~64s,
+                            // so a persistently failing pool stops storming.
+                            pool.warm_fail_streak = pool.warm_fail_streak.saturating_add(1);
+                            let backoff_ms = 1000u64 << pool.warm_fail_streak.min(6);
+                            pool.warm_backoff_until_ms = now_ms() + backoff_ms;
                         }
                         warn!(func = %key, error = %e, "keep-warm cold start failed");
                     }

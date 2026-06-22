@@ -14,3 +14,9 @@ serde_json = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+# Function serving: front the in-guest HTTP server with the SAME multiplexed
+# tunnel protocol the gateway speaks (mock backend uses TunnelServer too), over
+# an async vsock listener.
+tokio = { workspace = true }
+tokio-vsock = "0.5"
+fluid-tunnel = { workspace = true }

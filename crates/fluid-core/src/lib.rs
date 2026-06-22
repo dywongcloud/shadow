@@ -153,6 +153,12 @@ pub struct Manifest {
     /// Relative dir (within the deployment root) holding static assets.
     #[serde(default)]
     pub static_dir: Option<String>,
+    /// Per-deployment cell image key. When set, the function pool provisions
+    /// cells with this image instead of the node's default, so an isolated
+    /// backend (Firecracker) can attach this deployment's delivered build
+    /// artifact. `None` => use the node's default image (mock / same-host).
+    #[serde(default)]
+    pub image: Option<String>,
     #[serde(default)]
     pub functions: Vec<FunctionConfig>,
     #[serde(default)]

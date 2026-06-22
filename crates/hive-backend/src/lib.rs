@@ -128,6 +128,28 @@ pub trait CellBackend: Send + Sync {
         sink: LogSink,
     ) -> anyhow::Result<BuildResult>;
 
+    /// Make a built deployment available to the cells that will serve it.
+    ///
+    /// The control plane builds on its own host filesystem (`build_dir`), then
+    /// serves via `provision` + `start_function`. For a same-host backend (mock,
+    /// child process) the serving cell already sees `build_dir`, so this is a
+    /// no-op. For an isolated backend (Firecracker microVM) the guest cannot see
+    /// the host's `build_dir`, so this packs it into a per-`image` artifact that
+    /// `provision` later attaches to the cell. Called once per deployment, keyed
+    /// by the same `image` the function pool will provision with.
+    async fn deliver_build(&self, _image: &str, _build_dir: &std::path::Path) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// The guest path a delivered build is mounted at inside a cell (so the
+    /// control plane can register the function pool's workdir to match). For
+    /// same-host backends the workdir is the host `build_dir` (returns `None`,
+    /// meaning "use the build dir as-is"); Firecracker mounts it at a fixed
+    /// guest path.
+    fn delivered_workdir(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Start a long-lived function server inside the cell and return an endpoint
     /// the gateway can open connections to (Fluid compute serving path). Unlike
     /// `run_build`, the cell is NOT single-use: it stays alive serving many
