@@ -34,6 +34,12 @@ const nextConfig = {
 
   async rewrites() {
     return [
+      // SECURITY: the ZK preview endpoints (enroll + proof mint) are how a member
+      // gains preview access — they must NOT be reachable from the browser, or a
+      // signed-in non-member could self-enroll and mint a proof. They're called
+      // only server-to-server by /api/preview-unlock + /api/zk-enroll (which first
+      // verify Clerk org membership). Block the public proxy path (matched first).
+      { source: "/cloud/v1/zkauth/:path*", destination: "/api/blocked" },
       // Proxy dashboard API calls to a hive-cloud node's admin API (avoids CORS).
       { source: "/cloud/:path*", destination: `${ADMIN}/:path*` },
       // Multi-zone proxies (env-driven).
