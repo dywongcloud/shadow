@@ -373,6 +373,14 @@ fn walk_assets(base: &std::path::Path, cap: usize) -> Vec<Value> {
 async fn deployment_resources(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Json<Value> {
     let t = tenant(&c, &headers);
     let Some(rec) = c.gw.deployment_records().into_iter().find(|r| r.id == id) else {
+        // Not hosted locally — the placement scheduler may have put this deployment
+        // on a peer. Proxy to the hosting node so its build outputs (functions +
+        // static assets, which live on that node's filesystem) are returned.
+        if let Some(admin) = host_admin_for_deployment(&c, &id) {
+            if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/deployments/{id}/resources"), &t).await {
+                return Json(v);
+            }
+        }
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     };
     if norm(&c.projects.team_of(&rec.project)) != t {
@@ -726,23 +734,27 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     } else {
         desired.trim().to_string()
     };
-    let Some(cur) = existing.get(&base) else {
+    // Case-insensitive collision check: `<project>.localhost` aliases are global
+    // and host routing is case-insensitive, so "Foo" and "foo" must not coexist.
+    let existing_ci = |name: &str| existing.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned();
+    let Some(hit) = existing_ci(&base) else {
         return base; // free — use it
     };
     // Redeploy of the same project (same repo + tenant) → keep the name.
-    let same_tenant = norm(&cur.team) == tenant;
+    let cur = existing.get(&hit);
+    let same_tenant = cur.map(|c| norm(&c.team) == tenant).unwrap_or(false);
     let same_repo = c
         .gw
-        .git_for_project(&base)
+        .git_for_project(&hit)
         .map(|g| crate::gitops::norm_repo(&g.repo_url) == crate::gitops::norm_repo(repo_url))
         .unwrap_or(false);
     if same_tenant && same_repo {
-        return base;
+        return hit;
     }
     // Otherwise find the next free `-N`.
     for i in 2..1000 {
         let cand = format!("{base}-{i}");
-        if !existing.contains_key(&cand) {
+        if existing_ci(&cand).is_none() {
             return cand;
         }
     }
@@ -753,12 +765,22 @@ async fn git_deploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     Json(mut req): Json<fluid_core::GitDeployRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     // Assign the (new) project to the requesting tenant so it shows under their
     // team only — with a globally-unique name (auto-generated when none given).
     let t = tenant(&c, &headers);
     let requested = req.project.clone().unwrap_or_default();
     let project = unique_project_name(&c, &requested, &req.repo_url, &t);
+    // Reject an EXPLICIT name the user typed that's already taken by a different
+    // project (Issue #4) — don't silently rename to `<name>-2`. Fanout deploys
+    // (no_fanout) and auto-named deploys (empty requested) are exempt: those must
+    // resolve to a concrete name without erroring.
+    if !req.no_fanout && !requested.trim().is_empty() && project != requested.trim() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("A project named \"{}\" already exists. Choose a different name.", requested.trim()),
+        ));
+    }
     req.project = Some(project.clone());
     c.projects.set_team(&project, &t);
     // Persist the subdirectory so future redeploys keep building it.
@@ -768,7 +790,7 @@ async fn git_deploy(
     crate::persist::persist(&c);
     // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
     let build_id = crate::git::start_build(c.clone(), req);
-    Json(json!({ "build_id": build_id, "project": project }))
+    Ok(Json(json!({ "build_id": build_id, "project": project })))
 }
 
 async fn build_get(
@@ -982,18 +1004,79 @@ async fn dep_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(i
     Ok(Json(json!({ "removed": id, "project": project })))
 }
 
-/// Delete an entire project: all its deployments + settings.
-async fn project_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(project): Path<String>) -> Result<Json<Value>, StatusCode> {
+/// Delete an entire project: all its deployments + settings. By default this
+/// cascades across the mesh (removing the project from any peer node the
+/// placement scheduler put it on); `?cascade=false` deletes only on this node
+/// (used by the scheduler's relocate cleanup, which must NOT cascade back and
+/// wipe the freshly-placed copy on another node).
+async fn project_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(project): Path<String>,
+    Query(q): Query<CascadeQ>,
+) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers);
-    if norm(&c.projects.team_of(&project)) != t {
+    // Authorize against the local store if we have it, else against the gossiped
+    // fleet — a project placed by the scheduler may live ONLY on a peer, so it's
+    // absent from this node's project store (team_of would default to "personal"
+    // and wrongly 404). Allow the delete if the requester's tenant owns the
+    // project anywhere in the mesh.
+    let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
+        // a deployment of this project hosted locally under the requester's tenant
+        || c.gw.list().iter().any(|d| d.project == project && norm(&d.tenant) == t)
+        // …or hosted on a peer (project lives only on a scheduler-placed node)
+        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && norm(&d.tenant) == t);
+    if !authorized {
         return Err(StatusCode::NOT_FOUND);
     }
     let ids = c.gw.remove_project(&project).await;
+    // The placement scheduler may host this project on peer node(s); remove it
+    // there too so a delete from the dashboard fully tears it down across the mesh.
+    // Peers are told `cascade=false` so the teardown is a single hop (no loops).
+    if q.cascade.unwrap_or(true) {
+        let admins = c.node_admins.read().clone();
+        let routes = c.peer_routes.read().clone();
+        let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Nodes whose gossiped deployment list contains this project (most reliable
+        // — covers errored/non-serving deployments that aren't in the route table).
+        for (node, deps) in c.peer_deployments.read().iter() {
+            if deps.iter().any(|d| d.project == project) {
+                hosting.insert(node.clone());
+            }
+        }
+        for (host, rs) in routes.iter() {
+            let sub = host.split('.').next().unwrap_or(host);
+            if sub == project || sub.starts_with(&format!("{project}-")) {
+                for r in rs {
+                    hosting.insert(r.node_id.clone());
+                }
+            }
+        }
+        for (node, admin) in admins.iter() {
+            if hosting.contains(node) {
+                let _ = c
+                    .http
+                    .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
+                    .header("x-hive-team", t.clone())
+                    .timeout(std::time::Duration::from_secs(15))
+                    .send()
+                    .await;
+            }
+        }
+    }
     record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
     c.projects.remove(&project);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
     Ok(Json(json!({ "project": project, "removed_deployments": ids })))
+}
+
+/// Query for project_delete: `cascade=false` deletes only on this node (no mesh
+/// fan-out). Defaults to cascade when absent.
+#[derive(Deserialize, Default)]
+struct CascadeQ {
+    #[serde(default)]
+    cascade: Option<bool>,
 }
 
 /// Body for a redeploy from the Redeploy modal (all fields optional/defaulted so
@@ -1008,12 +1091,88 @@ struct RedeployBody {
 }
 
 /// Redeploy a project's newest git source (create a fresh deployment).
+/// Find the latest git source for a project — from this node's gateway, OR (when
+/// the placement scheduler put the project on a peer) from the gossiped fleet
+/// deployments. Lets redeploy work even when the project is hosted remotely.
+fn git_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::GitSource> {
+    if let Some(g) = c.gw.git_for_project(project) {
+        return Some(g);
+    }
+    c.peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .filter(|d| d.project == project)
+        .max_by_key(|d| d.created_at_ms)
+        .and_then(|d| d.git.clone())
+}
+
+/// Admin URL of the peer node hosting `project` (when the placement scheduler put
+/// it on a peer rather than this node), for proxying per-project read views.
+fn host_admin_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
+    let pd = c.peer_deployments.read();
+    let admins = c.node_admins.read();
+    for (node, deps) in pd.iter() {
+        if deps.iter().any(|d| d.project == project) {
+            if let Some(a) = admins.get(node) {
+                return Some(a.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Admin URL of the peer node hosting deployment `id`, for proxying per-deployment
+/// read views (resources) to wherever the deployment actually lives.
+fn host_admin_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
+    let pd = c.peer_deployments.read();
+    let admins = c.node_admins.read();
+    for (node, deps) in pd.iter() {
+        if deps.iter().any(|d| d.id.to_string() == id) {
+            if let Some(a) = admins.get(node) {
+                return Some(a.clone());
+            }
+        }
+    }
+    None
+}
+
+/// Admin URLs of peer nodes that host ANY of the requester-tenant's projects —
+/// the set to aggregate for fleet-wide views (the global Workflows tab). Empty
+/// when nothing of this tenant is placed remotely.
+fn peer_admins_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
+    let pd = c.peer_deployments.read();
+    let admins = c.node_admins.read();
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (node, deps) in pd.iter() {
+        if deps.iter().any(|d| norm(&d.tenant) == team) {
+            if let Some(a) = admins.get(node) {
+                out.insert(a.clone());
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// GET `path` from a peer admin, forwarding the team header; returns parsed JSON.
+async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str) -> Option<Value> {
+    let resp = c
+        .http
+        .get(format!("{admin}{path}"))
+        .header("x-hive-team", team)
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+        .ok()?;
+    resp.json::<Value>().await.ok()
+}
+
 async fn project_redeploy(
     State(c): State<Arc<CloudState>>,
     Path(project): Path<String>,
     Json(body): Json<RedeployBody>,
 ) -> Result<Json<Value>, StatusCode> {
-    let git = c.gw.git_for_project(&project).ok_or(StatusCode::NOT_FOUND)?;
+    let git = git_for_project_fleet(&c, &project).ok_or(StatusCode::NOT_FOUND)?;
     let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
     // Environment chosen in the modal: "production" | "preview". When absent the
     // branch decides (Vercel's classification).
@@ -1032,6 +1191,8 @@ async fn project_redeploy(
         root_dir,
         env: None, // redeploy: existing project env is read from the store at build time
         no_fanout: false, // dashboard redeploy is a coordinator deploy → schedule + fanout
+        build_config: None, // coordinator reads its own store; fanout fills these per-target
+        function_settings: None,
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -1211,6 +1372,8 @@ async fn git_webhook(
             root_dir,
             env: None, // git push redeploy: env comes from the project store
             no_fanout: false, // gitops redeploy is a coordinator deploy → schedule + fanout
+            build_config: None,
+            function_settings: None,
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));
@@ -1608,6 +1771,10 @@ async fn cron_del(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> J
 struct WfQuery {
     /// Restrict to a single project.
     project: Option<String>,
+    /// Internal: when set by a fleet-aggregation proxy call, return ONLY this
+    /// node's local workflows (no further fan-out) — prevents proxy recursion.
+    #[serde(default)]
+    local: Option<bool>,
 }
 
 /// Does this workflow's project belong to the requesting team?
@@ -1617,13 +1784,46 @@ fn wf_in_team(c: &Arc<CloudState>, project: &str, team: &str) -> bool {
 
 async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers);
-    let defs: Vec<_> = c
+    // Workflows are ingested on the node that HOSTS a deployment. If this project
+    // was placed on a peer, proxy to that node so its workflows show up.
+    if let Some(project) = q.project.as_deref() {
+        if c.gw.git_for_project(project).is_none() {
+            if let Some(admin) = host_admin_for_project(&c, project) {
+                if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows?project={project}"), &team).await {
+                    return Json(v);
+                }
+            }
+        }
+    }
+    let mut defs: Vec<Value> = c
         .workflows
         .defs()
         .into_iter()
         .filter(|d| wf_in_team(&c, &d.project, &team))
         .filter(|d| q.project.as_deref().map(|p| p == d.project).unwrap_or(true))
+        .map(|d| json!(d))
         .collect();
+    // Global view (no project filter): merge in workflows registered on peer nodes
+    // that host this tenant's projects — they're ingested on the HOST, so the
+    // coordinator otherwise shows none for scheduler-placed projects.
+    if q.project.is_none() && !q.local.unwrap_or(false) {
+        let mut seen: std::collections::HashSet<String> = defs
+            .iter()
+            .map(|d| format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or("")))
+            .collect();
+        for admin in peer_admins_for_tenant(&c, &team) {
+            if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows?local=true", &team).await {
+                if let Some(arr) = v.as_array() {
+                    for d in arr {
+                        let key = format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or(""));
+                        if seen.insert(key) {
+                            defs.push(d.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
     Json(json!(defs))
 }
 
@@ -1634,13 +1834,40 @@ async fn wf_define(State(c): State<Arc<CloudState>>, Json(def): Json<WorkflowDef
 
 async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers);
-    let runs: Vec<_> = c
+    if let Some(project) = q.project.as_deref() {
+        if c.gw.git_for_project(project).is_none() {
+            if let Some(admin) = host_admin_for_project(&c, project) {
+                if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows/runs?project={project}"), &team).await {
+                    return Json(v);
+                }
+            }
+        }
+    }
+    let mut runs: Vec<Value> = c
         .workflows
         .runs()
         .into_iter()
         .filter(|r| wf_in_team(&c, &r.project, &team))
         .filter(|r| q.project.as_deref().map(|p| p == r.project).unwrap_or(true))
+        .map(|r| json!(r))
         .collect();
+    if q.project.is_none() && !q.local.unwrap_or(false) {
+        let mut seen: std::collections::HashSet<String> =
+            runs.iter().filter_map(|r| r.get("id").and_then(|x| x.as_str()).map(String::from)).collect();
+        for admin in peer_admins_for_tenant(&c, &team) {
+            if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows/runs?local=true", &team).await {
+                if let Some(arr) = v.as_array() {
+                    for r in arr {
+                        if let Some(id) = r.get("id").and_then(|x| x.as_str()) {
+                            if seen.insert(id.to_string()) {
+                                runs.push(r.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     Json(json!(runs))
 }
 
@@ -1650,7 +1877,7 @@ async fn wf_run_detail(State(c): State<Arc<CloudState>>, Path(id): Path<String>)
 }
 
 /// Per-project rollup for the global "All Projects" workflows view.
-async fn wf_summary(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
+async fn wf_summary(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
     use std::collections::BTreeMap;
     let team = tenant(&c, &headers);
     // project -> (created, completed, failed, active)
@@ -1668,6 +1895,25 @@ async fn wf_summary(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Jso
             hive_edge::workflows::RunStatus::Running | hive_edge::workflows::RunStatus::Pending => e.3 += 1,
             _ => {}
         }
+    }
+    // Merge peer rollups (the tenant's projects placed on other nodes). A project
+    // lives on one host, so per-project rows don't overlap; sum defensively.
+    if !q.local.unwrap_or(false) {
+      for admin in peer_admins_for_tenant(&c, &team) {
+        if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows/summary?local=true", &team).await {
+            if let Some(arr) = v.as_array() {
+                for r in arr {
+                    let proj = r.get("project").and_then(|x| x.as_str()).unwrap_or("default").to_string();
+                    let e = agg.entry(proj).or_insert((0, 0, 0, 0));
+                    let g = |k: &str| r.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                    e.0 += g("created");
+                    e.1 += g("completed");
+                    e.2 += g("failed");
+                    e.3 += g("active");
+                }
+            }
+        }
+      }
     }
     let rows: Vec<Value> = agg
         .into_iter()

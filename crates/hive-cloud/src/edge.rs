@@ -266,11 +266,15 @@ pub async fn edge_pipeline(
                             let mut out = builder
                                 .body(Body::from_stream(stream))
                                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                            // Report the ACTUAL serving region (the owner node's),
+                            // not this intermediate node's — else the Network tab
+                            // shows the wrong region for a cross-node serve.
+                            let serve_region = if cand.region.is_empty() { region.as_str() } else { cand.region.as_str() };
                             set(&mut out, "x-hive-routed-to", &cand.node_id);
                             set(&mut out, "x-hive-transport", "iroh-p2p");
-                            set(&mut out, "x-hive-region", &region);
+                            set(&mut out, "x-hive-region", serve_region);
                             set(&mut out, "x-hive-request-id", &rid);
-                            let mut ev = cloud.event(&region, &method, &host, &path, status, "mesh-route-p2p", &cand.node_id);
+                            let mut ev = cloud.event(serve_region, &method, &host, &path, status, "mesh-route-p2p", &cand.node_id);
                             ev.request_id = rid.clone();
                             cloud.record(ev);
                             return out;
@@ -316,10 +320,11 @@ pub async fn edge_pipeline(
                         let mut out = builder
                             .body(Body::from_stream(r.bytes_stream()))
                             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+                        let serve_region = if cand.region.is_empty() { region.as_str() } else { cand.region.as_str() };
                         set(&mut out, "x-hive-routed-to", &cand.node_id);
-                        set(&mut out, "x-hive-region", &region);
+                        set(&mut out, "x-hive-region", serve_region);
                         set(&mut out, "x-hive-request-id", &rid);
-                        let mut ev = cloud.event(&region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
+                        let mut ev = cloud.event(serve_region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
                         ev.request_id = rid.clone();
                         cloud.record(ev);
                         return out;

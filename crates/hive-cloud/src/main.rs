@@ -470,7 +470,7 @@ pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
 /// either acquire/renew our fenced lease (if we're preferred) or release it (so the
 /// preferred node can take over). A short liveness window gives fast failover.
 fn spawn_lease_loop(cloud: Arc<CloudState>) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
@@ -478,13 +478,16 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
             let region = cloud.region.clone();
             let now = now_ms();
             // Live nodes = self + peers seen within 12s (fast failover detection).
-            let live: HashSet<String> = cloud
-                .registry
-                .nodes()
-                .into_iter()
+            let nodes_now = cloud.registry.nodes();
+            let live: HashSet<String> = nodes_now
+                .iter()
                 .filter(|n| n.is_self || now.saturating_sub(n.last_seen_ms) < 12_000)
-                .map(|n| n.id)
+                .map(|n| n.id.clone())
                 .collect();
+            // node -> region, so the election can be region-constrained. Every node
+            // sees the same gossiped regions → all compute the same owner.
+            let node_region: HashMap<String, String> =
+                nodes_now.iter().map(|n| (n.id.clone(), n.region.clone())).collect();
             let holders = cloud.container_holders.read().clone();
             for key in cloud.gw.container_projects() {
                 // The live nodes that can actually run this container (self + peers
@@ -496,6 +499,28 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
                 h.retain(|n| live.contains(n));
                 if h.is_empty() {
                     h.push(self_id.clone());
+                }
+                // Region-constrain the election for region-pinned containers: a
+                // `regions:["virginia"]` container must only ever be owned by a
+                // holder IN an allowed region — otherwise a non-region holder could
+                // win the rendezvous hash and serve from the wrong region. Fall back
+                // to the unconstrained set only if NO holder is in an allowed region
+                // (availability beats strict pinning when mis-placed).
+                let regions = cloud.projects.get(&key).functions.regions;
+                if !regions.is_empty() {
+                    let allowed: Vec<String> = h
+                        .iter()
+                        .filter(|n| {
+                            node_region
+                                .get(*n)
+                                .map(|r| regions.iter().any(|ar| ar.eq_ignore_ascii_case(r)))
+                                .unwrap_or(false)
+                        })
+                        .cloned()
+                        .collect();
+                    if !allowed.is_empty() {
+                        h = allowed;
+                    }
                 }
                 match crate::lease::hrw_owner(&key, &h) {
                     Some(pref) if pref == self_id => {
@@ -554,6 +579,10 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
             let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
             // Container holders, seeded with this node's own container deployments.
             let mut holders: HashMap<String, Vec<String>> = HashMap::new();
+            // Rebuild replicated zkauth rosters from scratch each cycle (so peer
+            // revocations converge); each peer's export is merged in below.
+            #[cfg(feature = "zkauth")]
+            crate::zkauth::clear_peer_cache();
             for key in cloud.gw.container_projects() {
                 holders.entry(key).or_default().push(cloud.node_name.clone());
             }
@@ -644,6 +673,20 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                                 }
                             }
                         }
+                    }
+                }
+                // Replicate the peer's public zkauth roster so previews placed on
+                // THIS node verify against the same ring the home node minted.
+                #[cfg(feature = "zkauth")]
+                if let Ok(resp) = cloud
+                    .http
+                    .get(format!("{peer}/v1/zkauth/roster-export"))
+                    .timeout(Duration::from_secs(4))
+                    .send()
+                    .await
+                {
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        crate::zkauth::ingest_peer_export(&v);
                     }
                 }
                 // Converge container leases (highest fencing epoch wins).

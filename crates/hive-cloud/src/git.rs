@@ -202,6 +202,17 @@ async fn run_build(
         }
     }
 
+    // On a fanout deploy, adopt the coordinator's forwarded BuildConfig +
+    // FunctionSettings so this target builds with the user's configured framework/
+    // commands + compute tier (not just auto-detect). Direct user deploys omit
+    // these (the coordinator reads its own store).
+    if let Some(bc) = req.build_config.as_ref().and_then(|v| serde_json::from_value::<crate::project_settings::BuildConfig>(v.clone()).ok()) {
+        cloud.projects.set_build(&project, bc);
+    }
+    if let Some(fs) = req.function_settings.as_ref().and_then(|v| serde_json::from_value::<crate::project_settings::FunctionSettings>(v.clone()).ok()) {
+        cloud.projects.set_functions(&project, fs);
+    }
+
     // ---- Placement scheduler / fanout (coordinator only) -------------------
     // Unless this is already a per-target deploy (`no_fanout`), decide WHERE this
     // project should be HOSTED from its configured regions + live mesh state, and
@@ -638,6 +649,10 @@ async fn fanout_remote(
     let log = |s: String| cloud.builds.log(bid, s);
     let team = cloud.projects.team_of(project);
     let env = cloud.projects.env_map(project);
+    // Forward the user's configured build settings + compute tier so the target
+    // builds identically to the coordinator (not just from auto-detect).
+    let build_config = cloud.projects.get_if_set(project).map(|s| s.build).and_then(|b| serde_json::to_value(b).ok());
+    let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
     let mut all_ok = true;
     for t in remote {
         let admin = match &t.admin {
@@ -648,6 +663,8 @@ async fn fanout_remote(
         dreq.no_fanout = true;
         dreq.project = Some(project.to_string());
         dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
+        dreq.build_config = build_config.clone();
+        dreq.function_settings = function_settings.clone();
         log(format!("→ {}: dispatching deploy", t.node));
         let resp = cloud
             .http
@@ -673,6 +690,44 @@ async fn fanout_remote(
         let ok = mirror_remote_build(cloud, bid, &admin, &target_bid, &t.node).await;
         if !ok {
             all_ok = false;
+        } else {
+            // Sync the host's auto-detected Build settings back to THIS coordinator
+            // so the dashboard (which reads settings here) shows the framework +
+            // commands that were actually used (Issue #3). Only fill fields the
+            // user hasn't explicitly set, so manual overrides are never clobbered.
+            if let Some(v) = cloud
+                .http
+                .get(format!("{admin}/v1/projects/{project}/settings"))
+                .header("x-hive-team", team.clone())
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await
+                .ok()
+            {
+                if let Ok(s) = v.json::<serde_json::Value>().await {
+                    if let Some(rb) = s.get("build") {
+                        if let Ok(remote_bc) = serde_json::from_value::<crate::project_settings::BuildConfig>(rb.clone()) {
+                            let mut cur = cloud.projects.get_if_set(project).map(|s| s.build).unwrap_or_default();
+                            let mut changed = false;
+                            for (cf, rf) in [
+                                (&mut cur.framework, &remote_bc.framework),
+                                (&mut cur.install_command, &remote_bc.install_command),
+                                (&mut cur.build_command, &remote_bc.build_command),
+                                (&mut cur.output_dir, &remote_bc.output_dir),
+                            ] {
+                                if cf.trim().is_empty() && !rf.trim().is_empty() {
+                                    *cf = rf.clone();
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                cloud.projects.set_build(project, cur);
+                                crate::persist::persist(cloud);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     all_ok
@@ -750,8 +805,26 @@ async fn mirror_remote_build(
 /// still hosts it to delete it — so changing regions RELOCATES the deployment
 /// rather than leaving stale copies. Best-effort; never fails the deploy.
 async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_names: &[String]) {
-    // Which nodes currently host this project? Derive from the gossiped routes:
-    // any host alias that starts with "<project>." or "<project>-".
+    // SELF cleanup first: peer_routes only ever lists PEERS, so a stale copy on
+    // THIS (coordinator) node would otherwise survive a relocation — wasting disk,
+    // keeping it a lease candidate, and inflating the serving count. If this node
+    // isn't a chosen target but still hosts the project, drop the local
+    // DEPLOYMENTS (gateway) — but keep the project SETTINGS, since the coordinator
+    // holds the authoritative env/build config for future redeploys.
+    let me = cloud.node_name.clone();
+    if !target_names.iter().any(|t| t == &me) {
+        let hosts_locally = cloud.gw.served_hosts().iter().any(|h| {
+            let sub = h.split('.').next().unwrap_or(h);
+            sub == project || sub.starts_with(&format!("{project}-"))
+        });
+        if hosts_locally {
+            let removed = cloud.gw.remove_project(project).await;
+            tracing::info!(project, removed = removed.len(), "relocation: removed stale local copy from coordinator");
+            crate::persist::persist(cloud);
+        }
+    }
+    // Which PEER nodes currently host this project? Derive from the gossiped
+    // routes: any host alias that starts with "<project>." or "<project>-".
     let admins = cloud.node_admins.read().clone();
     let routes = cloud.peer_routes.read().clone();
     let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -769,9 +842,11 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             continue; // keep the chosen targets
         }
         if let Some(admin) = admins.get(&node) {
+            // cascade=false: delete ONLY on that node — must not fan back out and
+            // wipe the freshly-placed copy on the new target.
             let _ = cloud
                 .http
-                .delete(format!("{admin}/v1/projects/{project}"))
+                .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
                 .header("x-hive-team", team.clone())
                 .timeout(Duration::from_secs(15))
                 .send()
@@ -923,6 +998,23 @@ fn should_use_npm_ci(pm: &str, has_package_lock: bool, first_deploy: bool, use_c
     pm == "npm" && has_package_lock && (first_deploy || !use_cache)
 }
 
+/// Ensure a `yarn`/`pnpm` command's binary exists before running it (Issue #2).
+/// yarn/pnpm are provisioned by corepack — but corepack itself is missing from
+/// some distro Node packages, so a bare `corepack enable` is a no-op and the
+/// command fails with "yarn: command not found". This self-heals: install
+/// corepack via npm if absent, enable the shims (which respect the project's
+/// `packageManager` field → correct yarn/pnpm version, classic or berry), then
+/// run the command. npm always ships with Node. npm/bun/other commands pass
+/// through unchanged.
+fn corepack_wrap(cmd: &str) -> String {
+    match cmd.split_whitespace().next().unwrap_or("") {
+        "yarn" | "pnpm" => format!(
+            "(command -v corepack >/dev/null 2>&1 || npm i -g corepack >/dev/null 2>&1); corepack enable >/dev/null 2>&1; {cmd}"
+        ),
+        _ => cmd.to_string(),
+    }
+}
+
 /// Framework-Defined Infrastructure: detect the framework, run its real install
 /// + build commands (streamed), then normalize the output into a Manifest —
 /// either static assets or a serverless server. This is the executor that turns
@@ -962,6 +1054,28 @@ async fn build_via_fdi(
     let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| pick(|b| &b.framework));
 
     let plan = fluid_build::plan_build(dir, fwo.as_deref(), inst.as_deref(), bld.as_deref(), outd.as_deref());
+
+    // Persist the auto-detected framework back into Project Settings so the
+    // dashboard's Build settings reflect what was actually built (Issue #3). Only
+    // fill in a field the user hasn't explicitly set, so we never clobber overrides.
+    {
+        let cur = bc.clone().unwrap_or_default();
+        if cur.framework.trim().is_empty() {
+            let mut nb = cur;
+            nb.framework = plan.framework.slug.to_string();
+            if nb.install_command.trim().is_empty() {
+                nb.install_command = plan.install_command.clone();
+            }
+            if nb.build_command.trim().is_empty() {
+                nb.build_command = plan.build_command.clone();
+            }
+            if nb.output_dir.trim().is_empty() {
+                nb.output_dir = plan.output_dir.clone();
+            }
+            cloud.projects.set_build(project, nb);
+            log(format!("Auto-detected framework: {} (saved to Build settings).", plan.framework.name));
+        }
+    }
 
     // Generic "Static" framework = publish the files as-is: no install, no build.
     // This honors the user's explicit choice and, crucially, never runs `npm
@@ -1018,13 +1132,13 @@ async fn build_via_fdi(
     let use_npm_ci = should_use_npm_ci(pm, install_dir.join("package-lock.json").exists(), first_deploy, use_cache);
     // Install command: honor an explicit override, else the right command for the
     // detected package manager (pnpm/yarn via corepack so the binary is present).
-    let install_cmd: String = inst.unwrap_or_else(|| match pm {
-        "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm install --no-frozen-lockfile{pnpm_filter}"),
-        "yarn" => "corepack enable >/dev/null 2>&1; yarn install --network-timeout 600000".into(),
+    let install_cmd: String = corepack_wrap(&inst.unwrap_or_else(|| match pm {
+        "pnpm" => format!("pnpm install --no-frozen-lockfile{pnpm_filter}"),
+        "yarn" => "yarn install --network-timeout 600000".into(),
         "bun" => "bun install".into(),
         _ if use_npm_ci => "npm ci --no-audit --no-fund".into(),
         _ => "npm install --no-audit --no-fund".into(),
-    });
+    }));
     if use_npm_ci {
         log(format!(
             "Using `npm ci` (package-lock.json present, {}).",
@@ -1039,7 +1153,7 @@ async fn build_via_fdi(
     // "vite: command not found" (exit 127). Run framework build commands through
     // the package manager's `exec` so it resolves the bin from the hoisted/virtual
     // store. A `npm run …` style command is just re-pointed to the active PM.
-    let build_cmd = {
+    let build_cmd = corepack_wrap(&{
         let bc = plan.build_command.clone();
         let first = bc.split_whitespace().next().unwrap_or("");
         let is_pm_invocation = matches!(first, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx" | "corepack");
@@ -1047,8 +1161,8 @@ async fn build_via_fdi(
             bc.replacen("npm", pm, 1)
         } else if !bc.trim().is_empty() && !is_pm_invocation {
             match pm {
-                "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm exec {bc}"),
-                "yarn" => format!("corepack enable >/dev/null 2>&1; yarn exec {bc}"),
+                "pnpm" => format!("pnpm exec {bc}"),
+                "yarn" => format!("yarn exec {bc}"),
                 "bun" => format!("bunx {bc}"),
                 // npm: the raw binary resolves via node_modules/.bin on PATH.
                 _ => bc,
@@ -1056,7 +1170,7 @@ async fn build_via_fdi(
         } else {
             bc
         }
-    };
+    });
 
     // 0) Restore cached dependencies (local, else pull from a mesh peer). Skipped
     // when the cache is disabled (redeploy opt-out) or when `npm ci` will wipe
@@ -1105,12 +1219,12 @@ async fn build_via_fdi(
                     _ => "@sveltejs/adapter-node",
                 };
                 log(format!("SvelteKit detected with adapter-auto — switching to {spec} so it serves on a self-hosted node."));
-                let add = match pm {
-                    "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm add -D --config.strict-peer-dependencies=false {spec}"),
-                    "yarn" => format!("corepack enable >/dev/null 2>&1; yarn add -D {spec}"),
+                let add = corepack_wrap(&match pm {
+                    "pnpm" => format!("pnpm add -D --config.strict-peer-dependencies=false {spec}"),
+                    "yarn" => format!("yarn add -D {spec}"),
                     "bun" => format!("bun add -d {spec}"),
                     _ => format!("npm install -D --no-audit --no-fund --legacy-peer-deps {spec}"),
-                };
+                });
                 run_streamed(dir, &add, cloud, bid, &proj_env)
                     .await
                     .map_err(|e| anyhow::anyhow!("installing adapter-node failed: {e}"))?;

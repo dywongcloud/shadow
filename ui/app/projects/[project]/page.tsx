@@ -23,6 +23,7 @@ import { ProjectWorkflows } from "@/components/workflows";
 import { DeploymentResources } from "@/components/deployment-resources";
 import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
+import { CreateDeploymentModal } from "@/components/create-deployment-modal";
 
 // Lazy-load the React Flow service graph — it's a heavy client bundle, so it's
 // only fetched when the Service Graph tab is actually opened.
@@ -55,6 +56,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
   const [busy, setBusy] = useState("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   // A redeploy doesn't create a deployment row until its build FINISHES (the live
   // version keeps serving meanwhile), so the table looked frozen after pressing
   // Redeploy. Show an immediate optimistic "Building" row keyed by the build id;
@@ -313,9 +315,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm text-secondary">{mine.length + pendingRows.length} deployment{mine.length + pendingRows.length === 1 ? "" : "s"}</span>
           <div className="flex gap-2">
-            <Link href={`/new?repo=${encodeURIComponent(prod?.git?.repo_url ?? "")}`}>
-              <Button><Plus className="h-4 w-4" /> New Deployment</Button>
-            </Link>
+            <Button onClick={() => setCreateOpen(true)}><Plus className="h-4 w-4" /> New Deployment</Button>
           </div>
         </div>
         <Table>
@@ -407,6 +407,19 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           onDone={(buildId, env) => {
             // Show the building row immediately, jump to the deployments tab so
             // it's visible, and refresh (the real row replaces it when ready).
+            setPending((p) => [{ id: buildId, env, at: Date.now() }, ...p]);
+            setTab("deployments");
+            refresh();
+          }}
+        />
+      )}
+      {createOpen && (
+        <CreateDeploymentModal
+          project={name}
+          repoUrl={prod?.git?.repo_url ?? ""}
+          branch={prod?.git?.branch}
+          onClose={() => setCreateOpen(false)}
+          onDone={(buildId, env) => {
             setPending((p) => [{ id: buildId, env, at: Date.now() }, ...p]);
             setTab("deployments");
             refresh();

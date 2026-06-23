@@ -126,6 +126,13 @@ fn team_of(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// The team roster used for BOTH minting and verifying — the union of this node's
+/// local members and the public members replicated from peers via gossip. Because
+/// a preview can be PLACED on a peer (the placement scheduler), the node that
+/// serves it must rebuild the *identical* ring the home node minted against;
+/// replicating the public roster makes that ring match across the mesh.
+/// `Roster::enroll` dedups by key and `Roster::ring` sorts by bytes, so the ring
+/// is identical regardless of merge order.
 fn roster_of(team: &str, store: &Store) -> Roster {
     let mut r = Roster::new();
     if let Some(members) = store.teams.get(team) {
@@ -135,7 +142,62 @@ fn roster_of(team: &str, store: &Store) -> Roster {
             }
         }
     }
+    if let Some(members) = peer_cache().lock().unwrap().get(team) {
+        for (pubkey, role) in members {
+            if let Some(pk) = unhex(pubkey).and_then(|b| arr32(&b)).and_then(|a| PublicKey::from_bytes(&a).ok()) {
+                r.enroll(pk, parse_role(role));
+            }
+        }
+    }
     r
+}
+
+// --------------------- mesh roster replication (public keys only) ------------
+
+/// Public rosters learned from peers: team -> [(pubkey hex, role)]. Rebuilt each
+/// gossip cycle so revocations converge. Holds only public info — never secrets.
+fn peer_cache() -> &'static Mutex<HashMap<String, Vec<(String, String)>>> {
+    static P: OnceLock<Mutex<HashMap<String, Vec<(String, String)>>>> = OnceLock::new();
+    P.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// This node's LOCAL roster as public JSON (no secrets), for peers to replicate.
+/// Exports only local members (never the peer cache) so revocations can't echo.
+pub fn export_json() -> Value {
+    let s = store().lock().unwrap();
+    let teams: serde_json::Map<String, Value> = s
+        .teams
+        .iter()
+        .map(|(t, ms)| {
+            let members: Vec<Value> = ms.iter().map(|m| json!({ "pubkey": m.pubkey, "role": m.role })).collect();
+            (t.clone(), json!(members))
+        })
+        .collect();
+    json!({ "teams": teams })
+}
+
+/// Drop all replicated peer rosters (called at the start of each gossip cycle).
+pub fn clear_peer_cache() {
+    peer_cache().lock().unwrap().clear();
+}
+
+/// Merge one peer's [`export_json`] output into the peer roster cache.
+pub fn ingest_peer_export(v: &Value) {
+    let Some(teams) = v.get("teams").and_then(|x| x.as_object()) else {
+        return;
+    };
+    let mut pc = peer_cache().lock().unwrap();
+    for (team, members) in teams {
+        let Some(arr) = members.as_array() else { continue };
+        let entry = pc.entry(team.clone()).or_default();
+        for m in arr {
+            let pk = m.get("pubkey").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("member").to_string();
+            if !pk.is_empty() && !entry.iter().any(|(p, _)| p == &pk) {
+                entry.push((pk, role));
+            }
+        }
+    }
 }
 
 // ----------------------------- core ops -----------------------------
@@ -289,6 +351,13 @@ pub fn routes() -> Router {
         .route("/v1/zkauth/register", post(register))
         .route("/v1/zkauth/preview-proof", post(preview_proof))
         .route("/v1/zkauth/roster", get(roster))
+        .route("/v1/zkauth/roster-export", get(roster_export))
+}
+
+/// Node-to-node: this node's local public roster, for mesh replication so peers
+/// that serve previews can rebuild the identical verification ring.
+async fn roster_export() -> Json<Value> {
+    Json(export_json())
 }
 
 #[derive(Deserialize)]

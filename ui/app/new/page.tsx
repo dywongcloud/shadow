@@ -98,6 +98,9 @@ export default function NewProjectPage() {
   const [url, setUrl] = useState("");
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
+  // Env vars for the quick git-URL deploy (Issue #6) — collapsible editor.
+  const [urlEnvOpen, setUrlEnvOpen] = useState(false);
+  const [urlEnvRows, setUrlEnvRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
   const [gh, setGh] = useState<{ configured: boolean; connected: boolean }>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   const [repoQ, setRepoQ] = useState("");
@@ -120,6 +123,25 @@ export default function NewProjectPage() {
       }
     }).catch(() => {});
   }, []);
+
+  // Build the env map for the quick git-URL deploy from its editor rows.
+  function urlEnv(): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const r of urlEnvRows) if (r.k.trim()) out[r.k.trim()] = r.v;
+    return out;
+  }
+  // Paste a `.env` blob into a KEY field → expand into rows.
+  function onUrlEnvPaste(e: React.ClipboardEvent, idx: number) {
+    const text = e.clipboardData.getData("text");
+    if (!text.includes("\n") && !text.includes("=")) return;
+    e.preventDefault();
+    const parsed = text
+      .split("\n").map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#") && l.includes("="))
+      .map((l) => { const i = l.indexOf("="); return { k: l.slice(0, i).trim(), v: l.slice(i + 1).trim().replace(/^["']|["']$/g, "") }; });
+    if (!parsed.length) return;
+    setUrlEnvRows((cur) => { const next = [...cur]; next.splice(idx, 1, ...parsed); return next.filter((r) => r.k || r.v).concat({ k: "", v: "" }); });
+  }
 
   async function deploy(repoUrl: string, branch?: string, project?: string, root?: string, env?: Record<string, string>, template?: Template) {
     if (!repoUrl) return;
@@ -187,13 +209,42 @@ export default function NewProjectPage() {
             placeholder="Enter a Git repository URL to deploy…"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && deploy(url)}
+            onKeyDown={(e) => e.key === "Enter" && deploy(url, undefined, undefined, undefined, urlEnv())}
             className="border-0 focus:ring-0"
           />
-          <Button onClick={() => deploy(url)} disabled={deploying || !url}>
+          <Button onClick={() => deploy(url, undefined, undefined, undefined, urlEnv())} disabled={deploying || !url}>
             {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : "Deploy"}
           </Button>
         </div>
+        {/* Environment Variables (Issue #6): set env on the quick URL deploy too. */}
+        <button
+          type="button"
+          onClick={() => setUrlEnvOpen((o) => !o)}
+          className="mt-1 flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-xs text-secondary hover:text-fg"
+        >
+          <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", urlEnvOpen ? "" : "-rotate-90")} />
+          Environment Variables{(() => { const n = Object.keys(urlEnv()).length; return n ? ` (${n})` : ""; })()}
+        </button>
+        {urlEnvOpen && (
+          <div className="space-y-2 px-2 pb-2">
+            {urlEnvRows.map((row, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input className="flex-1 font-mono text-xs" placeholder="KEY" value={row.k}
+                  onPaste={(e) => onUrlEnvPaste(e, i)}
+                  onChange={(e) => setUrlEnvRows((c) => c.map((r, j) => (j === i ? { ...r, k: e.target.value } : r)))} />
+                <Input className="flex-1 font-mono text-xs" placeholder="value" value={row.v}
+                  onChange={(e) => setUrlEnvRows((c) => c.map((r, j) => (j === i ? { ...r, v: e.target.value } : r)))} />
+                <button type="button" className="text-muted hover:text-fg" onClick={() => setUrlEnvRows((c) => { const n = c.filter((_, j) => j !== i); return n.length ? n : [{ k: "", v: "" }]; })}>
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+            <Button variant="outline" onClick={() => setUrlEnvRows((c) => [...c, { k: "", v: "" }])}>
+              <Plus className="h-3.5 w-3.5" /> Add Variable
+            </Button>
+            <p className="text-xs text-muted">Tip: paste a .env file into a KEY field to import many at once.</p>
+          </div>
+        )}
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
         Paste any public Git repo URL — OpenEdge clones, builds, and deploys it.

@@ -865,6 +865,16 @@ pub struct GitDeployRequest {
     /// placement never recurses.
     #[serde(default)]
     pub no_fanout: bool,
+    /// Project BuildConfig (framework/install/build/output/root), forwarded by the
+    /// coordinator on a fanout deploy so the target builds with the SAME settings
+    /// the user configured — not just whatever it auto-detects. Opaque JSON to
+    /// avoid a fluid-core → hive-cloud dependency. None on direct user deploys.
+    #[serde(default)]
+    pub build_config: Option<serde_json::Value>,
+    /// Project FunctionSettings (vcpus/memory/regions/…), forwarded on fanout so a
+    /// remotely-placed deployment honors the user's compute tier. Opaque JSON.
+    #[serde(default)]
+    pub function_settings: Option<serde_json::Value>,
 }
 fn default_prod() -> bool {
     true

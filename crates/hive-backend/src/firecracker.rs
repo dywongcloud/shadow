@@ -76,6 +76,13 @@ pub struct FirecrackerBackend {
     /// Live Firecracker processes, keyed by cell. Kept here because `CellHandle`
     /// is `Clone` and stored in the control plane, but a `Child` is not.
     procs: Arc<Mutex<HashMap<CellId, Child>>>,
+    /// Per-cell host TAP device name, for outbound networking — torn down with the
+    /// cell. See `setup_cell_net`.
+    taps: Arc<Mutex<HashMap<CellId, String>>>,
+    /// Monotonic index for allocating each cell a distinct /30 egress subnet.
+    net_idx: Arc<std::sync::atomic::AtomicU32>,
+    /// Set once host NAT/forwarding has been configured.
+    nat_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FirecrackerBackend {
@@ -83,6 +90,9 @@ impl FirecrackerBackend {
         FirecrackerBackend {
             cfg,
             procs: Arc::new(Mutex::new(HashMap::new())),
+            taps: Arc::new(Mutex::new(HashMap::new())),
+            net_idx: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -103,6 +113,108 @@ impl FirecrackerBackend {
     fn data_image_for(&self, image: &str) -> PathBuf {
         self.cfg.rootfs_dir.join(format!("{}.data.ext4", sanitize_image(image)))
     }
+
+    /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) can
+    /// reach the internet. Run once per process; failures are non-fatal (cells
+    /// just won't get egress).
+    async fn ensure_host_nat(&self) {
+        use std::sync::atomic::Ordering;
+        if self.nat_ready.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Use iptables where present, else nftables (modern distros ship only
+        // `nft`). Both set a MASQUERADE on the guest subnet + allow forwarding.
+        let script = r#"
+            export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
+            sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+            if command -v iptables >/dev/null 2>&1; then
+              iptables -t nat -C POSTROUTING -s 172.16.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.0.0/16 -j MASQUERADE
+              iptables -C FORWARD -s 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 172.16.0.0/16 -j ACCEPT
+              iptables -C FORWARD -d 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 172.16.0.0/16 -j ACCEPT
+            elif command -v nft >/dev/null 2>&1; then
+              nft add table ip hive_nat 2>/dev/null
+              nft 'add chain ip hive_nat post { type nat hook postrouting priority 100 ; }' 2>/dev/null
+              nft flush chain ip hive_nat post 2>/dev/null
+              nft add rule ip hive_nat post ip saddr 172.16.0.0/16 masquerade 2>/dev/null
+              nft 'add chain ip hive_nat fwd { type filter hook forward priority 0 ; }' 2>/dev/null
+              nft flush chain ip hive_nat fwd 2>/dev/null
+              nft add rule ip hive_nat fwd ip saddr 172.16.0.0/16 accept 2>/dev/null
+              nft add rule ip hive_nat fwd ip daddr 172.16.0.0/16 accept 2>/dev/null
+            fi"#;
+        let _ = Command::new("/bin/sh").arg("-c").arg(script).output().await;
+    }
+
+    /// Allocate a /30 egress subnet + host TAP for a cell. Returns the kernel
+    /// `ip=` boot-arg fragment + guest MAC to attach as eth0, or None if host
+    /// networking couldn't be set up (cell then boots without egress — never a
+    /// regression vs. the old vsock-only behavior).
+    async fn setup_cell_net(&self, id: &CellId) -> Option<CellNet> {
+        use std::sync::atomic::Ordering;
+        self.ensure_host_nat().await;
+        let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % 16384;
+        let third = ((i >> 6) & 0xff) as u8;
+        let base = ((i & 0x3f) as u8) * 4;
+        let host_ip = format!("172.16.{third}.{}", base + 1);
+        let guest_ip = format!("172.16.{third}.{}", base + 2);
+        let tap = format!("fc{i}");
+        let mac = format!("02:fc:00:00:{:02x}:{:02x}", (i >> 8) as u8, i as u8);
+        // Recreate the tap fresh (delete any stale one from a prior cell at this index).
+        let script = format!(
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
+             ip link del {tap} 2>/dev/null; ip tuntap add dev {tap} mode tap 2>/dev/null && \
+             ip addr add {host_ip}/30 dev {tap} 2>/dev/null && ip link set {tap} up 2>/dev/null"
+        );
+        let ok = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            return None;
+        }
+        self.taps.lock().await.insert(id.clone(), tap.clone());
+        Some(CellNet {
+            tap,
+            mac,
+            // kernel ip= autoconfig: client::gw:netmask::device:off
+            ip_cmdline: format!("ip={guest_ip}::{host_ip}:255.255.255.252::eth0:off"),
+        })
+    }
+
+    /// Write `/etc/resolv.conf` into the PER-CELL overlay (never the shared base
+    /// image) via debugfs — no mount needed — so the guest can resolve DNS for
+    /// outbound `fetch`. Best-effort: DNS simply won't work if debugfs is absent.
+    async fn write_guest_resolv(&self, overlay: &std::path::Path) {
+        let tmp = overlay.with_extension("resolv.tmp");
+        if tokio::fs::write(&tmp, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n").await.is_err() {
+            return;
+        }
+        let script = format!(
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
+             debugfs -w -R 'rm /etc/resolv.conf' '{ov}' >/dev/null 2>&1; \
+             debugfs -w -R 'write {tmp} /etc/resolv.conf' '{ov}' >/dev/null 2>&1",
+            ov = overlay.display(),
+            tmp = tmp.display(),
+        );
+        let _ = Command::new("/bin/sh").arg("-c").arg(&script).status().await;
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    /// Tear down a cell's TAP (best-effort).
+    async fn teardown_cell_net(&self, id: &CellId) {
+        if let Some(tap) = self.taps.lock().await.remove(id) {
+            let _ = Command::new("/bin/sh").arg("-c").arg(format!("export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {tap} 2>/dev/null")).status().await;
+        }
+    }
+}
+
+/// Per-cell egress networking config (host TAP + guest boot args).
+struct CellNet {
+    tap: String,
+    mac: String,
+    ip_cmdline: String,
 }
 
 /// Guest path the per-deployment build output is mounted at (the agent mounts
@@ -158,6 +270,8 @@ impl CellBackend for FirecrackerBackend {
             base.display()
         );
         tokio::fs::copy(&base, &overlay).await?;
+        // Give the guest working DNS for outbound fetch (per-cell overlay only).
+        self.write_guest_resolv(&overlay).await;
 
         // If this image has a delivered build artifact (packed by `deliver_build`),
         // give the cell a private writable copy to attach as its second drive.
@@ -187,6 +301,15 @@ impl CellBackend for FirecrackerBackend {
         // Wait for the API socket to appear.
         wait_for_path(&api_sock, Duration::from_secs(5)).await?;
 
+        // Outbound networking: give the cell a host TAP + NAT egress so the app
+        // can reach databases/APIs (Upstash, OpenAI, …). Best-effort — if it
+        // fails, the VM still boots (vsock-only), so this never regresses serving.
+        let net = self.setup_cell_net(&spec.id).await;
+        let boot_args = match &net {
+            Some(n) => format!("{} {}", self.cfg.boot_args, n.ip_cmdline),
+            None => self.cfg.boot_args.clone(),
+        };
+
         // Configure the microVM via the REST API, then boot it.
         let mem_mib = spec.resources.mem_mib;
         let vcpus = spec.resources.vcpus;
@@ -201,10 +324,23 @@ impl CellBackend for FirecrackerBackend {
             "/boot-source",
             &serde_json::json!({
                 "kernel_image_path": self.cfg.kernel_image,
-                "boot_args": self.cfg.boot_args,
+                "boot_args": boot_args,
             }),
         )
         .await?;
+        // Attach the egress NIC (eth0 in the guest, backed by the host TAP).
+        if let Some(n) = &net {
+            fc_put(
+                &api_sock,
+                "/network-interfaces/eth0",
+                &serde_json::json!({
+                    "iface_id": "eth0",
+                    "host_dev_name": n.tap,
+                    "guest_mac": n.mac,
+                }),
+            )
+            .await?;
+        }
         fc_put(
             &api_sock,
             "/drives/rootfs",
@@ -433,6 +569,7 @@ impl CellBackend for FirecrackerBackend {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        self.teardown_cell_net(&cell.id).await;
         let _ = tokio::fs::remove_dir_all(&cell.root).await;
         Ok(())
     }

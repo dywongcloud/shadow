@@ -1098,14 +1098,32 @@ async fn build_response(
     mut resp: fluid_tunnel::TunnelResponse,
 ) -> Response {
     let mut hdrs = HeaderMap::new();
-    let mut is_stream = false;
+    // Stream incrementally for ANY response the function didn't declare a fixed
+    // length for — matching Vercel streaming-functions behavior. That covers SSE
+    // (text/event-stream), React Server Component streaming (text/x-component,
+    // chunked HTML), and AI-SDK/ReadableStream responses (chunked, no
+    // content-length). A response WITH a content-length is a finished, sized body
+    // → buffer it (sized, clean termination), exactly as before.
+    let mut has_content_length = false;
+    let mut forced_stream = false;
     for (k, v) in &resp.headers {
         let kl = k.to_ascii_lowercase();
-        if kl == "content-length" || kl == "transfer-encoding" || kl == "connection" {
+        if kl == "content-length" {
+            has_content_length = true;
             continue;
         }
-        if kl == "content-type" && v.to_ascii_lowercase().contains("event-stream") {
-            is_stream = true;
+        if kl == "transfer-encoding" {
+            if v.to_ascii_lowercase().contains("chunked") {
+                forced_stream = true;
+            }
+            continue;
+        }
+        if kl == "connection" {
+            continue;
+        }
+        let vl = v.to_ascii_lowercase();
+        if kl == "content-type" && (vl.contains("event-stream") || vl.contains("x-component") || vl.contains("stream")) {
+            forced_stream = true;
         }
         if let (Ok(name), Ok(val)) = (
             HeaderName::from_bytes(k.as_bytes()),
@@ -1114,6 +1132,7 @@ async fn build_response(
             hdrs.append(name, val);
         }
     }
+    let is_stream = forced_stream || !has_content_length;
     hdrs.insert(
         HeaderName::from_static("x-fluid-instance"),
         HeaderValue::from_str(&cell.to_string()).unwrap_or(HeaderValue::from_static("?")),

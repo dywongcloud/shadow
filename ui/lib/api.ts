@@ -32,7 +32,12 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
     headers: { "content-type": "application/json", ...teamHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
-  if (!r.ok) throw new Error(`${method} ${path} -> ${r.status}`);
+  if (!r.ok) {
+    // Surface the server's error message (e.g. "project name already taken")
+    // instead of an opaque status, so callers can show it to the user.
+    const detail = await r.text().catch(() => "");
+    throw new Error(detail?.trim() ? detail.trim() : `${method} ${path} -> ${r.status}`);
+  }
   const isMutation = method !== "GET" && method !== "HEAD";
   if (typeof window !== "undefined" && isMutation && CONFIG_PATHS.test(path) && path !== "/v1/gitops") {
     window.dispatchEvent(new Event("gitops-sync"));
