@@ -121,12 +121,19 @@ export interface NodeInfo {
   lon?: number | null;
   city?: string | null;
   country?: string | null;
+  /** Static host capacity advertised by the node (gossiped). */
+  cpu_cores?: number;
+  mem_total_mb?: number;
+  disk_total_gb?: number;
 }
 
 export interface AnycastTable {
   region: string;
   selected: string | null;
   table: NodeInfo[];
+  /** node name → count of deployments it actually hosts (real placement). A node
+   *  with ≥1 is "serving"; 0/absent is "standby". */
+  serving?: Record<string, number>;
 }
 
 export interface RateLimitStats {
@@ -172,6 +179,8 @@ export interface CronJob {
   last_run_ms?: number;
   next_run_ms?: number;
   runs: number;
+  /** "manual" (created here) or "vercel.json" (declared in a deployment's config). */
+  source?: string;
 }
 
 export interface FunctionStats {
@@ -244,6 +253,8 @@ export interface FunctionSettings {
   default_max_duration_secs: number;
   regions: string[];
   failover: boolean;
+  /** vCPUs per instance (microVM). Standard tier = 1, Performance tier = 2. */
+  vcpus: number;
   memory_mib: number;
 }
 
@@ -557,4 +568,19 @@ export interface Build {
   deployment_id: string | null;
   alias: string | null;
   lines: BuildLogLine[];
+}
+
+// ---- CDN routing (dashboard-managed redirects/rewrites; `/v1/routing`) ----
+export interface RouteRedirect {
+  source: string;
+  destination: string;
+  status: number;
+}
+export interface RouteRewrite {
+  source: string;
+  destination: string;
+}
+export interface RoutingConfig {
+  redirects: RouteRedirect[];
+  rewrites: RouteRewrite[];
 }

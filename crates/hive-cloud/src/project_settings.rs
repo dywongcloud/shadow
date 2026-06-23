@@ -1,6 +1,7 @@
 //! Per-project settings — Environment Variables, Build & Development config, and
 //! Function settings (Fluid, max duration, regions, failover). Keyed by project
-//! name so they persist across deployments. In-memory for this study build.
+//! name so they persist across deployments: changes are saved via `persist::persist`
+//! into `PlatformSnapshot.projects` and restored on boot.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -53,7 +54,15 @@ pub struct FunctionSettings {
     pub default_max_duration_secs: u64,
     pub regions: Vec<String>,
     pub failover: bool,
+    /// Per-instance CPU/memory tier (one microVM per instance):
+    ///   Standard    = 1 vCPU  / 2048 MiB  (default)
+    ///   Performance = 2 vCPUs / 4096 MiB
+    #[serde(default = "default_vcpus")]
+    pub vcpus: u32,
     pub memory_mib: u32,
+}
+fn default_vcpus() -> u32 {
+    1
 }
 impl Default for FunctionSettings {
     fn default() -> Self {
@@ -65,7 +74,9 @@ impl Default for FunctionSettings {
             // region picker is populated from where nodes actually are.
             regions: vec![],
             failover: false,
-            memory_mib: 512,
+            // Standard serverless tier: 1 vCPU / 2 GB.
+            vcpus: 1,
+            memory_mib: 2048,
         }
     }
 }

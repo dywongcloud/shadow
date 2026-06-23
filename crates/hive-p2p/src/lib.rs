@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use iroh::{endpoint::presets::N0, endpoint::Connection, endpoint::QuicTransportConfig, EndpointAddr};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 // Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
@@ -31,6 +31,14 @@ const KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// ALPN identifying the Hive function-tunnel protocol over iroh.
 pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
+
+/// First byte on every hive-p2p bi stream selects how the owner handles it:
+/// a multiplexed `fluid-tunnel` session (HTTP request/response) or a raw byte
+/// splice for upgraded connections (WebSocket). This 1-byte mode lives at the
+/// hive-p2p framing layer — the `fluid-tunnel` wire protocol is unchanged, it
+/// simply rides AFTER this byte on a `STREAM_TUNNEL` stream.
+const STREAM_TUNNEL: u8 = 0x00;
+const STREAM_RAW: u8 = 0x01;
 
 /// Serialize this endpoint's dialable address (direct socket addrs + relay url) to
 /// JSON, so peers can learn it via gossip and dial directly — no DNS/relay
@@ -44,6 +52,27 @@ pub struct TunnelResp {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// A streamed P2P response: head available immediately, body delivered as chunks
+/// via [`recv`](TunnelStream::recv) as they arrive (gateway side). Completes when
+/// the owner finishes the response — letting the caller forward an SSE / chunked
+/// body incrementally instead of buffering it whole.
+pub struct TunnelStream {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    body: tokio::sync::mpsc::UnboundedReceiver<bytes::Bytes>,
+    /// Kept alive so the tunnel's QUIC streams stay open until the body is fully
+    /// consumed — dropping the client early would reset the send stream and can
+    /// truncate the response. The owning [`TunnelStream`] outlives the body drain.
+    _client: fluid_tunnel::TunnelClient,
+}
+
+impl TunnelStream {
+    /// Next body chunk, or `None` at the end of the response body.
+    pub async fn recv(&mut self) -> Option<bytes::Bytes> {
+        self.body.recv().await
+    }
 }
 
 /// A cached, reusable QUIC connection to one peer — the "trunk". The pool OWNS the
@@ -140,12 +169,39 @@ impl PeerPool {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<TunnelResp> {
+        // Buffered helper for callers that need the whole body in memory: drive the
+        // streaming path and drain its chunk channel.
+        let mut s = self
+            .request_stream(node_id, addr_json, method, path, headers, body)
+            .await?;
+        let mut buf = Vec::new();
+        while let Some(chunk) = s.recv().await {
+            buf.extend_from_slice(&chunk);
+        }
+        Ok(TunnelResp { status: s.status, headers: s.headers, body: buf })
+    }
+
+    /// Streaming variant of [`request`]: returns the response head plus a receiver
+    /// that yields body chunks as the owner produces them — no buffering. The
+    /// caller (e.g. the edge gateway) can wrap the receiver in an
+    /// `axum::body::Body::from_stream` so SSE / chunked responses arrive
+    /// incrementally cross-node. Pre-send (`open_bi`) failures retry once exactly
+    /// as [`request`] did; a failure after the request is on the wire is returned.
+    pub async fn request_stream(
+        &self,
+        node_id: &str,
+        addr_json: &str,
+        method: &str,
+        path: &str,
+        headers: &[(String, String)],
+        body: &[u8],
+    ) -> Result<TunnelStream> {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
             let conn = self.acquire(node_id, addr_json).await?;
             // `open_bi` is PRE-SEND: an error means no request bytes left this node.
-            let (send, recv) = match conn.open_bi().await {
+            let (mut send, recv) = match conn.open_bi().await {
                 Ok(pair) => pair,
                 Err(e) => {
                     self.evict(node_id).await;
@@ -155,16 +211,46 @@ impl PeerPool {
                     return Err(e.into());
                 }
             };
+            // Select the multiplexed tunnel mode for the owner's dispatcher.
+            send.write_all(&[STREAM_TUNNEL]).await?;
+            send.flush().await?;
             // Past this point the request may be on the wire → do NOT retry in-call.
             let client = fluid_tunnel::TunnelClient::new(tokio::io::join(recv, send));
             // `to_vec` per attempt so a retry still owns the headers.
             let resp = client.request(method, path, headers.to_vec(), body).await?;
-            let mut buf = Vec::new();
-            let mut rx = resp.body;
-            while let Some(chunk) = rx.recv().await {
-                buf.extend_from_slice(&chunk);
-            }
-            return Ok(TunnelResp { status: resp.status, headers: resp.headers, body: buf });
+            // Move the client INTO the stream so it lives until the body is drained
+            // (keeping the QUIC streams open); see `TunnelStream::_client`.
+            return Ok(TunnelStream {
+                status: resp.status,
+                headers: resp.headers,
+                body: resp.body,
+                _client: client,
+            });
+        }
+    }
+
+    /// Open a RAW bidirectional byte stream to a peer over its trunk, for upgraded
+    /// connections (WebSocket) where HTTP request/response framing must be
+    /// bypassed. The owner splices these bytes straight to its local target. Same
+    /// pre-send retry-once semantics as [`request`].
+    pub async fn open_raw(&self, node_id: &str, addr_json: &str) -> Result<P2pStream> {
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let conn = self.acquire(node_id, addr_json).await?;
+            let (mut send, recv) = match conn.open_bi().await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+            send.write_all(&[STREAM_RAW]).await?;
+            send.flush().await?;
+            return Ok(tokio::io::join(recv, send));
         }
     }
 
@@ -212,15 +298,22 @@ pub async fn bind() -> Result<Endpoint> {
 /// The combined send+recv halves of a P2P stream, usable as one duplex stream.
 pub type P2pStream = tokio::io::Join<iroh::endpoint::RecvStream, iroh::endpoint::SendStream>;
 
-/// Dial a remote endpoint and open a bidirectional stream for one tunnel.
+/// Dial a remote endpoint and open a bidirectional stream for one tunnel. Writes
+/// the `STREAM_TUNNEL` mode byte so the owner's dispatcher treats it as a
+/// `fluid-tunnel` session (the caller wraps the returned stream in a `TunnelClient`).
 pub async fn dial(ep: &Endpoint, addr: impl Into<EndpointAddr>) -> Result<P2pStream> {
     let conn = ep.connect(addr, HIVE_ALPN).await?;
-    let (send, recv) = conn.open_bi().await?;
+    let (mut send, recv) = conn.open_bi().await?;
+    send.write_all(&[STREAM_TUNNEL]).await?;
+    send.flush().await?;
     Ok(tokio::io::join(recv, send))
 }
 
-/// Accept P2P connections forever; serve every bidirectional stream as a tunnel
-/// to the local function server at `local_http`. This is the instance side.
+/// Accept P2P connections forever; serve every bidirectional stream according to
+/// its leading mode byte: `STREAM_TUNNEL` → a `fluid-tunnel` session proxied to
+/// the local server at `local_http`; `STREAM_RAW` → a raw byte splice to a fresh
+/// connection to `local_http` (for upgraded/WebSocket connections). This is the
+/// instance (owner) side.
 pub async fn serve_tunnels(ep: Endpoint, local_http: String, max_concurrency: u32) {
     while let Some(incoming) = ep.accept().await {
         let local = local_http.clone();
@@ -229,18 +322,40 @@ pub async fn serve_tunnels(ep: Endpoint, local_http: String, max_concurrency: u3
                 Ok(c) => c,
                 Err(_) => return,
             };
-            // One inbound connection → many bi streams, each served as its own
-            // tunnel. This already handles a pooled peer that multiplexes many
-            // requests over one connection (each request is a new stream here).
-            while let Ok((send, recv)) = conn.accept_bi().await {
-                let stream = tokio::io::join(recv, send);
+            // One inbound connection → many bi streams, each dispatched by mode.
+            // This already handles a pooled peer that multiplexes many requests
+            // over one connection (each request is a new stream here).
+            while let Ok((send, mut recv)) = conn.accept_bi().await {
                 let local = local.clone();
                 tokio::spawn(async move {
-                    fluid_tunnel::TunnelServer::serve(stream, local, max_concurrency).await;
+                    // Read the 1-byte mode selector that prefixes every stream.
+                    let mut mode = [0u8; 1];
+                    if recv.read_exact(&mut mode).await.is_err() {
+                        return;
+                    }
+                    let stream = tokio::io::join(recv, send);
+                    match mode[0] {
+                        STREAM_RAW => raw_splice(stream, &local).await,
+                        _ => fluid_tunnel::TunnelServer::serve(stream, local, max_concurrency).await,
+                    }
                 });
             }
         });
     }
+}
+
+/// Splice a raw P2P stream to a fresh TCP connection to `local_http`, copying
+/// bytes both ways until either side closes. Used for upgraded (WebSocket)
+/// connections, which carry their own framing and must bypass HTTP parsing.
+async fn raw_splice(mut stream: P2pStream, local_http: &str) {
+    let mut tcp = match tokio::net::TcpStream::connect(local_http).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(local = %local_http, error = %e, "raw splice: local connect failed");
+            return;
+        }
+    };
+    let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
 }
 
 /// Assert at compile time that a `P2pStream` satisfies the tunnel transport bound.

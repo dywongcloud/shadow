@@ -9,7 +9,7 @@ use hive_controlplane::Hive;
 use hive_core::now_ms;
 use hive_edge::{
     bot::BotPolicy, BotManager, CdnCache, ConcurrencyLimiter, CronScheduler, NodeRegistry,
-    RateLimiter, Router, Waf, WorkflowEngine,
+    RateLimiter, Router, RuntimeCache, Waf, WorkflowEngine,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
@@ -39,17 +39,29 @@ pub struct Event {
     pub detail: String,
     #[serde(default)]
     pub project: String,
+    /// Correlation id for tracing a request across nodes (accepted from
+    /// `x-hive-request-id` or generated at ingress; forwarded over the mesh).
+    #[serde(default)]
+    pub request_id: String,
 }
 
 pub struct CloudState {
     pub region: String,
     pub node_name: String,
     pub public_base: String,
+    /// Host suffixes this node will route on (the pooled wildcard ingress roots,
+    /// e.g. `deployment.shadow.ngrok.pizza`). A multi-label Host that doesn't end
+    /// with one is a foreign root and is rejected before routing — so a foreign
+    /// domain whose first label collides with a real alias can't be served.
+    /// Configured via `HIVE_DEPLOY_SUFFIXES` (comma-separated).
+    pub deploy_suffixes: Vec<String>,
 
     pub waf: Arc<Waf>,
     pub bot: Arc<BotManager>,
     pub bot_policy: RwLock<BotPolicy>,
     pub cdn: Arc<CdnCache>,
+    /// Regional runtime/data cache for tenant functions (Vercel Runtime Cache).
+    pub runtime_cache: Arc<RuntimeCache>,
     pub limiter: Arc<ConcurrencyLimiter>,
     /// Per-IP L7 rate limiter (DDoS mitigation) at the edge.
     pub ratelimit: Arc<RateLimiter>,
@@ -69,10 +81,18 @@ pub struct CloudState {
     pub gitops: crate::gitops::GitOpsStore,
     /// Mesh peer admin URLs (for P2P build-cache pulls).
     pub peers: RwLock<Vec<String>>,
+    /// node name -> that node's admin URL (learned via gossip). Lets the placement
+    /// scheduler dispatch a deploy to a specific target node's admin.
+    pub node_admins: RwLock<std::collections::HashMap<String, String>>,
     /// Cross-node routing table: deployment subdomain -> peer nodes that serve it
     /// (learned via gossip). Lets any node route/load-balance requests to the node
     /// that actually hosts a deployment.
     pub peer_routes: RwLock<std::collections::HashMap<String, Vec<PeerRoute>>>,
+    /// Deployments hosted on each peer node (name -> its deployments), learned via
+    /// gossip. Lets the dashboard's per-project deployment list show deployments
+    /// that the placement scheduler placed on OTHER nodes (e.g. the default
+    /// San-Jose placement), not just the ones this coordinator hosts locally.
+    pub peer_deployments: RwLock<std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>>,
     /// This node's iroh P2P endpoint (real QUIC mesh transport), if bound. Used to
     /// dial peers and tunnel cross-node requests over QUIC (with HTTP fallback).
     pub iroh: RwLock<Option<hive_p2p::Endpoint>>,
@@ -106,6 +126,18 @@ pub struct CloudState {
     blocked_count: Mutex<u64>,
 }
 
+/// Core of [`CloudState::host_allowed`] (a free fn so it's unit-testable without
+/// constructing a whole node). A bare/single-label or empty host is allowed
+/// (local/direct/default deployment); a multi-label host must equal or end with
+/// `.<suffix>` for some configured suffix, else it's a foreign root.
+fn host_has_allowed_suffix(host: &str, suffixes: &[String]) -> bool {
+    let h = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    if h.is_empty() || !h.contains('.') {
+        return true;
+    }
+    suffixes.iter().any(|s| h == *s || h.ends_with(&format!(".{s}")))
+}
+
 impl CloudState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -127,16 +159,30 @@ impl CloudState {
         let cluster = crate::cluster::Cluster::new(node_name.clone());
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
+        // Allowed wildcard ingress roots. Default to the pooled deployment domain
+        // plus `localhost` for local dev; override with HIVE_DEPLOY_SUFFIXES.
+        let deploy_suffixes = std::env::var("HIVE_DEPLOY_SUFFIXES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .map(|x| x.trim().trim_start_matches('.').to_ascii_lowercase())
+                    .filter(|x| !x.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| vec!["deployment.shadow.ngrok.pizza".into(), "localhost".into()]);
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         Arc::new(CloudState {
             region,
             node_name,
             public_base,
+            deploy_suffixes,
             waf,
             bot,
             bot_policy: RwLock::new(BotPolicy::default()),
             cdn,
+            runtime_cache: Arc::new(RuntimeCache::new()),
             limiter,
             ratelimit: Arc::new(RateLimiter::new(100, 10_000)),
             router,
@@ -153,7 +199,9 @@ impl CloudState {
             teams,
             gitops: crate::gitops::GitOpsStore::new(),
             peers: RwLock::new(Vec::new()),
+            node_admins: RwLock::new(std::collections::HashMap::new()),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
+            peer_deployments: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),
             mesh: RwLock::new(None),
             leases: crate::lease::LeaseStore::new(),
@@ -199,6 +247,13 @@ impl CloudState {
         (*self.req_count.lock(), *self.blocked_count.lock())
     }
 
+    /// Whether this node should route on `host`. A bare/single-label or empty
+    /// host (local/direct/default deployment) is allowed; any multi-label host
+    /// must end with a configured deploy suffix, else it's a foreign root.
+    pub fn host_allowed(&self, host: &str) -> bool {
+        host_has_allowed_suffix(host, &self.deploy_suffixes)
+    }
+
     pub fn event(&self, region: &str, method: &str, host: &str, path: &str, status: u16, action: &str, detail: &str) -> Event {
         // Resolve which project this event belongs to (from the request host),
         // so project-scoped logs work regardless of how the request arrived.
@@ -216,6 +271,33 @@ impl CloudState {
             action: action.to_string(),
             detail: detail.to_string(),
             project,
+            request_id: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_has_allowed_suffix;
+
+    fn suffixes() -> Vec<String> {
+        vec!["deployment.shadow.ngrok.pizza".into(), "localhost".into()]
+    }
+
+    #[test]
+    fn allowed_suffixes_route_foreign_roots_rejected() {
+        let s = suffixes();
+        // Legit wildcard ingress hosts.
+        assert!(host_has_allowed_suffix("myapp.deployment.shadow.ngrok.pizza", &s));
+        assert!(host_has_allowed_suffix("dpl-abc.deployment.shadow.ngrok.pizza:443", &s));
+        assert!(host_has_allowed_suffix("myapp.localhost", &s));
+        assert!(host_has_allowed_suffix("myapp.localhost:8787", &s));
+        // Bare / empty / direct hosts are allowed (no foreign root to spoof).
+        assert!(host_has_allowed_suffix("foobar", &s));
+        assert!(host_has_allowed_suffix("", &s));
+        // Foreign roots are rejected even if the first label collides with an alias.
+        assert!(!host_has_allowed_suffix("myapp.evil.com", &s));
+        assert!(!host_has_allowed_suffix("foobar.evil.com", &s));
+        assert!(!host_has_allowed_suffix("deployment.shadow.ngrok.pizza.evil.com", &s));
     }
 }

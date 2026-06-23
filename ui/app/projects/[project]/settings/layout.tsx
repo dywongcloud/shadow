@@ -10,6 +10,7 @@ const sections = [
   { slug: "environment-variables", label: "Environment Variables" },
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },
+  { slug: "routing", label: "Routing" },
   { slug: "webhooks", label: "Webhooks" },
   { slug: "secure-compute", label: "Secure Compute" },
   { slug: "team", label: "Team & Privacy" },

@@ -178,7 +178,7 @@ export default function NewProjectPage() {
       <Link href="/" className="mb-6 inline-flex items-center gap-2 text-sm text-secondary hover:text-fg">
         <ArrowLeft className="h-4 w-4" /> Back
       </Link>
-      <h1 className="mb-6 text-3xl font-semibold tracking-tight">Let&apos;s build something new</h1>
+      <h1 className="mb-6 text-2xl sm:text-3xl font-semibold tracking-tight">Let&apos;s build something new</h1>
 
       {/* Git URL bar */}
       <Card className="mb-2 p-2">

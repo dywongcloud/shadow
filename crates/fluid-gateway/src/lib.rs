@@ -532,20 +532,69 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
         None => return (StatusCode::NOT_FOUND, "no deployment").into_response(),
     };
 
-    // 1) Redirects mapped from the framework build run first (respond immediately).
-    if let Some((location, status)) = dep.manifest.redirect_for(&path) {
+    // Image Optimization API (`vercel.json` `images`). Next.js' `<Image>` loader
+    // hits `/_next/image`; the Vercel runtime endpoint is `/_vercel/image`.
+    if path == "/_vercel/image" || path == "/_next/image" {
+        return serve_optimized_image(&dep, parts.uri.query().unwrap_or(""), &parts.headers).await;
+    }
+
+    // Request context for `has`/`missing` conditions + host-scoped matching.
+    let query = parts.uri.query().unwrap_or("").to_string();
+    let with_query = |loc: String| -> String {
+        if query.is_empty() { loc } else { format!("{loc}?{query}") }
+    };
+    let ctx = fluid_core::ReqCtx {
+        host: host.clone().unwrap_or_default(),
+        headers: parts
+            .headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_ascii_lowercase(), vs.to_string())))
+            .collect(),
+        query: query.clone(),
+    };
+    // The original path drives `headers` matching (Vercel matches the incoming
+    // path, before any rewrite).
+    let orig_path = path.clone();
+    let redirect = |status: u16, location: String| -> Response {
         let code = StatusCode::from_u16(status).unwrap_or(StatusCode::TEMPORARY_REDIRECT);
-        return Response::builder()
+        Response::builder()
             .status(code)
             .header(header::LOCATION, location)
             .body(Body::empty())
             .unwrap()
-            .into_response();
-    }
-    // 2) Rewrites map the public path to an internal one (client URL unchanged).
-    let path = dep.manifest.rewrite_path(&path);
+            .into_response()
+    };
 
-    match dep.manifest.resolve(&path) {
+    // 1) trailingSlash normalization (308 add/remove the trailing slash).
+    if let Some(newp) = dep.manifest.trailing_slash_redirect(&path) {
+        return redirect(308, with_query(newp));
+    }
+    // 2) cleanUrls: a request for `/about.html` 308-redirects to `/about`
+    //    (the extensionless form is served directly — see serve_static).
+    if dep.manifest.clean_urls && path.ends_with(".html") {
+        let mut clean = path.trim_end_matches(".html").to_string();
+        if clean.ends_with("/index") {
+            clean.truncate(clean.len() - "index".len()); // ".../index" -> ".../"
+        }
+        if clean.is_empty() {
+            clean = "/".into();
+        }
+        if clean != path {
+            return redirect(308, with_query(clean));
+        }
+    }
+    // 3) Redirects (vercel.json + framework), honoring has/missing + :param.
+    if let Some((location, status)) = dep.manifest.redirect_for_ctx(&path, &ctx) {
+        return redirect(status, location);
+    }
+    // 4) Rewrites map the public path to an internal one (client URL unchanged).
+    let path = dep.manifest.rewrite_path_ctx(&path, &ctx);
+
+    // 5) Response headers from `vercel.json` `headers` (matched on the incoming
+    //    path) are injected onto whatever the route produces.
+    let extra_headers = dep.manifest.headers_for(&orig_path, &ctx);
+
+    let resp = match dep.manifest.resolve(&path) {
         RouteTarget::Static => serve_static(&dep, &path).await,
         RouteTarget::Function(name) => {
             let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
@@ -555,7 +604,22 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             proxy_function(&gw, &dep, &name, &parts.method, &path_q, &parts.headers, body_bytes)
                 .await
         }
+    };
+    inject_headers(resp, &extra_headers)
+}
+
+/// Apply configured response headers (`vercel.json` `headers`) onto a response.
+fn inject_headers(mut resp: Response, extra: &[(String, String)]) -> Response {
+    if extra.is_empty() {
+        return resp;
     }
+    let h = resp.headers_mut();
+    for (k, v) in extra {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+            h.insert(name, val);
+        }
+    }
+    resp
 }
 
 /// Vercel Web Analytics + Speed Insights endpoints.
@@ -595,9 +659,33 @@ addEventListener('visibilitychange',function(){if(document.visibilityState==='hi
         (&Method::POST, "/_vercel/insights/view")
         | (&Method::POST, "/_vercel/insights/event")
         | (&Method::POST, "/_vercel/speed-insights/vitals") => Some(accepted()),
+        // Image Optimization is handled per-deployment after selection.
+        (_, "/_vercel/image") => None,
         // Unknown _vercel path: 204 so the client never sees a hard 404.
         _ => Some((StatusCode::NO_CONTENT, "").into_response()),
     }
+}
+
+/// Vercel-standard `Cache-Control` for a served static asset. Content-hashed
+/// build assets (Next.js `/_next/static/**`, or Vite/webpack `name.<hex>.ext`)
+/// are immutable and cached for a year; everything else uses Vercel's default
+/// (`public, max-age=0, must-revalidate`) — which our CDN treats as
+/// non-storable, so a redeploy never serves stale non-hashed content.
+fn static_cache_control(path: &str) -> &'static str {
+    let file = path.rsplit('/').next().unwrap_or("");
+    if path.contains("/_next/static/") || is_hashed_asset(file) {
+        "public, max-age=31536000, immutable"
+    } else {
+        "public, max-age=0, must-revalidate"
+    }
+}
+
+/// True if a filename carries a content hash (a `.`/`-`-delimited hex token of
+/// 8+ chars containing a digit), e.g. `index-4f3a9c2b.js`, `main.1a2b3c4d.css`.
+fn is_hashed_asset(file: &str) -> bool {
+    file.split(['.', '-']).any(|seg| {
+        seg.len() >= 8 && seg.bytes().all(|b| b.is_ascii_hexdigit()) && seg.bytes().any(|b| b.is_ascii_digit())
+    })
 }
 
 async fn serve_static(dep: &Deployment, path: &str) -> Response {
@@ -616,18 +704,303 @@ async fn serve_static(dep: &Deployment, path: &str) -> Response {
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
             let ctype = content_type(&file);
-            ([(header::CONTENT_TYPE, ctype)], bytes).into_response()
+            (
+                [(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, static_cache_control(path))],
+                bytes,
+            )
+                .into_response()
         }
         Err(_) => {
+            // cleanUrls: serve `about.html` for a request to `/about`.
+            if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
+                let html = base.join(format!("{rel}.html"));
+                if is_within(&base, &html) {
+                    if let Ok(bytes) = tokio::fs::read(&html).await {
+                        return (
+                            [
+                                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
+                            ],
+                            bytes,
+                        )
+                            .into_response();
+                    }
+                }
+            }
             // SPA-ish fallback: try index.html at the static root.
             let idx = base.join("index.html");
             if let Ok(bytes) = tokio::fs::read(&idx).await {
-                ([(header::CONTENT_TYPE, "text/html")], bytes).into_response()
+                (
+                    [
+                        (header::CONTENT_TYPE, "text/html"),
+                        (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
+                    ],
+                    bytes,
+                )
+                    .into_response()
             } else {
                 (StatusCode::NOT_FOUND, "not found").into_response()
             }
         }
     }
+}
+
+/// Vercel Image Optimization API (`/_vercel/image`, also `/_next/image`).
+/// Validates the request against the deployment's `images` config, fetches the
+/// source (local asset or allow-listed remote), and re-encodes it at the
+/// requested width/quality. Resizing uses the pure-Rust `image` crate.
+async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &HeaderMap) -> Response {
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, m.to_string()).into_response();
+
+    // ---- parse query ----
+    let mut url = String::new();
+    let mut w: Option<u32> = None;
+    let mut q: u32 = 75;
+    for (k, v) in parse_query(query) {
+        match k.as_str() {
+            "url" => url = v,
+            "w" => w = v.parse().ok(),
+            "q" => {
+                if let Ok(n) = v.parse() {
+                    q = n;
+                }
+            }
+            _ => {}
+        }
+    }
+    if url.is_empty() {
+        return bad("missing `url`");
+    }
+    let Some(width) = w else { return bad("missing `w`") };
+    if width == 0 || width > 4096 {
+        return bad("invalid `w`");
+    }
+
+    let cfg = dep.manifest.images.as_ref();
+    // Enforce the allow-lists when configured.
+    if let Some(c) = cfg {
+        if !c.sizes.is_empty() && !c.sizes.contains(&width) {
+            return bad("`w` not in images.sizes");
+        }
+        if !c.qualities.is_empty() && !c.qualities.contains(&q) {
+            return bad("`q` not in images.qualities");
+        }
+    }
+    let q = q.clamp(1, 100) as u8;
+
+    // ---- resolve + fetch the source ----
+    let is_remote = url.starts_with("http://") || url.starts_with("https://");
+    let (bytes, is_svg): (Vec<u8>, bool) = if is_remote {
+        // Remote sources require an allow-list (no open proxy / SSRF).
+        let allowed = cfg.map(|c| remote_allowed(c, &url)).unwrap_or(false);
+        if !allowed {
+            return bad("remote url not allowed by images.remotePatterns/domains");
+        }
+        let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+            Ok(c) => c,
+            Err(_) => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
+        };
+        match client.get(&url).send().await {
+            Ok(r) if r.status().is_success() => {
+                let svg = r
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|t| t.contains("svg"))
+                    .unwrap_or(false);
+                match r.bytes().await {
+                    Ok(b) if b.len() <= 16 * 1024 * 1024 => (b.to_vec(), svg || url.ends_with(".svg")),
+                    _ => return (StatusCode::BAD_GATEWAY, "image too large").into_response(),
+                }
+            }
+            _ => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
+        }
+    } else {
+        // Local asset: validate localPatterns (when set), read from static dir.
+        if let Some(c) = cfg {
+            if !c.local_patterns.is_empty() && !local_allowed(c, &url) {
+                return bad("local url not allowed by images.localPatterns");
+            }
+        }
+        let static_dir = dep.manifest.static_dir.clone().unwrap_or_else(|| ".".into());
+        let base = dep.root.join(static_dir);
+        let rel = url.split('?').next().unwrap_or(&url).trim_start_matches('/');
+        let file = base.join(rel);
+        if !is_within(&base, &file) {
+            return bad("forbidden");
+        }
+        match tokio::fs::read(&file).await {
+            Ok(b) => (b, rel.ends_with(".svg")),
+            Err(_) => return (StatusCode::NOT_FOUND, "image not found").into_response(),
+        }
+    };
+
+    // ---- SVG: not rasterized; passthrough only when explicitly allowed ----
+    if is_svg {
+        let allow_svg = cfg.and_then(|c| c.dangerously_allow_svg).unwrap_or(false);
+        if !allow_svg {
+            return bad("SVG optimization disabled (set images.dangerouslyAllowSVG)");
+        }
+        return image_response(bytes, "image/svg+xml", cfg);
+    }
+
+    // ---- decode → resize → encode (CPU-bound: off the async runtime) ----
+    let accept_webp = req_headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|a| a.contains("image/webp"))
+        .unwrap_or(false);
+    let formats = cfg.map(|c| c.formats.clone()).unwrap_or_default();
+    let encoded = tokio::task::spawn_blocking(move || optimize_bytes(&bytes, width, q, accept_webp, &formats)).await;
+    match encoded {
+        Ok(Some((out, ctype))) => image_response(out, ctype, cfg),
+        _ => (StatusCode::UNPROCESSABLE_ENTITY, "could not process image").into_response(),
+    }
+}
+
+/// Build the optimized-image response with caching / disposition / CSP headers.
+fn image_response(body: Vec<u8>, ctype: &str, cfg: Option<&fluid_core::ImagesConfig>) -> Response {
+    let ttl = cfg.and_then(|c| c.minimum_cache_ttl).unwrap_or(60);
+    let mut b = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, ctype)
+        .header(header::CACHE_CONTROL, format!("public, max-age={ttl}, must-revalidate"));
+    if let Some(c) = cfg {
+        if let Some(disp) = &c.content_disposition_type {
+            b = b.header(header::CONTENT_DISPOSITION, disp.clone());
+        }
+        if let Some(csp) = &c.content_security_policy {
+            b = b.header("content-security-policy", csp.clone());
+        }
+    }
+    b.body(Body::from(body)).unwrap().into_response()
+}
+
+/// Decode, resize to `width` (preserving aspect), and re-encode. Returns the
+/// encoded bytes + content-type, or `None` if the input isn't a decodable image.
+fn optimize_bytes(bytes: &[u8], width: u32, quality: u8, accept_webp: bool, formats: &[String]) -> Option<(Vec<u8>, &'static str)> {
+    use image::imageops::FilterType;
+    let img = image::load_from_memory(bytes).ok()?;
+    let resized = if img.width() > width {
+        let h = ((img.height() as u64 * width as u64) / img.width().max(1) as u64).max(1) as u32;
+        img.resize(width, h, FilterType::Lanczos3)
+    } else {
+        img
+    };
+
+    // Prefer WebP when the client accepts it and config permits (image 0.25's
+    // WebP encoder is lossless; fall back to JPEG/PNG on any error).
+    let want_webp = accept_webp && (formats.is_empty() || formats.iter().any(|f| f == "image/webp"));
+    if want_webp {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        if resized.write_to(&mut buf, image::ImageFormat::WebP).is_ok() {
+            return Some((buf.into_inner(), "image/webp"));
+        }
+    }
+    if resized.color().has_alpha() {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        resized.write_to(&mut buf, image::ImageFormat::Png).ok()?;
+        Some((buf.into_inner(), "image/png"))
+    } else {
+        use image::ImageEncoder;
+        let mut buf = Vec::new();
+        let rgb = resized.to_rgb8();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
+            .write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .ok()?;
+        Some((buf, "image/jpeg"))
+    }
+}
+
+/// Minimal `application/x-www-form-urlencoded` query parser with percent-decode.
+fn parse_query(q: &str) -> Vec<(String, String)> {
+    q.split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (pct_decode(k), pct_decode(v))
+        })
+        .collect()
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.replace('+', " ");
+    let bytes = b.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Is a remote image URL permitted by `images.remotePatterns` / `images.domains`?
+fn remote_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
+    // Parse scheme://host[:port]/path?query without a url crate.
+    let after = url.splitn(2, "://").nth(1).unwrap_or("");
+    let (authority, rest) = after.split_once('/').map(|(a, r)| (a, format!("/{r}"))).unwrap_or((after, "/".to_string()));
+    let (host, port) = authority.split_once(':').map(|(h, p)| (h, Some(p))).unwrap_or((authority, None));
+    let (pathname, search) = rest.split_once('?').map(|(p, s)| (p.to_string(), format!("?{s}"))).unwrap_or((rest.clone(), String::new()));
+    let scheme = url.split("://").next().unwrap_or("");
+
+    if cfg.domains.iter().any(|d| d == host) {
+        return true;
+    }
+    cfg.remote_patterns.iter().any(|p| {
+        p.protocol.as_deref().map(|pr| pr == scheme).unwrap_or(true)
+            && host_matches(&p.hostname, host)
+            && p.port.as_deref().map(|pt| pt.is_empty() || Some(pt) == port).unwrap_or(true)
+            && p.pathname.as_deref().map(|pn| pattern_matches(pn, &pathname)).unwrap_or(true)
+            && p.search.as_deref().map(|s| s.is_empty() || s == search).unwrap_or(true)
+    })
+}
+
+fn local_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
+    let (pathname, search) = url.split_once('?').map(|(p, s)| (p.to_string(), format!("?{s}"))).unwrap_or((url.to_string(), String::new()));
+    cfg.local_patterns.iter().any(|p| {
+        p.pathname.as_deref().map(|pn| pattern_matches(pn, &pathname)).unwrap_or(true)
+            && p.search.as_deref().map(|s| s.is_empty() || s == search).unwrap_or(true)
+    })
+}
+
+/// Hostname match supporting a single leading `**.` (any subdepth) or `*.`
+/// (one label) wildcard, à la Next.js remotePatterns.
+fn host_matches(pattern: &str, host: &str) -> bool {
+    if let Some(suffix) = pattern.strip_prefix("**.") {
+        host == suffix || host.ends_with(&format!(".{suffix}"))
+    } else if let Some(suffix) = pattern.strip_prefix("*.") {
+        host.strip_suffix(suffix).map(|p| p.ends_with('.') && !p[..p.len() - 1].contains('.')).unwrap_or(false)
+    } else {
+        pattern == host
+    }
+}
+
+/// Match a remotePattern `pathname` (supports a trailing `/**` and a `^...$`
+/// regex-ish form via simple prefix/glob) against a path. Best-effort.
+fn pattern_matches(pattern: &str, value: &str) -> bool {
+    // Treat an anchored regex like `^/account123/.*$` as a prefix on the literal
+    // segment before `.*`.
+    let pat = pattern.trim_start_matches('^').trim_end_matches('$');
+    if let Some(prefix) = pat.strip_suffix(".*") {
+        return value.starts_with(prefix);
+    }
+    if let Some(prefix) = pat.strip_suffix("/**") {
+        return value == prefix || value.starts_with(&format!("{prefix}/"));
+    }
+    if let Some(prefix) = pat.strip_suffix("/*") {
+        return value.strip_prefix(&format!("{prefix}/")).map(|r| !r.contains('/')).unwrap_or(false);
+    }
+    pat == value
 }
 
 async fn proxy_function(
@@ -959,5 +1332,77 @@ fn content_type(file: &Path) -> &'static str {
         Some("txt") => "text/plain; charset=utf-8",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn pct_decode_and_query() {
+        let q = parse_query("url=%2Fa%2Fb.png&w=640&q=75");
+        assert_eq!(q[0], ("url".to_string(), "/a/b.png".to_string()));
+        assert_eq!(q[1], ("w".to_string(), "640".to_string()));
+    }
+
+    #[test]
+    fn host_and_pattern_matching() {
+        assert!(host_matches("example.com", "example.com"));
+        assert!(!host_matches("example.com", "evil.com"));
+        assert!(host_matches("**.example.com", "cdn.images.example.com"));
+        assert!(host_matches("*.example.com", "cdn.example.com"));
+        assert!(!host_matches("*.example.com", "a.b.example.com"));
+        assert!(pattern_matches("^/account123/.*$", "/account123/pic.png"));
+        assert!(!pattern_matches("^/account123/.*$", "/other/pic.png"));
+        assert!(pattern_matches("/imgs/**", "/imgs/a/b.png"));
+        assert!(pattern_matches("/imgs/*", "/imgs/a.png"));
+        assert!(!pattern_matches("/imgs/*", "/imgs/a/b.png"));
+    }
+
+    #[test]
+    fn optimize_resizes_and_encodes() {
+        // Build a 100x50 opaque RGB image, encode to PNG, then optimize to w=40.
+        let img = image::DynamicImage::ImageRgb8(image::RgbImage::new(100, 50));
+        let mut src = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut src, image::ImageFormat::Png).unwrap();
+        let (out, ctype) = optimize_bytes(src.get_ref(), 40, 75, false, &[]).expect("optimized");
+        // Opaque -> JPEG, and the decoded result is 40px wide.
+        assert_eq!(ctype, "image/jpeg");
+        let decoded = image::load_from_memory(&out).unwrap();
+        assert_eq!(decoded.width(), 40);
+        assert_eq!(decoded.height(), 20);
+    }
+
+    #[test]
+    fn static_cache_classification() {
+        assert_eq!(static_cache_control("/_next/static/chunks/main.js"), "public, max-age=31536000, immutable");
+        assert_eq!(static_cache_control("/assets/index-4f3a9c2b.js"), "public, max-age=31536000, immutable");
+        assert_eq!(static_cache_control("/main.1a2b3c4d.css"), "public, max-age=31536000, immutable");
+        // Non-hashed assets + HTML get the safe revalidating default.
+        assert_eq!(static_cache_control("/index.html"), "public, max-age=0, must-revalidate");
+        assert_eq!(static_cache_control("/styles.css"), "public, max-age=0, must-revalidate");
+        assert_eq!(static_cache_control("/bootstrap5.css"), "public, max-age=0, must-revalidate"); // not a hex hash
+        assert_eq!(static_cache_control("/documentation.html"), "public, max-age=0, must-revalidate");
+        assert!(!is_hashed_asset("react-dom.js"));
+        assert!(is_hashed_asset("index-4f3a9c2b.js"));
+    }
+
+    #[test]
+    fn remote_allow_list() {
+        let cfg = fluid_core::ImagesConfig {
+            remote_patterns: vec![fluid_core::RemotePattern {
+                protocol: Some("https".into()),
+                hostname: "example.com".into(),
+                port: None,
+                pathname: Some("^/a/.*$".into()),
+                search: None,
+            }],
+            ..Default::default()
+        };
+        assert!(remote_allowed(&cfg, "https://example.com/a/pic.png"));
+        assert!(!remote_allowed(&cfg, "https://example.com/b/pic.png"));
+        assert!(!remote_allowed(&cfg, "http://example.com/a/pic.png")); // wrong scheme
+        assert!(!remote_allowed(&cfg, "https://evil.com/a/pic.png"));
     }
 }

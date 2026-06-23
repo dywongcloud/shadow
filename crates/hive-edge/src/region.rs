@@ -48,6 +48,23 @@ pub struct NodeInfo {
     pub mem_total_mb: u64,
     #[serde(default)]
     pub disk_total_gb: u64,
+    /// Isolation backend this node runs: "firecracker" (real microVMs) or "mock"
+    /// (sandboxed child processes — local/dev). The placement scheduler only
+    /// auto-targets firecracker nodes; mock/local nodes host only when a region is
+    /// explicitly selected for them.
+    #[serde(default)]
+    pub backend: String,
+}
+
+/// Great-circle distance (km) between two lat/lon points — for "nearest node".
+pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let r = 6371.0_f64;
+    let (lat1, lon1) = (a.0.to_radians(), a.1.to_radians());
+    let (lat2, lon2) = (b.0.to_radians(), b.1.to_radians());
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
 }
 
 /// Classify a geographic coordinate into a continent name. Used to auto-assign a
@@ -211,6 +228,7 @@ mod tests {
             cpu_cores: 0,
             mem_total_mb: 0,
             disk_total_gb: 0,
+            backend: String::new(),
         }
     }
 

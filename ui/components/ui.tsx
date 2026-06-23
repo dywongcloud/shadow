@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils";
 export function Card({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) {
   return (
     <div
-      className={cn("rounded-xl border border-border bg-card p-5 shadow-card", className)}
+      className={cn("rounded-xl border border-border bg-card p-4 sm:p-5 shadow-card", className)}
       {...props}
     />
   );
@@ -141,7 +141,7 @@ export function PageHeader({
   return (
     <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-fg">{title}</h1>
+        <h1 className="text-xl sm:text-2xl font-semibold tracking-tight text-fg">{title}</h1>
         {desc ? <p className="mt-1 text-sm text-secondary">{desc}</p> : null}
       </div>
       {action}
@@ -194,7 +194,7 @@ export function SettingCard({
         {children ? <div className="mt-5">{children}</div> : null}
       </div>
       {footer || footerAction ? (
-        <div className="flex items-center justify-between gap-3 border-t border-border bg-subtle px-5 py-3 sm:px-6">
+        <div className="flex flex-col gap-3 border-t border-border bg-subtle px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
           <div className="text-xs text-secondary">{footer}</div>
           {footerAction}
         </div>

@@ -32,7 +32,9 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         // No hard-coded region — real regions come from the live mesh catalog.
         regions: [],
         failover: false,
-        memory_mib: 512,
+        // Standard serverless tier: 1 vCPU / 2 GB.
+        vcpus: 1,
+        memory_mib: 2048,
       };
       const fn = { ...fallback, ...(s.functions ?? {}) };
       setFs(fn);
@@ -93,6 +95,48 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         </div>
       </SettingCard>
 
+      {/* CPU & Memory tier — one microVM per instance. */}
+      <SettingCard
+        title="CPU & Memory"
+        desc="The resources each function instance (microVM) is allocated. Standard fits most serverless functions; Performance gives latency-sensitive apps and SSR workloads more headroom. A new deployment is required for changes to take effect."
+        footer="Billed per active instance-time — Performance instances cost roughly 2× Standard."
+      >
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          {(
+            [
+              { id: "standard", name: "Standard", vcpus: 1, mem: 2048, blurb: "1 vCPU · 2 GB memory — the default for serverless functions." },
+              { id: "performance", name: "Performance", vcpus: 2, mem: 4096, blurb: "2 vCPUs · 4 GB memory — for latency-sensitive apps and SSR workloads." },
+            ] as const
+          ).map((t) => {
+            const selected = (fs.vcpus ?? 1) >= 2 ? t.id === "performance" : t.id === "standard";
+            return (
+              <button
+                key={t.id}
+                onClick={() => save({ ...fs, vcpus: t.vcpus, memory_mib: t.mem })}
+                className={cn(
+                  "flex flex-col items-start gap-1 rounded-xl border p-4 text-left transition-colors",
+                  selected ? "border-link bg-link/5 ring-1 ring-link" : "border-border hover:bg-subtle"
+                )}
+              >
+                <div className="flex w-full items-center justify-between">
+                  <span className="text-sm font-medium text-fg">{t.name}</span>
+                  <span
+                    className={cn(
+                      "flex h-4 w-4 items-center justify-center rounded-full border text-[10px]",
+                      selected ? "border-link bg-link text-white" : "border-border-strong"
+                    )}
+                  >
+                    {selected ? "✓" : ""}
+                  </span>
+                </div>
+                <span className="font-mono text-sm text-fg">{t.vcpus} vCPU{t.vcpus > 1 ? "s" : ""} · {t.mem / 1024} GB</span>
+                <span className="text-xs text-secondary">{t.blurb}</span>
+              </button>
+            );
+          })}
+        </div>
+      </SettingCard>
+
       {/* Function Max Duration */}
       <SettingCard
         title="Function Max Duration"
@@ -129,11 +173,11 @@ export default function FunctionsSettings({ params }: { params: { project: strin
         </div>
       </SettingCard>
 
-      {/* Function Regions */}
+      {/* Deployment Regions */}
       <SettingCard
-        title="Function Regions"
-        desc="These are the regions on the OpenEdge network that your functions will execute in. You can use up to 5 regions on your current plan. A new deployment is required for changes to take effect."
-        footer={`${fs.regions.length}/5 regions selected`}
+        title="Deployment Regions"
+        desc="The regions on the OpenEdge network where this project is deployed — every deployment (functions, containers, or static) is placed on the nodes in the regions you select, and requests are routed to the nearest one. Leave empty to deploy automatically to the eligible region nearest you. Select up to 5; redeploy for changes to take effect."
+        footer={`${fs.regions.length}/5 regions selected${fs.regions.length === 0 ? " — auto (nearest region)" : ""}`}
       >
         {/* Global region map — dots mark the regions you've selected. Background and
             land follow the current UI theme (light/dark) rather than being hard-black. */}

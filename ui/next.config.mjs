@@ -59,8 +59,41 @@ const nextConfig = {
     ];
   },
 
-  // Security headers (production checklist).
+  // Security headers (production checklist) + client/CDN caching to cut traffic.
   async headers() {
+    // Reasonable cache windows. Public marketing/docs are shared-cacheable; the
+    // hashed Next build assets are immutable. Sensitive surfaces (personal/team/
+    // project settings, project deployments, network, billing, admin) are never
+    // cached. The /cloud API proxy and /api routes are left untouched (live
+    // per-request data). The middleware applies the same policy as a backstop.
+    const PUBLIC_CACHE = "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400";
+    const PRIVATE_CACHE = "private, max-age=60, stale-while-revalidate=300";
+    const NO_STORE = "private, no-store, max-age=0, must-revalidate";
+    const cc = (value) => [{ key: "Cache-Control", value }];
+    const noStorePaths = [
+      "/account/:path*",
+      "/settings/:path*",
+      "/teams/:path*",
+      "/network/:path*",
+      "/deployments/:path*",
+      "/billing/:path*",
+      "/admin/:path*",
+      "/projects/:project/settings/:path*",
+      "/projects/:project",
+    ];
+    const publicPaths = [
+      "/",
+      "/product/:path*",
+      "/solutions/:path*",
+      "/features/:path*",
+      "/pricing/:path*",
+      "/blog/:path*",
+      "/case-studies/:path*",
+      "/contact/:path*",
+      "/privacy/:path*",
+      "/docs/:path*",
+      "/status/:path*",
+    ];
     return [
       {
         source: "/:path*",
@@ -69,6 +102,20 @@ const nextConfig = {
           { key: "X-Frame-Options", value: "SAMEORIGIN" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
         ],
+      },
+      // Immutable hashed build assets — cache for a year.
+      { source: "/_next/static/:path*", headers: cc("public, max-age=31536000, immutable") },
+      // Sensitive / dynamic management surfaces — never cache.
+      ...noStorePaths.map((source) => ({ source, headers: cc(NO_STORE) })),
+      // Public marketing / docs / status — shared (CDN) + browser cacheable.
+      ...publicPaths.map((source) => ({ source, headers: cc(PUBLIC_CACHE) })),
+      // Other authenticated dashboard tabs — short private browser cache of the
+      // page shell (live data still streams from /cloud). Negative lookahead
+      // excludes the sensitive + public + API/asset paths handled above.
+      {
+        source:
+          "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up)[^.]*)",
+        headers: cc(PRIVATE_CACHE),
       },
     ];
   },

@@ -76,7 +76,13 @@ export function RedeployModal({
   }
 
   const selfHost = deploymentHost(deployment.id_alias || deployment.commit_alias || deployment.alias);
-  const domainHost = deploymentHost(prodAlias);
+  // Assigned domain reflects the CHOSEN environment: production → the project's
+  // production domain; preview → the generated preview URL (branch alias, else the
+  // unique deployment alias) — never the production URL for a preview redeploy.
+  const previewHost = deploymentHost(
+    deployment.branch_alias || deployment.id_alias || deployment.commit_alias || deployment.alias,
+  );
+  const domainHost = env === "production" ? deploymentHost(prodAlias) : previewHost;
   const commitMsg = deployment.git?.commit_message || "Latest commit";
 
   if (typeof document === "undefined") return null;

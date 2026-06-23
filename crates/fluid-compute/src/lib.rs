@@ -354,7 +354,7 @@ impl Fluid {
         // Bound concurrent provisioning so a burst can't saturate the host. Held
         // for the whole provision+start; dropped when this fn returns.
         let _permit = self.cold_start_sem.clone().acquire_owned().await;
-        let (image, launch, mem, tenant) = {
+        let (image, launch, mem, vcpus, tenant) = {
             let reg = self.registry.lock();
             let pool = reg.get(key).ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
             let port = free_port()?;
@@ -365,14 +365,14 @@ impl Fluid {
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
             };
-            (pool.image.clone(), launch, pool.cfg.memory_mib, pool.tenant.clone())
+            (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
         };
 
         let spec = CellSpec {
             id: CellId::new(),
             image,
             resources: ResourceSpec {
-                vcpus: 1,
+                vcpus: vcpus.max(1),
                 mem_mib: mem,
                 disk_mib: 1024,
                 timeout_secs: 0,

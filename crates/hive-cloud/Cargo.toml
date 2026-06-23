@@ -29,6 +29,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
+futures = { workspace = true }
+hyper = { version = "1", features = ["http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 uuid = { workspace = true }
 jsonwebtoken = "9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

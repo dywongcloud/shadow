@@ -39,14 +39,14 @@ export default function DeploymentsPage() {
         action={<Link href="/new"><Button><Plus className="h-4 w-4" /> New Deployment</Button></Link>}
       />
       <Table>
-        <thead><tr><Th>Project</Th><Th>Deployment</Th><Th>Status</Th><Th>URL</Th><Th>Source</Th><Th>Created</Th><Th></Th></tr></thead>
+        <thead><tr><Th>Project</Th><Th className="hidden lg:table-cell">Deployment</Th><Th>Status</Th><Th>URL</Th><Th className="hidden md:table-cell">Source</Th><Th className="hidden sm:table-cell">Created</Th><Th></Th></tr></thead>
         <tbody>
           {(deps ?? []).map((d) => {
             const working = busy === d.id;
             return (
               <tr key={d.id}>
                 <Td className="font-medium">{d.project}</Td>
-                <Td className="font-mono text-xs text-muted">{d.id}</Td>
+                <Td className="font-mono text-xs text-muted hidden lg:table-cell">{d.id}</Td>
                 <Td>
                   {/* Environment is the immutable build target; the green dot marks
                       the deployment currently promoted to the production domain. */}
@@ -60,17 +60,19 @@ export default function DeploymentsPage() {
                     );
                   })()}
                 </Td>
-                {/* Each deployment links to its OWN immutable URL (the commit URL,
-                    or the per-deployment id URL) — never the shared production
-                    domain, so a preview row opens that preview, not production. */}
+                {/* The row currently promoted to production links via the project
+                    production alias (e.g. my-app.<domain>), so production opens at
+                    its real production URL. Every other row links to its OWN
+                    immutable URL (the per-deployment id, or commit URL), so a
+                    preview opens that preview — not production. */}
                 <Td className="font-mono text-xs">
-                  {(() => { const self = d.id_alias || d.commit_alias || d.alias;
+                  {(() => { const self = d.production ? d.alias : (d.id_alias || d.commit_alias || d.alias);
                     return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer">{deploymentHost(self)}</a>; })()}
                 </Td>
-                <Td className="text-xs text-secondary">
+                <Td className="text-xs text-secondary hidden md:table-cell">
                   {d.git ? <span className="font-mono">{d.git.branch}@{d.git.commit || "—"}</span> : <span className="text-muted">CLI</span>}
                 </Td>
-                <Td className="text-muted">{timeAgo(d.created_at_ms)}</Td>
+                <Td className="text-muted hidden sm:table-cell">{timeAgo(d.created_at_ms)}</Td>
                 <Td>
                   <div className="flex items-center justify-end gap-1">
                     {working ? (

@@ -166,13 +166,30 @@ fn has_dep(pkg: &serde_json::Value, name: &str) -> bool {
 
 /// Produce the build plan, honoring overrides the user set in project settings
 /// (empty string => use the framework default).
+/// Find a preset by slug or display name (case-insensitive), so an explicit
+/// framework choice in project settings can override auto-detection.
+pub fn preset_by_name(name: &str) -> Option<&'static FrameworkPreset> {
+    let n = name.trim().to_ascii_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    PRESETS
+        .iter()
+        .find(|p| p.slug.eq_ignore_ascii_case(&n) || p.name.to_ascii_lowercase() == n)
+}
+
 pub fn plan_build(
     repo: &Path,
+    framework_override: Option<&str>,
     install_override: Option<&str>,
     build_override: Option<&str>,
     output_override: Option<&str>,
 ) -> BuildPlan {
-    let fw = detect(repo).clone();
+    // An explicit framework choice (project settings) wins over auto-detection.
+    let fw = framework_override
+        .and_then(preset_by_name)
+        .cloned()
+        .unwrap_or_else(|| detect(repo).clone());
     let pm = package_manager(repo);
     let pick = |ov: Option<&str>, default: &str| {
         ov.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default).to_string()
@@ -237,7 +254,7 @@ mod tests {
     #[test]
     fn build_override_wins() {
         let dir = repo_with(&[("package.json", r#"{"dependencies":{"next":"14"}}"#)]);
-        let plan = plan_build(&dir, None, Some("pnpm build"), None);
+        let plan = plan_build(&dir, None, None, Some("pnpm build"), None);
         assert_eq!(plan.build_command, "pnpm build");
         assert_eq!(plan.framework.slug, "nextjs");
         let _ = fs::remove_dir_all(&dir);

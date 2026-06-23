@@ -46,7 +46,7 @@ export default function CronPage() {
         <tbody>
           {(jobs ?? []).map((j) => (
             <tr key={j.id}>
-              <Td>{j.name} {j.enabled ? <Badge tone="green">on</Badge> : <Badge>off</Badge>}</Td>
+              <Td>{j.name} {j.enabled ? <Badge tone="green">on</Badge> : <Badge>off</Badge>}{j.source === "vercel.json" && <Badge tone="blue">vercel.json</Badge>}</Td>
               <Td className="font-mono text-xs">{j.schedule}</Td>
               <Td className="font-mono text-xs text-muted">{j.deployment}{j.path}</Td>
               <Td className="tabular-nums">{j.runs}</Td>

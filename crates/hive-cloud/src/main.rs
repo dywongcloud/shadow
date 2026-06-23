@@ -27,6 +27,7 @@ mod notifications;
 mod persist;
 mod project_settings;
 mod resources;
+mod schedule;
 mod secrets;
 mod securelink;
 #[cfg(feature = "zkauth")]
@@ -103,22 +104,41 @@ async fn main() -> anyhow::Result<()> {
     // and fall back to the sandboxed child-process MockBackend otherwise (e.g. local
     // dev on macOS). `HIVE_FORCE_MOCK=1` forces the mock for local development.
     let force_mock = std::env::var("HIVE_FORCE_MOCK").map(|v| v == "1").unwrap_or(false);
-    let firecracker = FirecrackerBackend::new(FirecrackerConfig::default());
-    let backend: Arc<dyn CellBackend> = if firecracker.is_supported() && !force_mock {
-        tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
-        Arc::new(firecracker)
-    } else {
-        if force_mock {
-            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
-        } else {
-            tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
+    // Guest kernel cmdline override. Some hosts need extra args — e.g. PVM
+    // (software-virtualized KVM on a cloud VM) wants the i8042 probes disabled:
+    //   HIVE_FC_BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off i8042.noaux \
+    //     i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/sbin/hive-cell-agent"
+    // Must keep `init=/sbin/hive-cell-agent` so the cell agent runs as PID 1.
+    let mut fc_cfg = FirecrackerConfig::default();
+    if let Ok(ba) = std::env::var("HIVE_FC_BOOT_ARGS") {
+        if !ba.trim().is_empty() {
+            fc_cfg.boot_args = ba;
         }
-        Arc::new(MockBackend::new(MockConfig {
-            root: std::env::temp_dir().join("hive-cloud-cells"),
-            provision_latency: Duration::from_millis(200),
-            cache_root: std::env::temp_dir().join("hive-cloud-cache"),
-        }))
-    };
+    }
+    let firecracker = FirecrackerBackend::new(fc_cfg);
+    // Backend kind ("firecracker"|"mock") captured alongside the backend — gossiped
+    // so the placement scheduler only auto-targets real-microVM nodes (never the
+    // local/mock Mac nodes).
+    let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) =
+        if firecracker.is_supported() && !force_mock {
+            tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
+            (Arc::new(firecracker), "firecracker")
+        } else {
+            if force_mock {
+                tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
+            } else {
+                tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
+            }
+            (
+                Arc::new(MockBackend::new(MockConfig {
+                    root: std::env::temp_dir().join("hive-cloud-cells"),
+                    provision_latency: Duration::from_millis(200),
+                    cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+                })),
+                "mock",
+            )
+        };
+    let backend_name = backend_name.to_string();
 
     // Auto-detect this node's real-world location (IP geolocation) so it reports
     // its true position for the regions map + the function-region picker.
@@ -201,8 +221,9 @@ async fn main() -> anyhow::Result<()> {
         cpu_cores: cap.0,
         mem_total_mb: cap.1,
         disk_total_gb: cap.2,
+        backend: backend_name.clone(),
     };
-    tracing::info!(cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, "node host capacity");
+    tracing::info!(cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name, "node host capacity");
     let registry = NodeRegistry::new(me);
 
     let cloud = CloudState::new(
@@ -528,6 +549,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
             // Rebuild the cross-node routing table from scratch each cycle so stale
             // routes (peers that no longer host a deployment) age out.
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
+            // Deployments hosted on each peer (name -> list), for the fleet-wide
+            // dashboard deployment view.
+            let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
             // Container holders, seeded with this node's own container deployments.
             let mut holders: HashMap<String, Vec<String>> = HashMap::new();
             for key in cloud.gw.container_projects() {
@@ -564,6 +588,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                         }
                         if let Some(pid) = peer_self_id {
                             cloud.registry.set_health(&pid, rtt, true);
+                            // Remember how to reach this node's admin (its peer URL),
+                            // so the placement scheduler can dispatch deploys to it.
+                            cloud.node_admins.write().insert(pid, peer.clone());
                         }
                     }
                 }
@@ -600,6 +627,25 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                         }
                     }
                 }
+                // Pull this peer's deployments → fleet-wide dashboard view.
+                if let Ok(resp) = cloud
+                    .http
+                    .get(format!("{peer}/v1/fleet-deployments"))
+                    .timeout(Duration::from_secs(4))
+                    .send()
+                    .await
+                {
+                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                        let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                        if !node_id.is_empty() && node_id != cloud.node_name {
+                            if let Some(deps) = v.get("deployments") {
+                                if let Ok(list) = serde_json::from_value::<Vec<fluid_core::DeploymentInfo>>(deps.clone()) {
+                                    fleet.insert(node_id, list);
+                                }
+                            }
+                        }
+                    }
+                }
                 // Converge container leases (highest fencing epoch wins).
                 if let Ok(resp) = cloud
                     .http
@@ -616,6 +662,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                 }
             }
             *cloud.peer_routes.write() = routes;
+            *cloud.peer_deployments.write() = fleet;
             *cloud.container_holders.write() = holders;
             tokio::time::sleep(Duration::from_secs(5)).await;
         }

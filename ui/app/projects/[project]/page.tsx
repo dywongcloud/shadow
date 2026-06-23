@@ -320,7 +320,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         </div>
         <Table>
           <thead>
-            <tr><Th className="px-2">Deployment</Th><Th className="px-2">Status</Th><Th className="px-2">Environment</Th><Th className="px-2">Source</Th><Th className="px-2">Created</Th><Th className="px-2">By</Th><Th className="px-2"></Th></tr>
+            <tr><Th className="px-2">Deployment</Th><Th className="px-2">Status</Th><Th className="px-2">Environment</Th><Th className="px-2 hidden md:table-cell">Source</Th><Th className="px-2 hidden sm:table-cell">Created</Th><Th className="px-2 hidden lg:table-cell">By</Th><Th className="px-2"></Th></tr>
           </thead>
           <tbody>
             {/* Optimistic "Building" rows for in-flight redeploys (immediate
@@ -336,20 +336,22 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                   </span>
                 </Td>
                 <Td className="px-2">{p.env === "production" ? <Badge>Production</Badge> : <Badge tone="blue">Preview</Badge>}</Td>
-                <Td className="px-2 font-mono text-xs text-secondary">
+                <Td className="px-2 font-mono text-xs text-secondary hidden md:table-cell">
                   <span className="inline-flex items-center gap-1"><RefreshCw className="h-3.5 w-3.5" /> redeploy</span>
                 </Td>
-                <Td className="px-2 text-secondary">just now</Td>
-                <Td className="px-2 text-secondary">you</Td>
+                <Td className="px-2 text-secondary hidden sm:table-cell">just now</Td>
+                <Td className="px-2 text-secondary hidden lg:table-cell">you</Td>
                 <Td className="px-2"></Td>
               </tr>
             ))}
             {mine.map((d) => (
               <tr key={d.id}>
-                {/* Link to this deployment's OWN immutable URL (commit URL / id
-                    URL), so a preview row opens that preview — not production. */}
+                {/* The production-promoted row links via the project production
+                    alias (my-app.<domain>); every other row links to its OWN
+                    immutable URL (commit / id URL), so a preview opens that
+                    preview — not production. */}
                 <Td className="px-2 font-mono text-xs">
-                  <a className="text-link hover:underline" href={deploymentUrl(d.id_alias || d.commit_alias || d.alias)} target="_blank" rel="noreferrer">{d.id}</a>
+                  <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.id_alias || d.commit_alias || d.alias))} target="_blank" rel="noreferrer">{d.id}</a>
                 </Td>
                 <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">
@@ -370,15 +372,15 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                     );
                   })()}
                 </Td>
-                <Td className="px-2 font-mono text-xs text-secondary">
+                <Td className="px-2 font-mono text-xs text-secondary hidden md:table-cell">
                   {d.git ? (
                     <span className="inline-flex items-center gap-1"><Code2 className="h-3.5 w-3.5" /> {d.git.branch} {d.git.commit}</span>
                   ) : (
                     <span className="inline-flex items-center gap-1"><Terminal className="h-3.5 w-3.5" /> hive deploy</span>
                   )}
                 </Td>
-                <Td className="px-2 text-secondary">{timeAgo(d.created_at_ms)} ago</Td>
-                <Td className="px-2 text-secondary">{d.creator}</Td>
+                <Td className="px-2 text-secondary hidden sm:table-cell">{timeAgo(d.created_at_ms)} ago</Td>
+                <Td className="px-2 text-secondary hidden lg:table-cell">{d.creator}</Td>
                 <Td className="px-2">
                   <DeploymentRowMenu
                     canRollback={!d.production}

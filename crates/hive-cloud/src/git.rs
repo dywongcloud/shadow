@@ -202,6 +202,41 @@ async fn run_build(
         }
     }
 
+    // ---- Placement scheduler / fanout (coordinator only) -------------------
+    // Unless this is already a per-target deploy (`no_fanout`), decide WHERE this
+    // project should be HOSTED from its configured regions + live mesh state, and
+    // place it there rather than always building on this (the coordinator) node —
+    // which is the resource-poor local Mac. See `schedule::place`.
+    if !req.no_fanout {
+        let regions = cloud.projects.get(&project).functions.regions;
+        let targets = crate::schedule::place(cloud, &regions);
+        let local_selected = targets.iter().any(|t| t.admin.is_none());
+        let remote: Vec<crate::schedule::Target> =
+            targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
+
+        if !targets.is_empty() && !local_selected {
+            // Pure remote placement: do NOT build/host locally. Dispatch to the
+            // chosen region node(s), mirror their build into this build record,
+            // then remove the project from any other node that still hosts it.
+            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+            log(format!("Placement: region-aware scheduler → {}", names.join(", ")));
+            let ok = fanout_remote(cloud, bid, &req, &project, &remote).await;
+            cleanup_non_targets(cloud, &project, &names).await;
+            cloud.builds.update(bid, |b| {
+                b.state = if ok { DeployState::Ready } else { DeployState::Error };
+                b.finished_ms = Some(now_ms());
+            });
+            crate::persist::persist(cloud);
+            return Ok(());
+        }
+        if local_selected && !remote.is_empty() {
+            let names: Vec<String> = remote.iter().map(|t| t.node.clone()).collect();
+            log(format!("Placement: hosting here + replicating to {} (multi-region)", names.join(", ")));
+        }
+        // local_selected (host here, fanout extras at the tail) OR no eligible
+        // target (empty → host locally as a safe fallback): fall through.
+    }
+
     log(format!("Running build in {region_label} - {region}"));
     log("Build machine configuration: 4 cores, 8 GB".into());
     tokio::time::sleep(Duration::from_millis(350)).await;
@@ -274,6 +309,35 @@ async fn run_build(
     };
     anyhow::ensure!(build_dir.exists(), "root directory '{}' not found in repo", effective_root.unwrap_or_default());
 
+    // ---- Ignored Build Step (vercel.json `ignoreCommand`) ----
+    // Vercel semantics: run the command in the project root; exit 0 => skip this
+    // build entirely (no new deployment — the prior one keeps serving), non-zero
+    // => continue. Lets a repo short-circuit commits that don't need a rebuild.
+    if let Some(vc) = fluid_build::load_vercel_config(&build_dir) {
+        if let Some(cmd) = vc.ignore_command.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            log(format!("Running Ignored Build Step: {cmd}"));
+            if let Ok(st) = Command::new("sh").arg("-c").arg(&cmd).current_dir(&build_dir).status().await {
+                if st.success() {
+                    log("Ignored Build Step exited 0 — skipping this build (no changes to deploy).".into());
+                    cloud.builds.update(bid, |b| {
+                        b.state = DeployState::Ready;
+                        b.finished_ms = Some(now_ms());
+                    });
+                    return Ok(());
+                }
+                log(format!("Ignored Build Step exited {} — continuing build.", st.code().unwrap_or(-1)));
+            }
+        }
+        // devCommand / bunVersion are recorded for parity but not executed: the
+        // platform has no local dev server and manages the runtime itself.
+        if let Some(dc) = vc.dev_command.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            log(format!("vercel.json devCommand: {dc} (informational — not executed)"));
+        }
+        if let Some(bv) = vc.bun_version.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            log(format!("vercel.json bunVersion: {bv} (informational)"));
+        }
+    }
+
     // Produce the deployment manifest. A build failure must NOT abort the
     // deploy — Vercel still records the deployment/project — so on error we fall
     // back to a "build failed" page and keep going (build state ends as Error).
@@ -304,12 +368,12 @@ async fn run_build(
             manifest.redirects = feats
                 .redirects
                 .iter()
-                .map(|r| fluid_core::Redirect { source: r.source.clone(), destination: r.destination.clone(), status: r.status })
+                .map(|r| fluid_core::Redirect { source: r.source.clone(), destination: r.destination.clone(), status: r.status, has: vec![], missing: vec![] })
                 .collect();
             manifest.rewrites = feats
                 .rewrites
                 .iter()
-                .map(|r| fluid_core::Rewrite { source: r.source.clone(), destination: r.destination.clone() })
+                .map(|r| fluid_core::Rewrite { source: r.source.clone(), destination: r.destination.clone(), has: vec![], missing: vec![] })
                 .collect();
             if let Some(mw) = &feats.middleware {
                 manifest.middleware = Some(fluid_core::Middleware { matcher: mw.matcher.clone(), runtime: mw.runtime.clone() });
@@ -341,7 +405,17 @@ async fn run_build(
             f.env.insert(k.clone(), v.clone());
         }
         f.max_duration_secs = fsettings.default_max_duration_secs;
+        f.vcpus = fsettings.vcpus.max(1);
         f.memory_mib = fsettings.memory_mib;
+    }
+
+    // ---- Merge vercel.json routing/headers/crons/images + per-function config ----
+    // Applied AFTER project defaults so vercel.json per-function overrides win,
+    // and its redirects/rewrites are evaluated before framework-derived ones.
+    if !build_failed {
+        if let Some(vc) = fluid_build::load_vercel_config(&build_dir) {
+            apply_vercel_config(&mut manifest, &vc, &|s| log(s));
+        }
     }
 
     // Ensure static deployments always have something to serve at "/". Some
@@ -385,6 +459,20 @@ async fn run_build(
         prod_branch
     ));
 
+    // Runtime Cache wiring: expose the regional data cache to this deployment's
+    // function cells via env. Scope isolates production vs preview per Vercel.
+    // Cells reach the loopback admin endpoint (HIVE_RUNTIME_CACHE_URL override
+    // for non-standard admin ports / isolated backends).
+    {
+        let rc_url = std::env::var("HIVE_RUNTIME_CACHE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8786/v1/runtime-cache".to_string());
+        let rc_scope = format!("{}:{}", project, if is_production { "production" } else { "preview" });
+        for f in manifest.functions.iter_mut() {
+            f.env.insert("HIVE_RUNTIME_CACHE_URL".into(), rc_url.clone());
+            f.env.insert("HIVE_RUNTIME_CACHE_SCOPE".into(), rc_scope.clone());
+        }
+    }
+
     // Register the routable deployment.
     let git = GitSource {
         repo_url: req.repo_url.clone(),
@@ -407,6 +495,10 @@ async fn run_build(
         }
     }
 
+    // Capture vercel.json crons before the manifest is moved into the gateway —
+    // they're registered (production only) after the deployment is live.
+    let cron_specs = manifest.crons.clone();
+
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
     let tenant = cloud.projects.team_of(&manifest.project);
@@ -419,6 +511,35 @@ async fn run_build(
         if build_failed { DeployState::Error } else { DeployState::Ready },
         tenant,
     );
+
+    // Register `vercel.json` crons against the PRODUCTION deployment (Vercel only
+    // runs crons in production). Replaces this project's prior config-sourced jobs
+    // so redeploys don't accumulate duplicates; manual jobs are untouched. Crons
+    // hit the project's production alias, so they always target current prod.
+    if !build_failed && is_production {
+        let jobs: Vec<hive_edge::CronJob> = cron_specs
+            .iter()
+            .enumerate()
+            .map(|(i, c)| hive_edge::CronJob {
+                id: format!("vc-{}-{}", sanitize_tag(&project), i),
+                name: format!("vercel.json {}", c.path),
+                // Vercel uses 5-field expressions; the scheduler is 6-field (with
+                // seconds) — prepend a 0-second field when needed.
+                schedule: to_six_field_cron(&c.schedule),
+                deployment: project.clone(),
+                path: c.path.clone(),
+                enabled: true,
+                last_run_ms: None,
+                next_run_ms: None,
+                runs: 0,
+                source: "vercel.json".into(),
+            })
+            .collect();
+        let n = cloud.cron.set_source_jobs(&project, "vercel.json", jobs);
+        if !cron_specs.is_empty() {
+            log(format!("Registered {n} cron job(s) from vercel.json."));
+        }
+    }
 
     // Ingest any Vercel WDK manifest the app emitted (`.well-known/workflow/v1/
     // manifest.json`) so its workflows + step graphs appear in the Workflows tab
@@ -481,7 +602,182 @@ async fn run_build(
             "commit": commit,
         }),
     );
+
+    // Multi-region tail: this node was a selected target AND hosted the build, so
+    // also replicate the deploy to any OTHER selected region node(s), then drop
+    // the project from nodes that are no longer targets. Only on a clean build.
+    if !req.no_fanout && !build_failed {
+        let regions = cloud.projects.get(&project).functions.regions;
+        let targets = crate::schedule::place(cloud, &regions);
+        if targets.iter().any(|t| t.admin.is_none()) {
+            let remote: Vec<crate::schedule::Target> =
+                targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
+            if !remote.is_empty() {
+                let _ = fanout_remote(cloud, bid, &req, &project, &remote).await;
+            }
+            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+            cleanup_non_targets(cloud, &project, &names).await;
+        }
+    }
     Ok(())
+}
+
+/// Dispatch a per-target deploy to each remote target's admin and MIRROR its
+/// build into this coordinator build record (so the dashboard's existing build
+/// page streams the real, remote build log). Returns true if every target ended
+/// in a Ready state. Each dispatched deploy carries `no_fanout:true` so the
+/// target just builds + hosts (no recursion), the project's current env (so the
+/// target has it even on a redeploy), and the owning team header.
+async fn fanout_remote(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    req: &GitDeployRequest,
+    project: &str,
+    remote: &[crate::schedule::Target],
+) -> bool {
+    let log = |s: String| cloud.builds.log(bid, s);
+    let team = cloud.projects.team_of(project);
+    let env = cloud.projects.env_map(project);
+    let mut all_ok = true;
+    for t in remote {
+        let admin = match &t.admin {
+            Some(a) => a.clone(),
+            None => continue,
+        };
+        let mut dreq = req.clone();
+        dreq.no_fanout = true;
+        dreq.project = Some(project.to_string());
+        dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
+        log(format!("→ {}: dispatching deploy", t.node));
+        let resp = cloud
+            .http
+            .post(format!("{admin}/v1/git/deploy"))
+            .header("x-hive-team", team.clone())
+            .json(&dreq)
+            .timeout(Duration::from_secs(15))
+            .send()
+            .await;
+        let target_bid = match resp {
+            Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from)),
+            Err(e) => {
+                log(format!("✗ {}: dispatch failed: {e}", t.node));
+                all_ok = false;
+                continue;
+            }
+        };
+        let Some(target_bid) = target_bid else {
+            log(format!("✗ {}: no build id returned", t.node));
+            all_ok = false;
+            continue;
+        };
+        let ok = mirror_remote_build(cloud, bid, &admin, &target_bid, &t.node).await;
+        if !ok {
+            all_ok = false;
+        }
+    }
+    all_ok
+}
+
+/// Poll a remote node's `/v1/builds/{id}` and stream NEW log lines into this
+/// build record (prefixed with the node name) until it reaches a terminal state
+/// or times out. On success, copies the remote deployment's id + alias onto this
+/// build record so the dashboard shows the live URL. Returns true iff Ready.
+async fn mirror_remote_build(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    admin: &str,
+    target_bid: &str,
+    node: &str,
+) -> bool {
+    let mut mirrored = 0usize;
+    let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
+    loop {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let v = match cloud
+            .http
+            .get(format!("{admin}/v1/builds/{target_bid}"))
+            .timeout(Duration::from_secs(8))
+            .send()
+            .await
+            .ok()
+        {
+            Some(r) => r.json::<serde_json::Value>().await.ok(),
+            None => None,
+        };
+        let Some(v) = v else {
+            if now_ms() > deadline {
+                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build"));
+                return false;
+            }
+            continue;
+        };
+        // Stream any log lines we haven't mirrored yet.
+        if let Some(lines) = v.get("lines").and_then(|x| x.as_array()) {
+            for line in lines.iter().skip(mirrored) {
+                if let Some(text) = line.get("line").and_then(|x| x.as_str()) {
+                    cloud.builds.log(bid, format!("[{node}] {text}"));
+                }
+            }
+            mirrored = lines.len();
+        }
+        let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
+        if state.eq_ignore_ascii_case("ready") {
+            if let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) {
+                let dep = dep.to_string();
+                let alias = v.get("alias").and_then(|x| x.as_str()).map(String::from);
+                cloud.builds.update(bid, |b| {
+                    b.deployment_id = Some(dep.clone());
+                    if let Some(a) = &alias {
+                        b.alias = Some(a.clone());
+                    }
+                });
+            }
+            cloud.builds.log(bid, format!("✓ {node}: deployment ready"));
+            return true;
+        }
+        if state.eq_ignore_ascii_case("error") {
+            cloud.builds.log(bid, format!("✗ {node}: build failed"));
+            return false;
+        }
+        if now_ms() > deadline {
+            cloud.builds.log(bid, format!("✗ {node}: remote build timed out"));
+            return false;
+        }
+    }
+}
+
+/// After placing a project on its target node(s), tell every OTHER node that
+/// still hosts it to delete it — so changing regions RELOCATES the deployment
+/// rather than leaving stale copies. Best-effort; never fails the deploy.
+async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_names: &[String]) {
+    // Which nodes currently host this project? Derive from the gossiped routes:
+    // any host alias that starts with "<project>." or "<project>-".
+    let admins = cloud.node_admins.read().clone();
+    let routes = cloud.peer_routes.read().clone();
+    let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (host, rs) in routes.iter() {
+        let sub = host.split('.').next().unwrap_or(host);
+        if sub == project || sub.starts_with(&format!("{project}-")) {
+            for r in rs {
+                hosting.insert(r.node_id.clone());
+            }
+        }
+    }
+    let team = cloud.projects.team_of(project);
+    for node in hosting {
+        if target_names.iter().any(|t| t == &node) {
+            continue; // keep the chosen targets
+        }
+        if let Some(admin) = admins.get(&node) {
+            let _ = cloud
+                .http
+                .delete(format!("{admin}/v1/projects/{project}"))
+                .header("x-hive-team", team.clone())
+                .timeout(Duration::from_secs(15))
+                .send()
+                .await;
+        }
+    }
 }
 
 /// Best-effort GitHub Commit Status report (Vercel-style "shadw — Deployment
@@ -648,11 +944,35 @@ async fn build_via_fdi(
     let pick = |f: fn(&crate::project_settings::BuildConfig) -> &String| {
         bc.as_ref().map(f).filter(|s| !s.trim().is_empty()).cloned()
     };
-    let inst = pick(|b| &b.install_command);
-    let bld = pick(|b| &b.build_command);
-    let outd = pick(|b| &b.output_dir);
+    // `vercel.json` (loaded from the project root) takes precedence over Project
+    // Settings, which in turn override framework auto-detection — exactly Vercel's
+    // resolution order. A non-empty vercel.json value wins; otherwise fall back.
+    let vc = fluid_build::load_vercel_config(dir);
+    if vc.is_some() {
+        log("Detected vercel.json — applying configuration overrides.".into());
+    }
+    let vc_pick = |sel: fn(&fluid_build::VercelConfig) -> Option<&String>| {
+        vc.as_ref().and_then(sel).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string)
+    };
+    let inst = vc_pick(|c| c.install_command.as_ref()).or_else(|| pick(|b| &b.install_command));
+    let bld = vc_pick(|c| c.build_command.as_ref()).or_else(|| pick(|b| &b.build_command));
+    let outd = vc_pick(|c| c.output_directory.as_ref()).or_else(|| pick(|b| &b.output_dir));
+    // An explicit framework choice (vercel.json, else project settings) overrides
+    // auto-detection.
+    let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| pick(|b| &b.framework));
 
-    let plan = fluid_build::plan_build(dir, inst.as_deref(), bld.as_deref(), outd.as_deref());
+    let plan = fluid_build::plan_build(dir, fwo.as_deref(), inst.as_deref(), bld.as_deref(), outd.as_deref());
+
+    // Generic "Static" framework = publish the files as-is: no install, no build.
+    // This honors the user's explicit choice and, crucially, never runs `npm
+    // install` — so repos with a build-y `postinstall` (e.g. jor1k's `./compile`)
+    // deploy as plain static sites instead of failing the install. Serve the
+    // configured output dir, else the repo root (where index.html lives).
+    if plan.framework.slug == "static" {
+        let sd = outd.clone().unwrap_or_else(|| ".".to_string());
+        log(format!("Static project (framework override) — skipping install/build; serving \"{sd}\" as-is."));
+        return Ok(static_manifest(project, &sd));
+    }
 
     // Monorepo detection: only when THIS package actually uses `workspace:*` deps
     // (which resolve only from a root install). A standalone example that merely
@@ -759,6 +1079,46 @@ async fn build_via_fdi(
             .await
             .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
     }
+    // 1.5) SvelteKit: the default `@sveltejs/adapter-auto` only emits output for
+    // managed hosts (Vercel/Netlify/Cloudflare/…); on a self-hosted node it
+    // produces NO runnable server, so the function never binds its port. Swap it
+    // for `@sveltejs/adapter-node`, which emits a standalone `build/` server that
+    // listens on $HOST:$PORT — run later with `node build`. Done after install
+    // (node_modules present) and before the build.
+    let is_sveltekit = plan.framework.slug == "sveltekit";
+    if is_sveltekit {
+        let cfg = dir.join("svelte.config.js");
+        if let Ok(src) = tokio::fs::read_to_string(&cfg).await {
+            if !src.contains("@sveltejs/adapter-node") && src.contains("@sveltejs/adapter-auto") {
+                // Pin adapter-node to the installed SvelteKit major (kit 1.x →
+                // adapter-node 1.x; kit ≥2 → latest), or modern adapter-node's
+                // `@sveltejs/kit@^2` peer dep clashes with an old kit and `npm`
+                // aborts (ERESOLVE). `--legacy-peer-deps` tolerates prereleases.
+                let kit_major = tokio::fs::read_to_string(dir.join("node_modules/@sveltejs/kit/package.json"))
+                    .await
+                    .ok()
+                    .and_then(|s| s.split("\"version\"").nth(1).map(|x| x.to_string()))
+                    .and_then(|x| x.split('"').nth(1).map(|v| v.to_string()))
+                    .and_then(|ver| ver.split('.').next().map(|m| m.to_string()));
+                let spec = match kit_major.as_deref() {
+                    Some("1") => "@sveltejs/adapter-node@^1",
+                    _ => "@sveltejs/adapter-node",
+                };
+                log(format!("SvelteKit detected with adapter-auto — switching to {spec} so it serves on a self-hosted node."));
+                let add = match pm {
+                    "pnpm" => format!("corepack enable pnpm >/dev/null 2>&1; pnpm add -D --config.strict-peer-dependencies=false {spec}"),
+                    "yarn" => format!("corepack enable >/dev/null 2>&1; yarn add -D {spec}"),
+                    "bun" => format!("bun add -d {spec}"),
+                    _ => format!("npm install -D --no-audit --no-fund --legacy-peer-deps {spec}"),
+                };
+                run_streamed(dir, &add, cloud, bid, &proj_env)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("installing adapter-node failed: {e}"))?;
+                let patched = src.replace("@sveltejs/adapter-auto", "@sveltejs/adapter-node");
+                let _ = tokio::fs::write(&cfg, patched).await;
+            }
+        }
+    }
     // 2) Build in the project directory.
     if has_pkg && !build_cmd.trim().is_empty() {
         log(format!("Running \"{}\"", build_cmd));
@@ -786,8 +1146,13 @@ async fn build_via_fdi(
         Primitive::Serverless | Primitive::Hybrid => {
             // Node-server model: the framework was just built, so its production
             // server (`next start`, `node build`, …) will boot and listen on
-            // $PORT in the build dir. The gateway proxies to it.
-            let start = detect_start_cmd(dir).await;
+            // $PORT in the build dir. The gateway proxies to it. SvelteKit (built
+            // with adapter-node above) runs its standalone server via `node build`.
+            let start = if is_sveltekit && dir.join("build/index.js").exists() {
+                vec!["node".to_string(), "build".to_string()]
+            } else {
+                detect_start_cmd(dir).await
+            };
             log(format!("Provisioning serverless server: `{}`.", start.join(" ")));
             Ok(function_manifest(project, start))
         }
@@ -1148,6 +1513,225 @@ async fn parse_expose(path: &Path) -> Option<u16> {
 /// A container deployment: the function "process" is `podman run`. The app is
 /// told to listen on `internal` (via PORT env) and we publish the cell's $PORT →
 /// that internal port, so the gateway proxies to 127.0.0.1:$PORT.
+/// Merge a parsed `vercel.json` into the deployment manifest: routing
+/// (redirects/rewrites/headers, prepended so vercel.json wins), cleanUrls,
+/// trailingSlash, images, crons, and per-function overrides (matched by glob).
+fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
+    use fluid_core::{
+        redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
+        Redirect, RemotePattern, Rewrite, RuleCondition,
+    };
+
+    let conv_conds = |cs: &[fluid_build::VercelCondition]| -> Vec<RuleCondition> {
+        cs.iter()
+            .map(|c| RuleCondition {
+                kind: c.kind.clone(),
+                key: c.key.clone(),
+                value: c.value.as_ref().map(|v| match v {
+                    fluid_build::ConditionValue::Text(t) => CondValue::Text(t.clone()),
+                    fluid_build::ConditionValue::Expr { pre, suf } => {
+                        CondValue::Expr { pre: pre.clone(), suf: suf.clone() }
+                    }
+                }),
+            })
+            .collect()
+    };
+
+    // Redirects (vercel.json first → highest precedence).
+    if !vc.redirects.is_empty() {
+        let mut conv: Vec<Redirect> = vc
+            .redirects
+            .iter()
+            .map(|r| Redirect {
+                source: r.source.clone(),
+                destination: r.destination.clone(),
+                status: redirect_status(r.permanent, r.status_code),
+                has: conv_conds(&r.has),
+                missing: conv_conds(&r.missing),
+            })
+            .collect();
+        conv.append(&mut m.redirects);
+        m.redirects = conv;
+    }
+
+    // Rewrites (vercel.json first).
+    if !vc.rewrites.is_empty() {
+        let mut conv: Vec<Rewrite> = vc
+            .rewrites
+            .iter()
+            .map(|r| Rewrite {
+                source: r.source.clone(),
+                destination: r.destination.clone(),
+                has: conv_conds(&r.has),
+                missing: conv_conds(&r.missing),
+            })
+            .collect();
+        conv.append(&mut m.rewrites);
+        m.rewrites = conv;
+    }
+
+    // Response headers.
+    if !vc.headers.is_empty() {
+        m.headers = vc
+            .headers
+            .iter()
+            .map(|h| HeaderRule {
+                source: h.source.clone(),
+                headers: h.headers.iter().map(|x| Header { key: x.key.clone(), value: x.value.clone() }).collect(),
+                has: conv_conds(&h.has),
+                missing: conv_conds(&h.missing),
+            })
+            .collect();
+    }
+
+    if let Some(cu) = vc.clean_urls {
+        m.clean_urls = cu;
+    }
+    if vc.trailing_slash.is_some() {
+        m.trailing_slash = vc.trailing_slash;
+    }
+
+    if let Some(img) = &vc.images {
+        m.images = Some(ImagesConfig {
+            sizes: img.sizes.clone(),
+            qualities: img.qualities.clone(),
+            formats: img.formats.clone(),
+            minimum_cache_ttl: img.minimum_cache_ttl,
+            domains: img.domains.clone(),
+            remote_patterns: img
+                .remote_patterns
+                .iter()
+                .map(|p| RemotePattern {
+                    protocol: p.protocol.clone(),
+                    hostname: p.hostname.clone(),
+                    port: p.port.clone(),
+                    pathname: p.pathname.clone(),
+                    search: p.search.clone(),
+                })
+                .collect(),
+            local_patterns: img
+                .local_patterns
+                .iter()
+                .map(|p| LocalPattern { pathname: p.pathname.clone(), search: p.search.clone() })
+                .collect(),
+            dangerously_allow_svg: img.dangerously_allow_svg,
+            content_security_policy: img.content_security_policy.clone(),
+            content_disposition_type: img.content_disposition_type.clone(),
+        });
+    }
+
+    if !vc.crons.is_empty() {
+        m.crons = vc.crons.iter().map(|c| CronSpec { path: c.path.clone(), schedule: c.schedule.clone() }).collect();
+    }
+
+    // Per-function overrides (glob → matched functions).
+    for (glob, fnc) in &vc.functions {
+        for f in m.functions.iter_mut() {
+            if glob_match(glob, &f.name) {
+                if let Some(d) = fnc.max_duration {
+                    f.max_duration_secs = d;
+                }
+                if let Some(mem) = fnc.memory {
+                    f.memory_mib = mem;
+                    // Vercel scales CPU with memory; >2 GB ⇒ Performance tier.
+                    f.vcpus = if mem > 2048 { 2 } else { 1 };
+                }
+                if !fnc.regions.is_empty() {
+                    f.regions = fnc.regions.clone();
+                }
+                if let Some(inc) = &fnc.include_files {
+                    f.include_files = Some(inc.clone());
+                }
+                if let Some(exc) = &fnc.exclude_files {
+                    f.exclude_files = Some(exc.clone());
+                }
+                if let Some(rt) = &fnc.runtime {
+                    f.runtime = rt.clone();
+                }
+            }
+        }
+    }
+
+    // Project-level regions apply to any function without its own preference.
+    if !vc.regions.is_empty() {
+        for f in m.functions.iter_mut() {
+            if f.regions.is_empty() {
+                f.regions = vc.regions.clone();
+            }
+        }
+    }
+
+    log(format!(
+        "vercel.json merged: {} redirect(s), {} rewrite(s), {} header rule(s), cleanUrls={}, trailingSlash={:?}, {} cron(s), images={}.",
+        m.redirects.len(),
+        m.rewrites.len(),
+        m.headers.len(),
+        m.clean_urls,
+        m.trailing_slash,
+        m.crons.len(),
+        m.images.is_some(),
+    ));
+}
+
+/// Convert a Vercel 5-field cron (`min hour dom mon dow`) to the scheduler's
+/// 6-field form (`sec min hour dom mon dow`) by prepending a 0-second field.
+/// Already-6-field expressions pass through unchanged.
+fn to_six_field_cron(expr: &str) -> String {
+    let fields = expr.split_whitespace().count();
+    if fields == 5 {
+        format!("0 {}", expr.trim())
+    } else {
+        expr.trim().to_string()
+    }
+}
+
+/// Glob match for `vercel.json` `functions` keys against a function name.
+/// Supports `*` (within a path segment) and `**` (across segments). Because our
+/// function names are extension-less (e.g. `api/hello`), a trailing file
+/// extension on the pattern (e.g. `api/*.js`) is also tried with the extension
+/// stripped.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    if wild(pattern.as_bytes(), name.as_bytes()) {
+        return true;
+    }
+    if let Some(dot) = pattern.rfind('.') {
+        if !pattern[dot..].contains('/') {
+            return wild(pattern[..dot].as_bytes(), name.as_bytes());
+        }
+    }
+    false
+}
+
+/// Recursive wildcard matcher. `*` matches any run NOT crossing `/`; `**`
+/// matches any run including `/`. Recursion is bounded by pattern length.
+fn wild(p: &[u8], s: &[u8]) -> bool {
+    if p.is_empty() {
+        return s.is_empty();
+    }
+    if p[0] == b'*' {
+        let dbl = p.len() > 1 && p[1] == b'*';
+        let rest = if dbl { &p[2..] } else { &p[1..] };
+        let mut i = 0;
+        loop {
+            if wild(rest, &s[i..]) {
+                return true;
+            }
+            if i >= s.len() {
+                return false;
+            }
+            // A single `*` may not consume `/`.
+            if !dbl && s[i] == b'/' {
+                return false;
+            }
+            i += 1;
+        }
+    } else if !s.is_empty() && p[0] == s[0] {
+        wild(&p[1..], &s[1..])
+    } else {
+        false
+    }
+}
+
 fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
     Manifest {
         project: project.to_string(),
@@ -1159,12 +1743,14 @@ fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
             // detached container, mapping the cell $PORT -> internal port.
             start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string()],
             env: Default::default(),
+            vcpus: 1,
             memory_mib: 512,
             max_concurrency: 20,
             min_instances: 1,
             max_instances: 5,
             idle_ttl_secs: 120,
             max_duration_secs: 300,
+            ..Default::default()
         }],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
         ..Default::default()
@@ -1180,12 +1766,14 @@ fn function_manifest(project: &str, start_cmd: Vec<String>) -> Manifest {
             runtime: "auto".into(),
             start_cmd,
             env: Default::default(),
+            vcpus: 1,
             memory_mib: 512,
             max_concurrency: 10,
             min_instances: 1,
             max_instances: 5,
             idle_ttl_secs: 60,
             max_duration_secs: 300,
+            ..Default::default()
         }],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("api".into()) }],
         ..Default::default()
@@ -1353,6 +1941,49 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glob_match_function_keys() {
+        // within-segment * and extension stripping for our extension-less names
+        assert!(glob_match("api/*.js", "api/hello"));
+        assert!(glob_match("api/*", "api/hello"));
+        assert!(!glob_match("api/*.js", "api/sub/hello")); // * doesn't cross '/'
+        assert!(glob_match("api/**/*.ts", "api/sub/hello"));
+        assert!(glob_match("api/**/*", "api/a/b/c"));
+        assert!(glob_match("api/test.js", "api/test"));
+        assert!(glob_match("src/pages/**/*", "src/pages/isr/x"));
+        assert!(!glob_match("api/users", "api/posts"));
+    }
+
+    #[test]
+    fn apply_vercel_config_merges() {
+        use fluid_build::VercelConfig;
+        let vc = VercelConfig::from_json(
+            r#"{
+              "redirects": [{ "source": "/old", "destination": "/new", "permanent": false }],
+              "headers": [{ "source": "/(.*)", "headers": [{ "key": "X-A", "value": "1" }] }],
+              "cleanUrls": true,
+              "trailingSlash": false,
+              "crons": [{ "path": "/api/cron", "schedule": "0 0 * * *" }],
+              "functions": { "api/*": { "maxDuration": 45, "memory": 3009 } }
+            }"#,
+        )
+        .unwrap();
+        let mut m = Manifest {
+            functions: vec![FunctionConfig { name: "api/hello".into(), ..Default::default() }],
+            ..Default::default()
+        };
+        apply_vercel_config(&mut m, &vc, &|_| {});
+        assert_eq!(m.redirects.len(), 1);
+        assert_eq!(m.redirects[0].status, 307); // permanent:false
+        assert_eq!(m.headers.len(), 1);
+        assert!(m.clean_urls);
+        assert_eq!(m.trailing_slash, Some(false));
+        assert_eq!(m.crons.len(), 1);
+        assert_eq!(m.functions[0].max_duration_secs, 45);
+        assert_eq!(m.functions[0].memory_mib, 3009);
+        assert_eq!(m.functions[0].vcpus, 2);
+    }
 
     #[test]
     fn project_name_from_url_sanitizes() {

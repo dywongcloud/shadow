@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2 } from "lucide-react";
+import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Menu } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
@@ -22,6 +22,7 @@ const tabs = [
   { href: "/observability", label: "Observability" },
   { href: "/cdn", label: "CDN" },
   { href: "/integrations", label: "Integrations" },
+  { href: "/git", label: "Git" },
   { href: "/domains", label: "Domains" },
   { href: "/firewall", label: "Firewall" },
   { href: "/network", label: "Network" },
@@ -89,9 +90,10 @@ export function TopNav() {
           </Link>
         </div>
       </div>
-      {/* Row 2: tabs — active underline sits flush on the header's bottom border */}
+      {/* Row 2: tabs. Desktop (lg+) = horizontal underline tabs. Below that, a
+          compact dropdown so the nav never needs ugly horizontal scrolling. */}
       <div className="mx-auto max-w-[1400px] px-2 sm:px-4">
-        <nav className="-mb-px flex items-center gap-0.5 overflow-x-auto">
+        <nav className="-mb-px hidden items-center gap-0.5 lg:flex">
           {tabs.map((t) => {
             const active = isActive(t.href);
             return (
@@ -110,8 +112,59 @@ export function TopNav() {
             );
           })}
         </nav>
+        <MobileTabs isActive={isActive} />
       </div>
     </header>
+  );
+}
+
+/** Mobile/tablet nav (< lg): a single bar showing the current section, opening a
+ *  vertical dropdown of all tabs. Replaces the cramped horizontal scroll. */
+function MobileTabs({ isActive }: { isActive: (href: string) => boolean }) {
+  const pathname = usePathname();
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  // Close on navigation.
+  useEffect(() => setOpen(false), [pathname]);
+  useEffect(() => {
+    function onClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, []);
+  const current = tabs.find((t) => isActive(t.href)) ?? tabs[0];
+  return (
+    <div className="relative lg:hidden" ref={ref}>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="-mb-px flex w-full items-center justify-between gap-2 border-b-2 border-fg px-1.5 pb-2.5 pt-1 text-sm font-medium text-fg"
+      >
+        <span className="truncate">{current.label}</span>
+        <Menu className="h-4 w-4 shrink-0 text-secondary" />
+      </button>
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-40 mt-1 max-h-[70vh] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-pop">
+          {tabs.map((t) => {
+            const active = isActive(t.href);
+            return (
+              <Link
+                key={t.href}
+                href={t.href}
+                onClick={() => setOpen(false)}
+                className={cn(
+                  "flex items-center justify-between px-4 py-2.5 text-sm hover:bg-subtle",
+                  active ? "font-medium text-fg" : "text-secondary hover:text-fg"
+                )}
+              >
+                {t.label}
+                {active ? <Check className="h-4 w-4" /> : null}
+              </Link>
+            );
+          })}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -261,7 +314,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-border bg-card shadow-pop">
+        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 max-w-[90vw] overflow-hidden rounded-lg border border-border bg-card shadow-pop">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option
             label={identity.name}
@@ -380,7 +433,7 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
       </button>
 
       {open && (
-        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 overflow-hidden rounded-lg border border-border bg-card shadow-pop">
+        <div className="absolute left-0 top-full z-40 mt-1.5 w-64 max-w-[90vw] overflow-hidden rounded-lg border border-border bg-card shadow-pop">
           <div className="px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Personal Account</div>
           <Option label={identity.name} hint="Hobby" icon={<User className="h-3.5 w-3.5" />} selected={sel === PERSONAL} onClick={() => choose(PERSONAL)} />
           <div className="mt-1 border-t border-border px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-muted">Teams</div>

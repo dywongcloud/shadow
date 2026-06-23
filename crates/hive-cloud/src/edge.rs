@@ -18,6 +18,8 @@ use hive_edge::{
     waf::{RequestCtx, Verdict},
 };
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::state::CloudState;
 
 fn set(resp: &mut Response, name: &'static str, val: &str) {
@@ -72,17 +74,49 @@ pub async fn edge_pipeline(
 
     // EXPERIMENT (feature `zkauth`): anonymous preview-access bootstrap. Verifies
     // a membership proof and drops a short-lived access cookie, then redirects.
+    // Only the node that OWNS the deployment can do this: it has the team roster
+    // (to verify the ring-signature proof) and the secret key (to seal the access
+    // cookie it later checks). When a pooled request for `/_shadw/zk` lands on a
+    // node that doesn't serve this host, fall through to mesh routing so it's
+    // proxied to the owner — which then handles it locally here.
     #[cfg(feature = "zkauth")]
-    if path.starts_with("/_shadw/zk") {
+    if path.starts_with("/_shadw/zk") && cloud.gw.serves_host(&host) {
         return crate::zkauth::bootstrap(&cloud, &host, &query);
     }
 
+    // Request-ID (#4): accept an inbound `x-hive-request-id` or mint one; it's
+    // forwarded over the mesh and stamped on every routing event below.
+    let rid = header(&headers_vec, "x-hive-request-id")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
+    // Allowed-suffix validation (#3): a multi-label Host must end with a configured
+    // deploy suffix. A foreign root (e.g. `app.evil.com`) — even if its first label
+    // collides with a real alias — is rejected here with a clean 404 that leaks
+    // nothing. (`/_vercel/*` + `/_shadw/zk` already returned above; bare/empty hosts
+    // and the default deployment are allowed.)
+    if !host.is_empty() && !cloud.host_allowed(&host) {
+        let mut ev = cloud.event(&region, &method, &host, &path, 404, "host-rejected", &host);
+        ev.request_id = rid.clone();
+        cloud.record(ev);
+        return deployment_not_found(&region);
+    }
+
+    // WebSocket upgrade detection (#2): upgraded connections need a raw byte splice
+    // across the mesh (HTTP framing bypassed), not the buffered/streamed tunnel.
+    let is_ws_upgrade = header(&headers_vec, "upgrade")
+        .map(|u| u.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+        && header(&headers_vec, "connection")
+            .map(|c| c.to_ascii_lowercase().split(',').any(|t| t.trim() == "upgrade"))
+            .unwrap_or(false);
+
     // ---- Cross-node mesh routing ------------------------------------------------
     // If this node doesn't host the requested deployment but a peer in the mesh
-    // does, reverse-proxy the request to the best peer: same-region first, then
-    // lowest latency (anycast), failing over to the next peer on a connection
-    // error. `x-hive-proxied` breaks loops. This is what turns N nodes into one
-    // cloud — hit any node, the request reaches wherever the deployment lives.
+    // does, reverse-proxy to the best peer: ordered by the deployment's configured
+    // regions/failover (#5), else same-region-first anycast, failing over to the
+    // next candidate on error. `x-hive-proxied` breaks loops. Hit any node, the
+    // request reaches wherever the deployment lives.
     let already_proxied = header(&headers_vec, "x-hive-proxied").is_some();
     let serve_local = cloud.gw.serves_host(&host);
     let sub = host
@@ -101,29 +135,53 @@ pub async fn edge_pipeline(
         None
     };
     if !already_proxied && !host.is_empty() && (!serve_local || container_owner.is_some()) {
-        let mut cands: Vec<crate::state::PeerRoute> = cloud
+        // Only nodes healthy in BOTH the route table AND the gossip registry are
+        // eligible (#6) — a dropped/unhealthy node is excluded as a candidate.
+        let healthy_ids: std::collections::HashSet<String> = cloud
+            .registry
+            .nodes()
+            .into_iter()
+            .filter(|n| n.healthy)
+            .map(|n| n.id)
+            .collect();
+        let raw: Vec<crate::state::PeerRoute> = cloud
             .peer_routes
             .read()
             .get(&sub)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|r| r.healthy)
+            .filter(|r| r.healthy && healthy_ids.contains(&r.node_id))
             .collect();
-        // For container enforcement, route ONLY to the elected owner.
-        if let Some(owner) = &container_owner {
-            cands.retain(|c| &c.node_id == owner);
-        }
-        if !cands.is_empty() {
-            cands.sort_by_key(|r| (if r.region == region { 0u8 } else { 1u8 }, r.latency_ms));
-            let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
-            let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
-            let (_parts, body) = req.into_parts();
-            let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+        let had_routes = !raw.is_empty();
 
-            // For the iroh transport: the pooled mesh client (reuses one QUIC
-            // connection per peer) + a map of peer node id -> its gossiped iroh dial
-            // address. Headers forwarded over the tunnel.
+        // Candidate ordering: container → ONLY the elected owner (single-owner);
+        // otherwise apply the deployment's configured region/failover policy (#5).
+        let cands: Vec<crate::state::PeerRoute> = if let Some(owner) = &container_owner {
+            raw.into_iter().filter(|c| &c.node_id == owner).collect()
+        } else {
+            let project = cloud.gw.project_for_host(&host).unwrap_or_else(|| sub.clone());
+            let fs = cloud.projects.get(&project).functions;
+            order_candidates(raw, &fs, &region)
+        };
+
+        if cands.is_empty() {
+            // The deployment EXISTS in the mesh but no healthy node is in an allowed
+            // region (failover:false + primary down, or failover:true with every
+            // configured region unhealthy). Never cross into a forbidden region —
+            // return 503 rather than silently routing elsewhere (#5/#6).
+            if had_routes {
+                let mut ev = cloud.event(&region, &method, &host, &path, 503, "mesh-region-unavailable", &sub);
+                ev.request_id = rid.clone();
+                cloud.record(ev);
+                let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "no healthy node in the configured region(s)").into_response();
+                set(&mut resp, "x-hive-region", &region);
+                set(&mut resp, "x-hive-request-id", &rid);
+                return resp;
+            }
+            // else: no routes at all → fall through to DEPLOYMENT_NOT_FOUND below.
+        } else {
+            let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
             let mesh = cloud.mesh.read().clone();
             let node_iroh: std::collections::HashMap<String, String> = cloud
                 .registry
@@ -131,24 +189,63 @@ pub async fn edge_pipeline(
                 .into_iter()
                 .filter_map(|n| n.iroh_addr.map(|a| (n.id, a)))
                 .collect();
-            let mut fwd_headers: Vec<(String, String)> =
-                vec![("host".into(), host.clone()), ("x-hive-proxied".into(), "1".into())];
+            // Forwarded headers: preserve the original Host + everything else, add the
+            // loop guard and the request-id (#4). (Hop-by-hop stripped.)
+            let mut fwd_headers: Vec<(String, String)> = vec![
+                ("host".into(), host.clone()),
+                ("x-hive-proxied".into(), "1".into()),
+                ("x-hive-request-id".into(), rid.clone()),
+            ];
             for (k, v) in &headers_vec {
                 let lk = k.to_lowercase();
-                if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied") {
+                if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied" | "x-hive-request-id") {
                     continue;
                 }
                 fwd_headers.push((k.clone(), v.clone()));
             }
 
+            // WebSocket (#2): a raw cross-node byte splice over the iroh trunk —
+            // open_raw is failover-safe (the client upgrade is only consumed once the
+            // owner side is ready), so we can try each candidate's trunk in turn.
+            if is_ws_upgrade {
+                if let Some(pool) = &mesh {
+                    for cand in &cands {
+                        if let Some(addr_json) = node_iroh.get(&cand.node_id) {
+                            if let Ok(resp) =
+                                ws_proxy(&mut req, pool, &cand.node_id, addr_json, &method, &path_q, &fwd_headers).await
+                            {
+                                let mut ev = cloud.event(&region, &method, &host, &path, resp.status().as_u16(), "mesh-ws", &cand.node_id);
+                                ev.request_id = rid.clone();
+                                cloud.record(ev);
+                                return resp;
+                            }
+                        }
+                    }
+                }
+                let mut ev = cloud.event(&region, &method, &host, &path, 502, "mesh-ws-fail", &sub);
+                ev.request_id = rid.clone();
+                cloud.record(ev);
+                let mut resp = (StatusCode::BAD_GATEWAY, "no node could serve this websocket").into_response();
+                set(&mut resp, "x-hive-region", &region);
+                set(&mut resp, "x-hive-request-id", &rid);
+                return resp;
+            }
+
+            // HTTP: buffer the request body once (reused across failover attempts).
+            let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+            let (_parts, body) = req.into_parts();
+            let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+
             for cand in &cands {
                 // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
-                // works across NATs. Fall through to HTTP on any failure.
+                // works across NATs. STREAM the response so SSE / chunked bodies
+                // arrive incrementally cross-node (#1). Fall through to HTTP on error.
                 if let (Some(pool), Some(addr_json)) = (&mesh, node_iroh.get(&cand.node_id)) {
-                    match pool.request(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
-                        Ok(tr) => {
-                            let mut builder = Response::builder().status(tr.status);
-                            for (k, v) in &tr.headers {
+                    match pool.request_stream(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
+                        Ok(ts) => {
+                            let status = ts.status;
+                            let mut builder = Response::builder().status(ts.status);
+                            for (k, v) in &ts.headers {
                                 let lk = k.to_lowercase();
                                 if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
                                     continue;
@@ -159,13 +256,22 @@ pub async fn edge_pipeline(
                                     builder = builder.header(name, val);
                                 }
                             }
+                            // Body streams from the tunnel's chunk channel — no
+                            // buffering, no forced content-length on a streamed body.
+                            // The whole `TunnelStream` is moved into the unfold state
+                            // so the tunnel stays open until the body is fully sent.
+                            let stream = futures::stream::unfold(ts, |mut ts| async move {
+                                ts.recv().await.map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), ts))
+                            });
                             let mut out = builder
-                                .body(Body::from(tr.body))
+                                .body(Body::from_stream(stream))
                                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
                             set(&mut out, "x-hive-routed-to", &cand.node_id);
                             set(&mut out, "x-hive-transport", "iroh-p2p");
                             set(&mut out, "x-hive-region", &region);
-                            let ev = cloud.event(&region, &method, &host, &path, tr.status, "mesh-route-p2p", &cand.node_id);
+                            set(&mut out, "x-hive-request-id", &rid);
+                            let mut ev = cloud.event(&region, &method, &host, &path, status, "mesh-route-p2p", &cand.node_id);
+                            ev.request_id = rid.clone();
                             cloud.record(ev);
                             return out;
                         }
@@ -178,11 +284,12 @@ pub async fn edge_pipeline(
                     .request(rmethod.clone(), &url)
                     .header("host", &host)
                     .header("x-hive-proxied", "1")
+                    .header("x-hive-request-id", &rid)
                     .timeout(std::time::Duration::from_secs(30))
                     .body(body_bytes.clone());
                 for (k, v) in &headers_vec {
                     let lk = k.to_lowercase();
-                    if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied") {
+                    if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied" | "x-hive-request-id") {
                         continue;
                     }
                     rb = rb.header(k, v);
@@ -191,11 +298,10 @@ pub async fn edge_pipeline(
                     Ok(r) => {
                         let status = r.status();
                         let rheaders = r.headers().clone();
-                        let bytes = r.bytes().await.unwrap_or_default();
                         let mut builder = Response::builder().status(status.as_u16());
                         for (k, v) in rheaders.iter() {
                             let lk = k.as_str().to_lowercase();
-                            // Skip hop-by-hop headers — the body length is re-derived.
+                            // Skip hop-by-hop headers — the body framing is re-derived.
                             if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
                                 continue;
                             }
@@ -206,12 +312,15 @@ pub async fn edge_pipeline(
                                 builder = builder.header(name, val);
                             }
                         }
+                        // Stream the upstream body through (SSE / chunked stay incremental).
                         let mut out = builder
-                            .body(Body::from(bytes))
+                            .body(Body::from_stream(r.bytes_stream()))
                             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
                         set(&mut out, "x-hive-routed-to", &cand.node_id);
                         set(&mut out, "x-hive-region", &region);
-                        let ev = cloud.event(&region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
+                        set(&mut out, "x-hive-request-id", &rid);
+                        let mut ev = cloud.event(&region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
+                        ev.request_id = rid.clone();
                         cloud.record(ev);
                         return out;
                     }
@@ -219,10 +328,12 @@ pub async fn edge_pipeline(
                 }
             }
             // Every candidate peer failed.
-            let ev = cloud.event(&region, &method, &host, &path, 502, "mesh-route-fail", &sub);
+            let mut ev = cloud.event(&region, &method, &host, &path, 502, "mesh-route-fail", &sub);
+            ev.request_id = rid.clone();
             cloud.record(ev);
             let mut resp = (StatusCode::BAD_GATEWAY, "no healthy node could serve this deployment").into_response();
             set(&mut resp, "x-hive-region", &region);
+            set(&mut resp, "x-hive-request-id", &rid);
             return resp;
         }
     }
@@ -574,6 +685,58 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Resolve the dashboard origin to bounce a protected-preview browser request to.
+///
+/// When the request arrived over a PUBLIC wildcard host (e.g.
+/// `app.deployment.shadow.ngrok.pizza`), the unlock screen must stay on the public
+/// tunnel — NOT redirect to `localhost:3002` (which is what every node's
+/// `HIVE_DASHBOARD_URL` points at for local dev). Prefer an explicit
+/// `HIVE_PUBLIC_DASHBOARD_URL`, else derive it from the matched deploy suffix by
+/// dropping the leading `deployment.` label (→ `https://shadow.ngrok.pizza`). For
+/// a local/loopback host, use `HIVE_DASHBOARD_URL` as before.
+fn dashboard_origin(cloud: &Arc<CloudState>, host: &str) -> Option<String> {
+    derive_dashboard(
+        host,
+        &cloud.deploy_suffixes,
+        std::env::var("HIVE_PUBLIC_DASHBOARD_URL").ok(),
+        std::env::var("HIVE_DASHBOARD_URL").ok(),
+    )
+}
+
+/// Pure core of [`dashboard_origin`] (unit-testable without a node). A public
+/// wildcard host resolves to `public_env` if set, else the deploy suffix minus a
+/// leading `deployment.` label as `https://…`; a local/loopback host resolves to
+/// `local_env`.
+fn derive_dashboard(
+    host: &str,
+    suffixes: &[String],
+    public_env: Option<String>,
+    local_env: Option<String>,
+) -> Option<String> {
+    let h = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let public_suffix = if h.contains('.') {
+        suffixes
+            .iter()
+            .find(|s| s.as_str() != "localhost" && (h == **s || h.ends_with(&format!(".{s}"))))
+            .cloned()
+    } else {
+        None
+    };
+    if let Some(suffix) = public_suffix {
+        if let Some(u) = public_env {
+            let u = u.trim_end_matches('/');
+            if !u.is_empty() {
+                return Some(u.to_string());
+            }
+        }
+        let base = suffix.strip_prefix("deployment.").unwrap_or(&suffix);
+        return Some(format!("https://{base}"));
+    }
+    local_env
+        .map(|u| u.trim_end_matches('/').to_string())
+        .filter(|u| !u.is_empty())
+}
+
 /// Gate access to protected preview deployments. Returns `Some(401)` when the
 /// host is a team-private preview and the request carries no valid access
 /// credential; `None` to let the request proceed.
@@ -624,9 +787,8 @@ fn preview_gate(
     // plain 401 so nothing breaks.
     let wants_html = header(headers, "accept").map(|a| a.contains("text/html")).unwrap_or(false);
     if wants_html && method.eq_ignore_ascii_case("GET") {
-        if let Ok(dash) = std::env::var("HIVE_DASHBOARD_URL") {
-            let dash = dash.trim_end_matches('/');
-            if !dash.is_empty() {
+        if let Some(dash) = dashboard_origin(cloud, host) {
+            {
                 let url = format!(
                     "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
                     pct(host), pct(&project), pct(&team), pct(path),
@@ -694,4 +856,228 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.clone())
+}
+
+/// Order mesh candidates by the deployment's configured region/failover policy (#5).
+///
+/// * `regions` empty → same-region-first anycast (the serving node's region),
+///   latency as tiebreak (unchanged default).
+/// * `failover: true` → keep only configured regions, ordered primary-first then
+///   latency, so traffic falls through to the next configured region's healthy node.
+/// * `failover: false` → restrict to the PRIMARY region only; never cross regions
+///   (an empty result makes the caller return 503 instead of routing elsewhere).
+///
+/// Only `healthy` candidates are passed in; latency is always the within-region
+/// tiebreak.
+fn order_candidates(
+    mut raw: Vec<crate::state::PeerRoute>,
+    fs: &crate::project_settings::FunctionSettings,
+    serving_region: &str,
+) -> Vec<crate::state::PeerRoute> {
+    let regions: Vec<&String> = fs.regions.iter().filter(|r| !r.is_empty()).collect();
+    if regions.is_empty() {
+        raw.sort_by_key(|r| (if r.region == serving_region { 0u8 } else { 1u8 }, r.latency_ms));
+        return raw;
+    }
+    let rank = |r: &crate::state::PeerRoute| {
+        regions.iter().position(|cr| cr.eq_ignore_ascii_case(&r.region))
+    };
+    if fs.failover {
+        raw.retain(|r| rank(r).is_some());
+        raw.sort_by_key(|r| (rank(r).unwrap_or(usize::MAX) as u16, r.latency_ms));
+    } else {
+        let primary = regions[0].clone();
+        raw.retain(|r| r.region.eq_ignore_ascii_case(&primary));
+        raw.sort_by_key(|r| r.latency_ms);
+    }
+    raw
+}
+
+/// Cross-node WebSocket proxy (#2): open a RAW byte stream to the owner over its
+/// iroh trunk, replay the upgrade request (so the owner's local target performs
+/// the handshake), relay the owner's response head (e.g. `101`) back to the
+/// client, then splice raw bytes both ways (client ↔ iroh ↔ owner) — HTTP framing
+/// bypassed. `open_raw` runs BEFORE the client upgrade is consumed, so a failed
+/// candidate can be retried on the next one.
+///
+/// NOTE: the owner splices to its own gateway address; a full end-to-end upgrade
+/// to a deployed *function* additionally needs the owner's LOCAL serving path to
+/// upgrade (it's request/response today) — TODO. The cross-NODE transport here is
+/// complete and exercised by the `hive-p2p` raw-splice test.
+async fn ws_proxy(
+    req: &mut Request,
+    pool: &hive_p2p::PeerPool,
+    node_id: &str,
+    addr_json: &str,
+    method: &str,
+    path_q: &str,
+    fwd_headers: &[(String, String)],
+) -> Result<Response, ()> {
+    let mut raw = pool.open_raw(node_id, addr_json).await.map_err(|_| ())?;
+    // Replay the upgrade request to the owner so its target does the WS handshake.
+    let mut head = format!("{method} {path_q} HTTP/1.1\r\n");
+    for (k, v) in fwd_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    if raw.write_all(head.as_bytes()).await.is_err() {
+        return Err(());
+    }
+    let _ = raw.flush().await;
+    // Read the owner's response head (its target's 101 carries the correct
+    // Sec-WebSocket-Accept for the client's key, which we forwarded verbatim).
+    let (status, resp_headers, leftover) = read_http_head(&mut raw).await?;
+    let mut builder = Response::builder().status(status);
+    for (k, v) in &resp_headers {
+        if let (Ok(name), Ok(val)) =
+            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
+        {
+            builder = builder.header(name, val);
+        }
+    }
+    let resp = builder.body(Body::empty()).map_err(|_| ())?;
+    // Commit: take over the client connection and splice it to the iroh stream.
+    let on_upg = hyper::upgrade::on(&mut *req);
+    tokio::spawn(async move {
+        if let Ok(upgraded) = on_upg.await {
+            let mut client = hyper_util::rt::TokioIo::new(upgraded);
+            if !leftover.is_empty() {
+                let _ = client.write_all(&leftover).await;
+            }
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut raw).await;
+        }
+    });
+    Ok(resp)
+}
+
+/// Read an HTTP/1.x response head (status line + headers up to the blank line)
+/// from a raw stream; returns the status, header pairs, and any bytes already read
+/// past the head (the start of the spliced body / WS frames).
+async fn read_http_head<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut R,
+) -> Result<(StatusCode, Vec<(String, String)>, Vec<u8>), ()> {
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 1024];
+    loop {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let leftover = buf[pos + 4..].to_vec();
+            let text = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            let mut lines = text.split("\r\n");
+            let code = lines
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse::<u16>().ok())
+                .ok_or(())?;
+            let status = StatusCode::from_u16(code).map_err(|_| ())?;
+            let headers = lines
+                .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+                .collect();
+            return Ok((status, headers, leftover));
+        }
+        let n = r.read(&mut tmp).await.map_err(|_| ())?;
+        if n == 0 {
+            return Err(());
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.len() > 64 * 1024 {
+            return Err(());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{derive_dashboard, order_candidates};
+    use crate::project_settings::FunctionSettings;
+    use crate::state::PeerRoute;
+
+    fn suffixes() -> Vec<String> {
+        vec!["deployment.shadow.ngrok.pizza".into(), "localhost".into()]
+    }
+
+    #[test]
+    fn public_wildcard_preview_unlock_uses_public_dashboard_not_localhost() {
+        let s = suffixes();
+        let local = Some("http://localhost:3002".to_string());
+        // Public wildcard host → derived public dashboard (NOT localhost:3002).
+        assert_eq!(
+            derive_dashboard("app.deployment.shadow.ngrok.pizza", &s, None, local.clone()),
+            Some("https://shadow.ngrok.pizza".to_string())
+        );
+        // Explicit override wins.
+        assert_eq!(
+            derive_dashboard(
+                "app.deployment.shadow.ngrok.pizza:443",
+                &s,
+                Some("https://dash.example.com/".to_string()),
+                local.clone()
+            ),
+            Some("https://dash.example.com".to_string())
+        );
+        // Local/loopback host → the local dashboard env (dev unchanged).
+        assert_eq!(
+            derive_dashboard("app.localhost", &s, None, local.clone()),
+            local
+        );
+    }
+
+    fn route(node: &str, region: &str, lat: u64) -> PeerRoute {
+        PeerRoute {
+            node_id: node.into(),
+            region: region.into(),
+            gateway: format!("http://{node}:8787"),
+            latency_ms: lat,
+            healthy: true,
+        }
+    }
+    fn fs(regions: &[&str], failover: bool) -> FunctionSettings {
+        FunctionSettings {
+            regions: regions.iter().map(|s| s.to_string()).collect(),
+            failover,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn failover_true_orders_by_configured_region_then_falls_through() {
+        let raw = vec![
+            route("la1", "los-angeles", 5),
+            route("bkk1", "bangkok", 50),
+            route("sf1", "san-francisco", 1),
+        ];
+        let out = order_candidates(raw, &fs(&["bangkok", "los-angeles"], true), "san-francisco");
+        let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
+        // Primary (bangkok) first, then the next configured region (los-angeles);
+        // san-francisco is excluded entirely (not a configured region).
+        assert_eq!(ids, vec!["bkk1", "la1"]);
+    }
+
+    #[test]
+    fn failover_false_restricts_to_primary_region() {
+        let raw = vec![route("la1", "los-angeles", 5), route("bkk1", "bangkok", 50)];
+        let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
+        let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["bkk1"], "no cross-region: only the primary region's node");
+    }
+
+    #[test]
+    fn failover_false_primary_down_yields_empty() {
+        let raw = vec![route("la1", "los-angeles", 5), route("sf1", "san-francisco", 1)];
+        let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
+        assert!(out.is_empty(), "primary down + no failover → empty (caller returns 503, never crosses)");
+    }
+
+    #[test]
+    fn no_regions_is_anycast_serving_region_first() {
+        let raw = vec![route("la1", "los-angeles", 5), route("sf1", "san-francisco", 50)];
+        let out = order_candidates(raw, &fs(&[], false), "san-francisco");
+        assert_eq!(out[0].node_id, "sf1", "serving region first even at higher latency");
+    }
+
+    #[test]
+    fn within_region_latency_is_the_tiebreak() {
+        let raw = vec![route("bkk-slow", "bangkok", 90), route("bkk-fast", "bangkok", 3)];
+        let out = order_candidates(raw, &fs(&["bangkok"], true), "x");
+        assert_eq!(out[0].node_id, "bkk-fast", "lowest latency within the region wins");
+    }
 }

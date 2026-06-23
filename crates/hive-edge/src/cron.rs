@@ -26,6 +26,15 @@ pub struct CronJob {
     pub next_run_ms: Option<u64>,
     #[serde(default)]
     pub runs: u64,
+    /// Where the job came from: `"manual"` (created via the API/UI) or
+    /// `"vercel.json"` (declared in a deployment's config). Used to replace the
+    /// config-sourced set on each deploy without touching manual jobs.
+    #[serde(default = "default_cron_source")]
+    pub source: String,
+}
+
+fn default_cron_source() -> String {
+    "manual".into()
 }
 
 pub struct CronScheduler {
@@ -48,6 +57,24 @@ impl CronScheduler {
 
     pub fn remove(&self, id: &str) {
         self.jobs.write().retain(|j| j.id != id);
+    }
+
+    /// Replace the set of jobs for a `(deployment, source)` pair with `jobs`
+    /// (computing each one's first run). Used to register a deployment's
+    /// `vercel.json` crons on deploy without disturbing manually-created jobs.
+    /// Invalid expressions are skipped. Returns the number registered.
+    pub fn set_source_jobs(&self, deployment: &str, source: &str, jobs: Vec<CronJob>) -> usize {
+        let mut g = self.jobs.write();
+        g.retain(|j| !(j.deployment == deployment && j.source == source));
+        let mut n = 0;
+        for mut job in jobs {
+            if let Some(next) = next_after(&job.schedule, now_ms()) {
+                job.next_run_ms = Some(next);
+                g.push(job);
+                n += 1;
+            }
+        }
+        n
     }
 
     pub fn list(&self) -> Vec<CronJob> {
@@ -113,6 +140,7 @@ mod tests {
                 last_run_ms: None,
                 next_run_ms: None,
                 runs: 0,
+                source: "manual".into(),
             })
             .expect("valid");
         assert!(job.next_run_ms.is_some());
@@ -135,6 +163,7 @@ mod tests {
             last_run_ms: None,
             next_run_ms: None,
             runs: 0,
+            source: "manual".into(),
         });
         assert!(r.is_err());
     }

@@ -16,11 +16,16 @@ pub mod build_output;
 pub mod framework;
 pub mod nextjs;
 pub mod parser;
+pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
 pub use framework::{detect, package_manager, plan_build, BuildPlan, FrameworkPreset, Primitive, PRESETS};
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
+pub use vercel_config::{
+    load_vercel_config, ConditionValue, VercelCondition, VercelConfig, VercelCron, VercelFunction,
+    VercelHeader, VercelHeaderRule, VercelImages, VercelRedirect, VercelRewrite,
+};
 
 use serde::Serialize;
 use std::path::Path;
@@ -42,7 +47,7 @@ pub struct Analysis {
 
 /// Inspect a repo without building it.
 pub fn analyze(repo: &Path) -> Analysis {
-    let plan = plan_build(repo, None, None, None);
+    let plan = plan_build(repo, None, None, None, None);
     Analysis {
         framework_slug: plan.framework.slug.to_string(),
         framework_name: plan.framework.name.to_string(),
@@ -71,7 +76,7 @@ pub fn resolve(repo: &Path) -> anyhow::Result<Resolution> {
     if has_build_output(repo) {
         Ok(Resolution::Ready(parse_build_output(repo)?))
     } else {
-        Ok(Resolution::NeedsBuild(plan_build(repo, None, None, None)))
+        Ok(Resolution::NeedsBuild(plan_build(repo, None, None, None, None)))
     }
 }
 

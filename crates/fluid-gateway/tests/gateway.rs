@@ -50,12 +50,14 @@ async fn gateway_handles_concurrent_requests() {
             runtime: "python".into(),
             start_cmd: vec![py, "server.py".into()],
             env: BTreeMap::new(),
+            vcpus: 1,
             memory_mib: 128,
             max_concurrency: 5,
             min_instances: 0,
             max_instances: 4,
             idle_ttl_secs: 30,
             max_duration_secs: 300,
+            ..Default::default()
         }],
         routes: vec![Route {
             pattern: "/api".into(),
@@ -131,12 +133,14 @@ async fn max_duration_504_and_error_isolation() {
                 runtime: "python".into(),
                 start_cmd: vec![py, "server.py".into()],
                 env: BTreeMap::new(),
+                vcpus: 1,
                 memory_mib: 128,
                 max_concurrency: 10,
                 min_instances: 1,
                 max_instances: 2,
                 idle_ttl_secs: 30,
                 max_duration_secs: 1, // tiny budget so /api/verylong (5s) trips it
+                ..Default::default()
             }],
             routes: vec![Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) }],
             ..Default::default()

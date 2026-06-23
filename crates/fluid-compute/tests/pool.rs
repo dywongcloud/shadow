@@ -52,12 +52,14 @@ fn func(max_concurrency: u32, max_instances: u32, min_instances: u32, py: &str) 
                 .into(),
         ],
         env: Default::default(),
+        vcpus: 1,
         memory_mib: 128,
         max_concurrency,
         min_instances,
         max_instances,
         idle_ttl_secs: 1,
         max_duration_secs: 300,
+        ..Default::default()
     }
 }
 

@@ -15,8 +15,10 @@ pluggable isolation backend:
 
 - **mock** — a cell is a sandboxed child-process build. Runs anywhere (incl.
   macOS / Apple Silicon) so you can exercise the whole control plane today.
-- **firecracker** — a cell is a real aarch64 Firecracker microVM on KVM,
-  intended to run inside a **Lima** VM with nested virtualization on an M3/M4.
+- **firecracker** — a cell is a real Firecracker microVM. It runs anywhere a KVM
+  interface is available: an **M3/M4 Mac** via a Lima nested-virt VM, a **bare-metal
+  Linux box** with real `/dev/kvm`, or even an **ordinary cloud VM without nested
+  virtualization** via **PVM** (see [Firecracker without KVM (PVM)](#firecracker-without-kvm-on-plain-cloud-vms-pvm)).
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for the concept→code map and the build
 lifecycle.
@@ -295,6 +297,172 @@ Gotchas worth knowing if you reproduce it:
   response by `Content-Length` rather than reading to EOF.
 - The rootfs must be glibc-based (Ubuntu/Debian) to match the dynamically-linked
   agent — not Alpine/musl.
+
+## Public ingress over ngrok (pooled wildcard)
+
+Nodes have no public IPs, so deployments are exposed to the internet through an
+**ngrok** wildcard tunnel. A deployment routes by its **subdomain** (the first
+host label), so `https://my-app.deployment.shadow.ngrok.pizza/` reaches the
+gateway and serves the `my-app` deployment exactly like `http://my-app.localhost:8787/`
+does locally.
+
+The key idea is **endpoint pooling**: *every* node runs its own ngrok agent that
+binds the **same** wildcard endpoint with `pooling_enabled: true`. ngrok's edge
+then load-balances incoming requests across all pooled agents — a request for any
+subdomain can land on any node. That dovetails with the mesh router: whichever
+node ngrok hands the request to inspects the `Host`, looks up the deployment's
+owning node in the gossip registry, and either serves it locally or transparently
+proxies it over the iroh QUIC mesh (with region-aware failover). Net effect: **hit
+any node, reach any deployment** — and ingress has no single point of failure.
+
+ngrok is also **outbound-only** — the agent dials out to ngrok's edge, so no
+inbound ports, port-forwarding, or public IPs are required on the nodes.
+
+Per-node config (`/etc/ngrok/ngrok.yml`, run as a `systemd` service on Linux
+nodes / a launchd agent on the Mac):
+
+```yaml
+version: "3"
+agent:
+  authtoken: <your-ngrok-authtoken>
+endpoints:
+  - name: deployments
+    url: https://*.deployment.shadow.ngrok.pizza   # the reserved wildcard domain
+    pooling_enabled: true                          # REQUIRED on every node to pool
+    upstream:
+      url: 8787                                     # the node's public gateway
+```
+
+The dashboard itself is exposed the same way at a non-wildcard endpoint
+(`https://shadow.ngrok.pizza` → `:3002`); preview-unlock redirects detect a public
+wildcard host and bounce to that public dashboard origin (`HIVE_PUBLIC_DASHBOARD_URL`)
+rather than `localhost`.
+
+> **Gotchas.** Pooling only works if **all** agents on the endpoint enable it —
+> otherwise you get `ERR_NGROK_334` ("endpoint already online"). `--pooling-enabled`
+> is **not** a valid `ngrok start` flag in v3; it's the per-endpoint
+> `pooling_enabled: true` config field. The wildcard domain must be reserved on
+> your ngrok account first.
+
+## Firecracker without KVM on plain cloud VMs (PVM)
+
+Firecracker is a Type‑2 VMM: it asks the host's **KVM** subsystem (`/dev/kvm`) to
+create a VM, and KVM in turn programs the CPU's hardware virtualization extensions
+(Intel **VT‑x**/`vmx` or AMD‑V/`svm`). On bare metal those extensions are present;
+on an Apple Silicon Mac, Lima's `vz` VM enables **nested virtualization** so the
+guest sees them too. But a stock cloud VM almost never exposes nested virt — the
+hypervisor hides VT‑x/AMD‑V from your instance — so KVM has nothing to initialize,
+`/dev/kvm` never appears, and Firecracker can't start.
+
+You can see exactly that on our Virginia node, an AMD Tencent CVM: **no hardware
+virtualization is exposed to the guest, yet `/dev/kvm` exists anyway.**
+
+```text
+$ grep -c -E 'svm|vmx' /proc/cpuinfo      # AMD‑V / VT‑x available to this VM?
+0                                          #   → none. No nested virt.
+$ lsmod | grep kvm
+kvm_pvm   53248  4
+kvm      1404928  1 kvm_pvm                #   → kvm_amd is NOT loaded; kvm_pvm is.
+$ ls -l /dev/kvm
+crw-rw-rw- 1 root kvm 10, 232 /dev/kvm     #   → the KVM device is present regardless.
+```
+
+### What PVM is, and how it conjures `/dev/kvm`
+
+**PVM (Paged Virtual Machine)** is a *software* hypervisor (from loophole labs /
+the upstream Linux PVM project) that runs guests **without any hardware
+virtualization support**. Instead of trapping into VT‑x/AMD‑V root mode, PVM runs
+the guest **paravirtualized**: a cooperating, PVM‑aware guest kernel runs
+de‑privileged, and privileged operations (page‑table changes, mode switches,
+hypercalls) are mediated by the host. Crucially, PVM is implemented as a **KVM
+"vendor" backend** — a kernel module (`kvm-pvm.ko`) that plugs into the generic
+`kvm` core exactly where `kvm-intel`/`kvm-amd` normally would:
+
+```text
+$ modinfo kvm_pvm | egrep 'filename|depends'
+filename: /lib/modules/6.12.33-pvm+/kernel/arch/x86/kvm/kvm-pvm.ko
+depends:  kvm
+```
+
+Because it sits behind the same `kvm` core, **it exposes the identical `/dev/kvm`
+ioctl ABI** (`KVM_CREATE_VM`, `KVM_CREATE_VCPU`, `KVM_RUN`, memory‑region and CPUID
+ioctls, …). That is the whole trick: any VMM that speaks KVM — QEMU, cloud‑hypervisor,
+**Firecracker** — keeps working, because from userspace `/dev/kvm` looks and behaves
+like real KVM. PVM just satisfies those ioctls in software + paravirt instead of
+with silicon.
+
+### The two-kernel split (why a stock guest kernel won't boot)
+
+PVM requires cooperation on **both** sides, so two different kernels are involved:
+
+- **Host kernel** — a PVM‑patched kernel (ours: `6.12.33-pvm+`) that provides the
+  host side and loads `kvm` + `kvm-pvm`. Once it's booted, `/dev/kvm` is available
+  even though `/proc/cpuinfo` shows neither `svm` nor `vmx`.
+- **Guest kernel** — must be **PVM‑aware**. A normal `vmlinux` (or a Firecracker‑CI
+  kernel) will *not* boot under PVM, because the guest has to drive PVM's
+  paravirt interface rather than expect hardware virt. Ours is built with:
+
+  ```text
+  CONFIG_PVM_GUEST=y        # the PVM paravirt guest port
+  CONFIG_PARAVIRT_XXL=y     # full paravirt-ops (MMU, CPU, IRQ) the guest hooks into
+  CONFIG_HYPERVISOR_GUEST=y
+  CONFIG_KVM_GUEST=y
+  ```
+
+  This is why each microVM boots our `vmlinux-pvm-guest` image, not the generic
+  kernel we use on hardware‑KVM nodes.
+
+### The Firecracker fork
+
+We run the **PVM fork of Firecracker**
+([loopholelabs/firecracker @ `main-live-migration-pvm`](https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm),
+`v1.13.0-dev`). Because `/dev/kvm` is preserved, the vast majority of Firecracker
+is untouched; the fork carries the PVM‑specific bits of vCPU/CPUID/segment setup
+and the live‑migration work the branch is named for. (PVM's design — a fully
+software‑defined CPU state — makes microVMs cleanly migratable between hosts.)
+
+### What our node had to do (almost nothing)
+
+Because PVM presents `/dev/kvm`, the Firecracker backend's capability probe —
+`is_supported()` = *Linux + `/dev/kvm` + a `firecracker` binary* — **passes with no
+change**, so a PVM node auto‑selects the real microVM backend exactly like bare
+metal:
+
+```
+isolation backend: Firecracker microVM (real, Linux + /dev/kvm)
+control plane starting hive=hive-virginia ... backend="firecracker"
+```
+
+The only PVM‑specific accommodation is the **guest kernel cmdline**. PVM's emulated
+platform stalls if the guest probes the legacy i8042 keyboard controller, so we
+disable it — overridable per node via the **`HIVE_FC_BOOT_ARGS`** env var, keeping
+`init=/sbin/hive-cell-agent` so the cell agent is PID 1:
+
+```
+HIVE_FC_BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off \
+  i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd \
+  root=/dev/vda rw init=/sbin/hive-cell-agent"
+```
+
+Everything downstream is identical to the hardware‑KVM path: the per‑deployment
+build is delivered into the cell as a **virtio‑blk data disk** (mounted at
+`/build`), and the gateway reaches the function through the **vsock** tunnel to the
+in‑guest cell agent. End‑to‑end, our Virginia CVM serves deployments from genuine
+Firecracker microVMs over PVM.
+
+### Trade‑offs
+
+- **Pro:** real VM isolation (a separate guest kernel, not a shared one like
+  containers) on commodity cloud VMs that can't do nested virt — no special
+  instance type, no bare metal.
+- **Con:** software virtualization has CPU overhead versus hardware KVM, so it's
+  best for I/O‑bound / serverless workloads (our case) rather than CPU‑pinned ones.
+- **Verify it's actually PVM on any node:** `grep -E 'svm|vmx' /proc/cpuinfo` (empty),
+  `lsmod | grep kvm_pvm`, `ls -l /dev/kvm`, `firecracker --version`.
+
+Background reading: Alex Ellis,
+["How to run Firecracker without KVM on regular cloud VMs"](https://blog.alexellis.io/how-to-run-firecracker-without-kvm-on-regular-cloud-vms/),
+and the [PVM Firecracker fork](https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm).
 
 ## hived flags
 

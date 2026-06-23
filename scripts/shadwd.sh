@@ -36,6 +36,23 @@ DOMAIN="gui/$(id -u)"
 NODES="${NODES:-2}"
 FC="${FC:-1}"   # include the Firecracker-backed in-VM node as a managed agent
 DASH="${HIVE_DASHBOARD_URL:-http://localhost:3002}"
+# Public dashboard origin for protected-preview unlock redirects reached over the
+# wildcard tunnel (so the unlock screen stays on the tunnel, not localhost).
+PUB_DASH="${HIVE_PUBLIC_DASHBOARD_URL:-https://shadow.ngrok.pizza}"
+# Remote (Bangkok) node admin, reachable via the dev.shadw.peer-bkk forward tunnel
+# (Mac 127.0.0.1:18796 -> Bangkok admin). node-a peers it so it learns Bangkok's
+# deployment placement (mesh routing + the Network "serving" view). Empty = none.
+BKK_PEER="${BKK_PEER:-http://127.0.0.1:18796}"
+# Remote (Virginia) node admin, via the dev.shadw.peer-va forward tunnel
+# (Mac 127.0.0.1:18797 -> Virginia admin). Empty = none.
+VA_PEER="${VA_PEER:-http://127.0.0.1:18797}"
+# Remote (San Jose) node admin, via the dev.shadw.peer-sj forward tunnel
+# (Mac 127.0.0.1:18798 -> San Jose admin). node-a peers it so it can route to
+# deployments placed on fc-sanjose. Empty = none.
+SJ_PEER="${SJ_PEER:-http://127.0.0.1:18798}"
+# Remote (Virginia/Ashburn-2, fc-virginia-2) node admin, via the dev.shadw.peer-va2
+# forward tunnel (Mac 127.0.0.1:18799 -> fc-virginia-2 admin). Empty = none.
+VA2_PEER="${VA2_PEER:-http://127.0.0.1:18799}"
 NODE_BIN="$(dirname "$(command -v node 2>/dev/null || echo /usr/bin/false)")"
 PATHVAL="$NODE_BIN:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin"
 RL="info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
@@ -47,10 +64,11 @@ LABELS+=(dev.shadw.watchdog)   # loaded last; restarts any down node (backstops 
 # --- plist writers ---------------------------------------------------------
 xml_args() { for a in "$@"; do printf '    <string>%s</string>\n' "$a"; done; }
 
-write_node_plist() { # <label> <name> <public> <admin> <dns> <tls> <datadir> [peerUrl]
-  local label="$1" name="$2" pub="$3" adm="$4" dns="$5" tls="$6" data="$7" peer="${8:-}"
+write_node_plist() { # <label> <name> <public> <admin> <dns> <tls> <datadir> [peerUrl...]
+  local label="$1" name="$2" pub="$3" adm="$4" dns="$5" tls="$6" data="$7"; shift 7
   local args=("$BIN" --name "$name" --listen "127.0.0.1:$pub" --admin "127.0.0.1:$adm")
-  [ -n "$peer" ] && args+=(--peer "$peer")
+  local peer
+  for peer in "$@"; do [ -n "$peer" ] && args+=(--peer "$peer"); done
   cat > "$LA/$label.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -64,6 +82,7 @@ $(xml_args "${args[@]}")  </array>
     <key>RUST_LOG</key><string>$RL</string>
     <key>HIVE_DATA</key><string>$data</string>
     <key>HIVE_DASHBOARD_URL</key><string>$DASH</string>
+    <key>HIVE_PUBLIC_DASHBOARD_URL</key><string>$PUB_DASH</string>
     <key>HIVE_DNS_ADDR</key><string>127.0.0.1:$dns</string>
     <key>HIVE_TLS_ADDR</key><string>127.0.0.1:$tls</string>
   </dict>
@@ -157,7 +176,7 @@ cmd_install() {
   command -v podman >/dev/null 2>&1 && podman container prune -f >/dev/null 2>&1 || true
   echo "==> Writing LaunchAgents → $LA"
   write_lima_plist
-  write_node_plist dev.shadw.node-a node-a 8787 8786 5354 8443 "$HOME/.hive-cloud"
+  write_node_plist dev.shadw.node-a node-a 8787 8786 5354 8443 "$HOME/.hive-cloud" "$BKK_PEER" "$VA_PEER" "$SJ_PEER" "$VA2_PEER"
   [ "$NODES" -ge 2 ] && write_node_plist dev.shadw.node-b node-b 8789 8788 5355 8444 "$HOME/.hive-cloud-b" "http://127.0.0.1:8786"
   [ "$FC" = 1 ] && write_fc_plist
   write_watchdog_plist

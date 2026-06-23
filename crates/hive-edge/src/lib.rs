@@ -10,6 +10,7 @@ pub mod cron;
 pub mod ratelimit;
 pub mod region;
 pub mod routing;
+pub mod runtime_cache;
 pub mod waf;
 pub mod workflows;
 
@@ -22,7 +23,8 @@ pub use cdn::{CacheState, CdnCache, Lookup};
 pub use concurrency::{ConcurrencyLimiter, ConcurrencyStats, Plan};
 pub use cron::{CronJob, CronScheduler};
 pub use ratelimit::{RateLimiter, RateLimitStats};
-pub use region::{continent_of, NodeInfo, NodeRegistry};
+pub use region::{continent_of, haversine_km, NodeInfo, NodeRegistry};
 pub use routing::{Redirect, Rewrite, RouteOutcome, Router};
+pub use runtime_cache::RuntimeCache;
 pub use waf::{RequestCtx, Verdict, Waf, WafAction, WafMatch, WafRule};
 pub use workflows::{RunStatus, StepInvoker, WorkflowDef, WorkflowEngine, WorkflowRun, WorkflowStep};

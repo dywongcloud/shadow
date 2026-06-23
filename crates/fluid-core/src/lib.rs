@@ -57,6 +57,9 @@ pub struct FunctionConfig {
     pub start_cmd: Vec<String>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// vCPUs per instance (microVM). Standard tier = 1, Performance tier = 2.
+    #[serde(default = "default_vcpus")]
+    pub vcpus: u32,
     #[serde(default = "default_memory")]
     pub memory_mib: u32,
     /// Fluid in-function concurrency: max simultaneous requests per instance.
@@ -75,13 +78,27 @@ pub struct FunctionConfig {
     /// Exceeding it returns 504 — error isolation keeps other requests alive.
     #[serde(default = "default_max_duration")]
     pub max_duration_secs: u64,
+    /// Per-function region preference (`vercel.json` `functions[].regions`).
+    /// Overrides the project-level default for this function when non-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
+    /// Glob of extra files to bundle (`functions[].includeFiles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_files: Option<String>,
+    /// Glob of files to exclude (`functions[].excludeFiles`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclude_files: Option<String>,
 }
 
 fn default_runtime() -> String {
     "command".into()
 }
+fn default_vcpus() -> u32 {
+    1
+}
 fn default_memory() -> u32 {
-    512
+    // Standard serverless tier: 2 GB.
+    2048
 }
 fn default_max_concurrency() -> u32 {
     10
@@ -94,6 +111,27 @@ fn default_idle_ttl() -> u64 {
 }
 fn default_max_duration() -> u64 {
     300 // Vercel Fluid default max duration (5 minutes)
+}
+
+impl Default for FunctionConfig {
+    fn default() -> Self {
+        FunctionConfig {
+            name: String::new(),
+            runtime: default_runtime(),
+            start_cmd: Vec::new(),
+            env: BTreeMap::new(),
+            vcpus: default_vcpus(),
+            memory_mib: default_memory(),
+            max_concurrency: default_max_concurrency(),
+            min_instances: 0,
+            max_instances: default_max_instances(),
+            idle_ttl_secs: default_idle_ttl(),
+            max_duration_secs: default_max_duration(),
+            regions: Vec::new(),
+            include_files: None,
+            exclude_files: None,
+        }
+    }
 }
 
 /// What a route serves.
@@ -112,14 +150,21 @@ pub struct Route {
 }
 
 /// A redirect rule mapped from the framework build (Next.js `redirects()`,
-/// Build Output API routes with a 3xx status). Evaluated by the gateway before
-/// routing — first match wins.
+/// Build Output API routes with a 3xx status) or from `vercel.json`. Evaluated
+/// by the gateway before routing — first match wins. `status` is the resolved
+/// HTTP code (308 permanent / 307 temporary / explicit `statusCode`).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Redirect {
     pub source: String,
     pub destination: String,
     #[serde(default = "default_redirect_status")]
     pub status: u16,
+    /// Conditional matching (`vercel.json` `has`) — all must be present/match.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub has: Vec<RuleCondition>,
+    /// Conditional matching (`vercel.json` `missing`) — all must be absent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<RuleCondition>,
 }
 fn default_redirect_status() -> u16 {
     308
@@ -130,6 +175,364 @@ fn default_redirect_status() -> u16 {
 pub struct Rewrite {
     pub source: String,
     pub destination: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub has: Vec<RuleCondition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<RuleCondition>,
+}
+
+/// A single response header (`vercel.json` `headers[].headers[]`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Header {
+    pub key: String,
+    pub value: String,
+}
+
+/// A response-header rule (`vercel.json` `headers`). When `source` (+ optional
+/// `has`/`missing`) matches a request path, the gateway injects `headers` onto
+/// the response.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HeaderRule {
+    pub source: String,
+    pub headers: Vec<Header>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub has: Vec<RuleCondition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<RuleCondition>,
+}
+
+/// A scheduled job (`vercel.json` `crons`). Registered against the production
+/// deployment; the scheduler invokes `path` on `schedule` (cron expression).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CronSpec {
+    pub path: String,
+    pub schedule: String,
+}
+
+/// A `has`/`missing` condition matched against the request (`vercel.json`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RuleCondition {
+    /// One of: `host`, `header`, `cookie`, `query`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<CondValue>,
+}
+
+/// The `value` of a condition — a literal string, or an expressive
+/// prefix/suffix matcher (`{ "pre": "...", "suf": "..." }`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CondValue {
+    Text(String),
+    Expr {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        suf: Option<String>,
+    },
+}
+
+impl CondValue {
+    pub fn matches(&self, candidate: &str) -> bool {
+        match self {
+            CondValue::Text(t) => candidate == t,
+            CondValue::Expr { pre, suf } => {
+                pre.as_deref().map(|p| candidate.starts_with(p)).unwrap_or(true)
+                    && suf.as_deref().map(|s| candidate.ends_with(s)).unwrap_or(true)
+            }
+        }
+    }
+}
+
+/// Image Optimization configuration (`vercel.json` `images`) — enforced by the
+/// gateway's `/_vercel/image` endpoint.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ImagesConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sizes: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qualities: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formats: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_cache_ttl: Option<u64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub remote_patterns: Vec<RemotePattern>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub local_patterns: Vec<LocalPattern>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dangerously_allow_svg: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_security_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_disposition_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RemotePattern {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    pub hostname: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LocalPattern {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pathname: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search: Option<String>,
+}
+
+/// Minimal request context for evaluating `has`/`missing` conditions and
+/// host-scoped matching. Built cheaply by the gateway per request.
+#[derive(Clone, Debug, Default)]
+pub struct ReqCtx {
+    pub host: String,
+    /// (lowercased key, value) pairs.
+    pub headers: Vec<(String, String)>,
+    /// Raw query string (without leading `?`).
+    pub query: String,
+}
+
+impl ReqCtx {
+    pub fn header(&self, key: &str) -> Option<String> {
+        let k = key.to_ascii_lowercase();
+        self.headers.iter().find(|(hk, _)| *hk == k).map(|(_, v)| v.clone())
+    }
+    pub fn cookie(&self, key: &str) -> Option<String> {
+        let raw = self.header("cookie")?;
+        for part in raw.split(';') {
+            let part = part.trim();
+            if let Some((k, v)) = part.split_once('=') {
+                if k.trim() == key {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+        None
+    }
+    pub fn query_param(&self, key: &str) -> Option<String> {
+        for part in self.query.split('&') {
+            if let Some((k, v)) = part.split_once('=') {
+                if k == key {
+                    return Some(v.to_string());
+                }
+            } else if part == key {
+                return Some(String::new());
+            }
+        }
+        None
+    }
+}
+
+/// Evaluate one condition against the request.
+fn cond_matches(c: &RuleCondition, ctx: &ReqCtx) -> bool {
+    let actual: Option<String> = match c.kind.as_str() {
+        "host" => Some(ctx.host.clone()),
+        "header" => c.key.as_ref().and_then(|k| ctx.header(k)),
+        "cookie" => c.key.as_ref().and_then(|k| ctx.cookie(k)),
+        "query" => c.key.as_ref().and_then(|k| ctx.query_param(k)),
+        _ => None,
+    };
+    match (&c.value, actual) {
+        (None, Some(_)) => true,       // presence only
+        (None, None) => false,
+        (Some(v), Some(a)) => v.matches(&a),
+        (Some(_), None) => false,
+    }
+}
+
+/// `has`: every condition must match. `missing`: every condition must NOT match.
+fn conditions_pass(has: &[RuleCondition], missing: &[RuleCondition], ctx: &ReqCtx) -> bool {
+    has.iter().all(|c| cond_matches(c, ctx)) && missing.iter().all(|c| !cond_matches(c, ctx))
+}
+
+/// Resolved redirect status for a redirect built from `vercel.json`:
+/// explicit `statusCode` wins; else `permanent` => 308 / 307; else default 308.
+pub fn redirect_status(permanent: Option<bool>, status_code: Option<u16>) -> u16 {
+    if let Some(sc) = status_code {
+        return sc;
+    }
+    match permanent {
+        Some(false) => 307,
+        _ => 308,
+    }
+}
+
+// ---- path-to-regexp-lite matcher (Vercel `:param` / `:param*` + inline regex) ----
+
+/// Compile a Vercel source pattern (`/blog/:slug`, `/post/:p(\\d+)`,
+/// `/proxy/:m*`, `/(.*)`) into an anchored regex with named captures. Returns
+/// `None` if the pattern isn't regex-like or fails to compile (caller falls back
+/// to literal/prefix matching).
+fn compile_source(source: &str) -> Option<regex::Regex> {
+    if !(source.contains(':') || source.contains('(') || source.contains('*')) {
+        return None;
+    }
+    let mut out = String::from("^");
+    let mut lit = String::new();
+    let flush = |out: &mut String, lit: &mut String| {
+        if !lit.is_empty() {
+            out.push_str(&regex::escape(lit));
+            lit.clear();
+        }
+    };
+    let chars: Vec<char> = source.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            ':' => {
+                flush(&mut out, &mut lit);
+                i += 1;
+                let mut name = String::new();
+                while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                    name.push(chars[i]);
+                    i += 1;
+                }
+                if name.is_empty() {
+                    lit.push(':');
+                    continue;
+                }
+                // Optional modifier or inline regex.
+                if i < chars.len() && chars[i] == '(' {
+                    // Balanced custom pattern.
+                    let mut depth = 0i32;
+                    let mut body = String::new();
+                    while i < chars.len() {
+                        let ch = chars[i];
+                        if ch == '(' {
+                            depth += 1;
+                            if depth == 1 {
+                                i += 1;
+                                continue;
+                            }
+                        } else if ch == ')' {
+                            depth -= 1;
+                            if depth == 0 {
+                                i += 1;
+                                break;
+                            }
+                        }
+                        body.push(ch);
+                        i += 1;
+                    }
+                    out.push_str(&format!("(?P<{name}>{body})"));
+                } else if i < chars.len() && chars[i] == '*' {
+                    out.push_str(&format!("(?P<{name}>.*)"));
+                    i += 1;
+                } else if i < chars.len() && chars[i] == '+' {
+                    out.push_str(&format!("(?P<{name}>.+)"));
+                    i += 1;
+                } else {
+                    out.push_str(&format!("(?P<{name}>[^/]+)"));
+                }
+            }
+            '(' => {
+                // Raw regex group passes through verbatim (balanced copy).
+                flush(&mut out, &mut lit);
+                let mut depth = 0i32;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    out.push(ch);
+                    if ch == '(' {
+                        depth += 1;
+                    } else if ch == ')' {
+                        depth -= 1;
+                        if depth == 0 {
+                            i += 1;
+                            break;
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            '*' => {
+                flush(&mut out, &mut lit);
+                out.push_str(".*");
+                i += 1;
+            }
+            _ => {
+                lit.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut out, &mut lit);
+    out.push('$');
+    regex::Regex::new(&out).ok()
+}
+
+/// Substitute `:name` / `:name*` references in a destination with values
+/// captured from the source match.
+fn subst_dest(dest: &str, caps: &regex::Captures) -> String {
+    let chars: Vec<char> = dest.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ':' {
+            i += 1;
+            let mut name = String::new();
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                name.push(chars[i]);
+                i += 1;
+            }
+            // Consume an optional trailing `*`/`+` modifier in the destination.
+            if i < chars.len() && (chars[i] == '*' || chars[i] == '+') {
+                i += 1;
+            }
+            if let Some(m) = caps.name(&name) {
+                out.push_str(m.as_str());
+            } else if name.is_empty() {
+                out.push(':');
+            }
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Try to match `path` against `source` (param/regex aware), returning the
+/// resolved destination if it matches. Falls back to literal/prefix matching.
+pub fn rule_apply(source: &str, dest: &str, path: &str) -> Option<String> {
+    if let Some(re) = compile_source(source) {
+        if let Some(caps) = re.captures(path) {
+            return Some(subst_dest(dest, &caps));
+        }
+        // A regex-like source that didn't match: also try the literal fallback,
+        // since lookahead-bearing sources may have failed to compile elsewhere.
+        if rule_match(source, path) {
+            return Some(rule_target(source, dest, path));
+        }
+        return None;
+    }
+    if rule_match(source, path) {
+        Some(rule_target(source, dest, path))
+    } else {
+        None
+    }
+}
+
+/// Whether `source` matches `path` (used by header rules that have no dest).
+pub fn rule_matches(source: &str, path: &str) -> bool {
+    if let Some(re) = compile_source(source) {
+        re.is_match(path) || rule_match(source, path)
+    } else {
+        rule_match(source, path)
+    }
 }
 
 /// Middleware / proxy (`middleware.ts` / `proxy.ts`) detected in the build. Runs
@@ -172,6 +575,22 @@ pub struct Manifest {
     /// Edge middleware / proxy detected in the build, if any.
     #[serde(default)]
     pub middleware: Option<Middleware>,
+    /// Response-header rules (`vercel.json` `headers`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<HeaderRule>,
+    /// Scheduled jobs (`vercel.json` `crons`) — registered on production deploy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub crons: Vec<CronSpec>,
+    /// `vercel.json` `cleanUrls` — strip `.html` and redirect extension paths.
+    #[serde(default)]
+    pub clean_urls: bool,
+    /// `vercel.json` `trailingSlash` — `Some(true)` enforce, `Some(false)` strip,
+    /// `None` no normalization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trailing_slash: Option<bool>,
+    /// `vercel.json` `images` — Image Optimization config (gateway enforces).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<ImagesConfig>,
 }
 
 impl Manifest {
@@ -199,23 +618,80 @@ impl Manifest {
     }
 
     /// The first matching redirect for `path`, as (location, status).
+    /// Back-compat path-only entry point (no `has`/`missing` context).
     pub fn redirect_for(&self, path: &str) -> Option<(String, u16)> {
+        self.redirect_for_ctx(path, &ReqCtx::default())
+    }
+
+    /// The first matching redirect for `path`, honoring `has`/`missing`
+    /// conditions and `:param` / regex source patterns.
+    pub fn redirect_for_ctx(&self, path: &str, ctx: &ReqCtx) -> Option<(String, u16)> {
         for r in &self.redirects {
-            if rule_match(&r.source, path) {
-                return Some((rule_target(&r.source, &r.destination, path), r.status));
+            if !conditions_pass(&r.has, &r.missing, ctx) {
+                continue;
+            }
+            if let Some(dest) = rule_apply(&r.source, &r.destination, path) {
+                return Some((dest, r.status));
             }
         }
         None
     }
 
     /// Apply the first matching rewrite, returning the (possibly) rewritten path.
+    /// Back-compat path-only entry point.
     pub fn rewrite_path(&self, path: &str) -> String {
+        self.rewrite_path_ctx(path, &ReqCtx::default())
+    }
+
+    /// Apply the first matching rewrite, honoring `has`/`missing` + `:param`.
+    pub fn rewrite_path_ctx(&self, path: &str, ctx: &ReqCtx) -> String {
         for r in &self.rewrites {
-            if rule_match(&r.source, path) {
-                return rule_target(&r.source, &r.destination, path);
+            if !conditions_pass(&r.has, &r.missing, ctx) {
+                continue;
+            }
+            if let Some(dest) = rule_apply(&r.source, &r.destination, path) {
+                return dest;
             }
         }
         path.to_string()
+    }
+
+    /// All response headers to inject for `path` (every matching rule, in order).
+    pub fn headers_for(&self, path: &str, ctx: &ReqCtx) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for rule in &self.headers {
+            if !conditions_pass(&rule.has, &rule.missing, ctx) {
+                continue;
+            }
+            if rule_matches(&rule.source, path) {
+                for h in &rule.headers {
+                    out.push((h.key.clone(), h.value.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Trailing-slash normalization for `path`. Returns `Some(new_path)` when a
+    /// 308 redirect should be issued, else `None`. Paths with a file extension in
+    /// the last segment are never given a trailing slash (Vercel semantics).
+    pub fn trailing_slash_redirect(&self, path: &str) -> Option<String> {
+        let want = self.trailing_slash?;
+        if path == "/" {
+            return None;
+        }
+        let has_slash = path.ends_with('/');
+        if want && !has_slash {
+            let last = path.rsplit('/').next().unwrap_or("");
+            if last.contains('.') {
+                return None; // file with extension
+            }
+            Some(format!("{path}/"))
+        } else if !want && has_slash {
+            Some(path.trim_end_matches('/').to_string())
+        } else {
+            None
+        }
     }
 
     /// Count of edge-runtime functions in this deployment.
@@ -383,6 +859,12 @@ pub struct GitDeployRequest {
     /// containers). Set from the "New Project" screen.
     #[serde(default)]
     pub env: Option<std::collections::BTreeMap<String, String>>,
+    /// When true, this node deploys LOCALLY only (build + host) and does NOT run
+    /// the placement scheduler / fanout. The coordinator sets this on the
+    /// per-target deploys it dispatches, so a target node "just hosts this" and
+    /// placement never recurses.
+    #[serde(default)]
+    pub no_fanout: bool,
 }
 fn default_prod() -> bool {
     true
@@ -494,14 +976,88 @@ mod routing_tests {
     #[test]
     fn manifest_redirect_and_rewrite() {
         let m = Manifest {
-            redirects: vec![Redirect { source: "/old".into(), destination: "/new".into(), status: 308 }],
-            rewrites: vec![Rewrite { source: "/proxy".into(), destination: "/internal".into() }],
+            redirects: vec![Redirect { source: "/old".into(), destination: "/new".into(), status: 308, has: vec![], missing: vec![] }],
+            rewrites: vec![Rewrite { source: "/proxy".into(), destination: "/internal".into(), has: vec![], missing: vec![] }],
             ..Default::default()
         };
         assert_eq!(m.redirect_for("/old"), Some(("/new".to_string(), 308)));
         assert_eq!(m.redirect_for("/nope"), None);
         assert_eq!(m.rewrite_path("/proxy"), "/internal");
         assert_eq!(m.rewrite_path("/untouched"), "/untouched");
+    }
+
+    fn red(source: &str, dest: &str, status: u16, has: Vec<RuleCondition>, missing: Vec<RuleCondition>) -> Redirect {
+        Redirect { source: source.into(), destination: dest.into(), status, has, missing }
+    }
+
+    #[test]
+    fn param_matching_and_substitution() {
+        let m = Manifest {
+            redirects: vec![
+                red("/blog/:slug", "/news/:slug", 308, vec![], vec![]),
+                red("/proxy/:path*", "/internal/:path*", 307, vec![], vec![]),
+                red("/post/:p(\\d+)", "/n/:p", 308, vec![], vec![]),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(m.redirect_for("/blog/hello"), Some(("/news/hello".into(), 308)));
+        assert_eq!(m.redirect_for("/proxy/a/b/c"), Some(("/internal/a/b/c".into(), 307)));
+        assert_eq!(m.redirect_for("/post/42"), Some(("/n/42".into(), 308)));
+        assert_eq!(m.redirect_for("/post/abc"), None); // non-numeric fails the inline regex
+    }
+
+    #[test]
+    fn has_missing_conditions() {
+        let m = Manifest {
+            rewrites: vec![Rewrite {
+                source: "/dashboard".into(),
+                destination: "/login".into(),
+                has: vec![],
+                missing: vec![RuleCondition { kind: "cookie".into(), key: Some("auth_token".into()), value: None }],
+            }],
+            ..Default::default()
+        };
+        // No auth cookie -> rewrite to /login.
+        let ctx_no = ReqCtx::default();
+        assert_eq!(m.rewrite_path_ctx("/dashboard", &ctx_no), "/login");
+        // With auth cookie present -> NOT rewritten.
+        let ctx_yes = ReqCtx { headers: vec![("cookie".into(), "auth_token=abc".into())], ..Default::default() };
+        assert_eq!(m.rewrite_path_ctx("/dashboard", &ctx_yes), "/dashboard");
+    }
+
+    #[test]
+    fn header_rules_inject() {
+        let m = Manifest {
+            headers: vec![HeaderRule {
+                source: "/(.*)".into(),
+                headers: vec![Header { key: "X-Frame-Options".into(), value: "DENY".into() }],
+                has: vec![],
+                missing: vec![],
+            }],
+            ..Default::default()
+        };
+        let got = m.headers_for("/anything", &ReqCtx::default());
+        assert_eq!(got, vec![("X-Frame-Options".to_string(), "DENY".to_string())]);
+    }
+
+    #[test]
+    fn trailing_slash_normalization() {
+        let strip = Manifest { trailing_slash: Some(false), ..Default::default() };
+        assert_eq!(strip.trailing_slash_redirect("/about/"), Some("/about".into()));
+        assert_eq!(strip.trailing_slash_redirect("/about"), None);
+        let add = Manifest { trailing_slash: Some(true), ..Default::default() };
+        assert_eq!(add.trailing_slash_redirect("/about"), Some("/about/".into()));
+        assert_eq!(add.trailing_slash_redirect("/styles.css"), None); // file ext untouched
+        let none = Manifest { trailing_slash: None, ..Default::default() };
+        assert_eq!(none.trailing_slash_redirect("/about/"), None);
+    }
+
+    #[test]
+    fn redirect_status_resolution() {
+        assert_eq!(redirect_status(None, None), 308);
+        assert_eq!(redirect_status(Some(false), None), 307);
+        assert_eq!(redirect_status(Some(true), None), 308);
+        assert_eq!(redirect_status(Some(true), Some(301)), 301);
     }
 
     #[test]

@@ -38,7 +38,14 @@ function isLocalHostname(h: string): boolean {
  */
 function activeDeployDomain(): string {
   if (typeof window !== "undefined") {
-    return isLocalHostname(window.location.hostname) ? "" : DEPLOY_DOMAIN;
+    const h = window.location.hostname;
+    if (isLocalHostname(h)) return "";
+    // Tunnel/public session: prefer the configured public domain. If it didn't
+    // get inlined into this chunk (NEXT_PUBLIC_* are baked at compile time, and a
+    // dev server can serve a chunk compiled before the env was set), derive it
+    // from the dashboard's own apex host so links never wrongly fall back to a
+    // localhost gateway URL on a public session.
+    return DEPLOY_DOMAIN || `deployment.${h}`;
   }
   return DEPLOY_DOMAIN;
 }

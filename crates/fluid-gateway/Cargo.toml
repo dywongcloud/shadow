@@ -19,6 +19,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
+reqwest = { workspace = true }
+# Pure-Rust image codecs (no native deps with these features) for the Image
+# Optimization endpoint: JPEG/PNG/WebP/GIF decode + JPEG/PNG/WebP encode.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
 
 [dev-dependencies]
 reqwest = { workspace = true }

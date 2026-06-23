@@ -40,6 +40,12 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/bot", get(bot_get).put(bot_put))
         .route("/v1/cdn", get(cdn_get))
         .route("/v1/cdn/purge", post(cdn_purge))
+        // Runtime Cache (regional data cache for tenant functions). Loopback-only
+        // (admin port), reached by local function cells via the injected
+        // HIVE_RUNTIME_CACHE_URL. Scope = "<project>:<environment>".
+        .route("/v1/runtime-cache", get(rc_stats))
+        .route("/v1/runtime-cache/entry", get(rc_get).put(rc_put).delete(rc_delete))
+        .route("/v1/runtime-cache/revalidate", post(rc_revalidate))
         .route("/v1/concurrency", get(concurrency_get))
         .route("/v1/routing", get(routing_get))
         .route("/v1/routing/redirects", post(add_redirect))
@@ -61,6 +67,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project", delete(project_delete))
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
         .route("/v1/git/deploy", post(git_deploy))
+        .route("/v1/fleet-deployments", get(fleet_deployments))
         .route("/v1/builds/:id", get(build_get))
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
@@ -875,13 +882,31 @@ async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<
     // key's team). Projects in other tenants are never returned — this is what
     // prevents data bleeding across accounts when switching teams.
     let t = tenant(&c, &headers);
-    let list: Vec<_> = c
+    let mut list: Vec<_> = c
         .gw
         .list()
         .into_iter()
         .filter(|d| norm(&c.projects.team_of(&d.project)) == t)
         .collect();
+    // Merge in deployments the placement scheduler placed on OTHER mesh nodes
+    // (e.g. the default San-Jose placement), so the dashboard shows them too.
+    // Dedup by id; tenant-filter on the remote-reported tenant.
+    let mut seen: std::collections::HashSet<String> = list.iter().map(|d| d.id.to_string()).collect();
+    for deps in c.peer_deployments.read().values() {
+        for d in deps {
+            if norm(&d.tenant) == t && seen.insert(d.id.to_string()) {
+                list.push(d.clone());
+            }
+        }
+    }
+    list.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
     Json(json!(list))
+}
+
+/// Node-to-node: this node's full deployment list (all tenants), for peers to
+/// build a fleet-wide view. Consumed by the gossip loop into `peer_deployments`.
+async fn fleet_deployments(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!({ "node": c.node_name, "deployments": c.gw.list() }))
 }
 
 async fn dep_create(
@@ -934,6 +959,7 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
         action: action.to_string(),
         detail: detail.to_string(),
         project: project.to_string(),
+        request_id: String::new(),
     });
 }
 
@@ -1005,6 +1031,7 @@ async fn project_redeploy(
         use_cache: body.use_cache,
         root_dir,
         env: None, // redeploy: existing project env is read from the store at build time
+        no_fanout: false, // dashboard redeploy is a coordinator deploy → schedule + fanout
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -1183,6 +1210,7 @@ async fn git_webhook(
             use_cache: true, // git push redeploy: reuse the warm dependency cache
             root_dir,
             env: None, // git push redeploy: env comes from the project store
+            no_fanout: false, // gitops redeploy is a coordinator deploy → schedule + fanout
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));
@@ -1308,10 +1336,35 @@ async fn cluster_status(State(c): State<Arc<CloudState>>) -> Json<Value> {
 /// would route a request to (lowest-latency healthy, region-preferred).
 async fn anycast_table(State(c): State<Arc<CloudState>>) -> Json<Value> {
     let selected = c.registry.anycast(Some(&c.region));
+    // REAL placement: which nodes actually HOST deployments — this node's local
+    // deployments plus peers' deployments learned via gossip (`peer_routes`). A
+    // node is "serving" if it hosts >= 1 deployment, independent of the single
+    // anycast pick. This is what the Network page reads to mark serving vs standby.
+    use std::collections::{HashMap, HashSet};
+    let mut serving: HashMap<String, HashSet<String>> = HashMap::new();
+    let self_subs: HashSet<String> = c
+        .gw
+        .served_hosts()
+        .into_iter()
+        .filter_map(|h| h.split('.').next().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if !self_subs.is_empty() {
+        serving.insert(c.node_name.clone(), self_subs);
+    }
+    for (sub, routes) in c.peer_routes.read().iter() {
+        for r in routes {
+            serving.entry(r.node_id.clone()).or_default().insert(sub.clone());
+        }
+    }
+    let serving_counts: HashMap<String, usize> =
+        serving.iter().map(|(k, v)| (k.clone(), v.len())).collect();
     Json(json!({
         "region": c.region,
         "selected": selected.as_ref().map(|n| n.name.clone()),
         "table": c.registry.routing_table(),
+        // node name -> count of deployments it actually hosts (0/absent = standby).
+        "serving": serving_counts,
     }))
 }
 
@@ -1423,6 +1476,64 @@ async fn bot_put(State(c): State<Arc<CloudState>>, Json(p): Json<BotPolicy>) -> 
 async fn cdn_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     let (hits, misses, stale, entries, ratio) = c.cdn.stats();
     Json(json!({ "hits": hits, "misses": misses, "stale": stale, "entries": entries, "hit_ratio": ratio }))
+}
+
+// ---- Runtime Cache (Vercel-style regional data cache) ----
+
+#[derive(Deserialize)]
+struct RcKey {
+    scope: String,
+    key: String,
+    #[serde(default)]
+    ttl: u64,
+    /// Comma-separated tags.
+    #[serde(default)]
+    tags: String,
+}
+
+#[derive(Deserialize)]
+struct RcTag {
+    scope: String,
+    tag: String,
+}
+
+async fn rc_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let (entries, reads, writes, hits, revalidations) = c.runtime_cache.stats();
+    Json(json!({
+        "entries": entries, "reads": reads, "writes": writes,
+        "hits": hits, "revalidations": revalidations,
+    }))
+}
+
+async fn rc_get(State(c): State<Arc<CloudState>>, Query(q): Query<RcKey>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match c.runtime_cache.get(&q.scope, &q.key) {
+        Some(v) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], v).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn rc_put(
+    State(c): State<Arc<CloudState>>,
+    Query(q): Query<RcKey>,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let tags: Vec<String> = q.tags.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
+    match c.runtime_cache.set(&q.scope, &q.key, body.to_vec(), q.ttl, tags) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+async fn rc_delete(State(c): State<Arc<CloudState>>, Query(q): Query<RcKey>) -> StatusCode {
+    c.runtime_cache.delete(&q.scope, &q.key);
+    StatusCode::NO_CONTENT
+}
+
+async fn rc_revalidate(State(c): State<Arc<CloudState>>, Query(q): Query<RcTag>) -> Json<Value> {
+    let removed = c.runtime_cache.revalidate_tag(&q.scope, &q.tag);
+    Json(json!({ "removed": removed }))
 }
 
 async fn cdn_purge(State(c): State<Arc<CloudState>>) -> Json<Value> {
