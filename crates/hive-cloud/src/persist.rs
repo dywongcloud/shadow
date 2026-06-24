@@ -246,12 +246,17 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     deployments.sort_by_key(|d| d.created_at_ms);
     let n = deployments.len();
     for rec in deployments {
-        // Container deployments run from a pre-built image (podman/Firecracker),
-        // not from files under `root` — their root may be empty or absent, so
-        // never prune them on that basis. Other (static/serverless) deployments
-        // serve from disk, so only restore them if their build output survives.
+        // Decide whether a persisted deployment can still serve after a restart:
+        //   • container      → runs from a pre-built image; `root` irrelevant.
+        //   • firecracker    → serves from the delivered microVM IMAGE, not the
+        //                       host `root` build dir (which is scratch and may be
+        //                       reaped by the build-dir GC). Restore if it has an
+        //                       image — requiring `root` here wrongly dropped live
+        //                       Firecracker deployments on restart (e.g. shoomoo).
+        //   • mock (static/serverless) → serves files from `root`, so root must exist.
         let is_container = rec.manifest.functions.iter().any(|f| f.runtime == "container");
-        if is_container || std::path::Path::new(&rec.root).exists() {
+        let fc_image_backed = cloud.gw.backend_name() == "firecracker" && rec.manifest.image.is_some();
+        if is_container || fc_image_backed || std::path::Path::new(&rec.root).exists() {
             cloud.gw.restore(rec);
         }
     }

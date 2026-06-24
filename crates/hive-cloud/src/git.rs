@@ -104,14 +104,45 @@ fn deploy_root() -> PathBuf {
     std::env::temp_dir().join("hive-deploys")
 }
 
+/// Whether `project` already has a deployment ANYWHERE in the fleet — the local
+/// gateway OR a peer node (via gossiped `peer_deployments`). This distinguishes a
+/// FIRST deploy from a REDEPLOY. Critical for remotely-placed projects: the
+/// coordinator doesn't serve the host locally, so a local-only `serves_host` check
+/// wrongly treats every redeploy as a first deploy — spawning a phantom "Building…"
+/// placeholder deployment (git-less → classified Preview) and forcing `npm ci`.
+fn project_has_deployment(cloud: &Arc<CloudState>, project: &str) -> bool {
+    if cloud.gw.serves_host(&format!("{project}.localhost")) {
+        return true;
+    }
+    if cloud.gw.list().iter().any(|d| d.project == project) {
+        return true;
+    }
+    cloud
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .any(|d| d.project == project)
+}
+
 /// Self-management GC: reap stale clone/build working dirs under `hive-deploys`.
 /// Each build clones a repo into `<root>/<project>-<stamp>` (and `-building-<ms>`);
 /// these are NOT removed after the build, so they accumulate and exhaust `/tmp`
-/// disk over time. Remove any dir untouched for longer than `max_age` — a live
-/// build keeps writing into its dir, so a stale mtime means the build is done (or
-/// died). Best-effort; returns the number of dirs removed.
-pub async fn gc_build_dirs(max_age: Duration) -> usize {
+/// disk over time. Remove any dir untouched for longer than `max_age` — UNLESS it
+/// is the `root` of a LIVE deployment. The mock backend serves files straight from
+/// `root`, and the restart restore keys off `root` existing, so reaping an active
+/// root would take a deployment offline / drop it on the next restart (this is the
+/// bug that dropped shoomoo). Best-effort; returns the number of dirs removed.
+pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize {
     let root = deploy_root();
+    // Never reap a dir that currently backs a deployment (its `root`), canonicalized
+    // so symlink/relative differences don't cause a false "not live".
+    let live_roots: std::collections::HashSet<PathBuf> = cloud
+        .gw
+        .deployment_records()
+        .iter()
+        .map(|r| std::fs::canonicalize(&r.root).unwrap_or_else(|_| PathBuf::from(&r.root)))
+        .collect();
     let mut entries = match tokio::fs::read_dir(&root).await {
         Ok(d) => d,
         Err(_) => return 0,
@@ -122,6 +153,10 @@ pub async fn gc_build_dirs(max_age: Duration) -> usize {
         let p = e.path();
         if !p.is_dir() {
             continue;
+        }
+        let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if live_roots.contains(&canon) {
+            continue; // backs a live deployment — keep it
         }
         let stale = e
             .metadata()
@@ -170,8 +205,9 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     tokio::spawn(async move {
         // Whether this is the project's FIRST deployment — captured BEFORE the
         // placeholder registers an alias (which would otherwise make it look like a
-        // redeploy). Drives `npm ci` on the initial build (Task 1).
-        let first_deploy = !cloud.gw.serves_host(&format!("{project}.localhost"));
+        // redeploy). Drives `npm ci` on the initial build (Task 1). Fleet-aware so a
+        // redeploy of a remotely-placed project isn't mistaken for a first deploy.
+        let first_deploy = !project_has_deployment(&cloud, &project);
         // First-deploy only: serve a "Building…" page at the domain immediately so
         // the URL resolves throughout the build (a slow Next.js build no longer
         // 404s). The real deployment supersedes it; we then remove the placeholder.
@@ -2151,8 +2187,13 @@ async fn register_building_placeholder(
     project: &str,
     req: &GitDeployRequest,
 ) -> Option<String> {
-    if cloud.gw.serves_host(&format!("{project}.localhost")) {
-        return None; // redeploy — keep the live version serving until ready
+    if project_has_deployment(cloud, project) {
+        // Redeploy (the project already has a live deployment somewhere in the
+        // fleet) — keep the live version serving until the new build is ready, and
+        // never spawn a phantom placeholder. The local-only `serves_host` check used
+        // to miss remotely-placed projects, producing a bogus "Building…" Preview
+        // deployment row on every redeploy.
+        return None;
     }
     let dir = deploy_root().join(format!("{project}-building-{}", now_ms()));
     tokio::fs::create_dir_all(&dir).await.ok()?;

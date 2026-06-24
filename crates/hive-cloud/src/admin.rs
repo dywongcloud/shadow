@@ -1402,7 +1402,12 @@ async fn git_webhook(
     // preview at build time (or `target` forces a preview for PRs).
     let mut triggered = Vec::new();
     for (project, _settings) in c.projects.snapshot() {
-        let Some(git) = c.gw.git_for_project(&project) else { continue };
+        // Fleet-aware git lookup: a project placed on a peer node (the common case —
+        // most projects run on Firecracker nodes, not this coordinator) has no LOCAL
+        // gateway git source, so `gw.git_for_project` returns None and the webhook
+        // would silently trigger NOTHING. Use the gossiped fleet view so pushes/PRs
+        // to remotely-placed projects still create deployments.
+        let Some(git) = git_for_project_fleet(&c, &project) else { continue };
         if crate::gitops::norm_repo(&git.repo_url) != want {
             continue;
         }

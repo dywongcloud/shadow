@@ -473,6 +473,50 @@ export async function setRepoVariable(
   }
 }
 
+/**
+ * Install a real GitHub repository webhook on a PROJECT's source repo so that
+ * pushes (every branch) and pull-request events are delivered to the OpenEdge
+ * node, which then creates production/preview deployments (the node's
+ * `/v1/git/webhook` classifies: prod branch → production, every other branch / PR
+ * → preview). Idempotent: GitHub 422s a duplicate hook with the same config, which
+ * we treat as success. Prefer this over the Actions workflow — it covers all
+ * branches + PRs (the workflow only fires on push-to-main), and avoids the
+ * double-deploy you'd get from running both.
+ */
+export async function createRepoWebhook(
+  entity: string,
+  owner: string,
+  repo: string,
+  url: string,
+  secret?: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!composioConfigured()) return { ok: false, error: "COMPOSIO_API_KEY not set" };
+  try {
+    const res = await ghExec(entity, "GITHUB_CREATE_A_REPOSITORY_WEBHOOK", {
+      owner,
+      repo,
+      name: "web",
+      active: true,
+      events: ["push", "pull_request"],
+      config: {
+        url,
+        content_type: "json",
+        insecure_ssl: "0",
+        ...(secret ? { secret } : {}),
+      },
+    });
+    if (res?.successful !== false) return { ok: true };
+    const msg = String(deep(res)?.message || res?.error || "");
+    // "Hook already exists on this repository" → already installed, treat as ok.
+    if (/already exists/i.test(msg)) return { ok: true };
+    return { ok: false, error: msg || "create webhook failed" };
+  } catch (e: any) {
+    const msg = String(e?.message || "unknown error");
+    if (/already exists/i.test(msg)) return { ok: true };
+    return { ok: false, error: `Composio: ${msg}` };
+  }
+}
+
 /** List the connected GitHub user's repositories for this entity. */
 export async function githubRepos(entity: string): Promise<GhRepo[]> {
   if (!composioConfigured()) return [];

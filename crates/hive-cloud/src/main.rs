@@ -273,11 +273,13 @@ async fn main() -> anyhow::Result<()> {
 
     // Self-management GC: reap stale clone/build working dirs under /tmp/hive-deploys
     // every 10 min (dirs untouched >30 min are dead builds), so build scratch never
-    // exhausts host disk. Pairs with the firecracker orphan-overlay GC.
+    // exhausts host disk. Pairs with the firecracker orphan-overlay GC. Skips dirs
+    // that still back a live deployment.
+    let gc_cloud = cloud.clone();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(600)).await;
-            let n = crate::git::gc_build_dirs(Duration::from_secs(1800)).await;
+            let n = crate::git::gc_build_dirs(&gc_cloud, Duration::from_secs(1800)).await;
             if n > 0 {
                 tracing::info!(removed = n, "gc: cleaned stale build dirs");
             }

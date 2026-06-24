@@ -156,8 +156,9 @@ export default function NewProjectPage() {
         creator: "you",
         env: env && Object.keys(env).length ? env : undefined,
       });
-      // Install the OpenEdge deploy workflow + webhook variable into the source
-      // repo so future pushes auto-deploy (no-ops if GitHub isn't connected).
+      // Install a real GitHub webhook (push + pull_request) on the source repo so
+      // future pushes auto-deploy and PRs / non-prod branches get PREVIEW deploys
+      // (falls back to an Actions workflow; no-ops if GitHub isn't connected).
       fetch("/api/gitops/project-ci", {
         method: "POST",
         headers: { "content-type": "application/json" },

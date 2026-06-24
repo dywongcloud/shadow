@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { composioConfigured, githubStatus, commitFile, setRepoVariable, resolveEntity } from "@/lib/composio";
+import { composioConfigured, githubStatus, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/composio";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
 export const dynamic = "force-dynamic";
@@ -33,25 +33,43 @@ export async function POST(req: NextRequest) {
   if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
 
   const { owner, repo } = parsed;
-  const commit = await commitFile(entity, {
-    owner, repo,
-    path: ".github/workflows/openedge-deploy.yml",
-    content: deployWorkflowContent(),
-    message: "ci(openedge): add deploy workflow",
-  });
-
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
-  let variableSet = false;
+  const secret = process.env.GITHUB_WEBHOOK_SECRET || undefined;
+
+  // Primary mechanism: a real repo webhook (push + pull_request) → the node's
+  // /v1/git/webhook, which creates a PRODUCTION deploy for the prod branch and a
+  // PREVIEW deploy for every other branch + PR. Covers all branches + PRs, unlike
+  // the Actions workflow (push-to-main only).
+  let webhookInstalled = false;
   if (webhookUrl) {
-    const v = await setRepoVariable(entity, owner, repo, "OPENEDGE_WEBHOOK_URL", webhookUrl);
-    variableSet = v.ok;
+    const hook = await createRepoWebhook(entity, owner, repo, `${webhookUrl}/v1/git/webhook`, secret);
+    webhookInstalled = hook.ok;
+  }
+
+  // Fallback ONLY when the real webhook couldn't be installed (e.g. no public URL):
+  // install the Actions workflow (push-to-main) so production deploys still trigger.
+  // We never install both — that would double-fire on push-to-main.
+  let workflowInstalled = false;
+  let variableSet = false;
+  if (!webhookInstalled) {
+    const commit = await commitFile(entity, {
+      owner, repo,
+      path: ".github/workflows/openedge-deploy.yml",
+      content: deployWorkflowContent(),
+      message: "ci(openedge): add deploy workflow",
+    });
+    workflowInstalled = commit.ok;
+    if (webhookUrl) {
+      const v = await setRepoVariable(entity, owner, repo, "OPENEDGE_WEBHOOK_URL", webhookUrl);
+      variableSet = v.ok;
+    }
   }
 
   return NextResponse.json({
-    ok: commit.ok,
+    ok: webhookInstalled || workflowInstalled,
     repo: `${owner}/${repo}`,
-    workflowInstalled: commit.ok,
+    webhookInstalled,
+    workflowInstalled,
     variableSet,
-    error: commit.ok ? undefined : commit.error,
   });
 }

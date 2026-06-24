@@ -2,15 +2,11 @@ import type { Metadata, Viewport } from "next";
 import { GeistSans } from "geist/font/sans";
 import { GeistMono } from "geist/font/mono";
 import { Space_Grotesk, Electrolize } from "next/font/google";
-import { ClerkProvider, SignedIn } from "@clerk/nextjs";
+import { ClerkProvider } from "@clerk/nextjs";
 import "./globals.css";
-import { TopNav } from "@/components/topnav";
-import { Footer } from "@/components/footer";
+import { ChromeTop, ChromeBottom } from "@/components/app-chrome";
 import { ThemeProvider } from "@/components/theme-provider";
-import { GitOps } from "@/components/gitops";
-import { CommandBar } from "@/components/command-bar";
 import { PwaRegister } from "@/components/pwa-register";
-import { ZkPreviewAuth } from "@/components/zk-preview-auth";
 import { Toaster } from "@/components/toast";
 
 // Sleek geometric tech typeface for the Shadow brand wordmark + landing.
@@ -76,38 +72,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <PwaRegister />
         <Toaster />
         <ThemeProvider>
-          {/* Dashboard chrome (top nav + footer) is for signed-in users. The
-              signed-out landing page renders its own nav/footer full-bleed. In
-              local (no-Clerk) mode the chrome always shows. */}
-          {clerkEnabled ? (
-            <SignedIn>
-              <TopNav />
-            </SignedIn>
-          ) : (
-            <TopNav />
-          )}
+          {/* Dashboard chrome (top nav + footer + overlays) is auth-gated in a
+              CLIENT component so it reacts to client-side login/logout — the
+              signed-out landing renders its own full-bleed nav/footer. See
+              `app-chrome.tsx` for why this must not live in the server layout. */}
+          <ChromeTop />
           <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
-          {clerkEnabled ? (
-            <SignedIn>
-              <Footer />
-            </SignedIn>
-          ) : (
-            <Footer />
-          )}
-          {/* GitOps onboarding is for signed-in users only — never show it on the
-              sign-in / sign-up pages. In local (no-Clerk) mode it always renders. */}
-          {clerkEnabled ? (
-            <SignedIn>
-              <GitOps />
-              <CommandBar />
-              <ZkPreviewAuth />
-            </SignedIn>
-          ) : (
-            <>
-              <GitOps />
-              <CommandBar />
-            </>
-          )}
+          <ChromeBottom />
         </ThemeProvider>
       </body>
     </html>
