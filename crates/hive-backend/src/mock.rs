@@ -537,6 +537,7 @@ mod tenant_tests {
             image: "img".into(),
             resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
             tenant: tenant.into(),
+            container: None,
         }
     }
 

@@ -83,24 +83,33 @@ pub struct FirecrackerBackend {
     net_idx: Arc<std::sync::atomic::AtomicU32>,
     /// Set once host NAT/forwarding has been configured.
     nat_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Container cells: cell -> podman container name. A Firecracker node runs
+    /// CONTAINER deployments via podman ON THE HOST (outside the microVM), so these
+    /// cells have no `Child` in `procs`; they're tracked + torn down here instead.
+    containers: Arc<Mutex<HashMap<CellId, String>>>,
+    /// Per-container tunnel-server accept loops (front the container's host port),
+    /// aborted on teardown.
+    ctnl_tasks: Arc<Mutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
 }
 
 impl FirecrackerBackend {
     pub fn new(cfg: FirecrackerConfig) -> Self {
         let procs = Arc::new(Mutex::new(HashMap::new()));
+        let containers: Arc<Mutex<HashMap<CellId, String>>> = Arc::new(Mutex::new(HashMap::new()));
         // Self-management GC: periodically reap orphaned per-cell run dirs — the
         // multi-GB microVM overlays left behind when a cell's firecracker process
         // is gone (e.g. after a node restart). Without this, dead overlays
         // accumulate and exhaust host disk (the SJ outage). Only dirs with no live
-        // process AND untouched for a grace period are removed, so an in-flight
-        // provision (dir created before the process registers) is never reaped.
+        // process/container AND untouched for a grace period are removed, so an
+        // in-flight provision (dir created before the process registers) is never reaped.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let procs_gc = procs.clone();
+            let ctrs_gc = containers.clone();
             let run_dir = cfg.run_dir.clone();
             handle.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(120)).await;
-                    Self::gc_orphans(&run_dir, &procs_gc).await;
+                    Self::gc_orphans(&run_dir, &procs_gc, &ctrs_gc).await;
                 }
             });
         }
@@ -110,15 +119,56 @@ impl FirecrackerBackend {
             taps: Arc::new(Mutex::new(HashMap::new())),
             net_idx: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            containers,
+            ctnl_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Remove run dirs for cells that are NOT live (no entry in `procs`) and whose
-    /// dir hasn't been modified in the last 5 minutes (so an in-flight provision is
-    /// safe). Frees orphaned overlay disk. Best-effort.
-    async fn gc_orphans(run_dir: &std::path::Path, procs: &Arc<Mutex<HashMap<CellId, Child>>>) {
-        let live: std::collections::HashSet<String> =
+    /// PATH for invoking podman on a Linux Firecracker host (systemd units run with
+    /// a minimal env). Covers the standard distro locations.
+    const PODMAN_PATH: &'static str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    /// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
+    /// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
+    /// the runtime to pass to `podman --runtime` ONLY when it's actually resolvable
+    /// on this host, so a misconfigured/missing runtime gracefully falls back to
+    /// podman's default (crun/runc) instead of failing every container cold start.
+    fn container_runtime() -> Option<String> {
+        let v = std::env::var("HIVE_CONTAINER_RUNTIME").ok()?;
+        let v = v.trim();
+        if v.is_empty() {
+            return None;
+        }
+        // Resolve to a concrete binary so we can verify it exists. An explicit path
+        // is used as-is; a bare name is searched in the standard runtime locations.
+        let candidates: Vec<String> = if v.contains('/') {
+            vec![v.to_string()]
+        } else {
+            ["/usr/local/bin", "/usr/bin", "/usr/local/sbin", "/usr/sbin", "/bin"]
+                .iter()
+                .map(|d| format!("{d}/{v}"))
+                .collect()
+        };
+        if let Some(path) = candidates.into_iter().find(|p| std::path::Path::new(p).exists()) {
+            Some(path)
+        } else {
+            tracing::warn!(runtime = %v, "HIVE_CONTAINER_RUNTIME set but binary not found — using podman default runtime");
+            None
+        }
+    }
+
+    /// Remove run dirs for cells that are NOT live (no entry in `procs` for microVM
+    /// cells, nor in `containers` for host-podman cells) and whose dir hasn't been
+    /// modified in the last 5 minutes (so an in-flight provision is safe). Frees
+    /// orphaned overlay disk. Best-effort.
+    async fn gc_orphans(
+        run_dir: &std::path::Path,
+        procs: &Arc<Mutex<HashMap<CellId, Child>>>,
+        containers: &Arc<Mutex<HashMap<CellId, String>>>,
+    ) {
+        let mut live: std::collections::HashSet<String> =
             procs.lock().await.keys().map(|c| c.to_string()).collect();
+        live.extend(containers.lock().await.keys().map(|c| c.to_string()));
         let grace = Duration::from_secs(300);
         let now = std::time::SystemTime::now();
         let mut tenants = match tokio::fs::read_dir(run_dir).await {
@@ -194,7 +244,7 @@ impl FirecrackerBackend {
             return Ok(());
         }
         tracing::warn!("disk below floor before provision — running orphan GC");
-        Self::gc_orphans(&self.cfg.run_dir, &self.procs).await;
+        Self::gc_orphans(&self.cfg.run_dir, &self.procs, &self.containers).await;
         let free = Self::disk_free_bytes(base);
         anyhow::ensure!(
             free >= FLOOR_BYTES,
@@ -344,6 +394,23 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn provision(&self, spec: &CellSpec) -> anyhow::Result<CellHandle> {
+        // CONTAINER cell: run via podman on the HOST (outside the microVM). No KVM /
+        // microVM boot needed — just a per-cell run dir; `start_function` does the
+        // `podman run`. This is what lets a Firecracker node also run containers.
+        if let Some(ctr) = &spec.container {
+            let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
+            let run_dir = self.cfg.run_dir.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
+            tokio::fs::create_dir_all(&run_dir).await?;
+            tracing::debug!(cell = %spec.id, image = %ctr.image, "provisioning container cell (host podman)");
+            return Ok(CellHandle {
+                id: spec.id.clone(),
+                image: spec.image.clone(),
+                resources: spec.resources.clone(),
+                root: run_dir,
+                endpoint: None,
+            });
+        }
+
         anyhow::ensure!(
             self.is_supported(),
             "firecracker backend unavailable: need Linux + /dev/kvm + {} (run inside the Lima VM)",
@@ -603,6 +670,32 @@ impl CellBackend for FirecrackerBackend {
         cell: &CellHandle,
         func: &FunctionLaunch,
     ) -> anyhow::Result<CellEndpoint> {
+        // CONTAINER cell: run the OCI image via podman on the HOST and front it with
+        // the tunnel server (same as the mock backend). The cell has no microVM /
+        // vsock — it was provisioned as a lightweight host-container cell.
+        if func.start_cmd.first().map(String::as_str) == Some("__container__") {
+            let image = func.start_cmd.get(1).cloned().unwrap_or_default();
+            let internal: u16 = func.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080);
+            let runtime = Self::container_runtime();
+            if let Some(rt) = &runtime {
+                tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
+            }
+            let (name, endpoint, task) = crate::podman_run_container(
+                &cell.id,
+                &image,
+                internal,
+                func.port,
+                &func.env,
+                func.max_concurrency,
+                Self::PODMAN_PATH,
+                runtime.as_deref(),
+            )
+            .await?;
+            self.containers.lock().await.insert(cell.id.clone(), name);
+            self.ctnl_tasks.lock().await.insert(cell.id.clone(), task);
+            return Ok(endpoint);
+        }
+
         let uds = cell
             .endpoint
             .as_ref()
@@ -677,6 +770,14 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
+        // Container cell: stop the tunnel loop + remove the podman container.
+        if let Some(task) = self.ctnl_tasks.lock().await.remove(&cell.id) {
+            task.abort();
+        }
+        if let Some(name) = self.containers.lock().await.remove(&cell.id) {
+            crate::podman_stop_container(&name, Self::PODMAN_PATH).await;
+        }
+        // Firecracker microVM cell: kill the process + tear down its egress net.
         if let Some(mut child) = self.procs.lock().await.remove(&cell.id) {
             let _ = child.start_kill();
             let _ = child.wait().await;

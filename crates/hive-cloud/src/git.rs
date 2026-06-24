@@ -605,41 +605,19 @@ async fn run_build(
         commit: commit.clone(),
         commit_message: commit_message.clone(),
     };
-    // Capability re-home: a CONTAINER deployment (`__container__`/podman) can only
-    // run on the mock/podman backend — a Firecracker node can't, so it would fail
-    // every cold start ("no capacity / No such file or directory"). If we built a
-    // container on a non-mock node, re-dispatch it to a podman-capable node and do
-    // NOT host it here. (Re-home terminates at the mock node — its backend IS mock,
-    // so it serves the container without re-dispatching again.)
-    if !build_failed
-        && cloud.gw.backend_name() != "mock"
-        && manifest.functions.iter().any(|f| f.runtime == "container")
-    {
-        let regions = cloud.projects.get(&project).functions.regions;
-        let remote: Vec<crate::schedule::Target> = crate::schedule::place(cloud, &regions, true)
-            .into_iter()
-            .filter(|t| t.admin.is_some())
-            .collect();
-        if !remote.is_empty() {
-            let names: Vec<String> = remote.iter().map(|t| t.node.clone()).collect();
-            log(format!("Container deployment — re-homing to podman-capable node(s): {}", names.join(", ")));
-            let ok = fanout_remote(cloud, bid, &req, &project, &remote).await;
-            cleanup_non_targets(cloud, &project, &names).await;
-            cloud.builds.update(bid, |b| {
-                b.state = if ok { DeployState::Ready } else { DeployState::Error };
-                b.finished_ms = Some(now_ms());
-            });
-            crate::persist::persist(cloud);
-            return Ok(());
-        }
-        log("WARN: container deployment but no podman-capable node is reachable; serving will fail.".into());
-    }
+    // CONTAINER deployments (`__container__`/podman) now run on ANY node — the
+    // Firecracker backend runs them via podman ON THE HOST (outside the microVM),
+    // just like the mock backend. So no re-home is needed: the container builds
+    // (podman build, below) and serves on whichever node it was placed on.
+    let is_container = manifest.functions.iter().any(|f| f.runtime == "container");
 
     // For an isolated backend (Firecracker), a serving microVM cannot see the
     // host build dir the mock backend serves from. Pack the build output into a
     // per-deployment artifact the cell mounts at /build, and point this
     // deployment's function pool at that image. No-op for the same-host mock.
-    if !build_failed && cloud.gw.backend_name() == "firecracker" {
+    // SKIP for containers: they serve from the OCI image (podman), not a microVM
+    // data disk, so there's nothing to deliver.
+    if !build_failed && !is_container && cloud.gw.backend_name() == "firecracker" {
         let image = format!("dpl-{}", sanitize_tag(bid));
         match cloud.gw.deliver_build(&image, &build_dir).await {
             Ok(()) => {
@@ -1082,6 +1060,10 @@ async fn produce_manifest(
         let t1 = now_ms();
         let mut build = Command::new("podman");
         build.arg("build").arg("-t").arg(&image);
+        // Resolve podman on both Linux Firecracker hosts (/usr/bin) and macOS
+        // (/opt/homebrew/bin) regardless of the service's inherited PATH.
+        let base_path = std::env::var("PATH").unwrap_or_default();
+        build.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"));
         // Pass project env as --build-arg so a Dockerfile `ARG`/`ENV` can use them.
         for (k, v) in cloud.projects.env_map(project) {
             build.arg("--build-arg").arg(format!("{k}={v}"));

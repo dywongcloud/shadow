@@ -320,6 +320,7 @@ impl Hive {
                         // Build cells aren't tenant-attributed yet (build-pipeline
                         // tenancy is a follow-up); default to the shared tenant.
                         tenant: String::new(),
+                        container: None, // build cell, not a container
                     },
                     None => return,
                 }
@@ -586,6 +587,7 @@ impl Hive {
                     resources: c.resources.clone(),
                     // Build cells aren't tenant-attributed yet (follow-up).
                     tenant: String::new(),
+                    container: None, // build cell, not a container
                 },
                 None => return,
             }

@@ -75,6 +75,124 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
     }
 }
 
+/// A container (podman) cell: instead of a microVM / host process, the backend
+/// runs this OCI image directly via podman on the HOST. Set when the deployment's
+/// function is `runtime == "container"`. Lets Firecracker nodes run containers on
+/// the host (outside the microVM) — not just the mock backend.
+#[derive(Clone, Debug)]
+pub struct ContainerSpec {
+    /// OCI image to `podman run` (from the function's `__container__` start_cmd).
+    pub image: String,
+    /// Port the container listens on inside (host port is allocated + mapped).
+    pub port: u16,
+}
+
+/// Run an OCI image as a detached podman container on the HOST, then front it with
+/// the Fluid tunnel server (so in-function concurrency + the gateway proxy work the
+/// same as any other cell). Shared by the mock + Firecracker backends so Firecracker
+/// nodes can run containers outside their microVMs. Returns the podman container
+/// name (for teardown), the tunnel endpoint, and the accept-loop task handle.
+pub(crate) async fn podman_run_container(
+    cell_id: &CellId,
+    image: &str,
+    internal_port: u16,
+    host_port: u16,
+    env: &std::collections::BTreeMap<String, String>,
+    max_concurrency: u32,
+    path_env: &str,
+    // Optional OCI runtime (e.g. gVisor's `runsc` for stronger sandboxing). `None`
+    // uses podman's default (crun/runc). A name or absolute path podman accepts.
+    runtime: Option<&str>,
+) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
+    use tokio::process::Command;
+    let name = format!("hive-{}", cell_id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+    // Clear any stale container from a prior cell at this id (kill_on_drop can't).
+    let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
+    // Base `podman run` args (everything after the subcommand, sans --runtime). The
+    // port is published on 127.0.0.1 ONLY — the container is never exposed to the
+    // internet directly; it's reached solely via the gateway/ngrok for the deployment.
+    let mut base: Vec<String> = vec![
+        "-d".into(), "--name".into(), name.clone(),
+        "-e".into(), format!("PORT={internal_port}"),
+    ];
+    for (k, v) in env {
+        base.push("-e".into());
+        base.push(format!("{k}={v}"));
+    }
+    base.push("-p".into());
+    base.push(format!("127.0.0.1:{host_port}:{internal_port}"));
+    base.push(image.to_string());
+
+    // Attempt 1: with the requested sandbox runtime (e.g. gVisor `runsc`) if any.
+    let mut attempt: Vec<String> = vec!["run".into()];
+    if let Some(rt) = runtime {
+        attempt.push("--runtime".into());
+        attempt.push(rt.to_string());
+    }
+    attempt.extend(base.iter().cloned());
+    let mut out = Command::new("podman").args(&attempt).env("PATH", path_env).output().await?;
+
+    // Non-breaking fallback: if a sandbox runtime was requested but the container
+    // couldn't start under it (a gVisor incompatibility), retry on podman's DEFAULT
+    // runtime so the deployment still serves. Isolation degrades to the default for
+    // that one container; logged so the degradation is visible.
+    if !out.status.success() && runtime.is_some() {
+        tracing::warn!(
+            runtime = ?runtime,
+            err = %String::from_utf8_lossy(&out.stderr).trim(),
+            "container failed under sandbox runtime — retrying with podman default runtime"
+        );
+        let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
+        let mut fb: Vec<String> = vec!["run".into()];
+        fb.extend(base.iter().cloned());
+        out = Command::new("podman").args(&fb).env("PATH", path_env).output().await?;
+    }
+    anyhow::ensure!(
+        out.status.success(),
+        "podman run failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    // Wait for the container's port to accept connections (image pull + boot).
+    let func_addr = format!("127.0.0.1:{host_port}");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if tokio::net::TcpStream::connect(&func_addr).await.is_ok() {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
+            anyhow::bail!("container {name} not ready on {func_addr} within 90s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let tunnel_addr = listener.local_addr()?.to_string();
+    let max_conc = max_concurrency.max(1);
+    let task = tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((conn, _)) => {
+                    let local = func_addr.clone();
+                    tokio::spawn(async move {
+                        fluid_tunnel::TunnelServer::serve(conn, local, max_conc).await;
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    Ok((name, CellEndpoint::Tcp(tunnel_addr), task))
+}
+
+/// Stop + remove a podman container by name (cell teardown). Best-effort.
+pub(crate) async fn podman_stop_container(name: &str, path_env: &str) {
+    let _ = tokio::process::Command::new("podman")
+        .args(["rm", "-f", name])
+        .env("PATH", path_env)
+        .output()
+        .await;
+}
+
 /// What the control plane asks a backend to materialize.
 #[derive(Clone, Debug)]
 pub struct CellSpec {
@@ -86,6 +204,10 @@ pub struct CellSpec {
     /// cell's host resources per tenant (the mock backend nests cell workdirs
     /// under the tenant; Firecracker nests its per-cell run dir likewise).
     pub tenant: String,
+    /// Set when this cell is a CONTAINER (podman) rather than a function/microVM.
+    /// The backend runs it via host podman; Firecracker uses this to skip booting a
+    /// microVM and run the container on the host instead. `None` = function cell.
+    pub container: Option<ContainerSpec>,
 }
 
 /// Make a tenant slug safe to use as a single host path component (no traversal,

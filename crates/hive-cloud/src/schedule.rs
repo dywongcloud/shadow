@@ -66,10 +66,16 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
     };
     // A node is dispatchable if it's us, or we know its admin URL.
     let reachable = |n: &NodeInfo| -> bool { n.name == me || cloud.node_admins.read().contains_key(&n.name) };
-    // Capability filter: containers need the podman (mock) backend; everything else
-    // wants a Firecracker microVM node (the resource floor still applies there).
+    // Capability filter. Firecracker nodes now run CONTAINERS via host podman
+    // (outside the microVM), so a container is eligible on any healthy real node —
+    // a Firecracker node (preferred: more resources) OR the mock/podman backend.
+    // Non-container functions still want a Firecracker microVM node.
     let capable = |n: &NodeInfo| -> bool {
-        if is_container { n.healthy && n.backend == "mock" } else { eligible(n) }
+        if is_container {
+            eligible(n) || (n.healthy && n.backend == "mock")
+        } else {
+            eligible(n)
+        }
     };
 
     let regions: Vec<String> = regions

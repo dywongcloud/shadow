@@ -21,6 +21,7 @@ fn spec(tenant: &str) -> CellSpec {
         image: "default".into(),
         resources: ResourceSpec { vcpus: 1, mem_mib: 128, disk_mib: 1024, timeout_secs: 0 },
         tenant: tenant.into(),
+        container: None,
     }
 }
 

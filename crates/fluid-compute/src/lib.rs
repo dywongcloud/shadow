@@ -410,6 +410,18 @@ impl Fluid {
             (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
         };
 
+        // A CONTAINER deployment (`["__container__", image, port]`) is run via host
+        // podman by the backend (mock OR firecracker), not as a microVM/process —
+        // surface that on the CellSpec so the backend skips booting a microVM.
+        let container = if launch.start_cmd.first().map(String::as_str) == Some("__container__") {
+            Some(hive_backend::ContainerSpec {
+                image: launch.start_cmd.get(1).cloned().unwrap_or_default(),
+                port: launch.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080),
+            })
+        } else {
+            None
+        };
+
         let spec = CellSpec {
             id: CellId::new(),
             image,
@@ -420,6 +432,7 @@ impl Fluid {
                 timeout_secs: 0,
             },
             tenant,
+            container,
         };
         debug!(func = %key, cell = %spec.id, "cold-starting function instance");
         let handle = self.backend.provision(&spec).await?;
