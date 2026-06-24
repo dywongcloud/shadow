@@ -882,7 +882,7 @@ fn order_candidates(
     let regions: Vec<&String> = fs.regions.iter().filter(|r| !r.is_empty()).collect();
     if regions.is_empty() {
         raw.sort_by_key(|r| (if r.region == serving_region { 0u8 } else { 1u8 }, r.latency_ms));
-        return raw;
+        return balance_same_region(raw);
     }
     let rank = |r: &crate::state::PeerRoute| {
         regions.iter().position(|cr| cr.eq_ignore_ascii_case(&r.region))
@@ -894,6 +894,35 @@ fn order_candidates(
         let primary = regions[0].clone();
         raw.retain(|r| r.region.eq_ignore_ascii_case(&primary));
         raw.sort_by_key(|r| r.latency_ms);
+    }
+    balance_same_region(raw)
+}
+
+/// Load-balance across nodes in the BEST (front) region tier so same-region peers
+/// — e.g. virginia + virginia-2 — share traffic instead of every request hitting
+/// the single lowest-latency node. Rotates the equal-best-region prefix by a
+/// global round-robin counter; the rest (failover tiers) keep their order. Still
+/// adheres to Fluid Compute: each chosen node runs its own in-instance-concurrent
+/// pool, this just spreads the *first-tried* node across same-region peers.
+fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::state::PeerRoute> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RR: AtomicUsize = AtomicUsize::new(0);
+    // Co-located peers (e.g. virginia + virginia-2) are within this latency band of
+    // each other; a much-slower same-region node falls outside it and is NOT rotated
+    // into the front (latency still wins there). 30ms comfortably covers intra-region
+    // jitter without spanning distinct regions.
+    const BAND_MS: u64 = 30;
+    if raw.len() > 1 {
+        let best = raw[0].region.clone();
+        let best_lat = raw[0].latency_ms;
+        let n = raw
+            .iter()
+            .take_while(|r| r.region.eq_ignore_ascii_case(&best) && r.latency_ms <= best_lat + BAND_MS)
+            .count();
+        if n > 1 {
+            let k = RR.fetch_add(1, Ordering::Relaxed) % n;
+            raw[0..n].rotate_left(k);
+        }
     }
     raw
 }
@@ -1083,6 +1112,23 @@ mod tests {
     fn within_region_latency_is_the_tiebreak() {
         let raw = vec![route("bkk-slow", "bangkok", 90), route("bkk-fast", "bangkok", 3)];
         let out = order_candidates(raw, &fs(&["bangkok"], true), "x");
+        // 90ms is outside the co-location band of 3ms → not rotated in; latency wins.
         assert_eq!(out[0].node_id, "bkk-fast", "lowest latency within the region wins");
+    }
+
+    #[test]
+    fn colocated_same_region_peers_load_balance_across_requests() {
+        // virginia + virginia-2 are co-located (near-equal latency). Over several
+        // requests the FIRST-tried node must rotate between them (issue #2), instead
+        // of every request hammering the single lowest-latency node.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..6 {
+            let raw = vec![route("va1", "virginia", 4), route("va2", "virginia", 6)];
+            let out = order_candidates(raw, &fs(&["virginia"], true), "virginia");
+            seen.insert(out[0].node_id.clone());
+            // Both peers are always present (balancing reorders, never drops).
+            assert_eq!(out.len(), 2);
+        }
+        assert!(seen.contains("va1") && seen.contains("va2"), "both same-region peers must take first-tried turns, got {seen:?}");
     }
 }

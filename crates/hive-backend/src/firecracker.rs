@@ -87,13 +87,122 @@ pub struct FirecrackerBackend {
 
 impl FirecrackerBackend {
     pub fn new(cfg: FirecrackerConfig) -> Self {
+        let procs = Arc::new(Mutex::new(HashMap::new()));
+        // Self-management GC: periodically reap orphaned per-cell run dirs — the
+        // multi-GB microVM overlays left behind when a cell's firecracker process
+        // is gone (e.g. after a node restart). Without this, dead overlays
+        // accumulate and exhaust host disk (the SJ outage). Only dirs with no live
+        // process AND untouched for a grace period are removed, so an in-flight
+        // provision (dir created before the process registers) is never reaped.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let procs_gc = procs.clone();
+            let run_dir = cfg.run_dir.clone();
+            handle.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                    Self::gc_orphans(&run_dir, &procs_gc).await;
+                }
+            });
+        }
         FirecrackerBackend {
             cfg,
-            procs: Arc::new(Mutex::new(HashMap::new())),
+            procs,
             taps: Arc::new(Mutex::new(HashMap::new())),
             net_idx: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Remove run dirs for cells that are NOT live (no entry in `procs`) and whose
+    /// dir hasn't been modified in the last 5 minutes (so an in-flight provision is
+    /// safe). Frees orphaned overlay disk. Best-effort.
+    async fn gc_orphans(run_dir: &std::path::Path, procs: &Arc<Mutex<HashMap<CellId, Child>>>) {
+        let live: std::collections::HashSet<String> =
+            procs.lock().await.keys().map(|c| c.to_string()).collect();
+        let grace = Duration::from_secs(300);
+        let now = std::time::SystemTime::now();
+        let mut tenants = match tokio::fs::read_dir(run_dir).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        while let Ok(Some(tenant)) = tenants.next_entry().await {
+            let tp = tenant.path();
+            if !tp.is_dir() {
+                continue;
+            }
+            let mut cells = match tokio::fs::read_dir(&tp).await {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            while let Ok(Some(cell)) = cells.next_entry().await {
+                let cid = cell.file_name().to_string_lossy().to_string();
+                if live.contains(&cid) {
+                    continue;
+                }
+                // Age guard: skip dirs modified recently (possible in-flight provision).
+                let recent = cell
+                    .metadata()
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|age| age < grace)
+                    .unwrap_or(false);
+                if recent {
+                    continue;
+                }
+                let p = cell.path();
+                if tokio::fs::remove_dir_all(&p).await.is_ok() {
+                    tracing::info!(cell = %cid, "gc: reaped orphaned cell run dir");
+                }
+            }
+        }
+    }
+
+    /// Free bytes available on the filesystem backing `path` (statvfs). 0 on error.
+    fn disk_free_bytes(path: &std::path::Path) -> u64 {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let cpath = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+                Ok(c) => c,
+                Err(_) => return 0,
+            };
+            // SAFETY: zeroed statvfs is a valid initial value; we only read it on success.
+            let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+            if unsafe { libc::statvfs(cpath.as_ptr(), &mut st) } == 0 {
+                return (st.f_bavail as u64).saturating_mul(st.f_frsize as u64);
+            }
+            0
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            u64::MAX
+        }
+    }
+
+    /// Disk-pressure guard for cold starts: if the run filesystem is critically low,
+    /// reap orphaned overlays first, then refuse the provision (clear error, no
+    /// silent half-boot) if still below the floor. Each microVM overlay is multi-GB,
+    /// so booting into a near-full disk is what corrupted SJ's state (the outage).
+    async fn ensure_disk_headroom(&self) -> anyhow::Result<()> {
+        // Floor: a microVM overlay pair (rootfs + data) plus slack. ~3 GiB.
+        const FLOOR_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+        let base = if self.cfg.run_dir.exists() { self.cfg.run_dir.as_path() } else { std::path::Path::new("/") };
+        if Self::disk_free_bytes(base) >= FLOOR_BYTES {
+            return Ok(());
+        }
+        tracing::warn!("disk below floor before provision — running orphan GC");
+        Self::gc_orphans(&self.cfg.run_dir, &self.procs).await;
+        let free = Self::disk_free_bytes(base);
+        anyhow::ensure!(
+            free >= FLOOR_BYTES,
+            "no capacity: host disk critically low ({} MiB free, need {} MiB) after GC",
+            free / (1024 * 1024),
+            FLOOR_BYTES / (1024 * 1024)
+        );
+        Ok(())
     }
 
     /// Probe so the box daemon can choose mock vs. firecracker.
@@ -240,6 +349,9 @@ impl CellBackend for FirecrackerBackend {
             "firecracker backend unavailable: need Linux + /dev/kvm + {} (run inside the Lima VM)",
             self.cfg.firecracker_bin.display()
         );
+        // Self-manage disk before allocating multi-GB overlays: GC orphans + refuse
+        // if still critically low, so we never boot into a near-full filesystem.
+        self.ensure_disk_headroom().await?;
 
         // Per-tenant run dir (`<run_dir>/<tenant>/<cell-id>`) so each team's VM
         // sockets / overlays / console logs are isolated on the host. (The VM

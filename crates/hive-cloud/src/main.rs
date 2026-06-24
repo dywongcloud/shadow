@@ -271,6 +271,19 @@ async fn main() -> anyhow::Result<()> {
     spawn_cluster_loop(cloud.clone());
     spawn_lease_loop(cloud.clone());
 
+    // Self-management GC: reap stale clone/build working dirs under /tmp/hive-deploys
+    // every 10 min (dirs untouched >30 min are dead builds), so build scratch never
+    // exhausts host disk. Pairs with the firecracker orphan-overlay GC.
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            let n = crate::git::gc_build_dirs(Duration::from_secs(1800)).await;
+            if n > 0 {
+                tracing::info!(removed = n, "gc: cleaned stale build dirs");
+            }
+        }
+    });
+
     // Warm the always-on GuardianDB (durable, iroh-replicated state store) so it
     // is live before the first snapshot. Best-effort; never blocks boot.
     guardian::init_background();
@@ -475,6 +488,9 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
+            // Drain superseded deployments' keep-warm pools — only the production
+            // deployment of each project stays warm (the rest scale to zero).
+            cloud.gw.reconcile_keepwarm();
             let self_id = cloud.node_name.clone();
             let region = cloud.region.clone();
             let now = now_ms();

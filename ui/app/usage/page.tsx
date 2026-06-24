@@ -43,13 +43,20 @@ export default function UsagePage() {
   const requests = ov?.requests ?? 0;
   const blocked = ov?.blocked ?? 0;
   const cacheHits = ov?.cdn.hits ?? 0;
-  const fluidMs = (fns ?? []).reduce((a, f) => a + f.fluid_ms, 0);
   const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
+  // Active CPU pricing (Vercel Fluid convention): bill ACTIVE CPU time + provisioned
+  // MEMORY GB-hrs, not idle instance wall-time. `active_cpu_ms` excludes I/O-idle
+  // keep-warm time — that's where the headline savings come from.
+  const activeCpuMs = (fns ?? []).reduce((a, f) => a + (f.active_cpu_ms ?? 0), 0);
+  const memGbHrs = (fns ?? []).reduce((a, f) => a + (f.memory_gb_hrs ?? 0), 0);
 
   // Real billing data drives the credit figures (so issued/purchased credits
   // and actual compute charges reflect here), falling back to an estimate model.
+  // Function compute is billed the Fluid way: Active CPU ($/CPU-hr) + Memory GB-hrs.
   const edgeCharge = (requests / 1_000_000) * 2.0;
-  const fnCharge = (fluidMs / 1000 / 3600) * 0.18;
+  const cpuCharge = (activeCpuMs / 1000 / 3600) * 0.128; // active CPU-hours
+  const memCharge = memGbHrs * 0.0106; // provisioned memory GB-hours
+  const fnCharge = cpuCharge + memCharge;
   const wafCharge = (blocked / 1_000_000) * 0.6;
   const acc = billing?.account;
   const includedTotal = acc ? acc.included_cents / 100 : 20;
@@ -166,9 +173,10 @@ export default function UsagePage() {
           <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={`${fmt(cacheHits)}`} charge={0} />
           <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={series(blocked)} usage={`${fmt(blocked)}`} charge={wafCharge} />
 
-          <GroupHeader name="OpenEdge Functions" />
+          <GroupHeader name="OpenEdge Functions (Fluid · Active CPU pricing)" />
           <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
-          <Row color="bg-purple-500" name="Active CPU (Fluid)" spark={series(fluidMs)} usage={`${(fluidMs / 1000).toFixed(1)} s`} charge={fnCharge} />
+          <Row color="bg-purple-500" name="Active CPU" spark={series(activeCpuMs)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
+          <Row color="bg-teal-500" name="Provisioned Memory" spark={series(Math.round(memGbHrs * 1000))} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
           <Row color="bg-cyan-500" name="Provisioned Instances" spark={series((ov?.instances ?? 0) * 100)} usage={`${ov?.instances ?? 0}`} charge={0} />
         </div>
       </Card>

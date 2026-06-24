@@ -48,8 +48,11 @@ fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
     m
 }
 
-/// Choose placement targets. See module docs for the policy.
-pub fn place(cloud: &Arc<CloudState>, regions: &[String]) -> Vec<Target> {
+/// Choose placement targets. See module docs for the policy. `is_container` routes
+/// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
+/// mock/podman backend) — Firecracker nodes can't run them, so placing a container
+/// there fails every cold start with "no capacity / No such file or directory".
+pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) -> Vec<Target> {
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
@@ -63,6 +66,11 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String]) -> Vec<Target> {
     };
     // A node is dispatchable if it's us, or we know its admin URL.
     let reachable = |n: &NodeInfo| -> bool { n.name == me || cloud.node_admins.read().contains_key(&n.name) };
+    // Capability filter: containers need the podman (mock) backend; everything else
+    // wants a Firecracker microVM node (the resource floor still applies there).
+    let capable = |n: &NodeInfo| -> bool {
+        if is_container { n.healthy && n.backend == "mock" } else { eligible(n) }
+    };
 
     let regions: Vec<String> = regions
         .iter()
@@ -84,7 +92,7 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String]) -> Vec<Target> {
             }
             // Prefer eligible nodes; if none are eligible, honor the explicit
             // region choice with any healthy node there (e.g. los-angeles → local).
-            let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| eligible(n)).collect();
+            let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| capable(n)).collect();
             let mut pool = if eligibles.is_empty() { cands } else { eligibles };
             pool.sort_by_key(|n| load_of(&n.name));
             let chosen = pool[0];
@@ -103,7 +111,7 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String]) -> Vec<Target> {
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         });
-    let mut elig: Vec<&NodeInfo> = nodes.iter().filter(|n| eligible(n) && reachable(n)).collect();
+    let mut elig: Vec<&NodeInfo> = nodes.iter().filter(|n| capable(n) && reachable(n)).collect();
     if elig.is_empty() {
         return Vec::new(); // caller hosts locally as a fallback
     }

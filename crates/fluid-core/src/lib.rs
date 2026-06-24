@@ -875,6 +875,13 @@ pub struct GitDeployRequest {
     /// remotely-placed deployment honors the user's compute tier. Opaque JSON.
     #[serde(default)]
     pub function_settings: Option<serde_json::Value>,
+    /// Set by the "New Deployment" modal on a project's own page: this is a fresh
+    /// deployment of an EXISTING project, not a new-project create. When the named
+    /// project already exists for the requesting tenant, its name is used verbatim
+    /// (no `-N` suffix, no "already exists" 409) even if the source repo/branch
+    /// differs — the user is intentionally deploying a new source into that project.
+    #[serde(default)]
+    pub redeploy: bool,
 }
 fn default_prod() -> bool {
     true

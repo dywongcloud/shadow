@@ -14,6 +14,46 @@ export type Progress = (line: string) => void;
 
 const CORS_PROXY = "/api/git/cors-proxy";
 
+// ---- console logging (issue #4: log all client-side git operations) ----
+// Every browser-side git operation logs to the dev console with a consistent
+// `[git]` badge, so the full client-side git activity (clone/commit/push/pull/…)
+// is observable in DevTools — not just in the page's activity feed. `glog` opens
+// a collapsed group per op; `gdone`/`gfail` close it with a timing/result line.
+const GIT_BADGE = "background:#1f6feb;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
+function now(): number {
+  return typeof performance !== "undefined" ? performance.now() : 0;
+}
+function glog(op: string, detail?: Record<string, unknown>): number {
+  if (typeof console === "undefined") return now();
+  try {
+    console.groupCollapsed(`%cgit%c ${op}`, GIT_BADGE, "color:inherit;font-weight:600");
+    if (detail && Object.keys(detail).length) console.log(detail);
+  } catch {
+    /* ignore */
+  }
+  return now();
+}
+function gdone(op: string, t0: number, result?: Record<string, unknown>): void {
+  if (typeof console === "undefined") return;
+  try {
+    const ms = Math.round(now() - t0);
+    console.log(`%cgit%c ${op} ✓ ${ms}ms`, GIT_BADGE, "color:#3fb950", result ?? "");
+    console.groupEnd();
+  } catch {
+    /* ignore */
+  }
+}
+function gfail(op: string, t0: number, err: unknown): void {
+  if (typeof console === "undefined") return;
+  try {
+    const ms = Math.round(now() - t0);
+    console.error(`%cgit%c ${op} ✗ ${ms}ms`, GIT_BADGE, "color:#f85149", err);
+    console.groupEnd();
+  } catch {
+    /* ignore */
+  }
+}
+
 // One LightningFS instance, lazily created (browser only). `any` at this polyfill
 // boundary: LightningFS is a PromiseFsClient that isomorphic-git accepts as `fs`.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -55,22 +95,33 @@ export async function cloneRepo(opts: CloneOpts): Promise<string> {
   const fs = await getFs();
   const { git, http } = await gitMods();
   const dir = "/" + repoDirName(opts.url);
-  await rmrf(dir);
-  opts.onProgress?.(`Cloning ${opts.url} …`);
-  await git.clone({
-    fs,
-    http,
-    dir,
-    url: opts.url,
-    corsProxy: CORS_PROXY,
-    ref: opts.ref,
-    singleBranch: true,
-    depth: opts.depth ?? 1,
-    onAuth: authFor(opts.token || ""),
-    onMessage: (m: string) => opts.onProgress?.(m.trim()),
-  });
-  opts.onProgress?.("Clone complete.");
-  return dir;
+  const t0 = glog("clone", { url: opts.url, ref: opts.ref ?? "default", depth: opts.depth ?? 1, dir });
+  try {
+    await rmrf(dir);
+    opts.onProgress?.(`Cloning ${opts.url} …`);
+    await git.clone({
+      fs,
+      http,
+      dir,
+      url: opts.url,
+      corsProxy: CORS_PROXY,
+      ref: opts.ref,
+      singleBranch: true,
+      depth: opts.depth ?? 1,
+      onAuth: authFor(opts.token || ""),
+      onMessage: (m: string) => {
+        const line = m.trim();
+        opts.onProgress?.(line);
+        if (line && typeof console !== "undefined") console.log(`%cgit%c clone › ${line}`, GIT_BADGE, "color:inherit");
+      },
+    });
+    opts.onProgress?.("Clone complete.");
+    gdone("clone", t0, { dir });
+    return dir;
+  } catch (e) {
+    gfail("clone", t0, e);
+    throw e;
+  }
 }
 
 /** Initialize a brand-new repo in the browser FS at `/<name>`. */
@@ -78,9 +129,16 @@ export async function initRepo(name: string, defaultBranch = "main"): Promise<st
   const fs = await getFs();
   const { git } = await gitMods();
   const dir = "/" + safeName(name);
-  await rmrf(dir);
-  await git.init({ fs, dir, defaultBranch });
-  return dir;
+  const t0 = glog("init", { dir, defaultBranch });
+  try {
+    await rmrf(dir);
+    await git.init({ fs, dir, defaultBranch });
+    gdone("init", t0, { dir });
+    return dir;
+  } catch (e) {
+    gfail("init", t0, e);
+    throw e;
+  }
 }
 
 /** Write a file (creating parent dirs) into the working dir. */
@@ -88,8 +146,55 @@ export async function writeFile(dir: string, filepath: string, content: string):
   const fs = (await getFs()) as { promises: { mkdir: (p: string) => Promise<void>; writeFile: (p: string, c: string) => Promise<void> } };
   const full = `${dir}/${filepath}`.replace(/\/+/g, "/");
   const parent = full.slice(0, full.lastIndexOf("/"));
-  await mkdirp(parent);
-  await fs.promises.writeFile(full, content);
+  const t0 = glog("write", { path: full, bytes: content.length });
+  try {
+    await mkdirp(parent);
+    await fs.promises.writeFile(full, content);
+    gdone("write", t0, { path: full });
+  } catch (e) {
+    gfail("write", t0, e);
+    throw e;
+  }
+}
+
+/** Remove a file from the working dir (no-op if absent). Lets the local GitOps
+ *  provider reflect deleted projects as removed artifact files before committing. */
+export async function unlink(dir: string, filepath: string): Promise<void> {
+  const fs = (await getFs()) as { promises: { unlink: (p: string) => Promise<void> } };
+  const full = `${dir}/${filepath}`.replace(/\/+/g, "/");
+  try {
+    await fs.promises.unlink(full);
+    if (typeof console !== "undefined") console.log(`%cgit%c rm ${full}`, GIT_BADGE, "color:inherit");
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Whether a git repo already exists at `dir` (has a .git dir). */
+export async function repoExists(dir: string): Promise<boolean> {
+  const fs = (await getFs()) as { promises: { stat: (p: string) => Promise<unknown> } };
+  try {
+    await fs.promises.stat(`${dir}/.git`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Initialize a repo at `dir` only if one isn't already there (preserves history). */
+export async function ensureRepo(dir: string, defaultBranch = "main"): Promise<boolean> {
+  const fs = await getFs();
+  const { git } = await gitMods();
+  if (await repoExists(dir)) return false;
+  const t0 = glog("init", { dir, defaultBranch });
+  try {
+    await git.init({ fs, dir, defaultBranch });
+    gdone("init", t0, { dir });
+    return true;
+  } catch (e) {
+    gfail("init", t0, e);
+    throw e;
+  }
 }
 
 /** Read a file from the working dir as text (or null if absent). */
@@ -123,6 +228,7 @@ export async function status(dir: string): Promise<FileStatus[]> {
     if (s !== "unmodified") out.push({ filepath, status: s });
     void stage;
   }
+  if (typeof console !== "undefined") console.log(`%cgit%c status — ${out.length} change(s)`, GIT_BADGE, "color:inherit", out);
   return out;
 }
 
@@ -130,16 +236,27 @@ export async function status(dir: string): Promise<FileStatus[]> {
 export async function commitAll(dir: string, message: string, author: RepoIdentity): Promise<string> {
   const fs = await getFs();
   const { git } = await gitMods();
-  const matrix = (await git.statusMatrix({ fs, dir })) as unknown as Array<[string, number, number, number]>;
-  for (const [filepath, , workdir] of matrix) {
-    if (workdir === 0) {
-      await git.remove({ fs, dir, filepath });
-    } else {
-      await git.add({ fs, dir, filepath });
+  const t0 = glog("commit", { dir, message });
+  try {
+    const matrix = (await git.statusMatrix({ fs, dir })) as unknown as Array<[string, number, number, number]>;
+    let added = 0;
+    let removed = 0;
+    for (const [filepath, , workdir] of matrix) {
+      if (workdir === 0) {
+        await git.remove({ fs, dir, filepath });
+        removed++;
+      } else {
+        await git.add({ fs, dir, filepath });
+        added++;
+      }
     }
+    const sha = await git.commit({ fs, dir, message, author: { name: author.name, email: author.email } });
+    gdone("commit", t0, { sha: sha.slice(0, 8), staged: added, removed });
+    return sha;
+  } catch (e) {
+    gfail("commit", t0, e);
+    throw e;
   }
-  const sha = await git.commit({ fs, dir, message, author: { name: author.name, email: author.email } });
-  return sha;
 }
 
 export interface PushOpts {
@@ -155,27 +272,39 @@ export interface PushOpts {
 export async function push(opts: PushOpts): Promise<void> {
   const fs = await getFs();
   const { git, http } = await gitMods();
-  if (opts.url) {
-    const remotes = await git.listRemotes({ fs, dir: opts.dir });
-    if (!remotes.find((r: { remote: string }) => r.remote === "origin")) {
-      await git.addRemote({ fs, dir: opts.dir, remote: "origin", url: opts.url });
+  const t0 = glog("push", { dir: opts.dir, ref: opts.ref ?? "current", force: !!opts.force });
+  try {
+    if (opts.url) {
+      const remotes = await git.listRemotes({ fs, dir: opts.dir });
+      if (!remotes.find((r: { remote: string }) => r.remote === "origin")) {
+        await git.addRemote({ fs, dir: opts.dir, remote: "origin", url: opts.url });
+        if (typeof console !== "undefined") console.log(`%cgit%c push › added remote origin → ${opts.url}`, GIT_BADGE, "color:inherit");
+      }
     }
+    const ref = opts.ref || (await git.currentBranch({ fs, dir: opts.dir, fullname: false })) || "main";
+    opts.onProgress?.(`Pushing ${ref} → origin …`);
+    const res = await git.push({
+      fs,
+      http,
+      dir: opts.dir,
+      remote: "origin",
+      ref,
+      corsProxy: CORS_PROXY,
+      force: opts.force,
+      onAuth: authFor(opts.token),
+      onMessage: (m: string) => {
+        const line = m.trim();
+        opts.onProgress?.(line);
+        if (line && typeof console !== "undefined") console.log(`%cgit%c push › ${line}`, GIT_BADGE, "color:inherit");
+      },
+    });
+    if (res?.error) throw new Error(res.error);
+    opts.onProgress?.("Push complete.");
+    gdone("push", t0, { ref });
+  } catch (e) {
+    gfail("push", t0, e);
+    throw e;
   }
-  const ref = opts.ref || (await git.currentBranch({ fs, dir: opts.dir, fullname: false })) || "main";
-  opts.onProgress?.(`Pushing ${ref} → origin …`);
-  const res = await git.push({
-    fs,
-    http,
-    dir: opts.dir,
-    remote: "origin",
-    ref,
-    corsProxy: CORS_PROXY,
-    force: opts.force,
-    onAuth: authFor(opts.token),
-    onMessage: (m: string) => opts.onProgress?.(m.trim()),
-  });
-  if (res?.error) throw new Error(res.error);
-  opts.onProgress?.("Push complete.");
 }
 
 /** Recent commit log (newest first). */
@@ -183,6 +312,7 @@ export async function log(dir: string, depth = 20): Promise<Array<{ oid: string;
   const fs = await getFs();
   const { git } = await gitMods();
   const entries = await git.log({ fs, dir, depth });
+  if (typeof console !== "undefined") console.log(`%cgit%c log — ${entries.length} commit(s) from ${dir}`, GIT_BADGE, "color:inherit");
   return entries.map((e: { oid: string; commit: { message: string; author: { name: string; timestamp: number } } }) => ({
     oid: e.oid.slice(0, 8),
     message: e.commit.message.split("\n")[0],

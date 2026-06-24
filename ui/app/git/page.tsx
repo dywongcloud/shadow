@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { GitBranch, GitCommit, Plus, Download, Upload, KeyRound } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { GitBranch, GitCommit, Plus, Download, Upload, KeyRound, FolderGit2, RefreshCw, FileCode2, Cloud, HardDrive } from "lucide-react";
 import { Card, Button, Input, PageHeader, Badge } from "@/components/ui";
 import {
   cloneRepo,
@@ -13,6 +13,14 @@ import {
   log as gitLog,
   type FileStatus,
 } from "@/lib/isogit";
+import { currentTeam } from "@/lib/api";
+import {
+  syncLocalGitops,
+  readLocalSnapshot,
+  localProviderActive,
+  localGitLog,
+  type LocalSnapshot,
+} from "@/lib/gitops-local";
 
 // Client-side git in the browser (isomorphic-git + LightningFS). The PAT is held
 // only in this tab (localStorage) and is sent over our own same-origin proxy —
@@ -62,6 +70,8 @@ export default function GitPage() {
         title="Git"
         desc="Client-side git in your browser — clone, commit, push, and create repos with isomorphic-git. No server-side checkout."
       />
+
+      <GitOpsMirrorCard />
 
       <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
         {/* Credentials */}
@@ -266,6 +276,148 @@ function ExistingRepoCard({
           </>
         )}
       </div>
+    </Card>
+  );
+}
+
+/**
+ * GitOps mirror (issue #4). Shows where dashboard CRUD ops are reflected to as
+ * declarative config: a linked remote config repo, or — with zero setup — the
+ * LOCAL in-browser provider, a real isomorphic-git repo that materializes the
+ * OpenEdge artifact tree (openedge.yaml, per-project specs, meta, CI) and commits
+ * on every change. Every git/CRUD op is also logged to the browser console.
+ */
+function GitOpsMirrorCard() {
+  const [snap, setSnap] = useState<LocalSnapshot | null>(null);
+  const [linked, setLinked] = useState(false);
+  const [commits, setCommits] = useState<Array<{ oid: string; message: string; author: string; ts: number }>>([]);
+  const [openFile, setOpenFile] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [team, setTeam] = useState("personal");
+
+  const refresh = useCallback(async () => {
+    setLinked(!localProviderActive());
+    setTeam(currentTeam());
+    setSnap(readLocalSnapshot());
+    setCommits(await localGitLog());
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    // The provider commits ~asynchronously after a CRUD mutation fires the event;
+    // re-read the snapshot shortly after so the UI reflects the new commit.
+    const onSync = () => window.setTimeout(refresh, 900);
+    window.addEventListener("gitops-sync", onSync);
+    return () => window.removeEventListener("gitops-sync", onSync);
+  }, [refresh]);
+
+  async function syncNow() {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await syncLocalGitops();
+      await refresh();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function downloadFile(path: string, content: string) {
+    const blob = new Blob([content], { type: "text/plain" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = path.split("/").pop() || "artifact.yaml";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  }
+
+  return (
+    <Card className="mb-5 p-5">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 font-semibold">
+          <FolderGit2 className="h-4 w-4" /> GitOps mirror
+          {linked ? (
+            <Badge tone="green"><Cloud className="mr-1 h-3 w-3" /> Remote repo</Badge>
+          ) : (
+            <Badge tone="blue"><HardDrive className="mr-1 h-3 w-3" /> Local provider</Badge>
+          )}
+        </div>
+        {!linked && (
+          <Button onClick={syncNow} disabled={busy} variant="outline" className="self-start">
+            <RefreshCw className={`mr-1.5 h-3.5 w-3.5 ${busy ? "animate-spin" : ""}`} /> Sync now
+          </Button>
+        )}
+      </div>
+
+      {linked ? (
+        <p className="text-xs text-secondary">
+          A remote config repo is linked — every CRUD op (new project/deployment, deletions, settings,
+          env, regions) is committed to it automatically. Open DevTools to see each reflection logged.
+        </p>
+      ) : (
+        <p className="text-xs text-secondary">
+          No remote config repo linked, so OpenEdge mirrors your config <strong>locally in this browser</strong> as
+          a real git repo — translating every dashboard CRUD op into versioned GitOps artifacts. Connect GitHub
+          from <span className="font-mono">Integrations</span> to push these to a repo instead.
+        </p>
+      )}
+
+      {snap ? (
+        <div className="mt-4 grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div>
+            <div className="mb-2 flex items-center gap-3 text-xs text-secondary">
+              <span><code className="font-mono text-fg">{snap.repo}</code></span>
+              <span>· {snap.projectCount} project{snap.projectCount === 1 ? "" : "s"}</span>
+              <span>· {snap.files.length} artifacts</span>
+              {snap.commit && <span>· <code className="font-mono">{snap.commit}</code></span>}
+            </div>
+            <div className="rounded-md border border-border bg-bg">
+              {snap.files.map((f) => (
+                <div key={f.path} className="border-b border-border last:border-0">
+                  <button
+                    onClick={() => setOpenFile(openFile === f.path ? null : f.path)}
+                    className="flex w-full items-center justify-between px-3 py-1.5 text-left font-mono text-xs hover:bg-card"
+                  >
+                    <span className="flex items-center gap-1.5 truncate"><FileCode2 className="h-3.5 w-3.5 shrink-0 text-muted" /> {f.path}</span>
+                    <span className="ml-2 shrink-0 text-muted">{f.content.length} B</span>
+                  </button>
+                  {openFile === f.path && (
+                    <div className="border-t border-border bg-card p-2">
+                      <div className="mb-1 flex justify-end">
+                        <button onClick={() => downloadFile(f.path, f.content)} className="text-[11px] text-link hover:underline">
+                          Download
+                        </button>
+                      </div>
+                      <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all text-[11px] leading-relaxed text-secondary">{f.content}</pre>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+          <div>
+            <div className="mb-2 text-xs font-medium text-secondary">Local commit history</div>
+            <div className="rounded-md border border-border bg-bg p-2 font-mono text-[11px] text-secondary">
+              {commits.length === 0 ? (
+                <span className="text-muted">No commits yet — trigger a CRUD op or Sync now.</span>
+              ) : (
+                commits.slice(0, 12).map((c) => (
+                  <div key={c.oid} className="truncate"><span className="text-muted">{c.oid}</span> {c.message}</div>
+                ))
+              )}
+            </div>
+            <p className="mt-2 text-[11px] text-muted">
+              Last synced {snap.syncedAt ? new Date(snap.syncedAt).toLocaleString() : "—"} · team{" "}
+              <code className="font-mono">{team}</code>
+            </p>
+          </div>
+        </div>
+      ) : (
+        <p className="mt-4 text-xs text-muted">
+          No local mirror yet. Make any config change (or click <strong>Sync now</strong>) to materialize the GitOps
+          artifact tree in this browser.
+        </p>
+      )}
     </Card>
   );
 }

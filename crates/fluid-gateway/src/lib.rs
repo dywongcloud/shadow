@@ -232,6 +232,22 @@ impl Gateway {
         st.deployments.get(&did).map(view_of)
     }
 
+    /// Keep-warm reconciliation: only the PRODUCTION deployment of each project
+    /// keeps its configured `min_instances` warm; every superseded (non-production)
+    /// deployment is drained to zero. Without this, each redeploy left an old
+    /// deployment pinning an idle warm instance (N warm microVMs per project).
+    /// Idempotent — safe to call on a timer and after deploy/promote.
+    pub fn reconcile_keepwarm(&self) {
+        let st = self.state.lock();
+        for d in st.deployments.values() {
+            for f in &d.manifest.functions {
+                let key = func_key(d.id.as_str(), &f.name);
+                let n = if d.production { f.min_instances } else { 0 };
+                self.fluid.set_min_instances(&key, n);
+            }
+        }
+    }
+
     /// Delete a single deployment: unregister its functions and drop it. Returns
     /// the project it belonged to (so callers can persist / re-point).
     pub async fn remove(&self, id: &str) -> Option<String> {

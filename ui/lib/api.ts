@@ -22,9 +22,12 @@ export async function apiGet<T>(path: string): Promise<T> {
 }
 
 // Mutations to these paths change the declarative config, so they should reflect
-// in the committed GitOps YAML. We fire a debounced sync event the GitOps loop
-// listens for (server-side it's a no-op when unlinked / nothing changed).
-const CONFIG_PATHS = /^\/v1\/(projects\/|teams\/?$|teams\/|databases|securelinks|gitops)/;
+// in the committed GitOps YAML (or the local in-browser provider when no repo is
+// linked). We fire a debounced sync event the GitOps loop listens for. Covers:
+// new projects + new deployments (`git/deploy`), deleted projects + all settings/
+// env/build/function/domain updates (`projects/`), teams, databases, securelinks.
+const CONFIG_PATHS = /^\/v1\/(projects\/|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy)/;
+const GITOPS_BADGE = "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
 
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
   const r = await fetch(`${BASE}${path}`, {
@@ -40,6 +43,14 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
   }
   const isMutation = method !== "GET" && method !== "HEAD";
   if (typeof window !== "undefined" && isMutation && CONFIG_PATHS.test(path) && path !== "/v1/gitops") {
+    // Reflect this CRUD op to GitOps (remote repo if linked, else the local
+    // in-browser provider). Log it so the mirroring is observable in DevTools.
+    const linked = localStorage.getItem("hive_gitops_linked") === "1";
+    console.log(
+      `%cgitops%c reflect ${method} ${path} → ${linked ? "remote config repo" : "local in-browser provider"}`,
+      GITOPS_BADGE,
+      "color:inherit",
+    );
     window.dispatchEvent(new Event("gitops-sync"));
   }
   return r.json();
@@ -197,6 +208,10 @@ export interface FunctionStats {
   traditional_ms: number;
   fluid_ms: number;
   savings_pct: number;
+  /** Active CPU pricing (Vercel Fluid convention). */
+  active_cpu_ms: number;
+  memory_gb_hrs: number;
+  active_cpu_savings_pct: number;
 }
 
 export interface GitSource {

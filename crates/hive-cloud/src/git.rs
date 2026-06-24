@@ -104,6 +104,41 @@ fn deploy_root() -> PathBuf {
     std::env::temp_dir().join("hive-deploys")
 }
 
+/// Self-management GC: reap stale clone/build working dirs under `hive-deploys`.
+/// Each build clones a repo into `<root>/<project>-<stamp>` (and `-building-<ms>`);
+/// these are NOT removed after the build, so they accumulate and exhaust `/tmp`
+/// disk over time. Remove any dir untouched for longer than `max_age` — a live
+/// build keeps writing into its dir, so a stale mtime means the build is done (or
+/// died). Best-effort; returns the number of dirs removed.
+pub async fn gc_build_dirs(max_age: Duration) -> usize {
+    let root = deploy_root();
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let now = std::time::SystemTime::now();
+    let mut removed = 0usize;
+    while let Ok(Some(e)) = entries.next_entry().await {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let stale = e
+            .metadata()
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .map(|age| age > max_age)
+            .unwrap_or(false);
+        if stale && tokio::fs::remove_dir_all(&p).await.is_ok() {
+            removed += 1;
+            tracing::info!(dir = %p.display(), "gc: reaped stale build dir");
+        }
+    }
+    removed
+}
+
 /// Start a build; returns its id immediately. The build runs in the background.
 pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
@@ -220,7 +255,28 @@ async fn run_build(
     // which is the resource-poor local Mac. See `schedule::place`.
     if !req.no_fanout {
         let regions = cloud.projects.get(&project).functions.regions;
-        let targets = crate::schedule::place(cloud, &regions);
+        // is_container is unknown until the repo is built (Dockerfile detection),
+        // so default to firecracker placement here; a container is re-homed to a
+        // podman-capable node after the build (see the capability re-dispatch below).
+        let targets = crate::schedule::place(cloud, &regions, false);
+        // #3: surface the auto-chosen region(s) in Function Settings — when a
+        // project has none configured (new project), persist where the scheduler
+        // placed it so the dashboard shows that region pre-selected/checked.
+        if regions.is_empty() && !targets.is_empty() {
+            let node_region: std::collections::HashMap<String, String> =
+                cloud.registry.nodes().into_iter().map(|n| (n.name, n.region)).collect();
+            let mut placed: Vec<String> =
+                targets.iter().filter_map(|t| node_region.get(&t.node).cloned()).filter(|r| !r.is_empty()).collect();
+            placed.sort();
+            placed.dedup();
+            if !placed.is_empty() {
+                let mut fs = cloud.projects.get(&project).functions;
+                fs.regions = placed.clone();
+                cloud.projects.set_functions(&project, fs);
+                crate::persist::persist(cloud);
+                log(format!("Default region(s) set in Function Settings: {}", placed.join(", ")));
+            }
+        }
         let local_selected = targets.iter().any(|t| t.admin.is_none());
         let remote: Vec<crate::schedule::Target> =
             targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
@@ -232,7 +288,17 @@ async fn run_build(
             let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             log(format!("Placement: region-aware scheduler → {}", names.join(", ")));
             let ok = fanout_remote(cloud, bid, &req, &project, &remote).await;
-            cleanup_non_targets(cloud, &project, &names).await;
+            // Atomic promotion (Vercel convention): only relocate — i.e. remove the
+            // project from nodes that still host the PREVIOUS deployment — once the
+            // new placement actually built & is serving. A FAILED build must never
+            // take down the currently-serving deployment; the old one keeps serving
+            // and the user just sees a failed build. (This is the bug that dropped a
+            // healthy project when a relocating redeploy errored.)
+            if ok {
+                cleanup_non_targets(cloud, &project, &names).await;
+            } else {
+                log("Build failed — keeping the existing deployment in place (no relocation).".into());
+            }
             cloud.builds.update(bid, |b| {
                 b.state = if ok { DeployState::Ready } else { DeployState::Error };
                 b.finished_ms = Some(now_ms());
@@ -418,6 +484,18 @@ async fn run_build(
         f.max_duration_secs = fsettings.default_max_duration_secs;
         f.vcpus = fsettings.vcpus.max(1);
         f.memory_mib = fsettings.memory_mib;
+        // Fluid Compute (the project's `fluid_enabled` toggle): when ON (default),
+        // one warm instance serves MANY concurrent requests (in-instance
+        // concurrency — ideal for I/O-bound work like LLM/DB calls that sit idle
+        // waiting) and at least one instance is kept warm to avoid cold starts.
+        // When OFF, fall back to classic one-request-per-instance + scale-to-zero.
+        if fsettings.fluid_enabled {
+            f.max_concurrency = f.max_concurrency.max(10);
+            f.min_instances = f.min_instances.max(1);
+        } else {
+            f.max_concurrency = 1;
+            f.min_instances = 0;
+        }
     }
 
     // ---- Merge vercel.json routing/headers/crons/images + per-function config ----
@@ -491,6 +569,36 @@ async fn run_build(
         commit: commit.clone(),
         commit_message: commit_message.clone(),
     };
+    // Capability re-home: a CONTAINER deployment (`__container__`/podman) can only
+    // run on the mock/podman backend — a Firecracker node can't, so it would fail
+    // every cold start ("no capacity / No such file or directory"). If we built a
+    // container on a non-mock node, re-dispatch it to a podman-capable node and do
+    // NOT host it here. (Re-home terminates at the mock node — its backend IS mock,
+    // so it serves the container without re-dispatching again.)
+    if !build_failed
+        && cloud.gw.backend_name() != "mock"
+        && manifest.functions.iter().any(|f| f.runtime == "container")
+    {
+        let regions = cloud.projects.get(&project).functions.regions;
+        let remote: Vec<crate::schedule::Target> = crate::schedule::place(cloud, &regions, true)
+            .into_iter()
+            .filter(|t| t.admin.is_some())
+            .collect();
+        if !remote.is_empty() {
+            let names: Vec<String> = remote.iter().map(|t| t.node.clone()).collect();
+            log(format!("Container deployment — re-homing to podman-capable node(s): {}", names.join(", ")));
+            let ok = fanout_remote(cloud, bid, &req, &project, &remote).await;
+            cleanup_non_targets(cloud, &project, &names).await;
+            cloud.builds.update(bid, |b| {
+                b.state = if ok { DeployState::Ready } else { DeployState::Error };
+                b.finished_ms = Some(now_ms());
+            });
+            crate::persist::persist(cloud);
+            return Ok(());
+        }
+        log("WARN: container deployment but no podman-capable node is reachable; serving will fail.".into());
+    }
+
     // For an isolated backend (Firecracker), a serving microVM cannot see the
     // host build dir the mock backend serves from. Pack the build output into a
     // per-deployment artifact the cell mounts at /build, and point this
@@ -619,7 +727,7 @@ async fn run_build(
     // the project from nodes that are no longer targets. Only on a clean build.
     if !req.no_fanout && !build_failed {
         let regions = cloud.projects.get(&project).functions.regions;
-        let targets = crate::schedule::place(cloud, &regions);
+        let targets = crate::schedule::place(cloud, &regions, false);
         if targets.iter().any(|t| t.admin.is_none()) {
             let remote: Vec<crate::schedule::Target> =
                 targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
@@ -1268,6 +1376,25 @@ async fn build_via_fdi(
                 detect_start_cmd(dir).await
             };
             log(format!("Provisioning serverless server: `{}`.", start.join(" ")));
+            // Per-route bundle splitting (Issue: SHADOW_NEXT_PER_ROUTE) — DISCOVERY
+            // ONLY for now. When enabled and this is a Next.js app, classify each
+            // route from the .next manifests + file traces and write a per-route
+            // build manifest. The serve path is UNCHANGED (still `next start`); the
+            // runtime dispatcher consumes this manifest separately and falls back.
+            if std::env::var("SHADOW_NEXT_PER_ROUTE").map(|v| v == "1" || v == "true").unwrap_or(false) {
+                let next_dir = dir.join(".next");
+                if next_dir.exists() {
+                    let prm = fluid_build::per_route::discover(&next_dir);
+                    log(format!(
+                        "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
+                        prm.routes.len(), prm.eligible_count(), prm.fallback_count()
+                    ));
+                    if let Ok(js) = serde_json::to_string_pretty(&prm) {
+                        let _ = tokio::fs::write(dir.join("shadow-per-route.json"), js).await;
+                        log("per-route: wrote shadow-per-route.json (build manifest). Serving still uses `next start` (fallback).".into());
+                    }
+                }
+            }
             Ok(function_manifest(project, start))
         }
     }

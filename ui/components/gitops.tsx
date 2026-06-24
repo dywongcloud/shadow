@@ -8,10 +8,21 @@ import { currentTeam } from "@/lib/api";
 interface GhStatus { configured: boolean; connected: boolean; entity?: string | null }
 interface Repo { name: string; full_name: string; default_branch: string; private: boolean; owner?: string }
 
-/** Fire a GitOps config sync (no-op server-side if nothing changed / not linked). */
+/**
+ * Fire a GitOps config sync. If a remote config repo is linked, push the artifact
+ * tree to it (deduped server-side by content hash). Otherwise mirror the same tree
+ * into the LOCAL in-browser provider (issue #4) so CRUD ops still produce versioned
+ * GitOps artifacts with zero external setup. The local module is dynamically
+ * imported so isomorphic-git never bloats the main bundle.
+ */
 export function triggerGitopsSync() {
   if (typeof window === "undefined") return;
-  if (localStorage.getItem("hive_gitops_linked") !== "1") return;
+  if (localStorage.getItem("hive_gitops_linked") !== "1") {
+    import("@/lib/gitops-local")
+      .then((m) => m.syncLocalGitops())
+      .catch(() => {});
+    return;
+  }
   fetch("/api/gitops/sync", {
     method: "POST",
     headers: { "content-type": "application/json" },

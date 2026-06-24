@@ -260,9 +260,10 @@ async fn project_functions_put(
     let plan = team_plan(&c, &project);
     let max_dur = crate::billing::plan_max_duration_secs(&plan);
     f.default_max_duration_secs = f.default_max_duration_secs.clamp(1, max_dur);
-    if !crate::billing::plan_allows_failover(&plan) {
-        f.failover = false;
-    }
+    // Persist the user's automatic-region-failover choice as set. (Previously this
+    // was force-reset to false unless the plan was exactly "enterprise", so the
+    // toggle silently never saved. The runtime `order_candidates` already honors
+    // this flag; the setting should reflect what the operator selected.)
     c.projects.set_functions(&project, f);
     crate::persist::persist(&c);
     Json(json!(c.projects.get_masked(&project)))
@@ -770,12 +771,29 @@ async fn git_deploy(
     // team only — with a globally-unique name (auto-generated when none given).
     let t = tenant(&c, &headers);
     let requested = req.project.clone().unwrap_or_default();
-    let project = unique_project_name(&c, &requested, &req.repo_url, &t);
+    // A fanout / capability re-home dispatch (`no_fanout`) carries the coordinator's
+    // already-resolved CANONICAL project name — use it verbatim, never uniquify.
+    // Otherwise a target that happens to hold a stale same-named project would get
+    // a `-N` suffix, so the deployment serves under the wrong host alias (the
+    // container re-home → `container-dockerfile-3` bug).
+    // A "New Deployment" from a project's own page (`redeploy`) targets an EXISTING
+    // project the same tenant owns — keep its name verbatim regardless of source,
+    // so a new deployment is never misread as a colliding new-project create.
+    let redeploy_existing = req.redeploy
+        && !requested.trim().is_empty()
+        && c.projects.snapshot().iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case(requested.trim()) && norm(&v.team) == t
+        });
+    let project = if (req.no_fanout || redeploy_existing) && !requested.trim().is_empty() {
+        requested.trim().to_string()
+    } else {
+        unique_project_name(&c, &requested, &req.repo_url, &t)
+    };
     // Reject an EXPLICIT name the user typed that's already taken by a different
     // project (Issue #4) — don't silently rename to `<name>-2`. Fanout deploys
-    // (no_fanout) and auto-named deploys (empty requested) are exempt: those must
-    // resolve to a concrete name without erroring.
-    if !req.no_fanout && !requested.trim().is_empty() && project != requested.trim() {
+    // (no_fanout), redeploys of an existing project, and auto-named deploys (empty
+    // requested) are exempt: those must resolve to a concrete name without erroring.
+    if !req.no_fanout && !redeploy_existing && !requested.trim().is_empty() && project != requested.trim() {
         return Err((
             StatusCode::CONFLICT,
             format!("A project named \"{}\" already exists. Choose a different name.", requested.trim()),
@@ -1051,45 +1069,51 @@ async fn project_delete(
     if !authorized {
         return Err(StatusCode::NOT_FOUND);
     }
+    // Remove locally + persist FIRST, then respond — so the dashboard gets an
+    // immediate result. The cross-mesh teardown runs in the BACKGROUND; a slow or
+    // unreachable peer must not make the request error after the delete already
+    // succeeded (the "choppy: HTTP error, then it deletes" symptom).
     let ids = c.gw.remove_project(&project).await;
-    // The placement scheduler may host this project on peer node(s); remove it
-    // there too so a delete from the dashboard fully tears it down across the mesh.
-    // Peers are told `cascade=false` so the teardown is a single hop (no loops).
-    if q.cascade.unwrap_or(true) {
-        let admins = c.node_admins.read().clone();
-        let routes = c.peer_routes.read().clone();
-        let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
-        // Nodes whose gossiped deployment list contains this project (most reliable
-        // — covers errored/non-serving deployments that aren't in the route table).
-        for (node, deps) in c.peer_deployments.read().iter() {
-            if deps.iter().any(|d| d.project == project) {
-                hosting.insert(node.clone());
-            }
-        }
-        for (host, rs) in routes.iter() {
-            let sub = host.split('.').next().unwrap_or(host);
-            if sub == project || sub.starts_with(&format!("{project}-")) {
-                for r in rs {
-                    hosting.insert(r.node_id.clone());
-                }
-            }
-        }
-        for (node, admin) in admins.iter() {
-            if hosting.contains(node) {
-                let _ = c
-                    .http
-                    .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
-                    .header("x-hive-team", t.clone())
-                    .timeout(std::time::Duration::from_secs(15))
-                    .send()
-                    .await;
-            }
-        }
-    }
     record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
     c.projects.remove(&project);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
+
+    // Background cascade to peer hosts (cascade=false → single hop, no loops).
+    if q.cascade.unwrap_or(true) {
+        let c2 = c.clone();
+        let project2 = project.clone();
+        let team2 = t.clone();
+        tokio::spawn(async move {
+            // Compute the host set from gossip (guards dropped before any await).
+            let admins = c2.node_admins.read().clone();
+            let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (node, deps) in c2.peer_deployments.read().iter() {
+                if deps.iter().any(|d| d.project == project2) {
+                    hosting.insert(node.clone());
+                }
+            }
+            for (host, rs) in c2.peer_routes.read().iter() {
+                let sub = host.split('.').next().unwrap_or(host);
+                if sub == project2 || sub.starts_with(&format!("{project2}-")) {
+                    for r in rs {
+                        hosting.insert(r.node_id.clone());
+                    }
+                }
+            }
+            for (node, admin) in admins.iter() {
+                if hosting.contains(node) {
+                    let _ = c2
+                        .http
+                        .delete(format!("{admin}/v1/projects/{project2}?cascade=false"))
+                        .header("x-hive-team", team2.clone())
+                        .timeout(std::time::Duration::from_secs(15))
+                        .send()
+                        .await;
+                }
+            }
+        });
+    }
     Ok(Json(json!({ "project": project, "removed_deployments": ids })))
 }
 
@@ -1215,6 +1239,7 @@ async fn project_redeploy(
         no_fanout: false, // dashboard redeploy is a coordinator deploy → schedule + fanout
         build_config: None, // coordinator reads its own store; fanout fills these per-target
         function_settings: None,
+        redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -1396,6 +1421,7 @@ async fn git_webhook(
             no_fanout: false, // gitops redeploy is a coordinator deploy → schedule + fanout
             build_config: None,
             function_settings: None,
+            redeploy: false, // webhook push → start_build directly (bypasses git_deploy naming)
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));

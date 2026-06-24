@@ -90,6 +90,9 @@ export function CreateDeploymentModal({
         target,
         production: target === "production",
         env: Object.keys(env).length ? env : undefined,
+        // This is a new deployment of an EXISTING project (we're on its page), not
+        // a new-project create — keep the name verbatim, never 409 / suffix.
+        redeploy: true,
       });
       toast("New Deployment Created");
       onDone?.(r.build_id, target);

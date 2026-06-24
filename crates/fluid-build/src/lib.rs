@@ -16,6 +16,7 @@ pub mod build_output;
 pub mod framework;
 pub mod nextjs;
 pub mod parser;
+pub mod per_route;
 pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};

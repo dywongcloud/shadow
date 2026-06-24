@@ -13,6 +13,12 @@
 //! * **Keep-warm** — `min_instances` are kept ready.
 //! * **Scale-to-zero** — idle instances beyond `min_instances` are drained
 //!   after `idle_ttl`.
+//! * **`waitUntil`** — an instance's lease is held for a declared post-response
+//!   window (`x-fluid-wait-until-ms`) so background work runs after the response
+//!   (see `fluid-gateway`).
+//! * **Active CPU pricing** — metering reports active CPU time (ms) + provisioned
+//!   memory (GB-hrs), not idle wall-time (`FunctionStats`), matching Fluid's
+//!   billing convention where I/O-idle time isn't CPU-billed.
 //!
 //! Concurrency discipline matches the control plane: one `parking_lot::Mutex`
 //! over the registry, never held across an `.await`; backend provisioning and
@@ -103,6 +109,18 @@ pub struct FunctionStats {
     pub savings_pct: f64,
     /// Instances reaped as unhealthy/unreachable and replaced.
     pub dead_reaped: u64,
+    // ---- Active CPU pricing (Vercel Fluid convention) -------------------------
+    // Fluid bills the ACTIVE CPU time used (ms) plus the PROVISIONED MEMORY
+    // (GB-hrs) — NOT idle wall-time. While an instance waits on I/O (DB, API, LLM)
+    // it isn't billed for CPU, which is where the "90%+ savings" come from.
+    /// Active CPU time across all requests (ms) — the time instances were actually
+    /// processing, excluding idle keep-warm time.
+    pub active_cpu_ms: u64,
+    /// Provisioned memory consumed, in GB-hours: Σ (instance memory GB × alive hrs).
+    pub memory_gb_hrs: f64,
+    /// Additional savings of Active-CPU billing vs paying for full instance-time
+    /// (fluid_ms), 0.0–1.0 — the "Active CPU pricing" story on top of multiplexing.
+    pub active_cpu_savings_pct: f64,
 }
 
 pub struct FluidConfig {
@@ -190,6 +208,16 @@ impl Fluid {
         );
     }
 
+    /// Set a pool's keep-warm floor. Setting it to 0 lets the autoscaler drain the
+    /// pool's idle instances to zero (scale-to-zero) — used to stop keeping
+    /// superseded (non-production) deployments warm while still allowing a cold
+    /// start if their immutable URL is hit. No-op if the pool isn't registered.
+    pub fn set_min_instances(&self, key: &str, n: u32) {
+        if let Some(p) = self.registry.lock().get_mut(key) {
+            p.cfg.min_instances = n;
+        }
+    }
+
     /// The owning tenant of a function pool (normalized), if registered.
     pub fn tenant_of(&self, key: &str) -> Option<String> {
         self.registry.lock().get(key).map(|p| p.tenant.clone())
@@ -237,6 +265,17 @@ impl Fluid {
                 } else {
                     0.0
                 };
+                // Active CPU pricing (Vercel convention): bill active processing
+                // time + provisioned memory GB-hrs, not idle instance wall-time.
+                let active_cpu_ms = p.served_ms_sum;
+                let memory_gb_hrs = (p.cfg.memory_mib as f64 / 1024.0) * (fluid_ms as f64 / 3_600_000.0);
+                // Active-CPU billing only charges processing time, so on top of the
+                // multiplexing win it saves the idle keep-warm portion of fluid_ms.
+                let active_cpu_savings_pct = if fluid_ms > 0 {
+                    (1.0 - (active_cpu_ms as f64 / fluid_ms as f64)).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
                 FunctionStats {
                     key: k.clone(),
                     instances: p.instances.iter().filter(|i| !i.draining).count(),
@@ -251,6 +290,9 @@ impl Fluid {
                     fluid_ms,
                     savings_pct,
                     dead_reaped: p.dead_reaped,
+                    active_cpu_ms,
+                    memory_gb_hrs,
+                    active_cpu_savings_pct,
                 }
             })
             .collect();
