@@ -1,274 +1,247 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import dynamic from "next/dynamic";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ChevronRight, ScrollText, MoreHorizontal, ChevronDown, Loader2 } from "lucide-react";
-import { usePoll, type WorkflowRun, type StepRun } from "@/lib/api";
-import { Triangle } from "@/components/ui";
-import { statusView, fmtDuration, runDuration } from "@/components/workflows";
+import { useSearchParams } from "next/navigation";
+import { ChevronLeft, Loader2 } from "lucide-react";
+import { apiGet } from "@/lib/api";
 
-// Lazy-load the React Flow manifest canvas (heavy) — only when the Graph tab opens.
-const WorkflowGraph = dynamic(() => import("@/components/workflow-graph").then((m) => m.WorkflowGraph), {
-  ssr: false,
-  loading: () => (
-    <div className="flex h-[460px] items-center justify-center rounded-xl border border-border bg-bg">
-      <Loader2 className="h-5 w-5 animate-spin text-muted" />
-    </div>
-  ),
-});
-
-function useNow(ms = 1000) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), ms);
-    return () => clearInterval(id);
-  }, [ms]);
-  return now;
+// Timestamps from the WDK world are epoch SECONDS (float). Normalize to ms.
+const toMs = (t: unknown): number | null => {
+  if (typeof t !== "number") return null;
+  return t > 1e12 ? t : t * 1000; // already-ms vs seconds
+};
+// "workflow//./app/workflows/session//sessionWorkflow" → "sessionWorkflow"
+function cleanName(n?: string): string {
+  if (!n) return "workflow";
+  const parts = n.split("/").filter(Boolean);
+  return parts[parts.length - 1] || n;
+}
+function fmtDur(ms: number | null): string {
+  if (ms == null || ms < 0) return "—";
+  if (ms < 1000) return `${Math.round(ms)}ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
+  const m = Math.floor(ms / 60_000);
+  return `${m}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+function fmtTime(ms: number | null): string {
+  if (ms == null) return "—";
+  return new Date(ms).toLocaleString();
 }
 
-type Tab = "trace" | "graph" | "events" | "streams";
+type Status = string;
+const STATUS_COLOR: Record<string, string> = {
+  completed: "#16a34a",
+  succeeded: "#16a34a",
+  running: "#0070f3",
+  pending: "#a1a1aa",
+  queued: "#a1a1aa",
+  failed: "#dc2626",
+  error: "#dc2626",
+  cancelled: "#d97706",
+};
+const colorFor = (s: Status) => STATUS_COLOR[(s || "").toLowerCase()] || "#71717a";
+
+function StatusBadge({ status }: { status: string }) {
+  const c = colorFor(status);
+  const running = (status || "").toLowerCase() === "running";
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 text-xs font-medium" style={{ background: `${c}1a`, color: c }}>
+      <span className={`h-1.5 w-1.5 rounded-full ${running ? "animate-pulse" : ""}`} style={{ background: c }} />
+      {status || "unknown"}
+    </span>
+  );
+}
+
+interface Step {
+  stepId?: string;
+  stepName?: string;
+  status?: string;
+  attempt?: number;
+  startedAt?: number;
+  completedAt?: number;
+  createdAt?: number;
+  error?: unknown;
+}
+interface RunDetail {
+  run?: Record<string, any>;
+  steps?: Step[];
+  events?: Record<string, any>[];
+}
 
 export default function RunDetailPage({ params }: { params: { id: string } }) {
-  const id = decodeURIComponent(params.id);
-  const { data: run } = usePoll<WorkflowRun>(`/v1/workflows/runs/${encodeURIComponent(id)}`, 1500);
-  const now = useNow();
-  const [tab, setTab] = useState<Tab>("trace");
-  const [selected, setSelected] = useState<number | null>(null);
+  return (
+    <Suspense fallback={<div className="mx-auto max-w-5xl px-4 py-6 text-sm text-secondary">Loading run…</div>}>
+      <RunDetail id={params.id} />
+    </Suspense>
+  );
+}
 
-  if (!run) {
-    return <div className="py-20 text-center text-sm text-secondary">Loading run…</div>;
-  }
+function RunDetail({ id }: { id: string }) {
+  const runId = decodeURIComponent(id);
+  const project = useSearchParams().get("project") || "";
+  const [data, setData] = useState<RunDetail | null>(null);
+  const [err, setErr] = useState("");
+  const [now, setNow] = useState(() => Date.now());
+  const [tab, setTab] = useState<"gantt" | "events" | "io">("gantt");
 
-  const sv = statusView(run.status);
-  const total = runDuration(run, now);
-  const sel = selected != null ? run.steps[selected] : null;
+  const run = data?.run ?? {};
+  const status = (run.status as string) || "";
+  const isLive = ["running", "pending", "queued"].includes(status.toLowerCase());
+
+  // Poll the run detail. Poll fast while live, slow once terminal.
+  useEffect(() => {
+    let stop = false;
+    const path = `/v1/workflows/runs/${encodeURIComponent(runId)}${project ? `?project=${encodeURIComponent(project)}` : ""}`;
+    const tick = async () => {
+      try {
+        const d = await apiGet<RunDetail>(path);
+        if (!stop) setData(d);
+      } catch (e) {
+        if (!stop) setErr(String(e));
+      }
+    };
+    tick();
+    const iv = setInterval(tick, isLive ? 1500 : 6000);
+    return () => { stop = true; clearInterval(iv); };
+  }, [runId, project, isLive]);
+
+  // Clock for live bar growth.
+  useEffect(() => {
+    if (!isLive) return;
+    const iv = setInterval(() => setNow(Date.now()), 500);
+    return () => clearInterval(iv);
+  }, [isLive]);
+
+  const steps = data?.steps ?? [];
+
+  // Gantt timeline window: run start → run end (or now if live).
+  const { t0, t1 } = useMemo(() => {
+    const starts = [toMs(run.startedAt), toMs(run.createdAt), ...steps.map((s) => toMs(s.startedAt) ?? toMs(s.createdAt))].filter((x): x is number => x != null);
+    const ends = [toMs(run.completedAt), ...steps.map((s) => toMs(s.completedAt))].filter((x): x is number => x != null);
+    const start = starts.length ? Math.min(...starts) : now - 1000;
+    const end = isLive ? Math.max(now, ...(ends.length ? ends : [start])) : ends.length ? Math.max(...ends) : start + 1000;
+    return { t0: start, t1: Math.max(end, start + 1) };
+  }, [data, now, isLive]);
+  const span = Math.max(t1 - t0, 1);
+
+  const runStart = toMs(run.startedAt) ?? toMs(run.createdAt);
+  const runEnd = toMs(run.completedAt) ?? (isLive ? now : null);
+  const runDur = runStart != null ? (runEnd ?? now) - runStart : null;
 
   return (
-    <div className="pb-20">
-      {/* Breadcrumb */}
-      <div className="mb-5 flex items-center gap-1.5 text-sm text-secondary">
-        <Link href={`/projects/${encodeURIComponent(run.project)}?tab=workflows`} className="flex items-center gap-1.5 hover:text-fg">
-          <Triangle className="h-4 w-4" /> {run.project || "default"}
-        </Link>
-        <ChevronRight className="h-3.5 w-3.5 text-muted" />
-        <Link href="/workflows" className="hover:text-fg">Workflows</Link>
-        <ChevronRight className="h-3.5 w-3.5 text-muted" />
-        <span className="font-mono text-fg">{run.id}</span>
-      </div>
+    <div className="mx-auto max-w-5xl px-4 py-6">
+      <Link href="/workflows" className="mb-4 inline-flex items-center gap-1 text-sm text-secondary hover:text-fg">
+        <ChevronLeft className="h-4 w-4" /> Workflows
+      </Link>
 
-      {/* Title */}
-      <div className="mb-5 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <span className="text-xl font-semibold">{run.name || run.def_id}</span>
-          <span className="font-mono text-sm text-muted">{run.id}</span>
-          <span className={`flex items-center gap-1.5 text-sm ${sv.text}`}>
-            <span className={`h-2 w-2 rounded-full ${sv.dot}`} /> {sv.label}
-          </span>
+      {/* Header */}
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <h1 className="truncate text-xl font-semibold">{cleanName(run.workflowName)}</h1>
+            <StatusBadge status={status} />
+            {isLive && <Loader2 className="h-4 w-4 animate-spin text-[#0070f3]" />}
+          </div>
+          <div className="mt-1 font-mono text-xs text-muted">{runId}</div>
         </div>
-        <div className="flex items-center gap-2">
-          <Link href={`/projects/${encodeURIComponent(run.project)}/logs`} className="flex items-center gap-1.5 rounded-md border border-border-strong px-3 py-1.5 text-sm hover:bg-subtle">
-            <ScrollText className="h-3.5 w-3.5" /> View Logs
-          </Link>
-          <button className="flex h-8 w-8 items-center justify-center rounded-md border border-border-strong text-muted hover:bg-subtle"><MoreHorizontal className="h-4 w-4" /></button>
+        <div className="flex gap-5 text-sm">
+          <div><div className="text-xs text-muted">Started</div><div>{fmtTime(runStart)}</div></div>
+          <div><div className="text-xs text-muted">Duration</div><div>{fmtDur(runDur)}</div></div>
+          <div><div className="text-xs text-muted">Steps</div><div>{steps.length}</div></div>
         </div>
       </div>
 
-      {/* Meta */}
-      <div className="mb-6 grid grid-cols-2 gap-4 rounded-xl border border-border bg-card px-5 py-4 sm:grid-cols-5">
-        <Meta label="Created" value={`${fmtDuration(now - run.started_ms)} ago`} />
-        <Meta label="Completed" value={run.finished_ms ? `${fmtDuration(now - run.finished_ms)} ago` : "—"} />
-        <Meta label="Duration" value={fmtDuration(total)} />
-        <Meta label="Steps" value={String(run.steps.length)} />
-        <Meta label="Storage" value={`${Math.max(1, run.steps.length)} KB`} />
-      </div>
+      {err && !data && <p className="text-sm text-red-600">{err}</p>}
 
       {/* Tabs */}
-      <div className="mb-4 flex items-center gap-1 rounded-lg border border-border bg-card p-1 w-fit">
-        {(["trace", "graph", "events", "streams"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`rounded-md px-3 py-1 text-sm capitalize transition-colors ${tab === t ? "bg-subtle font-medium text-fg" : "text-secondary hover:text-fg"}`}
-          >
-            {t}
+      <div className="mb-4 flex gap-1 border-b border-border">
+        {(["gantt", "events", "io"] as const).map((t) => (
+          <button key={t} onClick={() => setTab(t)}
+            className={`px-3 py-2 text-sm capitalize ${tab === t ? "border-b-2 border-fg font-medium" : "text-secondary hover:text-fg"}`}>
+            {t === "gantt" ? "Timeline" : t === "io" ? "Input / Output" : "Events"}
           </button>
         ))}
       </div>
 
-      {tab === "trace" && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1fr_360px]">
-          <Trace run={run} now={now} selected={selected} onSelect={setSelected} />
-          {sel ? <StepPanel step={sel} run={run} now={now} onClose={() => setSelected(null)} /> : (
-            <div className="hidden rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted lg:block">
-              Select a span to inspect its output and events.
+      {/* Gantt timeline */}
+      {tab === "gantt" && (
+        <div className="space-y-1.5">
+          {!steps.length && <p className="py-8 text-center text-sm text-secondary">No steps recorded yet.</p>}
+          {steps.map((s, i) => {
+            const st = toMs(s.startedAt) ?? toMs(s.createdAt) ?? t0;
+            const en = toMs(s.completedAt) ?? (["running", "pending"].includes((s.status || "").toLowerCase()) ? now : st);
+            const left = ((st - t0) / span) * 100;
+            const width = Math.max(((en - st) / span) * 100, 0.6);
+            const c = colorFor(s.status || "");
+            const live = (s.status || "").toLowerCase() === "running";
+            return (
+              <div key={s.stepId || i} className="grid grid-cols-[220px_1fr] items-center gap-3">
+                <div className="flex items-center gap-2 truncate">
+                  <span className="h-2 w-2 shrink-0 rounded-full" style={{ background: c }} />
+                  <span className="truncate text-sm" title={s.stepName}>{cleanName(s.stepName) || s.stepId}</span>
+                  {(s.attempt ?? 1) > 1 && <span className="rounded bg-amber-500/15 px-1 text-[10px] text-amber-600">retry {s.attempt}</span>}
+                </div>
+                <div className="relative h-6 rounded bg-subtle">
+                  <div
+                    className={`absolute top-0.5 bottom-0.5 rounded ${live ? "animate-pulse" : ""}`}
+                    style={{ left: `${left}%`, width: `${width}%`, background: c, minWidth: 3 }}
+                    title={`${s.status} · ${fmtDur(en - st)}`}
+                  />
+                  <span className="absolute right-1.5 top-1/2 -translate-y-1/2 text-[10px] text-muted">{fmtDur(en - st)}</span>
+                </div>
+              </div>
+            );
+          })}
+          {/* time axis */}
+          {steps.length > 0 && (
+            <div className="grid grid-cols-[220px_1fr] gap-3 pt-1">
+              <div />
+              <div className="flex justify-between text-[10px] text-muted">
+                <span>0ms</span><span>{fmtDur(span / 2)}</span><span>{fmtDur(span)}</span>
+              </div>
             </div>
           )}
         </div>
       )}
 
-      {tab === "graph" && <WorkflowGraph run={run} now={now} />}
-      {tab === "events" && <Events run={run} />}
-      {tab === "streams" && (
-        <div className="rounded-xl border border-border bg-card px-4 py-12 text-center text-sm text-secondary">No streams for this run.</div>
-      )}
-    </div>
-  );
-}
-
-function Meta({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="text-xs text-muted">{label}</div>
-      <div className="mt-0.5 text-sm tabular-nums">{value}</div>
-    </div>
-  );
-}
-
-/* ---- Trace (gantt) ---- */
-function Trace({ run, now, selected, onSelect }: { run: WorkflowRun; now: number; selected: number | null; onSelect: (i: number | null) => void }) {
-  const start = run.started_ms;
-  const end = run.finished_ms ?? now;
-  const total = Math.max(1, end - start);
-
-  // ~6 evenly spaced time ticks.
-  const ticks = Array.from({ length: 7 }, (_, i) => Math.round((total / 6) * i));
-
-  const barColor = (s: StepRun) =>
-    s.status === "failed" ? "bg-red-500" : s.status === "running" ? "bg-amber-500" : "bg-emerald-500/80";
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
-      {/* Time axis */}
-      <div className="relative h-7 border-b border-border text-[10px] text-muted">
-        {ticks.map((t, i) => (
-          <span key={i} className="absolute top-1.5 -translate-x-1/2 tabular-nums" style={{ left: `${(t / total) * 100}%` }}>
-            {fmtDuration(t)}
-          </span>
-        ))}
-      </div>
-
-      {/* Root span */}
-      <div className="border-b border-border px-3 py-2">
-        <div className="relative h-6">
-          <div className="absolute inset-y-1 left-0 right-0 flex items-center rounded bg-blue-600/80 px-2 text-xs font-medium text-white">
-            <span className="truncate">{run.name || run.def_id}</span>
-            <span className="ml-auto tabular-nums">{fmtDuration(total)}</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Step spans */}
-      <div className="divide-y divide-border">
-        {run.steps.length === 0 && <div className="px-4 py-8 text-center text-sm text-secondary">Waiting for first step…</div>}
-        {run.steps.map((s, i) => {
-          const sStart = s.started_ms - start;
-          const sEnd = (s.finished_ms ?? now) - start;
-          const left = Math.min(100, Math.max(0, (sStart / total) * 100));
-          const width = Math.max(1.2, ((sEnd - sStart) / total) * 100);
-          const active = selected === i;
-          return (
-            <button
-              key={i}
-              onClick={() => onSelect(active ? null : i)}
-              className={`relative block h-9 w-full px-3 text-left transition-colors hover:bg-subtle/50 ${active ? "bg-subtle/60" : ""}`}
-            >
-              <div className="relative h-full">
-                <div
-                  className={`absolute top-1/2 flex h-5 -translate-y-1/2 items-center rounded ${barColor(s)} px-1.5`}
-                  style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%`, minWidth: 18 }}
-                >
-                  <span className="truncate text-[11px] font-medium text-white">{s.name}</span>
-                </div>
-                {/* label to the right of very short bars */}
-                {width < 12 && (
-                  <span className="absolute top-1/2 -translate-y-1/2 whitespace-nowrap pl-1 text-[11px] text-secondary" style={{ left: `calc(${Math.min(left + width, 100)}% + 4px)` }}>
-                    {fmtDuration(sEnd - sStart)}
-                  </span>
-                )}
+      {/* Events */}
+      {tab === "events" && (
+        <div className="space-y-2">
+          {!(data?.events?.length) && <p className="py-8 text-center text-sm text-secondary">No events.</p>}
+          {(data?.events ?? []).map((e, i) => (
+            <div key={e.eventId || i} className="flex items-start gap-3 rounded-lg border border-border p-3">
+              <span className="mt-0.5 font-mono text-xs text-muted">{fmtTime(toMs(e.createdAt))}</span>
+              <div className="min-w-0">
+                <div className="text-sm font-medium">{e.eventType || "event"}</div>
               </div>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/* ---- Selected step side panel ---- */
-function StepPanel({ step, run, now, onClose }: { step: StepRun; run: WorkflowRun; now: number; onClose: () => void }) {
-  const sv = statusView(step.status);
-  const dur = (step.finished_ms ?? now) - step.started_ms;
-  return (
-    <div className="h-fit rounded-xl border border-border bg-card">
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
-        <span className="truncate font-mono text-sm">{step.name}</span>
-        <button onClick={onClose} className="text-muted hover:text-fg">✕</button>
-      </div>
-      <div className="space-y-4 p-4 text-sm">
-        <div className="flex items-center gap-2">
-          <span className={`flex items-center gap-1.5 ${sv.text}`}><span className={`h-2 w-2 rounded-full ${sv.dot}`} /> {sv.label}</span>
-          <span className="ml-auto tabular-nums text-secondary">{fmtDuration(dur)}</span>
+            </div>
+          ))}
         </div>
-        <Section title="Output">
-          <pre className="overflow-x-auto whitespace-pre-wrap break-words rounded-lg border border-border bg-subtle/50 p-3 font-mono text-xs text-secondary">
-            {step.output || "(no output yet)"}
-          </pre>
-        </Section>
-        <Section title="Events">
-          <div className="space-y-1.5 text-xs">
-            <EventRow label="step_created" ts={step.started_ms} />
-            <EventRow label="step_started" ts={step.started_ms} />
-            {step.finished_ms && <EventRow label={step.status === "failed" ? "step_failed" : "step_completed"} ts={step.finished_ms} />}
+      )}
+
+      {/* Input / Output / Error */}
+      {tab === "io" && (
+        <div className="space-y-4">
+          {run.error != null && (
+            <div className="rounded-lg border border-red-500/40 bg-red-500/5 p-3">
+              <div className="mb-1 text-xs font-medium text-red-600">Error</div>
+              <pre className="overflow-x-auto whitespace-pre-wrap break-all text-xs text-red-700 dark:text-red-400">{JSON.stringify(run.error, null, 2)}</pre>
+            </div>
+          )}
+          <div>
+            <div className="mb-1 text-xs font-medium text-muted">Steps</div>
+            <div className="space-y-1">
+              {steps.map((s, i) => (
+                <div key={s.stepId || i} className="flex items-center justify-between rounded border border-border px-3 py-1.5 text-sm">
+                  <span className="truncate">{cleanName(s.stepName) || s.stepId}</span>
+                  <StatusBadge status={s.status || ""} />
+                </div>
+              ))}
+            </div>
           </div>
-        </Section>
-        <div className="text-xs text-muted">Run {run.id}</div>
-      </div>
-    </div>
-  );
-}
-
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <div>
-      <div className="mb-1.5 flex items-center gap-1 text-xs font-medium text-secondary"><ChevronDown className="h-3.5 w-3.5" /> {title}</div>
-      {children}
-    </div>
-  );
-}
-
-function EventRow({ label, ts }: { label: string; ts: number }) {
-  return (
-    <div className="flex items-center justify-between rounded border border-border px-2 py-1">
-      <span className="font-mono">{label}</span>
-      <span className="tabular-nums text-muted">{new Date(ts).toLocaleTimeString()}</span>
-    </div>
-  );
-}
-
-/* ---- Events tab ---- */
-function Events({ run }: { run: WorkflowRun }) {
-  const rows: { label: string; ts: number; name: string }[] = [];
-  for (const s of run.steps) {
-    rows.push({ label: "step_created", ts: s.started_ms, name: s.name });
-    rows.push({ label: "step_started", ts: s.started_ms, name: s.name });
-    if (s.finished_ms) rows.push({ label: s.status === "failed" ? "step_failed" : "step_completed", ts: s.finished_ms, name: s.name });
-  }
-  rows.sort((a, b) => a.ts - b.ts);
-  return (
-    <div className="overflow-hidden rounded-xl border border-border bg-card">
-      <div className="grid grid-cols-[1fr_1fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-        <span>Event</span><span>Step</span><span>Time</span>
-      </div>
-      {rows.length === 0 ? (
-        <div className="px-4 py-10 text-center text-sm text-secondary">No events yet.</div>
-      ) : rows.map((r, i) => (
-        <div key={i} className="grid grid-cols-[1fr_1fr_auto] items-center border-b border-border px-4 py-2.5 text-sm last:border-0">
-          <span className="font-mono">{r.label}</span>
-          <span className="font-mono text-secondary">{r.name}</span>
-          <span className="tabular-nums text-muted">{new Date(r.ts).toLocaleTimeString()}</span>
         </div>
-      ))}
+      )}
     </div>
   );
 }

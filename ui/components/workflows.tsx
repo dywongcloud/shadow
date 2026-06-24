@@ -35,6 +35,46 @@ export function runDuration(r: WorkflowRun, now: number): number {
   return end - r.started_ms;
 }
 
+/* ---- WDK ("world") run normalization ----
+ * Runs read from a deployed app's WDK world (e.g. @open-workflow/world-redis)
+ * use a different shape (runId / workflowName / status: completed / epoch-seconds
+ * timestamps). Map them onto our internal WorkflowRun so the existing table +
+ * chips render both our-engine runs and real app runs uniformly. */
+function toMs(t: unknown): number | null {
+  if (typeof t !== "number") return null;
+  return t > 1e12 ? t : t * 1000;
+}
+function cleanWfName(n?: string): string {
+  if (!n) return "workflow";
+  const parts = n.split("/").filter(Boolean);
+  return parts[parts.length - 1] || n;
+}
+function mapWdkStatus(s?: string): RunStatus {
+  switch ((s || "").toLowerCase()) {
+    case "completed":
+    case "succeeded": return "succeeded";
+    case "running": return "running";
+    case "failed":
+    case "error": return "failed";
+    case "cancelled": return "cancelled";
+    default: return "pending";
+  }
+}
+export function normalizeRun(r: any): WorkflowRun {
+  const wdk = r.runId !== undefined || r.workflowName !== undefined || r.startedAt !== undefined;
+  if (!wdk) return r as WorkflowRun;
+  return {
+    id: r.runId ?? r.id ?? "",
+    def_id: r.workflowName ?? r.def_id ?? "",
+    name: cleanWfName(r.workflowName ?? r.name),
+    project: r.project ?? "",
+    status: mapWdkStatus(r.status),
+    steps: Array.isArray(r.steps) ? r.steps : [],
+    started_ms: toMs(r.startedAt) ?? toMs(r.createdAt) ?? r.started_ms ?? 0,
+    finished_ms: toMs(r.completedAt) ?? r.finished_ms ?? null,
+  };
+}
+
 /* ---- status count chips ---- */
 const CHIP_ORDER: { key: RunStatus | "active"; label: string; dot: string }[] = [
   { key: "succeeded", label: "Completed", dot: "bg-emerald-500" },
@@ -83,7 +123,7 @@ export function RunsTable({ runs, now, showProject }: { runs: WorkflowRun[]; now
           return (
             <Link
               key={r.id}
-              href={`/workflows/runs/${encodeURIComponent(r.id)}`}
+              href={`/workflows/runs/${encodeURIComponent(r.id)}${r.project ? `?project=${encodeURIComponent(r.project)}` : ""}`}
               className={`grid ${showProject ? "grid-cols-[1.4fr_1.6fr_0.9fr_0.8fr_0.9fr]" : "grid-cols-[1.4fr_1.8fr_0.9fr_0.8fr_0.9fr]"} items-center border-b border-border px-4 py-3 text-sm transition-colors last:border-0 hover:bg-subtle/50`}
             >
               <span className="truncate font-mono">{r.name || r.def_id}</span>
@@ -118,10 +158,11 @@ function useNow(ms = 1000) {
 }
 
 export function ProjectWorkflows({ project }: { project: string }) {
-  const { data: runs, refresh } = usePoll<WorkflowRun[]>(
+  const { data: rawRuns, refresh } = usePoll<WorkflowRun[]>(
     `/v1/workflows/runs?project=${encodeURIComponent(project)}`,
     2000
   );
+  const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
   const now = useNow();
   const [q, setQ] = useState("");
   const [live, setLive] = useState(true);
@@ -129,7 +170,7 @@ export function ProjectWorkflows({ project }: { project: string }) {
 
   const filtered = useMemo(() => {
     const needle = q.toLowerCase();
-    return (runs ?? []).filter(
+    return runs.filter(
       (r) => r.name.toLowerCase().includes(needle) || r.id.toLowerCase().includes(needle)
     );
   }, [runs, q]);

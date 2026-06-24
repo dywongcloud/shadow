@@ -28,6 +28,7 @@ mod persist;
 mod project_settings;
 mod resources;
 mod schedule;
+mod world;
 mod secrets;
 mod securelink;
 #[cfg(feature = "zkauth")]

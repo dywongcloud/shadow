@@ -957,15 +957,37 @@ async fn dep_create(
 /// Roll back / promote: make an existing deployment the project's production.
 async fn dep_promote(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    let info = c.gw.promote(&id).ok_or(StatusCode::NOT_FOUND)?;
-    crate::persist::persist(&c);
-    let ev = c.event(&c.region, "PROMOTE", &info.alias, "/", 200, "deploy", &format!("rolled back to {id}"));
-    c.record(ev);
-    crate::webhooks::dispatch(&c.webhooks, &info.project, "deployment.promoted",
-        json!({ "id": id, "project": info.project, "url": format!("https://{}", info.alias) }));
-    Ok(Json(json!(info)))
+    if let Some(info) = c.gw.promote(&id) {
+        crate::persist::persist(&c);
+        let ev = c.event(&c.region, "PROMOTE", &info.alias, "/", 200, "deploy", &format!("rolled back to {id}"));
+        c.record(ev);
+        crate::webhooks::dispatch(&c.webhooks, &info.project, "deployment.promoted",
+            json!({ "id": id, "project": info.project, "url": format!("https://{}", info.alias) }));
+        return Ok(Json(json!(info)));
+    }
+    // Not hosted locally — the placement scheduler put this deployment on a peer.
+    // Proxy the promote to its host so instant rollback works cross-node.
+    let t = tenant(&c, &headers);
+    if let Some(admin) = host_admin_for_deployment(&c, &id) {
+        if let Ok(r) = c
+            .http
+            .post(format!("{admin}/v1/deployments/{id}/promote"))
+            .header("x-hive-team", t)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    return Ok(Json(v));
+                }
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 /// Record a control-plane event (shows in Recent Activity / Activity / Audit),
@@ -1564,6 +1586,10 @@ struct LimitQ {
     project: Option<String>,
     /// Free-text search across path/host/detail.
     q: Option<String>,
+    /// Internal: when set by a fleet-aggregation proxy, return ONLY this node's
+    /// local events (no fan-out) — prevents proxy recursion.
+    #[serde(default)]
+    local: Option<bool>,
 }
 
 async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<LimitQ>) -> Json<Value> {
@@ -1590,8 +1616,42 @@ async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Qu
                 || e.action.to_lowercase().contains(&sl)
         });
     }
-    evs.truncate(limit);
-    Json(json!(evs))
+    // Fleet aggregation: requests are recorded on the node that SERVES them, so a
+    // project placed on a peer logs there, not here. Merge in the relevant peers'
+    // events (scoped to the same project/search, `local=true` to avoid recursion),
+    // then sort newest-first and truncate.
+    let mut out: Vec<Value> = evs.into_iter().map(|e| json!(e)).collect();
+    if !q.local.unwrap_or(false) {
+        let qs = {
+            let mut s = format!("limit={}&local=true", limit);
+            if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
+                s.push_str(&format!("&project={}", urlencode(p)));
+            }
+            if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
+                s.push_str(&format!("&q={}", urlencode(qq)));
+            }
+            s
+        };
+        // A project filter targets just its host; otherwise pull from every peer
+        // that hosts one of this tenant's projects.
+        let admins: Vec<String> = match q.project.as_deref() {
+            Some(p) if c.gw.git_for_project(p).is_none() => host_admin_for_project(&c, p).into_iter().collect(),
+            Some(_) => Vec::new(),
+            None => peer_admins_for_tenant(&c, &t),
+        };
+        for admin in admins {
+            if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/logs?{qs}"), &t).await {
+                if let Some(arr) = v.as_array() {
+                    out.extend(arr.iter().cloned());
+                }
+            }
+        }
+        out.sort_by(|a, b| {
+            b.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0).cmp(&a.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0))
+        });
+    }
+    out.truncate(limit);
+    Json(json!(out))
 }
 
 // ---- WAF ----
@@ -1851,15 +1911,41 @@ async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q):
         .filter(|r| q.project.as_deref().map(|p| p == r.project).unwrap_or(true))
         .map(|r| json!(r))
         .collect();
+    // Append the REAL runs the deployed app executed, read from its WDK "world"
+    // store. Only for projects HOSTED on THIS node (env_map decrypts locally); the
+    // coordinator gets these via the per-project / `local=true` proxy paths above.
+    {
+        let mut locals: Vec<String> = match q.project.as_deref() {
+            Some(p) if c.gw.git_for_project(p).is_some() => vec![p.to_string()],
+            Some(_) => vec![],
+            None => {
+                let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for d in c.gw.list() {
+                    if norm(&c.projects.team_of(&d.project)) == team {
+                        s.insert(d.project);
+                    }
+                }
+                s.into_iter().collect()
+            }
+        };
+        locals.retain(|p| crate::world::has_world(&c, p));
+        for proj in locals {
+            if let Some(wruns) = crate::world::list_runs(&c, &proj, 100).await {
+                runs.extend(wruns);
+            }
+        }
+    }
+    let run_key = |r: &Value| -> Option<String> {
+        r.get("runId").or_else(|| r.get("id")).and_then(|x| x.as_str()).map(String::from)
+    };
     if q.project.is_none() && !q.local.unwrap_or(false) {
-        let mut seen: std::collections::HashSet<String> =
-            runs.iter().filter_map(|r| r.get("id").and_then(|x| x.as_str()).map(String::from)).collect();
+        let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         for admin in peer_admins_for_tenant(&c, &team) {
             if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows/runs?local=true", &team).await {
                 if let Some(arr) = v.as_array() {
                     for r in arr {
-                        if let Some(id) = r.get("id").and_then(|x| x.as_str()) {
-                            if seen.insert(id.to_string()) {
+                        if let Some(id) = run_key(r) {
+                            if seen.insert(id) {
                                 runs.push(r.clone());
                             }
                         }
@@ -1871,9 +1957,69 @@ async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q):
     Json(json!(runs))
 }
 
-/// One run with full step detail (for the trace timeline).
-async fn wf_run_detail(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
-    c.workflows.run(&id).map(|r| Json(json!(r))).ok_or(StatusCode::NOT_FOUND)
+/// One run with full step detail (for the trace timeline / Gantt). Resolves from
+/// our engine first, else from the project's WDK "world" store — proxied to the
+/// hosting node when the project lives on a peer (the world env is decrypted
+/// there). `?project=` is required to locate a world run.
+async fn wf_run_detail(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(q): Query<WfQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    if let Some(r) = c.workflows.run(&id) {
+        return Ok(Json(json!(r)));
+    }
+    let team = tenant(&c, &headers);
+    let found = |v: &Value| v.get("run").map(|r| !r.is_null()).unwrap_or(false);
+    // 1) Explicit project (proxy to its host if remote, else read locally).
+    if let Some(project) = q.project.as_deref() {
+        if c.gw.git_for_project(project).is_none() && !q.local.unwrap_or(false) {
+            if let Some(admin) = host_admin_for_project(&c, project) {
+                if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows/runs/{id}?project={project}&local=true"), &team).await {
+                    if found(&v) {
+                        return Ok(Json(v));
+                    }
+                }
+            }
+        }
+        if let Some(detail) = crate::world::run_detail(&c, project, &id).await {
+            if found(&detail) {
+                return Ok(Json(detail));
+            }
+        }
+    }
+    // 2) Auto-resolve: no (or wrong) project given — scan this node's world
+    // projects for the run (lets a bare /workflows/runs/<id> URL resolve).
+    let locals: Vec<String> = {
+        let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for d in c.gw.list() {
+            if norm(&c.projects.team_of(&d.project)) == team {
+                s.insert(d.project);
+            }
+        }
+        s.into_iter().collect()
+    };
+    for p in locals {
+        if crate::world::has_world(&c, &p) {
+            if let Some(detail) = crate::world::run_detail(&c, &p, &id).await {
+                if found(&detail) {
+                    return Ok(Json(detail));
+                }
+            }
+        }
+    }
+    // 3) Fleet: ask peers hosting this tenant's projects to resolve it.
+    if !q.local.unwrap_or(false) {
+        for admin in peer_admins_for_tenant(&c, &team) {
+            if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows/runs/{id}?local=true"), &team).await {
+                if found(&v) {
+                    return Ok(Json(v));
+                }
+            }
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 /// Per-project rollup for the global "All Projects" workflows view.

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
 import { Button, Input, Triangle, PageHeader } from "@/components/ui";
 import { apiSend, usePoll, type WorkflowRun, type WorkflowSummaryRow, type WorkflowDef } from "@/lib/api";
-import { StatusChips, RunsTable } from "@/components/workflows";
+import { StatusChips, RunsTable, normalizeRun } from "@/components/workflows";
 import { WorkflowDefGraph } from "@/components/workflow-graph";
 
 const RANGES: Record<string, number> = {
@@ -25,7 +25,8 @@ function useNow(ms = 1000) {
 }
 
 export default function WorkflowsPage() {
-  const { data: runs } = usePoll<WorkflowRun[]>("/v1/workflows/runs", 2000);
+  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs", 2000);
+  const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
   const { data: summary } = usePoll<WorkflowSummaryRow[]>("/v1/workflows/summary", 4000);
   const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 5000);
   const now = useNow();
