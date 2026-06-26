@@ -66,7 +66,10 @@ export default function DeploymentsPage() {
                     immutable URL (the per-deployment id, or commit URL), so a
                     preview opens that preview — not production. */}
                 <Td className="font-mono text-xs">
-                  {(() => { const self = d.production ? d.alias : (d.id_alias || d.commit_alias || d.alias);
+                  {/* Prefer the SHARED, mesh-routable commit alias for previews; the
+                      per-node id alias (dpl-<id>) only resolves on its own host node
+                      under multi-region fanout, so it 404s through the pooled ingress. */}
+                  {(() => { const self = d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias);
                     return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer">{deploymentHost(self)}</a>; })()}
                 </Td>
                 <Td className="text-xs text-secondary hidden md:table-cell">

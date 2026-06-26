@@ -182,6 +182,106 @@ async fn max_duration_504_and_error_isolation() {
     assert_eq!(normal_ok, 10, "normal requests must survive (error isolation)");
 }
 
+/// #17 context-leak runtime test (full stack): many concurrent requests forced
+/// onto ONE instance (max_instances=1, high max_concurrency) each carry a unique
+/// path, `x-ctx` header, and body. Every response must reflect EXACTLY its own
+/// request — and all must report the SAME pid (proving they truly shared one
+/// in-instance-concurrent instance, so the isolation claim is meaningful).
+#[tokio::test]
+async fn no_context_leak_across_concurrent_requests_on_one_instance() {
+    let Some(py) = python3() else {
+        eprintln!("skipping: python3 not found");
+        return;
+    };
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("gw3-{}", std::process::id())),
+        provision_latency: Duration::from_millis(10),
+        cache_root: std::env::temp_dir().join(format!("gw3-cache-{}", std::process::id())),
+    }));
+    let fluid = Fluid::start(backend, FluidConfig::default());
+    let gw = Gateway::new(fluid, "default".into());
+    let hello_dir = format!("{}/../../examples/hello", env!("CARGO_MANIFEST_DIR"));
+    gw.deploy(
+        hello_dir,
+        Manifest {
+            project: "hello".into(),
+            static_dir: Some("public".into()),
+            functions: vec![FunctionConfig {
+                name: "api".into(),
+                runtime: "python".into(),
+                start_cmd: vec![py, "server.py".into()],
+                env: BTreeMap::new(),
+                vcpus: 1,
+                memory_mib: 128,
+                max_concurrency: 64, // many requests share the instance
+                min_instances: 1,
+                max_instances: 1, // FORCE a single instance -> real in-instance concurrency
+                idle_ttl_secs: 30,
+                max_duration_secs: 300,
+                ..Default::default()
+            }],
+            routes: vec![Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) }],
+            ..Default::default()
+        },
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, fluid_gateway::public_router(gw)).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let _ = client.get(format!("{base}/api/hello")).send().await; // warm the single instance
+
+    let mut handles = Vec::new();
+    for i in 0..80u32 {
+        let client = client.clone();
+        let base = base.clone();
+        handles.push(tokio::spawn(async move {
+            let path = format!("/api/echo/{i}");
+            let ctx = format!("ctx-{i:08x}");
+            let body = format!("payload-{i}-").repeat((i % 29 + 1) as usize);
+            let resp = tokio::time::timeout(
+                Duration::from_secs(25),
+                client
+                    .post(format!("{base}{path}"))
+                    .header("x-ctx", &ctx)
+                    .body(body.clone())
+                    .send(),
+            )
+            .await
+            .expect("timed out")
+            .expect("send failed");
+            assert_eq!(resp.status().as_u16(), 200);
+            // Response header must carry THIS request's ctx.
+            let hdr_ctx = resp
+                .headers()
+                .get("x-ctx")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
+            let v: serde_json::Value =
+                resp.json().await.expect("function must return JSON");
+            assert_eq!(hdr_ctx, ctx, "x-ctx response header leaked");
+            assert_eq!(v["ctx"], ctx, "echoed ctx leaked across requests");
+            assert_eq!(v["path"], path, "echoed path leaked across requests");
+            assert_eq!(v["body"], body, "echoed body leaked/corrupted across requests");
+            v["pid"].as_i64().unwrap_or(-1)
+        }));
+    }
+    let mut pids = std::collections::BTreeSet::new();
+    let mut done = 0;
+    for h in handles {
+        pids.insert(h.await.expect("task panicked"));
+        done += 1;
+    }
+    assert_eq!(done, 80);
+    // All requests must have been served by the SAME single instance — otherwise
+    // the isolation we just proved wouldn't be exercising in-instance concurrency.
+    assert_eq!(pids.len(), 1, "expected one shared instance pid, got {pids:?}");
+}
+
 /// Regression: after a restart, a project's host alias must resolve to its
 /// PRODUCTION deployment — never to a stale prior deployment that happens to be
 /// restored last. (This caused `ctr-demo.localhost` to serve the old broken
@@ -225,6 +325,40 @@ async fn restore_prefers_production_deployment_for_alias() {
     // Per-deployment preview URLs still resolve each exact deployment.
     assert_eq!(gw.host_deployment_id("dpl-old.localhost").as_deref(), Some("dpl-old"));
     assert_eq!(gw.host_deployment_id("dpl-new.localhost").as_deref(), Some("dpl-new"));
+}
+
+/// #9 in-flight version pinning (structural lock): promoting a new version must
+/// NOT disturb the previously-deployed version — it stays resolvable by its own
+/// immutable commit/branch URLs, and its function pool key is DISTINCT from the
+/// new version's. Together with handle_public cloning the `Deployment` once at
+/// request entry (so an in-flight request holds an immutable snapshot), this
+/// guarantees a request that started on v1 keeps serving from v1's own instance
+/// pool even across a mid-flight promotion. This test fails loudly if a refactor
+/// ever makes versions share a pool key or makes promotion mutate the old version.
+#[tokio::test]
+async fn promotion_does_not_repin_or_merge_prior_version_pool() {
+    let gw = test_gw();
+    let v1 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "1111111")), true, fluid_core::DeployState::Ready, "personal".into());
+    let v2 = gw.deploy_full("/nonexistent".into(), Manifest { project: "app".into(), ..Default::default() }, "you".into(), Some(git("main", "2222222")), false, fluid_core::DeployState::Ready, "personal".into());
+    let (v1_id, v2_id) = (v1.id.to_string(), v2.id.to_string());
+
+    // Production alias starts on v1.
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(v1_id.as_str()));
+
+    // Promote v2 -> production alias re-points.
+    gw.promote(&v2_id).expect("promote");
+    assert_eq!(gw.host_deployment_id("app.localhost").as_deref(), Some(v2_id.as_str()));
+
+    // v1 is NOT gone: its immutable commit URL still resolves to v1 — an in-flight
+    // request that resolved v1 (or a direct hit on its commit URL) still gets v1.
+    assert_eq!(gw.host_deployment_id("app-1111111.localhost").as_deref(), Some(v1_id.as_str()),
+        "prior version must remain resolvable by its own immutable URL (in-flight pinning)");
+
+    // The two versions occupy DISTINCT function pools (keyed by deployment id), so
+    // v1's warm instances never serve v2's requests or get merged on promotion.
+    let k1 = fluid_compute::func_key(&v1_id, "api");
+    let k2 = fluid_compute::func_key(&v2_id, "api");
+    assert_ne!(k1, k2, "each version must have its own instance pool key");
 }
 
 fn test_gw() -> Arc<Gateway> {

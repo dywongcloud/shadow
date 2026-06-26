@@ -313,9 +313,11 @@ async fn run_build(
                 log(format!("Default region(s) set in Function Settings: {}", placed.join(", ")));
             }
         }
-        let local_selected = targets.iter().any(|t| t.admin.is_none());
+        // A target is LOCAL only when it has neither an HTTP admin nor an iroh route
+        // (iroh targets are remote FC nodes reached over the mesh).
+        let local_selected = targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none());
         let remote: Vec<crate::schedule::Target> =
-            targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
+            targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();
 
         if !targets.is_empty() && !local_selected {
             // Pure remote placement: do NOT build/host locally. Dispatch to the
@@ -611,6 +613,18 @@ async fn run_build(
     // (podman build, below) and serves on whichever node it was placed on.
     let is_container = manifest.functions.iter().any(|f| f.runtime == "container");
 
+    // Build-time V8 compile-cache warm-up (Node cold-start): precompile the server
+    // bundle's bytecode INTO the artifact so a fresh microVM's first hit skips
+    // parse/compile. Runs for the first Node-family function only; best-effort. Must
+    // happen BEFORE deliver_build so `.hive-compile-cache` is packed into the image.
+    if !build_failed && !is_container {
+        if let Some(node_fn) = manifest.functions.iter().find(|f| is_node_start_cmd(&f.start_cmd)) {
+            let start_cmd = node_fn.start_cmd.clone();
+            let warm_env = cloud.projects.env_map(&project);
+            warmup_node_cache(&build_dir, &start_cmd, &warm_env, cloud, bid).await;
+        }
+    }
+
     // For an isolated backend (Firecracker), a serving microVM cannot see the
     // host build dir the mock backend serves from. Pack the build output into a
     // per-deployment artifact the cell mounts at /build, and point this
@@ -742,9 +756,9 @@ async fn run_build(
     if !req.no_fanout && !build_failed {
         let regions = cloud.projects.get(&project).functions.regions;
         let targets = crate::schedule::place(cloud, &regions, false);
-        if targets.iter().any(|t| t.admin.is_none()) {
+        if targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none()) {
             let remote: Vec<crate::schedule::Target> =
-                targets.iter().filter(|t| t.admin.is_some()).cloned().collect();
+                targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();
             if !remote.is_empty() {
                 let _ = fanout_remote(cloud, bid, &req, &project, &remote).await;
             }
@@ -777,46 +791,47 @@ async fn fanout_remote(
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
     let mut all_ok = true;
     for t in remote {
-        let admin = match &t.admin {
-            Some(a) => a.clone(),
-            None => continue,
-        };
         let mut dreq = req.clone();
         dreq.no_fanout = true;
         dreq.project = Some(project.to_string());
         dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
         dreq.build_config = build_config.clone();
         dreq.function_settings = function_settings.clone();
-        log(format!("→ {}: dispatching deploy", t.node));
-        let resp = cloud
-            .http
-            .post(format!("{admin}/v1/git/deploy"))
-            .header("x-hive-team", team.clone())
-            .json(&dreq)
-            .timeout(Duration::from_secs(15))
-            .send()
-            .await;
-        let target_bid = match resp {
-            Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from)),
-            Err(e) => {
-                log(format!("✗ {}: dispatch failed: {e}", t.node));
-                all_ok = false;
-                continue;
+        let route = if t.admin.is_some() { "http" } else { "iroh" };
+        log(format!("→ {}: dispatching deploy (via {route})", t.node));
+        // Dispatch over HTTP admin (preferred) OR the iroh mesh (NAT'd coordinator →
+        // FC nodes, the SSH tunnels are gone). Both return `{ "build_id": ... }`.
+        let resp_json: Option<serde_json::Value> = if let Some(admin) = &t.admin {
+            match cloud.http.post(format!("{admin}/v1/git/deploy")).header("x-hive-team", team.clone()).json(&dreq).timeout(Duration::from_secs(15)).send().await {
+                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                Err(e) => { log(format!("✗ {}: dispatch failed: {e}", t.node)); all_ok = false; continue; }
             }
+        } else if let Some((id, addr)) = &t.iroh {
+            let body = serde_json::to_vec(&dreq).unwrap_or_default();
+            let path = format!("/v1/git/deploy?team={team}");
+            match crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, &path, &body, 20).await {
+                Some(b) => serde_json::from_slice(&b).ok(),
+                None => { log(format!("✗ {}: iroh dispatch failed", t.node)); all_ok = false; continue; }
+            }
+        } else {
+            continue;
         };
+        let target_bid = resp_json.as_ref().and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from));
         let Some(target_bid) = target_bid else {
-            log(format!("✗ {}: no build id returned", t.node));
+            let err = resp_json.as_ref().and_then(|v| v.get("error").and_then(|x| x.as_str())).unwrap_or("no build id returned");
+            log(format!("✗ {}: {err}", t.node));
             all_ok = false;
             continue;
         };
-        let ok = mirror_remote_build(cloud, bid, &admin, &target_bid, &t.node).await;
+        let ok = mirror_remote_build(cloud, bid, t, &target_bid, &t.node).await;
         if !ok {
             all_ok = false;
-        } else {
+        } else if let Some(admin) = &t.admin {
             // Sync the host's auto-detected Build settings back to THIS coordinator
             // so the dashboard (which reads settings here) shows the framework +
             // commands that were actually used (Issue #3). Only fill fields the
             // user hasn't explicitly set, so manual overrides are never clobbered.
+            // HTTP targets only (non-critical; iroh targets skip it).
             if let Some(v) = cloud
                 .http
                 .get(format!("{admin}/v1/projects/{project}/settings"))
@@ -862,7 +877,7 @@ async fn fanout_remote(
 async fn mirror_remote_build(
     cloud: &Arc<CloudState>,
     bid: &str,
-    admin: &str,
+    target: &crate::schedule::Target,
     target_bid: &str,
     node: &str,
 ) -> bool {
@@ -870,16 +885,18 @@ async fn mirror_remote_build(
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
-        let v = match cloud
-            .http
-            .get(format!("{admin}/v1/builds/{target_bid}"))
-            .timeout(Duration::from_secs(8))
-            .send()
-            .await
-            .ok()
-        {
-            Some(r) => r.json::<serde_json::Value>().await.ok(),
-            None => None,
+        // Poll the target's build over the SAME transport we dispatched on.
+        let v: Option<serde_json::Value> = if let Some(admin) = &target.admin {
+            match cloud.http.get(format!("{admin}/v1/builds/{target_bid}")).timeout(Duration::from_secs(8)).send().await.ok() {
+                Some(r) => r.json::<serde_json::Value>().await.ok(),
+                None => None,
+            }
+        } else if let Some((id, addr)) = &target.iroh {
+            crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_GET, &format!("/v1/builds/{target_bid}"), &[], 8)
+                .await
+                .and_then(|b| serde_json::from_slice(&b).ok())
+        } else {
+            None
         };
         let Some(v) = v else {
             if now_ms() > deadline {
@@ -1399,6 +1416,7 @@ async fn build_via_fdi(
             // route from the .next manifests + file traces and write a per-route
             // build manifest. The serve path is UNCHANGED (still `next start`); the
             // runtime dispatcher consumes this manifest separately and falls back.
+            let mut route_policies: Vec<fluid_core::RoutePolicy> = Vec::new();
             if std::env::var("SHADOW_NEXT_PER_ROUTE").map(|v| v == "1" || v == "true").unwrap_or(false) {
                 let next_dir = dir.join(".next");
                 if next_dir.exists() {
@@ -1407,13 +1425,24 @@ async fn build_via_fdi(
                         "per-route: classified {} route(s) — {} per-route-eligible (Node), {} on next-start fallback (static/edge/middleware).",
                         prm.routes.len(), prm.eligible_count(), prm.fallback_count()
                     ));
+                    // Map build-time classification -> runtime policy (#16), persisted
+                    // into the manifest so the serve path can apply route-type-aware
+                    // caching/retry. The `next start` fallback still serves every
+                    // route; this only enriches responses, it doesn't change routing.
+                    route_policies = prm.routes.iter().map(|r| fluid_core::RoutePolicy {
+                        pattern: r.route.clone(),
+                        class: fluid_core::RouteClass::from_name(r.kind.class_name()),
+                        revalidate: r.revalidate,
+                    }).collect();
                     if let Ok(js) = serde_json::to_string_pretty(&prm) {
                         let _ = tokio::fs::write(dir.join("shadow-per-route.json"), js).await;
-                        log("per-route: wrote shadow-per-route.json (build manifest). Serving still uses `next start` (fallback).".into());
+                        log(format!("per-route: wrote shadow-per-route.json + {} route policies into the manifest (cache/retry wiring). Serving still uses `next start` (fallback).", route_policies.len()));
                     }
                 }
             }
-            Ok(function_manifest(project, start))
+            let mut m = function_manifest(project, start);
+            m.route_policies = route_policies;
+            Ok(m)
         }
     }
 }
@@ -1478,6 +1507,204 @@ pub fn preferred_node_bin() -> Option<String> {
         }
     }
     None
+}
+
+/// Node BINARY to use for the build-time compile-cache warm-up. The produced V8
+/// bytecode cache is keyed by the exact Node/V8 version + CPU arch — if the warm-up
+/// Node differs from the RUNTIME Node, the runtime silently ignores the cache and
+/// recompiles (the "cross-platform silent-miss"). On Firecracker the runtime is the
+/// microVM's baked-in Node, which is NOT the build host's Node, so each FC host sets
+/// `HIVE_WARMUP_NODE` to a copy of that exact binary. Elsewhere (Mac/mock backend,
+/// where build host == runtime) we fall back to the pinned stable Node directory.
+pub fn warmup_node_bin() -> Option<String> {
+    if let Ok(p) = std::env::var("HIVE_WARMUP_NODE") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(p);
+        }
+        let cand = pb.join("node");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    preferred_node_bin().map(|d| PathBuf::from(d).join("node").to_string_lossy().into_owned())
+}
+
+/// Node-family start command? (the V8 compile-cache warm-up + runtime wiring apply
+/// only to these — never to static sites, Python, or containers). Matches on the
+/// basename so an absolute `…/bin/node` still counts.
+pub fn is_node_start_cmd(start_cmd: &[String]) -> bool {
+    let Some(first) = start_cmd.first() else { return false };
+    let base = Path::new(first).file_name().and_then(|s| s.to_str()).unwrap_or(first);
+    matches!(base, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next")
+}
+
+/// (file count, total bytes) under `dir`, recursively — to report what the warm-up
+/// captured into the compile cache.
+async fn dir_stats(dir: &Path) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(mut rd) = tokio::fs::read_dir(&d).await else { continue };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            match e.file_type().await {
+                Ok(ft) if ft.is_dir() => stack.push(e.path()),
+                Ok(_) => {
+                    files += 1;
+                    if let Ok(m) = e.metadata().await {
+                        bytes += m.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (files, bytes)
+}
+
+/// Build-time V8 compile-cache warm-up (Node cold-start contract). Boots the server
+/// once under `NODE_COMPILE_CACHE=<root>/.hive-compile-cache` so V8 bytecode for the
+/// hot modules (framework + server bundle) is written INTO the artifact; the runtime
+/// cell points `NODE_COMPILE_CACHE` at the same dir (workdir == delivered root), so
+/// even a fresh microVM's first hit skips parse/compile. A `--require` preload flushes
+/// the cache and exits cleanly after a short boot window (no signal needed; works for
+/// `node x` and `npm start`). Best-effort: any failure is a perf no-op, never breaks a
+/// deploy. Uses the pinned build Node — the runtime cell must run the SAME Node
+/// major+arch or V8 silently ignores the cache (safe, just no speedup).
+async fn warmup_node_cache(
+    build_dir: &Path,
+    start_cmd: &[String],
+    proj_env: &std::collections::BTreeMap<String, String>,
+    cloud: &Arc<CloudState>,
+    bid: &str,
+) {
+    use std::process::Stdio;
+    let log = |m: String| cloud.builds.log(bid, m);
+    if std::env::var("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+        return;
+    }
+    if !is_node_start_cmd(start_cmd) {
+        return; // non-Node (static / python / container) — never set the cache
+    }
+    let cache_dir = build_dir.join(".hive-compile-cache");
+    if tokio::fs::create_dir_all(&cache_dir).await.is_err() {
+        return;
+    }
+    // Preload: after HIVE_WARMUP_MS, flush the compile cache + exit(0) so bytecode
+    // persists. Self-terminating, so it works regardless of the server's own signal
+    // handling and needs no external kill. `flushCompileCache` exists on Node >=22.8;
+    // on older/unsupported Node it's a no-op and the cache dir stays empty (handled).
+    let preload = build_dir.join(".hive-warmup-preload.cjs");
+    let preload_js = "const m=require('module');const ms=parseInt(process.env.HIVE_WARMUP_MS||'5000',10);setTimeout(()=>{try{m.flushCompileCache&&m.flushCompileCache();}catch(e){}process.exit(0);},ms);";
+    if tokio::fs::write(&preload, preload_js).await.is_err() {
+        return;
+    }
+    // PATH mirrors run_streamed: project-local .bin, then the pinned stable Node.
+    let local_bin = build_dir.join("node_modules/.bin");
+    let mut prefix = local_bin.to_string_lossy().into_owned();
+    // Pin the warm-up to the RUNTIME Node (HIVE_WARMUP_NODE on FC nodes = the microVM's
+    // baked Node) so the bytecode cache is valid at runtime, not silently re-compiled.
+    let warm_node = warmup_node_bin();
+    if let Some(dir) = warm_node.as_deref().and_then(|nb| Path::new(nb).parent()) {
+        prefix.push(':');
+        prefix.push_str(&dir.to_string_lossy());
+    }
+    let path = format!(
+        "{prefix}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cmd_str = start_cmd.join(" ");
+    // The V8 compile cache is keyed by each module's ABSOLUTE path. On Firecracker the
+    // runtime relocates the artifact to a FIXED workdir (the microVM mounts the data
+    // disk at /build), so the warm-up must compile with those SAME paths or the runtime
+    // silently re-compiles (the cross-platform/-path silent-miss). When
+    // HIVE_WARMUP_BUILD_PATH is set (FC nodes → /build), run the warm-up in a private
+    // mount namespace with build_dir bind-mounted there so module paths match. On the
+    // Mac/mock backend build_dir IS the run dir, so no remap is needed (env unset).
+    let remap = std::env::var("HIVE_WARMUP_BUILD_PATH").ok().filter(|p| p.starts_with('/'));
+    let remap = remap.as_deref().map(|t| t.trim_end_matches('/').to_string());
+    let (cc_dir, preload_arg): (String, String) = match &remap {
+        Some(t) => (format!("{t}/.hive-compile-cache"), format!("{t}/.hive-warmup-preload.cjs")),
+        None => (cache_dir.to_string_lossy().into_owned(), preload.to_string_lossy().into_owned()),
+    };
+    log(format!("Compile-cache: warming V8 bytecode (booting `{cmd_str}`)…"));
+    // `exec` so the child IS the server process (not a wrapping shell); PORT=0 binds an
+    // ephemeral port (compilation happens during boot, before/around the listen).
+    let mut command = match &remap {
+        Some(t) => {
+            let mut c = Command::new("unshare");
+            c.arg("-m").arg("sh").arg("-c").arg(format!(
+                "mkdir -p {t} && mount --bind {b} {t} && cd {t} && exec {cmd_str}",
+                b = build_dir.to_string_lossy()
+            ));
+            c
+        }
+        None => {
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(format!("exec {cmd_str}")).current_dir(build_dir);
+            c
+        }
+    };
+    let home: &Path = remap.as_deref().map(Path::new).unwrap_or(build_dir);
+    let child = command
+        .env("PATH", &path)
+        .env("HOME", home)
+        .env("PORT", "0")
+        .env("NODE_COMPILE_CACHE", &cc_dir)
+        .env("NODE_OPTIONS", format!("--require {preload_arg}"))
+        .env("HIVE_WARMUP_MS", "5000")
+        .envs(proj_env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match child {
+        Ok(mut c) => {
+            // A launcher (`npm start`, `next start`) forks the real server as a CHILD that
+            // compiles + flushes its bytecode slightly AFTER the launcher exits. Reading the
+            // cache the instant the launcher exits ships only the launcher's modules and
+            // SILENTLY MISSES the server's (the real compile cost). So poll the cache until
+            // it stops growing — i.e. all descendants have finished flushing — with a hard
+            // cap so a hung boot can't stall the deploy. The preload self-exits each Node
+            // process ~HIVE_WARMUP_MS after its modules are compiled (sync require completes
+            // first), so the cache converges quickly.
+            let start = tokio::time::Instant::now();
+            let mut last = 0u64;
+            let mut stable = 0u32;
+            loop {
+                tokio::time::sleep(Duration::from_millis(800)).await;
+                let exited = matches!(c.try_wait(), Ok(Some(_)));
+                let (_f, bytes) = dir_stats(&cache_dir).await;
+                if bytes > 0 && bytes == last { stable += 1 } else { stable = 0 }
+                last = bytes;
+                let elapsed = start.elapsed();
+                // Done when: the cache captured something and held steady ~2.4s; OR the
+                // launcher exited having produced nothing after a grace window (non-Node /
+                // old Node — nothing to wait for); OR the 45s hard cap.
+                if (stable >= 3 && bytes > 0)
+                    || (exited && bytes == 0 && elapsed > Duration::from_secs(8))
+                    || elapsed > Duration::from_secs(45)
+                {
+                    break;
+                }
+            }
+            let _ = c.start_kill();
+        }
+        Err(e) => log(format!("WARN: compile-cache warm-up could not start ({e}); deploy continues uncached.")),
+    }
+    let _ = tokio::fs::remove_file(&preload).await;
+    let (files, bytes) = dir_stats(&cache_dir).await;
+    if files > 0 {
+        log(format!(
+            "Compile-cache: precompiled {files} module(s), {} KB → shipped in artifact (warm-up Node: {}).",
+            bytes / 1024,
+            warm_node.as_deref().unwrap_or("system")
+        ));
+    } else {
+        let _ = tokio::fs::remove_dir_all(&cache_dir).await;
+        log("Compile-cache: no bytecode captured (runtime Node may be <22.1, or the server didn't boot) — app still starts, just uncached.".into());
+    }
 }
 
 /// Run a shell command in `dir`, streaming stdout+stderr into the build log.
@@ -1668,15 +1895,104 @@ async fn compute_cache_key(install_dir: &Path, pm: &str) -> Option<String> {
     Some(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
 }
 
+// ---- #22 build-artifact integrity + authenticity --------------------------
+//
+// A node pulls `node_modules` tarballs from mesh peers (`try_peer_fetch`). Without
+// verification, a corrupted byte stream — or a malicious peer — could inject
+// arbitrary content into a build (a supply-chain hole). We protect every pull with
+// two checks, both using primitives already in the tree (`sha2`, `hmac`):
+//   * a SHA-256 CONTENT digest (`x-hive-artifact-sha256`) catches CORRUPTION —
+//     always enforced when the header is present (works with no shared secret).
+//   * an HMAC-SHA256 SIGNATURE (`x-hive-artifact-sig`) over the bytes, keyed by a
+//     fleet-shared secret, catches FORGERY — a peer without the secret can't mint a
+//     valid signature. Enforced whenever a secret is configured on this node.
+
+pub const ARTIFACT_SHA_HEADER: &str = "x-hive-artifact-sha256";
+pub const ARTIFACT_SIG_HEADER: &str = "x-hive-artifact-sig";
+
+/// Fleet-shared secret for artifact signatures (#22). Reuses `HIVE_JWT_SECRET`
+/// (already distributed fleet-wide) unless `HIVE_ARTIFACT_SECRET` overrides it.
+/// `None` => signing disabled (dev / single-node), like the JWT dev-open default.
+pub fn artifact_secret() -> Option<String> {
+    std::env::var("HIVE_ARTIFACT_SECRET")
+        .ok()
+        .or_else(|| std::env::var("HIVE_JWT_SECRET").ok())
+        .filter(|s| !s.is_empty())
+}
+
+/// Lowercase hex SHA-256 of `bytes` (#22 content digest).
+pub fn artifact_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Lowercase hex HMAC-SHA256(secret, bytes) (#22 authenticity signature).
+pub fn artifact_sig(secret: &str, bytes: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    mac.update(bytes);
+    mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+}
+
+/// Constant-time verify of an HMAC artifact signature (#22).
+pub fn artifact_sig_valid(secret: &str, bytes: &[u8], sig_hex: &str) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let Some(expected) = hex_decode(sig_hex) else { return false };
+    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    mac.update(bytes);
+    mac.verify_slice(&expected).is_ok() // constant-time comparison
+}
+
+/// Verify a pulled artifact against the peer's integrity/authenticity headers (#22).
+/// Returns Ok(()) if the bytes are trustworthy, Err(reason) otherwise. `sha`/`sig`
+/// are the header values the peer sent (None if absent).
+fn verify_pulled_artifact(bytes: &[u8], sha: Option<&str>, sig: Option<&str>) -> Result<(), String> {
+    // Content digest: if present, it MUST match (corruption guard).
+    if let Some(sha) = sha {
+        if !artifact_sha256(bytes).eq_ignore_ascii_case(sha) {
+            return Err("content sha256 mismatch (corrupted artifact)".into());
+        }
+    }
+    // Authenticity: if THIS node has a secret configured, a valid signature is
+    // REQUIRED — a peer that can't sign is not trusted to supply build inputs.
+    if let Some(secret) = artifact_secret() {
+        match sig {
+            Some(sig) if artifact_sig_valid(&secret, bytes, sig) => {}
+            Some(_) => return Err("artifact signature invalid (untrusted/forged)".into()),
+            None => return Err("artifact signature missing (peer can't authenticate)".into()),
+        }
+    }
+    Ok(())
+}
+
 /// Try to fetch a cache blob from a mesh peer; write it to `dest`. Returns true on
-/// success. Best-effort: any error is swallowed.
+/// success. Best-effort: any error is swallowed. Verifies integrity + authenticity
+/// of the pulled bytes (#22) before accepting — a failed check rejects that peer's
+/// copy and tries the next, never writing untrusted bytes to the cache.
 async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool {
     let peers = cloud.peers.read().clone();
     for peer in peers {
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
         if let Ok(resp) = cloud.http.get(&url).timeout(Duration::from_secs(20)).send().await {
             if resp.status().is_success() {
+                let sha = resp.headers().get(ARTIFACT_SHA_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
+                let sig = resp.headers().get(ARTIFACT_SIG_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
                 if let Ok(bytes) = resp.bytes().await {
+                    if let Err(reason) = verify_pulled_artifact(&bytes, sha.as_deref(), sig.as_deref()) {
+                        tracing::warn!(peer = %peer, key = %key, %reason, "rejected untrusted build artifact (#22)");
+                        continue; // never write unverified bytes; try the next peer
+                    }
                     if tokio::fs::create_dir_all(cache_root()).await.is_ok()
                         && tokio::fs::write(dest, &bytes).await.is_ok()
                     {
@@ -2205,6 +2521,54 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn artifact_sha256_detects_corruption() {
+        let a = b"tarball-bytes-v1";
+        let d = artifact_sha256(a);
+        assert_eq!(d.len(), 64, "sha256 hex is 64 chars");
+        assert_eq!(artifact_sha256(a), d, "deterministic");
+        assert_ne!(artifact_sha256(b"tarball-bytes-v2"), d, "different bytes -> different digest");
+    }
+
+    #[test]
+    fn artifact_hmac_sign_verify_and_tamper() {
+        let secret = "fleet-shared-secret";
+        let bytes = b"node_modules tar payload";
+        let sig = artifact_sig(secret, bytes);
+        assert!(artifact_sig_valid(secret, bytes, &sig), "valid signature verifies");
+        // Tampered payload fails.
+        assert!(!artifact_sig_valid(secret, b"node_modules tar payloaX", &sig));
+        // Wrong secret (a peer without the fleet secret) can't forge.
+        assert!(!artifact_sig_valid("other-secret", bytes, &sig));
+        // Garbage / odd-length hex is rejected, not panicked.
+        assert!(!artifact_sig_valid(secret, bytes, "zz"));
+        assert!(!artifact_sig_valid(secret, bytes, "abc"));
+    }
+
+    // One test owns the process env vars (tests share a process; mutating env in
+    // parallel would race), exercising both the no-secret and secret-set regimes.
+    #[test]
+    fn verify_pulled_artifact_integrity_and_authenticity() {
+        let bytes = b"the artifact";
+        let good_sha = artifact_sha256(bytes);
+
+        // --- No secret configured (dev / single node) ---
+        std::env::remove_var("HIVE_ARTIFACT_SECRET");
+        std::env::remove_var("HIVE_JWT_SECRET");
+        assert!(verify_pulled_artifact(bytes, Some(&good_sha), None).is_ok(), "good digest accepted");
+        assert!(verify_pulled_artifact(bytes, Some("deadbeef"), None).is_err(), "corruption rejected");
+        assert!(verify_pulled_artifact(bytes, None, None).is_ok(), "legacy peer accepted in dev");
+
+        // --- Fleet secret configured (production) ---
+        std::env::set_var("HIVE_ARTIFACT_SECRET", "s3cret");
+        let sig = artifact_sig("s3cret", bytes);
+        assert!(verify_pulled_artifact(bytes, Some(&good_sha), Some(&sig)).is_ok(), "valid sha+sig accepted");
+        assert!(verify_pulled_artifact(bytes, Some(&good_sha), None).is_err(), "missing sig rejected when secret set");
+        let forged = artifact_sig("wrong", bytes);
+        assert!(verify_pulled_artifact(bytes, Some(&good_sha), Some(&forged)).is_err(), "forged sig rejected");
+        std::env::remove_var("HIVE_ARTIFACT_SECRET");
+    }
 
     #[test]
     fn glob_match_function_keys() {

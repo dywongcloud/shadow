@@ -36,6 +36,14 @@ mod linux {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
+    /// Node-family start command? (the V8 compile-cache env applies only to these —
+    /// never static sites, Python, or containers). Matches on the basename.
+    fn is_node_start_cmd(start_cmd: &[String]) -> bool {
+        let Some(first) = start_cmd.first() else { return false };
+        let base = first.rsplit('/').next().unwrap_or(first);
+        matches!(base, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next")
+    }
+
     pub fn run() {
         let as_init = std::process::id() == 1;
         if as_init {
@@ -198,6 +206,19 @@ mod linux {
             .env("PORT", launch.port.to_string())
             .envs(launch.env.iter())
             .stdin(Stdio::null());
+        // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
+        // WRITABLE cache dir under the workdir. The build shipped precompiled bytecode
+        // there; Node >=22.1 picks it up automatically (skips parse/compile on a cold
+        // start) and appends entries for modules the build didn't pre-cache. Node-family
+        // only, and opt-out via HIVE_COMPILE_CACHE=0 in the deployment env. Never fails
+        // boot: a missing/invalid/unwritable cache just means Node recompiles.
+        let cc_off = launch.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
+        if !cc_off && is_node_start_cmd(&launch.start_cmd) {
+            let cache_dir = format!("{}/.hive-compile-cache", workdir.trim_end_matches('/'));
+            if std::fs::create_dir_all(&cache_dir).is_ok() {
+                cmd.env("NODE_COMPILE_CACHE", &cache_dir);
+            }
+        }
         // Detach: the function lives until the cell is torn down. Dropping the
         // std Child does not kill it.
         let _child = cmd.spawn()?;

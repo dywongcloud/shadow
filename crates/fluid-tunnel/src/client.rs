@@ -108,6 +108,11 @@ impl TunnelClient {
                             h.max_concurrency = m.max_concurrency;
                             h.last_update_ms = now_ms();
                             h.alive = true;
+                            // #14: tunnel byte/backpressure metering.
+                            h.bytes_in = m.bytes_in;
+                            h.bytes_out = m.bytes_out;
+                            h.queue_depth = m.queue_depth;
+                            h.backpressure_events = m.backpressure_events;
                         }
                     }
                     _ => {}

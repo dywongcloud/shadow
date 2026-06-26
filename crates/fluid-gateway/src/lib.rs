@@ -467,25 +467,62 @@ pub fn admin_router(gw: Arc<Gateway>) -> Router {
         .with_state(gw)
 }
 
-#[derive(Serialize)]
-struct TunnelStats {
-    tunnels_opened: u64,
-    tunnels_reused: u64,
-    reuse_pct: f64,
-    live_tunnels: usize,
+#[derive(Serialize, Clone, Default)]
+pub struct TunnelStats {
+    pub tunnels_opened: u64,
+    pub tunnels_reused: u64,
+    pub reuse_pct: f64,
+    pub live_tunnels: usize,
+    /// Aggregate tunnel byte/backpressure metering across live tunnels (#14).
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    /// Sum of current write-queue depth across live tunnels (downstream backpressure).
+    pub queue_depth: u32,
+    /// Cumulative backpressure high-water trips across live tunnels.
+    pub backpressure_events: u64,
+    /// Live tunnels currently showing a non-empty write queue (under backpressure).
+    pub tunnels_backpressured: usize,
+}
+
+impl Gateway {
+    /// Tunnel reuse + #14 byte/backpressure metering, aggregated across live
+    /// tunnels. Exposed so the node admin API can surface it.
+    pub async fn tunnel_stats(&self) -> TunnelStats {
+        let opened = self.tunnels_opened.load(Ordering::Relaxed);
+        let reused = self.tunnels_reused.load(Ordering::Relaxed);
+        let total = opened + reused;
+        let reuse_pct = if total > 0 { reused as f64 / total as f64 } else { 0.0 };
+        let (mut bytes_in, mut bytes_out, mut queue_depth, mut bp, mut backpressured) =
+            (0u64, 0u64, 0u32, 0u64, 0usize);
+        let live = self.tunnels.lock().await;
+        for client in live.values() {
+            let h = client.health();
+            bytes_in += h.bytes_in;
+            bytes_out += h.bytes_out;
+            queue_depth += h.queue_depth;
+            bp += h.backpressure_events;
+            if h.queue_depth > 0 {
+                backpressured += 1;
+            }
+        }
+        let live_tunnels = live.len();
+        drop(live);
+        TunnelStats {
+            tunnels_opened: opened,
+            tunnels_reused: reused,
+            reuse_pct,
+            live_tunnels,
+            bytes_in,
+            bytes_out,
+            queue_depth,
+            backpressure_events: bp,
+            tunnels_backpressured: backpressured,
+        }
+    }
 }
 
 async fn admin_tunnels(State(gw): State<Arc<Gateway>>) -> Json<TunnelStats> {
-    let opened = gw.tunnels_opened.load(Ordering::Relaxed);
-    let reused = gw.tunnels_reused.load(Ordering::Relaxed);
-    let total = opened + reused;
-    let reuse_pct = if total > 0 { reused as f64 / total as f64 } else { 0.0 };
-    Json(TunnelStats {
-        tunnels_opened: opened,
-        tunnels_reused: reused,
-        reuse_pct,
-        live_tunnels: gw.tunnels.lock().await.len(),
-    })
+    Json(gw.tunnel_stats().await)
 }
 
 pub async fn serve_public(gw: Arc<Gateway>, addr: std::net::SocketAddr) -> anyhow::Result<()> {
@@ -621,7 +658,37 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                 .await
         }
     };
+    // Per-route policy (#16): when this deployment carries Next.js per-route
+    // classification, apply route-type-aware caching to the response. Matched on
+    // the ORIGINAL request path (route patterns are user-facing, pre-rewrite).
+    // No-op when `route_policies` is empty (the common case) -> byte-identical.
+    let resp = apply_route_policy(resp, &dep, &orig_path);
     inject_headers(resp, &extra_headers)
+}
+
+/// Apply a deployment's per-route policy (#16) to a response: tag it with the
+/// matched route class for observability, and — for Static/ISR routes whose
+/// origin didn't set its own `Cache-Control` — synthesize the route-type cache
+/// header (Static => immutable, ISR => `s-maxage=revalidate, SWR`). Purely
+/// additive: returns the response untouched when no policy matches, when the
+/// origin already set caching, or for non-success statuses.
+fn apply_route_policy(mut resp: Response, dep: &Deployment, path: &str) -> Response {
+    let Some(policy) = dep.manifest.route_policy(path) else {
+        return resp;
+    };
+    // Observability: surfaces which class served the request (enables live verify).
+    resp.headers_mut().insert("x-hive-route-class", HeaderValue::from_static(policy.class.name()));
+    // Only synthesize caching for cacheable (2xx) responses that don't already
+    // carry a Cache-Control from the origin (don't override the app's intent).
+    if !resp.status().is_success() || resp.headers().contains_key(header::CACHE_CONTROL) {
+        return resp;
+    }
+    if let Some(cc) = policy.class.cache_policy(policy.revalidate).cache_control() {
+        if let Ok(v) = HeaderValue::from_str(&cc) {
+            resp.headers_mut().insert(header::CACHE_CONTROL, v);
+        }
+    }
+    resp
 }
 
 /// Apply configured response headers (`vercel.json` `headers`) onto a response.
@@ -1051,9 +1118,15 @@ async fn proxy_function(
         let lease = match gw.fluid.lease(&key).await {
             Ok(l) => l,
             Err(e) => {
-                warn!(func = %key, error = %e, "lease failed");
-                return (StatusCode::SERVICE_UNAVAILABLE, format!("no capacity: {e}"))
-                    .into_response();
+                // Structured failure (#18): classify, return a STABLE public code +
+                // correct status — never leak the internal error to the caller.
+                let es = e.to_string();
+                let class = classify_lease_error(&es);
+                warn!(func = %key, error = %es, code = class.code(), "lease failed");
+                let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let mut resp = (status, class.code()).into_response();
+                resp.headers_mut().insert("x-hive-error", HeaderValue::from_static(class.code()));
+                return resp;
             }
         };
         let cell = lease.cell_id().clone();
@@ -1097,7 +1170,28 @@ async fn proxy_function(
             }
         }
     }
-    (StatusCode::BAD_GATEWAY, format!("upstream failed after reroute: {last_err}")).into_response()
+    // Reroute budget exhausted — runtime tunnel kept failing. Public code only;
+    // the internal `last_err` (tunnel internals) stays in the log (#18).
+    warn!(func = %key, error = %last_err, "upstream failed after reroute budget");
+    let class = fluid_core::FailureClass::RuntimeTunnelFailed;
+    let mut resp = (StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY), class.code()).into_response();
+    resp.headers_mut().insert("x-hive-error", HeaderValue::from_static(class.code()));
+    resp
+}
+
+/// Classify a `Fluid::lease` error into a stable public [`FailureClass`] (#18).
+/// A tenant hitting its cross-pool instance quota is a 429 (back off, you're
+/// throttled); any other lease failure (concurrency saturation, cold-start cap,
+/// provisioning failure) is a 503 capacity problem. Coupled to the `NackReason`
+/// Debug name surfaced by `fluid-compute`'s `bail!("... ({reason:?})")` — the
+/// `classify_lease_error_*` tests lock that contract so a format change can't
+/// silently downgrade quota throttles to generic capacity errors.
+fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
+    if es.contains("TenantQuota") {
+        fluid_core::FailureClass::TenantThrottled
+    } else {
+        fluid_core::FailureClass::CapacityExhausted
+    }
 }
 
 /// Turn a tunnel response into an axum response.
@@ -1367,6 +1461,119 @@ fn content_type(file: &Path) -> &'static str {
         Some("txt") => "text/plain; charset=utf-8",
         Some("wasm") => "application/wasm",
         _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod route_policy_tests {
+    use super::*;
+    use fluid_core::{Manifest, RouteClass, RoutePolicy};
+
+    fn dep_with(policies: Vec<RoutePolicy>) -> Deployment {
+        Deployment {
+            id: DeploymentId::from("dpl-test".to_string()),
+            project: "p".into(),
+            root: PathBuf::from("/tmp"),
+            manifest: Manifest { project: "p".into(), route_policies: policies, ..Default::default() },
+            created_at_ms: 0,
+            state: fluid_core::DeployState::Ready,
+            creator: String::new(),
+            git: None,
+            production: true,
+            target: "production".into(),
+            tenant: String::new(),
+        }
+    }
+
+    fn resp(status: StatusCode, cache: Option<&str>) -> Response {
+        let mut b = Response::builder().status(status);
+        if let Some(c) = cache {
+            b = b.header(header::CACHE_CONTROL, c);
+        }
+        b.body(Body::empty()).unwrap().into_response()
+    }
+
+    fn cc(r: &Response) -> Option<String> {
+        r.headers().get(header::CACHE_CONTROL).map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn no_policies_is_byte_identical_noop() {
+        let dep = dep_with(vec![]);
+        let r = apply_route_policy(resp(StatusCode::OK, None), &dep, "/anything");
+        assert!(cc(&r).is_none());
+        assert!(!r.headers().contains_key("x-hive-route-class"));
+    }
+
+    #[test]
+    fn isr_route_gets_synthesized_cache_and_class_header() {
+        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
+        let r = apply_route_policy(resp(StatusCode::OK, None), &dep, "/blog/hello");
+        assert_eq!(cc(&r).as_deref(), Some("public, s-maxage=120, stale-while-revalidate"));
+        assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "isr");
+    }
+
+    #[test]
+    fn origin_cache_control_is_never_overridden() {
+        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
+        let r = apply_route_policy(resp(StatusCode::OK, Some("private, no-store")), &dep, "/blog/hello");
+        assert_eq!(cc(&r).as_deref(), Some("private, no-store"), "app intent wins");
+        // class header is still tagged for observability.
+        assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "isr");
+    }
+
+    #[test]
+    fn dynamic_route_tagged_but_no_synthetic_cache() {
+        let dep = dep_with(vec![RoutePolicy { pattern: "/api/claw".into(), class: RouteClass::ApiNode, revalidate: None }]);
+        let r = apply_route_policy(resp(StatusCode::OK, None), &dep, "/api/claw");
+        assert!(cc(&r).is_none(), "dynamic defers to origin");
+        assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "api_node");
+    }
+
+    #[test]
+    fn non_success_status_not_cached() {
+        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
+        let r = apply_route_policy(resp(StatusCode::INTERNAL_SERVER_ERROR, None), &dep, "/blog/hello");
+        assert!(cc(&r).is_none(), "errors are not cached");
+    }
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+    use fluid_core::FailureClass;
+
+    #[test]
+    fn classify_lease_error_maps_quota_and_capacity() {
+        // Quota breach -> 429 throttle.
+        let q = classify_lease_error("function 'app:fn' saturated (TenantQuota)");
+        assert_eq!(q, FailureClass::TenantThrottled);
+        assert_eq!(q.status(), 429);
+        assert_eq!(q.code(), "TENANT_THROTTLED");
+        // Concurrency saturation / cold-start cap / anything else -> 503 capacity.
+        for es in [
+            "function 'app:fn' saturated (ConcurrencyLimit)",
+            "function 'app:fn' saturated (ColdStartCap)",
+            "cold-start coalesce timed out",
+            "provision failed: backend stub",
+        ] {
+            let c = classify_lease_error(es);
+            assert_eq!(c, FailureClass::CapacityExhausted, "for {es}");
+            assert_eq!(c.status(), 503);
+            assert_eq!(c.code(), "CAPACITY_EXHAUSTED");
+        }
+    }
+
+    #[test]
+    fn classify_lease_error_matches_fluid_bail_format() {
+        // Lock the cross-crate contract: the string fluid-compute actually bails
+        // with on a tenant-quota NACK must classify as TenantThrottled. If
+        // fluid-compute changes its Debug/bail format, this fails loudly here
+        // instead of silently downgrading throttles to 503 in production.
+        let reason = fluid_compute::NackReason::TenantQuota;
+        let bail = format!("function 'app:fn' saturated ({reason:?})");
+        assert!(bail.contains("TenantQuota"), "fluid bail string was: {bail}");
+        assert_eq!(classify_lease_error(&bail), FailureClass::TenantThrottled);
     }
 }
 

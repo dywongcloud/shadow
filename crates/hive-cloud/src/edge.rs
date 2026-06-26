@@ -28,6 +28,17 @@ fn set(resp: &mut Response, name: &'static str, val: &str) {
     }
 }
 
+/// Build a structured failure response (#18): correct status + a stable public code
+/// body + `x-hive-error` header. Internal detail stays in the recorded event/log.
+fn fail_response(class: fluid_core::FailureClass, region: &str, rid: &str) -> Response {
+    let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut resp = (status, class.code()).into_response();
+    set(&mut resp, "x-hive-error", class.code());
+    set(&mut resp, "x-hive-region", region);
+    set(&mut resp, "x-hive-request-id", rid);
+    resp
+}
+
 pub async fn edge_pipeline(
     State(cloud): State<Arc<CloudState>>,
     mut req: Request,
@@ -123,17 +134,19 @@ pub async fn edge_pipeline(
         .split(':').next().unwrap_or(&host)
         .split('.').next().unwrap_or(&host)
         .to_string();
-    // CONTAINER single-owner enforcement: even if THIS node has the container
-    // locally, only the lease owner may serve it — so route to the owner (prevents
-    // split-brain double-running of a stateful container). Functions are unaffected.
-    let container_owner: Option<String> = if serve_local && cloud.gw.is_container_host(&host) {
-        match cloud.leases.owner_of(&sub) {
-            Some(owner) if owner != cloud.node_name => Some(owner),
-            _ => None,
-        }
-    } else {
-        None
-    };
+    // CONTAINER single-owner routing: a container deployment has a placement LEASE,
+    // and ONLY its lease owner may serve it (prevents split-brain double-running of a
+    // stateful container). The lease propagates mesh-wide via gossip, so ANY node can
+    // determine the owner from `owner_of(sub)` — even a node that neither hosts the
+    // container nor gossips serve-hosts directly with the owner. We route to that
+    // owner using the gossip REGISTRY's address (below), NOT peer_routes (which needs
+    // full-mesh serve-hosts gossip to be complete). `owner_of` returns `Some` only for
+    // a live container lease, so functions are unaffected. `None` when WE are the
+    // owner (serve locally) or there's no live lease.
+    let container_owner: Option<String> = cloud
+        .leases
+        .owner_of(&sub)
+        .filter(|owner| owner != &cloud.node_name);
     if !already_proxied && !host.is_empty() && (!serve_local || container_owner.is_some()) {
         // Only nodes healthy in BOTH the route table AND the gossip registry are
         // eligible (#6) — a dropped/unhealthy node is excluded as a candidate.
@@ -155,33 +168,96 @@ pub async fn edge_pipeline(
             .collect();
         let had_routes = !raw.is_empty();
 
-        // Candidate ordering: container → ONLY the elected owner (single-owner);
-        // otherwise apply the deployment's configured region/failover policy (#5).
-        let cands: Vec<crate::state::PeerRoute> = if let Some(owner) = &container_owner {
-            raw.into_iter().filter(|c| &c.node_id == owner).collect()
+        // Candidate ordering: container → ONLY the elected lease owner (single-owner),
+        // addressed from the gossip REGISTRY so it's reachable from any node even when
+        // peer_routes lacks it (non-full-mesh serve-hosts gossip). Otherwise apply the
+        // deployment's configured region/failover policy (#5) over peer_routes.
+        let mut cands: Vec<crate::state::PeerRoute> = if let Some(owner) = &container_owner {
+            cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .find(|n| &n.id == owner && n.healthy)
+                .map(|n| crate::state::PeerRoute {
+                    node_id: n.id,
+                    region: n.region,
+                    gateway: n.public_url,
+                    latency_ms: n.latency_ms,
+                    healthy: true,
+                    last_seen_ms: hive_core::now_ms(),
+                })
+                .into_iter()
+                .collect()
         } else {
             let project = cloud.gw.project_for_host(&host).unwrap_or_else(|| sub.clone());
             let fs = cloud.projects.get(&project).functions;
-            order_candidates(raw, &fs, &region)
+            order_candidates(raw.clone(), &fs, &region)
         };
 
         if cands.is_empty() {
-            // The deployment EXISTS in the mesh but no healthy node is in an allowed
-            // region (failover:false + primary down, or failover:true with every
-            // configured region unhealthy). Never cross into a forbidden region —
-            // return 503 rather than silently routing elsewhere (#5/#6).
-            if had_routes {
+            // The deployment EXISTS in the mesh but no healthy node can serve it: a
+            // container whose lease owner is currently unhealthy, or a function with
+            // failover:false + primary down / all configured regions unhealthy. Never
+            // cross into a forbidden region — 503 rather than silently routing
+            // elsewhere (#5/#6). `container_owner.is_some()` ⇒ the deployment exists
+            // (we hold its lease) even if peer_routes is empty on this node.
+            if container_owner.is_some() {
                 let mut ev = cloud.event(&region, &method, &host, &path, 503, "mesh-region-unavailable", &sub);
                 ev.request_id = rid.clone();
                 cloud.record(ev);
-                let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "no healthy node in the configured region(s)").into_response();
-                set(&mut resp, "x-hive-region", &region);
-                set(&mut resp, "x-hive-request-id", &rid);
-                return resp;
+                return fail_response(fluid_core::FailureClass::NoHealthyRegion, &region, &rid);
+            }
+            // FUNCTION with healthy routes but none in the configured/preferred region
+            // PER THIS NODE'S route table. That's almost always incomplete/mislabeled
+            // per-node metadata (serve-hosts gossip is non-full-mesh; a peer learned the
+            // host's route with a stale/missing region), NOT a genuine region outage —
+            // the deployment is provably healthy somewhere (`raw` is non-empty). Falsely
+            // 503ing a healthy deployment (the "no healthy region from some nodes" bug)
+            // is worse than serving it: fall back to the healthy routes (latency-first),
+            // which point at the real hosting node (itself in an allowed region, since
+            // placement only hosts in allowed regions). Log it so the metadata gap is
+            // observable.
+            if had_routes {
+                tracing::warn!(
+                    sub = %sub,
+                    routes = ?raw.iter().map(|r| (r.node_id.clone(), r.region.clone())).collect::<Vec<_>>(),
+                    "no candidate in preferred region; falling back to healthy routes (incomplete per-node route metadata)"
+                );
+                let mut fb = raw;
+                fb.sort_by_key(|r| (if r.region == region { 0u8 } else { 1u8 }, r.latency_ms));
+                cands = fb;
             }
             // else: no routes at all → fall through to DEPLOYMENT_NOT_FOUND below.
-        } else {
+        }
+        if !cands.is_empty() {
             let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+
+            // Region-affinity redirect (browser navigations only): a request that
+            // entered the WRONG region for this deployment (e.g. `app.iad.ngrok.pizza`
+            // when the app is hosted in sj) is 307'd to the app's HOME-region URL so the
+            // next hop lands DIRECT instead of mesh-forwarding cross-region. Gated to:
+            // region-coded hosts (`*.<code>.ngrok.pizza`, never the legacy zone), a
+            // `text/html` Accept (top-level navigation — API/asset/fetch clients fall
+            // through and forward transparently, so non-redirect clients never break),
+            // non-WS, and only when the home code actually DIFFERS — so the redirected
+            // request, now in the home region, serves local and never re-redirects (no
+            // loop). `cands[0]` is the chosen serving node, so its region is the home.
+            if !is_ws_upgrade {
+                if let Some(host_code) = host_region_code(&host) {
+                    let home_code = crate::admin::region_code(&cands[0].region);
+                    let wants_html = header(&headers_vec, "accept")
+                        .map(|a| a.contains("text/html"))
+                        .unwrap_or(false);
+                    if wants_html && !home_code.is_empty() && home_code != host_code {
+                        let target = format!("https://{sub}.{home_code}.ngrok.pizza{path_q}");
+                        let mut ev = cloud.event(&region, &method, &host, &path, 307, "region-redirect", home_code);
+                        ev.request_id = rid.clone();
+                        cloud.record(ev);
+                        return axum::response::Redirect::temporary(&target).into_response();
+                    }
+                }
+            }
+
             let mesh = cloud.mesh.read().clone();
             let node_iroh: std::collections::HashMap<String, String> = cloud
                 .registry
@@ -234,13 +310,35 @@ pub async fn edge_pipeline(
             // HTTP: buffer the request body once (reused across failover attempts).
             let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
             let (_parts, body) = req.into_parts();
-            let body_bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_default();
+            // Track replayability (#7): a body we couldn't fully buffer is NOT safe to
+            // re-send on a retry. (>16 MiB streaming uploads are a known gap — they
+            // still go out empty on the first attempt; here we just never RETRY them.)
+            let (body_bytes, body_replay) = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                Ok(b) => (b, crate::retry::BodyReplay::Buffered),
+                Err(_) => (Bytes::new(), crate::retry::BodyReplay::NonReplayable),
+            };
+            // Retry-safety inputs (#6): idempotent method, or an explicit idempotency key.
+            let has_idem_key = header(&headers_vec, "idempotency-key").is_some()
+                || header(&headers_vec, "x-idempotency-key").is_some();
+            // Once a request has been attempted on one transport/peer, any further
+            // attempt is a RETRY — only allowed when safe (no double side-effect, no
+            // started response, replayable body). The FIRST attempt always proceeds.
+            let mut attempted = false;
+            let mut refused_retry = false;
 
             for cand in &cands {
                 // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
                 // works across NATs. STREAM the response so SSE / chunked bodies
                 // arrive incrementally cross-node (#1). Fall through to HTTP on error.
                 if let (Some(pool), Some(addr_json)) = (&mesh, node_iroh.get(&cand.node_id)) {
+                    // Gate a RE-attempt: refuse if retrying could double-execute / replay unsafely.
+                    if attempted
+                        && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
+                    {
+                        refused_retry = true;
+                        break;
+                    }
+                    attempted = true;
                     match pool.request_stream(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
                         Ok(ts) => {
                             let status = ts.status;
@@ -282,6 +380,15 @@ pub async fn edge_pipeline(
                         Err(_) => { /* iroh failed → try HTTP for this candidate */ }
                     }
                 }
+                // Gate the HTTP attempt too (it's a re-attempt after iroh for this
+                // candidate, or after a previous candidate). First attempt passes.
+                if attempted
+                    && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
+                {
+                    refused_retry = true;
+                    break;
+                }
+                attempted = true;
                 let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
                 let mut rb = cloud
                     .http
@@ -332,13 +439,21 @@ pub async fn edge_pipeline(
                     Err(_) => continue, // peer down → fail over to the next candidate
                 }
             }
-            // Every candidate peer failed.
-            let mut ev = cloud.event(&region, &method, &host, &path, 502, "mesh-route-fail", &sub);
+            // Either every candidate failed, OR the first attempt failed and the
+            // request was not safe to retry (non-idempotent / non-replayable). In the
+            // latter case we deliberately do NOT re-execute it on another peer.
+            let (action, class) = if refused_retry {
+                ("mesh-route-noretry", fluid_core::FailureClass::NotRetryable)
+            } else {
+                ("mesh-route-fail", fluid_core::FailureClass::PeerUnreachable)
+            };
+            let mut ev = cloud.event(&region, &method, &host, &path, class.status(), action, &sub);
             ev.request_id = rid.clone();
             cloud.record(ev);
-            let mut resp = (StatusCode::BAD_GATEWAY, "no healthy node could serve this deployment").into_response();
-            set(&mut resp, "x-hive-region", &region);
-            set(&mut resp, "x-hive-request-id", &rid);
+            let mut resp = fail_response(class, &region, &rid);
+            if refused_retry {
+                set(&mut resp, "x-hive-retry", "refused");
+            }
             return resp;
         }
     }
@@ -541,6 +656,23 @@ fn region_code(region: &str) -> String {
 
 /// Vercel-style `404: NOT_FOUND` / `DEPLOYMENT_NOT_FOUND` page. The id encodes the
 /// serving region instance: `<region-code>::<rand>-<timestamp>-<hash>`.
+/// The ngrok ingress region code of a `*.<code>.ngrok.pizza` host (iad/sin/sfo/lax),
+/// or None for the legacy zone, localhost, or any non-region host. Used to detect a
+/// region-MISMATCHED request so a browser can be redirected to the app's home region.
+/// NOTE: distinct from the vanity `region_code` above (which returns `iad1`/`sfo1` for
+/// error-IDs); these no-digit codes are the actual reserved ngrok wildcards.
+fn host_region_code(host: &str) -> Option<&'static str> {
+    let h = host.split(':').next().unwrap_or(host);
+    let stem = h.strip_suffix(".ngrok.pizza")?;
+    match stem.rsplit('.').next()? {
+        "iad" => Some("iad"),
+        "sin" => Some("sin"),
+        "sfo" => Some("sfo"),
+        "lax" => Some("lax"),
+        _ => None,
+    }
+}
+
 fn deployment_not_found(region: &str) -> Response {
     let u = uuid::Uuid::new_v4().simple().to_string();
     let id = format!(
@@ -1062,6 +1194,7 @@ mod tests {
             gateway: format!("http://{node}:8787"),
             latency_ms: lat,
             healthy: true,
+            last_seen_ms: 0,
         }
     }
     fn fs(regions: &[&str], failover: bool) -> FunctionSettings {

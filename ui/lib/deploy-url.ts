@@ -55,18 +55,31 @@ function subOf(alias: string): string {
   return alias.replace(/\.localhost$/i, "").split(".")[0];
 }
 
-/** The public host for a deployment (no scheme), e.g. `my-app.deployment.shadow.ngrok.pizza`
- *  on a tunnel session, else `my-app.localhost:8787` on a localhost session. */
-export function deploymentHost(alias: string | undefined | null): string {
-  if (!alias) return "";
+/**
+ * Region-affinity ingress: when a deployment carries a region code (iad/sin/sfo/lax),
+ * its PRIMARY public URL is `<sub>.<code>.ngrok.pizza` so the request enters directly
+ * on a node in that region (no cross-region entry hop). Falls back to the legacy
+ * region-agnostic zone for empty/unknown codes, and to localhost on a local session.
+ */
+function publicDeployDomain(regionCode?: string | null): string {
   const domain = activeDeployDomain();
+  if (!domain) return ""; // localhost session — never region-encode
+  const code = (regionCode || "").trim().toLowerCase();
+  return code ? `${code}.ngrok.pizza` : domain;
+}
+
+/** The public host for a deployment (no scheme), e.g. `my-app.iad.ngrok.pizza` on a
+ *  tunnel session (region-encoded), else `my-app.localhost:8787` on a localhost session. */
+export function deploymentHost(alias: string | undefined | null, regionCode?: string | null): string {
+  if (!alias) return "";
+  const domain = publicDeployDomain(regionCode);
   return domain ? `${subOf(alias)}.${domain}` : `${subOf(alias)}.localhost:8787`;
 }
 
 /** The full clickable URL for a deployment. */
-export function deploymentUrl(alias: string | undefined | null): string {
+export function deploymentUrl(alias: string | undefined | null, regionCode?: string | null): string {
   if (!alias) return "#";
-  const domain = activeDeployDomain();
+  const domain = publicDeployDomain(regionCode);
   return domain ? `https://${subOf(alias)}.${domain}/` : `http://${subOf(alias)}.localhost:8787/`;
 }
 
@@ -85,8 +98,8 @@ export const zkEnabled = process.env.NEXT_PUBLIC_ZKAUTH === "1";
  * without leaking identity to the serving node. Falls back to a plain open if the
  * flag is off, no proof is available, or anything fails.
  */
-export async function openDeployment(alias: string | undefined | null, project: string) {
-  const base = deploymentUrl(alias).replace(/\/$/, "");
+export async function openDeployment(alias: string | undefined | null, project: string, regionCode?: string | null) {
+  const base = deploymentUrl(alias, regionCode).replace(/\/$/, "");
   if (zkEnabled && alias) {
     try {
       // Imported lazily to avoid pulling the api client into pure-URL callers.

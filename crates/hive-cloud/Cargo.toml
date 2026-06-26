@@ -38,6 +38,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hmac = "0.12"
 sha2 = "0.10"
 sysinfo = "0.32"
+# Seer: the platform's own pkarr discovery relay (verify/serve signed node records).
+# `signed_packet` only — no DHT/client/network deps. Pinned to iroh's pkarr version.
+pkarr = { version = "3.10", default-features = false, features = ["signed_packet"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }

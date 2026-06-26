@@ -356,7 +356,7 @@ pub fn routes() -> Router {
 
 /// Node-to-node: this node's local public roster, for mesh replication so peers
 /// that serve previews can rebuild the identical verification ring.
-async fn roster_export() -> Json<Value> {
+pub(crate) async fn roster_export() -> Json<Value> {
     Json(export_json())
 }
 

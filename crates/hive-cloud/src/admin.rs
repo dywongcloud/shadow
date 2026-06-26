@@ -33,6 +33,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/regions", get(regions))
         .route("/v1/logs", get(logs))
         .route("/v1/functions", get(functions))
+        .route("/v1/tunnels", get(tunnels))
+        .route("/v1/relay", get(relay_stats))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -371,14 +373,14 @@ fn walk_assets(base: &std::path::Path, cap: usize) -> Vec<Value> {
 }
 
 /// Functions + static assets for a deployment — the build artifacts/resources.
-async fn deployment_resources(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Json<Value> {
+pub(crate) async fn deployment_resources(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Json<Value> {
     let t = tenant(&c, &headers);
     let Some(rec) = c.gw.deployment_records().into_iter().find(|r| r.id == id) else {
         // Not hosted locally — the placement scheduler may have put this deployment
         // on a peer. Proxy to the hosting node so its build outputs (functions +
         // static assets, which live on that node's filesystem) are returned.
-        if let Some(admin) = host_admin_for_deployment(&c, &id) {
-            if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/deployments/{id}/resources"), &t).await {
+        if let Some(node) = host_node_for_deployment(&c, &id) {
+            if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/resources"), &t).await {
                 return Json(v);
             }
         }
@@ -762,7 +764,7 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     format!("{base}-{}", now_ms())
 }
 
-async fn git_deploy(
+pub(crate) async fn git_deploy(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     Json(mut req): Json<fluid_core::GitDeployRequest>,
@@ -811,7 +813,7 @@ async fn git_deploy(
     Ok(Json(json!({ "build_id": build_id, "project": project })))
 }
 
-async fn build_get(
+pub(crate) async fn build_get(
     State(c): State<Arc<CloudState>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
@@ -821,7 +823,7 @@ async fn build_get(
 /// Publish the host subdomains this node serves + its gateway URL, so peers can
 /// build their cross-node routing tables (the mesh routes requests to wherever a
 /// deployment actually lives).
-async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
+pub(crate) async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!({
         "node": c.node_name,
         "region": c.region,
@@ -835,7 +837,7 @@ async fn serve_hosts(State(c): State<Arc<CloudState>>) -> Json<Value> {
 /// Current container placement leases across the mesh (owner + fencing epoch +
 /// expiry). The single owner of each stateful container, for visibility + the
 /// edge router (container requests go to the owner).
-async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+pub(crate) async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.leases.list()))
 }
 
@@ -874,7 +876,28 @@ async fn buildcache_get(Path(key): Path<String>) -> Result<axum::response::Respo
     }
     let path = crate::git::cache_root().join(format!("{key}.tar"));
     match tokio::fs::read(&path).await {
-        Ok(bytes) => Ok(([(axum::http::header::CONTENT_TYPE, "application/x-tar")], bytes).into_response()),
+        Ok(bytes) => {
+            // #22: attach a content digest (integrity) + an HMAC signature
+            // (authenticity, when a fleet secret is set) so the puller can reject
+            // corrupted or forged artifacts.
+            let mut headers = vec![
+                (axum::http::header::CONTENT_TYPE.as_str().to_string(), "application/x-tar".to_string()),
+                (crate::git::ARTIFACT_SHA_HEADER.to_string(), crate::git::artifact_sha256(&bytes)),
+            ];
+            if let Some(secret) = crate::git::artifact_secret() {
+                headers.push((crate::git::ARTIFACT_SIG_HEADER.to_string(), crate::git::artifact_sig(&secret, &bytes)));
+            }
+            let mut resp = bytes.into_response();
+            for (k, v) in headers {
+                if let (Ok(name), Ok(val)) = (
+                    axum::http::HeaderName::from_bytes(k.as_bytes()),
+                    axum::http::HeaderValue::from_str(&v),
+                ) {
+                    resp.headers_mut().insert(name, val);
+                }
+            }
+            Ok(resp)
+        }
         Err(_) => Err(StatusCode::NOT_FOUND),
     }
 }
@@ -916,6 +939,19 @@ fn norm(team: &str) -> &str {
     if team.is_empty() { "personal" } else { team }
 }
 
+/// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
+/// (virginia→iad, bangkok→sin, san-jose→sfo, los-angeles→lax). Unknown regions
+/// return "" so the dashboard falls back to the legacy region-agnostic zone URL.
+pub fn region_code(region: &str) -> &'static str {
+    match region {
+        "virginia" => "iad",
+        "bangkok" => "sin",
+        "san-jose" => "sfo",
+        "los-angeles" => "lax",
+        _ => "",
+    }
+}
+
 async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<Value> {
     // STRICT multi-tenant isolation: a request only ever sees the deployments for
     // its active tenant (the Clerk org slug / team via `x-hive-team`, or an API
@@ -940,12 +976,29 @@ async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap) -> Json<
         }
     }
     list.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
-    Json(json!(list))
+    // Enrich each with its placement region + public ingress code so the dashboard
+    // can render the region-encoded primary URL (`<dep>.<code>.ngrok.pizza`). The
+    // placement region = the project's first configured region, else the scheduler's
+    // default (nearest-eligible = San Jose). Additive fields; legacy URL still works.
+    let out: Vec<Value> = list
+        .into_iter()
+        .map(|d| {
+            let regions = c.projects.get(&d.project).functions.regions;
+            let primary = regions.first().cloned().unwrap_or_else(|| "san-jose".to_string());
+            let mut v = serde_json::to_value(&d).unwrap_or_else(|_| json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("region".to_string(), json!(primary));
+                o.insert("region_code".to_string(), json!(region_code(&primary)));
+            }
+            v
+        })
+        .collect();
+    Json(json!(out))
 }
 
 /// Node-to-node: this node's full deployment list (all tenants), for peers to
 /// build a fleet-wide view. Consumed by the gossip loop into `peer_deployments`.
-async fn fleet_deployments(State(c): State<Arc<CloudState>>) -> Json<Value> {
+pub(crate) async fn fleet_deployments(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!({ "node": c.node_name, "deployments": c.gw.list() }))
 }
 
@@ -1211,6 +1264,71 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
         .await
         .ok()?;
     resp.json::<Value>().await.ok()
+}
+
+// ---- node-addressed read-view proxying (HTTP admin OR iroh mesh) ----------------
+// The NAT'd coordinator has NO HTTP admin path to the FC nodes (SSH tunnels cut), so
+// `node_admins` is empty for them and the HTTP `host_admin_for_*` helpers return None
+// — which silently emptied the dashboard's per-deployment read views (resources, and
+// the workflows tab) for FC-hosted projects. These resolve the host NODE NAME instead
+// and fetch over whichever transport works: HTTP admin if known, else the iroh mesh.
+
+/// Host node NAME for deployment `id` (no HTTP-admin requirement).
+fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
+    c.peer_deployments
+        .read()
+        .iter()
+        .find(|(_, deps)| deps.iter().any(|d| d.id.to_string() == id))
+        .map(|(node, _)| node.clone())
+}
+
+/// Host node NAME for any deployment of `project` (no HTTP-admin requirement).
+fn host_node_for_project(c: &Arc<CloudState>, project: &str) -> Option<String> {
+    c.peer_deployments
+        .read()
+        .iter()
+        .find(|(_, deps)| deps.iter().any(|d| d.project == project))
+        .map(|(node, _)| node.clone())
+}
+
+/// Peer node NAMES hosting any of the tenant's projects (for fleet-wide aggregation).
+fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
+    let pd = c.peer_deployments.read();
+    let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (node, deps) in pd.iter() {
+        if deps.iter().any(|d| norm(&d.tenant) == team) {
+            out.insert(node.clone());
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// GET a read-view from a host node by NAME: HTTP admin if we have one, else over the
+/// iroh mesh (resolve the node's id+addr from the gossip registry). Team rides as a
+/// query param on the iroh path (no HTTP headers over that transport).
+async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
+    // Bind out of the lock FIRST so no parking_lot guard is held across the await
+    // (the dispatched future must be `Send`).
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Some(v) = proxy_get_json(c, &admin, path, team).await {
+            return Some(v);
+        }
+    }
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((id, addr)) = target {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let p = format!("{path}{sep}team={team}");
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 10).await {
+            return serde_json::from_slice(&b).ok();
+        }
+    }
+    None
 }
 
 async fn project_redeploy(
@@ -1506,7 +1624,7 @@ fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
 
 // ---- Mesh: a peer announces itself to us ----
 
-async fn node_announce(
+pub(crate) async fn node_announce(
     State(c): State<Arc<CloudState>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Json<Value> {
@@ -1536,10 +1654,23 @@ async fn overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
         "waf_managed": c.waf.managed_enabled(),
         "cron_jobs": c.cron.list().len(),
         "workflows": c.workflows.defs().len(),
+        "control_plane": {
+            // #25: gossip freshness. degraded=true means peers are configured but
+            // we haven't synced within the TTL — data plane still serves local
+            // known-good state; this just makes the staleness observable.
+            "last_gossip_ms": c.last_gossip_ms(),
+            "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
+        },
+        "peer_trust": {
+            // #20: P2P admission control. enforced=true rejects iroh peers whose
+            // cryptographic identity isn't in `trusted` (env + gossip roster).
+            "enforced": std::env::var("HIVE_PEER_TRUST").map(|v| v == "1" || v == "true").unwrap_or(false),
+            "trusted_peers": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0),
+        },
     }))
 }
 
-async fn nodes(State(c): State<Arc<CloudState>>) -> Json<Value> {
+pub(crate) async fn nodes(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.registry.nodes()))
 }
 
@@ -1608,6 +1739,37 @@ async fn regions(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 async fn functions(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.fluid.stats()))
+}
+
+/// Tunnel reuse + #14 byte/backpressure metering for this node's gateway.
+async fn tunnels(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.gw.tunnel_stats().await))
+}
+
+/// Relay cost accounting (#23): relay-vs-direct connection + byte breakdown for
+/// this node's mesh trunks. `relayed_*` bytes transit a relay server (a real cost
+/// + a holepunch-failure signal). Empty when P2P (iroh) isn't enabled on the node.
+async fn relay_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    let pool = c.mesh.read().clone();
+    match pool {
+        Some(pool) => {
+            let s = pool.relay_stats().await;
+            let total = s.relayed_bytes_tx + s.relayed_bytes_rx + s.direct_bytes_tx + s.direct_bytes_rx;
+            let relayed = s.relayed_bytes_tx + s.relayed_bytes_rx;
+            let relayed_pct = if total > 0 { relayed as f64 / total as f64 } else { 0.0 };
+            Json(json!({
+                "enabled": true,
+                "relayed_conns": s.relayed_conns,
+                "direct_conns": s.direct_conns,
+                "relayed_bytes_tx": s.relayed_bytes_tx,
+                "relayed_bytes_rx": s.relayed_bytes_rx,
+                "direct_bytes_tx": s.direct_bytes_tx,
+                "direct_bytes_rx": s.direct_bytes_rx,
+                "relayed_bytes_pct": relayed_pct,
+            }))
+        }
+        None => Json(json!({ "enabled": false })),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1859,13 +2021,13 @@ async fn cron_del(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> J
 // ---- Workflows ----
 
 #[derive(Deserialize)]
-struct WfQuery {
+pub(crate) struct WfQuery {
     /// Restrict to a single project.
-    project: Option<String>,
+    pub(crate) project: Option<String>,
     /// Internal: when set by a fleet-aggregation proxy call, return ONLY this
     /// node's local workflows (no further fan-out) — prevents proxy recursion.
     #[serde(default)]
-    local: Option<bool>,
+    pub(crate) local: Option<bool>,
 }
 
 /// Does this workflow's project belong to the requesting team?
@@ -1873,14 +2035,14 @@ fn wf_in_team(c: &Arc<CloudState>, project: &str, team: &str) -> bool {
     norm(&c.projects.team_of(project)) == norm(team)
 }
 
-async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
+pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers);
     // Workflows are ingested on the node that HOSTS a deployment. If this project
     // was placed on a peer, proxy to that node so its workflows show up.
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
-            if let Some(admin) = host_admin_for_project(&c, project) {
-                if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows?project={project}"), &team).await {
+            if let Some(node) = host_node_for_project(&c, project) {
+                if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows?project={project}&local=true"), &team).await {
                     return Json(v);
                 }
             }
@@ -1902,8 +2064,8 @@ async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q):
             .iter()
             .map(|d| format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or("")))
             .collect();
-        for admin in peer_admins_for_tenant(&c, &team) {
-            if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows?local=true", &team).await {
+        for node in peer_nodes_for_tenant(&c, &team) {
+            if let Some(v) = fetch_from_host(&c, &node, "/v1/workflows?local=true", &team).await {
                 if let Some(arr) = v.as_array() {
                     for d in arr {
                         let key = format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or(""));
@@ -1923,12 +2085,12 @@ async fn wf_define(State(c): State<Arc<CloudState>>, Json(def): Json<WorkflowDef
     Json(json!(c.workflows.defs()))
 }
 
-async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
+pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers);
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
-            if let Some(admin) = host_admin_for_project(&c, project) {
-                if let Some(v) = proxy_get_json(&c, &admin, &format!("/v1/workflows/runs?project={project}"), &team).await {
+            if let Some(node) = host_node_for_project(&c, project) {
+                if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs?project={project}&local=true"), &team).await {
                     return Json(v);
                 }
             }
@@ -1971,8 +2133,8 @@ async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, Query(q):
     };
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
-        for admin in peer_admins_for_tenant(&c, &team) {
-            if let Some(v) = proxy_get_json(&c, &admin, "/v1/workflows/runs?local=true", &team).await {
+        for node in peer_nodes_for_tenant(&c, &team) {
+            if let Some(v) = fetch_from_host(&c, &node, "/v1/workflows/runs?local=true", &team).await {
                 if let Some(arr) = v.as_array() {
                     for r in arr {
                         if let Some(id) = run_key(r) {

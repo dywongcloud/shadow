@@ -146,8 +146,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
               <h1 className="text-xl font-semibold">{name}</h1>
             </div>
             {prod && (
-              <a className="text-sm text-link hover:underline" href={deploymentUrl(prod.alias)} target="_blank" rel="noreferrer">
-                {deploymentHost(prod.alias)} <ExternalLink className="inline h-3 w-3" />
+              <a className="text-sm text-link hover:underline" href={deploymentUrl(prod.alias, prod.region_code)} target="_blank" rel="noreferrer">
+                {deploymentHost(prod.alias, prod.region_code)} <ExternalLink className="inline h-3 w-3" />
               </a>
             )}
           </div>
@@ -163,7 +163,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
             {busy === "project" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />} Delete
           </Button>
           <a
-            href={deploymentUrl(prod?.alias)}
+            href={deploymentUrl(prod?.alias, prod?.region_code)}
             target="_blank"
             rel="noreferrer"
             onClick={(e) => {
@@ -171,7 +171,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
               // the preview instead of a plain open. Otherwise the link proceeds.
               if (zkEnabled && prod) {
                 e.preventDefault();
-                openDeployment(prod.alias, name);
+                openDeployment(prod.alias, name, prod.region_code);
               }
             }}
           >
@@ -236,8 +236,8 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 </div>
                 <div>
                   <div className="text-muted">Domains</div>
-                  <a className="text-link hover:underline" href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer">
-                    {prod ? deploymentHost(prod.alias) : "—"} <ExternalLink className="inline h-3 w-3" />
+                  <a className="text-link hover:underline" href={deploymentUrl(prod?.alias, prod?.region_code)} target="_blank" rel="noreferrer">
+                    {prod ? deploymentHost(prod.alias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
                   </a>
                 </div>
                 <div className="flex gap-12">
@@ -351,7 +351,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                     immutable URL (commit / id URL), so a preview opens that
                     preview — not production. */}
                 <Td className="px-2 font-mono text-xs">
-                  <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.id_alias || d.commit_alias || d.alias))} target="_blank" rel="noreferrer">{d.id}</a>
+                  <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias), d.region_code)} target="_blank" rel="noreferrer">{d.id}</a>
                 </Td>
                 <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">
@@ -477,7 +477,7 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
 
   if (pv.kind === "image" && pv.url && !imgError) {
     return (
-      <a href={deploymentUrl(prod?.alias)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
+      <a href={deploymentUrl(prod?.alias, prod?.region_code)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src={`/cloud${pv.url}`}

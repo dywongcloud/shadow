@@ -91,6 +91,22 @@ class Handler(BaseHTTPRequestHandler):
             "path": self.path,
         })
 
+    def do_POST(self):
+        # /api/echo reflects this request's identity back: path, the `x-ctx`
+        # header, and the full request body, plus the serving PID. Used by the
+        # context-leak test to prove concurrent requests sharing one instance
+        # never observe each other's path/header/body.
+        clen = int(self.headers.get("content-length", "0") or "0")
+        body = self.rfile.read(clen).decode("utf-8", "replace") if clen else ""
+        ctx = self.headers.get("x-ctx", "")
+        data = json.dumps({"path": self.path, "ctx": ctx, "body": body, "pid": PID}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("x-ctx", ctx)
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def log_message(self, *args):
         pass  # quiet
 

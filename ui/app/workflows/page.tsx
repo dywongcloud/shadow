@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
 import { Button, Input, Triangle, PageHeader } from "@/components/ui";
-import { apiSend, usePoll, type WorkflowRun, type WorkflowSummaryRow, type WorkflowDef } from "@/lib/api";
+import { apiSend, usePoll, type WorkflowRun, type WorkflowDef } from "@/lib/api";
 import { StatusChips, RunsTable, normalizeRun } from "@/components/workflows";
 import { WorkflowDefGraph } from "@/components/workflow-graph";
 
@@ -27,28 +27,53 @@ function useNow(ms = 1000) {
 export default function WorkflowsPage() {
   const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs", 2000);
   const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
-  const { data: summary } = usePoll<WorkflowSummaryRow[]>("/v1/workflows/summary", 4000);
   const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 5000);
   const now = useNow();
   const [q, setQ] = useState("");
   const [range, setRange] = useState("Last 12 hours");
+  const [env, setEnv] = useState("All Environments");
   const [creating, setCreating] = useState(false);
   const [view, setView] = useState<WdkView>("runs");
 
+  // Time window, then environment scope. (Workflow runs execute on the deployed
+  // app, so they default to "production"; the env filter narrows the same dataset.)
   const windowed = useMemo(() => {
     const cutoff = now - (RANGES[range] ?? RANGES["Last 12 hours"]);
     return (runs ?? []).filter((r) => r.started_ms >= cutoff);
   }, [runs, range, now]);
 
+  const envScoped = useMemo(() => {
+    if (env === "All Environments") return windowed;
+    const want = env.toLowerCase();
+    return windowed.filter((r) => (r.environment ?? "production") === want);
+  }, [windowed, env]);
+
+  // Per-project activity rollup derived from the REAL runs (created / completed /
+  // failed / active), so the table reflects live data + the env/time filters —
+  // this is what was previously empty (the summary endpoint ignored WDK world runs).
+  const summary = useMemo(() => {
+    const agg = new Map<string, { project: string; created: number; completed: number; failed: number; active: number }>();
+    for (const r of envScoped) {
+      const proj = r.project || "default";
+      const e = agg.get(proj) ?? { project: proj, created: 0, completed: 0, failed: 0, active: 0 };
+      e.created++;
+      if (r.status === "succeeded") e.completed++;
+      else if (r.status === "failed") e.failed++;
+      else if (r.status === "running" || r.status === "pending") e.active++;
+      agg.set(proj, e);
+    }
+    return [...agg.values()].sort((a, b) => b.created - a.created);
+  }, [envScoped]);
+
   const filtered = useMemo(() => {
     const needle = q.toLowerCase();
-    return windowed.filter(
+    return envScoped.filter(
       (r) =>
         r.name.toLowerCase().includes(needle) ||
         r.id.toLowerCase().includes(needle) ||
         r.project.toLowerCase().includes(needle)
     );
-  }, [windowed, q]);
+  }, [envScoped, q]);
 
   return (
     <div className="pb-20">
@@ -84,9 +109,9 @@ export default function WorkflowsPage() {
 
       {view === "runs" && (
         <>
-          <div className="mb-4"><StatusChips runs={windowed} /></div>
+          <div className="mb-4"><StatusChips runs={envScoped} /></div>
           <div className="mb-3 flex items-center gap-2">
-            <Pill label="Production" options={["Production", "Preview", "All Environments"]} onSelect={() => {}} />
+            <Pill label={env} options={["All Environments", "Production", "Preview"]} onSelect={setEnv} />
             <div className="relative flex-1">
               <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
               <Input placeholder="Search workflows, runs, and projects…" value={q} onChange={(e) => setQ(e.target.value)} className="pl-9" />

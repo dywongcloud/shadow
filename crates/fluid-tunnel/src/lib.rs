@@ -44,11 +44,26 @@ pub struct RespMeta {
     pub wait_until_ms: u64,
 }
 
-/// In-band health/metrics the instance pushes to the router (gap #3).
+/// In-band health/metrics the instance pushes to the router (gap #3, #14).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Metrics {
     pub inflight: u32,
     pub max_concurrency: u32,
+    /// Cumulative request bytes received from the router over this tunnel (#14).
+    #[serde(default)]
+    pub bytes_in: u64,
+    /// Cumulative response bytes written back to the router over this tunnel (#14).
+    #[serde(default)]
+    pub bytes_out: u64,
+    /// Current write-queue depth: frames enqueued for the router but not yet
+    /// flushed to the socket (#14). A sustained non-zero depth means the router /
+    /// network can't drain responses as fast as the function produces them — i.e.
+    /// downstream backpressure.
+    #[serde(default)]
+    pub queue_depth: u32,
+    /// Times the write queue crossed the backpressure high-water mark (#14).
+    #[serde(default)]
+    pub backpressure_events: u64,
 }
 
 /// Snapshot of an instance's health as last reported over the tunnel.
@@ -58,4 +73,9 @@ pub struct Health {
     pub max_concurrency: u32,
     pub last_update_ms: u64,
     pub alive: bool,
+    /// Tunnel byte/backpressure metering (#14), last reported.
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub queue_depth: u32,
+    pub backpressure_events: u64,
 }

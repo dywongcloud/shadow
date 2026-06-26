@@ -35,7 +35,7 @@ export default function GeneralSettings({ params }: { params: { project: string 
       <SettingCard title="Project ID & Source" desc="Connection details for this project.">
         <div className="flex flex-col divide-y divide-border text-sm">
           <Row label="Project" value={<span className="font-mono">{project}</span>} />
-          <Row label="Production URL" value={dep ? <a className="text-link hover:underline" href={deploymentUrl(dep.alias)} target="_blank" rel="noreferrer">{deploymentHost(dep.alias)}</a> : "—"} />
+          <Row label="Production URL" value={dep ? <a className="text-link hover:underline" href={deploymentUrl(dep.alias, dep.region_code)} target="_blank" rel="noreferrer">{deploymentHost(dep.alias, dep.region_code)}</a> : "—"} />
           <Row
             label="Git"
             value={dep?.git ? <span className="font-mono text-xs">{dep.git.repo_url} @ {dep.git.branch}</span> : <Badge>Not connected</Badge>}

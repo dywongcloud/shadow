@@ -32,9 +32,3 @@ endpoints:
     pooling_enabled: true
     upstream:
       url: 8787
-
-  - name: gateway-lax
-    url: https://*.lax.ngrok.pizza
-    pooling_enabled: true
-    upstream:
-      url: 8787

@@ -90,6 +90,10 @@ pub struct FirecrackerBackend {
     /// Per-container tunnel-server accept loops (front the container's host port),
     /// aborted on teardown.
     ctnl_tasks: Arc<Mutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
+    /// Throttled batch CPU sampler for `cpu_percent` (#2): samples the per-cell
+    /// Firecracker VMM host process, whose CPU tracks the guest's vCPU work
+    /// (Firecracker is a thin VMM).
+    sampler: Arc<crate::CpuSampler>,
 }
 
 impl FirecrackerBackend {
@@ -121,6 +125,7 @@ impl FirecrackerBackend {
             nat_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             containers,
             ctnl_tasks: Arc::new(Mutex::new(HashMap::new())),
+            sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
 
@@ -785,6 +790,16 @@ impl CellBackend for FirecrackerBackend {
         self.teardown_cell_net(&cell.id).await;
         let _ = tokio::fs::remove_dir_all(&cell.root).await;
         Ok(())
+    }
+
+    async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
+        // Sample the per-cell Firecracker VMM host process; its CPU tracks the
+        // guest's vCPU work. Container cells (no microVM) have no VMM proc → None.
+        let pid = {
+            let procs = self.procs.lock().await;
+            procs.get(&cell.id).and_then(|c| c.id())?
+        };
+        self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
 }
 

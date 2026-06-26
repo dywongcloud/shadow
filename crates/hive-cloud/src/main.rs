@@ -17,6 +17,8 @@ mod dnsserver;
 mod docstore;
 mod edge;
 mod git;
+mod gossip;
+mod discovery;
 mod gitops;
 mod lease;
 mod guardian;
@@ -27,6 +29,7 @@ mod notifications;
 mod persist;
 mod project_settings;
 mod resources;
+mod retry;
 mod schedule;
 mod world;
 mod secrets;
@@ -190,7 +193,31 @@ async fn main() -> anyhow::Result<()> {
     // node has a real peer id and can serve/accept Hive tunnels across networks.
     // Best-effort with a timeout: if it can't bind (offline), the node still boots
     // and the HTTP mesh keeps working.
-    let iroh_ep = match tokio::time::timeout(Duration::from_secs(8), hive_p2p::bind()).await {
+    // Persistent iroh identity: a stable EndpointId across restarts so peers' cached
+    // addresses stay valid (enables gossip-over-iroh + retiring SSH tunnels).
+    let iroh_key_path = persist::data_dir().join("iroh_secret.key");
+    // Cold-start bootstrap seeds: stable public nodes a wiped/fresh node rendezvous
+    // with over iroh (no SSH, no prior state). From `HIVE_BOOTSTRAP_PEERS` (CSV) or a
+    // `$HIVE_DATA/bootstrap_peers` file. Registered with iroh so seeds dial by NodeId.
+    let bootstrap_seeds = {
+        let csv = std::env::var("HIVE_BOOTSTRAP_PEERS").ok().filter(|s| !s.trim().is_empty()).or_else(|| {
+            std::fs::read_to_string(persist::data_dir().join("bootstrap_peers"))
+                .ok()
+                .map(|s| s.replace(['\n', '\r'], ","))
+        });
+        csv.map(|c| hive_p2p::parse_bootstrap_seeds(&c)).unwrap_or_default()
+    };
+    // Self-hosted discovery (Seer): pkarr relay URLs the node publishes to + resolves
+    // from, instead of depending on n0's public pkarr/DNS. Added alongside n0 (the
+    // mesh keeps working if Seer is down). Run Seer itself with HIVE_SEER_ADDR.
+    let discovery_urls: Vec<String> = std::env::var("HIVE_DISCOVERY_DNS")
+        .ok()
+        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .unwrap_or_default();
+    // HIVE_DISCOVERY_N0=0 drops n0's public pkarr/DNS (Seer-only discovery, n0 relay
+    // kept). Default keeps n0 (Seer additive).
+    let n0_discovery = std::env::var("HIVE_DISCOVERY_N0").map(|v| v != "0" && v != "false").unwrap_or(true);
+    let iroh_ep = match tokio::time::timeout(Duration::from_secs(8), hive_p2p::bind_full(Some(iroh_key_path), &bootstrap_seeds, &discovery_urls, n0_discovery)).await {
         Ok(Ok(ep)) => {
             tracing::info!(peer_id = %ep.id(), "iroh P2P endpoint bound (real QUIC mesh)");
             Some(ep)
@@ -204,11 +231,26 @@ async fn main() -> anyhow::Result<()> {
             None
         }
     };
+    // Reachable PUBLIC IP for the client-facing DNS (Seer). Authoritative source is
+    // HIVE_PUBLIC_IP (set on nodes with a real inbound-reachable address). These cloud
+    // nodes sit behind 1:1 NAT (private NIC IP), so the public IP can't be sniffed off
+    // the interface — it MUST be configured. `HIVE_PUBLIC_IP=auto` opts into ip-api
+    // detection (correct for 1:1-NAT cloud nodes; do NOT use on home-NAT'd nodes, where
+    // the detected IP is the ISP gateway, not reachable inbound). Unset → None (NAT-safe).
+    let public_ip = resolve_public_ip(geo.as_ref().and_then(|g| g.4.clone()));
+    let public_ip6 = std::env::var("HIVE_PUBLIC_IP6").ok().and_then(|s| {
+        s.trim().parse::<std::net::Ipv6Addr>().ok().filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+    }).map(|ip| ip.to_string());
+    if let Some(ip) = &public_ip {
+        tracing::info!(%ip, ip6 = ?public_ip6, "node public IP (advertised to client DNS / Seer)");
+    }
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
         region: region.clone(),
         public_url: public_base.clone(),
+        public_ip,
+        public_ip6,
         peer_id: iroh_ep.as_ref().map(|e| e.id().to_string()),
         iroh_addr: iroh_ep.as_ref().and_then(hive_p2p::addr_json),
         last_seen_ms: now_ms(),
@@ -246,6 +288,31 @@ async fn main() -> anyhow::Result<()> {
 
     // Restore persisted platform state from disk (deployments, settings, WAF…).
     persist::restore(&cloud, persist::load());
+    // Seed the gossip-transport map from disk so we can reach peers over iroh
+    // immediately on restart (bootstrap without the HTTP-over-SSH tunnels). Stable
+    // persistent iroh identities keep these addresses valid across restarts.
+    *cloud.peer_iroh.write() = persist::load_peer_iroh();
+
+    // Cold-start bootstrap: turn the seeds into always-available iroh gossip targets.
+    // Exclude ourselves (a seed list may include this node), key them as `seed:<id>`,
+    // and pre-seed `peer_iroh` so the gossip loop dials them over iroh even with an
+    // empty/wiped warm map. These are re-asserted each round (so the timeout+evict
+    // can't permanently drop a flaky seed) and added to the gossip target list.
+    let self_iroh_id = iroh_ep.as_ref().map(|e| e.id().to_string());
+    let seed_targets: Vec<(String, String, String)> = bootstrap_seeds
+        .iter()
+        .filter(|s| self_iroh_id.as_deref() != Some(s.node_id.as_str()))
+        .map(|s| (format!("seed:{}", s.node_id), s.node_id.clone(), s.addr_json.clone()))
+        .collect();
+    {
+        let mut pi = cloud.peer_iroh.write();
+        for (key, nid, addr) in &seed_targets {
+            pi.entry(key.clone()).or_insert_with(|| (nid.clone(), addr.clone()));
+        }
+    }
+    if !seed_targets.is_empty() {
+        tracing::info!(seeds = seed_targets.len(), "cold-start bootstrap seeds registered");
+    }
 
     // Record mesh peers so the build cache can be pulled P2P from other nodes.
     *cloud.peers.write() = args.peers.clone();
@@ -259,7 +326,25 @@ async fn main() -> anyhow::Result<()> {
         // stream per request (built here, alongside the endpoint it dials with).
         *cloud.mesh.write() = Some(hive_p2p::PeerPool::new(ep.clone()));
         let gateway_addr = args.listen.to_string();
-        tokio::spawn(hive_p2p::serve_tunnels(ep, gateway_addr, 256));
+        // #20 peer trust: enforce the allowlist only when HIVE_PEER_TRUST is set
+        // (opt-in — default keeps the mesh open, no behavior change). When on, the
+        // accept loop rejects any peer whose iroh identity isn't in the trust set.
+        let enforce_trust = std::env::var("HIVE_PEER_TRUST")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let trust = enforce_trust.then(|| cloud.trusted_peer_ids.clone());
+        if enforce_trust {
+            tracing::info!(
+                trusted = cloud.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0),
+                "iroh P2P peer-trust enforcement ENABLED (#20)"
+            );
+        }
+        // Serve control-plane gossip over the same iroh mesh (the inbound side of
+        // the HTTP-over-SSH → QUIC migration). Always provided; peers only use it
+        // when THEY have HIVE_GOSSIP_IROH on. The connection trust gate (#20) still
+        // applies, so gossip is authenticated by the peer's iroh identity.
+        let gossip_handler = crate::gossip::handler(cloud.clone());
+        tokio::spawn(hive_p2p::serve_tunnels(ep, gateway_addr, 256, trust, Some(gossip_handler)));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections");
     }
 
@@ -304,9 +389,28 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    if !args.peers.is_empty() {
-        spawn_gossip_loop(cloud.clone(), args.peers.clone());
+    // Discovery (Plane B, node↔node): the platform's own pkarr relay — serves/accepts
+    // self-verifying iroh NodeAddr records so the fleet resolves peers on platform-owned
+    // infra instead of n0. Bind with HIVE_DISCOVERY_ADDR (run on stable PUBLIC nodes).
+    // NOTE: distinct from Seer (Plane A, client→node DNS, in dnsserver.rs). HIVE_SEER_ADDR
+    // is still accepted as a deprecated alias for the bind addr (the names once collided).
+    if let Some(disc_addr) = std::env::var("HIVE_DISCOVERY_ADDR")
+        .or_else(|_| std::env::var("HIVE_SEER_ADDR"))
+        .ok()
+        .and_then(|s| s.parse::<SocketAddr>().ok())
+    {
+        tokio::spawn(async move {
+            if let Err(e) = discovery::serve(disc_addr, discovery::DiscoveryStore::new()).await {
+                tracing::warn!(error=%e, %disc_addr, "discovery (pkarr relay) failed to bind");
+            }
+        });
     }
+    if !args.peers.is_empty() || !seed_targets.is_empty() {
+        spawn_gossip_loop(cloud.clone(), args.peers.clone(), seed_targets.clone());
+    }
+    // Active full-mesh health probing: direct, parallel probes of every public peer so
+    // down-detection is fast (sub-interval) rather than transitive-gossip + staleness.
+    spawn_health_loop(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())
@@ -343,7 +447,7 @@ async fn main() -> anyhow::Result<()> {
 /// node's region reflects where it actually is (e.g. "los-angeles") rather than a
 /// hard-coded label. Co-located nodes resolve to the same id (one region, many
 /// nodes). Falls back to "local" when geolocation is unavailable (offline).
-fn region_id_from_geo(geo: Option<&(f64, f64, String, String)>) -> String {
+fn region_id_from_geo(geo: Option<&(f64, f64, String, String, Option<String>)>) -> String {
     let slug = |s: &str| {
         s.trim()
             .to_lowercase()
@@ -353,7 +457,7 @@ fn region_id_from_geo(geo: Option<&(f64, f64, String, String)>) -> String {
             .trim_matches('-')
             .to_string()
     };
-    if let Some((_, _, city, _country)) = geo {
+    if let Some((_, _, city, _country, _ip)) = geo {
         let c = slug(city);
         if !c.is_empty() {
             return c;
@@ -391,21 +495,44 @@ async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Best-effort IP geolocation at startup → (lat, lon, city, country). Uses the
-/// free ip-api.com endpoint with a short timeout; returns None on any failure so
+/// Resolve this node's reachable PUBLIC IPv4 for the client-facing DNS (Seer):
+/// - `HIVE_PUBLIC_IP=<ipv4>` → that address (authoritative; validated, never 0.0.0.0/loopback).
+/// - `HIVE_PUBLIC_IP=auto`   → the ip-api-detected external IP (`detected`), iff it's a real
+///   public address. Correct for 1:1-NAT cloud nodes; NOT for home-NAT'd nodes.
+/// - unset → `None`: the node advertises no public IP and is excluded from client DNS answers
+///   (the NAT-safe default — a browser must only ever get a node it can actually reach).
+fn resolve_public_ip(detected: Option<String>) -> Option<String> {
+    let is_public_v4 = |ip: &std::net::Ipv4Addr| {
+        !ip.is_unspecified() && !ip.is_loopback() && !ip.is_private() && !ip.is_link_local()
+    };
+    match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+        Some(v) if v.eq_ignore_ascii_case("auto") => {
+            detected.and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).filter(is_public_v4).map(|ip| ip.to_string())
+        }
+        Some(v) if !v.is_empty() => {
+            v.parse::<std::net::Ipv4Addr>().ok().filter(|ip| !ip.is_unspecified() && !ip.is_loopback()).map(|ip| ip.to_string())
+        }
+        _ => None,
+    }
+}
+
+/// Best-effort IP geolocation at startup → (lat, lon, city, country, public_ip). Uses
+/// the free ip-api.com endpoint with a short timeout; returns None on any failure so
 /// a node always boots even offline. Override with HIVE_GEO="lat,lon,city,country".
-async fn geolocate() -> Option<(f64, f64, String, String)> {
+/// The 5th tuple element is the detected external IP (ip-api `query`), used only when
+/// `HIVE_PUBLIC_IP=auto` (see `resolve_public_ip`).
+async fn geolocate() -> Option<(f64, f64, String, String, Option<String>)> {
     if let Ok(manual) = std::env::var("HIVE_GEO") {
         let parts: Vec<&str> = manual.splitn(4, ',').collect();
         if parts.len() == 4 {
             if let (Ok(lat), Ok(lon)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
-                return Some((lat, lon, parts[2].trim().to_string(), parts[3].trim().to_string()));
+                return Some((lat, lon, parts[2].trim().to_string(), parts[3].trim().to_string(), None));
             }
         }
     }
     let client = reqwest::Client::new();
     let resp = client
-        .get("http://ip-api.com/json/?fields=status,lat,lon,city,country")
+        .get("http://ip-api.com/json/?fields=status,lat,lon,city,country,query")
         .timeout(Duration::from_secs(4))
         .send()
         .await
@@ -419,6 +546,7 @@ async fn geolocate() -> Option<(f64, f64, String, String)> {
         v.get("lon")?.as_f64()?,
         v.get("city")?.as_str()?.to_string(),
         v.get("country")?.as_str()?.to_string(),
+        v.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()),
     ))
 }
 
@@ -586,13 +714,35 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
     });
 }
 
-fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
+fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(String, String, String)>) {
     use std::collections::HashMap;
+    // Gossip targets = the configured --peer URLs (warm path, via persisted peer_iroh
+    // or HTTP) PLUS the bootstrap seed keys (always-available iroh rendezvous). The
+    // seed keys carry the cold/wiped node until its warm peer_iroh is repopulated.
+    let mut targets = peers.clone();
+    for (key, _, _) in &seeds {
+        if !targets.contains(key) {
+            targets.push(key.clone());
+        }
+    }
     tokio::spawn(async move {
         loop {
+            // Re-assert the bootstrap seeds into peer_iroh each round: the gossip
+            // timeout+evict drops a stale/dead target's entry, but seeds are
+            // config-derived rendezvous points we must keep retrying — so re-add any
+            // that were evicted (without clobbering a fresher learned address).
+            {
+                let mut pi = cloud.peer_iroh.write();
+                for (key, nid, addr) in &seeds {
+                    pi.entry(key.clone()).or_insert_with(|| (nid.clone(), addr.clone()));
+                }
+            }
             // Rebuild the cross-node routing table from scratch each cycle so stale
             // routes (peers that no longer host a deployment) age out.
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
+            // #24: node ids successfully gossiped this round — drives the route TTL
+            // merge so a transient miss to a healthy peer doesn't drop its routes.
+            let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
             // Deployments hosted on each peer (name -> list), for the fleet-wide
             // dashboard deployment view.
             let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
@@ -605,32 +755,39 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
             for key in cloud.gw.container_projects() {
                 holders.entry(key).or_default().push(cloud.node_name.clone());
             }
-            for peer in &peers {
-                // Announce ourselves, and learn the peer's view of the cloud.
+            for peer in &targets {
+                // Announce ourselves, and learn the peer's view of the cloud — over
+                // iroh QUIC when enabled+known, else HTTP-over-SSH (bootstrap/fallback).
                 let me = cloud.registry.me();
-                let _ = cloud
-                    .http
-                    .post(format!("{peer}/v1/nodes/announce"))
-                    .json(&me)
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await;
+                let me_bytes = serde_json::to_vec(&me).unwrap_or_default();
+                let _ = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_POST, "/v1/nodes/announce", &me_bytes).await;
                 let t0 = now_ms();
                 let mut rtt = 0u64;
-                if let Ok(resp) = cloud
-                    .http
-                    .get(format!("{peer}/v1/nodes"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
-                {
+                if let Some(bytes) = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await {
                     // Round-trip latency to this peer (for anycast selection).
                     rtt = now_ms().saturating_sub(t0);
-                    if let Ok(nodes) = resp.json::<Vec<NodeInfo>>().await {
+                    if let Ok(nodes) = serde_json::from_slice::<Vec<NodeInfo>>(&bytes) {
                         // The peer lists itself first (its `me()`); record its latency.
-                        let peer_self_id = nodes.first().map(|n| n.id.clone());
+                        let peer_self = nodes.first().cloned();
+                        // Record the peer's iroh address so the NEXT round can gossip
+                        // to it over QUIC instead of HTTP-over-SSH.
+                        if let Some(ps) = &peer_self {
+                            if let Some(addr) = ps.iroh_addr.clone() {
+                                cloud.peer_iroh.write().insert(peer.clone(), (ps.id.clone(), addr));
+                            }
+                        }
+                        let peer_self_id = peer_self.map(|n| n.id);
                         for n in nodes {
                             if n.id != cloud.node_name {
+                                // #20: trust the iroh identity of every fleet node we
+                                // learn over this (operator-controlled) gossip channel.
+                                if let Some(addr) = n.iroh_addr.as_deref() {
+                                    if let Some(eid) = hive_p2p::endpoint_id_from_addr_json(addr) {
+                                        if let Ok(mut t) = cloud.trusted_peer_ids.write() {
+                                            t.insert(eid);
+                                        }
+                                    }
+                                }
                                 cloud.registry.upsert_peer(n);
                             }
                         }
@@ -638,23 +795,38 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                             cloud.registry.set_health(&pid, rtt, true);
                             // Remember how to reach this node's admin (its peer URL),
                             // so the placement scheduler can dispatch deploys to it.
-                            cloud.node_admins.write().insert(pid, peer.clone());
+                            // Skip synthetic seed keys (`seed:<id>`) — they're an iroh
+                            // rendezvous handle, not an HTTP admin URL; don't overwrite
+                            // a real --peer admin URL with one.
+                            if !peer.starts_with("seed:") {
+                                cloud.node_admins.write().insert(pid, peer.clone());
+                            }
+                            // Control-plane sync succeeded (#25) — clears degraded state.
+                            cloud.mark_gossip_ok();
                         }
+                    }
+                } else {
+                    // Direct probe to this peer FAILED → mark it unhealthy so Seer (client
+                    // DNS) and anycast immediately stop handing browsers a node they can't
+                    // reach. Self-heals: the next successful round flips it back healthy.
+                    // We can't read the id from a failed response, so resolve it from the
+                    // iroh map learned on a prior round (keyed by this peer handle).
+                    let id = cloud.peer_iroh.read().get(peer).map(|(id, _)| id.clone());
+                    if let Some(id) = id.filter(|s| !s.is_empty()) {
+                        cloud.registry.set_health(&id, 0, false);
                     }
                 }
                 // Learn which deployments this peer serves → routing table.
-                if let Ok(resp) = cloud
-                    .http
-                    .get(format!("{peer}/v1/serve-hosts"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
+                if let Some(bytes) = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await
                 {
-                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
                         let region = v.get("region").and_then(|x| x.as_str()).unwrap_or("").to_string();
                         let gateway = v.get("gateway").and_then(|x| x.as_str()).unwrap_or("").to_string();
                         if !gateway.is_empty() && node_id != cloud.node_name {
+                            // #24: this peer was reached this round → its routing is
+                            // authoritative (used by the TTL merge below).
+                            seen_nodes.insert(node_id.clone());
                             if let Some(hosts) = v.get("hosts").and_then(|x| x.as_array()) {
                                 for h in hosts.iter().filter_map(|x| x.as_str()) {
                                     routes.entry(h.to_string()).or_default().push(crate::state::PeerRoute {
@@ -663,6 +835,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                                         gateway: gateway.clone(),
                                         latency_ms: rtt,
                                         healthy: true,
+                                        last_seen_ms: now_ms(),
                                     });
                                 }
                             }
@@ -676,14 +849,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                     }
                 }
                 // Pull this peer's deployments → fleet-wide dashboard view.
-                if let Ok(resp) = cloud
-                    .http
-                    .get(format!("{peer}/v1/fleet-deployments"))
-                    .timeout(Duration::from_secs(4))
-                    .send()
-                    .await
+                if let Some(bytes) = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_GET, "/v1/fleet-deployments", &[]).await
                 {
-                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
                         if !node_id.is_empty() && node_id != cloud.node_name {
                             if let Some(deps) = v.get("deployments") {
@@ -697,36 +865,154 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>) {
                 // Replicate the peer's public zkauth roster so previews placed on
                 // THIS node verify against the same ring the home node minted.
                 #[cfg(feature = "zkauth")]
-                if let Ok(resp) = cloud
-                    .http
-                    .get(format!("{peer}/v1/zkauth/roster-export"))
-                    .timeout(Duration::from_secs(4))
-                    .send()
-                    .await
+                if let Some(bytes) = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_GET, "/v1/zkauth/roster-export", &[]).await
                 {
-                    if let Ok(v) = resp.json::<serde_json::Value>().await {
+                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                         crate::zkauth::ingest_peer_export(&v);
                     }
                 }
                 // Converge container leases (highest fencing epoch wins).
-                if let Ok(resp) = cloud
-                    .http
-                    .get(format!("{peer}/v1/leases"))
-                    .timeout(Duration::from_secs(3))
-                    .send()
-                    .await
+                if let Some(bytes) = gossip::fetch(&cloud, peer, hive_p2p::GOSSIP_GET, "/v1/leases", &[]).await
                 {
-                    if let Ok(leases) = resp.json::<Vec<crate::lease::ContainerLease>>().await {
+                    if let Ok(leases) = serde_json::from_slice::<Vec<crate::lease::ContainerLease>>(&bytes) {
                         for l in leases {
                             cloud.leases.merge(l);
                         }
                     }
                 }
             }
-            *cloud.peer_routes.write() = routes;
-            *cloud.peer_deployments.write() = fleet;
+            // #24: TTL-merge routes so a route from a peer we briefly couldn't reach
+            // this round survives (up to ROUTE_TTL_MS) instead of vanishing and
+            // 404-ing the deployment; reached peers' routes are still authoritative.
+            let merged = {
+                let prev = cloud.peer_routes.read().clone();
+                crate::state::merge_routes_ttl(&prev, routes, &seen_nodes, now_ms(), crate::state::ROUTE_TTL_MS)
+            };
+            *cloud.peer_routes.write() = merged;
+            // TTL-merge fleet deployments too (same rationale as routes): a single missed
+            // gossip fetch to a peer must NOT wipe its projects from the dashboard's
+            // workflows/runs/deployments views. Carry forward an alive-but-unreached
+            // node's deployments; drop only nodes that have aged out of the registry.
+            let alive: std::collections::HashSet<String> =
+                cloud.registry.nodes().into_iter().map(|n| n.name).collect();
+            let merged_deps = {
+                let prev = cloud.peer_deployments.read().clone();
+                crate::state::merge_deployments_ttl(&prev, fleet, &alive)
+            };
+            *cloud.peer_deployments.write() = merged_deps;
             *cloud.container_holders.write() = holders;
+            // Persist the gossip-transport map so the next restart bootstraps iroh
+            // gossip from disk (no SSH tunnel needed for rendezvous).
+            crate::persist::save_peer_iroh(&cloud.peer_iroh.read());
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
+}
+
+/// Parse a positive-u64 env var with a default (clamped to >= 1).
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default).max(1)
+}
+
+/// Decide the health write from a probe result + the running consecutive-miss count.
+/// Returns `(new_miss_count, write)` where `write` is `Some(true)`/`Some(false)` to
+/// call `set_health`, or `None` to leave the current health untouched. Success →
+/// reset + healthy (fast recovery). Failure → only flip unhealthy after `threshold`
+/// CONSECUTIVE misses (a single dropped/slow probe never flaps a node).
+fn health_decision(prev_misses: u32, ok: bool, threshold: u32) -> (u32, Option<bool>) {
+    if ok {
+        (0, Some(true))
+    } else {
+        let m = prev_misses + 1;
+        if m >= threshold { (m, Some(false)) } else { (m, None) }
+    }
+}
+
+/// Active full-mesh health probing (the fast path for down-detection). Every node
+/// directly probes every OTHER public node in PARALLEL on a short interval, so health
+/// — up AND down — is owned by a direct probe (sub-`interval` flips) instead of
+/// transitive gossip + the ~30s staleness drain. Scope = public-IP nodes only: NAT'd
+/// nodes are reachable solely via relay, are already excluded from client DNS (the
+/// `public_ip` gate in `lb_records`), and stay on the staleness model so relay-probe
+/// jitter can't churn their health or spam logs. `nodes()`'s 30s staleness drop stays
+/// the backstop for a peer that's both unprobeable and gone. Config:
+/// `HIVE_HEALTH_INTERVAL` (s, def 5), `HIVE_HEALTH_TIMEOUT` (s, def 2),
+/// `HIVE_HEALTH_FAIL_THRESHOLD` (consecutive misses, def 2).
+fn spawn_health_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
+    let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));
+    let threshold = env_u64("HIVE_HEALTH_FAIL_THRESHOLD", 2) as u32;
+    tracing::info!(?interval, ?timeout, threshold, "active health probing (public nodes)");
+    tokio::spawn(async move {
+        let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        loop {
+            tokio::time::sleep(interval).await;
+            // No mesh transport bound yet → skip the round (never false-flag a peer).
+            if cloud.mesh.read().is_none() {
+                continue;
+            }
+            // Probe set: every OTHER node with a public IP + a resolvable iroh address.
+            let targets: Vec<(String, String, String)> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self && n.public_ip.is_some())
+                .filter_map(|n| Some((n.id.clone(), n.peer_id.clone()?, n.iroh_addr.clone()?)))
+                .collect();
+            if targets.is_empty() {
+                continue;
+            }
+            // Probe ALL targets concurrently — a dead/slow peer must not delay the rest.
+            let results = futures::future::join_all(targets.into_iter().map(|(name, id, addr)| {
+                let cloud = cloud.clone();
+                async move { (name, gossip::probe(&cloud, &id, &addr, timeout).await) }
+            }))
+            .await;
+            let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (name, rtt) in results {
+                live.insert(name.clone());
+                let prev = *misses.get(&name).unwrap_or(&0);
+                let (next, write) = health_decision(prev, rtt.is_some(), threshold);
+                misses.insert(name.clone(), next);
+                match write {
+                    Some(true) => cloud.registry.set_health(&name, rtt.unwrap_or(0), true),
+                    Some(false) => {
+                        tracing::debug!(node = %name, misses = next, "peer marked unhealthy (probe)");
+                        cloud.registry.set_health(&name, 0, false);
+                    }
+                    None => {}
+                }
+            }
+            // Forget miss-counters for nodes no longer in the probe set (relocated/gone).
+            misses.retain(|k, _| live.contains(k));
+        }
+    });
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::health_decision;
+
+    #[test]
+    fn threshold_prevents_single_probe_flapping() {
+        let threshold = 2;
+        // First miss (< threshold): stay as-is (no write), counter = 1.
+        let (m, w) = health_decision(0, false, threshold);
+        assert_eq!(m, 1);
+        assert_eq!(w, None, "a single dropped probe must NOT flip the node");
+        // Second consecutive miss (== threshold): flip unhealthy.
+        let (m, w) = health_decision(m, false, threshold);
+        assert_eq!(m, 2);
+        assert_eq!(w, Some(false), "Nth consecutive miss flips unhealthy");
+        // A success resets the counter and restores health immediately.
+        let (m, w) = health_decision(m, true, threshold);
+        assert_eq!(m, 0, "success resets the miss counter");
+        assert_eq!(w, Some(true), "success → healthy (fast recovery)");
+    }
+
+    #[test]
+    fn threshold_one_flips_on_first_miss() {
+        let (m, w) = health_decision(0, false, 1);
+        assert_eq!((m, w), (1, Some(false)));
+    }
 }

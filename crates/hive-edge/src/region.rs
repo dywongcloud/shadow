@@ -16,6 +16,16 @@ pub struct NodeInfo {
     pub region: String,
     /// Public gateway URL (for same-LAN / direct addressing).
     pub public_url: String,
+    /// Reachable PUBLIC IPv4 — the address a *browser* can hit over HTTPS. Used by
+    /// the client-facing authoritative DNS (Seer) for A records. `None` for NAT'd
+    /// nodes (no inbound-reachable address) → they're excluded from client DNS.
+    /// Set from `HIVE_PUBLIC_IP`; NEVER the `--listen` bind addr and never 0.0.0.0.
+    #[serde(default)]
+    pub public_ip: Option<String>,
+    /// Reachable PUBLIC IPv6 (Seer AAAA records). `None` if the node has none.
+    /// Set from `HIVE_PUBLIC_IP6`.
+    #[serde(default)]
+    pub public_ip6: Option<String>,
     /// iroh endpoint id, for P2P reachability across networks.
     pub peer_id: Option<String>,
     /// iroh dialable address (JSON: direct socket addrs + relay), so peers can
@@ -162,11 +172,25 @@ impl NodeRegistry {
         &self.me.region
     }
 
-    /// Record/refresh a peer.
+    /// Record/refresh a peer learned over gossip. Crucially, this does NOT bump
+    /// `last_seen` to local-now: a node's liveness is whether ITS OWN emitted record is
+    /// still recent (origin timestamp), not whether some peer just re-mentioned a cached
+    /// copy. Re-stamping on every relay is exactly what kept a dead node alive forever as
+    /// a "healthy zombie" — its record was perpetually refreshed second-hand and never
+    /// aged out. Keeping the origin timestamp means a dead node's record freezes and
+    /// drops mesh-wide via the 30s staleness window in `nodes()` (clocks are NTP-synced,
+    /// skew ≪ window). Direct probes (`set_health`) still bump freshness for OUR peers.
     pub fn upsert_peer(&self, mut peer: NodeInfo) {
-        peer.last_seen_ms = now_ms();
         peer.is_self = false;
-        self.peers.write().insert(peer.id.clone(), peer);
+        let mut peers = self.peers.write();
+        if let Some(existing) = peers.get(&peer.id) {
+            // Health + latency are owned by our OWN direct probes, never second-hand gossip.
+            peer.healthy = existing.healthy;
+            peer.latency_ms = existing.latency_ms;
+            // Keep the freshest origin timestamp seen (a relayed copy may arrive stale).
+            peer.last_seen_ms = peer.last_seen_ms.max(existing.last_seen_ms);
+        }
+        peers.insert(peer.id.clone(), peer);
     }
 
     /// All nodes (self first), with stale peers (>30s) dropped.
@@ -215,6 +239,8 @@ mod tests {
             name: id.into(),
             region: region.into(),
             public_url: format!("http://{id}:8787"),
+            public_ip: None,
+            public_ip6: None,
             peer_id: None,
             iroh_addr: None,
             last_seen_ms: now_ms(),
@@ -276,5 +302,22 @@ mod tests {
         let pick = reg.anycast(Some("sfo1")).unwrap();
         assert!(pick.healthy);
         assert_ne!(pick.id, "sfo");
+    }
+
+    #[test]
+    fn upsert_does_not_resurrect_directly_failed_health() {
+        let reg = NodeRegistry::new(node("self", "iad1", 0, true));
+        reg.upsert_peer(node("peer", "sfo1", 10, true));
+        // Our own direct probe failed → unhealthy.
+        reg.set_health("peer", 0, false);
+        // A second node re-gossips it as healthy=true (the zombie path)...
+        reg.upsert_peer(node("peer", "sfo1", 10, true));
+        // ...but locally-observed health wins: it stays unhealthy until OUR probe succeeds.
+        let p = reg.nodes().into_iter().find(|n| n.id == "peer").unwrap();
+        assert!(!p.healthy, "second-hand gossip must not resurrect a directly-failed node");
+        // A real direct success does bring it back.
+        reg.set_health("peer", 5, true);
+        let p = reg.nodes().into_iter().find(|n| n.id == "peer").unwrap();
+        assert!(p.healthy, "direct probe success restores health");
     }
 }

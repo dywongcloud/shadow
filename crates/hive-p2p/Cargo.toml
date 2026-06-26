@@ -11,6 +11,7 @@ bytes = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 iroh = "1"
+url = "2"
 serde_json = { workspace = true }
 
 [[bin]]

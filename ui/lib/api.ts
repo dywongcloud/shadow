@@ -212,6 +212,16 @@ export interface FunctionStats {
   active_cpu_ms: number;
   memory_gb_hrs: number;
   active_cpu_savings_pct: number;
+  /** Scheduler observability. */
+  safe_concurrency?: number;
+  nack_total?: number;
+  nack_concurrency?: number;
+  nack_quota?: number;
+  scale_out_total?: number;
+  coldstart_deduped?: number;
+  recycled?: number;
+  last_provision_ms?: number;
+  last_runtime_init_ms?: number;
 }
 
 export interface GitSource {
@@ -242,6 +252,10 @@ export interface Deployment {
   production: boolean;
   kind: string;
   features?: DeploymentFeatures;
+  /** Placement region (e.g. "san-jose") — the project's primary region, else default. */
+  region?: string;
+  /** Public ingress code for the region (iad/sin/sfo/lax); "" when unmapped. */
+  region_code?: string;
 }
 
 export interface DeploymentFeatures {
@@ -470,6 +484,8 @@ export interface WorkflowRun {
   steps: StepRun[];
   started_ms: number;
   finished_ms: number | null;
+  /** Deployment environment the run executed on ("production" | "preview"). */
+  environment?: string;
 }
 export interface WorkflowSummaryRow {
   project: string;

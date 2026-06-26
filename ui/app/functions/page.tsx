@@ -10,7 +10,7 @@ export default function FunctionsPage() {
       <PageHeader title="Functions" desc="Fluid compute — instances multiplex concurrent requests, scale to zero, and bill Active CPU + memory (not idle wall-time)" />
       <Table>
         <thead>
-          <tr><Th>Function</Th><Th>Instances</Th><Th>In-flight</Th><Th>Concurrency</Th><Th>Requests</Th><Th>Active CPU</Th><Th>Memory</Th><Th>Fluid savings</Th><Th>Active-CPU savings</Th></tr>
+          <tr><Th>Function</Th><Th>Instances</Th><Th>In-flight</Th><Th>Concurrency</Th><Th>Scale-outs</Th><Th>NACKs</Th><Th>Recycled</Th><Th>Requests</Th><Th>Active CPU</Th><Th>Memory</Th><Th>Fluid savings</Th><Th>Active-CPU savings</Th></tr>
         </thead>
         <tbody>
           {(fns ?? []).map((f) => (
@@ -18,7 +18,10 @@ export default function FunctionsPage() {
               <Td className="font-mono text-xs">{f.key}</Td>
               <Td className="tabular-nums">{f.instances}</Td>
               <Td className="tabular-nums">{f.inflight}</Td>
-              <Td className="tabular-nums">{f.max_concurrency}</Td>
+              <Td className="tabular-nums">{f.safe_concurrency ?? f.max_concurrency}{(f.safe_concurrency ?? f.max_concurrency) !== f.max_concurrency ? ` / ${f.max_concurrency}` : ""}</Td>
+              <Td className="tabular-nums">{f.scale_out_total ?? 0}</Td>
+              <Td className="tabular-nums"><span title={`concurrency: ${f.nack_concurrency ?? 0} · quota: ${f.nack_quota ?? 0}`}>{f.nack_total ?? 0}</span></Td>
+              <Td className="tabular-nums"><span title={`last cold start — provision ${f.last_provision_ms ?? 0}ms · runtime init ${f.last_runtime_init_ms ?? 0}ms`}>{f.recycled ?? 0}</span></Td>
               <Td className="tabular-nums">{f.requests}</Td>
               <Td className="tabular-nums">{((f.active_cpu_ms ?? 0) / 1000).toFixed(1)}s</Td>
               <Td className="tabular-nums">{(f.memory_gb_hrs ?? 0).toFixed(3)} GB-hr</Td>

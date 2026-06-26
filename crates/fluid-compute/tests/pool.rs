@@ -34,6 +34,7 @@ fn test_fluid(lease_timeout_ms: u64) -> Arc<Fluid> {
             autoscaler_interval: Duration::from_millis(50),
             lease_timeout: Duration::from_millis(lease_timeout_ms),
             max_instances_per_tenant: 0,
+            ..Default::default()
         },
     )
 }
@@ -228,6 +229,7 @@ async fn per_tenant_instance_quota_is_isolated() {
             autoscaler_interval: Duration::from_millis(50),
             lease_timeout: Duration::from_millis(300),
             max_instances_per_tenant: 2, // alpha may hold at most 2 live instances
+            ..Default::default()
         },
     );
     // concurrency=1 so each held lease pins its own instance.

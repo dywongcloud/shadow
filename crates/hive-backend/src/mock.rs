@@ -52,6 +52,8 @@ pub struct MockBackend {
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
     /// Per-cell podman container names (Railway-style container deploys).
     containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
+    /// Throttled batch CPU sampler for `cpu_percent` (#2).
+    sampler: Arc<crate::CpuSampler>,
 }
 
 impl MockBackend {
@@ -61,6 +63,7 @@ impl MockBackend {
             funcs: Arc::new(AsyncMutex::new(HashMap::new())),
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
+            sampler: Arc::new(crate::CpuSampler::new()),
         }
     }
 }
@@ -288,6 +291,18 @@ impl CellBackend for MockBackend {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
+        // writable cache dir under the workdir so cold starts reuse precompiled
+        // bytecode (Node >=22.1 auto-loads it). Node-family only; opt-out via
+        // HIVE_COMPILE_CACHE=0 in the deployment env. Mirrors the microVM cell-agent.
+        let cc_off = func.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
+        let first = func.start_cmd[0].rsplit('/').next().unwrap_or(&func.start_cmd[0]);
+        if !cc_off && matches!(first, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next") {
+            let cache_dir = workdir.join(".hive-compile-cache");
+            if std::fs::create_dir_all(&cache_dir).is_ok() {
+                cmd.env("NODE_COMPILE_CACHE", &cache_dir);
+            }
+        }
 
         let child = cmd.spawn()?;
         self.funcs.lock().await.insert(cell.id.clone(), child);
@@ -338,6 +353,17 @@ impl CellBackend for MockBackend {
         // Single-use build cell: blow away the work dir.
         let _ = tokio::fs::remove_dir_all(&cell.root).await;
         Ok(())
+    }
+
+    async fn cpu_percent(&self, cell: &CellHandle) -> Option<f32> {
+        // The function runs as a direct child process here (the mock analogue of a
+        // microVM); sample its CPU via sysinfo and normalize to the cell's vCPU
+        // budget so the AIMD thresholds mean the same thing regardless of vcpus.
+        let pid = {
+            let funcs = self.funcs.lock().await;
+            funcs.get(&cell.id).and_then(|c| c.id())?
+        };
+        self.sampler.cpu_percent(pid, cell.resources.vcpus)
     }
 }
 
@@ -563,6 +589,51 @@ mod tenant_tests {
         assert_ne!(a.root.parent(), b.root.parent(), "tenants must not share a cell parent dir");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// #2: `cpu_percent` reports REAL CPU — a busy process pegs near a full core,
+    /// an idle one stays low. This is the genuine saturation signal the adaptive
+    /// concurrency controller consumes (no latency proxy).
+    #[tokio::test]
+    async fn cpu_percent_reflects_real_process_load() {
+        let be = MockBackend::default();
+        let handle = |id: &CellId| CellHandle {
+            id: id.clone(),
+            image: "x".into(),
+            resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
+            root: std::env::temp_dir(),
+            endpoint: None,
+        };
+
+        // Busy child: a shell spin loop pegs one core.
+        let busy_id = CellId::new();
+        let busy = Command::new("sh")
+            .arg("-c").arg("while :; do :; done")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .kill_on_drop(true).spawn().unwrap();
+        be.funcs.lock().await.insert(busy_id.clone(), busy);
+
+        // Idle child: sleeps, ~0 CPU.
+        let idle_id = CellId::new();
+        let idle = Command::new("sh")
+            .arg("-c").arg("sleep 30")
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .kill_on_drop(true).spawn().unwrap();
+        be.funcs.lock().await.insert(idle_id.clone(), idle);
+
+        // Prime the sampler (first sample is the baseline → 0), then measure.
+        let _ = be.cpu_percent(&handle(&busy_id)).await;
+        let _ = be.cpu_percent(&handle(&idle_id)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let busy_cpu = be.cpu_percent(&handle(&busy_id)).await.unwrap_or(0.0);
+        let idle_cpu = be.cpu_percent(&handle(&idle_id)).await.unwrap_or(-1.0);
+
+        be.terminate(&handle(&busy_id)).await.unwrap();
+        be.terminate(&handle(&idle_id)).await.unwrap();
+
+        assert!(busy_cpu > 40.0, "busy process should report high CPU, got {busy_cpu}");
+        assert!(idle_cpu >= 0.0 && idle_cpu < 25.0, "idle process should report low CPU, got {idle_cpu}");
+        assert!(busy_cpu > idle_cpu, "busy must exceed idle ({busy_cpu} vs {idle_cpu})");
     }
 
     /// A hostile tenant slug can't escape the cells root via path traversal.

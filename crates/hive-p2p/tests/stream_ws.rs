@@ -86,7 +86,7 @@ async fn bind_pair(local: String) -> Option<(Arc<hive_p2p::PeerPool>, String, St
     let ep_b = hive_p2p::bind().await.ok()?;
     let id = ep_b.id().to_string();
     let addr = hive_p2p::addr_json(&ep_b)?;
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, local, 100));
+    tokio::spawn(hive_p2p::serve_tunnels(ep_b, local, 100, None, None));
     let ep_a = hive_p2p::bind().await.ok()?;
     Some((hive_p2p::PeerPool::new(ep_a), id, addr))
 }

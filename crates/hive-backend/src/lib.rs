@@ -28,6 +28,196 @@ pub use hive_core::FunctionLaunch;
 /// any number of log subscribers.
 pub type LogSink = mpsc::UnboundedSender<LogLine>;
 
+/// Cumulative CPU time (user+system) consumed by a SINGLE `pid` since it started,
+/// in nanoseconds. Read straight from the OS (no third-party sampler — sysinfo's
+/// per-process CPU is unreliable on macOS), so the delta we compute is exact.
+#[cfg(target_os = "macos")]
+fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
+    // proc_pidinfo(PROC_PIDTASKINFO) returns task times in MACH absolute-time
+    // units, not nanoseconds — on Apple Silicon a unit is ~41.67ns. Convert via
+    // mach_timebase_info (numer/denom), else CPU% reads ~42× too low.
+    let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    let n = unsafe {
+        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, &mut ti as *mut _ as *mut libc::c_void, size)
+    };
+    if n != size {
+        return None;
+    }
+    let raw = ti.pti_total_user.saturating_add(ti.pti_total_system);
+    let mut tb = libc::mach_timebase_info { numer: 0, denom: 0 };
+    if unsafe { libc::mach_timebase_info(&mut tb) } != 0 || tb.denom == 0 {
+        return None;
+    }
+    Some(raw.saturating_mul(tb.numer as u64) / tb.denom as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_pid_ppid, cpu) = parse_linux_stat(&stat)?;
+    Some(cpu)
+}
+
+/// Snapshot of every process as `(pid, ppid, cumulative_cpu_ns)`. Lets us sum CPU
+/// over a cell's whole process TREE — a function may run under a wrapper (e.g.
+/// `npm exec next start` spawns `next-server`), so sampling only the direct child
+/// would miss the real work. (On Firecracker the cell is one VMM process whose CPU
+/// already covers the guest, so its subtree is just itself.)
+#[cfg(target_os = "macos")]
+fn all_procs() -> Vec<(u32, u32, u64)> {
+    let cnt = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if cnt <= 0 {
+        return Vec::new();
+    }
+    let mut pids = vec![0i32; cnt as usize + 32];
+    let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+    let got = unsafe { libc::proc_listallpids(pids.as_mut_ptr() as *mut libc::c_void, bytes) };
+    if got <= 0 {
+        return Vec::new();
+    }
+    let n = (got as usize / std::mem::size_of::<i32>()).min(pids.len());
+    let mut out = Vec::with_capacity(n);
+    for &p in &pids[..n] {
+        if p <= 0 {
+            continue;
+        }
+        let mut bi: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let r = unsafe {
+            libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, &mut bi as *mut _ as *mut libc::c_void, sz)
+        };
+        if r != sz {
+            continue;
+        }
+        let cpu = pid_cpu_time_ns(p as u32).unwrap_or(0);
+        out.push((p as u32, bi.pbi_ppid, cpu));
+    }
+    out
+}
+
+/// Parse `(ppid, cpu_ns)` from a `/proc/<pid>/stat` line. The comm field (2) may
+/// contain spaces/`)`, so we split after the final `)`: then state(0), ppid(1),
+/// …, utime(11), stime(12).
+#[cfg(target_os = "linux")]
+fn parse_linux_stat(stat: &str) -> Option<(u32, u64)> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    let f: Vec<&str> = after.split_whitespace().collect();
+    let ppid: u32 = f.get(1)?.parse().ok()?;
+    let utime: u64 = f.get(11)?.parse().ok()?;
+    let stime: u64 = f.get(12)?.parse().ok()?;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    Some((ppid, (utime.saturating_add(stime)).saturating_mul(1_000_000_000) / hz as u64))
+}
+
+#[cfg(target_os = "linux")]
+fn all_procs() -> Vec<(u32, u32, u64)> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    for e in rd.flatten() {
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if let Some((ppid, cpu)) = parse_linux_stat(&stat) {
+                out.push((pid, ppid, cpu));
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn all_procs() -> Vec<(u32, u32, u64)> {
+    Vec::new()
+}
+
+/// Sum cumulative CPU (ns) over `root` and all its descendants in `procs`.
+/// `None` if `root` isn't present (process gone).
+fn subtree_cpu_ns(root: u32, procs: &[(u32, u32, u64)]) -> Option<u64> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut cpu: HashMap<u32, u64> = HashMap::new();
+    for &(pid, ppid, c) in procs {
+        children.entry(ppid).or_default().push(pid);
+        cpu.insert(pid, c);
+    }
+    cpu.get(&root)?; // root must exist
+    let mut sum = 0u64;
+    let mut seen = HashSet::new();
+    let mut q = VecDeque::new();
+    q.push_back(root);
+    seen.insert(root);
+    while let Some(p) = q.pop_front() {
+        sum = sum.saturating_add(cpu.get(&p).copied().unwrap_or(0));
+        if let Some(cs) = children.get(&p) {
+            for &c in cs {
+                if seen.insert(c) {
+                    q.push_back(c);
+                }
+            }
+        }
+    }
+    Some(sum)
+}
+
+/// Per-cell CPU sampler shared by the backends for `cpu_percent` (#2). Computes
+/// utilization as `Δsubtree_cpu_time / Δwall_time` — exact, no dependency on a
+/// sampler library's internal timing. The all-process snapshot is cached briefly
+/// so many per-cell queries within one autoscaler tick share one enumeration. The
+/// first sample for a pid returns 0 (baseline only); steady-state is accurate.
+pub(crate) struct CpuSampler {
+    inner: std::sync::Mutex<SamplerState>,
+}
+
+struct SamplerState {
+    snapshot: Vec<(u32, u32, u64)>,
+    snapshot_at: Option<std::time::Instant>,
+    prev: std::collections::HashMap<u32, (u64, std::time::Instant)>,
+}
+
+impl CpuSampler {
+    pub(crate) fn new() -> Self {
+        CpuSampler {
+            inner: std::sync::Mutex::new(SamplerState {
+                snapshot: Vec::new(),
+                snapshot_at: None,
+                prev: std::collections::HashMap::new(),
+            }),
+        }
+    }
+
+    /// CPU of the process tree rooted at `pid`, as a percentage of `vcpus`
+    /// allocated cores (so ~100 ≈ one fully-busy vCPU). `None` if `pid` is gone.
+    pub(crate) fn cpu_percent(&self, pid: u32, vcpus: u32) -> Option<f32> {
+        let now = std::time::Instant::now();
+        let mut g = self.inner.lock().ok()?;
+        // Refresh the all-process snapshot at most ~4×/s; per-cell queries in one
+        // tick reuse it.
+        let stale = g.snapshot_at.map(|t| t.elapsed() >= std::time::Duration::from_millis(250)).unwrap_or(true);
+        if stale {
+            g.snapshot = all_procs();
+            g.snapshot_at = Some(now);
+        }
+        let cur_ns = subtree_cpu_ns(pid, &g.snapshot)?;
+        let pct = match g.prev.get(&pid) {
+            Some((prev_ns, prev_t)) => {
+                let wall_ns = now.duration_since(*prev_t).as_nanos() as u64;
+                if wall_ns == 0 {
+                    0.0
+                } else {
+                    let cpu_ns = cur_ns.saturating_sub(*prev_ns);
+                    (cpu_ns as f64 / wall_ns as f64 * 100.0 / vcpus.max(1) as f64) as f32
+                }
+            }
+            None => 0.0,
+        };
+        g.prev.insert(pid, (cur_ns, now));
+        Some(pct)
+    }
+}
+
 /// An address the gateway can open connections to in order to reach a function
 /// server running inside a cell (Fluid compute data plane).
 #[derive(Clone, Debug)]
@@ -285,4 +475,17 @@ pub trait CellBackend: Send + Sync {
     /// Tear the cell down. Cells are single-use for builds; for functions this
     /// is called when the instance is scaled down.
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()>;
+
+    /// Current CPU utilization of this cell's function process, as a percentage of
+    /// the cell's ALLOCATED CPU budget (so ~100 ≈ one fully-busy vCPU for a 1-vCPU
+    /// cell, normalized by `cell.resources.vcpus`). This is the REAL saturation
+    /// signal that drives adaptive concurrency (#2): the pool lowers per-instance
+    /// concurrency when this is high (a CPU-bound function) so new requests scale
+    /// OUT instead of piling onto a hot instance, and raises it back when there's
+    /// headroom (an I/O-bound function keeps the full ceiling). Returns `None` when
+    /// the backend can't sample — the pool then holds concurrency unchanged, never
+    /// guessing from latency (which would wrongly penalize I/O-bound work).
+    async fn cpu_percent(&self, _cell: &CellHandle) -> Option<f32> {
+        None
+    }
 }

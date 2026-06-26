@@ -1821,6 +1821,7 @@ name = "fluid-compute"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "fluid-core",
  "hive-backend",
  "hive-core",
@@ -2575,6 +2576,7 @@ dependencies = [
  "jsonwebtoken",
  "openraft",
  "parking_lot",
+ "pkarr",
  "rcgen",
  "reqwest 0.12.28",
  "ring",
@@ -2645,6 +2647,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

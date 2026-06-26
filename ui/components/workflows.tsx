@@ -72,6 +72,9 @@ export function normalizeRun(r: any): WorkflowRun {
     steps: Array.isArray(r.steps) ? r.steps : [],
     started_ms: toMs(r.startedAt) ?? toMs(r.createdAt) ?? r.started_ms ?? 0,
     finished_ms: toMs(r.completedAt) ?? r.finished_ms ?? null,
+    // Workflow runs execute on the deployed app → default to production. (The WDK
+    // world store is shared across a project's environments and doesn't tag runs.)
+    environment: r.environment ?? "production",
   };
 }
 

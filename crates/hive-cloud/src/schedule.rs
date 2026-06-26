@@ -22,12 +22,16 @@ use crate::state::CloudState;
 /// Minimum total memory (MB) for a node to be auto-eligible.
 const MEM_FLOOR_MB: u64 = 1024;
 
-/// A chosen placement target. `admin` is `None` when the target is THIS node
-/// (host locally); otherwise it's the node's admin URL to dispatch the deploy to.
+/// A chosen placement target. Dispatch route, in preference order:
+///   * `admin = Some(url)` → POST the deploy to that HTTP admin URL.
+///   * `admin = None, iroh = Some((id, addr))` → dispatch over the iroh mesh (a NAT'd
+///     coordinator has no HTTP path to FC nodes; the SSH tunnels were cut).
+///   * `admin = None, iroh = None` → THIS node (host locally).
 #[derive(Clone, Debug)]
 pub struct Target {
     pub node: String,
     pub admin: Option<String>,
+    pub iroh: Option<(String, String)>,
 }
 
 fn eligible(n: &NodeInfo) -> bool {
@@ -57,15 +61,29 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
     let load_of = |name: &str| -> usize { load.get(name).copied().unwrap_or(0) };
-    let admin_of = |name: &str| -> Option<String> {
-        if name == me {
-            None
-        } else {
-            cloud.node_admins.read().get(name).cloned()
+    // Build the dispatch route for a chosen node: self (both None), HTTP admin URL, or
+    // iroh (id, addr) when no HTTP path exists (NAT'd coordinator → FC over the mesh).
+    let target_of = |n: &NodeInfo| -> Target {
+        if n.name == me {
+            return Target { node: n.name.clone(), admin: None, iroh: None };
         }
+        if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
+            return Target { node: n.name.clone(), admin: Some(a), iroh: None };
+        }
+        let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
+            (Some(id), Some(addr)) => Some((id, addr)),
+            _ => None,
+        };
+        Target { node: n.name.clone(), admin: None, iroh }
     };
-    // A node is dispatchable if it's us, or we know its admin URL.
-    let reachable = |n: &NodeInfo| -> bool { n.name == me || cloud.node_admins.read().contains_key(&n.name) };
+    // A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
+    // over the iroh mesh (has a peer id + dialable address). The last case is what lets
+    // a NAT'd coordinator place deploys on FC nodes after the SSH tunnels were cut.
+    let reachable = |n: &NodeInfo| -> bool {
+        n.name == me
+            || cloud.node_admins.read().contains_key(&n.name)
+            || (n.peer_id.is_some() && n.iroh_addr.is_some())
+    };
     // Capability filter. Firecracker nodes now run CONTAINERS via host podman
     // (outside the microVM), so a container is eligible on any healthy real node —
     // a Firecracker node (preferred: more resources) OR the mock/podman backend.
@@ -103,7 +121,7 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
             pool.sort_by_key(|n| load_of(&n.name));
             let chosen = pool[0];
             if seen.insert(chosen.name.clone()) {
-                targets.push(Target { node: chosen.name.clone(), admin: admin_of(&chosen.name) });
+                targets.push(target_of(chosen));
             }
         }
         return targets;
@@ -134,7 +152,7 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
             .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
     });
     let chosen = elig[0];
-    vec![Target { node: chosen.name.clone(), admin: admin_of(&chosen.name) }]
+    vec![target_of(chosen)]
 }
 
 #[cfg(test)]
@@ -148,6 +166,8 @@ mod tests {
             name: name.into(),
             region: region.into(),
             public_url: String::new(),
+            public_ip: None,
+            public_ip6: None,
             peer_id: None,
             iroh_addr: None,
             last_seen_ms: 0,
@@ -166,10 +186,13 @@ mod tests {
     }
 
     // Pure-logic mirror of `place` for unit testing without a full CloudState.
-    fn pick(nodes: &[NodeInfo], me: &str, regions: &[&str]) -> Vec<String> {
-        let admins: std::collections::HashSet<String> =
-            nodes.iter().filter(|n| n.name != me).map(|n| n.name.clone()).collect();
-        let reachable = |n: &NodeInfo| n.name == me || admins.contains(&n.name);
+    // `admins` = nodes we have an HTTP admin URL for; a node is ALSO reachable if it has
+    // an iroh address (peer_id + iroh_addr) — mirrors the real `reachable` so a NAT'd
+    // coordinator can place on FC nodes over the mesh.
+    fn pick_with(nodes: &[NodeInfo], me: &str, regions: &[&str], admins: &std::collections::HashSet<String>) -> Vec<String> {
+        let reachable = |n: &NodeInfo| {
+            n.name == me || admins.contains(&n.name) || (n.peer_id.is_some() && n.iroh_addr.is_some())
+        };
         let regions: Vec<String> = regions.iter().map(|r| r.to_lowercase()).collect();
         if !regions.is_empty() {
             let mut out = Vec::new();
@@ -191,6 +214,13 @@ mod tests {
             da.partial_cmp(&db).unwrap()
         });
         vec![elig[0].name.clone()]
+    }
+
+    // Back-compat wrapper: every non-self node has an HTTP admin URL.
+    fn pick(nodes: &[NodeInfo], me: &str, regions: &[&str]) -> Vec<String> {
+        let admins: std::collections::HashSet<String> =
+            nodes.iter().filter(|n| n.name != me).map(|n| n.name.clone()).collect();
+        pick_with(nodes, me, regions, &admins)
     }
 
     fn mesh() -> Vec<NodeInfo> {
@@ -231,5 +261,24 @@ mod tests {
         // Even if node-a is the coordinator, default never picks it (mock).
         let got = pick(&mesh(), "node-a", &[]);
         assert!(!got.contains(&"node-a".to_string()));
+    }
+
+    #[test]
+    fn iroh_reachable_fc_node_selected_when_no_http_admin() {
+        // The preview-strand bug: from the NAT'd coordinator the SSH tunnels are gone,
+        // so node_admins (HTTP) is EMPTY — yet the FC nodes are reachable over iroh.
+        // They must still be chosen (dispatch over the mesh), NOT stranded locally.
+        let mut nodes = mesh();
+        for n in nodes.iter_mut().filter(|n| n.backend == "firecracker") {
+            n.peer_id = Some(format!("id-{}", n.name));
+            n.iroh_addr = Some("{\"id\":\"x\",\"addrs\":[]}".into());
+        }
+        let no_admins = std::collections::HashSet::new(); // no HTTP admin URLs at all
+        let got = pick_with(&nodes, "node-a", &["virginia", "bangkok"], &no_admins);
+        assert_eq!(got, vec!["fc-virginia", "fc-bangkok"], "iroh-reachable FC nodes are placed, not stranded");
+        // Without iroh AND without admins, those regions are unreachable → empty (caller
+        // then hosts locally — the old, broken behavior we fixed).
+        let plain = mesh();
+        assert!(pick_with(&plain, "node-a", &["virginia", "bangkok"], &no_admins).is_empty());
     }
 }

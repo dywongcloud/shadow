@@ -149,6 +149,115 @@ pub struct Route {
     pub target: RouteTarget,
 }
 
+/// Runtime-facing classification of a (Next.js) route (#16). The canonical home
+/// for the cache/retry/concurrency POLICY a route kind implies — `fluid-build`
+/// discovers the kind at build time (`per_route::RouteKind`) and `hive-cloud`
+/// maps it onto this when persisting the per-route manifest into [`Manifest`].
+/// The snake_case wire form is the cross-crate contract with `RouteKind::class_name`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteClass {
+    Static,
+    Isr,
+    ApiNode,
+    RouteHandler,
+    SsrPage,
+    Edge,
+    Middleware,
+}
+
+impl RouteClass {
+    /// Parse the cross-crate class string (`RouteKind::class_name`). Unknown
+    /// strings map to `SsrPage` (the safe dynamic default: defers caching to the
+    /// origin and uses the method gate for retries).
+    pub fn from_name(s: &str) -> RouteClass {
+        match s {
+            "static" => RouteClass::Static,
+            "isr" => RouteClass::Isr,
+            "api_node" => RouteClass::ApiNode,
+            "route_handler" => RouteClass::RouteHandler,
+            "ssr_page" => RouteClass::SsrPage,
+            "edge" => RouteClass::Edge,
+            "middleware" => RouteClass::Middleware,
+            _ => RouteClass::SsrPage,
+        }
+    }
+
+    /// The snake_case class name (inverse of [`RouteClass::from_name`]); the
+    /// stable wire/observability form, e.g. surfaced as `x-hive-route-class`.
+    pub fn name(self) -> &'static str {
+        match self {
+            RouteClass::Static => "static",
+            RouteClass::Isr => "isr",
+            RouteClass::ApiNode => "api_node",
+            RouteClass::RouteHandler => "route_handler",
+            RouteClass::SsrPage => "ssr_page",
+            RouteClass::Edge => "edge",
+            RouteClass::Middleware => "middleware",
+        }
+    }
+
+    /// Default shared-cache policy. Drives the `Cache-Control` the gateway
+    /// synthesizes ONLY when the origin response didn't set its own.
+    pub fn cache_policy(self, revalidate: Option<i64>) -> RouteCachePolicy {
+        match self {
+            RouteClass::Static => RouteCachePolicy::Immutable,
+            RouteClass::Isr => RouteCachePolicy::Revalidate(revalidate.unwrap_or(0).max(0)),
+            _ => RouteCachePolicy::Origin,
+        }
+    }
+
+    /// Whether a response is safe to replay on failover regardless of HTTP method.
+    /// Pure reads (Static/ISR/SSR page render) are idempotent; side-effect-capable
+    /// kinds must still pass the method+idempotency gate (`hive-cloud retry`).
+    /// Returns only "definitely safe", never "definitely unsafe".
+    pub fn always_replayable(self) -> bool {
+        matches!(self, RouteClass::Static | RouteClass::Isr | RouteClass::SsrPage)
+    }
+
+    /// Whether serving this route consumes a runtime instance (function
+    /// concurrency). Static/ISR are served from cache/CDN and never lease a cell.
+    pub fn uses_runtime(self) -> bool {
+        !matches!(self, RouteClass::Static | RouteClass::Isr)
+    }
+}
+
+/// Shared-cache policy a [`RouteClass`] implies (#16).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteCachePolicy {
+    /// Fully prerendered/static — long shared + browser cache, immutable.
+    Immutable,
+    /// ISR — serve from shared cache for N seconds, then revalidate in the
+    /// background (`stale-while-revalidate`). N is clamped to >= 1 when rendered.
+    Revalidate(i64),
+    /// Dynamic — no synthetic policy; honor whatever the origin sent.
+    Origin,
+}
+
+impl RouteCachePolicy {
+    /// The `Cache-Control` value to apply, or `None` to leave the origin's own
+    /// header untouched (dynamic routes).
+    pub fn cache_control(self) -> Option<String> {
+        match self {
+            RouteCachePolicy::Immutable => Some("public, max-age=31536000, immutable".to_string()),
+            RouteCachePolicy::Revalidate(n) => {
+                Some(format!("public, s-maxage={}, stale-while-revalidate", n.max(1)))
+            }
+            RouteCachePolicy::Origin => None,
+        }
+    }
+}
+
+/// One route's runtime policy, persisted into the deployment [`Manifest`] (#16).
+/// `pattern` is the Next.js route pattern (e.g. `/blog/[slug]`, `/api/claw`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RoutePolicy {
+    pub pattern: String,
+    pub class: RouteClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revalidate: Option<i64>,
+}
+
 /// A redirect rule mapped from the framework build (Next.js `redirects()`,
 /// Build Output API routes with a 3xx status) or from `vercel.json`. Evaluated
 /// by the gateway before routing — first match wins. `status` is the resolved
@@ -591,6 +700,13 @@ pub struct Manifest {
     /// `vercel.json` `images` — Image Optimization config (gateway enforces).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub images: Option<ImagesConfig>,
+    /// Per-route runtime policies (#16) from Next.js per-route classification.
+    /// Empty for non-Next deployments / when per-route discovery is disabled — in
+    /// which case the serve path behaves byte-for-byte as before. When present,
+    /// the gateway consults [`Manifest::route_policy`] to apply route-type-aware
+    /// caching/retry without changing the common (empty) case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub route_policies: Vec<RoutePolicy>,
 }
 
 impl Manifest {
@@ -615,6 +731,28 @@ impl Manifest {
             }
         }
         best.map(|r| r.target.clone()).unwrap_or(RouteTarget::Static)
+    }
+
+    /// The per-route runtime policy (#16) for a request path, if any. Matches the
+    /// request against the persisted Next.js route patterns (exact + dynamic
+    /// `[seg]` / catch-all `[...seg]`), preferring the most specific (fewest
+    /// dynamic segments, then longest) match. Returns `None` when no per-route
+    /// policy is configured — the common case, leaving behavior unchanged.
+    pub fn route_policy(&self, path: &str) -> Option<&RoutePolicy> {
+        if self.route_policies.is_empty() {
+            return None;
+        }
+        let req = path.split(['?', '#']).next().unwrap_or(path);
+        let mut best: Option<(&RoutePolicy, u32)> = None; // (policy, specificity)
+        for p in &self.route_policies {
+            if let Some(spec) = next_route_match(&p.pattern, req) {
+                match best {
+                    Some((_, bs)) if bs >= spec => {}
+                    _ => best = Some((p, spec)),
+                }
+            }
+        }
+        best.map(|(p, _)| p)
     }
 
     /// The first matching redirect for `path`, as (location, status).
@@ -731,6 +869,51 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
         rest.is_empty() || rest.starts_with('/')
     } else {
         false
+    }
+}
+
+/// Match a request path against a Next.js route pattern (#16), supporting exact
+/// segments, dynamic `[seg]` (one segment), and catch-all `[...seg]` /
+/// `[[...seg]]` (one-or-more / zero-or-more trailing segments). Returns a
+/// specificity score on match (higher = more specific: static segments score
+/// highest, single-dynamic lower, catch-all lowest), or `None` if it doesn't
+/// match. Used only for per-route policy lookup; the normal router is unaffected.
+pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
+    let pat = pattern.trim_matches('/');
+    let req = path.trim_matches('/');
+    let pseg: Vec<&str> = if pat.is_empty() { vec![] } else { pat.split('/').collect() };
+    let rseg: Vec<&str> = if req.is_empty() { vec![] } else { req.split('/').collect() };
+
+    let mut score: u32 = 0;
+    let mut i = 0;
+    while i < pseg.len() {
+        let p = pseg[i];
+        // Catch-all: `[...x]` (>=1 remaining) or optional `[[...x]]` (>=0 remaining).
+        if p.starts_with("[[...") && p.ends_with("]]") {
+            return Some(score + 1); // optional catch-all matches the rest (incl. none)
+        }
+        if p.starts_with("[...") && p.ends_with(']') {
+            // Requires at least one remaining segment.
+            return if i < rseg.len() { Some(score + 2) } else { None };
+        }
+        // Out of request segments but pattern still has required parts -> no match.
+        if i >= rseg.len() {
+            return None;
+        }
+        if p.starts_with('[') && p.ends_with(']') {
+            score += 10; // dynamic single segment
+        } else if p == rseg[i] {
+            score += 100; // exact segment is most specific
+        } else {
+            return None;
+        }
+        i += 1;
+    }
+    // All pattern segments consumed: match iff request has no leftover segments.
+    if rseg.len() == pseg.len() {
+        Some(score)
+    } else {
+        None
     }
 }
 
@@ -944,6 +1127,72 @@ pub struct DeploymentFeatures {
     pub serverless_functions: usize,
 }
 
+/// Structured platform failure taxonomy (Fluid hardening #18). Maps each way a
+/// request can fail to route/serve to a STABLE public code + correct HTTP status.
+/// The public body is the code ONLY — internal error detail (`{e}`, peer ids,
+/// tunnel internals) is logged/evented, never returned to the caller. Shared by the
+/// gateway (lease/serve) and the edge (mesh routing) so the taxonomy is one source
+/// of truth. Pure + dep-free (status as u16; callers convert to their HTTP type).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureClass {
+    /// Tenant exceeded its fairness limit (rate / quota). 429.
+    TenantThrottled,
+    /// All instances at safe concurrency and the pool/tenant can't scale out. 503.
+    CapacityExhausted,
+    /// A deployment's circuit breaker is open (crash-looping). 503.
+    DeploymentCircuitOpen,
+    /// No healthy peer in the mesh can serve this deployment. 503.
+    NoHealthyPeer,
+    /// No healthy node in the deployment's configured region(s). 503.
+    NoHealthyRegion,
+    /// The runtime tunnel to the chosen instance failed. 502.
+    RuntimeTunnelFailed,
+    /// The chosen peer was unreachable over both iroh and HTTP. 502.
+    PeerUnreachable,
+    /// First attempt failed and the request was not safe to retry (#6/#7/#8). 502.
+    NotRetryable,
+    /// The per-request deadline can't be met. 504.
+    DeadlineExceeded,
+    /// The host maps to no known deployment. 404.
+    DeploymentNotFound,
+    /// The Host header isn't a deployment host this node accepts. 404.
+    HostRejected,
+}
+
+impl FailureClass {
+    /// HTTP status as a u16 (dep-free; callers convert to their status type).
+    pub fn status(self) -> u16 {
+        match self {
+            FailureClass::TenantThrottled => 429,
+            FailureClass::CapacityExhausted
+            | FailureClass::DeploymentCircuitOpen
+            | FailureClass::NoHealthyPeer
+            | FailureClass::NoHealthyRegion => 503,
+            FailureClass::RuntimeTunnelFailed
+            | FailureClass::PeerUnreachable
+            | FailureClass::NotRetryable => 502,
+            FailureClass::DeadlineExceeded => 504,
+            FailureClass::DeploymentNotFound | FailureClass::HostRejected => 404,
+        }
+    }
+    /// Stable, public, non-leaky machine code (safe to return + put in `x-hive-error`).
+    pub fn code(self) -> &'static str {
+        match self {
+            FailureClass::TenantThrottled => "TENANT_THROTTLED",
+            FailureClass::CapacityExhausted => "CAPACITY_EXHAUSTED",
+            FailureClass::DeploymentCircuitOpen => "DEPLOYMENT_CIRCUIT_OPEN",
+            FailureClass::NoHealthyPeer => "NO_HEALTHY_PEER",
+            FailureClass::NoHealthyRegion => "NO_HEALTHY_REGION",
+            FailureClass::RuntimeTunnelFailed => "RUNTIME_TUNNEL_FAILED",
+            FailureClass::PeerUnreachable => "PEER_UNREACHABLE",
+            FailureClass::NotRetryable => "NOT_RETRYABLE",
+            FailureClass::DeadlineExceeded => "DEADLINE_EXCEEDED",
+            FailureClass::DeploymentNotFound => "DEPLOYMENT_NOT_FOUND",
+            FailureClass::HostRejected => "HOST_REJECTED",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,6 +1224,105 @@ mod routing_tests {
     #[test]
     fn deploy_state_defaults_to_ready() {
         assert_eq!(DeployState::default(), DeployState::Ready);
+    }
+
+    #[test]
+    fn route_class_policy_semantics() {
+        // Cache.
+        assert_eq!(RouteClass::Static.cache_policy(None), RouteCachePolicy::Immutable);
+        assert_eq!(
+            RouteClass::Static.cache_policy(None).cache_control().as_deref(),
+            Some("public, max-age=31536000, immutable")
+        );
+        assert_eq!(RouteClass::Isr.cache_policy(Some(60)), RouteCachePolicy::Revalidate(60));
+        assert_eq!(
+            RouteClass::Isr.cache_policy(Some(60)).cache_control().as_deref(),
+            Some("public, s-maxage=60, stale-while-revalidate")
+        );
+        // revalidate 0 / None / negative all clamp to a valid >=1 s-maxage.
+        for r in [Some(0), None, Some(-9)] {
+            assert_eq!(
+                RouteClass::Isr.cache_policy(r).cache_control().as_deref(),
+                Some("public, s-maxage=1, stale-while-revalidate")
+            );
+        }
+        for c in [RouteClass::SsrPage, RouteClass::ApiNode, RouteClass::RouteHandler, RouteClass::Edge, RouteClass::Middleware] {
+            assert_eq!(c.cache_policy(Some(10)), RouteCachePolicy::Origin);
+            assert_eq!(c.cache_policy(None).cache_control(), None);
+        }
+        // Replay / runtime.
+        for c in [RouteClass::Static, RouteClass::Isr, RouteClass::SsrPage] {
+            assert!(c.always_replayable());
+        }
+        for c in [RouteClass::ApiNode, RouteClass::RouteHandler, RouteClass::Edge, RouteClass::Middleware] {
+            assert!(!c.always_replayable());
+        }
+        assert!(!RouteClass::Static.uses_runtime() && !RouteClass::Isr.uses_runtime());
+        assert!(RouteClass::SsrPage.uses_runtime() && RouteClass::ApiNode.uses_runtime());
+    }
+
+    #[test]
+    fn route_class_from_name_roundtrip_and_unknown() {
+        // Mirrors fluid_build::per_route::RouteKind::class_name strings.
+        for (s, c) in [
+            ("static", RouteClass::Static), ("isr", RouteClass::Isr),
+            ("api_node", RouteClass::ApiNode), ("route_handler", RouteClass::RouteHandler),
+            ("ssr_page", RouteClass::SsrPage), ("edge", RouteClass::Edge),
+            ("middleware", RouteClass::Middleware),
+        ] {
+            assert_eq!(RouteClass::from_name(s), c);
+            assert_eq!(c.name(), s, "name() is the inverse of from_name()");
+        }
+        // Unknown is treated as a dynamic SSR page (safe default).
+        assert_eq!(RouteClass::from_name("whatever"), RouteClass::SsrPage);
+    }
+
+    #[test]
+    fn next_route_match_exact_dynamic_catchall() {
+        // Exact.
+        assert!(next_route_match("/api/claw", "/api/claw").is_some());
+        assert!(next_route_match("/api/claw", "/api/claws").is_none());
+        assert!(next_route_match("/api/claw", "/api/claw/x").is_none());
+        // Dynamic single segment.
+        assert!(next_route_match("/blog/[slug]", "/blog/hello").is_some());
+        assert!(next_route_match("/blog/[slug]", "/blog/hello/world").is_none());
+        assert!(next_route_match("/blog/[slug]", "/blog").is_none());
+        // Catch-all requires >=1 segment.
+        assert!(next_route_match("/docs/[...path]", "/docs/a/b/c").is_some());
+        assert!(next_route_match("/docs/[...path]", "/docs").is_none());
+        // Optional catch-all matches zero-or-more.
+        assert!(next_route_match("/shop/[[...slug]]", "/shop").is_some());
+        assert!(next_route_match("/shop/[[...slug]]", "/shop/a/b").is_some());
+        // Root.
+        assert!(next_route_match("/", "/").is_some());
+        assert!(next_route_match("/", "/x").is_none());
+        // Specificity ordering: exact > dynamic.
+        assert!(next_route_match("/blog/featured", "/blog/featured").unwrap()
+            > next_route_match("/blog/[slug]", "/blog/featured").unwrap());
+    }
+
+    #[test]
+    fn manifest_route_policy_prefers_most_specific() {
+        let m = Manifest {
+            route_policies: vec![
+                RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(60) },
+                RoutePolicy { pattern: "/blog/featured".into(), class: RouteClass::Static, revalidate: None },
+                RoutePolicy { pattern: "/api/claw".into(), class: RouteClass::ApiNode, revalidate: None },
+            ],
+            ..Default::default()
+        };
+        // Exact static beats the dynamic ISR for the same path.
+        assert_eq!(m.route_policy("/blog/featured").unwrap().class, RouteClass::Static);
+        // Dynamic ISR for any other slug.
+        let p = m.route_policy("/blog/hello").unwrap();
+        assert_eq!(p.class, RouteClass::Isr);
+        assert_eq!(p.revalidate, Some(60));
+        // API route.
+        assert_eq!(m.route_policy("/api/claw?x=1").unwrap().class, RouteClass::ApiNode);
+        // No policy for unmatched path.
+        assert!(m.route_policy("/nope").is_none());
+        // Empty policies (common case) -> always None, no allocation/iteration.
+        assert!(Manifest::default().route_policy("/anything").is_none());
     }
 
     #[test]
@@ -1075,6 +1423,26 @@ mod routing_tests {
         assert_eq!(redirect_status(Some(false), None), 307);
         assert_eq!(redirect_status(Some(true), None), 308);
         assert_eq!(redirect_status(Some(true), Some(301)), 301);
+    }
+
+    #[test]
+    fn failure_class_taxonomy() {
+        assert_eq!(FailureClass::TenantThrottled.status(), 429);
+        assert_eq!(FailureClass::CapacityExhausted.status(), 503);
+        assert_eq!(FailureClass::NoHealthyRegion.status(), 503);
+        assert_eq!(FailureClass::PeerUnreachable.status(), 502);
+        assert_eq!(FailureClass::NotRetryable.status(), 502);
+        assert_eq!(FailureClass::DeadlineExceeded.status(), 504);
+        assert_eq!(FailureClass::DeploymentNotFound.status(), 404);
+        assert_eq!(FailureClass::CapacityExhausted.code(), "CAPACITY_EXHAUSTED");
+        // codes are stable + uppercase machine tokens, never internal detail
+        for c in [
+            FailureClass::TenantThrottled, FailureClass::CapacityExhausted,
+            FailureClass::NoHealthyPeer, FailureClass::PeerUnreachable,
+            FailureClass::DeadlineExceeded, FailureClass::DeploymentNotFound,
+        ] {
+            assert!(c.code().chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'));
+        }
     }
 
     #[test]

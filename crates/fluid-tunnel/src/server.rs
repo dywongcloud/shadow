@@ -4,12 +4,52 @@
 use crate::codec::{read_frame, Frame, FrameKind};
 use crate::{Metrics, ReqMeta, RespMeta};
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+
+/// Write-queue depth (frames waiting to be flushed to the router) at or above
+/// which we count a backpressure event (#14). Tuned to be well clear of normal
+/// streaming bursts so the counter signals a genuinely slow/stalled consumer.
+const BACKPRESSURE_HWM: u64 = 256;
+
+/// Byte + backpressure metering for one tunnel (#14). All counters are cumulative
+/// except `queued`, which is the live write-queue depth (enqueued minus flushed).
+#[derive(Default)]
+struct TunnelMeter {
+    bytes_in: AtomicU64,
+    bytes_out: AtomicU64,
+    queued: AtomicU64,
+    backpressure_events: AtomicU64,
+}
+
+/// An `UnboundedSender<Frame>` that meters every frame it enqueues (#14): it bumps
+/// the live write-queue depth and trips the backpressure counter when the depth
+/// crosses the high-water mark. Keeps call sites as plain `out.send(frame)`.
+#[derive(Clone)]
+struct MeteredSender {
+    tx: mpsc::UnboundedSender<Frame>,
+    meter: Arc<TunnelMeter>,
+}
+
+impl MeteredSender {
+    fn send(&self, f: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
+        let depth = self.meter.queued.fetch_add(1, Ordering::Relaxed) + 1;
+        if depth >= BACKPRESSURE_HWM {
+            self.meter.backpressure_events.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Err(e) = self.tx.send(f) {
+            // Send failed (tunnel closed) — undo the depth bump so the gauge
+            // doesn't drift upward on a dead tunnel.
+            self.meter.queued.fetch_sub(1, Ordering::Relaxed);
+            return Err(e);
+        }
+        Ok(())
+    }
+}
 
 pub struct TunnelServer;
 
@@ -21,28 +61,44 @@ impl TunnelServer {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (mut rd, mut wr) = tokio::io::split(stream);
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
+        let (raw_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
         let inflight = Arc::new(AtomicU32::new(0));
+        let meter = Arc::new(TunnelMeter::default());
+        let out_tx = MeteredSender { tx: raw_tx, meter: meter.clone() };
 
-        // Writer task.
-        let writer = tokio::spawn(async move {
-            while let Some(frame) = out_rx.recv().await {
-                if wr.write_all(&frame.encode()).await.is_err() {
-                    break;
+        // Writer task: flushes frames and accounts bytes_out + drains the queue gauge.
+        let writer = {
+            let meter = meter.clone();
+            tokio::spawn(async move {
+                while let Some(frame) = out_rx.recv().await {
+                    // Dequeued: drop the live write-queue depth before the (awaitable)
+                    // socket write, so the gauge reflects "waiting to flush", not
+                    // "currently flushing".
+                    meter.queued.fetch_sub(1, Ordering::Relaxed);
+                    let enc = frame.encode();
+                    if wr.write_all(&enc).await.is_err() {
+                        break;
+                    }
+                    meter.bytes_out.fetch_add(enc.len() as u64, Ordering::Relaxed);
                 }
-            }
-        });
+            })
+        };
 
-        // Metrics ticker (in-band health).
+        // Metrics ticker (in-band health + #14 byte/backpressure metering).
         {
             let out = out_tx.clone();
             let inflight = inflight.clone();
+            let meter = meter.clone();
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     let m = Metrics {
                         inflight: inflight.load(Ordering::Relaxed),
                         max_concurrency,
+                        bytes_in: meter.bytes_in.load(Ordering::Relaxed),
+                        bytes_out: meter.bytes_out.load(Ordering::Relaxed),
+                        queue_depth: meter.queued.load(Ordering::Relaxed) as u32,
+                        backpressure_events: meter.backpressure_events.load(Ordering::Relaxed),
                     };
                     let payload = serde_json::to_vec(&m).unwrap_or_default();
                     if out.send(Frame::new(0, FrameKind::Metrics, payload)).is_err() {
@@ -58,6 +114,8 @@ impl TunnelServer {
                 Ok(f) => f,
                 Err(_) => break,
             };
+            // Account inbound bytes (#14): request payloads dominate ingress.
+            meter.bytes_in.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
             match frame.kind {
                 FrameKind::Ping => {
                     let _ = out_tx.send(Frame::new(0, FrameKind::Pong, Bytes::new()));
@@ -89,7 +147,7 @@ async fn handle_request(
     id: u64,
     payload: Bytes,
     local_http: &str,
-    out: &mpsc::UnboundedSender<Frame>,
+    out: &MeteredSender,
 ) {
     if let Err(e) = proxy_local(id, &payload, local_http, out).await {
         // Make sure the caller gets *something* terminal.
@@ -116,7 +174,7 @@ async fn proxy_local(
     id: u64,
     payload: &[u8],
     local_http: &str,
-    out: &mpsc::UnboundedSender<Frame>,
+    out: &MeteredSender,
 ) -> anyhow::Result<()> {
     // Split payload: [u32 meta_len][meta json][body].
     anyhow::ensure!(payload.len() >= 4, "short request payload");
@@ -289,4 +347,45 @@ fn is_hop_by_hop(h: &str) -> bool {
         h,
         "connection" | "keep-alive" | "transfer-encoding" | "upgrade" | "te" | "trailers"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #14: the metered sender tracks live write-queue depth and trips the
+    // backpressure counter past the high-water mark when nothing drains the queue.
+    #[test]
+    fn metered_sender_tracks_queue_depth_and_backpressure() {
+        let meter = Arc::new(TunnelMeter::default());
+        let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
+        let s = MeteredSender { tx, meter: meter.clone() };
+
+        // Enqueue past the high-water mark without draining.
+        let n = BACKPRESSURE_HWM + 10;
+        for _ in 0..n {
+            s.send(Frame::new(1, FrameKind::RespBody, Bytes::from_static(b"x"))).unwrap();
+        }
+        assert_eq!(meter.queued.load(Ordering::Relaxed), n, "depth = all undrained frames");
+        // Events trip for every enqueue at/after the HWM: depths HWM..=n.
+        assert_eq!(meter.backpressure_events.load(Ordering::Relaxed), n - BACKPRESSURE_HWM + 1);
+
+        // Simulate the writer draining (it decrements on dequeue).
+        for _ in 0..n {
+            let _ = rx.try_recv();
+            meter.queued.fetch_sub(1, Ordering::Relaxed);
+        }
+        assert_eq!(meter.queued.load(Ordering::Relaxed), 0, "queue fully drained");
+    }
+
+    // A send on a closed tunnel must not leak the depth gauge upward.
+    #[test]
+    fn metered_sender_undoes_depth_on_closed_channel() {
+        let meter = Arc::new(TunnelMeter::default());
+        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+        let s = MeteredSender { tx, meter: meter.clone() };
+        drop(rx); // close the receiver
+        assert!(s.send(Frame::new(1, FrameKind::RespEnd, Bytes::new())).is_err());
+        assert_eq!(meter.queued.load(Ordering::Relaxed), 0, "depth restored on send failure");
+    }
 }

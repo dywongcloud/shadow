@@ -55,6 +55,24 @@ impl RouteKind {
             _ => "nodejs",
         }
     }
+
+    /// The runtime-facing class (#16). The canonical cache/retry/concurrency
+    /// policy lives on [`fluid_core::RouteClass`] (the shared crate the serve path
+    /// can reach); this maps build-time discovery onto it. `hive-cloud` does the
+    /// actual mapping when it persists the per-route manifest into the deployment
+    /// `Manifest` (it depends on both crates; `fluid-build` does not depend on
+    /// `fluid-core`, so the string is the contract).
+    pub fn class_name(self) -> &'static str {
+        match self {
+            RouteKind::Static => "static",
+            RouteKind::Isr => "isr",
+            RouteKind::ApiNode => "api_node",
+            RouteKind::RouteHandler => "route_handler",
+            RouteKind::SsrPage => "ssr_page",
+            RouteKind::Middleware => "middleware",
+            RouteKind::EdgeRoute => "edge",
+        }
+    }
 }
 
 /// One route's materialization plan.
@@ -319,6 +337,18 @@ mod tests {
     fn empty_when_no_next_dir() {
         let m = discover(Path::new("/nonexistent/.next"));
         assert!(m.routes.is_empty());
+    }
+
+    #[test]
+    fn route_kind_class_names_are_stable() {
+        // The class_name string is the cross-crate contract with fluid_core::RouteClass.
+        assert_eq!(RouteKind::Static.class_name(), "static");
+        assert_eq!(RouteKind::Isr.class_name(), "isr");
+        assert_eq!(RouteKind::ApiNode.class_name(), "api_node");
+        assert_eq!(RouteKind::RouteHandler.class_name(), "route_handler");
+        assert_eq!(RouteKind::SsrPage.class_name(), "ssr_page");
+        assert_eq!(RouteKind::Middleware.class_name(), "middleware");
+        assert_eq!(RouteKind::EdgeRoute.class_name(), "edge");
     }
 
     #[test]

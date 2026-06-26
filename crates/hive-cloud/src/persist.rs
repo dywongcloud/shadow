@@ -78,6 +78,35 @@ pub fn data_dir() -> PathBuf {
     dirs_home().join(".hive-cloud")
 }
 
+fn peer_iroh_path() -> PathBuf {
+    data_dir().join("peer_iroh.json")
+}
+
+/// Persist the gossip-transport map (peer admin URL -> (node_id, iroh addr_json)) so
+/// a node can bootstrap gossip over iroh on restart WITHOUT the HTTP-over-SSH
+/// tunnels. Safe to call every gossip round — atomic temp+rename. Paired with
+/// persistent iroh identities (stable EndpointId), the saved addresses stay valid
+/// across restarts, so the SSH tunnels are no longer required for rendezvous.
+pub fn save_peer_iroh(map: &std::collections::HashMap<String, (String, String)>) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("peer_iroh.json.tmp");
+    let Ok(json) = serde_json::to_string(map) else { return };
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, peer_iroh_path());
+    }
+}
+
+/// Load the persisted gossip-transport map (empty if none).
+pub fn load_peer_iroh() -> std::collections::HashMap<String, (String, String)> {
+    std::fs::read_to_string(peer_iroh_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }
