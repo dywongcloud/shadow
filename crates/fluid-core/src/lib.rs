@@ -88,6 +88,28 @@ pub struct FunctionConfig {
     /// Glob of files to exclude (`functions[].excludeFiles`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_files: Option<String>,
+    /// Application protocol this service speaks, for ingress/routing decisions
+    /// (Railway-style, configurable per service). One of: "http" (default), "https",
+    /// "ws"/"wss", "grpc", "json-rpc", "tcp", "udp". HTTP-family protocols ride the
+    /// normal L7 path; connection-oriented ones ("grpc", "tcp") are spliced as a raw
+    /// connection cross-node so framing (h2 trailers / arbitrary bytes) is preserved.
+    /// Empty string is treated as "http" (backward-compatible with older manifests).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protocol: String,
+}
+
+impl FunctionConfig {
+    /// The effective protocol, normalizing empty/legacy to "http".
+    pub fn protocol_or_http(&self) -> &str {
+        if self.protocol.is_empty() { "http" } else { self.protocol.as_str() }
+    }
+
+    /// Whether this service needs a RAW connection splice (vs the buffered/streamed
+    /// HTTP tunnel) when proxied cross-node — gRPC (HTTP/2 trailers) and raw TCP.
+    /// These are spliced byte-for-byte like a WebSocket so framing survives the mesh.
+    pub fn needs_raw_proxy(&self) -> bool {
+        matches!(self.protocol_or_http(), "grpc" | "tcp")
+    }
 }
 
 fn default_runtime() -> String {
@@ -130,6 +152,7 @@ impl Default for FunctionConfig {
             regions: Vec::new(),
             include_files: None,
             exclude_files: None,
+            protocol: String::new(),
         }
     }
 }
@@ -1065,6 +1088,13 @@ pub struct GitDeployRequest {
     /// differs — the user is intentionally deploying a new source into that project.
     #[serde(default)]
     pub redeploy: bool,
+    /// Base64 of an uploaded ZIP archive — an alternative SOURCE to `repo_url`.
+    /// When set, the build EXTRACTS this instead of `git clone`. It rides inside the
+    /// request so the existing placement/fanout ships it to the target node (bounded
+    /// by the gossip frame; the upload endpoint enforces ~10 MB raw). Cleared right
+    /// after extraction so it is never persisted or logged.
+    #[serde(default)]
+    pub zip_b64: Option<String>,
 }
 fn default_prod() -> bool {
     true
@@ -1220,6 +1250,31 @@ mod tests {
 #[cfg(test)]
 mod routing_tests {
     use super::*;
+
+    #[test]
+    fn function_protocol_defaults_and_raw_classification() {
+        let mut f = FunctionConfig::default();
+        // Empty/legacy protocol normalizes to http; http is NOT raw-proxied.
+        assert_eq!(f.protocol_or_http(), "http");
+        assert!(!f.needs_raw_proxy());
+        // json-rpc + ws ride the normal HTTP/L7 path (not raw).
+        f.protocol = "json-rpc".into();
+        assert!(!f.needs_raw_proxy());
+        f.protocol = "ws".into();
+        assert!(!f.needs_raw_proxy());
+        // grpc + tcp are connection-spliced cross-node.
+        f.protocol = "grpc".into();
+        assert_eq!(f.protocol_or_http(), "grpc");
+        assert!(f.needs_raw_proxy());
+        f.protocol = "tcp".into();
+        assert!(f.needs_raw_proxy());
+        // An empty protocol is skipped on the wire (backward-compatible manifests).
+        let j = serde_json::to_string(&FunctionConfig::default()).unwrap();
+        assert!(!j.contains("\"protocol\""), "empty protocol omitted from JSON");
+        // And a manifest without `protocol` deserializes to the http default.
+        let back: FunctionConfig = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.protocol_or_http(), "http");
+    }
 
     #[test]
     fn deploy_state_defaults_to_ready() {

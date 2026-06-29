@@ -277,6 +277,59 @@ pub struct ContainerSpec {
     pub port: u16,
 }
 
+/// Per-container resource ceilings applied to `podman run` so one tenant's
+/// container cannot exhaust host RAM, saturate every CPU, or fork-bomb the node
+/// (a DoS against every other tenant on a shared host). `None` on a field = no
+/// limit for that dimension. See [`ContainerLimits::default`] for the safe
+/// defaults applied to every deployment today; these can later be made
+/// per-deployment configurable via project settings.
+#[derive(Clone, Debug)]
+pub struct ContainerLimits {
+    /// Memory ceiling (podman `--memory`), e.g. "512m", "2g". None = no limit.
+    pub memory: Option<String>,
+    /// CPU quota (podman `--cpus`), e.g. "1.0", "0.5". None = no limit.
+    pub cpus: Option<String>,
+    /// Max PIDs (podman `--pids-limit`) — fork-bomb guard. None = no limit.
+    pub pids: Option<u32>,
+}
+
+impl Default for ContainerLimits {
+    fn default() -> Self {
+        Self {
+            memory: Some("512m".into()),
+            cpus: Some("1.0".into()),
+            pids: Some(256),
+        }
+    }
+}
+
+impl ContainerLimits {
+    /// The `podman run` OPTION flags for these limits plus always-on privilege
+    /// hardening (`--security-opt no-new-privileges`). Must be pushed BEFORE the
+    /// image name in the args vector (they're run options, not container CMD args).
+    /// Shared by every `podman run` path so limits can't drift between backends.
+    pub fn podman_run_flags(&self) -> Vec<String> {
+        let mut f = Vec::new();
+        if let Some(mem) = &self.memory {
+            f.push("--memory".into());
+            f.push(mem.clone());
+        }
+        if let Some(cpus) = &self.cpus {
+            f.push("--cpus".into());
+            f.push(cpus.clone());
+        }
+        if let Some(pids) = &self.pids {
+            f.push("--pids-limit".into());
+            f.push(pids.to_string());
+        }
+        // Prevent suid binaries inside the container from escalating privileges
+        // (free defense-in-depth; applied to every container).
+        f.push("--security-opt".into());
+        f.push("no-new-privileges".into());
+        f
+    }
+}
+
 /// Run an OCI image as a detached podman container on the HOST, then front it with
 /// the Fluid tunnel server (so in-function concurrency + the gateway proxy work the
 /// same as any other cell). Shared by the mock + Firecracker backends so Firecracker
@@ -293,11 +346,41 @@ pub(crate) async fn podman_run_container(
     // Optional OCI runtime (e.g. gVisor's `runsc` for stronger sandboxing). `None`
     // uses podman's default (crun/runc). A name or absolute path podman accepts.
     runtime: Option<&str>,
+    // Optional multi-service (docker-compose) network config — a JSON object from the
+    // deploy's `start_cmd[3]`: { net, subnet, gw, ip, hosts: ["name:ip", …] }. All of
+    // a deployment's services join one **DNS-less** podman network with STATIC IPs and
+    // `/etc/hosts` (`--add-host`) entries for every sibling, so they reach each other
+    // by service name WITHOUT podman's aardvark-dns (which binds the bridge gateway's
+    // :53 and would collide with the node's Seer DNS on 0.0.0.0:53). `None` =
+    // standalone single container — unchanged behavior.
+    net_json: Option<&str>,
+    // Per-container resource ceilings (memory/cpus/pids) applied as `podman run`
+    // flags so a single tenant can't DoS the shared host. See [`ContainerLimits`].
+    limits: &ContainerLimits,
 ) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
     use tokio::process::Command;
     let name = format!("hive-{}", cell_id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
     // Clear any stale container from a prior cell at this id (kill_on_drop can't).
     let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
+
+    let net = net_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    // Idempotently create the per-deployment DNS-LESS network (no aardvark → no :53
+    // collision with Seer DNS). "already exists" / overlap on a re-run is fine.
+    if let Some(n) = &net {
+        if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            let mut c = vec!["network".to_string(), "create".to_string(), "--disable-dns".to_string()];
+            if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                c.push("--subnet".into());
+                c.push(s.to_string());
+            }
+            if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                c.push("--gateway".into());
+                c.push(g.to_string());
+            }
+            c.push(netname.to_string());
+            let _ = Command::new("podman").args(&c).env("PATH", path_env).output().await;
+        }
+    }
     // Base `podman run` args (everything after the subcommand, sans --runtime). The
     // port is published on 127.0.0.1 ONLY — the container is never exposed to the
     // internet directly; it's reached solely via the gateway/ngrok for the deployment.
@@ -309,6 +392,26 @@ pub(crate) async fn podman_run_container(
         base.push("-e".into());
         base.push(format!("{k}={v}"));
     }
+    // Shared network with a static IP + sibling host entries (multi-service only).
+    if let Some(n) = &net {
+        if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            base.push("--network".into());
+            base.push(netname.to_string());
+            if let Some(ip) = n.get("ip").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                base.push("--ip".into());
+                base.push(ip.to_string());
+            }
+            if let Some(hosts) = n.get("hosts").and_then(|v| v.as_array()) {
+                for h in hosts.iter().filter_map(|h| h.as_str()) {
+                    base.push("--add-host".into());
+                    base.push(h.to_string());
+                }
+            }
+        }
+    }
+    // Resource ceilings + privilege drop — DoS / escalation defense-in-depth.
+    // These are `podman run` OPTIONS, so they must precede the image name below.
+    base.extend(limits.podman_run_flags());
     base.push("-p".into());
     base.push(format!("127.0.0.1:{host_port}:{internal_port}"));
     base.push(image.to_string());
@@ -487,5 +590,40 @@ pub trait CellBackend: Send + Sync {
     /// guessing from latency (which would wrongly penalize I/O-bound work).
     async fn cpu_percent(&self, _cell: &CellHandle) -> Option<f32> {
         None
+    }
+}
+
+#[cfg(test)]
+mod container_limits_tests {
+    use super::ContainerLimits;
+
+    fn idx(flags: &[String], name: &str) -> Option<usize> {
+        flags.iter().position(|f| f == name)
+    }
+
+    #[test]
+    fn default_limits_emit_memory_cpus_pids_and_no_new_privileges() {
+        let flags = ContainerLimits::default().podman_run_flags();
+        // Memory / CPU / PID ceilings present with the safe defaults.
+        let m = idx(&flags, "--memory").expect("--memory present");
+        assert_eq!(flags[m + 1], "512m");
+        let c = idx(&flags, "--cpus").expect("--cpus present");
+        assert_eq!(flags[c + 1], "1.0");
+        let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
+        assert_eq!(flags[p + 1], "256");
+        // Privilege-escalation guard on every container.
+        let s = idx(&flags, "--security-opt").expect("--security-opt present");
+        assert_eq!(flags[s + 1], "no-new-privileges");
+    }
+
+    #[test]
+    fn none_fields_omit_their_flags_but_keep_hardening() {
+        let limits = ContainerLimits { memory: None, cpus: None, pids: None };
+        let flags = limits.podman_run_flags();
+        assert!(idx(&flags, "--memory").is_none());
+        assert!(idx(&flags, "--cpus").is_none());
+        assert!(idx(&flags, "--pids-limit").is_none());
+        // no-new-privileges is unconditional hardening.
+        assert!(idx(&flags, "--security-opt").is_some());
     }
 }

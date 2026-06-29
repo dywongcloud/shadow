@@ -10,8 +10,17 @@
 // Safety: only git hosts are allowed (no open proxy / SSRF), and only the git
 // smart-HTTP endpoints. Any Authorization header the client set via isomorphic-
 // git's `onAuth` (the user's PAT) is forwarded to the host but never stored.
+//
+// Composio connection as the git client: when the request targets github.com and
+// the browser did NOT supply its own Authorization (no PAT), we inject the GitHub
+// OAuth token from THIS user's ACTIVE Composio connection server-side — so the
+// in-browser git uses the linked GitHub account without a pasted PAT, and the
+// token never reaches the browser. Fully additive: a request that already carries
+// auth (PAT) is forwarded unchanged, and if there's no Composio token we fall back
+// to the original behavior (anonymous for public repos).
 
 import { NextRequest, NextResponse } from "next/server";
+import { githubAccessToken, resolveEntity } from "@/lib/composio";
 
 export const dynamic = "force-dynamic";
 
@@ -65,6 +74,26 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
   }
   // git servers require a User-Agent.
   if (!headers.has("user-agent")) headers.set("user-agent", "git/isomorphic-git");
+
+  // Use the Composio GitHub connection as the client credential when the browser
+  // sent no auth of its own. ONLY for github.com, ONLY when no Authorization is
+  // present — so a pasted PAT (already forwarded above) always wins, and a public
+  // anonymous clone with no Composio link still works. Best-effort: any failure
+  // leaves the request exactly as it was.
+  if (target.hostname === "github.com" && !headers.has("authorization")) {
+    try {
+      const entity = await resolveEntity();
+      const token = await githubAccessToken(entity);
+      if (token) {
+        // GitHub accepts an OAuth token as the Basic-auth password (the same shape
+        // isomorphic-git uses for a PAT): username `x-access-token`, password=token.
+        const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
+        headers.set("authorization", `Basic ${basic}`);
+      }
+    } catch {
+      /* no Composio token available — fall through unauthenticated (unchanged behavior) */
+    }
+  }
 
   const init: RequestInit = {
     method: req.method,

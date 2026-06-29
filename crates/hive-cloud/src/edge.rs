@@ -41,6 +41,23 @@ fn fail_response(class: fluid_core::FailureClass, region: &str, rid: &str) -> Re
 
 pub async fn edge_pipeline(
     State(cloud): State<Arc<CloudState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    // Stamp the SERVING node on every response (routing diagnosis — e.g. which iad
+    // pool member returned a 503). A locally-served response gets THIS node's name;
+    // a mesh-proxied one already carries the peer's stamp (copied through from the
+    // peer's own pipeline), which we leave intact. Pairs with `x-hive-routed-to`.
+    let node = cloud.node_name.clone();
+    let mut resp = edge_pipeline_inner(State(cloud), req, next).await;
+    if !resp.headers().contains_key("x-hive-served-by") {
+        set(&mut resp, "x-hive-served-by", &node);
+    }
+    resp
+}
+
+async fn edge_pipeline_inner(
+    State(cloud): State<Arc<CloudState>>,
     mut req: Request,
     next: Next,
 ) -> Response {

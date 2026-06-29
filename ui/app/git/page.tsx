@@ -80,12 +80,13 @@ export default function GitPage() {
             <KeyRound className="h-4 w-4" /> Credentials
           </div>
           <p className="mb-3 text-xs text-secondary">
-            A GitHub personal access token (repo scope) for push + repo creation. Stored only in this browser; sent over
-            the dashboard&apos;s own proxy.
+            Optional — if your GitHub account is connected (Integrations), clone/push/create use that connection
+            automatically. Otherwise paste a personal access token (repo scope). A PAT is stored only in this browser;
+            either way credentials are sent over the dashboard&apos;s own proxy.
           </p>
           <div className="flex flex-col gap-2">
-            <Field label="GitHub token (PAT)">
-              <Input type="password" value={pat} onChange={(e) => setPat(e.target.value)} placeholder="ghp_…" className="font-mono" />
+            <Field label="GitHub token (PAT) — optional">
+              <Input type="password" value={pat} onChange={(e) => setPat(e.target.value)} placeholder="ghp_… (blank = use connected GitHub)" className="font-mono" />
             </Field>
             <div className="grid grid-cols-2 gap-2">
               <Field label="Author name">
@@ -126,26 +127,50 @@ function NewRepoCard({
 
   function create() {
     run(async () => {
-      if (!pat) throw new Error("Set a GitHub token first.");
       if (!name.trim()) throw new Error("Repo name is required.");
       if (!author.name || !author.email) throw new Error("Set author name + email first.");
       say(`Creating GitHub repo "${name}" …`);
-      // GitHub REST API sends CORS headers, so this runs directly from the browser.
-      const res = await fetch("https://api.github.com/user/repos", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${pat}`, Accept: "application/vnd.github+json", "content-type": "application/json" },
-        body: JSON.stringify({ name: name.trim(), private: isPrivate, auto_init: false }),
-      });
-      if (!res.ok) throw new Error(`GitHub: ${res.status} ${(await res.json().catch(() => ({}))).message || ""}`);
-      const repo = await res.json();
-      const cloneUrl: string = repo.clone_url;
-      say(`Created ${repo.full_name}. Initializing locally…`);
+      let cloneUrl: string;
+      let defaultBranch: string;
+      let htmlUrl: string;
+      if (pat) {
+        // PAT path (unchanged): GitHub REST API sends CORS headers, so this runs
+        // directly from the browser.
+        const res = await fetch("https://api.github.com/user/repos", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${pat}`, Accept: "application/vnd.github+json", "content-type": "application/json" },
+          body: JSON.stringify({ name: name.trim(), private: isPrivate, auto_init: false }),
+        });
+        if (!res.ok) throw new Error(`GitHub: ${res.status} ${(await res.json().catch(() => ({}))).message || ""}`);
+        const repo = await res.json();
+        cloneUrl = repo.clone_url;
+        defaultBranch = repo.default_branch || "main";
+        htmlUrl = repo.html_url;
+      } else {
+        // No PAT → create via this user's connected GitHub account (Composio),
+        // server-side. The push below authenticates through the same connection
+        // via the git proxy, so no token is needed in the browser.
+        const res = await fetch("/api/github/create-repo", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: name.trim(), isPrivate }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data?.ok) {
+          throw new Error(data?.error || "Create failed. Connect GitHub in Integrations, or set a PAT.");
+        }
+        cloneUrl = data.clone_url;
+        defaultBranch = data.default_branch || "main";
+        htmlUrl = data.html_url;
+      }
+      say(`Created ${htmlUrl.replace("https://github.com/", "")}. Initializing locally…`);
       const dir = await initRepo(name);
       await writeFile(dir, "README.md", readme);
       const sha = await commitAll(dir, "Initial commit", author);
       say(`Committed ${sha.slice(0, 8)}. Pushing…`);
-      await push({ dir, url: cloneUrl, token: pat, ref: repo.default_branch || "main", onProgress: say });
-      say(`Done → ${repo.html_url}`);
+      // token: pat may be empty — the proxy injects the Composio connection's token.
+      await push({ dir, url: cloneUrl, token: pat, ref: defaultBranch, onProgress: say });
+      say(`Done → ${htmlUrl}`);
     });
   }
 

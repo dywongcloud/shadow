@@ -11,6 +11,7 @@ mod audit;
 mod auth;
 mod billing;
 mod cluster;
+mod compose;
 mod databases;
 mod dns;
 mod dnsserver;

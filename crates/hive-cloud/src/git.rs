@@ -6,6 +6,7 @@
 //! registers the routable deployment via the gateway. The dashboard polls
 //! `GET /v1/builds/:id` to stream the logs as they appear.
 
+use base64::Engine;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,7 +241,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
-    req: GitDeployRequest,
+    mut req: GitDeployRequest,
     project: String,
     first_deploy: bool,
 ) -> anyhow::Result<()> {
@@ -356,43 +357,58 @@ async fn run_build(
     log("Build machine configuration: 4 cores, 8 GB".into());
     tokio::time::sleep(Duration::from_millis(350)).await;
 
-    // Clone.
+    // Acquire the source: extract an UPLOADED ZIP, or `git clone` a repo.
     let stamp = now_ms();
     let dir = deploy_root().join(format!("{project}-{stamp}"));
     tokio::fs::create_dir_all(deploy_root()).await?;
     let branch = req.branch.clone().unwrap_or_default();
-    let short_repo = req.repo_url.trim_start_matches("https://").trim_end_matches(".git");
-    log(format!(
-        "Cloning {short_repo} (Branch: {}, Commit: HEAD)",
-        if branch.is_empty() { "main" } else { &branch }
-    ));
 
-    let t0 = now_ms();
-    let mut cmd = Command::new("git");
-    cmd.arg("clone").arg("--depth").arg("1");
-    if !branch.is_empty() {
-        cmd.arg("--branch").arg(&branch);
-    }
-    cmd.arg(&req.repo_url).arg(&dir);
-    let out = cmd.output().await?;
-    anyhow::ensure!(
-        out.status.success(),
-        "git clone failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
-    log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
-
-    let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
-    // Full SHA for GitHub commit-status reporting (the statuses API needs it).
-    let full_sha = run_git(&dir, &["rev-parse", "HEAD"]).await.unwrap_or_else(|| commit.clone());
-    let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"]).await.unwrap_or_default();
-    // Best-effort "pending" check on the commit (no-op without GITHUB_TOKEN).
-    {
-        let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
-        tokio::spawn(async move {
-            report_github_status(&repo, &sha, "pending", "", "Build in progress…").await;
-        });
-    }
+    let (commit, full_sha, commit_message) = if let Some(zip_b64) = req.zip_b64.take() {
+        // Drag-drop / zip upload: decode + extract instead of cloning, and synthesize
+        // git-ish metadata so the rest of the pipeline is unchanged. `take()` drops the
+        // base64 off the request so it's never logged/persisted past this point.
+        let name = req.repo_url.trim_start_matches("upload://").to_string();
+        log(format!("Extracting uploaded archive: {}", if name.is_empty() { "archive.zip" } else { &name }));
+        let t0 = now_ms();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(zip_b64.as_bytes())
+            .map_err(|e| anyhow::anyhow!("invalid upload encoding: {e}"))?;
+        let files = extract_zip_into(&bytes, &dir).await?;
+        log(format!("Extracted {files} file(s) in {}ms", now_ms().saturating_sub(t0)));
+        ("upload".to_string(), String::new(), format!("Uploaded {}", if name.is_empty() { "archive.zip".into() } else { name }))
+    } else {
+        let short_repo = req.repo_url.trim_start_matches("https://").trim_end_matches(".git");
+        log(format!(
+            "Cloning {short_repo} (Branch: {}, Commit: HEAD)",
+            if branch.is_empty() { "main" } else { &branch }
+        ));
+        let t0 = now_ms();
+        let mut cmd = Command::new("git");
+        cmd.arg("clone").arg("--depth").arg("1");
+        if !branch.is_empty() {
+            cmd.arg("--branch").arg(&branch);
+        }
+        cmd.arg(&req.repo_url).arg(&dir);
+        let out = cmd.output().await?;
+        anyhow::ensure!(
+            out.status.success(),
+            "git clone failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
+        let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
+        // Full SHA for GitHub commit-status reporting (the statuses API needs it).
+        let full_sha = run_git(&dir, &["rev-parse", "HEAD"]).await.unwrap_or_else(|| commit.clone());
+        let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"]).await.unwrap_or_default();
+        // Best-effort "pending" check on the commit (no-op without GITHUB_TOKEN).
+        {
+            let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
+            tokio::spawn(async move {
+                report_github_status(&repo, &sha, "pending", "", "Build in progress…").await;
+            });
+        }
+        (commit, full_sha, commit_message)
+    };
     let actual_branch = if branch.is_empty() {
         run_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|| "main".into())
     } else {
@@ -1068,15 +1084,34 @@ async fn produce_manifest(
     use_cache: bool,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
-    let dockerfile = dir.join("Dockerfile");
-    if dockerfile.exists() {
-        log("Detected Dockerfile — building container image.".into());
+    // docker-compose / compose.yaml: a multi-service container deployment in ONE
+    // project namespace. Takes precedence over a lone Dockerfile (it expresses the
+    // full topology). Single-Dockerfile projects are unaffected.
+    if let Some(compose_path) = crate::compose::compose_file(dir) {
+        return build_compose_manifest(cloud, bid, dir, project, commit, &compose_path).await;
+    }
+    if let Some(dockerfile) = container_build_file(dir) {
+        let fname = dockerfile.file_name().and_then(|s| s.to_str()).unwrap_or("Dockerfile").to_string();
+        log(format!("Detected {fname} — building container image."));
         let safe_project = sanitize_tag(project);
         let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
-        let exposed = parse_expose(&dockerfile).await.unwrap_or(8080);
+        // Railway-style overrides from an optional `fluid.json` { "container": {...} }:
+        // explicit listen port + wire protocol (http/grpc/tcp/…). Falls back to the
+        // Dockerfile `EXPOSE`/`ENV PORT` (then 8080) and protocol "http".
+        let ovr = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
+            Ok(s) => parse_container_override(&s),
+            Err(_) => ContainerOverride::default(),
+        };
+        let exposed = match ovr.port {
+            Some(p) => p,
+            None => parse_expose(&dockerfile).await.unwrap_or(8080),
+        };
+        let protocol = ovr.protocol.unwrap_or_else(|| "http".to_string());
         let t1 = now_ms();
         let mut build = Command::new("podman");
-        build.arg("build").arg("-t").arg(&image);
+        // `-f` so the detected file (Dockerfile OR Containerfile) is used explicitly,
+        // regardless of podman's own default-file precedence.
+        build.arg("build").arg("-t").arg(&image).arg("-f").arg(&dockerfile);
         // Resolve podman on both Linux Firecracker hosts (/usr/bin) and macOS
         // (/opt/homebrew/bin) regardless of the service's inherited PATH.
         let base_path = std::env::var("PATH").unwrap_or_default();
@@ -1099,8 +1134,8 @@ async fn produce_manifest(
             log(format!("  {line}"));
         }
         anyhow::ensure!(out.status.success(), "podman build failed");
-        log(format!("Image built: {image} ({}ms), EXPOSE {exposed}", now_ms().saturating_sub(t1)));
-        Ok(container_manifest(project, &image, exposed))
+        log(format!("Image built: {image} ({}ms), port {exposed} ({protocol})", now_ms().saturating_sub(t1)));
+        Ok(container_manifest(project, &image, exposed, &protocol))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
@@ -1528,6 +1563,53 @@ pub fn warmup_node_bin() -> Option<String> {
         }
     }
     preferred_node_bin().map(|d| PathBuf::from(d).join("node").to_string_lossy().into_owned())
+}
+
+/// Extract an uploaded ZIP (raw bytes) into `dir` via the system `unzip`. Strips
+/// macOS cruft (`__MACOSX`, `.DS_Store`) and, when the archive is a single top-level
+/// directory (the common "zip a folder" / GitHub "Download ZIP" shape), flattens it
+/// so the project root (package.json, etc.) lands directly at `dir`. Returns the
+/// resulting file count. `unzip` itself refuses absolute/`..` (zip-slip) paths.
+async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
+    tokio::fs::create_dir_all(dir).await?;
+    let tmp = dir.with_extension("upload.zip"); // sibling of dir, never inside the build
+    tokio::fs::write(&tmp, bytes).await?;
+    // unzip exit 0 = ok, 1 = warning (e.g. it skipped an unsafe path) — both acceptable.
+    let out = Command::new("unzip")
+        .arg("-q")
+        .arg("-o")
+        .arg(&tmp)
+        .arg("-d")
+        .arg(dir)
+        .output()
+        .await?;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    let code = out.status.code().unwrap_or(-1);
+    anyhow::ensure!(
+        code == 0 || code == 1,
+        "could not unpack archive (unzip {code}): {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let _ = tokio::fs::remove_dir_all(dir.join("__MACOSX")).await;
+    // Collect top-level entries (dropping .DS_Store) to detect a single wrapper dir.
+    let mut top: Vec<PathBuf> = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(e) = rd.next_entry().await? {
+        if e.file_name() == ".DS_Store" {
+            let _ = tokio::fs::remove_file(e.path()).await;
+            continue;
+        }
+        top.push(e.path());
+    }
+    if top.len() == 1 && top[0].is_dir() {
+        let inner = top[0].clone();
+        let mut rd2 = tokio::fs::read_dir(&inner).await?;
+        while let Some(e) = rd2.next_entry().await? {
+            let _ = tokio::fs::rename(e.path(), dir.join(e.file_name())).await;
+        }
+        let _ = tokio::fs::remove_dir_all(&inner).await;
+    }
+    Ok(dir_stats(dir).await.0)
 }
 
 /// Node-family start command? (the V8 compile-cache warm-up + runtime wiring apply
@@ -2059,6 +2141,17 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     let _ = tokio::fs::remove_file(&tmp).await;
 }
 
+/// Locate a repo's container build file: a `Dockerfile` or its identical twin
+/// `Containerfile` (the vendor-neutral OCI/Buildah/Podman name — byte-for-byte the
+/// same format and instructions). Returns the path to whichever exists, preferring
+/// `Dockerfile` when both are present (the more common name; either builds the same).
+fn container_build_file(dir: &Path) -> Option<PathBuf> {
+    ["Dockerfile", "Containerfile"]
+        .iter()
+        .map(|f| dir.join(f))
+        .find(|p| p.exists())
+}
+
 /// Parse the container's listen port from a Dockerfile: prefer `EXPOSE`, else
 /// `ENV PORT=`, else None (caller defaults).
 async fn parse_expose(path: &Path) -> Option<u16> {
@@ -2307,7 +2400,7 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
+fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str) -> Manifest {
     Manifest {
         project: project.to_string(),
         static_dir: None,
@@ -2325,11 +2418,157 @@ fn container_manifest(project: &str, image: &str, internal: u16) -> Manifest {
             max_instances: 5,
             idle_ttl_secs: 120,
             max_duration_secs: 300,
+            protocol: protocol.to_string(),
             ..Default::default()
         }],
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
         ..Default::default()
     }
+}
+
+/// Build a MULTI-service container manifest from a docker-compose / compose.yaml.
+/// Each service becomes a `__container__` `FunctionConfig`; all share a per-project
+/// podman network (encoded as `start_cmd[3]`, with the service name as the alias in
+/// `start_cmd[4]`) so they reach each other by name. `min_instances=1` keeps every
+/// service warm so internal ones (db/redis) actually run. The PRIMARY public service
+/// gets the `/` route; other services run on the shared network (internal).
+async fn build_compose_manifest(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    dir: &Path,
+    project: &str,
+    commit: &str,
+    compose_path: &Path,
+) -> anyhow::Result<Manifest> {
+    let log = |s: String| cloud.builds.log(bid, s);
+    let text = tokio::fs::read_to_string(compose_path).await?;
+    let services = crate::compose::parse_compose(&text).map_err(|e| anyhow::anyhow!("compose parse failed: {e}"))?;
+    let fname = compose_path.file_name().and_then(|s| s.to_str()).unwrap_or("compose.yaml");
+    let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+    log(format!("Detected {fname} — {} service(s): {}", services.len(), names.join(", ")));
+
+    let safe_project = sanitize_tag(project);
+    let net = format!("hive-net-{safe_project}");
+    let short = &commit[..commit.len().min(7)];
+    let primary = crate::compose::primary_service(&services).map(|s| s.name.clone());
+    let proj_env = cloud.projects.env_map(project);
+
+    // Per-project /24 (deterministic, in the 10.128-191/16 space to avoid the common
+    // 10.0/10.89 podman ranges) for the services' shared DNS-LESS network: each
+    // service gets a STATIC IP and every service's `/etc/hosts` maps all sibling
+    // names → IPs. This gives Compose name resolution WITHOUT podman's aardvark-dns,
+    // which would otherwise collide with the node's Seer DNS on :53.
+    let (o2, o3) = {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        project.hash(&mut h);
+        let v = h.finish();
+        (128 + (v % 64) as u8, ((v >> 6) % 256) as u8)
+    };
+    let subnet = format!("10.{o2}.{o3}.0/24");
+    let gw = format!("10.{o2}.{o3}.1");
+    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + i);
+    let hosts: Vec<String> = services.iter().enumerate().map(|(i, s)| format!("{}:{}", s.name, svc_ip(i))).collect();
+
+    let mut functions = Vec::new();
+    let mut routes = Vec::new();
+    for (idx, svc) in services.iter().enumerate() {
+        let image = if let Some(b) = &svc.build {
+            let ctx = dir.join(&b.context);
+            let image = format!("hive-{}-{}-{}", safe_project, sanitize_tag(&svc.name), short);
+            log(format!("Building service '{}' from {} …", svc.name, b.context));
+            let mut build = Command::new("podman");
+            build.arg("build").arg("-t").arg(&image);
+            if let Some(df) = &b.dockerfile {
+                build.arg("-f").arg(ctx.join(df));
+            }
+            let base_path = std::env::var("PATH").unwrap_or_default();
+            build.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"));
+            for (k, v) in &proj_env {
+                build.arg("--build-arg").arg(format!("{k}={v}"));
+            }
+            let out = build.arg(".").current_dir(&ctx).output().await?;
+            for line in String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .chain(String::from_utf8_lossy(&out.stdout).lines())
+                .filter(|l| !l.trim().is_empty())
+                .take(25)
+            {
+                log(format!("  [{}] {line}", svc.name));
+            }
+            anyhow::ensure!(out.status.success(), "podman build failed for service '{}'", svc.name);
+            image
+        } else if let Some(img) = &svc.image {
+            log(format!("Service '{}' uses prebuilt image {img}", svc.name));
+            img.clone()
+        } else {
+            anyhow::bail!("compose service '{}' has neither `build` nor `image`", svc.name);
+        };
+
+        // Service env wins; project env fills gaps.
+        let mut env = svc.env.clone();
+        for (k, v) in &proj_env {
+            env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        // start_cmd[3] = JSON network config the backend uses to join this service to
+        // the shared DNS-less podman network with a static IP + sibling host entries.
+        let netcfg = serde_json::json!({
+            "net": net,
+            "subnet": subnet,
+            "gw": gw,
+            "ip": svc_ip(idx),
+            "alias": svc.name,
+            "hosts": hosts,
+        })
+        .to_string();
+        functions.push(FunctionConfig {
+            name: svc.name.clone(),
+            runtime: "container".into(),
+            // ["__container__", image, port, <netcfg-json>] — single container deploys
+            // omit the 4th arg (no network); compose deploys carry the shared-net cfg.
+            start_cmd: vec!["__container__".into(), image, svc.port.to_string(), netcfg],
+            env,
+            vcpus: 1,
+            memory_mib: 512,
+            max_concurrency: 20,
+            min_instances: 1, // keep every service warm so internal deps actually run
+            max_instances: 3,
+            idle_ttl_secs: 300,
+            max_duration_secs: 300,
+            ..Default::default()
+        });
+        if Some(&svc.name) == primary.as_ref() {
+            routes.push(Route { pattern: "/".into(), target: RouteTarget::Function(svc.name.clone()) });
+        }
+    }
+    log(format!(
+        "Compose deployment ready — public entrypoint: {} (services share network {net})",
+        primary.as_deref().unwrap_or("(none)")
+    ));
+    Ok(Manifest { project: project.to_string(), functions, routes, ..Default::default() })
+}
+
+/// Railway-style per-service overrides for a CONTAINER project, read from an optional
+/// `fluid.json` `container` block (e.g. `{ "container": { "port": 50051, "protocol":
+/// "grpc" } }`). Lets a Dockerfile/Containerfile project pin its listen port and
+/// declare its wire protocol without changing the image. All fields optional.
+#[derive(Debug, Default, serde::Deserialize)]
+struct ContainerOverride {
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+/// Parse the `container` override block from a repo's `fluid.json` text, if any.
+/// Tolerant: a fluid.json without a `container` key (or invalid) yields defaults.
+fn parse_container_override(fluid_json: &str) -> ContainerOverride {
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        #[serde(default)]
+        container: ContainerOverride,
+    }
+    serde_json::from_str::<Wrap>(fluid_json).map(|w| w.container).unwrap_or_default()
 }
 
 fn function_manifest(project: &str, start_cmd: Vec<String>) -> Manifest {
@@ -2521,6 +2760,64 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_build_file_detects_dockerfile_and_containerfile() {
+        let dir = std::env::temp_dir().join(format!("hive-cf-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Neither → None (falls through to fluid.json / framework detection).
+        assert!(container_build_file(&dir).is_none());
+
+        // Containerfile alone IS detected (the Task-2 fix — was ignored before).
+        std::fs::write(dir.join("Containerfile"), "FROM scratch\nEXPOSE 9000\n").unwrap();
+        let f = container_build_file(&dir).expect("Containerfile detected");
+        assert_eq!(f.file_name().unwrap(), "Containerfile");
+
+        // When both exist, Dockerfile takes priority (deterministic).
+        std::fs::write(dir.join("Dockerfile"), "FROM scratch\nEXPOSE 8080\n").unwrap();
+        let f = container_build_file(&dir).expect("Dockerfile preferred");
+        assert_eq!(f.file_name().unwrap(), "Dockerfile");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn container_override_parses_railway_style_config() {
+        // Full override: explicit port + protocol.
+        let o = parse_container_override(r#"{"container":{"port":50051,"protocol":"grpc"}}"#);
+        assert_eq!(o.port, Some(50051));
+        assert_eq!(o.protocol.as_deref(), Some("grpc"));
+        // fluid.json without a `container` block → all defaults (no override).
+        let o2 = parse_container_override(r#"{"project":"x","functions":[]}"#);
+        assert_eq!(o2.port, None);
+        assert_eq!(o2.protocol, None);
+        // Tolerant: invalid JSON yields defaults rather than erroring the build.
+        let o3 = parse_container_override("definitely not json");
+        assert_eq!(o3.port, None);
+        assert_eq!(o3.protocol, None);
+    }
+
+    #[test]
+    fn container_manifest_carries_protocol() {
+        let m = container_manifest("proj", "img:tag", 50051, "grpc");
+        assert_eq!(m.functions.len(), 1);
+        assert_eq!(m.functions[0].protocol_or_http(), "grpc");
+        assert!(m.functions[0].needs_raw_proxy());
+        assert_eq!(m.functions[0].start_cmd, vec!["__container__", "img:tag", "50051"]);
+    }
+
+    #[tokio::test]
+    async fn parse_expose_reads_containerfile_port() {
+        let dir = std::env::temp_dir().join(format!("hive-cf-port-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Containerfile"), "FROM scratch\nEXPOSE 50051/tcp\n").unwrap();
+        let cf = container_build_file(&dir).unwrap();
+        assert_eq!(parse_expose(&cf).await, Some(50051));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn artifact_sha256_detects_corruption() {

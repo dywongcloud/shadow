@@ -681,6 +681,8 @@ impl CellBackend for FirecrackerBackend {
         if func.start_cmd.first().map(String::as_str) == Some("__container__") {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
             let internal: u16 = func.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080);
+            // Multi-service (compose) deploys carry a JSON network config in start_cmd[3].
+            let net_json = func.start_cmd.get(3).map(|s| s.as_str()).filter(|s| !s.is_empty());
             let runtime = Self::container_runtime();
             if let Some(rt) = &runtime {
                 tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
@@ -694,6 +696,8 @@ impl CellBackend for FirecrackerBackend {
                 func.max_concurrency,
                 Self::PODMAN_PATH,
                 runtime.as_deref(),
+                net_json,
+                &crate::ContainerLimits::default(),
             )
             .await?;
             self.containers.lock().await.insert(cell.id.clone(), name);

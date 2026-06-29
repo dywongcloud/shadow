@@ -16,7 +16,7 @@ use axum::{
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,    // user id
     pub tenant: String, // org/team id (multi-tenancy)
@@ -62,9 +62,28 @@ pub fn verify(token: &str) -> anyhow::Result<Claims> {
 /// Middleware: when a JWT secret is configured, require a valid bearer token on
 /// mutating requests (POST/PUT/DELETE). Reads are always allowed. With no secret
 /// configured it is a pass-through (dev mode).
-pub async fn require_auth(req: Request, next: Next) -> Response {
+///
+/// Tenancy: whenever a valid platform JWT is presented (read OR write), the
+/// verified [`Claims`] are inserted into the request's extensions so downstream
+/// handlers can resolve the tenant from the cryptographically-bound `tenant`
+/// claim — never from a client-supplied `x-hive-team` header, which is spoofable.
+/// Extensions are in-process only and cannot be set by the client.
+pub async fn require_auth(mut req: Request, next: Next) -> Response {
     if !enforced() {
         return next.run(req).await;
+    }
+    // Verify the bearer token (if any) up front and bind its claims to the
+    // request. This runs for reads too, so read handlers also get the
+    // authoritative tenant.
+    let claims = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .and_then(|t| verify(t).ok());
+    let authed = claims.is_some();
+    if let Some(c) = claims {
+        req.extensions_mut().insert(c);
     }
     let method = req.method().clone();
     let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
@@ -76,14 +95,7 @@ pub async fn require_auth(req: Request, next: Next) -> Response {
     if !is_mutation || open {
         return next.run(req).await;
     }
-    let ok = req
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|h| h.strip_prefix("Bearer "))
-        .map(|t| verify(t).is_ok())
-        .unwrap_or(false);
-    if ok {
+    if authed {
         next.run(req).await
     } else {
         (StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response()

@@ -105,10 +105,20 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 headers.insert("x-hive-team", hv);
             }
             match serde_json::from_slice::<fluid_core::GitDeployRequest>(body) {
-                Ok(req) => match crate::admin::git_deploy(State(cloud.clone()), headers, axum::Json(req)).await {
+                Ok(req) => match crate::admin::git_deploy(State(cloud.clone()), headers, team_claims(p), axum::Json(req)).await {
                     Ok(j) => jb(j),
                     Err((_, msg)) => serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default(),
                 },
+                Err(_) => Vec::new(),
+            }
+        }
+        // Instant rollback to a placed deployment: the coordinator proxies the
+        // promote (a mutation) to the host node over the mesh. The host runs it
+        // locally (it holds the deployment), so there's no re-proxy loop.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/deployments/") && p.contains("/promote") => {
+            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
+            match crate::admin::dep_promote(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+                Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
         }
@@ -127,16 +137,44 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // and the coordinator always requests `local=true` so there's no re-proxy loop.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/resources") => {
             let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
-            jb(crate::admin::deployment_resources(State(cloud.clone()), team_headers(p), axum::extract::Path(id)).await)
+            jb(crate::admin::deployment_resources(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await)
+        }
+        // A single run's DETAIL — must match before the runs LIST arm below.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/runs/") => {
+            let id = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("").to_string();
+            match crate::admin::wf_run_detail(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id), wf_query(p)).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
         }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/runs") => {
-            jb(crate::admin::wf_runs(State(cloud.clone()), team_headers(p), wf_query(p)).await)
+            jb(crate::admin::wf_runs(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+        }
+        // Workflow summary rollup — must match before the generic `/v1/workflows` arm.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/summary") => {
+            jb(crate::admin::wf_summary(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
         }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows") => {
-            jb(crate::admin::wf_list(State(cloud.clone()), team_headers(p), wf_query(p)).await)
+            jb(crate::admin::wf_list(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+        }
+        // Request/routing event log: recorded on the SERVING node, so the coordinator
+        // proxies here to read a placed project's logs. `local=true` rides in the query
+        // so this node returns only its own events (no re-fan-out → no loop).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
+            jb(crate::admin::logs(State(cloud.clone()), team_headers(p), team_claims(p), logs_query(p)).await)
         }
         _ => Vec::new(),
     }
+}
+
+/// Reconstruct the logs `Query<LimitQ>` from a dispatched path's query string.
+fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LimitQ> {
+    axum::extract::Query(crate::admin::LimitQ {
+        limit: qparam(path, "limit").and_then(|v| v.parse().ok()),
+        project: qparam(path, "project"),
+        q: qparam(path, "q"),
+        local: qparam(path, "local").map(|v| v == "true" || v == "1"),
+    })
 }
 
 /// Pull a query-string value (`?k=v&...`) out of a dispatched path.
@@ -146,6 +184,27 @@ fn qparam(path: &str, key: &str) -> Option<String> {
         let (k, v) = kv.split_once('=')?;
         (k == key).then(|| v.to_string())
     })
+}
+
+/// Build a verified-claims extension for a mesh-internal admin call. The iroh
+/// transport carries no HTTP headers and the calling peer is already trusted
+/// (peer-trust allowlist + mesh auth), so the team that rides as `?team=` is
+/// injected as authoritative [`crate::auth::Claims`]. Handlers resolve the tenant
+/// from these claims — under enforced JWT auth the synthesized `x-hive-team`
+/// header is ignored, so without this the tenant would be lost on the host node.
+fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
+    let team = qparam(path, "team")?;
+    let team = team.trim();
+    if team.is_empty() {
+        return None;
+    }
+    Some(axum::Extension(crate::auth::Claims {
+        sub: "mesh-internal".into(),
+        tenant: team.to_string(),
+        role: "service".into(),
+        iat: 0,
+        exp: 0,
+    }))
 }
 
 /// Build a HeaderMap carrying the `?team=` param as `x-hive-team` (the mesh transport

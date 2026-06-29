@@ -221,8 +221,30 @@ impl CellBackend for MockBackend {
         if func.start_cmd[0] == "__container__" {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
             let internal = func.start_cmd.get(2).cloned().unwrap_or_else(|| "8080".into());
+            // Multi-service (compose) deploys: JSON network config in start_cmd[3] — a
+            // DNS-less shared network with static IPs + sibling host entries.
+            let net = func
+                .start_cmd
+                .get(3)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             let name = format!("hive-{}", cell.id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
             let _ = std::process::Command::new("podman").args(["rm", "-f", &name]).output();
+            if let Some(n) = &net {
+                if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    let mut c = vec!["network".to_string(), "create".to_string(), "--disable-dns".to_string()];
+                    if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        c.push("--subnet".into());
+                        c.push(s.to_string());
+                    }
+                    if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        c.push("--gateway".into());
+                        c.push(g.to_string());
+                    }
+                    c.push(netname.to_string());
+                    let _ = Command::new("podman").args(&c).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                }
+            }
             let port = func.port;
             let mut args: Vec<String> = vec![
                 "run".into(), "-d".into(), "--name".into(), name.clone(),
@@ -233,6 +255,26 @@ impl CellBackend for MockBackend {
                 args.push("-e".into());
                 args.push(format!("{k}={v}"));
             }
+            if let Some(n) = &net {
+                if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    args.push("--network".into());
+                    args.push(netname.to_string());
+                    if let Some(ip) = n.get("ip").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        args.push("--ip".into());
+                        args.push(ip.to_string());
+                    }
+                    if let Some(hosts) = n.get("hosts").and_then(|v| v.as_array()) {
+                        for h in hosts.iter().filter_map(|h| h.as_str()) {
+                            args.push("--add-host".into());
+                            args.push(h.to_string());
+                        }
+                    }
+                }
+            }
+            // Resource ceilings + privilege drop (DoS / escalation defense) —
+            // podman run OPTIONS, so they precede the image name. Mirrors the
+            // shared `podman_run_container` path's `ContainerLimits::default()`.
+            args.extend(crate::ContainerLimits::default().podman_run_flags());
             args.push("-p".into());
             args.push(format!("127.0.0.1:{port}:{internal}"));
             args.push(image.clone());

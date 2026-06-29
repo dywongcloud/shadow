@@ -334,15 +334,18 @@ export function randomConfigRepoName(): string {
  */
 export async function createRepo(
   entity: string,
-  opts: { name: string; org?: string; isPrivate?: boolean; description?: string }
+  opts: { name: string; org?: string; isPrivate?: boolean; description?: string; autoInit?: boolean }
 ): Promise<CreateRepoResult> {
   if (!composioConfigured()) return { ok: false, error: "COMPOSIO_API_KEY not set" };
-  const { name, org, isPrivate = true, description } = opts;
+  const { name, org, isPrivate = true, description, autoInit = true } = opts;
   const tool = org ? "GITHUB_CREATE_AN_ORGANIZATION_REPOSITORY" : "GITHUB_CREATE_A_REPOSITORY_FOR_THE_AUTHENTICATED_USER";
   const args: Record<string, unknown> = {
     name,
     private: isPrivate,
-    auto_init: true,
+    // `auto_init: true` (default) gives the GitOps config-repo flow a base commit to
+    // build its tree on. The in-browser Git page creates the repo EMPTY (autoInit:false)
+    // so its own first local commit is the initial push (no non-fast-forward clash).
+    auto_init: autoInit,
     description: description || "OpenEdge GitOps — auto-managed config",
   };
   if (org) args.org = org;
@@ -539,5 +542,39 @@ export async function githubRepos(entity: string): Promise<GhRepo[]> {
   } catch (e) {
     console.error("composio repos failed", e);
     return [];
+  }
+}
+
+/**
+ * The raw GitHub OAuth access token held by this entity's ACTIVE Composio
+ * connection — so server-side code (e.g. the in-browser-git CORS proxy) can use
+ * the Composio-managed GitHub link as the git client credential, instead of a
+ * separately-pasted PAT. Returns null when Composio is unconfigured, no ACTIVE
+ * connection exists, or the token isn't exposed — callers must treat that as
+ * "no token" and degrade (public/anonymous git or a user-supplied PAT).
+ *
+ * The token is fetched FRESH per call (never cached/persisted): Composio refreshes
+ * the ACTIVE connection's token, and stale tokens 401 — re-reading each time keeps
+ * the credential current without us managing refresh.
+ */
+export async function githubAccessToken(entity: string): Promise<string | null> {
+  if (!composioConfigured()) return null;
+  try {
+    const res = await v3(
+      `/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${GITHUB_SLUG}`
+    );
+    const items: any[] = res?.items ?? [];
+    // Prefer an ACTIVE connection; the token lives under `data.access_token` (also
+    // seen as `state.val.access_token` on some payloads).
+    const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE") || items[0];
+    if (!active) return null;
+    const token =
+      active?.data?.access_token ||
+      active?.state?.val?.access_token ||
+      active?.connectionParams?.access_token ||
+      null;
+    return typeof token === "string" && token ? token : null;
+  } catch {
+    return null;
   }
 }

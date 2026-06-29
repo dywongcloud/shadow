@@ -248,7 +248,11 @@ export default function NewProjectPage() {
         )}
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
-        Paste any public Git repo URL — OpenEdge clones, builds, and deploys it.
+        Paste any public Git repo URL — OpenEdge clones, builds, and deploys it.{" "}
+        <Link href="/new/upload" className="text-secondary underline decoration-dotted underline-offset-2 hover:text-fg">
+          No repository? Upload a .zip instead
+        </Link>
+        .
       </p>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
