@@ -284,25 +284,45 @@ export async function commitFile(
   opts: { owner: string; repo: string; path: string; content: string; message: string; branch?: string }
 ): Promise<CommitResult> {
   if (!composioConfigured()) return { ok: false, error: "COMPOSIO_API_KEY not set" };
-  try {
-    const { owner, repo, path, content, message, branch } = opts;
-    const sha = await githubFileSha(entity, owner, repo, path, branch);
-    const b64 = Buffer.from(content, "utf-8").toString("base64");
-    const res = await ghExec(entity, "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", {
-      owner, repo, path, message, content: b64,
-      ...(branch ? { branch } : {}),
-      ...(sha ? { sha } : {}),
-    });
-    if (res?.successful === false) {
-      return { ok: false, error: res?.error || "GitHub commit failed" };
+  const { owner, repo, path, content, message, branch } = opts;
+  const b64 = Buffer.from(content, "utf-8").toString("base64");
+  // The Contents API is optimistic-concurrency: it 409s ("is at X but expected Y")
+  // when the blob SHA we send is stale — i.e. the file changed between our SHA read
+  // and the write (concurrent syncs, or a just-created base commit). Re-read the
+  // FRESH SHA and retry a few times so a transient race resolves itself instead of
+  // surfacing raw GitHub JSON to the user.
+  let lastErr = "GitHub commit failed";
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const sha = await githubFileSha(entity, owner, repo, path, branch);
+      const res = await ghExec(entity, "GITHUB_CREATE_OR_UPDATE_FILE_CONTENTS", {
+        owner, repo, path, message, content: b64,
+        ...(branch ? { branch } : {}),
+        ...(sha ? { sha } : {}),
+      });
+      const data = res?.data?.details ?? res?.data ?? res ?? {};
+      if (res?.successful === false) {
+        const msg = String(data?.message || res?.error || "GitHub commit failed");
+        lastErr = msg;
+        if (isShaConflict(msg)) continue; // stale SHA → re-read + retry
+        return { ok: false, error: msg };
+      }
+      const commit = data?.commit?.sha || data?.content?.sha || sha || "";
+      return { ok: true, commit };
+    } catch (e: any) {
+      const msg = String(e?.message || "unknown error");
+      lastErr = msg;
+      if (isShaConflict(msg)) continue; // retry on optimistic-lock conflict
+      console.error("composio commitFile failed", e);
+      return { ok: false, error: `Composio: ${msg}` };
     }
-    const data = res?.data?.details ?? res?.data ?? res ?? {};
-    const commit = data?.commit?.sha || data?.content?.sha || sha || "";
-    return { ok: true, commit };
-  } catch (e: any) {
-    console.error("composio commitFile failed", e);
-    return { ok: false, error: `Composio: ${e?.message || "unknown error"}` };
   }
+  return { ok: false, error: lastErr };
+}
+
+/** GitHub Contents-API optimistic-concurrency conflict (stale blob SHA). */
+function isShaConflict(s: string): boolean {
+  return /but expected|does not match|409|sha.*mismatch|is at [0-9a-f]{7,}/i.test(s || "");
 }
 
 function deep(res: any): any {
@@ -315,6 +335,15 @@ export interface CreateRepoResult {
   default_branch?: string;
   conflict?: boolean; // the name already exists — caller should retry with a new name
   error?: string;
+  /** Set when an ORG has OAuth-App access restrictions enabled: the URL an org
+   *  owner must visit to grant this app access. The create can't proceed until then. */
+  approve_url?: string;
+  restricted?: boolean;
+}
+
+/** Detect GitHub's org OAuth-App access-restriction 403 (not a name conflict). */
+function looksLikeOrgRestriction(s: string): boolean {
+  return /OAuth App access restrictions|restricting-access-to-your-organization|third-parties is limited/i.test(s || "");
 }
 
 /** A random, collision-proof name for the GitOps config repo. */
@@ -357,6 +386,16 @@ export async function createRepo(
       const msg = d?.message || res?.error || JSON.stringify(d?.errors || {});
       // Name already taken → signal conflict; DO NOT reuse the existing repo.
       if (looksLikeConflict(msg)) return { ok: false, conflict: true, error: msg };
+      // Org has OAuth-App access restrictions → surface the exact approval URL so an
+      // org owner can grant this app, instead of dumping raw GitHub JSON at the user.
+      if (org && looksLikeOrgRestriction(msg)) {
+        return {
+          ok: false,
+          restricted: true,
+          approve_url: `https://github.com/orgs/${org}/policies/applications`,
+          error: `The "${org}" organization restricts third-party OAuth apps. An org owner must approve this app before a repo can be created there.`,
+        };
+      }
       return { ok: false, error: msg };
     }
     return {
@@ -367,6 +406,14 @@ export async function createRepo(
   } catch (e: any) {
     const msg = e?.message || "unknown error";
     if (looksLikeConflict(msg)) return { ok: false, conflict: true, error: msg };
+    if (org && looksLikeOrgRestriction(msg)) {
+      return {
+        ok: false,
+        restricted: true,
+        approve_url: `https://github.com/orgs/${org}/policies/applications`,
+        error: `The "${org}" organization restricts third-party OAuth apps. An org owner must approve this app before a repo can be created there.`,
+      };
+    }
     return { ok: false, error: `Composio: ${msg}` };
   }
 }
@@ -520,6 +567,35 @@ export async function createRepoWebhook(
   }
 }
 
+function mapRepos(arr: any[]): GhRepo[] {
+  return (Array.isArray(arr) ? arr : []).map((r: any) => ({
+    name: r.name,
+    full_name: r.full_name,
+    clone_url: r.clone_url || `https://github.com/${r.full_name}.git`,
+    default_branch: r.default_branch || "main",
+    private: !!r.private,
+    updated_at: r.updated_at,
+    owner: r.owner?.login,
+  }));
+}
+
+/** List repositories for a specific ORGANIZATION (used when the GitOps scope is an
+ *  org — the "use existing repo" picker must show the ORG's repos, not the user's). */
+export async function githubOrgRepos(entity: string, org: string): Promise<GhRepo[]> {
+  if (!composioConfigured() || !org) return [];
+  try {
+    const res = await ghExec(entity, "GITHUB_LIST_ORGANIZATION_REPOSITORIES", {
+      org, per_page: 100, sort: "updated",
+    });
+    const data = res?.data?.details ?? res?.data ?? res ?? [];
+    const arr: any[] = Array.isArray(data) ? data : data?.repositories ?? data?.items ?? [];
+    return mapRepos(arr);
+  } catch (e) {
+    console.error("composio org repos failed", e);
+    return [];
+  }
+}
+
 /** List the connected GitHub user's repositories for this entity. */
 export async function githubRepos(entity: string): Promise<GhRepo[]> {
   if (!composioConfigured()) return [];
@@ -545,6 +621,20 @@ export async function githubRepos(entity: string): Promise<GhRepo[]> {
   }
 }
 
+// Short-lived per-entity cache for the GitHub token. A single in-browser git op
+// (clone/push) fires several proxied requests in a burst; without a cache each one
+// would re-hit Composio. The TTL is deliberately short so a rotated/revoked token
+// is picked up quickly; `invalidateGithubToken` drops an entry immediately when a
+// cached token is rejected upstream (proxy sees a 401). Module-scope = per server
+// process (fine for the Node server the dashboard runs on).
+const GH_TOKEN_TTL_MS = 60_000;
+const ghTokenCache = new Map<string, { token: string | null; expires: number }>();
+
+/** Drop a cached GitHub token (e.g. after an upstream 401) so the next read refetches. */
+export function invalidateGithubToken(entity: string): void {
+  ghTokenCache.delete(entity);
+}
+
 /**
  * The raw GitHub OAuth access token held by this entity's ACTIVE Composio
  * connection — so server-side code (e.g. the in-browser-git CORS proxy) can use
@@ -553,12 +643,16 @@ export async function githubRepos(entity: string): Promise<GhRepo[]> {
  * connection exists, or the token isn't exposed — callers must treat that as
  * "no token" and degrade (public/anonymous git or a user-supplied PAT).
  *
- * The token is fetched FRESH per call (never cached/persisted): Composio refreshes
- * the ACTIVE connection's token, and stale tokens 401 — re-reading each time keeps
- * the credential current without us managing refresh.
+ * Cached per entity for a short TTL (`GH_TOKEN_TTL_MS`) so a burst of git requests
+ * shares one Composio lookup; the short TTL + `invalidateGithubToken` keep a
+ * rotated/revoked token from lingering.
  */
 export async function githubAccessToken(entity: string): Promise<string | null> {
   if (!composioConfigured()) return null;
+  const now = Date.now();
+  const hit = ghTokenCache.get(entity);
+  if (hit && hit.expires > now) return hit.token;
+  let token: string | null = null;
   try {
     const res = await v3(
       `/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${GITHUB_SLUG}`
@@ -567,13 +661,56 @@ export async function githubAccessToken(entity: string): Promise<string | null> 
     // Prefer an ACTIVE connection; the token lives under `data.access_token` (also
     // seen as `state.val.access_token` on some payloads).
     const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE") || items[0];
-    if (!active) return null;
-    const token =
+    const raw =
       active?.data?.access_token ||
       active?.state?.val?.access_token ||
       active?.connectionParams?.access_token ||
       null;
-    return typeof token === "string" && token ? token : null;
+    token = typeof raw === "string" && raw ? raw : null;
+  } catch {
+    token = null;
+  }
+  ghTokenCache.set(entity, { token, expires: now + GH_TOKEN_TTL_MS });
+  return token;
+}
+
+/**
+ * Generic credential extraction for ANY connected toolkit — the basis for
+ * exposing a Composio-linked integration as a consumable platform resource.
+ * Returns the active connection's auth material as a flat map (access_token /
+ * api_key / token / etc.) plus a coarse auth `kind`, or null if not connected.
+ * Credential shapes vary across toolkits, so we merge the few known carriers.
+ */
+export async function connectionCredentials(
+  entity: string,
+  slug: string
+): Promise<{ kind: string; credentials: Record<string, string> } | null> {
+  if (!composioConfigured()) return null;
+  try {
+    const res = await v3(
+      `/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${encodeURIComponent(slug)}`
+    );
+    const items: any[] = res?.items ?? [];
+    const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE") || items[0];
+    if (!active) return null;
+    const sources = [active?.data, active?.state?.val, active?.connectionParams].filter(Boolean);
+    const KEYS = [
+      "access_token", "token", "bearer_token", "api_key", "apiKey", "key", "secret",
+      "client_id", "client_secret", "refresh_token", "password", "username",
+      "account_id", "scope", "expires_at", "subdomain", "base_url", "region",
+    ];
+    const credentials: Record<string, string> = {};
+    for (const src of sources) {
+      for (const k of KEYS) {
+        const v = src?.[k];
+        if (typeof v === "string" && v && !(k in credentials)) credentials[k] = v;
+      }
+    }
+    const scheme =
+      active?.authConfig?.authScheme ||
+      active?.auth_scheme ||
+      (credentials.access_token ? "oauth" : credentials.api_key || credentials.apiKey ? "api_key" : "oauth");
+    return { kind: String(scheme).toLowerCase(), credentials };
   } catch {
     return null;
   }

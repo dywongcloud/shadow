@@ -15,8 +15,20 @@ function teamHeaders(): Record<string, string> {
   return { "x-hive-team": currentTeam() };
 }
 
+/** fetch with a hard timeout so a slow/unreachable backend (e.g. a far region)
+ *  can't leave a request — and the tab that awaits it — hanging indefinitely. */
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: ctrl.signal });
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export async function apiGet<T>(path: string): Promise<T> {
-  const r = await fetch(`${BASE}${path}`, { cache: "no-store", headers: teamHeaders() });
+  const r = await fetchWithTimeout(`${BASE}${path}`, { cache: "no-store", headers: teamHeaders() }, 20_000);
   if (!r.ok) throw new Error(`GET ${path} -> ${r.status}`);
   return r.json();
 }
@@ -26,15 +38,16 @@ export async function apiGet<T>(path: string): Promise<T> {
 // linked). We fire a debounced sync event the GitOps loop listens for. Covers:
 // new projects + new deployments (`git/deploy`), deleted projects + all settings/
 // env/build/function/domain updates (`projects/`), teams, databases, securelinks.
-const CONFIG_PATHS = /^\/v1\/(projects\/|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy)/;
+const CONFIG_PATHS =
+  /^\/v1\/(projects\/|teams\/?$|teams\/|databases|securelinks|gitops|git\/deploy|enterprise\/|routing|webhooks|domains|cron)/;
 const GITOPS_BADGE = "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600";
 
 export async function apiSend<T>(method: string, path: string, body?: unknown): Promise<T> {
-  const r = await fetch(`${BASE}${path}`, {
+  const r = await fetchWithTimeout(`${BASE}${path}`, {
     method,
     headers: { "content-type": "application/json", ...teamHeaders() },
     body: body === undefined ? undefined : JSON.stringify(body),
-  });
+  }, 30_000);
   if (!r.ok) {
     // Surface the server's error message (e.g. "project name already taken")
     // instead of an opaque status, so callers can show it to the user.
@@ -368,6 +381,12 @@ export interface Database {
   connection: Record<string, string>;
   container: string | null;
   note: string;
+  /** Configured replica regions (cross-region replication). */
+  replicas?: string[];
+  /** "primary" | "replica". */
+  role?: string;
+  /** Node hosting the primary (for replicas). */
+  primary_node?: string;
 }
 
 // ---- Monitoring ----
@@ -540,7 +559,42 @@ export interface PlanSpec {
   price_cents: number;
   included_cents: number;
   overage: boolean;
+  max_projects: number;
+  max_members: number;
   features: string[];
+}
+export interface RateCard {
+  active_cpu_hr_cents: number;
+  mem_gb_hr_cents: number;
+  requests_per_million_cents: number;
+  waf_per_million_cents: number;
+}
+export interface PlanLimits {
+  max_projects: number;
+  max_members: number;
+  max_duration_secs: number;
+  allows_failover: boolean;
+  allows_sso: boolean;
+  projects_used: number;
+  members_used: number;
+  can_deploy: boolean;
+}
+export interface InvoiceLine {
+  description: string;
+  amount_cents: number;
+}
+export interface Invoice {
+  id: string;
+  number: string;
+  tenant: string;
+  plan: string;
+  period_start_ms: number;
+  period_end_ms: number;
+  lines: InvoiceLine[];
+  subtotal_cents: number;
+  total_cents: number;
+  status: string;
+  created_ms: number;
 }
 export interface BillingAccount {
   tenant: string;
@@ -558,6 +612,9 @@ export interface BillingInfo {
   account: BillingAccount;
   plans: PlanSpec[];
   stripe: boolean;
+  rate_card?: RateCard;
+  limits?: PlanLimits;
+  current_invoice?: Invoice;
 }
 export interface LedgerEntry {
   id: string;

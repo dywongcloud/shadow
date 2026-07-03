@@ -8,26 +8,90 @@ import { currentTeam } from "@/lib/api";
 interface GhStatus { configured: boolean; connected: boolean; entity?: string | null }
 interface Repo { name: string; full_name: string; default_branch: string; private: boolean; owner?: string }
 
+/** Last GitOps sync outcome, persisted for the UI (mirror card, error banner). */
+export interface GitopsSyncStatus {
+  at: number; // epoch ms
+  ok: boolean;
+  mode: "server" | "local";
+  detail: string; // "pushed <sha>" | "unchanged" | error message
+  repo?: string;
+  commit?: string;
+}
+const STATUS_KEY = "hive_gitops_status";
+export function readGitopsStatus(): GitopsSyncStatus | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(STATUS_KEY);
+    return raw ? (JSON.parse(raw) as GitopsSyncStatus) : null;
+  } catch {
+    return null;
+  }
+}
+function recordStatus(s: GitopsSyncStatus) {
+  try {
+    localStorage.setItem(STATUS_KEY, JSON.stringify(s));
+    window.dispatchEvent(new Event("gitops-status"));
+  } catch {
+    /* storage full/blocked — status is best-effort */
+  }
+  const color = s.ok ? "color:#3fb950" : "color:#f85149";
+  console.log(`%cgitops%c ${s.mode} sync ${s.ok ? "ok" : "FAILED"} — ${s.detail}`, "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600", color);
+}
+
+let syncInFlight = false;
+
 /**
- * Fire a GitOps config sync. If a remote config repo is linked, push the artifact
- * tree to it (deduped server-side by content hash). Otherwise mirror the same tree
- * into the LOCAL in-browser provider (issue #4) so CRUD ops still produce versioned
- * GitOps artifacts with zero external setup. The local module is dynamically
- * imported so isomorphic-git never bloats the main bundle.
+ * Fire a GitOps config sync — fully autonomous and in the background.
+ *
+ * PRIMARY path: the SERVER-side sync route (`/api/gitops/sync`), which reads the
+ * tenant's linked config repo, regenerates the artifact tree from live platform
+ * state, and commits it via the GitHub API using the connected (Composio) token —
+ * reliable, no browser git, no CORS proxy, works for every mutation made while
+ * signed in. FALLBACK: when no repo is linked / GitHub isn't connected, the local
+ * in-browser mirror (`gitops-local`, dynamically imported) keeps a versioned copy.
+ * Every outcome (pushed / unchanged / error) is recorded to `hive_gitops_status`
+ * so failures are VISIBLE in the UI instead of dying in the console.
  */
 export function triggerGitopsSync() {
-  if (typeof window === "undefined") return;
-  if (localStorage.getItem("hive_gitops_linked") !== "1") {
-    import("@/lib/gitops-local")
-      .then((m) => m.syncLocalGitops())
-      .catch(() => {});
-    return;
-  }
-  fetch("/api/gitops/sync", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ team: currentTeam() }),
-  }).catch(() => {});
+  if (typeof window === "undefined" || syncInFlight) return;
+  syncInFlight = true;
+  (async () => {
+    try {
+      const team = currentTeam();
+      const r = await fetch("/api/gitops/sync", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ team }),
+      });
+      const d = await r.json().catch(() => ({}) as any);
+      if (d?.ok) {
+        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `pushed ${String(d.commit || "").slice(0, 8)} (${d.files} artifacts)`, repo: d.repo, commit: d.commit });
+        return;
+      }
+      if (d?.unchanged) {
+        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: "unchanged", repo: d.repo });
+        return;
+      }
+      if (d?.skipped) {
+        // Not linked / GitHub not connected → keep the local in-browser mirror.
+        const m = await import("@/lib/gitops-local");
+        const snap = await m.syncLocalGitops();
+        recordStatus({
+          at: Date.now(),
+          ok: !snap?.pushError,
+          mode: "local",
+          detail: snap?.pushError || (snap ? `local commit ${snap.commit}` : `local mirror (${d.reason})`),
+        });
+        return;
+      }
+      // Server route reachable but the commit failed — surface it.
+      recordStatus({ at: Date.now(), ok: false, mode: "server", detail: String(d?.error || `sync failed (HTTP ${r.status})`) });
+    } catch (e) {
+      recordStatus({ at: Date.now(), ok: false, mode: "server", detail: e instanceof Error ? e.message : String(e) });
+    } finally {
+      syncInFlight = false;
+    }
+  })();
 }
 
 /**
@@ -56,8 +120,23 @@ export function GitOps() {
   const [done, setDone] = useState(false);
   const [result, setResult] = useState<{ repo: string; created: boolean; files: number } | null>(null);
   const [error, setError] = useState("");
+  // When an org restricts third-party OAuth apps, GitHub 403s repo creation; this
+  // holds the org-owner approval URL so we show an actionable link, not raw JSON.
+  const [approveUrl, setApproveUrl] = useState("");
   const inited = useRef(false);
   const pathname = usePathname();
+
+  // Reload the "use existing" repo list for the current scope: the org's repos when
+  // an org login is entered, else the personal account's. Debounced so typing an
+  // org login doesn't spam the API.
+  useEffect(() => {
+    if (step !== "repo" || mode !== "existing" || !status.connected) return;
+    const org = scope === "org" ? orgLogin.trim() : "";
+    if (scope === "org" && !org) return; // wait for a login before listing org repos
+    const t = setTimeout(() => loadRepos(org), 350);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, mode, scope, orgLogin, status.connected]);
 
   const finishOnboarding = useCallback(() => {
     localStorage.setItem("hive_onboarded", "1");
@@ -83,7 +162,11 @@ export function GitOps() {
       return;
     }
 
-    fetch("/api/github/status")
+    // Bound the status probe so a slow Composio/backend round-trip (e.g. from a
+    // far region) can't leave onboarding state hanging; abort after 4s.
+    const statusCtrl = new AbortController();
+    const statusTimer = setTimeout(() => statusCtrl.abort(), 4000);
+    fetch("/api/github/status", { signal: statusCtrl.signal })
       .then((r) => r.json())
       .then((s: GhStatus) => {
         setStatus(s);
@@ -101,19 +184,22 @@ export function GitOps() {
         }
       })
       .catch(() => {
-        // Status fetch failed — only prompt if we've never onboarded.
+        // Status fetch failed/timed out — only prompt if we've never onboarded.
         if (localStorage.getItem("hive_onboarded") !== "1") setStep("intro");
-      });
+      })
+      .finally(() => clearTimeout(statusTimer));
   }, []);
 
-  async function loadRepos() {
+  async function loadRepos(org?: string) {
     setLoadingRepos(true);
     try {
-      const r = await fetch("/api/github/repos");
+      // Org scope → list the ORG's repos, not the personal account's.
+      const q = org && org.trim() ? `?org=${encodeURIComponent(org.trim())}` : "";
+      const r = await fetch(`/api/github/repos${q}`);
       const d = await r.json();
       const list: Repo[] = Array.isArray(d.repos) ? d.repos : [];
       setRepos(list);
-      if (list[0]) setRepo(list[0].full_name);
+      setRepo(list[0] ? list[0].full_name : "");
     } catch {
       /* ignore */
     } finally {
@@ -141,6 +227,7 @@ export function GitOps() {
 
   async function link() {
     setError("");
+    setApproveUrl("");
     if (mode === "existing" && !repo.includes("/")) return;
     if (scope === "org" && !orgLogin.trim()) { setError("Enter the GitHub organization login."); return; }
     setBusy(true);
@@ -161,8 +248,22 @@ export function GitOps() {
         }),
       });
       const d = await r.json();
-      if (!d.ok) { setError(d.error || "Failed to set up GitOps."); setBusy(false); return; }
+      if (!d.ok) {
+        setError(d.error || "Failed to set up GitOps.");
+        // Org restricts third-party OAuth apps → show the org-owner approval link.
+        if (d.approve_url) setApproveUrl(d.approve_url);
+        setBusy(false);
+        return;
+      }
       localStorage.setItem("hive_gitops_linked", "1");
+      // Record the generated repo as the autonomous client-side push target, so
+      // every future change commits + pushes here in the background (no git page).
+      if (d.repo) {
+        localStorage.setItem("hive_gitops_remote", d.repo);
+        localStorage.setItem("hive_gitops_remote_branch", d.branch || "main");
+      }
+      // Kick an immediate background sync so the first post-setup change lands.
+      triggerGitopsSync();
       setResult({ repo: d.repo, created: !!d.created, files: Array.isArray(d.files) ? d.files.length : 0 });
       setDone(true);
       setTimeout(finishOnboarding, 2200);
@@ -184,9 +285,46 @@ export function GitOps() {
     };
   }, []);
 
-  if (step === "hidden" || pathname.startsWith("/status")) return null;
+  // ---- sync failure toast: make broken GitHub mirroring VISIBLE ----
+  const [syncErr, setSyncErr] = useState<GitopsSyncStatus | null>(null);
+  useEffect(() => {
+    const onStatus = () => {
+      const s = readGitopsStatus();
+      // Only surface real push failures for a LINKED repo (local-mirror mode
+      // isn't an error state). Auto-clears on the next successful sync.
+      setSyncErr(s && !s.ok && localStorage.getItem("hive_gitops_linked") === "1" ? s : null);
+    };
+    window.addEventListener("gitops-status", onStatus);
+    onStatus();
+    return () => window.removeEventListener("gitops-status", onStatus);
+  }, []);
+
+  const errToast =
+    syncErr && !pathname.startsWith("/status") ? (
+      <div className="fixed bottom-4 right-4 z-[90] w-80 rounded-lg border border-red-500/40 bg-card p-3 shadow-2xl">
+        <div className="flex items-start justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-medium text-red-500">
+            <GitBranch className="h-4 w-4" /> GitOps sync failed
+          </div>
+          <button onClick={() => setSyncErr(null)} className="text-muted hover:text-fg" aria-label="Dismiss">
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+        <p className="mt-1 break-words text-xs text-secondary">{syncErr.detail}</p>
+        <button
+          onClick={() => { setSyncErr(null); triggerGitopsSync(); }}
+          className="mt-2 rounded-md border border-border px-2 py-1 text-xs text-secondary hover:bg-subtle hover:text-fg"
+        >
+          Retry now
+        </button>
+      </div>
+    ) : null;
+
+  if (step === "hidden" || pathname.startsWith("/status")) return errToast;
 
   return (
+    <>
+    {errToast}
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/50 p-4 backdrop-blur-sm">
       <div className="w-full max-w-md overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
         <div className="flex items-center justify-between border-b border-border px-5 py-3.5">
@@ -322,6 +460,16 @@ export function GitOps() {
                 )}
 
                 {error ? <p className="mt-3 text-xs text-red-500">{error}</p> : null}
+                {approveUrl ? (
+                  <a
+                    href={approveUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-link hover:underline"
+                  >
+                    Approve this app for the organization <ExternalLink className="h-3 w-3" />
+                  </a>
+                ) : null}
 
                 <div className="mt-5 flex items-center justify-between gap-2">
                   <button onClick={finishOnboarding} className="rounded-md px-3 py-2 text-sm text-secondary hover:bg-bg">
@@ -342,6 +490,7 @@ export function GitOps() {
         ) : null}
       </div>
     </div>
+    </>
   );
 }
 

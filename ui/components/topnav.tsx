@@ -1,28 +1,29 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
-import { useEffect, useRef, useState } from "react";
-import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Menu } from "lucide-react";
+import { usePathname, useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useRef, useState } from "react";
+import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2 } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
-import { Logo } from "@/components/logo";
+import { VercelMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, type Team } from "@/lib/api";
+import { useIsPlatformOwner } from "@/lib/owner";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
-const tabs = [
+// Team/account-level tabs — shown when NO project/deployment is selected.
+const teamTabs = [
   { href: "/", label: "Projects" },
   { href: "/workflows", label: "Workflows" },
   { href: "/storage", label: "Storage" },
   { href: "/observability", label: "Observability" },
   { href: "/cdn", label: "CDN" },
   { href: "/integrations", label: "Integrations" },
-  { href: "/git", label: "Git" },
   { href: "/domains", label: "Domains" },
   { href: "/firewall", label: "Firewall" },
   { href: "/network", label: "Network" },
@@ -30,6 +31,45 @@ const tabs = [
   { href: "/billing", label: "Billing" },
   { href: "/settings", label: "Settings" },
 ];
+
+/** Drilled-in context (Vercel breadcrumb-tabs model): once a project or a
+ *  deployment is selected, the TEAM tabs collapse into the breadcrumb and the
+ *  SUB-tabs for that level take the top tab-bar position. Returns the tab set +
+ *  the active key for the current URL. `tabParam` is the reactive `?tab=` value. */
+type TabItem = { href: string; label: string; key: string };
+function contextTabs(pathname: string, tabParam: string | null): { items: TabItem[]; activeKey: string } | null {
+  // Deployment detail: /deployments/<id>
+  const dep = pathname.match(/^\/deployments\/([^/]+)/);
+  if (dep) {
+    const id = dep[1];
+    const items: TabItem[] = [
+      { href: `/deployments/${id}`, label: "Overview", key: "overview" },
+      { href: `/deployments/${id}?tab=logs`, label: "Build Logs", key: "logs" },
+    ];
+    return { items, activeKey: tabParam === "logs" ? "logs" : "overview" };
+  }
+  // Project: /projects/<p>[/logs|/settings] with ?tab= for the in-page tabs.
+  const proj = pathname.match(/^\/projects\/([^/]+)/);
+  if (proj) {
+    const p = proj[1];
+    const base = `/projects/${p}`;
+    const items: TabItem[] = [
+      { href: `${base}?tab=overview`, label: "Overview", key: "overview" },
+      { href: `${base}?tab=graph`, label: "Service Graph", key: "graph" },
+      { href: `${base}?tab=workflows`, label: "Workflows", key: "workflows" },
+      { href: `${base}?tab=resources`, label: "Resources", key: "resources" },
+      { href: `${base}?tab=deployments`, label: "Deployments", key: "deployments" },
+      { href: `${base}/logs`, label: "Logs", key: "logs" },
+      { href: `${base}/settings`, label: "Settings", key: "settings" },
+    ];
+    let activeKey = "overview";
+    if (pathname.includes("/settings")) activeKey = "settings";
+    else if (pathname.includes("/logs")) activeKey = "logs";
+    else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
+    return { items, activeKey };
+  }
+  return null;
+}
 
 /** The Vercel triangle mark — inverts with the theme (black on light, white on dark). */
 /** Thin breadcrumb separator matching the brand slash. */
@@ -39,6 +79,7 @@ function Slash() {
 
 export function TopNav() {
   const pathname = usePathname();
+  const isOwner = useIsPlatformOwner();
   // The owner/ops dashboard + auth + public status pages render their own chrome.
   if (pathname.startsWith("/admin") || pathname.startsWith("/sign-in") || pathname.startsWith("/sign-up") || pathname.startsWith("/status") || pathname.startsWith("/docs")) return null;
   const isActive = (href: string) =>
@@ -49,13 +90,18 @@ export function TopNav() {
   const projectSeg = pathname.startsWith("/projects/")
     ? decodeURIComponent(pathname.split("/")[2] ?? "")
     : "";
+  // Deployment detail also gets a breadcrumb crumb (LOGO / Team / <id>), and its
+  // own sub-tabs take the top bar — matching Vercel's drill-in.
+  const deploymentSeg = pathname.startsWith("/deployments/")
+    ? decodeURIComponent(pathname.split("/")[2] ?? "")
+    : "";
 
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">
-          <Link href="/" className="flex items-center"><Logo className="h-6 w-auto" /></Link>
+          <Link href="/" className="flex items-center"><VercelMark className="h-5 w-auto" /></Link>
           <Slash />
           <WithIdentity>{(id) => (clerkOn ? <ClerkTeamSwitcher identity={id} /> : <TeamSwitcher identity={id} />)}</WithIdentity>
           {projectSeg && (
@@ -70,15 +116,27 @@ export function TopNav() {
               </Link>
             </>
           )}
+          {deploymentSeg && (
+            <>
+              <Slash />
+              <span className="flex min-w-0 items-center gap-2 px-1.5 py-1 font-medium">
+                <span className="truncate font-mono text-[13px]">{deploymentSeg}</span>
+                <span className="rounded bg-fg px-1.5 py-0.5 text-[10px] font-semibold uppercase text-bg">Deployment</span>
+              </span>
+            </>
+          )}
         </div>
         <div className="flex items-center gap-2">
-          <Link
-            href="/admin"
-            className="hidden items-center gap-1.5 rounded-md border border-border-strong px-2.5 py-1 text-xs font-medium text-secondary hover:bg-subtle hover:text-fg sm:flex"
-            title="Owner / operations dashboard"
-          >
-            <ShieldHalf className="h-3.5 w-3.5" /> Ops
-          </Link>
+          {/* Ops entry — platform owner only (middleware enforces; this just hides the link). */}
+          {isOwner && (
+            <Link
+              href="/admin"
+              className="hidden items-center gap-1.5 rounded-md border border-border-strong px-2.5 py-1 text-xs font-medium text-secondary hover:bg-subtle hover:text-fg sm:flex"
+              title="Owner / operations dashboard"
+            >
+              <ShieldHalf className="h-3.5 w-3.5" /> Ops
+            </Link>
+          )}
           <NotificationBell />
           <ThemeToggle />
           <Link
@@ -90,81 +148,82 @@ export function TopNav() {
           </Link>
         </div>
       </div>
-      {/* Row 2: tabs. Desktop (lg+) = horizontal underline tabs. Below that, a
-          compact dropdown so the nav never needs ugly horizontal scrolling. */}
+      {/* Row 2: section tabs — ONE horizontally-scrollable underline bar at every
+          width (Vercel-style). No dropdown/overlay on mobile: it swipes, the active
+          tab auto-centers, and the scrollbar is hidden. */}
       <div className="mx-auto max-w-[1400px] px-2 sm:px-4">
-        <nav className="-mb-px hidden items-center gap-0.5 lg:flex">
-          {tabs.map((t) => {
-            const active = isActive(t.href);
-            return (
-              <Link
-                key={t.href}
-                href={t.href}
-                className={cn(
-                  "whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
-                  active
-                    ? "border-fg text-fg"
-                    : "border-transparent text-secondary hover:text-fg"
-                )}
-              >
-                {t.label}
-              </Link>
-            );
-          })}
-        </nav>
-        <MobileTabs isActive={isActive} />
+        {/* Suspense-wrapped: SectionTabs reads `?tab=` (useSearchParams) — the
+            boundary keeps that from deopting static marketing pages to dynamic. */}
+        <Suspense fallback={<div className="h-[38px]" />}>
+          <SectionTabs isActive={isActive} />
+        </Suspense>
       </div>
     </header>
   );
 }
 
-/** Mobile/tablet nav (< lg): a single bar showing the current section, opening a
- *  vertical dropdown of all tabs. Replaces the cramped horizontal scroll. */
-function MobileTabs({ isActive }: { isActive: (href: string) => boolean }) {
+/** The section tab bar: a single underline row that scrolls horizontally on narrow
+ *  screens instead of collapsing into a dropdown. Keeps the active tab in view.
+ *  Context-aware: team tabs at the top level, or the project/deployment SUB-tabs
+ *  once drilled in (Vercel breadcrumb-tabs model). */
+function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   const pathname = usePathname();
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  // Close on navigation.
-  useEffect(() => setOpen(false), [pathname]);
+  const searchParams = useSearchParams();
+  const navRef = useRef<HTMLDivElement>(null);
+  const ctx = contextTabs(pathname, searchParams.get("tab"));
+  // Center the active tab within the scroll container (it may start off-screen on
+  // mobile). Only touches the container's scrollLeft — never scrolls the page.
   useEffect(() => {
-    function onClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    const nav = navRef.current;
+    const el = nav?.querySelector<HTMLElement>("[data-active='true']");
+    if (nav && el) {
+      nav.scrollLeft = el.offsetLeft - nav.clientWidth / 2 + el.clientWidth / 2;
     }
-    document.addEventListener("mousedown", onClick);
-    return () => document.removeEventListener("mousedown", onClick);
-  }, []);
-  const current = tabs.find((t) => isActive(t.href)) ?? tabs[0];
+  }, [pathname, searchParams]);
+
+  if (ctx) {
+    // Drilled-in: render the project/deployment sub-tabs in the top bar position.
+    return (
+      <nav ref={navRef} className="no-scrollbar -mb-px flex items-center gap-0.5 overflow-x-auto">
+        {ctx.items.map((t) => {
+          const active = t.key === ctx.activeKey;
+          return (
+            <Link
+              key={t.key}
+              href={t.href}
+              data-active={active}
+              className={cn(
+                "shrink-0 whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
+                active ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
+              )}
+            >
+              {t.label}
+            </Link>
+          );
+        })}
+      </nav>
+    );
+  }
+
   return (
-    <div className="relative lg:hidden" ref={ref}>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="-mb-px flex w-full items-center justify-between gap-2 border-b-2 border-fg px-1.5 pb-2.5 pt-1 text-sm font-medium text-fg"
-      >
-        <span className="truncate">{current.label}</span>
-        <Menu className="h-4 w-4 shrink-0 text-secondary" />
-      </button>
-      {open && (
-        <div className="absolute left-0 right-0 top-full z-40 mt-1 max-h-[70vh] overflow-y-auto rounded-lg border border-border bg-card py-1 shadow-pop">
-          {tabs.map((t) => {
-            const active = isActive(t.href);
-            return (
-              <Link
-                key={t.href}
-                href={t.href}
-                onClick={() => setOpen(false)}
-                className={cn(
-                  "flex items-center justify-between px-4 py-2.5 text-sm hover:bg-subtle",
-                  active ? "font-medium text-fg" : "text-secondary hover:text-fg"
-                )}
-              >
-                {t.label}
-                {active ? <Check className="h-4 w-4" /> : null}
-              </Link>
-            );
-          })}
-        </div>
-      )}
-    </div>
+    <nav ref={navRef} className="no-scrollbar -mb-px flex items-center gap-0.5 overflow-x-auto">
+      {teamTabs.map((t) => {
+        const active = isActive(t.href);
+        return (
+          <Link
+            key={t.href}
+            href={t.href}
+            data-active={active}
+            className={cn(
+              "shrink-0 whitespace-nowrap border-b-2 px-3 pb-2.5 pt-1 text-sm transition-colors",
+              active ? "border-fg text-fg" : "border-transparent text-secondary hover:text-fg"
+            )}
+          >
+            {t.label}
+          </Link>
+        );
+      })}
+    </nav>
   );
 }
 
@@ -197,6 +256,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
   const [selected, setSelected] = useState<string>(PERSONAL);
   const ref = useRef<HTMLDivElement>(null);
   const initDone = useRef(false);
+  const syncedKey = useRef("");
 
   const memberships = userMemberships?.data ?? [];
   const orgBySlug = (s: string) => memberships.find((m) => (m.organization.slug || m.organization.id) === s)?.organization;
@@ -251,6 +311,12 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     const org = selected === PERSONAL ? null : orgBySlug(selected) ?? null;
     if (selected !== PERSONAL && !org && !isLoaded) return; // wait for memberships
     const team = selected === PERSONAL ? "personal" : selected;
+    // De-dup: this effect re-runs on several dep changes that can fire in a <100ms
+    // burst, POSTing the same identity 2-4x. Skip when the (team,user,org) tuple is
+    // unchanged so we sync once per unique selection.
+    const key = `${team}|${identity.id}|${org?.id ?? ""}`;
+    if (syncedKey.current === key) return;
+    syncedKey.current = key;
     fetch("/cloud/v1/identity/sync", {
       method: "POST",
       headers: { "content-type": "application/json", "x-hive-team": team },
@@ -258,7 +324,9 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
         user: { id: identity.id, email: identity.email, name: identity.name, image_url: identity.imageUrl ?? "" },
         org: org ? { id: org.id, slug: org.slug ?? org.id, name: org.name, image_url: org.imageUrl ?? "" } : null,
       }),
-    }).catch(() => {});
+    }).catch(() => {
+      if (syncedKey.current === key) syncedKey.current = ""; // allow a retry on failure
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, isLoaded, memberships.length, identity.id]);
 

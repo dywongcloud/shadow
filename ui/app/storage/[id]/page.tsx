@@ -11,7 +11,7 @@ import { timeAgo } from "@/lib/utils";
 export default function DatabaseDetail({ params }: { params: { id: string } }) {
   const id = params.id;
   const router = useRouter();
-  const { data: db } = usePoll<Database>(`/v1/databases/${id}`, 3000);
+  const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, 3000);
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
 
@@ -30,8 +30,22 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
     router.push("/storage");
   }
 
-  if (!db) return <div className="text-sm text-secondary">Loading…</div>;
-  const conn = revealed ?? db.connection;
+  if (!db) {
+    // Show the fetch error (e.g. slow/unreachable backend) rather than hanging on
+    // "Loading…" forever, which under high latency reads as a broken page.
+    if (error) {
+      return (
+        <div className="flex flex-col items-start gap-2 text-sm">
+          <Link href="/storage" className="inline-flex items-center gap-1 text-secondary hover:text-fg"><ArrowLeft className="h-4 w-4" /> Storage</Link>
+          <p className="text-red-500">Couldn&apos;t load this database: {String(error).replace(/^Error:\s*/, "")}</p>
+        </div>
+      );
+    }
+    return <div className="text-sm text-secondary">Loading…</div>;
+  }
+  // conn may be absent for a still-provisioning or replica record — never let
+  // Object.entries throw (that produced a blank page).
+  const conn = revealed ?? db.connection ?? {};
 
   return (
     <div>
@@ -51,7 +65,7 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
         <Mini label="Type" value={db.kind} />
         <Mini label="Region" value={db.region} />
         <Mini label="Mode" value={db.mode} />
-        <Mini label="Created" value={`${timeAgo(db.created_ms)} ago`} />
+        <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)} ago` : "unknown"} />
       </div>
 
       <Card>
@@ -62,15 +76,19 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
           </Button>
         </div>
         <div className="divide-y divide-border">
-          {Object.entries(conn).map(([k, v]) => (
-            <div key={k} className="flex items-center gap-3 py-2.5">
-              <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
-              <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{v}</div>
-              <button onClick={() => copy(k, v)} className="shrink-0 text-muted hover:text-fg">
-                {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
-              </button>
-            </div>
-          ))}
+          {Object.entries(conn).length === 0 ? (
+            <p className="py-2.5 text-xs text-muted">No connection details yet.</p>
+          ) : (
+            Object.entries(conn).map(([k, v]) => (
+              <div key={k} className="flex items-center gap-3 py-2.5">
+                <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
+                <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{v}</div>
+                <button onClick={() => copy(k, v)} className="shrink-0 text-muted hover:text-fg">
+                  {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+                </button>
+              </div>
+            ))
+          )}
         </div>
         {db.container && <p className="mt-3 text-xs text-muted">Backed by container <code className="font-mono">{db.container}</code></p>}
       </Card>
