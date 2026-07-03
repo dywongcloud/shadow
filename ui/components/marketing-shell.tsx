@@ -66,6 +66,35 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const active = (href: string) => pathname === href || (href !== "/" && pathname.startsWith(href + "/"));
 
+  // The marketing/landing surface is ALWAYS the dark brand surface (#0c0d10),
+  // independent of the platform light/dark theme. Force the ROOT (html/body)
+  // background to match so the overscroll/rubber-band area and any gutter show the
+  // same dark — not the theme background (white in light mode). `color-scheme:dark`
+  // makes native scrollbars (and their corner) render dark, and `overflow-x:clip`
+  // removes the horizontal scrollbar the full-bleed `w-screen` shell would induce
+  // (which is what produced the tiny white scrollbar-corner square). All restored
+  // on unmount so the dashboard keeps its themed background.
+  useEffect(() => {
+    const html = document.documentElement;
+    const body = document.body;
+    const prev = {
+      htmlBg: html.style.backgroundColor,
+      bodyBg: body.style.backgroundColor,
+      scheme: html.style.colorScheme,
+      overflowX: body.style.overflowX,
+    };
+    html.style.backgroundColor = "#0c0d10";
+    body.style.backgroundColor = "#0c0d10";
+    html.style.colorScheme = "dark";
+    body.style.overflowX = "clip";
+    return () => {
+      html.style.backgroundColor = prev.htmlBg;
+      body.style.backgroundColor = prev.bodyBg;
+      html.style.colorScheme = prev.scheme;
+      body.style.overflowX = prev.overflowX;
+    };
+  }, []);
+
   // Mobile nav menu (below lg, where the inline nav is hidden).
   const [menuOpen, setMenuOpen] = useState(false);
   // Close the menu on navigation.
@@ -87,11 +116,11 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div
-      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-black text-white"
+      className="relative left-1/2 w-screen -translate-x-1/2 -my-8 overflow-hidden bg-[#0c0d10] text-white"
       style={{ fontFamily: "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif" }}
     >
       {/* Top nav — blue lining matches the SVG globe's blue streaks (#218CFF). */}
-      <header className="relative z-30 border-b border-[#218cff]/50 bg-black/80 backdrop-blur">
+      <header className="relative z-30 border-b border-[#218cff]/50 bg-[#0c0d10]/80 backdrop-blur">
         <div className="mx-auto flex max-w-[1500px] items-center justify-between px-6 py-4 lg:px-10">
           <Link href="/" className="shrink-0"><Logo className="h-7 sm:h-8" /></Link>
           <nav className="hidden items-center gap-8 font-semibold uppercase text-[18px] text-zinc-300 lg:flex">
@@ -134,7 +163,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       {menuOpen &&
         typeof document !== "undefined" &&
         createPortal(
-          <div className="fixed inset-0 z-[200] flex flex-col bg-black text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
+          <div className="fixed inset-0 z-[200] flex flex-col bg-[#0c0d10] text-white lg:hidden" style={{ fontFamily: ELECTROLIZE_FONT }}>
             {/* Top bar: logo + close button (mirrors the navbar). */}
             <div className="flex items-center justify-between border-b border-[#218cff]/50 px-6 py-4">
               <Link href="/" onClick={() => setMenuOpen(false)} className="shrink-0">
@@ -181,7 +210,7 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
       {children}
 
       {/* Footer */}
-      <footer className="relative overflow-hidden bg-black">
+      <footer className="relative overflow-hidden bg-[#0c0d10]">
         {/* Aurora glows rising from the bottom edge — light blue, aqua, turquoise,
             indigo and pink fuchsia. Dimmer + slightly larger radii for softer wash. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[26rem]">

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import {
   Github, Search, GitBranch, CheckCheck, LayoutGrid, List,
-  ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star,
+  ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star, Activity, X,
 } from "lucide-react";
 import { Card, Button, Input, Triangle } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -144,7 +144,7 @@ function Dashboard() {
           <button onClick={toggleFavOpen} className="mb-3 flex items-center gap-1.5 text-sm font-semibold">
             <ChevronDown className={`h-4 w-4 transition-transform ${favOpen ? "" : "-rotate-90"}`} /> Your Favorites
           </button>
-          {favOpen && (
+          {favOpen && deps !== null && (
             favoriteProjects.length ? (
               <div className="mb-6 grid grid-cols-1 gap-4 sm:grid-cols-2">
                 {favoriteProjects.map((p) => (
@@ -158,7 +158,17 @@ function Dashboard() {
             )
           )}
 
-          {!list.length ? (
+          {deps === null ? (
+            // Data not loaded yet (initial mount OR a team/account switch that
+            // cleared the previous tenant's data). Show a skeleton, NOT the empty
+            // state — otherwise "Deploy your first project" flashes for a frame
+            // before the new tenant's cards arrive.
+            <div className={view === "grid" ? "grid grid-cols-1 gap-4 sm:grid-cols-2" : "overflow-hidden rounded-xl border border-border bg-card"}>
+              {Array.from({ length: view === "grid" ? 4 : 6 }).map((_, i) => (
+                <div key={i} className={view === "grid" ? "h-28 animate-pulse rounded-xl border border-border bg-card" : "h-14 animate-pulse border-b border-border bg-card last:border-0"} />
+              ))}
+            </div>
+          ) : !list.length ? (
             <Card className="overflow-hidden p-8 text-center">
               <GlobeEmptyState title="Deploy your first project" desc="Import a Git repository or a Dockerfile to deploy across your global mesh. Use “New Project” above to get started." />
             </Card>
@@ -377,29 +387,63 @@ function repoLabel(url: string): string {
     .replace(/\.git$/, "");
 }
 
-/** Circular deployment-status ring with a double-check, like Vercel's. */
+/** Absolute short date like Vercel's project list: "May 28" for the current
+ *  year, "2/22/25" for a prior year. (Vercel shows absolute dates here, not a
+ *  relative "Xh ago".) */
+function shortDate(ms: number): string {
+  if (!ms) return "";
+  const d = new Date(ms);
+  const sameYear = d.getFullYear() === new Date().getFullYear();
+  return d.toLocaleDateString(
+    "en-US",
+    sameYear
+      ? { month: "short", day: "numeric" }
+      : { month: "numeric", day: "numeric", year: "2-digit" }
+  );
+}
+
+/** Vercel-style deployment-status ring: a light track with a colored progress
+ *  arc, and a double-check (or an activity pulse while building / a cross on
+ *  error) in the center. */
 function StatusRing({ state }: { state: string }) {
   const tone =
-    state === "ready" ? "text-green border-green/40"
-    : state === "building" ? "text-amber-500 border-amber-500/40"
-    : state === "error" ? "text-red-500 border-red-500/40"
-    : "text-muted border-border-strong";
+    state === "ready" ? "text-blue-500"
+    : state === "building" || state === "queued" ? "text-amber-500"
+    : state === "error" ? "text-red-500"
+    : "text-muted";
+  // Arc length on a 0–100 path scale: a small accent for steady states, a
+  // longer sweep while building.
+  const arc = state === "building" || state === "queued" ? "60 100" : "26 100";
   return (
-    <span className={`flex h-8 w-8 items-center justify-center rounded-full border-2 ${tone}`}>
-      <CheckCheck className="h-3.5 w-3.5" />
+    <span className={`relative flex h-8 w-8 shrink-0 items-center justify-center ${tone}`} title={state}>
+      <svg viewBox="0 0 36 36" className="absolute inset-0 h-full w-full" fill="none" aria-hidden>
+        <circle cx="18" cy="18" r="15.5" className="stroke-border" strokeWidth="2.5" />
+        <circle
+          cx="18" cy="18" r="15.5"
+          stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"
+          pathLength={100} strokeDasharray={arc} transform="rotate(-90 18 18)"
+        />
+      </svg>
+      {state === "building" || state === "queued" ? (
+        <Activity className="h-3.5 w-3.5 text-muted" />
+      ) : state === "error" ? (
+        <X className="h-3.5 w-3.5 text-red-500" />
+      ) : (
+        <CheckCheck className="h-3.5 w-3.5 text-secondary" />
+      )}
     </span>
   );
 }
 
 /** Card view — the whole card is a link (stretched-link pattern) while the
  *  status ring + ⋯ menu stay clickable on top. */
-function StarBtn({ isFav, onToggle }: { isFav?: boolean; onToggle?: () => void }) {
+function StarBtn({ isFav, onToggle, className }: { isFav?: boolean; onToggle?: () => void; className?: string }) {
   if (!onToggle) return null;
   return (
     <button
       onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggle(); }}
       aria-label={isFav ? "Unfavorite" : "Favorite"}
-      className={`pointer-events-auto flex h-7 w-7 items-center justify-center rounded-md hover:bg-subtle ${isFav ? "text-amber-400" : "text-muted hover:text-fg"}`}
+      className={`pointer-events-auto flex h-7 w-7 items-center justify-center rounded-md hover:bg-subtle ${isFav ? "text-amber-400" : "text-muted hover:text-fg"} ${className ?? ""}`}
     >
       <Star className="h-4 w-4" fill={isFav ? "currentColor" : "none"} />
     </button>
@@ -421,7 +465,9 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
             <Triangle />
             <div className="min-w-0">
               <div className="truncate font-semibold">{p.project}</div>
-              <div className="truncate text-sm text-secondary">{deploymentHost(p.alias)}</div>
+              <div className={`truncate text-sm ${p.production ? "text-secondary" : "text-muted"}`}>
+                {p.production ? deploymentHost(p.alias) : "No Production Deployment"}
+              </div>
             </div>
           </div>
           <div className="pointer-events-auto z-20 flex shrink-0 items-center gap-1">
@@ -441,7 +487,8 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
             </div>
             <p className="mt-3 truncate text-sm">{p.git!.commit_message || "Latest deployment"}</p>
             <div className="mt-3 flex items-center gap-1.5 text-xs text-muted">
-              {timeAgo(p.created_at_ms)} ago on
+              <span>{shortDate(p.created_at_ms)}</span>
+              <span>on</span>
               <GitBranch className="h-3 w-3" />
               {p.git!.branch || "main"}
             </div>
@@ -451,7 +498,7 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
             <Link href="/new" className="pointer-events-auto relative z-20 mt-3 inline-block text-sm font-medium text-link hover:underline">
               Connect Git Repository
             </Link>
-            <div className="mt-3 text-xs text-muted">{timeAgo(p.created_at_ms)} ago</div>
+            <div className="mt-3 text-xs text-muted">{shortDate(p.created_at_ms)}</div>
           </>
         )}
       </div>
@@ -459,11 +506,13 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
   );
 }
 
-/** List/row view — a full-width clickable row like Vercel's list layout. */
+/** List/row view — a full-width clickable row like Vercel's project list. */
 function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChange?: () => void; isFav?: boolean; onToggleFav?: () => void }) {
   const hasGit = !!p.git;
+  const isProd = p.production;
+  const date = shortDate(p.created_at_ms);
   return (
-    <div className="relative flex items-center gap-4 border-b border-border px-4 py-3.5 transition-colors last:border-0 hover:bg-subtle/50">
+    <div className="group relative flex items-center gap-4 border-b border-border px-4 py-3.5 transition-colors last:border-0 hover:bg-subtle/50">
       <Link
         href={`/projects/${encodeURIComponent(p.project)}`}
         aria-label={p.project}
@@ -471,32 +520,43 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChan
       />
       <div className="pointer-events-none relative z-10 flex flex-1 items-center gap-4">
         <Triangle />
-        <div className="min-w-0 shrink-0 basis-52">
+        {/* Name + production domain (or "No Production Deployment"). */}
+        <div className="min-w-0 shrink-0 basis-56 lg:basis-72">
           <div className="truncate font-semibold">{p.project}</div>
-          <div className="truncate text-xs text-secondary">{deploymentHost(p.alias)}</div>
+          <div className={`truncate text-xs ${isProd ? "text-secondary" : "text-muted"}`}>
+            {isProd ? deploymentHost(p.alias) : "No Production Deployment"}
+          </div>
         </div>
-        <div className="hidden min-w-0 flex-1 md:block">
+        {/* Deploy info: commit message / connect-git / status (top) + date (bottom). */}
+        <div className="hidden min-w-0 flex-1 flex-col justify-center md:flex">
           {hasGit ? (
-            <>
-              <div className="truncate text-sm">{p.git!.commit_message || "Latest deployment"}</div>
-              <div className="mt-0.5 flex items-center gap-1.5 text-xs text-muted">
-                {timeAgo(p.created_at_ms)} ago on
-                <GitBranch className="h-3 w-3" />
-                {p.git!.branch || "main"}
-              </div>
-            </>
-          ) : (
-            <div className="text-sm text-muted">No Production Deployment · {timeAgo(p.created_at_ms)} ago</div>
-          )}
+            <div className="truncate text-sm">{p.git!.commit_message || "Latest deployment"}</div>
+          ) : isProd ? (
+            <Link href="/new" className="pointer-events-auto relative z-20 w-fit text-sm font-medium text-link hover:underline">
+              Connect Git Repository
+            </Link>
+          ) : null}
+          <div className="mt-0.5 flex items-center gap-1.5 truncate text-xs text-muted">
+            <span className="shrink-0">{date}</span>
+            {hasGit && (
+              <>
+                <span className="shrink-0">on</span>
+                <GitBranch className="h-3 w-3 shrink-0" />
+                <span className="truncate">{p.git!.branch || "main"}</span>
+              </>
+            )}
+          </div>
         </div>
+        {/* GitHub repository badge. */}
         {hasGit && (
-          <span className="pointer-events-none hidden max-w-[220px] items-center gap-1.5 truncate rounded-md bg-subtle px-2 py-1 text-xs text-secondary lg:inline-flex">
+          <span className="pointer-events-none hidden max-w-[200px] items-center gap-1.5 truncate rounded-md bg-subtle px-2 py-1 text-xs text-secondary lg:inline-flex">
             <Github className="h-3.5 w-3.5 shrink-0" />
             <span className="truncate">{repoLabel(p.git!.repo_url)}</span>
           </span>
         )}
-        <div className="pointer-events-auto z-20 flex shrink-0 items-center gap-1">
-          <StarBtn isFav={isFav} onToggle={onToggleFav} />
+        {/* Actions: star (hover-reveal, like Vercel's hidden default) · status · ⋯ */}
+        <div className="pointer-events-auto z-20 ml-auto flex shrink-0 items-center gap-1.5">
+          <StarBtn isFav={isFav} onToggle={onToggleFav} className={`transition-opacity focus:opacity-100 group-hover:opacity-100 ${isFav ? "" : "opacity-0"}`} />
           <StatusRing state={p.state} />
           <ProjectMenu project={p.project} alias={p.alias} onChange={onChange} />
         </div>
