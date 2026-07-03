@@ -45,8 +45,10 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
     const items: TabItem[] = [
       { href: `/deployments/${id}`, label: "Overview", key: "overview" },
       { href: `/deployments/${id}?tab=logs`, label: "Build Logs", key: "logs" },
+      { href: `/deployments/${id}?tab=workflows`, label: "Workflows", key: "workflows" },
     ];
-    return { items, activeKey: tabParam === "logs" ? "logs" : "overview" };
+    const activeKey = tabParam === "logs" ? "logs" : tabParam === "workflows" ? "workflows" : "overview";
+    return { items, activeKey };
   }
   // Project: /projects/<p>[/logs|/settings] with ?tab= for the in-page tabs.
   const proj = pathname.match(/^\/projects\/([^/]+)/);
