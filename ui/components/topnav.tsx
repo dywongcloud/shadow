@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useRef, useState } from "react";
-import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2 } from "lucide-react";
+import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Workflow } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
@@ -68,6 +68,18 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
     else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
     return { items, activeKey };
   }
+  // Workflows: /workflows[/...] is a drilled-in context too — the top bar shows the
+  // Workflows SUB-tabs (Runs / Workflows / Hooks via `?tab=`), NOT the team tabs,
+  // matching the project/deployment breadcrumb-tabs model.
+  if (pathname === "/workflows" || pathname.startsWith("/workflows/")) {
+    const items: TabItem[] = [
+      { href: "/workflows?tab=runs", label: "Runs", key: "runs" },
+      { href: "/workflows?tab=workflows", label: "Workflows", key: "workflows" },
+      { href: "/workflows?tab=hooks", label: "Hooks", key: "hooks" },
+    ];
+    const activeKey = ["runs", "workflows", "hooks"].includes(tabParam ?? "") ? tabParam! : "runs";
+    return { items, activeKey };
+  }
   return null;
 }
 
@@ -95,6 +107,9 @@ export function TopNav() {
   const deploymentSeg = pathname.startsWith("/deployments/")
     ? decodeURIComponent(pathname.split("/")[2] ?? "")
     : "";
+  // Workflows is a drilled-in context: breadcrumb LOGO / Team / Workflows, with the
+  // Workflows sub-tabs (Runs / Workflows / Hooks) in the top tab bar below.
+  const workflowsSeg = pathname === "/workflows" || pathname.startsWith("/workflows/");
 
   return (
     <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
@@ -123,6 +138,18 @@ export function TopNav() {
                 <span className="truncate font-mono text-[13px]">{deploymentSeg}</span>
                 <span className="rounded bg-fg px-1.5 py-0.5 text-[10px] font-semibold uppercase text-bg">Deployment</span>
               </span>
+            </>
+          )}
+          {workflowsSeg && (
+            <>
+              <Slash />
+              <Link
+                href="/workflows"
+                className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
+              >
+                <Workflow className="h-4 w-4 shrink-0" />
+                <span className="truncate">Workflows</span>
+              </Link>
             </>
           )}
         </div>
