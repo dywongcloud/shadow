@@ -4251,7 +4251,16 @@ async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<Identit
         org_slug.as_deref(),
     );
     crate::persist::persist(&c);
-    Json(json!({ "ok": true, "tenant": tenant }))
+    // MULTI-TENANCY: tell the client whether this account is the PLATFORM OWNER.
+    // Personal-scope data historically lived under the single global "personal"
+    // namespace (the cross-account leak). The client now keys personal data by
+    // per-user id (`u_<uid>`); the owner alone keeps the legacy "personal"
+    // namespace so their pre-existing projects/deployments (local AND fleet-hosted,
+    // tagged tenant="personal") stay visible — without a risky mesh-wide retag.
+    // Every non-owner is isolated under their own `u_<uid>`.
+    let is_owner = !c.owner_email.trim().is_empty()
+        && req.user.email.eq_ignore_ascii_case(c.owner_email.trim());
+    Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
 // ============================ Billing & compute credits ============================

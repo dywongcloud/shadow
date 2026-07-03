@@ -4,11 +4,33 @@ import { useEffect, useState, useCallback } from "react";
 
 const BASE = "/cloud";
 
-/** Current tenant (team) for scoping all dashboard reads/writes. */
+/** Current tenant (team) for scoping all dashboard reads/writes.
+ *
+ * MULTI-TENANCY: an ORG scope resolves to the org slug (already isolated). The
+ * PERSONAL scope must NOT be the literal "personal" — that is a single global
+ * namespace every account would share (the cross-account data-leak bug). Instead
+ * it is keyed to the signed-in account's stable id (`hive_uid`, the Clerk user
+ * id) → `u_<uid>`, so no two accounts ever collide on personal data.
+ *
+ * Before identity resolves, with Clerk enabled we return a namespace that owns NO
+ * data (`__pending__`) rather than the shared "personal", so nothing can leak in
+ * the pre-auth window; a `hive-team-changed` event fires when the id lands and
+ * pollers re-fetch under the correct namespace. With Clerk disabled (local
+ * single-user dev) plain "personal" is correct. */
+const CLERK_ON = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
 export function currentTeam(): string {
   if (typeof window === "undefined") return "personal";
   const t = localStorage.getItem("hive_team");
-  return !t || t === "__personal__" ? "personal" : t;
+  if (t && t !== "__personal__" && t !== "personal") return t; // org scope
+  // Personal scope. The platform OWNER keeps the legacy "personal" namespace (so
+  // their existing projects/deployments remain visible); every other account is
+  // isolated under a per-user namespace. `hive_is_owner` is set from the backend's
+  // authoritative owner_email check (identity/sync), never guessed client-side.
+  if (localStorage.getItem("hive_is_owner") === "1") return "personal";
+  const uid = localStorage.getItem("hive_uid");
+  if (uid && uid !== "local") return `u_${uid}`;
+  return CLERK_ON ? "__pending__" : "personal";
 }
 
 function teamHeaders(): Record<string, string> {

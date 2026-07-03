@@ -275,14 +275,20 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     if (!identity.id || identity.id === "local") return;
     const prev = localStorage.getItem("hive_uid");
     if (prev && prev !== identity.id) {
-      for (const k of ["hive_team", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
+      for (const k of ["hive_team", "hive_is_owner", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;
       setSelected(PERSONAL);
       window.dispatchEvent(new Event("hive-team-changed"));
     }
+    const firstIdentity = prev !== identity.id; // includes unset -> set
     localStorage.setItem("hive_uid", identity.id);
+    // When the user id is first established, the personal namespace changes from
+    // the pre-auth placeholder to `u_<uid>` — tell pollers to re-fetch so personal
+    // data loads under the correct per-account namespace (and never leaks across
+    // accounts via a shared literal "personal").
+    if (firstIdentity) window.dispatchEvent(new Event("hive-team-changed"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity.id]);
 
@@ -310,7 +316,8 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     if (typeof window === "undefined") return;
     const org = selected === PERSONAL ? null : orgBySlug(selected) ?? null;
     if (selected !== PERSONAL && !org && !isLoaded) return; // wait for memberships
-    const team = selected === PERSONAL ? "personal" : selected;
+    // Personal scope is per-USER (`u_<uid>`), never the shared literal "personal".
+    const team = selected === PERSONAL ? `u_${identity.id}` : selected;
     // De-dup: this effect re-runs on several dep changes that can fire in a <100ms
     // burst, POSTing the same identity 2-4x. Skip when the (team,user,org) tuple is
     // unchanged so we sync once per unique selection.
@@ -324,9 +331,20 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
         user: { id: identity.id, email: identity.email, name: identity.name, image_url: identity.imageUrl ?? "" },
         org: org ? { id: org.id, slug: org.slug ?? org.id, name: org.name, image_url: org.imageUrl ?? "" } : null,
       }),
-    }).catch(() => {
-      if (syncedKey.current === key) syncedKey.current = ""; // allow a retry on failure
-    });
+    })
+      .then((r) => r.json())
+      .then((d) => {
+        // The backend authoritatively marks the platform owner (owner_email). The
+        // owner keeps the legacy "personal" namespace; everyone else stays isolated
+        // under `u_<uid>`. Refresh pollers so personal data loads under the right one.
+        const prev = localStorage.getItem("hive_is_owner");
+        const now = d?.is_owner ? "1" : "0";
+        localStorage.setItem("hive_is_owner", now);
+        if (prev !== now) window.dispatchEvent(new Event("hive-team-changed"));
+      })
+      .catch(() => {
+        if (syncedKey.current === key) syncedKey.current = ""; // allow a retry on failure
+      });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selected, isLoaded, memberships.length, identity.id]);
 
