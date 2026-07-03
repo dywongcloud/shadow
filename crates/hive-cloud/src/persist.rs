@@ -28,6 +28,12 @@ use crate::state::CloudState;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct PlatformSnapshot {
+    /// When this snapshot was SAVED (ms epoch). The guardian restore-on-rollback
+    /// guard compares this against the replicated copy to detect a local snapshot
+    /// that regressed (older file restored after a crash / disk swap): if the
+    /// GuardianDB replica is NEWER than what's on disk, the replica wins at boot.
+    #[serde(default)]
+    pub saved_ms: u64,
     #[serde(default)]
     pub deployments: Vec<DeployRecord>,
     #[serde(default)]
@@ -46,10 +52,18 @@ pub struct PlatformSnapshot {
     pub webhooks: Vec<crate::webhooks::Webhook>,
     #[serde(default)]
     pub databases: Vec<crate::databases::Database>,
+    /// Durable data for the in-process stores (queue + vector) so they survive a
+    /// restart like blob (disk) and the DB records themselves.
+    #[serde(default)]
+    pub database_data: crate::databases::DataSnapshot,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
     #[serde(default)]
     pub apikeys: Vec<crate::apikeys::ApiKey>,
+    #[serde(default)]
+    pub integrations: Vec<crate::integrations::IntegrationResource>,
+    #[serde(default)]
+    pub svcgraphs: Vec<crate::svcgraph::ServiceGraph>,
     #[serde(default)]
     pub orgs: Vec<crate::identity::OrgRecord>,
     #[serde(default)]
@@ -58,6 +72,8 @@ pub struct PlatformSnapshot {
     pub billing: Vec<crate::billing::BillingAccount>,
     #[serde(default)]
     pub billing_ledger: Vec<crate::billing::LedgerEntry>,
+    #[serde(default)]
+    pub billing_invoices: Vec<crate::billing::Invoice>,
     #[serde(default)]
     pub domains: Vec<crate::dns::DomainRecord>,
     #[serde(default)]
@@ -69,6 +85,10 @@ pub struct PlatformSnapshot {
     /// ingested during a live deploy, so without this they vanished on reboot.
     #[serde(default)]
     pub workflow_defs: Vec<WorkflowDef>,
+    /// Enterprise feature suite state (secrets AEAD-encrypted in-struct). See
+    /// [`crate::enterprise::EnterpriseSnapshot`].
+    #[serde(default)]
+    pub enterprise: crate::enterprise::EnterpriseSnapshot,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -181,6 +201,10 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     for k in &snap.apikeys {
         push(ns_norm(&k.team), "api_keys", json!(k));
     }
+    for i in &snap.integrations {
+        // Redacted view in the namespace docs — never persist secrets here.
+        push(ns_norm(&i.team), "integrations", i.public());
+    }
     for w in &snap.webhooks {
         push(team_of(&w.project), "webhooks", json!(w));
     }
@@ -238,6 +262,7 @@ pub fn save_namespaces(snap: &PlatformSnapshot) -> std::io::Result<()> {
 /// Capture the current platform state into a snapshot.
 pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
     PlatformSnapshot {
+        saved_ms: hive_core::now_ms(),
         deployments: cloud.gw.deployment_records(),
         projects: cloud.projects.snapshot(),
         waf_rules: cloud.waf.rules(),
@@ -247,24 +272,126 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         teams: cloud.teams.snapshot(),
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
+        database_data: cloud.databases.data_snapshot(),
         incidents: cloud.incidents.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
+        integrations: cloud.integrations.snapshot(),
+        svcgraphs: cloud.svcgraph.snapshot(),
         orgs: cloud.identity.orgs(),
         users: cloud.identity.users(),
         billing: cloud.billing.snapshot().0,
         billing_ledger: cloud.billing.snapshot().1,
+        billing_invoices: cloud.billing.invoices_snapshot(),
         domains: cloud.domains.snapshot(),
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
         workflow_defs: cloud.workflows.defs(),
+        enterprise: cloud.enterprise.snapshot(),
     }
 }
 
-/// Persist the current state to disk (call after any mutation).
+// ---------------------------------------------------------------------------
+// Coalescing background persister.
+//
+// `persist()` used to serialize the ENTIRE platform state + fsync + rename +
+// namespace-partition + guardian-replicate SYNCHRONOUSLY on the calling request
+// thread — paid in full on every single mutation (env edit, domain add, …), so a
+// burst of edits did N full-state fsyncs back-to-back on the hot path.
+//
+// This replaces that with a single background writer that COALESCES bursts while
+// preserving durability: `persist()` bumps a generation counter and wakes the
+// writer; the writer always captures + saves the LATEST state, and if more
+// mutations arrived during a save it immediately saves again. Properties:
+//   * No lost mutation under normal operation — after the last `persist()` the
+//     writer performs a save that captures state at-or-after that call.
+//   * Bounded crash-loss window (the in-flight capture), vs the old zero-window
+//     synchronous write — this is the accepted latency↔durability trade.
+//   * `flush_blocking()` (wired to SIGTERM/SIGINT in main) makes a graceful
+//     restart lose nothing.
+//   * Synchronous fallback when the writer isn't started (early boot / tests),
+//     so persistence is never silently dropped.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex, OnceLock};
+
+struct Persister {
+    cloud: Arc<CloudState>,
+    dirty: AtomicU64, // bumped on each persist() request
+    saved: AtomicU64, // highest generation durably written
+    lock: Mutex<()>,  // pairs with `cv` (marker mutex; does NOT guard state)
+    cv: Condvar,
+}
+static PERSISTER: OnceLock<Arc<Persister>> = OnceLock::new();
+
+/// Start the background coalescing persister. Call ONCE at boot, after `restore`.
+pub fn spawn_persister(cloud: Arc<CloudState>) {
+    let p = Arc::new(Persister {
+        cloud,
+        dirty: AtomicU64::new(0),
+        saved: AtomicU64::new(0),
+        lock: Mutex::new(()),
+        cv: Condvar::new(),
+    });
+    if PERSISTER.set(p.clone()).is_err() {
+        return; // already started
+    }
+    // Dedicated OS thread: capture + fsync are blocking, so keep them entirely off
+    // the async runtime's worker threads.
+    std::thread::Builder::new()
+        .name("hive-persister".into())
+        .spawn(move || loop {
+            {
+                let mut g = p.lock.lock().unwrap();
+                while p.dirty.load(Ordering::SeqCst) <= p.saved.load(Ordering::SeqCst) {
+                    g = p.cv.wait(g).unwrap();
+                }
+            }
+            // Drain: coalesce everything up to the newest generation seen now.
+            let target = p.dirty.load(Ordering::SeqCst);
+            let snap = capture(&p.cloud);
+            match save(&snap) {
+                Ok(()) => p.saved.store(target, Ordering::SeqCst),
+                Err(e) => {
+                    tracing::warn!(error = %e, "persist(bg) failed; will retry on next mutation");
+                    // Don't advance `saved` → the next persist() re-triggers a write.
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        })
+        .expect("spawn persister thread");
+}
+
+/// Persist the current state to disk (call after any mutation). Non-blocking when
+/// the background writer is running (just marks dirty + wakes it); synchronous
+/// fallback otherwise so a mutation is never silently un-persisted.
 pub fn persist(cloud: &Arc<CloudState>) {
+    if let Some(p) = PERSISTER.get() {
+        // Bump under the lock so the writer can't miss the wakeup between its
+        // predicate check and `wait`.
+        {
+            let _g = p.lock.lock().unwrap();
+            p.dirty.fetch_add(1, Ordering::SeqCst);
+        }
+        p.cv.notify_one();
+        return;
+    }
+    // Writer not started (early boot / tests) → write synchronously.
     let snap = capture(cloud);
     if let Err(e) = save(&snap) {
         tracing::warn!(error = %e, "failed to persist platform state");
+    }
+}
+
+/// Synchronously flush the latest state NOW (graceful shutdown). Safe to call even
+/// if the background writer is running — it writes the current state directly.
+pub fn flush_blocking() {
+    if let Some(p) = PERSISTER.get() {
+        let target = p.dirty.load(Ordering::SeqCst);
+        let snap = capture(&p.cloud);
+        if save(&snap).is_ok() {
+            p.saved.store(target, Ordering::SeqCst);
+        }
     }
 }
 
@@ -303,13 +430,18 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     }
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
+    cloud.databases.data_load(snap.database_data);
     cloud.incidents.load(snap.incidents);
     cloud.apikeys.load(snap.apikeys);
+    cloud.integrations.load(snap.integrations);
+    cloud.svcgraph.load(snap.svcgraphs);
     cloud.identity.load(snap.orgs, snap.users);
     cloud.billing.load(snap.billing, snap.billing_ledger);
+    cloud.billing.invoices_load(snap.billing_invoices);
     cloud.domains.load(snap.domains);
     cloud.docs.load(snap.docs);
     cloud.gitops.load(snap.gitops);
+    cloud.enterprise.load(snap.enterprise);
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }

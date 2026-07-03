@@ -10,7 +10,7 @@ use axum::{
     extract::{Request, State},
     http::{HeaderName, HeaderValue, StatusCode},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
 };
 use hive_edge::{
     cdn::{CacheState, CdnCache, Lookup},
@@ -73,7 +73,7 @@ async fn edge_pipeline_inner(
     // by our TLS listener after ALPN negotiates h2) carries it in the `:authority`
     // pseudo-header instead — exposed by hyper as the request URI's authority, with
     // no synthesized `Host` header. Fall back to that so h2 clients route correctly.
-    let host = header(&headers_vec, "host")
+    let mut host = hget(&req, "host")
         .filter(|s| !s.is_empty())
         .or_else(|| req.uri().authority().map(|a| a.host().to_string()))
         .unwrap_or_default();
@@ -85,8 +85,8 @@ async fn edge_pipeline_inner(
             req.headers_mut().insert(axum::http::header::HOST, v);
         }
     }
-    let ua = header(&headers_vec, "user-agent").unwrap_or_default();
-    let ip = header(&headers_vec, "x-forwarded-for")
+    let ua = hget(&req, "user-agent").unwrap_or_default();
+    let ip = hget(&req, "x-forwarded-for")
         .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
@@ -98,6 +98,30 @@ async fn edge_pipeline_inner(
     // or @vercel/speed-insights works regardless of the deployment's protection.
     if path.starts_with("/_vercel/") {
         return next.run(req).await;
+    }
+
+    // Microfrontends: compose child projects under the host project's domain. If
+    // this host is a microfrontend group's host project and the path matches a
+    // child's prefix, rewrite the host subdomain to the child project so the rest
+    // of the pipeline resolves and serves the CHILD's production deployment for
+    // that path — one domain, many projects. (Fast-guarded: only runs when a
+    // microfrontend group exists.)
+    if !host.is_empty() && cloud.enterprise.has_mfe() {
+        if let Some(dep) = cloud.gw.deployment_for_host(&host) {
+            let team = cloud.projects.team_of(&dep.project);
+            if let Some(child) = cloud.enterprise.mfe_child_for(&team, &dep.project, &path) {
+                let rest = host.split_once('.').map(|(_, r)| r.to_string());
+                host = match rest {
+                    Some(r) => format!("{child}.{r}"),
+                    None => child.clone(),
+                };
+                if let Ok(v) = HeaderValue::from_str(&host) {
+                    req.headers_mut().insert(axum::http::header::HOST, v);
+                }
+                let ev = cloud.event(&region, &method, &host, &path, 0, "mfe-route", &child);
+                cloud.record(ev);
+            }
+        }
     }
 
     // EXPERIMENT (feature `zkauth`): anonymous preview-access bootstrap. Verifies
@@ -114,7 +138,7 @@ async fn edge_pipeline_inner(
 
     // Request-ID (#4): accept an inbound `x-hive-request-id` or mint one; it's
     // forwarded over the mesh and stamped on every routing event below.
-    let rid = header(&headers_vec, "x-hive-request-id")
+    let rid = hget(&req, "x-hive-request-id")
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
 
@@ -132,12 +156,49 @@ async fn edge_pipeline_inner(
 
     // WebSocket upgrade detection (#2): upgraded connections need a raw byte splice
     // across the mesh (HTTP framing bypassed), not the buffered/streamed tunnel.
-    let is_ws_upgrade = header(&headers_vec, "upgrade")
+    let is_ws_upgrade = hget(&req, "upgrade")
         .map(|u| u.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false)
-        && header(&headers_vec, "connection")
+        && hget(&req, "connection")
             .map(|c| c.to_ascii_lowercase().split(',').any(|t| t.trim() == "upgrade"))
             .unwrap_or(false);
+
+    // ---- Account-level IP blocking (enterprise) ----------------------------------
+    // Enforced at the ENTRY node, BEFORE any mesh proxying/compute: if the target
+    // deployment's owning team has denylisted this client IP, reject here. The
+    // owning team resolves from the local gateway for locally-hosted deployments,
+    // else from the gossiped fleet deployment list (`peer_deployments` carries
+    // each deployment's tenant), else from the local project store. The block
+    // list itself is mesh-replicated (see enterprise::EdgeExport), so this works
+    // no matter which node authored the config or receives the request.
+    if !host.is_empty() && cloud.enterprise.any_team_blocks(&ip) {
+        let subl = host.split(':').next().unwrap_or(&host).split('.').next().unwrap_or(&host).to_string();
+        let team: Option<String> = cloud
+            .gw
+            .deployment_for_host(&host)
+            .map(|d| if d.tenant.is_empty() { cloud.projects.team_of(&d.project) } else { d.tenant })
+            .or_else(|| {
+                cloud.peer_deployments.read().values().flatten().find_map(|d| {
+                    let m = [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                        .iter()
+                        .any(|a| a.split('.').next().unwrap_or(a) == subl);
+                    if !m {
+                        return None;
+                    }
+                    Some(if d.tenant.is_empty() { cloud.projects.team_of(&d.project) } else { d.tenant.clone() })
+                })
+            });
+        if let Some(team) = team {
+            if !cloud.enterprise.ip_allowed(&team, &ip) {
+                let ev = cloud.event(&region, &method, &host, &path, 403, "ip-blocked", &ip);
+                cloud.record(ev);
+                let mut resp = (StatusCode::FORBIDDEN, "IP_BLOCKED").into_response();
+                set(&mut resp, "x-hive-region", &region);
+                set(&mut resp, "x-hive-blocked", "ip");
+                return resp;
+            }
+        }
+    }
 
     // ---- Cross-node mesh routing ------------------------------------------------
     // If this node doesn't host the requested deployment but a peer in the mesh
@@ -145,7 +206,7 @@ async fn edge_pipeline_inner(
     // regions/failover (#5), else same-region-first anycast, failing over to the
     // next candidate on error. `x-hive-proxied` breaks loops. Hit any node, the
     // request reaches wherever the deployment lives.
-    let already_proxied = header(&headers_vec, "x-hive-proxied").is_some();
+    let already_proxied = hget(&req, "x-hive-proxied").is_some();
     let serve_local = cloud.gw.serves_host(&host);
     let sub = host
         .split(':').next().unwrap_or(&host)
@@ -305,7 +366,7 @@ async fn edge_pipeline_inner(
                     for cand in &cands {
                         if let Some(addr_json) = node_iroh.get(&cand.node_id) {
                             if let Ok(resp) =
-                                ws_proxy(&mut req, pool, &cand.node_id, addr_json, &method, &path_q, &fwd_headers).await
+                                ws_proxy(&mut req, pool, &cloud.registry, &cand.node_id, addr_json, &method, &path_q, &fwd_headers).await
                             {
                                 let mut ev = cloud.event(&region, &method, &host, &path, resp.status().as_u16(), "mesh-ws", &cand.node_id);
                                 ev.request_id = rid.clone();
@@ -344,6 +405,11 @@ async fn edge_pipeline_inner(
             let mut refused_retry = false;
 
             for cand in &cands {
+                // One coherent per-candidate deadline (#H4): iroh (bounded ~connect
+                // + open + firstbyte) and the HTTP fallback SHARE this budget rather
+                // than stacking (iroh worst-case + a full fresh 30s). The HTTP
+                // fallback below gets whatever time is left.
+                let cand_start = std::time::Instant::now();
                 // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
                 // works across NATs. STREAM the response so SSE / chunked bodies
                 // arrive incrementally cross-node (#1). Fall through to HTTP on error.
@@ -394,7 +460,17 @@ async fn edge_pipeline_inner(
                             cloud.record(ev);
                             return out;
                         }
-                        Err(_) => { /* iroh failed → try HTTP for this candidate */ }
+                        Err(e) => {
+                            // A pre-send (connect/open) timeout is the strongest
+                            // "peer dead" signal (#H4): mark it unhealthy so
+                            // order_candidates stops ranking it — otherwise every
+                            // request re-pays the connect budget against a dead node.
+                            if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
+                                cloud.registry.set_health(&cand.node_id, u64::MAX, false);
+                                tracing::warn!(node = %cand.node_id, "p2p peer marked unhealthy after connect/open timeout");
+                            }
+                            /* iroh failed → try HTTP for this candidate */
+                        }
                     }
                 }
                 // Gate the HTTP attempt too (it's a re-attempt after iroh for this
@@ -413,7 +489,7 @@ async fn edge_pipeline_inner(
                     .header("host", &host)
                     .header("x-hive-proxied", "1")
                     .header("x-hive-request-id", &rid)
-                    .timeout(std::time::Duration::from_secs(30))
+                    .timeout(http_fallback_budget(cand_start))
                     .body(body_bytes.clone());
                 for (k, v) in &headers_vec {
                     let lk = k.to_lowercase();
@@ -487,6 +563,7 @@ async fn edge_pipeline_inner(
     }
 
     // -1) L7 DDoS mitigation: shed per-IP floods before any compute work.
+    // (Account-level IP blocking runs earlier — before mesh routing.)
     if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
         let ev = cloud.event(&region, &method, &host, &path, 429, "rate-limited", &ip);
         cloud.record(ev);
@@ -559,7 +636,7 @@ async fn edge_pipeline_inner(
 
     // 2.5) Preview protection: preview deployments are private to team members
     // by default. Anonymous requests to a protected preview host get a 401.
-    if let Some(resp) = preview_gate(&cloud, &host, &headers_vec, &region, &method, &path) {
+    if let Some(resp) = preview_gate(&cloud, &host, &headers_vec, &region, &method, &path, &query) {
         return resp;
     }
 
@@ -901,6 +978,7 @@ fn preview_gate(
     region: &str,
     method: &str,
     path: &str,
+    query: &str,
 ) -> Option<Response> {
     // Gate by the deployment's ACTUAL environment, not the subdomain. A production
     // deployment is never preview-protected — via its production domain OR its
@@ -915,7 +993,47 @@ fn preview_gate(
         dep.target.as_str()
     };
     let is_preview = !target.eq_ignore_ascii_case("production");
-    if !is_preview || !cloud.projects.preview_protected(&project) {
+
+    // Enterprise deployment protection (Vercel-parity): password / standard modes
+    // with a configurable scope ("preview" | "all" | "production" only). Evaluated
+    // alongside the legacy per-project preview toggle.
+    let ent = cloud.enterprise.protection(&project);
+    let ent_protects = ent.protects(target);
+
+    // Password mode — a shared password unlocks the deployment (no team identity).
+    if ent_protects && ent.mode == "password" {
+        // Already unlocked via the sealed `hive_pw` cookie?
+        if let Some(pw_cookie) = cookie_value(headers, "hive_pw") {
+            if cloud.enterprise.verify_password_cookie(&project, &pw_cookie) {
+                return None;
+            }
+        }
+        // Password submission via the unlock form (GET ?__shadw_pw=...). On success
+        // set the sealed cookie and redirect to the clean path; on failure re-prompt.
+        if let Some(submitted) = query_param(query, "__shadw_pw") {
+            if cloud.enterprise.verify_password(&project, &submitted) {
+                let cookie = cloud.enterprise.seal_password_cookie(&project, &submitted);
+                let mut resp = axum::response::Redirect::temporary(path).into_response();
+                set(&mut resp, "set-cookie", &format!("hive_pw={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"));
+                set(&mut resp, "x-hive-region", region);
+                set(&mut resp, "x-hive-preview", "password-unlocked");
+                let ev = cloud.event(region, method, host, path, 302, "deploy-password-ok", &project);
+                cloud.record(ev);
+                return Some(resp);
+            }
+            let ev = cloud.event(region, method, host, path, 401, "deploy-password-bad", &project);
+            cloud.record(ev);
+            return Some(password_page(&project, path, region, true));
+        }
+        let ev = cloud.event(region, method, host, path, 401, "deploy-password", &project);
+        cloud.record(ev);
+        return Some(password_page(&project, path, region, false));
+    }
+
+    // Standard/membership protection: enterprise "standard" scope OR the legacy
+    // per-project preview toggle. Anything else passes.
+    let legacy_preview = is_preview && cloud.projects.preview_protected(&project);
+    if !((ent_protects && ent.mode == "standard") || legacy_preview) {
         return None;
     }
     let team = cloud.projects.team_of(&project);
@@ -965,6 +1083,61 @@ fn preview_gate(
     Some(resp)
 }
 
+/// Extract one cookie value by name from the request headers.
+fn cookie_value(headers: &[(String, String)], name: &str) -> Option<String> {
+    let cookie = header(headers, "cookie")?;
+    let prefix = format!("{name}=");
+    cookie.split(';').map(|p| p.trim()).find_map(|kv| kv.strip_prefix(&prefix).map(|v| v.to_string()))
+}
+
+/// Extract one raw (percent-decoded) query-parameter value from a query string.
+fn query_param(query: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    query.split('&').find_map(|kv| kv.strip_prefix(&prefix).map(|v| percent_decode(v)))
+}
+
+/// Vercel-style deployment-password prompt. A minimal self-contained HTML page
+/// that GET-submits `__shadw_pw` back to the same path (the gate then seals a
+/// cookie + redirects). `bad` renders the "incorrect password" state.
+fn password_page(project: &str, path: &str, region: &str, bad: bool) -> Response {
+    let err = if bad {
+        "<p style=\"color:#f87171;font-size:13px;margin:0 0 12px\">Incorrect password. Try again.</p>"
+    } else {
+        ""
+    };
+    // Preserve any existing path so the redirect lands where the visitor asked.
+    let action = path;
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Protected Deployment</title>
+<style>
+  html,body{{height:100%;margin:0;background:#0c0d10;color:#e5e7eb;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}}
+  .wrap{{min-height:100%;display:flex;align-items:center;justify-content:center;padding:24px}}
+  .card{{width:100%;max-width:360px;background:#131316;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:28px}}
+  h1{{font-size:18px;margin:0 0 6px}}
+  p.sub{{color:#9ca3af;font-size:13px;margin:0 0 20px}}
+  input{{width:100%;box-sizing:border-box;background:#0c0d10;border:1px solid rgba(255,255,255,.12);border-radius:8px;color:#fff;padding:10px 12px;font-size:14px;margin-bottom:12px}}
+  button{{width:100%;background:#fff;color:#000;border:0;border-radius:8px;padding:10px 12px;font-size:14px;font-weight:600;cursor:pointer}}
+  .foot{{margin-top:16px;color:#6b7280;font-size:11px;text-align:center}}
+</style></head><body><div class="wrap"><div class="card">
+<h1>This deployment is password protected</h1>
+<p class="sub">Enter the password for <strong>{project}</strong> to continue.</p>
+{err}
+<form method="GET" action="{action}">
+  <input type="password" name="__shadw_pw" placeholder="Password" autofocus autocomplete="current-password" required>
+  <button type="submit">Continue</button>
+</form>
+<div class="foot">Protected by shadw</div>
+</div></div></body></html>"#
+    );
+    let mut resp = (StatusCode::UNAUTHORIZED, Html(html)).into_response();
+    set(&mut resp, "x-hive-region", region);
+    set(&mut resp, "x-hive-preview", "password");
+    set(&mut resp, "cache-control", "no-store");
+    resp
+}
+
 /// Percent-encode a query-parameter value (RFC 3986 unreserved kept verbatim).
 fn pct(s: &str) -> String {
     s.bytes()
@@ -1005,11 +1178,35 @@ fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
     false
 }
 
+/// O(1) single-header read straight from the request's HeaderMap, avoiding the
+/// O(n) linear scan over `headers_vec`. Only valid while `req` is owned/borrowable
+/// — used for the always-executed EARLY lookups (before any proxy consumes `req`);
+/// aggregate consumers (WAF ctx, preview gate, forward loops) keep using
+/// `headers_vec` because they need the full header list.
+#[inline]
+fn hget(req: &Request, name: &str) -> Option<String> {
+    req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+}
+
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {
     headers
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.clone())
+}
+
+/// HTTP-fallback timeout for one candidate (#H4). iroh and the HTTP fallback share
+/// a single per-candidate deadline (`HIVE_EDGE_CANDIDATE_MS`, default 30s) instead
+/// of stacking — the fallback gets whatever time the iroh attempt left, floored at
+/// 1s so a candidate that already burned the budget still gets one quick HTTP shot.
+fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
+    let total_ms = std::env::var("HIVE_EDGE_CANDIDATE_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(30_000);
+    let total = std::time::Duration::from_millis(total_ms);
+    total.saturating_sub(cand_start.elapsed()).max(std::time::Duration::from_secs(1))
 }
 
 /// Order mesh candidates by the deployment's configured region/failover policy (#5).
@@ -1090,13 +1287,20 @@ fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::stat
 async fn ws_proxy(
     req: &mut Request,
     pool: &hive_p2p::PeerPool,
+    registry: &hive_edge::region::NodeRegistry,
     node_id: &str,
     addr_json: &str,
     method: &str,
     path_q: &str,
     fwd_headers: &[(String, String)],
 ) -> Result<Response, ()> {
-    let mut raw = pool.open_raw(node_id, addr_json).await.map_err(|_| ())?;
+    let mut raw = pool.open_raw(node_id, addr_json).await.map_err(|e| {
+        // Pre-send (connect/open) timeout on the raw trunk → mark the peer dead
+        // (#H4) so candidate ranking drops it instead of re-paying the budget.
+        if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
+            registry.set_health(node_id, u64::MAX, false);
+        }
+    })?;
     // Replay the upgrade request to the owner so its target does the WS handshake.
     let mut head = format!("{method} {path_q} HTTP/1.1\r\n");
     for (k, v) in fwd_headers {
