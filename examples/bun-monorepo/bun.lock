@@ -1,0 +1,25 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bun-monorepo-root",
+    },
+    "packages/api": {
+      "name": "@acme/api",
+      "version": "1.0.0",
+      "dependencies": {
+        "@acme/shared": "workspace:*",
+      },
+    },
+    "packages/shared": {
+      "name": "@acme/shared",
+      "version": "1.0.0",
+    },
+  },
+  "packages": {
+    "@acme/api": ["@acme/api@workspace:packages/api"],
+
+    "@acme/shared": ["@acme/shared@workspace:packages/shared"],
+  }
+}

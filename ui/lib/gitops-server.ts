@@ -19,14 +19,26 @@ export async function backend(path: string, team: string, init?: RequestInit) {
  * stamps) so callers can skip a redundant commit when nothing changed.
  */
 export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml") {
-  const [projRes, teamRes, ovRes] = await Promise.all([
+  const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes] = await Promise.all([
     backend("/v1/gitops/projects", team),
     backend(`/v1/teams/${encodeURIComponent(team)}`, team),
     backend("/v1/overview", team),
+    backend("/v1/routing", team),
+    backend("/v1/enterprise/ip-blocks", team),
+    backend("/v1/enterprise/siem", team),
+    backend("/v1/enterprise/saml", team),
+    backend("/v1/enterprise/scim", team),
+    backend("/v1/enterprise/microfrontends", team),
   ]);
   const projects = projRes.ok ? await projRes.json() : [];
   const teamInfo = teamRes.ok ? await teamRes.json() : null;
   const ov = ovRes.ok ? await ovRes.json() : null;
+  const routing = routingRes.ok ? await routingRes.json().catch(() => null) : null;
+  const ipBlocks = ipRes.ok ? (await ipRes.json().catch(() => null))?.blocks : null;
+  const siem = siemRes.ok ? await siemRes.json().catch(() => null) : null;
+  const saml = samlRes.ok ? await samlRes.json().catch(() => null) : null;
+  const scim = scimRes.ok ? await scimRes.json().catch(() => null) : null;
+  const mfe = mfeRes.ok ? (await mfeRes.json().catch(() => null))?.groups : null;
 
   const files = buildArtifacts({
     org: {
@@ -38,6 +50,22 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     region: ov?.region,
     rootPath,
     projects: Array.isArray(projects) ? projects : [],
+    platform: {
+      routing: routing ? { redirects: routing.redirects || [], rewrites: routing.rewrites || [] } : undefined,
+      enterprise: {
+        ipBlocks: Array.isArray(ipBlocks) ? ipBlocks.map((b: any) => ({ prefix: b.prefix, note: b.note || undefined })) : [],
+        siem: { enabled: !!siem?.enabled, format: siem?.format },
+        saml: { enabled: !!saml?.enabled, enforced: !!saml?.enforced },
+        scim: { enabled: !!scim?.enabled },
+        microfrontends: Array.isArray(mfe)
+          ? mfe.map((g: any) => ({
+              name: g.name,
+              host: g.host_project,
+              children: (g.children || []).map((ch: any) => ({ project: ch.project, path: ch.path_prefix })),
+            }))
+          : [],
+      },
+    },
   });
 
   // Hash over all files with volatile timestamps neutralized so an unchanged

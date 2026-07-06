@@ -3,11 +3,11 @@
 import Link from "next/link";
 import { Users, ExternalLink } from "lucide-react";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
-import { usePoll, type Team } from "@/lib/api";
+import { useOpsPoll, type Team } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function AdminTeamsPage() {
-  const { data: teams } = usePoll<Team[]>("/v1/teams", 4000);
+  const { data: teams } = useOpsPoll<Team[]>("/v1/teams", 4000);
   const totalMembers = (teams ?? []).reduce((a, t) => a + t.members.length, 0);
 
   return (

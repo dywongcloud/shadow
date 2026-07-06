@@ -295,15 +295,45 @@ pub struct ContainerLimits {
 
 impl Default for ContainerLimits {
     fn default() -> Self {
+        // Ceilings, NOT reservations (podman `--memory` only bounds peak use), so a
+        // generous default is safe: a small app uses little, while a real monolith
+        // container (monorepo dev server, bundled front+back) isn't OOM-killed. Still
+        // bounds a runaway/hostile container on a shared host (the H1 DoS guard).
+        // 512m was far too low and OOM-killed legitimate apps (exit 137). Env-tunable
+        // fleet-wide; per-deployment override via fluid.json `container.memory`.
+        fn env_or(key: &str, default: &str) -> String {
+            std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+        }
         Self {
-            memory: Some("512m".into()),
-            cpus: Some("1.0".into()),
-            pids: Some(256),
+            memory: Some(env_or("HIVE_CONTAINER_MEMORY", "4g")),
+            cpus: Some(env_or("HIVE_CONTAINER_CPUS", "2.0")),
+            pids: std::env::var("HIVE_CONTAINER_PIDS").ok().and_then(|s| s.trim().parse().ok()).or(Some(1024)),
         }
     }
 }
 
 impl ContainerLimits {
+    /// Limits for a specific container function: honor the deployment's requested
+    /// memory (`memory_mib`, from fluid.json `container.memory` / project settings)
+    /// when set (>0), else the generous, env-tunable default. CPU/PID from default.
+    /// The requested value is CLAMPED to a fleet-wide maximum — without this, a
+    /// tenant's own `fluid.json` (`{"container":{"memory":"999999m"}}`) could
+    /// remove the ceiling entirely (H1's whole point was that ONE tenant's
+    /// container must never be able to exhaust host RAM and starve every other
+    /// co-located tenant on a shared node).
+    pub fn for_container(memory_mib: u32) -> Self {
+        let mut l = Self::default();
+        if memory_mib > 0 {
+            let max = std::env::var("HIVE_CONTAINER_MEMORY_MAX_MIB")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(16_384); // 16 GiB — generous for a real monolith, still a real ceiling
+            l.memory = Some(format!("{}m", memory_mib.min(max)));
+        }
+        l
+    }
+
     /// The `podman run` OPTION flags for these limits plus always-on privilege
     /// hardening (`--security-opt no-new-privileges`). Must be pushed BEFORE the
     /// image name in the args vector (they're run options, not container CMD args).
@@ -364,6 +394,20 @@ pub(crate) async fn podman_run_container(
     let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
 
     let net = net_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
+    // Automatic persistent volume: the run-config JSON (start_cmd[3]) may carry a
+    // stable `vol` name + `volpath` mount point. Every container gets a host-backed
+    // named volume (≥1 GB, effectively bounded only by host disk) mounted there, so
+    // its data survives instance restarts / scale-to-zero. The name is keyed per
+    // project (not per cell), so redeploys keep the data. `podman volume create` is
+    // idempotent — an "already exists" on a re-run is expected and fine.
+    let volume: Option<(String, String)> = net.as_ref().and_then(|n| {
+        let name = n.get("vol").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+        let path = n.get("volpath").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/data");
+        Some((name.to_string(), path.to_string()))
+    });
+    if let Some((vname, _)) = &volume {
+        let _ = Command::new("podman").args(["volume", "create", vname]).env("PATH", path_env).output().await;
+    }
     // Idempotently create the per-deployment DNS-LESS network (no aardvark → no :53
     // collision with Seer DNS). "already exists" / overlap on a re-run is fine.
     if let Some(n) = &net {
@@ -391,6 +435,13 @@ pub(crate) async fn podman_run_container(
     for (k, v) in env {
         base.push("-e".into());
         base.push(format!("{k}={v}"));
+    }
+    // Mount the automatic persistent volume + tell the app where it is ($HIVE_VOLUME).
+    if let Some((vname, vpath)) = &volume {
+        base.push("-e".into());
+        base.push(format!("HIVE_VOLUME={vpath}"));
+        base.push("-v".into());
+        base.push(format!("{vname}:{vpath}"));
     }
     // Shared network with a static IP + sibling host entries (multi-service only).
     if let Some(n) = &net {
@@ -440,21 +491,59 @@ pub(crate) async fn podman_run_container(
         fb.extend(base.iter().cloned());
         out = Command::new("podman").args(&fb).env("PATH", path_env).output().await?;
     }
-    anyhow::ensure!(
-        out.status.success(),
-        "podman run failed: {}",
-        String::from_utf8_lossy(&out.stderr).trim()
-    );
+    if !out.status.success() {
+        // CRITICAL leak fix: a FAILED `podman run` can still leave a partial
+        // `created` container holding one of podman's 2048 container LOCKS (e.g.
+        // when the failure IS "exceeded num_locks", or an image-pull/port error
+        // after the name+storage were allocated). Every cold-start uses a unique
+        // cell name, so without this `rm` the failures pile up in `created` state
+        // and exhaust the lock pool fleet-wide → CAPACITY_EXHAUSTED on ALL
+        // deployments (not just the one that failed). Reclaim the lock here.
+        let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
+        anyhow::bail!("podman run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
     // Wait for the container's port to accept connections (image pull + boot).
+    // Budget is env-tunable (`HIVE_CONTAINER_READY_SECS`, default 180) — a heavy
+    // monolith (monorepo dev server: webpack + tsc + nodemon, esp. under gVisor)
+    // can take minutes to compile before it listens, and the old hard 90s deadline
+    // killed it mid-boot → keep-warm restarted the slow boot → it never converged
+    // ("builds + deploys but never loads"). CRITICAL: on deadline we do NOT kill a
+    // container that is still RUNNING — we hand back the endpoint and let it finish
+    // booting (early requests 502 until the port opens, then it serves). We only
+    // bail if the container has actually EXITED (a real crash).
     let func_addr = format!("127.0.0.1:{host_port}");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(90);
+    let ready_secs = std::env::var("HIVE_CONTAINER_READY_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(180);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(ready_secs);
     loop {
         if tokio::net::TcpStream::connect(&func_addr).await.is_ok() {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
+            let running = Command::new("podman")
+                .args(["inspect", "-f", "{{.State.Running}}", &name])
+                .env("PATH", path_env)
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+                .unwrap_or(false);
+            if running {
+                // Still booting — keep it and return the endpoint (don't restart-loop).
+                tracing::warn!(
+                    container = %name, addr = %func_addr, secs = ready_secs,
+                    "container not accepting connections yet but still running — returning endpoint; it will serve once it listens"
+                );
+                break;
+            }
+            // Actually crashed/exited → surface it.
+            let logs = Command::new("podman").args(["logs", "--tail", "20", &name]).env("PATH", path_env).output().await
+                .ok().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
             let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", path_env).output().await;
-            anyhow::bail!("container {name} not ready on {func_addr} within 90s");
+            anyhow::bail!("container {name} exited before listening on {func_addr}: {logs}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }
@@ -604,16 +693,50 @@ mod container_limits_tests {
     #[test]
     fn default_limits_emit_memory_cpus_pids_and_no_new_privileges() {
         let flags = ContainerLimits::default().podman_run_flags();
-        // Memory / CPU / PID ceilings present with the safe defaults.
+        // Generous ceilings by default (512m OOM-killed real monolith containers).
+        // These are the fallbacks when the HIVE_CONTAINER_* env vars are unset.
         let m = idx(&flags, "--memory").expect("--memory present");
-        assert_eq!(flags[m + 1], "512m");
+        assert_eq!(flags[m + 1], "4g");
         let c = idx(&flags, "--cpus").expect("--cpus present");
-        assert_eq!(flags[c + 1], "1.0");
+        assert_eq!(flags[c + 1], "2.0");
         let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
-        assert_eq!(flags[p + 1], "256");
+        assert_eq!(flags[p + 1], "1024");
         // Privilege-escalation guard on every container.
         let s = idx(&flags, "--security-opt").expect("--security-opt present");
         assert_eq!(flags[s + 1], "no-new-privileges");
+    }
+
+    #[test]
+    fn for_container_honors_requested_memory_else_default() {
+        // A deployment's requested memory (memory_mib) overrides the default…
+        let flags = ContainerLimits::for_container(8192).podman_run_flags();
+        let m = idx(&flags, "--memory").expect("--memory present");
+        assert_eq!(flags[m + 1], "8192m", "explicit memory_mib wins");
+        // …and 0 falls back to the generous default (never the old 512m).
+        let d = ContainerLimits::for_container(0).podman_run_flags();
+        let dm = idx(&d, "--memory").expect("--memory present");
+        assert_ne!(d[dm + 1], "512m", "0 must not resurrect the OOM-killing 512m");
+    }
+
+    #[test]
+    fn for_container_clamps_an_excessive_requested_memory() {
+        // REGRESSION TEST for a real, confirmed vulnerability: a deployment's
+        // OWN fluid.json (`{"container":{"memory":"999999m"}}`) used to be
+        // applied to `podman run --memory` completely unclamped — a single
+        // tenant could remove the ceiling entirely and exhaust host RAM,
+        // defeating the entire H1 hardening pass ("one tenant's container
+        // cannot exhaust host RAM ... a DoS against every other tenant on a
+        // shared host").
+        let flags = ContainerLimits::for_container(999_999).podman_run_flags();
+        let m = idx(&flags, "--memory").expect("--memory present");
+        assert_eq!(flags[m + 1], "16384m", "an excessive request must be clamped to the fleet-wide maximum");
+
+        // A reasonable, legitimate request under the max is honored exactly
+        // (already covered above for 8192, re-asserted here as a boundary
+        // check right at the default max).
+        let flags = ContainerLimits::for_container(16_384).podman_run_flags();
+        let m = idx(&flags, "--memory").expect("--memory present");
+        assert_eq!(flags[m + 1], "16384m", "a request exactly at the max must pass through unchanged");
     }
 
     #[test]

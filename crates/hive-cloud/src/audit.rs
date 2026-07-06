@@ -85,6 +85,9 @@ impl AuditLog {
                 let _ = f.sync_all();
             }
         }
+        // Stream to any configured enterprise SIEM sink (best-effort, async;
+        // no-op unless the tenant has SIEM enabled). See [`crate::enterprise`].
+        crate::enterprise::siem_emit(&entry);
         let mut q = self.entries.lock();
         if q.len() >= 2000 {
             q.pop_front();

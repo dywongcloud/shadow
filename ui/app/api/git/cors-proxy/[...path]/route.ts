@@ -20,7 +20,7 @@
 // to the original behavior (anonymous for public repos).
 
 import { NextRequest, NextResponse } from "next/server";
-import { githubAccessToken, resolveEntity } from "@/lib/composio";
+import { githubAccessToken, invalidateGithubToken, resolveEntity } from "@/lib/composio";
 
 export const dynamic = "force-dynamic";
 
@@ -80,6 +80,9 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
   // present — so a pasted PAT (already forwarded above) always wins, and a public
   // anonymous clone with no Composio link still works. Best-effort: any failure
   // leaves the request exactly as it was.
+  // Track the entity whose injected Composio token we used, so a 401 from GitHub
+  // can drop it from the cache and the next request refetches a fresh one.
+  let injectedEntity: string | null = null;
   if (target.hostname === "github.com" && !headers.has("authorization")) {
     try {
       const entity = await resolveEntity();
@@ -89,6 +92,7 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
         // isomorphic-git uses for a PAT): username `x-access-token`, password=token.
         const basic = Buffer.from(`x-access-token:${token}`).toString("base64");
         headers.set("authorization", `Basic ${basic}`);
+        injectedEntity = entity;
       }
     } catch {
       /* no Composio token available — fall through unauthenticated (unchanged behavior) */
@@ -109,6 +113,12 @@ async function proxy(req: NextRequest, params: { path: string[] }): Promise<Resp
     upstream = await fetch(target.toString(), init);
   } catch {
     return NextResponse.json({ error: "git upstream fetch failed" }, { status: 502 });
+  }
+
+  // If GitHub rejected our injected Composio token, drop it so the next request
+  // refetches a fresh one (handles rotation/revocation within the cache TTL).
+  if (injectedEntity && (upstream.status === 401 || upstream.status === 403)) {
+    invalidateGithubToken(injectedEntity);
   }
 
   // Pass through status + content-type + the binary body.

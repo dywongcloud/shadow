@@ -1,12 +1,28 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
+import dynamic from "next/dynamic";
+import { Search, ChevronDown, Calendar, Plus, Loader2, X } from "lucide-react";
 import { Button, Input, Triangle, PageHeader } from "@/components/ui";
 import { apiSend, usePoll, type WorkflowRun, type WorkflowDef } from "@/lib/api";
 import { StatusChips, RunsTable, normalizeRun } from "@/components/workflows";
-import { WorkflowDefGraph } from "@/components/workflow-graph";
+
+// reactflow (the graph renderer) only mounts once a workflow definition is
+// opened — dynamic + ssr:false keeps its ~considerable bundle out of every
+// /workflows page load (the default "Runs" tab never touches it).
+const WorkflowDefGraph = dynamic(
+  () => import("@/components/workflow-graph").then((m) => m.WorkflowDefGraph),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-[480px] items-center justify-center rounded-xl border border-border bg-bg">
+        <Loader2 className="h-5 w-5 animate-spin text-muted" />
+      </div>
+    ),
+  }
+);
 
 const RANGES: Record<string, number> = {
   "Last 1 hour": 3600_000,
@@ -25,6 +41,16 @@ function useNow(ms = 1000) {
 }
 
 export default function WorkflowsPage() {
+  // useSearchParams (for the top-nav-driven `?tab=` view) must sit under a Suspense
+  // boundary in the app router.
+  return (
+    <Suspense fallback={<div className="h-40" />}>
+      <WorkflowsInner />
+    </Suspense>
+  );
+}
+
+function WorkflowsInner() {
   const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs", 2000);
   const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
   const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 5000);
@@ -33,7 +59,12 @@ export default function WorkflowsPage() {
   const [range, setRange] = useState("Last 12 hours");
   const [env, setEnv] = useState("All Environments");
   const [creating, setCreating] = useState(false);
-  const [view, setView] = useState<WdkView>("runs");
+  // The active view (Runs / Workflows / Hooks) is driven by the TOP-NAV sub-tabs
+  // (`?tab=`) — the breadcrumb-tabs model shared with the project/deployment pages —
+  // instead of an in-page tab bar. Defaults to "runs".
+  const searchParams = useSearchParams();
+  const tab = searchParams.get("tab");
+  const view: WdkView = tab === "workflows" || tab === "hooks" ? tab : "runs";
 
   // Time window, then environment scope. (Workflow runs execute on the deployed
   // app, so they default to "production"; the env filter narrows the same dataset.)
@@ -93,19 +124,8 @@ export default function WorkflowsPage() {
 
       {creating && <WorkflowDefiner onDone={() => setCreating(false)} />}
 
-      {/* WDK-web style sub-tabs (Workflows enabled + visible). */}
-      <div className="mb-5 flex items-center gap-1 border-b border-border">
-        {(["runs", "workflows", "hooks"] as const).map((v) => (
-          <button
-            key={v}
-            onClick={() => setView(v)}
-            className={`relative px-3 py-2 text-sm capitalize ${view === v ? "text-fg" : "text-secondary hover:text-fg"}`}
-          >
-            {v}
-            {view === v && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-fg" />}
-          </button>
-        ))}
-      </div>
+      {/* Sub-tabs (Runs / Workflows / Hooks) now live in the top nav's tab bar
+          (breadcrumb-tabs model) — driven by `?tab=`; no in-page tab bar here. */}
 
       {view === "runs" && (
         <>

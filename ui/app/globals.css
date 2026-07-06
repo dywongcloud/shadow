@@ -29,9 +29,9 @@
 
 /* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {
-  --background: 0 0% 100%;
+  --background: 0 0% 98%; /* #FAFAFA — root page background */
   --subtle: 0 0% 98%;
-  --card: 0 0% 100%;
+  --card: 0 0% 100%; /* cards/components stay pure white */
   --foreground: 0 0% 4%;
   --secondary: 0 0% 40%;
   --muted: 0 0% 56%;
@@ -58,14 +58,15 @@
   --green: 145 65% 49%;
 }
 
-/* De-zoom ~13%: rem-based spacing & type scale down proportionally so the whole
-   dashboard reads sleeker / less zoomed-in. */
+/* De-zoom ~13%, plus an additional 5% default zoom-out on top: rem-based
+   spacing & type scale down proportionally so the whole dashboard reads
+   sleeker / less zoomed-in. (87.5% * 0.95 = 83.125%, 90% * 0.95 = 85.5%.) */
 html {
-  font-size: 87.5%;
+  font-size: 83.125%;
 }
 @media (min-width: 1536px) {
   html {
-    font-size: 90%;
+    font-size: 85.5%;
   }
 }
 
@@ -129,6 +130,13 @@ html.dark {
   border-radius: 8px;
   border: 2px solid hsl(var(--background));
 }
+/* The corner where a horizontal + vertical scrollbar meet. Without this it
+   renders as the browser default (a light/white square) — the "tiny white square
+   in the bottom-right corner" on the dark landing (whose full-bleed w-screen shell
+   can induce a horizontal scrollbar). Transparent → it shows the page bg instead. */
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
 
 /* Scrollable but with no visible scrollbar (still scrolls via wheel/touch). */
 .no-scrollbar {
@@ -187,6 +195,44 @@ html.dark {
   }
   to {
     transform: translateX(-50%);
+  }
+}
+
+/* Rotating aurora glow ring (landing intro loader + hero left glow): the element
+   carries a conic rose→violet→teal gradient masked into a ring; rotating the
+   element spins the gradient so the visible arc cycles color — matching the
+   reference video's ~2s hue rotation. */
+/* Intro loader logo: pan up/down while growing/shrinking (the "breathing" motion
+   from the reference video) — one full cycle over the ~2s hold. */
+@keyframes intro-logo-pan {
+  0% {
+    transform: translateY(9%) scale(0.86);
+  }
+  50% {
+    transform: translateY(-9%) scale(1.12);
+  }
+  100% {
+    transform: translateY(9%) scale(0.86);
+  }
+}
+
+/* Hide Clerk's development-instance floating badge (the white rounded box pinned
+   bottom-right on a dev key). It's injected async into a body portal, so a CSS
+   catch-all across the class variants + the clerk.com link is the robust removal. */
+.cl-badge,
+.cl-internal-badge,
+[class*="cl-internal"][class*="badge"],
+[data-localization-key="badge__development"],
+a[aria-label="Clerk logo"][target="_blank"] {
+  display: none !important;
+}
+
+@keyframes glow-ring-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
   }
 }
 

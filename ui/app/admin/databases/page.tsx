@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
-import { usePoll, type Database, type DbKind } from "@/lib/api";
+import { useOpsPoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> = {
@@ -11,7 +11,7 @@ const kindTone: Record<DbKind, "blue" | "red" | "amber" | "green" | "default"> =
 
 export default function AdminDatabasesPage() {
   // Platform-owner view → ALL databases across every tenant (global endpoint).
-  const { data: dbs } = usePoll<Database[]>("/v1/admin/databases", 3000);
+  const { data: dbs } = useOpsPoll<Database[]>("/v1/admin/databases", 3000);
   const active = (dbs ?? []).filter((d) => d.status === "ready").length;
   const live = (dbs ?? []).filter((d) => d.mode === "live").length;
   const byKind = (dbs ?? []).reduce<Record<string, number>>((a, d) => { a[d.kind] = (a[d.kind] ?? 0) + 1; return a; }, {});

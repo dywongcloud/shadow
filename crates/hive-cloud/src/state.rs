@@ -122,6 +122,22 @@ pub struct CloudState {
     /// domain whose first label collides with a real alias can't be served.
     /// Configured via `HIVE_DEPLOY_SUFFIXES` (comma-separated).
     pub deploy_suffixes: Vec<String>,
+    /// The user-deployment wildcard domain (`*.{apps_domain}` serves every
+    /// deployment alias, one label only). `HIVE_APPS_DOMAIN`, default `shadw.app`.
+    /// Deliberately a SEPARATE registrable domain from the platform domain so user
+    /// content can never set cookies on / shadow the control plane.
+    pub apps_domain: String,
+    /// The platform/control-plane domain (`api.{platform_domain}` = admin API).
+    /// `HIVE_PLATFORM_DOMAIN`, default `shadw.cloud`.
+    pub platform_domain: String,
+    /// The per-tenant DATABASE wildcard domain (`*.{db_domain}` gives every tenant
+    /// database an external, TLS-SNI-routed endpoint — cross-protocol: Postgres
+    /// wire, Redis wire, HTTP REST). `HIVE_DB_DOMAIN` (e.g. `downstash.xyz`); EMPTY
+    /// disables the DB gateway entirely (no wildcard DNS/cert, no proxy listeners).
+    pub db_domain: String,
+    /// Public ingress mode: `ngrok` (today), `dual` (both paths live), `dns`
+    /// (direct DNS + self-terminated TLS; ngrok retired). `HIVE_INGRESS`.
+    pub ingress: String,
 
     pub waf: Arc<Waf>,
     pub bot: Arc<BotManager>,
@@ -130,6 +146,11 @@ pub struct CloudState {
     /// Regional runtime/data cache for tenant functions (Vercel Runtime Cache).
     pub runtime_cache: Arc<RuntimeCache>,
     pub limiter: Arc<ConcurrencyLimiter>,
+    /// Per-DEPLOYMENT concurrency admission (sliding-window burst budget keyed by
+    /// target host), so one busy deployment can only exhaust its OWN budget and
+    /// cannot 503 every other tenant on the node. Checked before the node-wide
+    /// `limiter` backstop (which now trips only under genuine total overload).
+    pub admission: Arc<RateLimiter>,
     /// Per-IP L7 rate limiter (DDoS mitigation) at the edge.
     pub ratelimit: Arc<RateLimiter>,
     pub router: Arc<Router>,
@@ -196,12 +217,22 @@ pub struct CloudState {
     pub incidents: crate::incidents::IncidentStore,
     pub securelinks: crate::securelink::SecureLinkStore,
     pub apikeys: crate::apikeys::ApiKeyStore,
+    pub integrations: crate::integrations::IntegrationStore,
+    pub svcgraph: crate::svcgraph::ServiceGraphStore,
     pub identity: crate::identity::IdentityStore,
     pub domains: crate::dns::DomainStore,
     pub docs: crate::docstore::DocStore,
     pub billing: crate::billing::BillingStore,
     pub audit: crate::audit::AuditLog,
     pub notifications: crate::notifications::NotificationStore,
+    /// Enterprise feature suite (IP blocking, SIEM, SAML, SCIM, deployment
+    /// protection, microfrontends, conformance). See [`crate::enterprise`].
+    pub enterprise: Arc<crate::enterprise::EnterpriseStore>,
+    /// Platform-native Sandboxes (isolated on-demand Linux environments) — real
+    /// Firecracker microVMs when this node's isolation backend supports it,
+    /// honestly reporting "simulated" on mock/dev nodes otherwise (never a
+    /// silent downgrade to a different, undisclosed isolation technology).
+    pub sandboxes: Arc<crate::sandboxes_platform::PlatformSandboxProvider>,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
 
@@ -222,6 +253,48 @@ fn host_has_allowed_suffix(host: &str, suffixes: &[String]) -> bool {
     suffixes.iter().any(|s| h == *s || h.ends_with(&format!(".{s}")))
 }
 
+/// Apps-domain host rule (`*.{apps_domain}`): the apex is allowed (landing/
+/// redirect) and a subdomain is allowed ONLY when it is exactly ONE label —
+/// Vercel-DNS wildcards match a single label, and every gateway alias is a
+/// single dash-flattened label. Case-insensitive; `:port` stripped. Pure for
+/// unit tests.
+pub fn host_matches_apps_domain(host: &str, apps_domain: &str) -> bool {
+    if apps_domain.is_empty() {
+        return false;
+    }
+    let h = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
+    let d = apps_domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    if h == d {
+        return true; // apex
+    }
+    match h.strip_suffix(&format!(".{d}")) {
+        Some(label) => !label.is_empty() && !label.contains('.'),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod apps_domain_tests {
+    use super::*;
+
+    #[test]
+    fn apps_domain_hosts_one_label_only() {
+        // apex + one-label subdomain allowed; deeper labels rejected (Vercel-DNS
+        // wildcard matches ONE label); case-insensitive; :port stripped.
+        assert!(host_matches_apps_domain("shadw.app", "shadw.app"));
+        assert!(host_matches_apps_domain("myapp.shadw.app", "shadw.app"));
+        assert!(host_matches_apps_domain("MyApp.Shadw.App:443", "shadw.app"));
+        assert!(host_matches_apps_domain("my-app-git-main-team.shadw.app", "shadw.app"));
+        assert!(!host_matches_apps_domain("a.b.shadw.app", "shadw.app"));
+        assert!(!host_matches_apps_domain(".shadw.app", "shadw.app"));
+        assert!(!host_matches_apps_domain("shadw.app.evil.com", "shadw.app"));
+        assert!(!host_matches_apps_domain("notshadw.app", "shadw.app"));
+        // user apps must NEVER be served from the platform domain
+        assert!(!host_matches_apps_domain("app.shadw.cloud", "shadw.app"));
+        assert!(!host_matches_apps_domain("anything", ""));
+    }
+}
+
 /// Default TTL for control-plane degradation (#25): if no peer gossip has succeeded
 /// within this window (and peers are configured), the node reports degraded. The
 /// gossip loop runs on a ~5s cadence, so 30s tolerates a few missed rounds.
@@ -239,6 +312,30 @@ pub fn cp_degraded(last_ok_ms: u64, peer_count: usize, now_ms: u64, ttl_ms: u64)
 }
 
 impl CloudState {
+    /// The current control-plane WRITE authority (leader), identity-ordered over
+    /// HEALTHY nodes (the same web3-style election as the billing coordinator, so
+    /// failover is automatic when the leader goes unhealthy). Returns the leader's
+    /// node name, or this node when no election is possible (single-node / no peers).
+    pub fn control_plane_leader(&self) -> String {
+        crate::cluster::Cluster::billing_leader(&self.registry.nodes())
+            .unwrap_or_else(|| self.node_name.clone())
+    }
+
+    /// True when THIS node is the control-plane leader.
+    pub fn is_control_plane_leader(&self) -> bool {
+        self.control_plane_leader() == self.node_name
+    }
+
+    /// The leader's [`NodeInfo`] (for its public IP), or None when this node is the
+    /// leader or the leader isn't resolvable in the registry.
+    pub fn leader_node(&self) -> Option<hive_edge::NodeInfo> {
+        let leader = self.control_plane_leader();
+        if leader == self.node_name {
+            return None;
+        }
+        self.registry.nodes().into_iter().find(|n| n.name == leader)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         region: String,
@@ -255,6 +352,7 @@ impl CloudState {
         gw: Arc<Gateway>,
         fluid: Arc<Fluid>,
         hive: Arc<Hive>,
+        firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
     ) -> Arc<CloudState> {
         let cluster = crate::cluster::Cluster::new(node_name.clone());
         let owner_email =
@@ -271,30 +369,72 @@ impl CloudState {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| {
-                // Legacy region-agnostic zone + the per-region ingress zones
-                // (<dep>.<code>.ngrok.pizza, code = iad/sin/sfo/lax) + localhost.
-                vec![
-                    "deployment.shadow.ngrok.pizza".into(),
-                    "iad.ngrok.pizza".into(),
-                    "sin.ngrok.pizza".into(),
-                    "sfo.ngrok.pizza".into(),
-                    "lax.ngrok.pizza".into(),
-                    "localhost".into(),
-                ]
+                // `dns` ingress: ngrok is retired — the apps domain (handled
+                // separately in host_allowed) is the only public root; keep
+                // localhost for local dev. Otherwise (ngrok/dual): the legacy
+                // region-agnostic zone + per-region ingress zones + localhost.
+                if std::env::var("HIVE_INGRESS").as_deref() == Ok("dns") {
+                    vec!["localhost".into()]
+                } else {
+                    vec![
+                        "deployment.shadow.ngrok.pizza".into(),
+                        "iad.ngrok.pizza".into(),
+                        "sin.ngrok.pizza".into(),
+                        "sfo.ngrok.pizza".into(),
+                        "lax.ngrok.pizza".into(),
+                        "localhost".into(),
+                    ]
+                }
             });
+        // Real-DNS ingress config (ngrok retirement): the two-domain split is
+        // deliberate (user content on apps_domain can never touch the platform
+        // domain). `HIVE_INGRESS` stages the cutover: ngrok -> dual -> dns.
+        let apps_domain = std::env::var("HIVE_APPS_DOMAIN")
+            .ok()
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "shadw.app".into());
+        let platform_domain = std::env::var("HIVE_PLATFORM_DOMAIN")
+            .ok()
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "shadw.cloud".into());
+        // Per-tenant DB gateway domain — EMPTY (unset) = gateway disabled.
+        let db_domain = std::env::var("HIVE_DB_DOMAIN")
+            .ok()
+            .map(|s| s.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default();
+        let ingress = std::env::var("HIVE_INGRESS")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| matches!(s.as_str(), "ngrok" | "dual" | "dns"))
+            .unwrap_or_else(|| "ngrok".into());
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
+        let region_for_sandboxes = region.clone();
         Arc::new(CloudState {
             region,
             node_name,
             public_base,
             deploy_suffixes,
+            apps_domain,
+            platform_domain,
+            db_domain,
+            ingress,
             waf,
             bot,
             bot_policy: RwLock::new(BotPolicy::default()),
             cdn,
             runtime_cache: Arc::new(RuntimeCache::new()),
             limiter,
+            // Per-deployment burst budget (host-keyed). Default: 1000 admissions
+            // / 10s per deployment — generous for real traffic, isolating any
+            // single deployment's surge from every other tenant on the node.
+            admission: Arc::new(RateLimiter::new(
+                std::env::var("HIVE_DEPLOY_BURST").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
+                10_000,
+            )),
             ratelimit: Arc::new(RateLimiter::new(100, 10_000)),
             router,
             registry,
@@ -335,12 +475,16 @@ impl CloudState {
             incidents: crate::incidents::IncidentStore::new(),
             securelinks: crate::securelink::SecureLinkStore::new(),
             apikeys: crate::apikeys::ApiKeyStore::new(),
+            integrations: crate::integrations::IntegrationStore::new(),
+            svcgraph: crate::svcgraph::ServiceGraphStore::new(),
             identity: crate::identity::IdentityStore::new(),
             domains: crate::dns::DomainStore::new(),
             docs: crate::docstore::DocStore::new(),
             billing: crate::billing::BillingStore::new(),
             audit: crate::audit::AuditLog::new(crate::persist::data_dir().join("audit.jsonl")),
             notifications: crate::notifications::NotificationStore::new(),
+            enterprise: Arc::new(crate::enterprise::EnterpriseStore::new()),
+            sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(region_for_sandboxes, firecracker)),
             owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),
@@ -372,7 +516,15 @@ impl CloudState {
         if ev.action == "waf-deny" || ev.action == "bot-block" {
             *self.blocked_count.lock() += 1;
         }
-        self.metrics.record(&ev);
+        // Attribute the event to the OWNING TENANT (the team that owns the project),
+        // so per-tenant metrics reads can't leak across tenants. Projectless events
+        // (host-rejected, platform-internal) go to the system tenant.
+        let mtenant = if ev.project.is_empty() {
+            crate::metrics::SYSTEM_TENANT.to_string()
+        } else {
+            crate::admin::norm(&self.projects.team_of(&ev.project)).to_string()
+        };
+        self.metrics.record(&ev, &mtenant);
         let mut q = self.events.lock();
         if q.len() >= 500 {
             q.pop_front();
@@ -390,10 +542,38 @@ impl CloudState {
     }
 
     /// Whether this node should route on `host`. A bare/single-label or empty
-    /// host (local/direct/default deployment) is allowed; any multi-label host
-    /// must end with a configured deploy suffix, else it's a foreign root.
+    /// host (local/direct/default deployment) is allowed; under real-DNS ingress
+    /// the apps domain (`*.{HIVE_APPS_DOMAIN}`, one label + apex) is allowed; any
+    /// other multi-label host must end with a configured deploy suffix (the ngrok
+    /// zones — kept while `HIVE_INGRESS != dns`), else it's a foreign root.
     pub fn host_allowed(&self, host: &str) -> bool {
-        host_has_allowed_suffix(host, &self.deploy_suffixes)
+        // The apps-domain rule only applies under real-DNS ingress (same gate as
+        // `deploy_url`). In ngrok mode `*.{apps_domain}` never reaches this node, so
+        // keep host admission byte-identical to the pre-apps-domain behavior.
+        (self.ingress != "ngrok" && host_matches_apps_domain(host, &self.apps_domain))
+            || host_has_allowed_suffix(host, &self.deploy_suffixes)
+    }
+
+    /// Public URL for a deployment alias. Real-DNS ingress (`HIVE_INGRESS !=
+    /// ngrok`) emits `https://<label>.{apps_domain}` (single-label wildcard);
+    /// ngrok mode keeps today's `https://<alias>` (the UI session-maps domains).
+    pub fn deploy_url(&self, alias: &str) -> String {
+        if self.ingress != "ngrok" {
+            let sub = alias.split('.').next().unwrap_or(alias);
+            format!("https://{}.{}", sub, self.apps_domain)
+        } else {
+            format!("https://{alias}")
+        }
+    }
+
+    /// Public base URL of the platform API (`https://api.{platform_domain}` under
+    /// real-DNS ingress; the internal gateway base otherwise).
+    pub fn api_base(&self) -> String {
+        if self.ingress != "ngrok" {
+            format!("https://api.{}", self.platform_domain)
+        } else {
+            self.public_base.clone()
+        }
     }
 
     pub fn event(&self, region: &str, method: &str, host: &str, path: &str, status: u16, action: &str, detail: &str) -> Event {

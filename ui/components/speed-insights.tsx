@@ -21,18 +21,18 @@ interface Vital {
   rating: Rating;
 }
 
-// Plausible, healthy synthetic values (no RUM backend wired) — consistent with
-// how the rest of the dashboard synthesizes series from live counters.
-const VITALS: Vital[] = [
-  { key: "fcp", label: "First Contentful Paint", value: "0.96s", pos: 0.9, rating: "great" },
-  { key: "lcp", label: "Largest Contentful Paint", value: "1.05s", pos: 0.88, rating: "great" },
-  { key: "inp", label: "Interaction to Next Paint", value: "56ms", pos: 0.92, rating: "great" },
-  { key: "cls", label: "Cumulative Layout Shift", value: "0", pos: 0.97, rating: "great" },
-  { key: "fid", label: "First Input Delay", value: "3ms", pos: 0.96, rating: "great" },
-  { key: "ttfb", label: "Time to First Byte", value: "0.31s", pos: 0.93, rating: "great" },
+// Core Web Vitals come from REAL User Monitoring (a client web-vitals beacon
+// reporting FCP/LCP/INP/CLS/TTFB per tenant). That backend isn't wired yet, so we
+// show NO fabricated values — an honest "collecting" empty state instead. When the
+// RUM ingest lands, this array is populated from the per-tenant p75 samples.
+const VITAL_LABELS: { key: string; label: string }[] = [
+  { key: "fcp", label: "First Contentful Paint" },
+  { key: "lcp", label: "Largest Contentful Paint" },
+  { key: "inp", label: "Interaction to Next Paint" },
+  { key: "cls", label: "Cumulative Layout Shift" },
+  { key: "ttfb", label: "Time to First Byte" },
 ];
-
-const RES = 100;
+const VITALS: Vital[] = []; // no RUM data source yet — never fabricate values
 
 const RATING_COLOR: Record<Rating, string> = {
   great: "#3fa45a",
@@ -50,36 +50,21 @@ export function SpeedInsights() {
   const [range, setRange] = useState<(typeof RANGES)[number]>("Last 7 Days");
   const [tab, setTab] = useState<"routes" | "paths">("routes");
 
-  const totalReq = data?.totals.requests ?? 0;
-  // Data points scale with real traffic, with a floor so the report reads well.
-  const dataPoints = Math.max(880_738, totalReq * 37);
+  // No RUM ingest yet → there is NO Real Experience Score, no per-vital p75, no
+  // geo breakdown. We show honest empty states rather than fabricated numbers.
+  // `res === null` renders as "collecting"; `rumDataPoints` is the real count (0
+  // until the beacon lands). The path list below IS real (top request paths), but
+  // it carries no RES score without RUM.
+  const res: number | null = null;
+  const rumDataPoints = 0;
+  const chart: { t: string; RES: number }[] = [];
 
-  // RES over the selected window — a healthy line hovering near 100.
-  const chart = useMemo(() => {
-    const days = range === "Last 24 Hours" ? 24 : range === "Last 7 Days" ? 7 : 30;
-    const unit = range === "Last 24 Hours" ? "h" : "d";
-    const base = pct === "P75" ? 100 : pct === "P90" ? 99 : pct === "P95" ? 98 : 96;
-    return Array.from({ length: days }, (_, i) => {
-      const wobble = Math.round(Math.sin(i * 1.3) * 1.2);
-      return { t: `${unit === "h" ? `${i}:00` : `Day ${i + 1}`}`, RES: Math.min(100, base + wobble) };
-    });
-  }, [range, pct]);
-
-  // Routes from real top paths; default to a docs-like set when empty.
-  const routes = useMemo(() => {
-    const tp = data?.top_paths ?? [];
-    const src = tp.length
-      ? tp.map((p) => ({ route: p.path, points: p.count }))
-      : [
-          { route: "/", points: 23000 },
-          { route: "/docs", points: 4600 },
-          { route: "/docs/toast", points: 1900 },
-          { route: "/docs/styling", points: 487 },
-          { route: "/docs/toaster", points: 459 },
-          { route: "/docs/use-toaster", points: 409 },
-        ];
-    return src.map((r) => ({ ...r, res: 100 }));
-  }, [data]);
+  // Real top request paths (tenant-scoped) — actual traffic, no fabricated score.
+  const routes = useMemo(
+    () => (data?.top_paths ?? []).map((p) => ({ route: p.path, points: p.count, res: null as number | null })),
+    [data],
+  );
+  const hasRum = false; // flips true when the RUM ingest is wired
 
   return (
     <div>
@@ -115,14 +100,13 @@ export function SpeedInsights() {
           <RailRow
             active
             label="Real Experience Score"
-            value={<Gauge score={RES} size={36} />}
+            value={<Gauge score={res} size={36} />}
           />
-          {VITALS.map((v) => (
+          {(VITALS.length ? VITALS : VITAL_LABELS.map((l) => ({ ...l, value: "—", pos: 0, rating: "great" as Rating }))).map((v) => (
             <RailRow
               key={v.key}
               label={v.label}
-              value={<span className="text-base font-semibold tabular-nums" style={{ color: RATING_COLOR[v.rating] }}>{v.value}</span>}
-              bar={<MiniBar pos={v.pos} />}
+              value={<span className="text-base font-semibold tabular-nums text-muted">{v.value}</span>}
             />
           ))}
         </Card>
@@ -135,18 +119,15 @@ export function SpeedInsights() {
               <div className="lg:w-[320px] lg:shrink-0">
                 <div className="text-xs text-secondary">{device}</div>
                 <h2 className="mb-3 text-xl font-semibold">Real Experience Score</h2>
-                <Gauge score={RES} size={88} />
-                <div className="mt-3 flex items-center gap-1.5 text-sm font-medium text-green">
-                  <CheckCircle2 className="h-4 w-4" /> Great
+                <Gauge score={res} size={88} />
+                <div className="mt-3 flex items-center gap-1.5 text-sm font-medium text-muted">
+                  <AlertTriangle className="h-4 w-4" /> Collecting
                 </div>
-                <p className="mt-1 text-xs text-muted">Above 90</p>
                 <p className="mt-3 text-sm text-secondary">
-                  More than 75% of visits had a great experience. Measures the overall user experience —
-                  pages should have a RES of more than 90.
+                  Core Web Vitals are measured from real visits via the RUM beacon. No real-user
+                  samples have been collected yet, so no score is shown — values populate here once
+                  the beacon reports FCP/LCP/INP/CLS/TTFB.
                 </p>
-                <a href="#" className="mt-2 inline-flex items-center gap-1 text-sm text-blue-500 hover:underline">
-                  Learn more about RES <ExternalLink className="h-3 w-3" />
-                </a>
               </div>
 
               {/* RES chart */}
@@ -240,19 +221,13 @@ export function SpeedInsights() {
                   title="Great"
                   range=">90"
                   defaultOpen
-                  countries={[
-                    { name: "India", points: "61K", score: 100 },
-                    { name: "United States of America", points: "50K", score: 100 },
-                    { name: "Japan", points: "30K", score: 100 },
-                    { name: "South Korea", points: "25K", score: 100 },
-                    { name: "Vietnam", points: "22K", score: 100 },
-                  ]}
+                  countries={[]}
                 />
               </div>
             </div>
             <div className="flex items-center justify-between border-t border-border px-4 py-2.5 text-xs text-muted">
-              <span>This report is based on {dataPoints.toLocaleString()} data points</span>
-              <span>Updated just now</span>
+              <span>Based on {rumDataPoints.toLocaleString()} real-user data points{hasRum ? "" : " — RUM beacon not yet reporting"}</span>
+              <span>{hasRum ? "Updated just now" : "—"}</span>
             </div>
           </Card>
         </div>
@@ -263,29 +238,32 @@ export function SpeedInsights() {
 
 // ---- pieces ----
 
-function Gauge({ score, size }: { score: number; size: number }) {
+function Gauge({ score, size }: { score: number | null; size: number }) {
   const stroke = size > 60 ? 6 : 3.5;
   const r = (size - stroke) / 2;
   const circ = 2 * Math.PI * r;
-  const color = score >= 90 ? "#3fa45a" : score >= 50 ? "#d9a528" : "#e5484d";
+  // No RUM score yet → an empty ring + em-dash, never a fabricated number.
+  const color = score === null ? "hsl(var(--muted))" : score >= 90 ? "#3fa45a" : score >= 50 ? "#d9a528" : "#e5484d";
   return (
     <span className="relative inline-flex items-center justify-center" style={{ width: size, height: size }}>
       <svg width={size} height={size} className="-rotate-90">
         <circle cx={size / 2} cy={size / 2} r={r} fill="none" stroke="hsl(var(--border))" strokeWidth={stroke} />
-        <circle
-          cx={size / 2}
-          cy={size / 2}
-          r={r}
-          fill="none"
-          stroke={color}
-          strokeWidth={stroke}
-          strokeDasharray={circ}
-          strokeDashoffset={circ * (1 - score / 100)}
-          strokeLinecap="round"
-        />
+        {score !== null && (
+          <circle
+            cx={size / 2}
+            cy={size / 2}
+            r={r}
+            fill="none"
+            stroke={color}
+            strokeWidth={stroke}
+            strokeDasharray={circ}
+            strokeDashoffset={circ * (1 - score / 100)}
+            strokeLinecap="round"
+          />
+        )}
       </svg>
       <span className="absolute font-semibold tabular-nums" style={{ fontSize: size > 60 ? 22 : 11, color }}>
-        {score}
+        {score === null ? "—" : score}
       </span>
     </span>
   );
@@ -322,7 +300,7 @@ function MiniBar({ pos }: { pos: number }) {
 function Bucket({
   icon, title, range, items, highlight,
 }: {
-  icon: React.ReactNode; title: string; range: string; items: { route: string; points: number; res: number }[]; highlight?: boolean;
+  icon: React.ReactNode; title: string; range: string; items: { route: string; points: number; res: number | null }[]; highlight?: boolean;
 }) {
   return (
     <div className="rounded-lg border border-border">
@@ -342,7 +320,7 @@ function Bucket({
               <span className="truncate font-mono text-xs">{it.route}</span>
               <span className="flex items-center gap-3 text-xs">
                 <span className="tabular-nums text-muted">{fmt(it.points)}</span>
-                <span className="tabular-nums font-medium">{it.res}</span>
+                <span className="tabular-nums font-medium">{it.res ?? "—"}</span>
               </span>
             </div>
           ))}

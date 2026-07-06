@@ -73,10 +73,21 @@ impl BuildStore {
             f(b);
         }
     }
+    /// Remove every build record for `project` — there was previously no
+    /// removal path at all (unbounded retention, including full log lines
+    /// that can carry commit-author/env/config content), so a deleted
+    /// project's build history stayed fully queryable via `GET /v1/builds/:id`
+    /// for as long as the process kept running. Returns the count removed.
+    pub fn remove_for_project(&self, project: &str) -> usize {
+        let mut m = self.map.lock();
+        let before = m.len();
+        m.retain(|_, b| b.project != project);
+        before - m.len()
+    }
 }
 
 /// Sanitize a string for use in a container image tag ([a-z0-9._-] only).
-fn sanitize_tag(s: &str) -> String {
+pub(crate) fn sanitize_tag(s: &str) -> String {
     let mut out: String = s
         .to_lowercase()
         .chars()
@@ -90,19 +101,53 @@ fn sanitize_tag(s: &str) -> String {
 }
 
 pub fn project_name_from_url(url: &str) -> String {
-    url.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("project")
-        .trim_end_matches(".git")
+    // Container-image refs (`image://ns/name:tag`): the project is the image NAME —
+    // drop the registry/namespace prefix AND the `:tag` (else "simplifi:latest"
+    // slugs to the ugly "simplifi-latest" and every tag change forks the project).
+    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("project");
+    let last = if url.starts_with("image://") {
+        last.split(':').next().unwrap_or(last)
+    } else {
+        last
+    };
+    last.trim_end_matches(".git")
         .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
         .collect()
 }
 
-fn deploy_root() -> PathBuf {
+pub(crate) fn deploy_root() -> PathBuf {
     std::env::temp_dir().join("hive-deploys")
+}
+
+/// The newest on-disk deploy checkout for a project (`<deploy_root>/<project>-*`),
+/// preferring a completed checkout with a package.json/Dockerfile. Lets a node that
+/// holds the SOURCE derive the service graph even when it holds no deployment
+/// RECORD (container deploys register the record on the coordinator, run on the
+/// lease-owner node). Returns None if no source is on disk.
+pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
+    let base = deploy_root();
+    let prefix = format!("{project}-");
+    let mut cands: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&base)
+        .ok()?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|e| {
+            let p = e.path();
+            if !p.is_dir() {
+                return None;
+            }
+            // Only real checkouts (has a package.json or a container build file).
+            if !p.join("package.json").exists() && !p.join("Dockerfile").exists() && !p.join("Containerfile").exists() {
+                return None;
+            }
+            let m = e.metadata().ok()?.modified().ok()?;
+            Some((m, p))
+        })
+        .collect();
+    cands.sort_by_key(|(m, _)| *m);
+    cands.pop().map(|(_, p)| p)
 }
 
 /// Whether `project` already has a deployment ANYWHERE in the fleet — the local
@@ -295,7 +340,9 @@ async fn run_build(
         // is_container is unknown until the repo is built (Dockerfile detection),
         // so default to firecracker placement here; a container is re-homed to a
         // podman-capable node after the build (see the capability re-dispatch below).
-        let targets = crate::schedule::place(cloud, &regions, false);
+        // EXCEPT a prebuilt-image deploy is known to be a container up front → place
+        // it on a container-capable node immediately (no post-build re-home needed).
+        let targets = crate::schedule::place(cloud, &regions, req.image_ref.is_some());
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
@@ -363,7 +410,14 @@ async fn run_build(
     tokio::fs::create_dir_all(deploy_root()).await?;
     let branch = req.branch.clone().unwrap_or_default();
 
-    let (commit, full_sha, commit_message) = if let Some(zip_b64) = req.zip_b64.take() {
+    let (commit, full_sha, commit_message) = if let Some(image) = req.image_ref.clone() {
+        // Prebuilt OCI image: NO source to clone/extract or build. Make an empty build
+        // dir so the shared tail (env injection, deploy_full) is unchanged; the image
+        // is pulled + turned into a container manifest in `produce_manifest`.
+        tokio::fs::create_dir_all(&dir).await?;
+        log(format!("Deploying prebuilt image: {image}"));
+        ("image".to_string(), String::new(), format!("Image: {image}"))
+    } else if let Some(zip_b64) = req.zip_b64.take() {
         // Drag-drop / zip upload: decode + extract instead of cloning, and synthesize
         // git-ish metadata so the rest of the pipeline is unchanged. `take()` drops the
         // base64 off the request so it's never logged/persisted past this point.
@@ -473,7 +527,7 @@ async fn run_build(
     // deploy — Vercel still records the deployment/project — so on error we fall
     // back to a "build failed" page and keep going (build state ends as Error).
     let mut build_failed = false;
-    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit, first_deploy, req.use_cache).await {
+    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit, first_deploy, req.use_cache, req.image_ref.as_deref(), req.image_port).await {
         Ok(m) => m,
         Err(e) => {
             build_failed = true;
@@ -629,15 +683,30 @@ async fn run_build(
     // (podman build, below) and serves on whichever node it was placed on.
     let is_container = manifest.functions.iter().any(|f| f.runtime == "container");
 
-    // Build-time V8 compile-cache warm-up (Node cold-start): precompile the server
-    // bundle's bytecode INTO the artifact so a fresh microVM's first hit skips
-    // parse/compile. Runs for the first Node-family function only; best-effort. Must
-    // happen BEFORE deliver_build so `.hive-compile-cache` is packed into the image.
+    // Build-time bytecode-cache warm-up: precompile the server's bytecode INTO
+    // the artifact so a fresh microVM's first hit skips parse/compile. Dispatches
+    // per the SINGLE resolved runtime (`hive_core::Runtime`, replacing what used
+    // to be four independent copies of argv-basename sniffing) — Node gets the
+    // opaque `NODE_COMPILE_CACHE` V8 cache (source untouched); Bun gets a
+    // STRUCTURALLY DIFFERENT build-time bundle+bytecode step that REWRITES the
+    // function's start_cmd to point at the cached bundle (see
+    // `warmup_bun_bytecode`'s doc comment for why the two mechanisms can't share
+    // one code path). Best-effort either way. Must happen BEFORE deliver_build so
+    // the cache/bundle is packed into the image.
     if !build_failed && !is_container {
-        if let Some(node_fn) = manifest.functions.iter().find(|f| is_node_start_cmd(&f.start_cmd)) {
+        if let Some(node_fn) = manifest.functions.iter().find(|f| {
+            hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Node
+        }) {
             let start_cmd = node_fn.start_cmd.clone();
             let warm_env = cloud.projects.env_map(&project);
             warmup_node_cache(&build_dir, &start_cmd, &warm_env, cloud, bid).await;
+        }
+        if let Some(idx) = manifest.functions.iter().position(|f| {
+            hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Bun
+        }) {
+            let start_cmd = manifest.functions[idx].start_cmd.clone();
+            let rewritten = warmup_bun_bytecode(&build_dir, &start_cmd, cloud, bid).await;
+            manifest.functions[idx].start_cmd = rewritten;
         }
     }
 
@@ -696,6 +765,7 @@ async fn run_build(
                 next_run_ms: None,
                 runs: 0,
                 source: "vercel.json".into(),
+                tenant: crate::admin::norm(&cloud.projects.team_of(&project)).to_string(),
             })
             .collect();
         let n = cloud.cron.set_source_jobs(&project, "vercel.json", jobs);
@@ -723,6 +793,42 @@ async fn run_build(
         b.deployment_id = Some(info.id.to_string());
         b.alias = Some(info.alias.clone());
     });
+
+    // Issue #2: derive the intelligent service graph ASYNC, off the deploy path. It
+    // reads the checked-out repo (kept for live deployments), detects the framework,
+    // scans consumed deps / monorepo packages / bundled front+back / databases, and
+    // records env var NAMES only. Never blocks the deploy; best-effort. Runs even for
+    // a FAILED build — the source tree is present, so the graph is still derivable.
+    {
+        let cloud2 = cloud.clone();
+        let bd = build_dir.clone();
+        let proj = info.project.clone();
+        let dep_id = info.id.to_string();
+        tokio::spawn(async move {
+            let fw = fluid_build::detect(&bd);
+            let (fw_slug, fw_name) = (fw.slug.to_string(), fw.name.to_string());
+            let is_container = bd.join("Dockerfile").exists()
+                || bd.join("Containerfile").exists()
+                || crate::compose::compose_file(&bd).is_some();
+            let bd2 = bd.clone();
+            let scan = match tokio::task::spawn_blocking(move || {
+                crate::svcgraph::scan_dir(&bd2, &fw_slug, &fw_name, is_container)
+            })
+            .await
+            {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let env_keys: Vec<String> =
+                cloud2.projects.get_masked(&proj).env.iter().map(|e| e.key.clone()).collect();
+            let graph = crate::svcgraph::build_graph(&proj, &dep_id, &scan, &env_keys);
+            let n = graph.nodes.len();
+            cloud2.svcgraph.put(graph);
+            crate::persist::persist(&cloud2);
+            tracing::info!(project = %proj, deployment = %dep_id, nodes = n, "service graph computed");
+        });
+    }
+
     let ev = cloud.event(&cloud.region, "DEPLOY", &info.alias, "/", 200, "deploy", &format!("git {}", req.repo_url));
     cloud.record(ev);
     cloud.audit.record(
@@ -738,7 +844,7 @@ async fn run_build(
     // GITHUB_TOKEN; points the check at the live deployment URL.
     {
         let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
-        let url = format!("https://{}", info.alias);
+        let url = cloud.deploy_url(&info.alias);
         let (state, desc) = if build_failed {
             ("failure", "Build failed")
         } else if is_production {
@@ -758,7 +864,7 @@ async fn run_build(
         serde_json::json!({
             "id": info.id.to_string(),
             "project": info.project,
-            "url": format!("https://{}", info.alias),
+            "url": cloud.deploy_url(&info.alias),
             "state": "ready",
             "production": is_production,
             "target": if is_production { "production" } else { "preview" },
@@ -824,7 +930,7 @@ async fn fanout_remote(
             }
         } else if let Some((id, addr)) = &t.iroh {
             let body = serde_json::to_vec(&dreq).unwrap_or_default();
-            let path = format!("/v1/git/deploy?team={team}");
+            let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
             match crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, &path, &body, 20).await {
                 Some(b) => serde_json::from_slice(&b).ok(),
                 None => { log(format!("✗ {}: iroh dispatch failed", t.node)); all_ok = false; continue; }
@@ -978,35 +1084,25 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             crate::persist::persist(cloud);
         }
     }
-    // Which PEER nodes currently host this project? Derive from the gossiped
-    // routes: any host alias that starts with "<project>." or "<project>-".
-    let admins = cloud.node_admins.read().clone();
-    let routes = cloud.peer_routes.read().clone();
-    let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (host, rs) in routes.iter() {
-        let sub = host.split('.').next().unwrap_or(host);
-        if sub == project || sub.starts_with(&format!("{project}-")) {
-            for r in rs {
-                hosting.insert(r.node_id.clone());
-            }
-        }
-    }
+    // Relocation cleanup: BROADCAST a single-hop delete to every healthy peer
+    // EXCEPT the chosen targets, over HTTP admin OR the iroh mesh. (Previously
+    // derived a "hosting" set from gossiped routes and dispatched HTTP-only —
+    // sparse post-restart gossip + empty node_admins for FC nodes meant stale
+    // copies silently survived relocations.) The receiving arm is team-checked
+    // and idempotent, so non-hosting peers are a cheap no-op.
     let team = cloud.projects.team_of(project);
-    for node in hosting {
+    let peers: Vec<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && n.healthy)
+        .map(|n| n.name)
+        .collect();
+    for node in peers {
         if target_names.iter().any(|t| t == &node) {
             continue; // keep the chosen targets
         }
-        if let Some(admin) = admins.get(&node) {
-            // cascade=false: delete ONLY on that node — must not fan back out and
-            // wipe the freshly-placed copy on the new target.
-            let _ = cloud
-                .http
-                .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
-                .header("x-hive-team", team.clone())
-                .timeout(Duration::from_secs(15))
-                .send()
-                .await;
-        }
+        crate::admin::dispatch_project_delete(cloud, &node, project, &team).await;
     }
 }
 
@@ -1082,8 +1178,16 @@ async fn produce_manifest(
     commit: &str,
     first_deploy: bool,
     use_cache: bool,
+    image_ref: Option<&str>,
+    image_port: Option<u16>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
+    // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
+    // port, and run it as a container with an automatic persistent volume + env. No
+    // Dockerfile build, no framework detection.
+    if let Some(image) = image_ref {
+        return image_container_manifest(cloud, bid, project, image, image_port).await;
+    }
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
     // full topology). Single-Dockerfile projects are unaffected.
@@ -1107,6 +1211,10 @@ async fn produce_manifest(
             None => parse_expose(&dockerfile).await.unwrap_or(8080),
         };
         let protocol = ovr.protocol.unwrap_or_else(|| "http".to_string());
+        // Memory ceiling: an explicit fluid.json `container.memory`, else 0 =
+        // "use the node's generous default" (never the old 512m that OOM-killed
+        // real monolith containers). This is baked into the manifest.
+        let mem_mib = ovr.memory.as_deref().map(parse_mem_mib).unwrap_or(0);
         let t1 = now_ms();
         let mut build = Command::new("podman");
         // `-f` so the detected file (Dockerfile OR Containerfile) is used explicitly,
@@ -1135,7 +1243,7 @@ async fn produce_manifest(
         }
         anyhow::ensure!(out.status.success(), "podman build failed");
         log(format!("Image built: {image} ({}ms), port {exposed} ({protocol})", now_ms().saturating_sub(t1)));
-        Ok(container_manifest(project, &image, exposed, &protocol))
+        Ok(container_manifest(project, &image, exposed, &protocol, mem_mib))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
@@ -1231,6 +1339,27 @@ async fn build_via_fdi(
     // auto-detection.
     let fwo = vc_pick(|c| c.framework.as_ref()).or_else(|| pick(|b| &b.framework));
 
+    // Explicit RUNTIME resolution — orthogonal to package-manager detection below.
+    // Precedence: vercel.json's native `runtime` field > vercel.json's `bunVersion`
+    // presence (Vercel's own Bun-beta selector) > Project Settings' explicit
+    // override > None (defer to `detect_start_cmd`/`adapter_manifest` inferring
+    // from the framework's own start command — today's behavior, unchanged, so
+    // every existing Node deployment and every Bun-as-package-manager-only
+    // project — a `bun.lock` with no explicit runtime choice — keeps running on
+    // Node exactly as before; a bun.lock alone must NEVER force the runtime).
+    let runtime_override: Option<hive_core::Runtime> = vc_pick(|c| c.runtime.as_ref())
+        .and_then(|s| hive_core::Runtime::from_config_str(&s))
+        .or_else(|| vc.as_ref().and_then(|c| c.bun_version.as_ref()).map(|_| hive_core::Runtime::Bun))
+        .or_else(|| {
+            bc.as_ref()
+                .map(|b| b.runtime.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .and_then(hive_core::Runtime::from_config_str)
+        });
+    if let Some(rt) = runtime_override {
+        log(format!("Explicit runtime: {} (vercel.json/project settings).", rt.as_str()));
+    }
+
     let plan = fluid_build::plan_build(dir, fwo.as_deref(), inst.as_deref(), bld.as_deref(), outd.as_deref());
 
     // Persist the auto-detected framework back into Project Settings so the
@@ -1280,13 +1409,26 @@ async fn build_via_fdi(
     // build dies with "command not found". Force npm here: npm doesn't traverse up
     // to a pnpm/yarn workspace, so it installs THIS dir's package.json in place.
     let foreign_subdir = !is_monorepo && dir != repo_root && root_is_workspace;
-    let pm = if foreign_subdir { "npm" } else { fluid_build::package_manager(install_dir) };
+    let pm_detection = fluid_build::detect_package_manager(install_dir);
+    let pm = if foreign_subdir { "npm" } else { pm_detection.manager };
 
     log(format!(
-        "Detected framework: {} — primitive: {:?}, package manager: {}{}",
-        plan.framework.name, plan.framework.primitive, pm,
+        "Detected framework: {} — primitive: {:?}, package manager: {} ({:?}){}",
+        plan.framework.name,
+        plan.framework.primitive,
+        pm,
+        if foreign_subdir { fluid_build::PackageManagerSource::Default } else { pm_detection.source },
         if is_monorepo { " (workspace monorepo — installing at root)" } else { "" }
     ));
+    // Package-manager choice never forces the RUNTIME (see `runtime_override`
+    // above) — a bun.lock/packageManager:"bun" alone only picks `bun install`.
+    // A conflicting lockfile (e.g. both bun.lock and pnpm-lock.yaml committed)
+    // is never silently dropped — always logged, deterministic winner.
+    if !foreign_subdir {
+        if let Some(w) = &pm_detection.conflict_warning {
+            log(format!("WARN: {w}"));
+        }
+    }
     if let Some(nd) = preferred_node_bin() {
         log(format!("Node runtime: {nd}"));
     }
@@ -1341,6 +1483,17 @@ async fn build_via_fdi(
             match pm {
                 "pnpm" => format!("pnpm exec {bc}"),
                 "yarn" => format!("yarn exec {bc}"),
+                // When the RUNTIME (not just the package manager) is explicitly
+                // Bun, add `--bun` so the framework's own internally-spawned
+                // Node-shebang child processes (e.g. Next.js's build workers)
+                // also run under Bun instead of silently falling back to Node —
+                // this is exactly Vercel's documented `bun run --bun next build`
+                // requirement. Plain `bunx {bc}` (no `--bun`) only resolves the
+                // LOCAL binary through Bun's package-runner; it does not affect
+                // what runtime that binary's own children use. Orthogonal to
+                // package-manager choice: a bun.lock with no explicit runtime
+                // override keeps today's plain `bunx {bc}`.
+                "bun" if runtime_override == Some(hive_core::Runtime::Bun) => format!("bunx --bun {bc}"),
                 "bun" => format!("bunx {bc}"),
                 // npm: the raw binary resolves via node_modules/.bin on PATH.
                 _ => bc,
@@ -1411,6 +1564,25 @@ async fn build_via_fdi(
             }
         }
     }
+    // 1.6) OpenNext: its default AWS wrapper emits a Lambda-style handler, which
+    // won't bind a port on a self-hosted node. Force the `node` wrapper+converter
+    // so `.open-next/server-functions/default/index.mjs` boots a standalone HTTP
+    // server on $PORT (run later with `node …index.mjs`) — giving it Fluid compute.
+    // Only synthesized when the user hasn't supplied their own open-next config.
+    if plan.framework.slug == "opennext" {
+        let has_cfg = ["open-next.config.ts", "open-next.config.js", "open-next.config.mjs"]
+            .iter()
+            .any(|f| dir.join(f).exists());
+        if !has_cfg {
+            let cfg = "// Auto-generated by OpenEdge: run OpenNext's server function as a\n\
+                       // standalone Node HTTP server on $PORT so it runs on Fluid compute.\n\
+                       export default {\n  default: {\n    override: {\n      wrapper: \"node\",\n      converter: \"node\",\n    },\n  },\n};\n";
+            let _ = tokio::fs::write(dir.join("open-next.config.ts"), cfg).await;
+            log("OpenNext detected — generated open-next.config.ts (node wrapper) so the server runs on $PORT under Fluid.".into());
+        } else {
+            log("OpenNext detected — using your open-next.config (ensure the default server uses the `node` wrapper to serve on $PORT).".into());
+        }
+    }
     // 2) Build in the project directory.
     if has_pkg && !build_cmd.trim().is_empty() {
         log(format!("Running \"{}\"", build_cmd));
@@ -1436,14 +1608,36 @@ async fn build_via_fdi(
             Ok(static_manifest(project, &sd))
         }
         Primitive::Serverless | Primitive::Hybrid => {
+            // Next.js DEPLOYMENT ADAPTERS (OpenNext / vinext): the build emits a
+            // Node HTTP server + a separate immutable-assets dir. Run the server as
+            // the Fluid `api` function and serve assets from the CDN, falling
+            // through to the function on a miss (the CDN→origin model). This is what
+            // gives OpenNext/vinext apps Fluid compute (warm pool + concurrency).
+            if let Some(m) = adapter_manifest(project, plan.framework.slug, dir, runtime_override).await {
+                log(format!(
+                    "{} adapter: server `{}`, assets from \"{}\" (CDN→origin fallthrough).",
+                    plan.framework.name,
+                    m.functions.first().map(|f| f.start_cmd.join(" ")).unwrap_or_default(),
+                    m.static_dir.clone().unwrap_or_default(),
+                ));
+                return Ok(m);
+            }
             // Node-server model: the framework was just built, so its production
             // server (`next start`, `node build`, …) will boot and listen on
             // $PORT in the build dir. The gateway proxies to it. SvelteKit (built
-            // with adapter-node above) runs its standalone server via `node build`.
+            // with adapter-node above) runs its standalone server via `node build`
+            // (Node's directory-resolution finds build/index.js automatically —
+            // left untouched for zero regression risk). Under an explicit Bun
+            // runtime, point directly at the file instead of relying on Bun
+            // matching Node's directory-resolution semantics (unverified).
             let start = if is_sveltekit && dir.join("build/index.js").exists() {
-                vec!["node".to_string(), "build".to_string()]
+                if runtime_override == Some(hive_core::Runtime::Bun) {
+                    vec!["bun".to_string(), "run".to_string(), "build/index.js".to_string()]
+                } else {
+                    vec!["node".to_string(), "build".to_string()]
+                }
             } else {
-                detect_start_cmd(dir).await
+                detect_start_cmd(dir, runtime_override).await
             };
             log(format!("Provisioning serverless server: `{}`.", start.join(" ")));
             // Per-route bundle splitting (Issue: SHADOW_NEXT_PER_ROUTE) — DISCOVERY
@@ -1475,7 +1669,7 @@ async fn build_via_fdi(
                     }
                 }
             }
-            let mut m = function_manifest(project, start);
+            let mut m = function_manifest(project, start, runtime_override);
             m.route_policies = route_policies;
             Ok(m)
         }
@@ -1493,21 +1687,46 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
 }
 
 /// The command that boots the built app's production server.
-async fn detect_start_cmd(dir: &Path) -> Vec<String> {
+async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Vec<String> {
+    let bun = runtime == Some(hive_core::Runtime::Bun);
     if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
             if v.get("scripts").and_then(|s| s.get("start")).is_some() {
-                return vec!["npm".into(), "start".into()];
+                // Bun's own script-runner honors package.json#scripts.start
+                // identically to `npm start` (package.json-script INDIRECTION —
+                // the script's own text is executed as a shell command), so
+                // `--bun` is required here: a script like `"start": "node
+                // server.js"` (extremely common — it's what `npm init`/most
+                // hand-written package.jsons emit) would otherwise spawn REAL
+                // node, silently defeating the Bun runtime choice. Verified
+                // live: `bun run start` on such a script reported
+                // `process.versions.bun === null`; `bun run --bun start`
+                // reported the real Bun version. This does NOT apply to a
+                // direct-file invocation (`bun server.js`, no script-name
+                // indirection) below — there the top-level process is already
+                // Bun, so nothing to force.
+                return if bun {
+                    vec!["bun".into(), "run".into(), "--bun".into(), "start".into()]
+                } else {
+                    vec!["npm".into(), "start".into()]
+                };
             }
         }
     }
     for entry in ["server.js", "index.js", "app.py", "main.py", "server.py"] {
         if dir.join(entry).exists() {
-            let runner = if entry.ends_with(".py") { "python3" } else { "node" };
+            if entry.ends_with(".py") {
+                return vec!["python3".into(), entry.into()];
+            }
+            let runner = if bun { "bun" } else { "node" };
             return vec![runner.into(), entry.into()];
         }
     }
-    vec!["npm".into(), "start".into()]
+    if bun {
+        vec!["bun".into(), "run".into(), "--bun".into(), "start".into()]
+    } else {
+        vec!["npm".into(), "start".into()]
+    }
 }
 
 /// Find a STABLE Node 20–24 bin dir, preferring it over an unstable system node
@@ -1565,6 +1784,50 @@ pub fn warmup_node_bin() -> Option<String> {
     preferred_node_bin().map(|d| PathBuf::from(d).join("node").to_string_lossy().into_owned())
 }
 
+/// Find a `bun` binary on common install locations (Homebrew, Bun's own
+/// installer default `~/.bun/bin`, system paths).
+fn which_bun() -> Option<String> {
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        let cand = PathBuf::from(dir).join("bun");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cand = PathBuf::from(&home).join(".bun/bin/bun");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Bun BINARY for the build-time bytecode warm-up. Like V8's compile cache, Bun's
+/// bytecode format is tied to a specific Bun build — mismatched builds mean the
+/// runtime silently ignores the cache (safe, just no speedup). `HIVE_WARMUP_BUN`
+/// pins the exact RUNTIME Bun (set on Firecracker hosts to a copy of the microVM's
+/// baked-in Bun), mirroring `HIVE_WARMUP_NODE`/`warmup_node_bin`. Falls back to
+/// whatever `bun` the build host has (correct when build host == runtime host,
+/// e.g. the Mac/mock backend).
+pub fn warmup_bun_bin() -> Option<String> {
+    if let Ok(p) = std::env::var("HIVE_WARMUP_BUN") {
+        let pb = PathBuf::from(&p);
+        if pb.is_file() {
+            return Some(p);
+        }
+        let cand = pb.join("bun");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    which_bun()
+}
+
+async fn bun_version(bun_bin: &str) -> Option<String> {
+    let out = Command::new(bun_bin).arg("--version").output().await.ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// Extract an uploaded ZIP (raw bytes) into `dir` via the system `unzip`. Strips
 /// macOS cruft (`__MACOSX`, `.DS_Store`) and, when the archive is a single top-level
 /// directory (the common "zip a folder" / GitHub "Download ZIP" shape), flattens it
@@ -1612,15 +1875,6 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
     Ok(dir_stats(dir).await.0)
 }
 
-/// Node-family start command? (the V8 compile-cache warm-up + runtime wiring apply
-/// only to these — never to static sites, Python, or containers). Matches on the
-/// basename so an absolute `…/bin/node` still counts.
-pub fn is_node_start_cmd(start_cmd: &[String]) -> bool {
-    let Some(first) = start_cmd.first() else { return false };
-    let base = Path::new(first).file_name().and_then(|s| s.to_str()).unwrap_or(first);
-    matches!(base, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next")
-}
-
 /// (file count, total bytes) under `dir`, recursively — to report what the warm-up
 /// captured into the compile cache.
 async fn dir_stats(dir: &Path) -> (u64, u64) {
@@ -1666,9 +1920,11 @@ async fn warmup_node_cache(
     if std::env::var("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false) {
         return;
     }
-    if !is_node_start_cmd(start_cmd) {
-        return; // non-Node (static / python / container) — never set the cache
-    }
+    // Callers only invoke this for a function whose resolved runtime is Node
+    // (see the `hive_core::Runtime::resolve(...) == Runtime::Node` filter at the
+    // call site) — no redundant argv re-check here, since re-deriving it from
+    // argv alone would disagree with an EXPLICIT `runtime: "node"` config paired
+    // with an unusual custom launcher script.
     let cache_dir = build_dir.join(".hive-compile-cache");
     if tokio::fs::create_dir_all(&cache_dir).await.is_err() {
         return;
@@ -1786,6 +2042,113 @@ async fn warmup_node_cache(
     } else {
         let _ = tokio::fs::remove_dir_all(&cache_dir).await;
         log("Compile-cache: no bytecode captured (runtime Node may be <22.1, or the server didn't boot) — app still starts, just uncached.".into());
+    }
+}
+
+/// Build-time Bun bytecode cache — the Bun-native equivalent of
+/// `warmup_node_cache`, but STRUCTURALLY DIFFERENT, not a copy-paste: V8's
+/// `NODE_COMPILE_CACHE` is an opaque, process-wide cache directory layered on
+/// UNMODIFIED source (any `require()` gets cached, no rewrite needed). Bun uses
+/// JavaScriptCore, which has no equivalent hook — its bytecode cache
+/// (`bun build --bytecode`) is a build-time BUNDLING step that emits a NEW file
+/// plus a `.jsc` bytecode sidecar (and, here, a `.map` external source map); `bun
+/// run <bundled-file>` auto-loads both with ZERO runtime env var. So on success
+/// this function REWRITES start_cmd to point at the bundled output — callers
+/// MUST use the returned Vec, not the one they passed in.
+///
+/// Only applies when start_cmd resolves to a real, existing entry FILE (`bun
+/// <file>` / `bun run <file>`) under `build_dir` — a plain Node-style
+/// server.js/index.js, or an OpenNext/vinext adapter's single bundled server
+/// file both qualify. Does NOT apply to a framework CLI invocation (`bunx --bun
+/// next start`, `bun run --bun next start`): a CLI wrapper is not a statically
+/// resolvable module graph Bun can bundle ahead of time — this is a REAL, proven
+/// Bun limitation (proven empirically: `bun build` on a CLI entry either fails
+/// or bundles the wrong thing), unlike Node's compile cache, which works
+/// regardless of how the process was launched. Detected explicitly and
+/// downgraded safely: start_cmd is returned UNCHANGED and a clear reason is
+/// logged; the app still runs correctly on Bun, just without the bytecode
+/// speedup for that one framework combination.
+///
+/// Best-effort: any failure (missing `bun` binary, bundling error, unexpected
+/// output shape) is a perf no-op, never breaks a deploy — returns the ORIGINAL
+/// start_cmd unchanged.
+///
+/// Pure entry-detection: is `start_cmd` a bundleable `bun <file>` / `bun run
+/// <file>` invocation? Returns the file argument if so, `None` for anything
+/// else (CLI wrappers like `bunx --bun next start`, non-Bun commands, etc.).
+/// Extracted so the decision is unit-testable without a `CloudState`.
+fn bun_bundle_entry(start_cmd: &[String]) -> Option<String> {
+    let is_bun = |s: &str| Path::new(s).file_name().and_then(|f| f.to_str()) == Some("bun");
+    match start_cmd {
+        [first, file] if is_bun(first) => Some(file.clone()),
+        [first, run, file] if is_bun(first) && run == "run" => Some(file.clone()),
+        _ => None,
+    }
+}
+
+async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc<CloudState>, bid: &str) -> Vec<String> {
+    let log = |m: String| cloud.builds.log(bid, m);
+    let original = start_cmd.to_vec();
+    if std::env::var("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+        return original;
+    }
+    let Some(entry_arg) = bun_bundle_entry(start_cmd) else {
+        log(
+            "Bytecode-cache: skipped — this start command runs Bun's own CLI wrapper \
+             (e.g. `bunx --bun next start`), not a single bundleable entry file. Bun's \
+             ahead-of-time bytecode cache needs a statically resolvable module graph, \
+             which a framework CLI is not (a real, documented Bun limitation — the app \
+             still runs correctly on Bun, just without this speedup)."
+                .into(),
+        );
+        return original;
+    };
+    let entry_path = build_dir.join(&entry_arg);
+    if !entry_path.is_file() {
+        log(format!("Bytecode-cache: skipped — entry `{entry_arg}` not found under the build output."));
+        return original;
+    }
+    let Some(bun_bin) = warmup_bun_bin() else {
+        log("Bytecode-cache: skipped — no `bun` binary available on this build host.".into());
+        return original;
+    };
+    let outdir = build_dir.join(".hive-bun-bytecode");
+    if tokio::fs::create_dir_all(&outdir).await.is_err() {
+        return original;
+    }
+    log(format!("Bytecode-cache: bundling `{entry_arg}` with Bun's ahead-of-time bytecode cache…"));
+    let out = Command::new(&bun_bin)
+        .arg("build")
+        .arg("--bytecode")
+        .arg("--sourcemap=external")
+        .arg("--target=bun")
+        .arg(format!("--outdir={}", outdir.to_string_lossy()))
+        .arg(&entry_path)
+        .current_dir(build_dir)
+        .output()
+        .await;
+    match out {
+        Ok(o) if o.status.success() => {
+            let stem = Path::new(&entry_arg).file_stem().and_then(|s| s.to_str()).unwrap_or("server");
+            let bundled = outdir.join(format!("{stem}.js"));
+            if !bundled.is_file() {
+                log("Bytecode-cache: bun build reported success but the expected output file was missing — using the original entry uncached.".into());
+                return original;
+            }
+            let rel = bundled.strip_prefix(build_dir).unwrap_or(&bundled).to_string_lossy().into_owned();
+            let ver = bun_version(&bun_bin).await.unwrap_or_else(|| "?".into());
+            log(format!("Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."));
+            vec!["bun".to_string(), "run".to_string(), rel]
+        }
+        Ok(o) => {
+            let stderr: String = String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect();
+            log(format!("Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."));
+            original
+        }
+        Err(e) => {
+            log(format!("Bytecode-cache: could not run `bun build` ({e}); using the original entry uncached."));
+            original
+        }
     }
 }
 
@@ -1920,18 +2283,29 @@ async fn run_streamed(
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
-    let (c1, b1) = (cloud.clone(), bid.to_string());
+    // Redact every decrypted project env VALUE out of build output before it's
+    // persisted to the (team-readable, indefinitely-retained) build log. The
+    // build process runs the repo's OWN install/build commands with these
+    // values injected — a build script that echoes env (verbose npm/yarn
+    // dumps, a framework build failure printing `process.env`, or a
+    // one-line `"prebuild": "env"` in a PR from anyone with push access) used
+    // to leak every real secret in cleartext. Mirrors the identical
+    // `sandboxes_platform.rs` exec-output redaction (`secret_values`/
+    // `redact_secrets`) — same utility, same "redact every value, not just
+    // ones flagged sensitive" conservative default.
+    let secret_values: Vec<String> = env.values().filter(|v| !v.is_empty()).cloned().collect();
+    let (c1, b1, s1) = (cloud.clone(), bid.to_string(), secret_values.clone());
     let t1 = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            c1.builds.log(&b1, format!("  {l}"));
+            c1.builds.log(&b1, format!("  {}", crate::sandboxes::redact_secrets(&l, &s1)));
         }
     });
-    let (c2, b2) = (cloud.clone(), bid.to_string());
+    let (c2, b2, s2) = (cloud.clone(), bid.to_string(), secret_values);
     let t2 = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            c2.builds.log(&b2, format!("  {l}"));
+            c2.builds.log(&b2, format!("  {}", crate::sandboxes::redact_secrets(&l, &s2)));
         }
     });
     let status = child.wait().await?;
@@ -1996,10 +2370,18 @@ pub const ARTIFACT_SIG_HEADER: &str = "x-hive-artifact-sig";
 /// (already distributed fleet-wide) unless `HIVE_ARTIFACT_SECRET` overrides it.
 /// `None` => signing disabled (dev / single-node), like the JWT dev-open default.
 pub fn artifact_secret() -> Option<String> {
-    std::env::var("HIVE_ARTIFACT_SECRET")
-        .ok()
-        .or_else(|| std::env::var("HIVE_JWT_SECRET").ok())
-        .filter(|s| !s.is_empty())
+    if let Some(s) = std::env::var("HIVE_ARTIFACT_SECRET").ok().filter(|s| !s.is_empty()) {
+        return Some(s);
+    }
+    // Fall back to a key DERIVED from HIVE_JWT_SECRET (a single HMAC call
+    // with a purpose-specific label — HKDF-Expand in spirit) rather than the
+    // raw JWT secret itself. Reusing the exact same symmetric key for two
+    // different HMAC purposes (session-token signing and mesh build-artifact
+    // integrity signing) violates "one key, one purpose": compromise of one
+    // subsystem's key material compromises the other. Set
+    // HIVE_ARTIFACT_SECRET explicitly in production for full independence.
+    let root = std::env::var("HIVE_JWT_SECRET").ok().filter(|s| !s.is_empty())?;
+    Some(artifact_sig(&root, b"hive-artifact-signing-v1"))
 }
 
 /// Lowercase hex SHA-256 of `bytes` (#22 content digest).
@@ -2400,7 +2782,61 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str) -> Manifest {
+/// The mount point for the automatic per-container persistent volume (env-tunable).
+fn container_volume_path() -> String {
+    std::env::var("HIVE_CONTAINER_VOLUME_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/data".to_string())
+}
+
+/// The run-config JSON (container `start_cmd[3]`) that attaches an automatic
+/// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
+/// (+ optional service suffix for compose), so a container's data survives instance
+/// restarts and redeploys. Merged into the compose network cfg when present.
+fn container_volume_cfg(project: &str, service: Option<&str>) -> String {
+    let mut name = format!("hive-vol-{}", sanitize_tag(project));
+    if let Some(svc) = service.filter(|s| !s.is_empty()) {
+        name.push('-');
+        name.push_str(&sanitize_tag(svc));
+    }
+    // TENANT/PROJECT NETWORK ISOLATION: standalone containers also get their own
+    // per-project DNS-less podman network (same deterministic subnet scheme as
+    // compose). Without this they land on podman's shared default bridge, where
+    // ANY tenant's container can reach ANY other's by bridge IP. No static `ip`
+    // is pinned (unlike compose) so scale-out instances coexist; the backend
+    // assigns dynamic addresses within the project subnet.
+    let (net, subnet, gw) = project_net(project);
+    serde_json::json!({
+        "vol": name,
+        "volpath": container_volume_path(),
+        "net": net,
+        "subnet": subnet,
+        "gw": gw,
+    })
+    .to_string()
+}
+
+/// Deterministic per-project podman network (name, /24 subnet, gateway) in the
+/// 10.128-191/16 space — identical scheme to the compose path so a project keeps
+/// one network regardless of how it's deployed. Shared with the databases module
+/// so a managed DB container joins the SAME network the app containers use (and
+/// is reachable by its network-alias).
+pub(crate) fn project_net(project: &str) -> (String, String, String) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    project.hash(&mut h);
+    let v = h.finish();
+    let (o2, o3) = (128 + (v % 64) as u8, ((v >> 6) % 256) as u8);
+    (
+        format!("hive-net-{}", sanitize_tag(project)),
+        format!("10.{o2}.{o3}.0/24"),
+        format!("10.{o2}.{o3}.1"),
+    )
+}
+
+fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str, memory_mib: u32) -> Manifest {
     Manifest {
         project: project.to_string(),
         static_dir: None,
@@ -2409,10 +2845,14 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str)
             runtime: "container".into(),
             // Structured marker the backend recognizes: run this image as a
             // detached container, mapping the cell $PORT -> internal port.
-            start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string()],
+            // start_cmd[3] = run-config JSON (here: the automatic persistent volume).
+            start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string(), container_volume_cfg(project, None)],
             env: Default::default(),
             vcpus: 1,
-            memory_mib: 512,
+            // 0 = use the node's generous, env-tunable container-memory default
+            // (a real value here comes from fluid.json `container.memory`). NOT the
+            // old hardcoded 512m, which OOM-killed monolith containers.
+            memory_mib,
             max_concurrency: 20,
             min_instances: 1,
             max_instances: 5,
@@ -2424,6 +2864,119 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str)
         routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
         ..Default::default()
     }
+}
+
+/// The PATH podman needs on both Linux FC hosts (/usr/bin) and macOS (/opt/homebrew).
+fn podman_path_env() -> String {
+    let base = std::env::var("PATH").unwrap_or_default();
+    format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base}")
+}
+
+/// Fully qualify a container-image reference for podman. Linux podman ENFORCES
+/// short-name resolution (`user/img:tag` fails with "short-name resolution
+/// enforced" unless registries.conf lists search registries — macOS podman-machine
+/// resolves docker.io implicitly, which is why short names work there). A ref whose
+/// first path component isn't a registry host (no `.`/`:`, not `localhost`) gets
+/// the Docker Hub prefix; single-component names also get the `library/` namespace.
+pub(crate) fn qualify_image_ref(image: &str) -> String {
+    let image = image.trim();
+    match image.split_once('/') {
+        // No slash: an official Docker Hub image (`nginx`, `redis:7`) — the `:` here
+        // is a TAG, never a host:port (that only occurs before a `/`).
+        None => format!("docker.io/library/{image}"),
+        Some((first, _)) => {
+            // Slash present: `first` is a registry host iff it looks like one
+            // (dots, a port, or `localhost`); otherwise it's a Hub namespace.
+            let is_registry_host = first.contains('.') || first.contains(':') || first == "localhost";
+            if is_registry_host {
+                image.to_string()
+            } else {
+                format!("docker.io/{image}") // user/img[:tag]
+            }
+        }
+    }
+}
+
+/// Deploy a PRE-BUILT OCI image from any registry (Docker Hub / Quay / arbitrary):
+/// `podman pull` it on this (target) node, auto-detect its listening port from the
+/// image's `ExposedPorts` (unless overridden), and synthesize a container manifest
+/// with the automatic persistent volume. Project env is injected by the caller.
+async fn image_container_manifest(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    project: &str,
+    image: &str,
+    port_override: Option<u16>,
+) -> anyhow::Result<Manifest> {
+    let log = |s: String| cloud.builds.log(bid, s);
+    let path = podman_path_env();
+    // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
+    // rejects unqualified refs ("short-name resolution enforced").
+    let qualified = qualify_image_ref(image);
+    let image = qualified.as_str();
+    // Pull the image (fail the build with the registry error if it can't be fetched —
+    // e.g. not found / private registry needing auth).
+    log(format!("Pulling image {image} …"));
+    let t0 = now_ms();
+    let out = Command::new("podman")
+        .args(["pull", image])
+        .env("PATH", &path)
+        .output()
+        .await?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        let msg = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("pull failed");
+        anyhow::bail!("podman pull {image} failed: {}", msg.trim());
+    }
+    log(format!("Pulled {image} in {}ms", now_ms().saturating_sub(t0)));
+
+    // Port: explicit override wins; else read the image's ExposedPorts; else 8080.
+    let port = match port_override {
+        Some(p) => p,
+        None => detect_image_port(&path, image).await.unwrap_or(8080),
+    };
+    log(format!(
+        "Container port {port}{}. Attaching persistent volume (≥1 GB) at {}.",
+        if port_override.is_some() { " (configured)" } else { " (from image ExposedPorts)" },
+        container_volume_path(),
+    ));
+    Ok(container_manifest(project, image, port, "http", 0))
+}
+
+/// Auto-detect a container's listening port from the image's `Config.ExposedPorts`
+/// (`podman image inspect`). Returns the lowest exposed TCP port, or None.
+async fn detect_image_port(path_env: &str, image: &str) -> Option<u16> {
+    let out = Command::new("podman")
+        .args(["image", "inspect", image, "--format", "{{json .Config.ExposedPorts}}"])
+        .env("PATH", path_env)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_exposed_ports(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Parse `podman image inspect --format '{{json .Config.ExposedPorts}}'` output
+/// (e.g. `{"8080/tcp":{},"9090/tcp":{}}`) → the lowest exposed TCP port. `null` /
+/// empty / udp-only → None.
+fn parse_exposed_ports(json: &str) -> Option<u16> {
+    let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let obj = v.as_object()?;
+    // Keys look like "8080/tcp"; take the lowest tcp port number.
+    let mut ports: Vec<u16> = obj
+        .keys()
+        .filter_map(|k| {
+            let (num, proto) = k.split_once('/').unwrap_or((k.as_str(), "tcp"));
+            if proto.eq_ignore_ascii_case("udp") {
+                return None;
+            }
+            num.parse::<u16>().ok()
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.first().copied()
 }
 
 /// Build a MULTI-service container manifest from a docker-compose / compose.yaml.
@@ -2519,6 +3072,9 @@ async fn build_compose_manifest(
             "ip": svc_ip(idx),
             "alias": svc.name,
             "hosts": hosts,
+            // Automatic per-service persistent volume (keyed by project+service).
+            "vol": format!("hive-vol-{}-{}", sanitize_tag(project), sanitize_tag(&svc.name)),
+            "volpath": container_volume_path(),
         })
         .to_string();
         functions.push(FunctionConfig {
@@ -2558,6 +3114,31 @@ struct ContainerOverride {
     port: Option<u16>,
     #[serde(default)]
     protocol: Option<String>,
+    /// Memory ceiling for the container, e.g. "4g", "2048m", "1.5g", or "512".
+    /// Overrides the node's generous default; lets a heavy monolith request more.
+    #[serde(default)]
+    memory: Option<String>,
+}
+
+/// Parse a human memory string ("4g", "2048m", "1.5g", "512") into MiB. Returns 0
+/// (→ use the node's default) for empty/unparseable input.
+fn parse_mem_mib(s: &str) -> u32 {
+    let t = s.trim().to_lowercase();
+    if t.is_empty() {
+        return 0;
+    }
+    let (num, mult) = if let Some(n) = t.strip_suffix('g') {
+        (n, 1024.0)
+    } else if let Some(n) = t.strip_suffix("gb") {
+        (n, 1024.0)
+    } else if let Some(n) = t.strip_suffix('m') {
+        (n, 1.0)
+    } else if let Some(n) = t.strip_suffix("mb") {
+        (n, 1.0)
+    } else {
+        (t.as_str(), 1.0) // bare number = MiB
+    };
+    num.trim().parse::<f64>().ok().map(|v| (v * mult).round() as u32).unwrap_or(0)
 }
 
 /// Parse the `container` override block from a repo's `fluid.json` text, if any.
@@ -2571,13 +3152,96 @@ fn parse_container_override(fluid_json: &str) -> ContainerOverride {
     serde_json::from_str::<Wrap>(fluid_json).map(|w| w.container).unwrap_or_default()
 }
 
-fn function_manifest(project: &str, start_cmd: Vec<String>) -> Manifest {
+/// Build a manifest for a Next.js deployment adapter (OpenNext / vinext): the
+/// framework's Node HTTP server runs as the Fluid `api` function while immutable
+/// assets are served from the CDN, falling through to the server on a miss. Returns
+/// `None` for non-adapter frameworks (caller uses the generic node-server path).
+async fn adapter_manifest(
+    project: &str,
+    slug: &str,
+    dir: &Path,
+    runtime: Option<hive_core::Runtime>,
+) -> Option<Manifest> {
+    let bun = runtime == Some(hive_core::Runtime::Bun);
+    // (start command, relative assets dir) per adapter. Both adapters emit a
+    // single bundled server file — exactly the shape `bun run <file>` needs (and
+    // the shape `warmup_bun_bytecode` can bytecode-cache), so under an explicit
+    // Bun runtime we run that same file directly through Bun instead of Node.
+    let (start_cmd, assets_dir): (Vec<String>, &str) = match slug {
+        "opennext" => {
+            let server = ".open-next/server-functions/default/index.mjs";
+            if !dir.join(server).exists() {
+                return None; // build didn't produce the expected server function
+            }
+            let runner = if bun { "bun" } else { "node" };
+            (vec![runner.into(), server.into()], ".open-next/assets")
+        }
+        "vinext" => {
+            // Prefer running Nitro's node server directly; else `vinext start`
+            // (both honor $PORT). `--no-install` avoids a runtime network fetch.
+            // `--bun` on the CLI-fallback path: the `vinext` CLI internally
+            // boots a Nitro server, which may itself invoke `node` for
+            // sub-tasks — same "prefer Bun for shebang-invoked children"
+            // reasoning as the package.json#scripts.start fix above, and
+            // documented as valid `bunx` usage (`bunx --bun vite dev …`).
+            let start = if dir.join(".output/server/index.mjs").exists() {
+                let runner = if bun { "bun" } else { "node" };
+                vec![runner.into(), ".output/server/index.mjs".into()]
+            } else if bun {
+                vec!["bunx".into(), "--bun".into(), "--no-install".into(), "vinext".into(), "start".into()]
+            } else {
+                vec!["npx".into(), "--no-install".into(), "vinext".into(), "start".into()]
+            };
+            (start, ".output/public")
+        }
+        _ => return None,
+    };
+
+    let func = FunctionConfig {
+        name: "api".into(),
+        runtime: runtime.map(|r| r.as_str().to_string()).unwrap_or_else(|| "auto".into()),
+        start_cmd,
+        env: Default::default(),
+        vcpus: 1,
+        memory_mib: 512,
+        max_concurrency: 10,
+        min_instances: 1,
+        max_instances: 5,
+        idle_ttl_secs: 60,
+        max_duration_secs: 300,
+        ..Default::default()
+    };
+
+    // Serve immutable assets from the CDN when they exist, with a fallthrough to the
+    // origin function; otherwise route everything to the function (the server serves
+    // its own assets).
+    if dir.join(assets_dir).exists() {
+        Some(Manifest {
+            project: project.to_string(),
+            static_dir: Some(assets_dir.to_string()),
+            functions: vec![func],
+            routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
+            origin_function: Some("api".into()),
+            ..Default::default()
+        })
+    } else {
+        Some(Manifest {
+            project: project.to_string(),
+            static_dir: None,
+            functions: vec![func],
+            routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("api".into()) }],
+            ..Default::default()
+        })
+    }
+}
+
+fn function_manifest(project: &str, start_cmd: Vec<String>, runtime: Option<hive_core::Runtime>) -> Manifest {
     Manifest {
         project: project.to_string(),
         static_dir: None,
         functions: vec![FunctionConfig {
             name: "api".into(),
-            runtime: "auto".into(),
+            runtime: runtime.map(|r| r.as_str().to_string()).unwrap_or_else(|| "auto".into()),
             start_cmd,
             env: Default::default(),
             vcpus: 1,
@@ -2762,6 +3426,201 @@ mod tests {
     use super::*;
 
     #[test]
+    fn image_refs_are_fully_qualified_for_linux_podman() {
+        // Short names get docker.io (Linux podman enforces qualification).
+        assert_eq!(qualify_image_ref("fruitbox12/simplifi:latest"), "docker.io/fruitbox12/simplifi:latest");
+        assert_eq!(qualify_image_ref("nginx"), "docker.io/library/nginx");
+        assert_eq!(qualify_image_ref("redis:7"), "docker.io/library/redis:7");
+        // Already-qualified refs are untouched.
+        assert_eq!(qualify_image_ref("quay.io/org/img:tag"), "quay.io/org/img:tag");
+        assert_eq!(qualify_image_ref("ghcr.io/owner/app"), "ghcr.io/owner/app");
+        assert_eq!(qualify_image_ref("localhost/hive-x"), "localhost/hive-x");
+        assert_eq!(qualify_image_ref("registry:5000/x"), "registry:5000/x");
+    }
+
+    #[test]
+    fn exposed_ports_picks_lowest_tcp() {
+        assert_eq!(parse_exposed_ports(r#"{"8080/tcp":{}}"#), Some(8080));
+        assert_eq!(parse_exposed_ports(r#"{"9090/tcp":{},"3000/tcp":{}}"#), Some(3000)); // lowest
+        assert_eq!(parse_exposed_ports(r#"{"53/udp":{}}"#), None); // udp ignored
+        assert_eq!(parse_exposed_ports("null"), None);
+        assert_eq!(parse_exposed_ports(""), None);
+    }
+
+    #[test]
+    fn image_manifest_has_container_fn_and_volume() {
+        // The prebuilt-image manifest runs the image as a container with a stable,
+        // per-project persistent volume encoded in start_cmd[3].
+        let m = container_manifest("my-proj", "fruitbox12/simplifi:latest", 8080, "http", 0);
+        let f = &m.functions[0];
+        assert_eq!(f.runtime, "container");
+        assert_eq!(f.start_cmd[0], "__container__");
+        assert_eq!(f.start_cmd[1], "fruitbox12/simplifi:latest");
+        assert_eq!(f.start_cmd[2], "8080");
+        let cfg: serde_json::Value = serde_json::from_str(&f.start_cmd[3]).unwrap();
+        assert_eq!(cfg["vol"], "hive-vol-my-proj");
+        assert!(cfg["volpath"].as_str().unwrap().starts_with('/'));
+    }
+
+    #[tokio::test]
+    async fn adapter_manifest_opennext_hybrid() {
+        let dir = std::env::temp_dir().join(format!("hive-on-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Non-adapter framework → None (generic node-server path).
+        assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
+        // No server function yet → None even for opennext.
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(adapter_manifest("p", "opennext", &dir, None).await.is_none());
+        // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
+        std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
+        std::fs::write(dir.join(".open-next/server-functions/default/index.mjs"), "//server").unwrap();
+        std::fs::create_dir_all(dir.join(".open-next/assets")).unwrap();
+        let m = adapter_manifest("p", "opennext", &dir, None).await.expect("opennext manifest");
+        assert_eq!(m.static_dir.as_deref(), Some(".open-next/assets"));
+        assert_eq!(m.origin_function.as_deref(), Some("api"));
+        assert_eq!(m.functions[0].start_cmd, vec!["node", ".open-next/server-functions/default/index.mjs"]);
+        assert_eq!(m.functions[0].runtime, "auto");
+        assert!(matches!(m.routes[0].target, RouteTarget::Static));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adapter_manifest_opennext_bun_runtime() {
+        let dir = std::env::temp_dir().join(format!("hive-on-bun-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
+        std::fs::write(dir.join(".open-next/server-functions/default/index.mjs"), "//server").unwrap();
+        std::fs::create_dir_all(dir.join(".open-next/assets")).unwrap();
+        let m = adapter_manifest("p", "opennext", &dir, Some(hive_core::Runtime::Bun)).await.expect("opennext manifest");
+        assert_eq!(m.functions[0].start_cmd, vec!["bun", ".open-next/server-functions/default/index.mjs"]);
+        assert_eq!(m.functions[0].runtime, "bun");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adapter_manifest_vinext_node_server() {
+        let dir = std::env::temp_dir().join(format!("hive-vi-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".output/server")).unwrap();
+        std::fs::write(dir.join(".output/server/index.mjs"), "//nitro").unwrap();
+        std::fs::create_dir_all(dir.join(".output/public")).unwrap();
+        let m = adapter_manifest("p", "vinext", &dir, None).await.expect("vinext manifest");
+        assert_eq!(m.static_dir.as_deref(), Some(".output/public"));
+        assert_eq!(m.origin_function.as_deref(), Some("api"));
+        assert_eq!(m.functions[0].start_cmd, vec!["node", ".output/server/index.mjs"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn adapter_manifest_vinext_bun_runtime_no_prebuilt_server() {
+        let dir = std::env::temp_dir().join(format!("hive-vi-bun-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".output/public")).unwrap();
+        let m = adapter_manifest("p", "vinext", &dir, Some(hive_core::Runtime::Bun)).await.expect("vinext manifest");
+        assert_eq!(m.functions[0].start_cmd, vec!["bunx", "--bun", "--no-install", "vinext", "start"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bun_next_ssr_example_fixture_resolves_end_to_end() {
+        // Runs the REAL detection + adapter pipeline against the checked-in,
+        // manually-verified `examples/bun-next-ssr` fixture (its
+        // `.open-next/server-functions/default/index.mjs` was confirmed by hand
+        // to actually boot and serve requests under `bun run`) — not a
+        // synthetic temp dir. Proves the full chain: framework auto-detection
+        // (`fluid_build::detect`) picks the opennext adapter, `vercel.json`'s
+        // native `runtime` field resolves to Bun, and `adapter_manifest` emits
+        // a `bun` start_cmd pointing at that exact file.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-next-ssr");
+        assert!(dir.exists(), "fixture missing: {}", dir.display());
+
+        let framework = fluid_build::detect(&dir);
+        assert_eq!(framework.slug, "opennext");
+
+        let vc = fluid_build::load_vercel_config(&dir).expect("vercel.json must parse");
+        let runtime = vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str);
+        assert_eq!(runtime, Some(hive_core::Runtime::Bun));
+
+        let m = adapter_manifest("bun-next-ssr", framework.slug, &dir, runtime).await.expect("opennext manifest");
+        assert_eq!(m.functions[0].start_cmd, vec!["bun", ".open-next/server-functions/default/index.mjs"]);
+        assert_eq!(m.functions[0].runtime, "bun");
+        assert_eq!(m.static_dir.as_deref(), Some(".open-next/assets"));
+    }
+
+    #[tokio::test]
+    async fn bun_next_middleware_example_fixture_resolves_bun_start_and_framework() {
+        // `examples/bun-next-middleware` is a REAL Next.js app (real `next`/
+        // `react`/`react-dom` deps, real `bun.lock`) with a `middleware.js`.
+        // Manually verified live end-to-end under the EXACT commands this
+        // platform generates: `bunx --bun next build` (real production build,
+        // compiled the middleware bundle) then `bun run --bun start` (== the
+        // `["bun","run","--bun","start"]` this test asserts) — the middleware
+        // executed correctly (`x-middleware-ran: true` on every response) and
+        // the page rendered correctly. Next.js sandboxes middleware in its own
+        // Edge Runtime regardless of the host process, so middleware behavior
+        // is identical under Node and Bun by construction — this fixture and
+        // its live verification are the proof, not an assumption.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-next-middleware");
+        assert!(dir.exists(), "fixture missing: {}", dir.display());
+
+        let framework = fluid_build::detect(&dir);
+        assert_eq!(framework.slug, "nextjs", "must detect as plain Next.js (no OpenNext/vinext adapter here)");
+        assert_eq!(framework.build_command, "next build");
+
+        let vc = fluid_build::load_vercel_config(&dir).expect("vercel.json must parse");
+        let runtime = vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str);
+        assert_eq!(runtime, Some(hive_core::Runtime::Bun));
+
+        let pm = fluid_build::detect_package_manager(&dir);
+        assert_eq!(pm.manager, "bun");
+
+        // The exact command the real deploy pipeline would run to serve this
+        // app (package.json has `"start": "next start"`).
+        let start = detect_start_cmd(&dir, runtime).await;
+        assert_eq!(start, vec!["bun", "run", "--bun", "start"]);
+    }
+
+    #[tokio::test]
+    async fn bun_monorepo_example_fixture_detected_as_monorepo_with_bun_pm() {
+        // `examples/bun-monorepo` is a REAL Bun workspace (root
+        // `"workspaces": ["packages/*"]` + root `bun.lock`, `packages/api`
+        // depends on `packages/shared` via `workspace:*`). Manually verified
+        // live: a real `bun install` at the root correctly symlinked
+        // `packages/api/node_modules/@acme/shared -> ../../../shared`, and
+        // `packages/api`'s server (run via the platform's exact
+        // `bun run --bun start` invocation) correctly imported and called
+        // into the shared package under genuine Bun. This test proves the
+        // PLATFORM's OWN monorepo-detection functions recognize this shape.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-monorepo");
+        let api_dir = repo_root.join("packages/api");
+        assert!(api_dir.exists(), "fixture missing: {}", api_dir.display());
+
+        assert!(is_workspace_root(&repo_root).await, "root package.json has a \"workspaces\" field");
+        assert!(uses_workspace_protocol(&api_dir).await, "packages/api depends on shared via workspace:*");
+        let is_monorepo = api_dir != repo_root && uses_workspace_protocol(&api_dir).await && is_workspace_root(&repo_root).await;
+        assert!(is_monorepo, "must be recognized as a monorepo member, matching build_via_fdi's own condition");
+
+        // Package-manager detection at the ROOT (where a monorepo installs)
+        // must pick bun via the root bun.lock.
+        let pm = fluid_build::detect_package_manager(&repo_root);
+        assert_eq!(pm.manager, "bun");
+        assert_eq!(pm.source, fluid_build::PackageManagerSource::BunLock);
+
+        // The subdirectory's own vercel.json still resolves the runtime
+        // independently of the monorepo-root package-manager detection —
+        // runtime resolution and monorepo/install-dir resolution are
+        // orthogonal concerns, exactly like runtime vs. package manager.
+        let vc = fluid_build::load_vercel_config(&api_dir).expect("packages/api/vercel.json must parse");
+        assert_eq!(
+            vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str),
+            Some(hive_core::Runtime::Bun)
+        );
+
+        let start = detect_start_cmd(&api_dir, Some(hive_core::Runtime::Bun)).await;
+        assert_eq!(start, vec!["bun", "run", "--bun", "start"]);
+    }
+
+    #[test]
     fn container_build_file_detects_dockerfile_and_containerfile() {
         let dir = std::env::temp_dir().join(format!("hive-cf-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2801,11 +3660,30 @@ mod tests {
 
     #[test]
     fn container_manifest_carries_protocol() {
-        let m = container_manifest("proj", "img:tag", 50051, "grpc");
+        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0);
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].protocol_or_http(), "grpc");
         assert!(m.functions[0].needs_raw_proxy());
-        assert_eq!(m.functions[0].start_cmd, vec!["__container__", "img:tag", "50051"]);
+        assert_eq!(&m.functions[0].start_cmd[..3], &["__container__", "img:tag", "50051"]);
+        // start_cmd[3] now carries the automatic persistent-volume run-config.
+        let cfg: serde_json::Value = serde_json::from_str(&m.functions[0].start_cmd[3]).unwrap();
+        assert_eq!(cfg["vol"], "hive-vol-proj");
+        assert_eq!(m.functions[0].memory_mib, 0, "0 = use the node's generous default (not 512m)");
+    }
+
+    #[test]
+    fn container_memory_override_parses_and_bakes_into_manifest() {
+        // fluid.json { container: { memory: "4g" } } → 4096 MiB on the manifest.
+        let o = parse_container_override(r#"{"container":{"memory":"4g"}}"#);
+        assert_eq!(o.memory.as_deref(), Some("4g"));
+        assert_eq!(parse_mem_mib("4g"), 4096);
+        assert_eq!(parse_mem_mib("2048m"), 2048);
+        assert_eq!(parse_mem_mib("1.5g"), 1536);
+        assert_eq!(parse_mem_mib("512"), 512);
+        assert_eq!(parse_mem_mib(""), 0);
+        assert_eq!(parse_mem_mib("garbage"), 0);
+        let m = container_manifest("proj", "img:tag", 8080, "http", 4096);
+        assert_eq!(m.functions[0].memory_mib, 4096);
     }
 
     #[tokio::test]
@@ -2865,6 +3743,18 @@ mod tests {
         let forged = artifact_sig("wrong", bytes);
         assert!(verify_pulled_artifact(bytes, Some(&good_sha), Some(&forged)).is_err(), "forged sig rejected");
         std::env::remove_var("HIVE_ARTIFACT_SECRET");
+
+        // REGRESSION: key separation (#73) — with no HIVE_ARTIFACT_SECRET but
+        // HIVE_JWT_SECRET set, artifact_secret() must return a DERIVED key,
+        // never the raw JWT secret verbatim (reusing one symmetric key for two
+        // unrelated HMAC purposes means compromising one compromises both).
+        std::env::set_var("HIVE_JWT_SECRET", "jwt-root-secret");
+        let derived = artifact_secret().expect("must derive a fallback key from HIVE_JWT_SECRET");
+        assert_ne!(derived, "jwt-root-secret", "must never reuse the raw JWT secret verbatim");
+        // Deterministic (same root -> same derived key every time).
+        assert_eq!(artifact_secret().as_deref(), Some(derived.as_str()));
+        std::env::remove_var("HIVE_JWT_SECRET");
+        assert!(artifact_secret().is_none(), "no secret configured at all -> None");
     }
 
     #[test]
@@ -2953,6 +3843,147 @@ mod tests {
         }
     }
 
+    #[test]
+    fn warmup_bun_bin_never_panics_and_points_at_a_real_binary() {
+        // Real host lookup (Homebrew/~/.bun/bin/system) — may be Some or None
+        // depending on the host, must not panic, and if Some must be executable.
+        if let Some(bin) = warmup_bun_bin() {
+            assert!(std::path::Path::new(&bin).is_file(), "warmup_bun_bin returned a non-existent path: {bin}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bun_version_reads_a_real_version_string() {
+        // This build host has a real `bun` installed — exercise the actual
+        // subprocess call (no mocking) and confirm it parses a real version.
+        let Some(bin) = which_bun() else { return }; // skip on a host with no bun
+        let v = bun_version(&bin).await.expect("bun --version must succeed on a real bun binary");
+        assert!(v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false), "unexpected bun --version output: {v}");
+    }
+
+    #[test]
+    fn bun_bundle_entry_accepts_plain_bun_invocations() {
+        assert_eq!(bun_bundle_entry(&["bun".into(), "server.js".into()]), Some("server.js".into()));
+        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "server.js".into()]), Some("server.js".into()));
+        assert_eq!(
+            bun_bundle_entry(&["/usr/local/bin/bun".into(), "index.mjs".into()]),
+            Some("index.mjs".into()),
+            "must match on basename, not just literal \"bun\""
+        );
+    }
+
+    #[test]
+    fn bun_bundle_entry_rejects_cli_wrapper_invocations() {
+        // Vercel's own documented Next.js+Bun form — a CLI wrapper, not a
+        // bundleable entry file. Must be explicitly rejected, not guessed at.
+        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "--bun".into(), "next".into(), "start".into()]), None);
+        assert_eq!(bun_bundle_entry(&["bunx".into(), "--bun".into(), "next".into(), "start".into()]), None);
+        assert_eq!(bun_bundle_entry(&["node".into(), "server.js".into()]), None);
+        assert_eq!(bun_bundle_entry(&[]), None);
+        // `detect_start_cmd`'s own package.json#scripts.start shape
+        // (`["bun","run","--bun","start"]`) — a script-NAME, not a file path —
+        // must also be rejected (there is nothing to bundle; "start" doesn't
+        // resolve to a file on disk).
+        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "--bun".into(), "start".into()]), None);
+    }
+
+    #[tokio::test]
+    async fn detect_start_cmd_regression_scripts_start_forces_real_bun_not_node() {
+        // REGRESSION TEST for a real bug found via live verification: a
+        // `package.json` with `"scripts": {"start": "node server.js"}` (the
+        // single most common real-world shape — it's what `npm init`/most
+        // hand-authored package.jsons emit) previously produced
+        // `["bun","run","start"]` under an explicit Bun runtime. That
+        // literally re-executes the script's own text ("node server.js") —
+        // Bun's script-runner treats package.json scripts as shell commands,
+        // so it spawned REAL Node, silently defeating the Bun runtime choice.
+        // Verified live: `bun run start` on such a script reported
+        // `process.versions.bun === null`; `bun run --bun start` reported the
+        // real Bun version. `detect_start_cmd` must always include `--bun`.
+        let dir = std::env::temp_dir().join(format!("hive-detect-start-cmd-bun-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&dir.join("package.json"), r#"{"scripts":{"start":"node server.js"}}"#).unwrap();
+        let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
+        assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
+        // The Node path must stay byte-for-byte identical to before.
+        let cmd_node = detect_start_cmd(&dir, None).await;
+        assert_eq!(cmd_node, vec!["npm", "start"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bun_express_api_example_fixture_gets_the_bun_flag() {
+        // Runs the REAL `detect_start_cmd` against the checked-in
+        // `examples/bun-express-api` fixture — the exact repo shape that
+        // exposed the `--bun` bug above (manually verified live both ways).
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-express-api");
+        assert!(dir.exists(), "fixture missing: {}", dir.display());
+        let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
+        assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
+    }
+
+    #[tokio::test]
+    async fn bun_hono_api_example_fixture_resolves_bun_start() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-hono-api");
+        assert!(dir.exists(), "fixture missing: {}", dir.display());
+        let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
+        assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
+    }
+
+    #[tokio::test]
+    async fn warmup_bun_bytecode_real_bundle_and_bytecode_cache() {
+        // Real end-to-end exercise of the actual Bun mechanism this function
+        // wraps (no mocks): bundle a real entry file with `bun build --bytecode`
+        // and confirm the .jsc bytecode sidecar + .map source map land exactly
+        // where `warmup_bun_bytecode`'s own success path expects them, using the
+        // SAME `bun` binary resolution (`warmup_bun_bin`) the real code path uses.
+        let Some(bun_bin) = warmup_bun_bin() else { return }; // skip on a host with no bun
+        let dir = std::env::temp_dir().join(format!("hive-bun-bytecode-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("server.js"),
+            "Bun.serve({port: Number(process.env.PORT||0), fetch(){return new Response('ok')}});",
+        )
+        .unwrap();
+        let outdir = dir.join(".hive-bun-bytecode");
+        let out = tokio::process::Command::new(&bun_bin)
+            .arg("build")
+            .arg("--bytecode")
+            .arg("--sourcemap=external")
+            .arg("--target=bun")
+            .arg(format!("--outdir={}", outdir.to_string_lossy()))
+            .arg(dir.join("server.js"))
+            .current_dir(&dir)
+            .output()
+            .await
+            .expect("bun build must run");
+        assert!(out.status.success(), "bun build failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(outdir.join("server.js").is_file(), "bundled entry missing");
+        assert!(outdir.join("server.js.jsc").is_file(), "bytecode sidecar missing — bytecode cache did not activate");
+        assert!(outdir.join("server.js.map").is_file(), "external source map missing");
+        // `bun run` on the bundled file must actually execute correctly (the whole
+        // point — a cache that produces an unrunnable artifact is worse than none).
+        let run = tokio::process::Command::new(&bun_bin)
+            .arg("run")
+            .arg(outdir.join("server.js"))
+            .env("PORT", "0")
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        if let Ok(mut child) = run {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // Still alive (didn't crash on boot) — good enough signal without a
+            // full HTTP round trip; kill it immediately after.
+            let alive = child.try_wait().ok().flatten().is_none();
+            let _ = child.start_kill();
+            assert!(alive, "bundled+bytecode-cached server crashed immediately on boot");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn cache_key_is_deterministic_and_content_sensitive() {
         let base = std::env::temp_dir().join(format!("oe-cachekey-{}", now_ms()));
@@ -3010,5 +4041,38 @@ mod tests {
         assert_eq!(b.lines[0].line, "building…");
         assert!(b.finished_ms.is_some());
         assert_eq!(store.list().len(), 1);
+    }
+
+    #[test]
+    fn build_log_redaction_matches_run_streamed_wiring() {
+        // REGRESSION TEST for a real, confirmed vulnerability: `run_streamed`
+        // used to inject decrypted project env vars into the build process
+        // and persist stdout/stderr verbatim — a build script that echoes env
+        // (verbose install-tool dumps, or a one-line `"prebuild": "env"`)
+        // leaked every real secret in cleartext into the team-readable build
+        // log. Exercises the EXACT expression `run_streamed` now runs on every
+        // line: collect `env.values()` into the redaction list, then
+        // `sandboxes::redact_secrets`.
+        let mut env: std::collections::BTreeMap<String, String> = Default::default();
+        env.insert("DATABASE_URL".into(), "postgres://u:sup3rSecr3t@host/db".into());
+        env.insert("STRIPE_SECRET_KEY".into(), "sk_live_abc123xyz".into());
+        env.insert("NODE_ENV".into(), "production".into());
+
+        let secret_values: Vec<String> = env.values().filter(|v| !v.is_empty()).cloned().collect();
+
+        let line = "prebuild: DATABASE_URL=postgres://u:sup3rSecr3t@host/db STRIPE_SECRET_KEY=sk_live_abc123xyz NODE_ENV=production npm WARN deprecated left-pad@1.0.0";
+        let redacted = crate::sandboxes::redact_secrets(line, &secret_values);
+
+        assert!(!redacted.contains("sup3rSecr3t"), "DB password must be redacted: {redacted}");
+        assert!(!redacted.contains("sk_live_abc123xyz"), "Stripe key must be redacted: {redacted}");
+        // Conservative-by-design: EVERY injected env value gets redacted, not
+        // just ones that look like secrets (matching sandboxes_platform.rs's
+        // identical "redact every value" convention) — so NODE_ENV's value
+        // disappears too, a deliberate false-positive tradeoff.
+        assert!(!redacted.contains("=production"), "every injected value is redacted, including non-secret-looking ones: {redacted}");
+        assert!(redacted.contains("[REDACTED]"), "must show a redaction marker: {redacted}");
+        // Content that was NEVER an injected env value (ordinary build-tool
+        // chatter) must survive untouched.
+        assert!(redacted.contains("npm WARN deprecated left-pad@1.0.0"), "unrelated log content must survive: {redacted}");
     }
 }

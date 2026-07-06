@@ -66,6 +66,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/deployments", get(dep_list).post(dep_create))
         .route("/v1/deployments/:id", delete(dep_delete))
         .route("/v1/deployments/:id/resources", get(deployment_resources))
+        .route("/v1/deployments/:id/build", get(deployment_build))
+        .route("/v1/deployments/:id/service-graph", get(deployment_service_graph))
         .route("/v1/deployments/:id/promote", post(dep_promote))
         .route("/v1/projects/:project", delete(project_delete))
         .route("/v1/projects/:project/redeploy", post(project_redeploy))
@@ -76,12 +78,15 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/deploy/zip",
             post(deploy_zip).layer(DefaultBodyLimit::max(12 * 1024 * 1024)),
         )
+        // Run a PRE-BUILT image from any registry (Docker Hub / Quay / arbitrary).
+        .route("/v1/deploy/image", post(deploy_image))
         .route("/v1/fleet-deployments", get(fleet_deployments))
         .route("/v1/builds/:id", get(build_get))
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
         .route("/v1/nodes/announce", post(node_announce))
         .route("/v1/token", post(mint_token))
+        .route("/v1/whoami", get(whoami))
         .route("/v1/auth", get(auth_status))
         .route("/v1/regions/catalog", get(region_catalog))
         .route("/v1/projects/:project/settings", get(project_settings_get))
@@ -89,6 +94,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/functions", put(project_functions_put))
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
+        .route("/v1/projects/:project/service-graph", get(project_service_graph))
         .route("/v1/projects/:project/domains", post(project_domain_add))
         .route("/v1/projects/:project/team", put(project_team_put))
         .route("/v1/domains", get(domains_list))
@@ -115,6 +121,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- API keys (tenant-scoped platform tokens) ----
         .route("/v1/apikeys", get(apikeys_list).post(apikey_create))
         .route("/v1/apikeys/:id", delete(apikey_revoke))
+        // ---- Connected integrations (consumable via the Vercel-compatible SDK) ----
+        .route("/v1/integrations", get(integrations_list).post(integration_upsert))
+        .route("/v1/integrations/:id", get(integration_get).delete(integration_delete))
+        .route("/v1/integrations/:id/credentials", get(integration_credentials))
         // ---- Webhooks ----
         .route("/v1/webhooks", get(webhooks_all).post(webhook_create_team))
         .route("/v1/webhooks/events", get(webhook_events))
@@ -123,10 +133,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/webhooks", get(webhooks_for_project).post(webhook_create))
         // ---- Databases / storage ----
         .route("/v1/databases", get(databases_list).post(database_create))
+        .route("/v1/db-directory", get(db_directory))
         .route("/v1/admin/databases", get(admin_databases_all))
         .route("/v1/databases/:id", get(database_get).delete(database_delete))
         .route("/v1/databases/:id/credentials", get(database_credentials))
         .route("/v1/projects/:project/databases", get(databases_for_project))
+        // Mesh-internal: register/remove a cross-region replica of a database.
+        .route("/v1/databases/replica", post(database_replica))
         // Functional storage REST surface (Blob / Queue / Vector).
         .route("/v1/storage/blob/:bucket", get(blob_list_keys))
         .route("/v1/storage/blob/:bucket/:key", get(blob_get).put(blob_put))
@@ -162,6 +175,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // ---- Billing & compute credits ----
         .route("/v1/billing", get(billing_get))
         .route("/v1/billing/ledger", get(billing_ledger))
+        .route("/v1/billing/invoices", get(billing_invoices))
         .route("/v1/billing/checkout", post(billing_checkout))
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
         .route("/v1/billing/confirm", post(billing_confirm))
@@ -171,6 +185,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
         .route("/v1/incidents", get(incidents_list).post(incident_open))
         .route("/v1/incidents/:id/updates", post(incident_update))
+        // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,
+        //      deployment protection, microfrontends, conformance) ----
+        .merge(crate::enterprise_api::routes())
+        // ---- Platform-native Microfrontends (project-scoped groups/members/config) ----
+        .merge(crate::microfrontends_api::routes())
+        // ---- Platform-native Sandboxes (isolated on-demand Linux environments) ----
+        .merge(crate::sandboxes_api::routes())
         .with_state(cloud);
     // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
@@ -186,21 +207,141 @@ struct TokenReq {
     sub: String,
     #[serde(default = "default_tenant")]
     tenant: String,
-    #[serde(default = "default_role")]
+    // No default: the caller must explicitly request the role it needs. A
+    // silent "owner" default meant every mint (even one that forgot to specify
+    // a role) came back with the highest tenant-scoped role.
+    #[serde(default)]
     role: String,
+    /// The verified account email (from the trusted dashboard server's own
+    /// Clerk session, never client-supplied trust) — used ONLY to
+    /// independently derive `platform_admin` against this backend's own
+    /// `owner_email`. Never trust a client-supplied `platform_admin` boolean.
+    #[serde(default)]
+    email: String,
 }
 fn default_sub() -> String { "user".into() }
 fn default_tenant() -> String { "default".into() }
-fn default_role() -> String { "owner".into() }
+
+/// Constant-time byte comparison for secret/token equality checks — ordinary
+/// `==` on a `str`/`[u8]` short-circuits on the first mismatched byte, which is
+/// a timing side-channel for comparing a caller-supplied value against a
+/// stored secret (bearer tokens, shared internal secrets, password hashes).
+pub(crate) fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
 
 async fn auth_status() -> Json<Value> {
     Json(json!({ "enforced": crate::auth::enforced() }))
 }
 
-async fn mint_token(Json(req): Json<TokenReq>) -> Result<Json<Value>, (StatusCode, String)> {
-    match crate::auth::issue(&req.sub, &req.tenant, &req.role, 8 * 3600) {
-        Ok(token) => Ok(Json(json!({ "token": token, "expires_in": 8 * 3600 }))),
+/// Whether a token-mint request is permitted.
+/// * Dev (no `HIVE_JWT_SECRET`): open — minted tokens aren't verified anyway, so
+///   this preserves the current local flow.
+/// * Enforced (`HIVE_JWT_SECRET` set): the mint is a privileged operation (it can
+///   assert ANY tenant), so it MUST come from the trusted dashboard server,
+///   proven by `x-hive-internal == HIVE_INTERNAL_TOKEN`. Fail CLOSED if the
+///   internal token isn't configured — never allow open minting when enforced.
+fn mint_allowed(headers: &HeaderMap) -> bool {
+    if !crate::auth::enforced() {
+        return true;
+    }
+    match std::env::var("HIVE_INTERNAL_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => headers
+            .get("x-hive-internal")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| ct_eq(v, &t))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+/// Dedicated, tight rate limit on the token-mint endpoint — independent of the
+/// tenant-facing edge pipeline's limiter (which doesn't even run in front of
+/// the admin router, see the separate rate-limiting audit finding). `/v1/token`
+/// is the platform's effective login/credential-mint endpoint, so repeated
+/// guesses of `HIVE_INTERNAL_TOKEN` must be throttled independently of every
+/// other route. 20 attempts / 60s per client IP, shared across the process.
+fn mint_rate_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| hive_edge::RateLimiter::new(20, 60_000))
+}
+
+/// Fleet-wide budget for the WHOLE admin/control-plane router — this surface
+/// previously had NO rate limiting of its own at all (the tenant-facing edge
+/// pipeline's WAF/limiter only wraps the deployment-serving router, never this
+/// one), so a compromised dashboard session or a brute-force script could hit
+/// every `/v1/*` admin route unbounded. 600 req/60s per client IP is generous
+/// enough for legitimate dashboard polling (team switches, build/deployment
+/// lists, live logs) while still bounding real abuse. Independent of
+/// `mint_rate_limiter` (tighter, /v1/token-only) and the tenant edge limiter.
+fn admin_rate_limiter() -> &'static hive_edge::RateLimiter {
+    static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+    LIMITER.get_or_init(|| hive_edge::RateLimiter::new(600, 60_000))
+}
+
+/// Outermost layer on the admin router (see `main.rs`): sheds excess requests
+/// by real TCP peer address before any auth/handler work runs.
+pub async fn admin_rate_limit(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if !admin_rate_limiter().check(&peer.ip().to_string(), now_ms()) {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response();
+    }
+    next.run(req).await
+}
+
+async fn mint_token(
+    State(c): State<Arc<CloudState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<TokenReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Real TCP peer address — no reverse proxy sits in front of the admin
+    // listener on any fleet node, so a client-supplied `x-forwarded-for` (the
+    // previous source here) is pure attacker-controlled input that lets a
+    // caller reset their own rate-limit bucket at will just by changing it.
+    let ip = peer.ip().to_string();
+    if !mint_rate_limiter().check(&ip, hive_core::now_ms()) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "too many token requests".into()));
+    }
+    if !mint_allowed(&headers) {
+        return Err((StatusCode::FORBIDDEN, "token minting is server-only (x-hive-internal required)".into()));
+    }
+    // Independently derive platform-operator status from THIS backend's own
+    // owner_email config — never trust a client-supplied claim for it. Mirrors
+    // the identity/sync owner check (admin.rs `is_owner` above).
+    let platform_admin = !c.owner_email.trim().is_empty()
+        && !req.email.trim().is_empty()
+        && req.email.trim().eq_ignore_ascii_case(c.owner_email.trim());
+    // 1-hour tokens; the dashboard re-mints on load + periodically. Short-lived so
+    // a leaked cookie expires quickly.
+    let ttl = 3600i64;
+    match crate::auth::issue(&req.sub, &req.tenant, &req.role, platform_admin, ttl) {
+        Ok(token) => Ok(Json(json!({ "token": token, "expires_in": ttl }))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e.to_string())),
+    }
+}
+
+/// Echo the verified caller identity (tenant/role/sub) so the dashboard can
+/// confirm its session mapping. Reads the JWT claims bound by `require_auth`
+/// (from Bearer or the `hive_jwt` cookie); returns `authenticated:false` in dev.
+async fn whoami(headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+    if let Some(c) = claims.as_ref().map(|e| &e.0) {
+        return Json(json!({ "authenticated": true, "sub": c.sub, "tenant": c.tenant, "role": c.role, "enforced": crate::auth::enforced() }));
+    }
+    // Not bound by middleware (e.g. dev pass-through) — try a best-effort verify so
+    // the endpoint is useful when called directly.
+    let tok = crate::auth::extract_token(&headers);
+    match tok.and_then(|t| crate::auth::verify(&t).ok()) {
+        Some(c) => Json(json!({ "authenticated": true, "sub": c.sub, "tenant": c.tenant, "role": c.role, "enforced": crate::auth::enforced() })),
+        None => Json(json!({ "authenticated": false, "enforced": crate::auth::enforced() })),
     }
 }
 
@@ -239,18 +380,27 @@ async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(out))
 }
 
-async fn project_settings_get(State(c): State<Arc<CloudState>>, Path(project): Path<String>) -> Json<Value> {
-    Json(json!(c.projects.get_masked(&project)))
+async fn project_settings_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 async fn project_build_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(build): Json<crate::project_settings::BuildConfig>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_build(&project, build);
     crate::persist::persist(&c);
-    Json(json!(c.projects.get_masked(&project)))
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 /// The tier (hobby/pro/enterprise) of the team owning a project.
@@ -261,9 +411,12 @@ fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
 
 async fn project_functions_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(mut f): Json<crate::project_settings::FunctionSettings>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     // Enforce plan limits: runtime cap (Enterprise = 1h) and Enterprise-only
     // automatic multi-region fail-over.
     let plan = team_plan(&c, &project);
@@ -275,26 +428,33 @@ async fn project_functions_put(
     // this flag; the setting should reflect what the operator selected.)
     c.projects.set_functions(&project, f);
     crate::persist::persist(&c);
-    Json(json!(c.projects.get_masked(&project)))
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 async fn project_env_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // Keep-secret + upsert-by-key semantics live in `put_env` (see there).
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
-    Json(json!(c.projects.get_masked(&project)))
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 async fn project_env_delete(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((project, key)): Path<(String, String)>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.delete_env(&project, &key);
     crate::persist::persist(&c);
-    Json(json!(c.projects.get_masked(&project)))
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 // ---- Domains ----
@@ -306,9 +466,12 @@ struct AddDomain {
 
 async fn project_domain_add(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(b): Json<AddDomain>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let ok = c.gw.add_alias(&b.domain, &project);
     if !ok {
         return Err((StatusCode::NOT_FOUND, format!("no deployment for project '{project}'")));
@@ -444,8 +607,13 @@ pub(crate) async fn deployment_resources(State(c): State<Arc<CloudState>>, heade
 
 /// Full domain record (DNS records, nameservers, free SSL cert, metadata).
 /// Creates a sensible default on first view.
-async fn domain_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+async fn domain_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     // Connected projects: projects in this tenant whose domain ends with this one.
     let connected: Vec<Value> = c
         .projects
@@ -454,7 +622,7 @@ async fn domain_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims
         .filter(|(p, d)| norm(&c.projects.team_of(p)) == t && (d == &domain || d.ends_with(&format!(".{domain}"))))
         .map(|(p, d)| json!({ "project": p, "domain": d }))
         .collect();
-    Json(json!({ "domain": c.domains.ensure(&domain, &t), "connected": connected }))
+    Ok(Json(json!({ "domain": c.domains.ensure(&domain, &t), "connected": connected })))
 }
 
 #[derive(Deserialize)]
@@ -475,9 +643,14 @@ fn default_dns_ttl() -> u32 {
     60
 }
 
-async fn domain_add_record(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>, Json(r): Json<AddRecordReq>) -> Result<Json<Value>, StatusCode> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+async fn domain_add_record(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+    Json(r): Json<AddRecordReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let rec = crate::dns::DnsRecord {
         id: String::new(),
         name: r.name,
@@ -489,20 +662,25 @@ async fn domain_add_record(State(c): State<Arc<CloudState>>, headers: HeaderMap,
         created_ms: 0,
         system: false,
     };
-    let added = c.domains.add_record(&domain, rec).ok_or(StatusCode::NOT_FOUND)?;
+    let added = c.domains.add_record(&domain, rec).ok_or((StatusCode::NOT_FOUND, "no such domain".into()))?;
     c.audit.record(&t, "user", "create", "dns_record", &added.id, &format!("{} {} → {} ({domain})", added.kind, added.name, added.value));
     crate::persist::persist(&c);
     Ok(Json(json!(added)))
 }
 
-async fn domain_delete_record(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path((domain, id)): Path<(String, String)>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+async fn domain_delete_record(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path((domain, id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let ok = c.domains.delete_record(&domain, &id);
     if ok {
         c.audit.record(&t, "user", "delete", "dns_record", &id, &domain);
         crate::persist::persist(&c);
     }
-    Json(json!({ "deleted": ok }))
+    Ok(Json(json!({ "deleted": ok })))
 }
 
 /// Edit an existing DNS record (system records are immutable).
@@ -512,12 +690,12 @@ async fn domain_update_record(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((domain, id)): Path<(String, String)>,
     Json(r): Json<AddRecordReq>,
-) -> Result<Json<Value>, StatusCode> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner_if_exists(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let updated = c
         .domains
         .update_record(&domain, &id, r.name, r.kind.to_uppercase(), r.value, r.ttl, r.priority, r.comment)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or((StatusCode::NOT_FOUND, "no such record".into()))?;
     c.audit.record(&t, "user", "update", "dns_record", &updated.id, &format!("{} {} → {} ({domain})", updated.kind, updated.name, updated.value));
     crate::persist::persist(&c);
     Ok(Json(json!(updated)))
@@ -542,9 +720,8 @@ async fn domain_import_records(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(domain): Path<String>,
     Json(req): Json<ImportReq>,
-) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let mut recs: Vec<crate::dns::DnsRecord> = req
         .records
         .into_iter()
@@ -568,15 +745,19 @@ async fn domain_import_records(
         c.audit.record(&t, "user", "import", "dns_record", &domain, &format!("imported {} record(s)", added.len()));
         crate::persist::persist(&c);
     }
-    Json(json!({ "imported": added.len(), "records": added }))
+    Ok(Json(json!({ "imported": added.len(), "records": added })))
 }
 
 /// Detect a domain's CURRENT public DNS records (via DNS-over-HTTPS) so a user can
 /// migrate them into the console with one click. Best-effort: returns whatever
 /// resolves. Records are NOT added — the client imports the ones it wants.
-async fn domain_scan_dns(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+async fn domain_scan_dns(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let mut found: Vec<Value> = Vec::new();
     // (query host suffix, record type) — apex + a few common subdomains.
     let queries: &[(&str, &str)] = &[
@@ -627,7 +808,7 @@ async fn domain_scan_dns(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
     }
     // De-dupe identical suggestions.
     found.dedup_by(|a, b| a.to_string() == b.to_string());
-    Json(json!({ "domain": domain, "records": found }))
+    Ok(Json(json!({ "domain": domain, "records": found })))
 }
 
 /// DoH numeric record type → name (the subset we surface).
@@ -703,13 +884,18 @@ struct NameserversReq {
     nameservers: Vec<String>,
 }
 
-async fn domain_set_nameservers(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>, Json(r): Json<NameserversReq>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+async fn domain_set_nameservers(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+    Json(r): Json<NameserversReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     c.domains.set_nameservers(&domain, r.nameservers);
     c.audit.record(&t, "user", "update", "nameservers", &domain, "");
     crate::persist::persist(&c);
-    Json(json!(c.domains.get(&domain)))
+    Ok(Json(json!(c.domains.get(&domain))))
 }
 
 #[derive(Deserialize)]
@@ -717,21 +903,30 @@ struct AutoRenewReq {
     on: bool,
 }
 
-async fn domain_set_auto_renew(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>, Json(r): Json<AutoRenewReq>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+async fn domain_set_auto_renew(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+    Json(r): Json<AutoRenewReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     c.domains.set_auto_renew(&domain, r.on);
     crate::persist::persist(&c);
-    Json(json!(c.domains.get(&domain)))
+    Ok(Json(json!(c.domains.get(&domain))))
 }
 
-async fn domain_renew_ssl(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(domain): Path<String>) -> Json<Value> {
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.domains.ensure(&domain, &t);
+async fn domain_renew_ssl(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(domain): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require_domain_owner(&c, &headers, claims.as_ref().map(|e| &e.0), &domain)?;
     let cert = c.domains.renew_ssl(&domain);
     c.audit.record(&t, "user", "update", "ssl_cert", &domain, "reissued free certificate");
     crate::persist::persist(&c);
-    Json(json!(cert))
+    Ok(Json(json!(cert)))
 }
 
 // ---- Git deploy (Import Git Repository) ----
@@ -740,7 +935,6 @@ async fn domain_renew_ssl(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
 /// (global), so two projects can't share a name. A genuine redeploy (same name +
 /// same repo + same tenant) keeps its name; anything else gets a `-N` suffix.
 fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenant: &str) -> String {
-    let existing = c.projects.snapshot();
     let base = if desired.trim().is_empty() {
         crate::git::project_name_from_url(repo_url)
     } else {
@@ -748,13 +942,13 @@ fn unique_project_name(c: &Arc<CloudState>, desired: &str, repo_url: &str, tenan
     };
     // Case-insensitive collision check: `<project>.localhost` aliases are global
     // and host routing is case-insensitive, so "Foo" and "foo" must not coexist.
-    let existing_ci = |name: &str| existing.keys().find(|k| k.eq_ignore_ascii_case(name)).cloned();
+    // Uses find_key_ci (key-only, no full-map clone) on this hot deploy path.
+    let existing_ci = |name: &str| c.projects.find_key_ci(name);
     let Some(hit) = existing_ci(&base) else {
         return base; // free — use it
     };
     // Redeploy of the same project (same repo + tenant) → keep the name.
-    let cur = existing.get(&hit);
-    let same_tenant = cur.map(|c| norm(&c.team) == tenant).unwrap_or(false);
+    let same_tenant = norm(&c.projects.team_of(&hit)) == tenant;
     let same_repo = c
         .gw
         .git_for_project(&hit)
@@ -806,9 +1000,10 @@ pub(crate) async fn start_named_deploy(
     // so a new deployment is never misread as a colliding new-project create.
     let redeploy_existing = req.redeploy
         && !requested.trim().is_empty()
-        && c.projects.snapshot().iter().any(|(k, v)| {
-            k.eq_ignore_ascii_case(requested.trim()) && norm(&v.team) == t
-        });
+        && c.projects
+            .find_key_ci(requested.trim())
+            .map(|k| norm(&c.projects.team_of(&k)) == t)
+            .unwrap_or(false);
     let project = if (req.no_fanout || redeploy_existing) && !requested.trim().is_empty() {
         requested.trim().to_string()
     } else {
@@ -823,6 +1018,38 @@ pub(crate) async fn start_named_deploy(
             StatusCode::CONFLICT,
             format!("A project named \"{}\" already exists. Choose a different name.", requested.trim()),
         ));
+    }
+    // ---- Business locking (plan quotas + credit gate) ----
+    // Only enforced on the COORDINATOR path (a `no_fanout` per-target dispatch has
+    // already passed the gate on the coordinator; re-checking would double-reject or
+    // block a legitimate placement). Redeploys of an existing project don't count
+    // against the project cap.
+    if !req.no_fanout {
+        let is_new_project = !c
+            .projects
+            .snapshot()
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case(&project));
+        // Credit / included-compute lock: an exhausted Hobby account can't deploy.
+        if let Err(e) = c.billing.can_deploy(&t) {
+            return Err((StatusCode::PAYMENT_REQUIRED, e));
+        }
+        // Project-count quota for the plan.
+        if is_new_project {
+            let plan = c.billing.account(&t).plan;
+            let max = crate::billing::plan_max_projects(&plan);
+            if max > 0 {
+                let count = c.projects.count_for_team(&t) as u32;
+                if count >= max {
+                    return Err((
+                        StatusCode::PAYMENT_REQUIRED,
+                        format!(
+                            "Project limit reached ({count}/{max}) on the {plan} plan — upgrade to add more."
+                        ),
+                    ));
+                }
+            }
+        }
     }
     req.project = Some(project.clone());
     c.projects.set_team(&project, &t);
@@ -897,15 +1124,116 @@ pub(crate) async fn deploy_zip(
         function_settings: None,
         redeploy: false,
         zip_b64: Some(zip_b64),
+        image_ref: None,
+        image_port: None,
+    };
+    start_named_deploy(&c, &t, req).await
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct ImageDeployReq {
+    /// OCI image reference, e.g. `fruitbox12/simplifi:latest`, `quay.io/org/img:tag`.
+    image: String,
+    #[serde(default)]
+    project: Option<String>,
+    /// Explicit container port; auto-detected from the image when omitted.
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    env: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    production: Option<bool>,
+    /// Fresh deployment of an EXISTING project (New Deployment modal) vs new project.
+    #[serde(default)]
+    redeploy: Option<bool>,
+}
+
+/// Deploy a PRE-BUILT container image from any registry. Skips clone + build: the
+/// target node pulls the image, auto-detects its port, attaches a persistent volume,
+/// and runs it with the project's env — riding the normal placement/fanout so it
+/// lands on a container-capable region node.
+pub(crate) async fn deploy_image(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(body): Json<ImageDeployReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let image = body.image.trim().to_string();
+    if image.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Provide an image reference, e.g. fruitbox12/simplifi:latest".into()));
+    }
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let req = fluid_core::GitDeployRequest {
+        // A synthetic source URL so the deployment record reads sensibly; the actual
+        // source is `image_ref` (no clone happens).
+        repo_url: format!("image://{image}"),
+        branch: None,
+        project: body.project,
+        creator: Some("you".into()),
+        production: body.production.unwrap_or(true),
+        target: None,
+        use_cache: true,
+        root_dir: None,
+        env: body.env,
+        no_fanout: false, // coordinator deploy → schedule + fanout to a container node
+        build_config: None,
+        function_settings: None,
+        redeploy: body.redeploy.unwrap_or(false),
+        zip_b64: None,
+        image_ref: Some(image),
+        image_port: body.port,
     };
     start_named_deploy(&c, &t, req).await
 }
 
 pub(crate) async fn build_get(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
-    c.builds.get(&id).map(|b| Json(json!(b))).ok_or(StatusCode::NOT_FOUND)
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let b = c.builds.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    // Team-scoped — this route previously had no ownership check at all, so
+    // any caller (even unauthenticated, since GET bypasses the JWT gate) who
+    // knew/guessed a build id could read another tenant's full build log.
+    if norm(&c.projects.team_of(&b.project)) != norm(&t) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!(b)))
+}
+
+/// The build behind a deployment — its status, timing, and full log lines — so the
+/// deployment detail page can show build logs (incl. a failed build's error). Newest
+/// matching build wins; scoped to the requesting team.
+pub(crate) async fn deployment_build(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Local build record (newest matching, team-scoped).
+    let mut builds: Vec<_> = c
+        .builds
+        .list()
+        .into_iter()
+        .filter(|b| b.deployment_id.as_deref() == Some(id.as_str()))
+        .filter(|b| norm(&c.projects.team_of(&b.project)) == norm(&t))
+        .collect();
+    builds.sort_by_key(|b| b.started_ms);
+    if let Some(b) = builds.pop() {
+        return Ok(Json(json!(b)));
+    }
+    // Not built here — the build (and its logs) live on the node that hosts this
+    // deployment. Proxy to it, exactly like deployment_resources does. The host has
+    // the record locally, so it answers directly and there's no re-proxy loop.
+    if let Some(node) = host_node_for_deployment(&c, &id) {
+        if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/build"), &t).await {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 /// Publish the host subdomains this node serves + its gateway URL, so peers can
@@ -1010,7 +1338,7 @@ async fn build_frameworks() -> Json<Value> {
 /// 3. **Dev mode only** (`!auth::enforced()`, i.e. `HIVE_JWT_SECRET` unset): the
 ///    dashboard's `x-hive-team` header, so unauthenticated local dev still works.
 /// 4. Default: `"personal"`.
-fn tenant(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>) -> String {
+pub(crate) fn tenant(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>) -> String {
     let header_team = h
         .get("x-hive-team")
         .and_then(|v| v.to_str().ok())
@@ -1040,9 +1368,21 @@ fn resolve_tenant(
         if let Some(team) = header_team {
             return team;
         }
+        // Dev default: the single local user is the platform owner ("personal").
+        return "personal".into();
     }
-    "personal".into()
+    // ENFORCED mode, no JWT claim and no API key: this request is UNAUTHENTICATED.
+    // It must NOT fall back to "personal" (the owner's namespace) — that would
+    // serve the owner's data to any unauthenticated read (the window before a
+    // user's hive_jwt cookie is minted, or any tokenless caller). Scope it to an
+    // anonymous namespace that owns NOTHING, so an unauthenticated read yields an
+    // empty result instead of leaking another tenant's data.
+    ANON_TENANT.into()
 }
+
+/// Namespace for unauthenticated requests under JWT enforcement — owns no data.
+/// Deliberately not a valid team slug so nothing is ever created under it.
+pub(crate) const ANON_TENANT: &str = "__anon__";
 
 /// If a valid platform API key is presented, return its team.
 fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
@@ -1055,8 +1395,126 @@ fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
 }
 
 /// Normalize an owner slug: empty/absent => "personal".
-fn norm(team: &str) -> &str {
+pub(crate) fn norm(team: &str) -> &str {
     if team.is_empty() { "personal" } else { team }
+}
+
+/// Multi-tenant ownership guard: resolve the caller's tenant and verify it owns
+/// `project`. Returns the tenant slug, or 403 when the project belongs to a
+/// different team. EVERY handler that takes a project name from the path/body
+/// and reads or mutates that project's state must call this — the path param is
+/// attacker-controlled, the tenant is not.
+pub(crate) fn require_project(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    project: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = tenant(c, h, claims);
+    let owner = c.projects.team_of(project);
+    if norm(&owner) == t {
+        Ok(t)
+    } else {
+        Err((StatusCode::FORBIDDEN, "project belongs to a different team".into()))
+    }
+}
+
+/// Multi-tenant ownership guard for TEAM-level resources: resolve the caller's
+/// tenant and verify it equals `slug` (a platform operator may act on any
+/// team). When `min_role` is non-empty, additionally require the caller's
+/// OWN role within that team (from the verified JWT claim — never
+/// client-supplied) to be one of the listed values. Every `/v1/teams/:slug*`
+/// handler must call this — the path `slug` is attacker-controlled, the
+/// caller's tenant/role are not.
+pub(crate) fn require_team(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    slug: &str,
+    min_role: &[&str],
+) -> Result<String, (StatusCode, String)> {
+    if claims.map(|cl| cl.platform_admin).unwrap_or(false) {
+        return Ok(tenant(c, h, claims));
+    }
+    let t = tenant(c, h, claims);
+    if norm(&t) != norm(slug) {
+        return Err((StatusCode::FORBIDDEN, "team belongs to a different tenant".into()));
+    }
+    if !min_role.is_empty() {
+        let role = claims.map(|cl| cl.role.as_str()).unwrap_or("");
+        if !min_role.contains(&role) {
+            return Err((StatusCode::FORBIDDEN, "insufficient team role for this action".into()));
+        }
+    }
+    Ok(t)
+}
+
+/// Multi-tenant ownership guard for DOMAIN resources: get-or-create the
+/// domain record (first registrant claims it, matching `DomainStore::ensure`'s
+/// existing semantics) and verify the caller's tenant owns it. Returns the
+/// tenant, or 403 when a DIFFERENT tenant already registered this domain
+/// string. `DomainStore` is keyed globally by the domain string with no
+/// built-in ownership check, so every `/v1/domains/:domain*` handler that
+/// creates-or-reads must call this.
+fn require_domain_owner(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    domain: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = tenant(c, h, claims);
+    let rec = c.domains.ensure(domain, &t);
+    if norm(&rec.tenant) != norm(&t) {
+        return Err((StatusCode::FORBIDDEN, "domain belongs to a different team".into()));
+    }
+    Ok(t)
+}
+
+/// Like [`require_domain_owner`] but does NOT create the domain record if it
+/// doesn't exist — for record-level edit/delete operations, where `ensure()`'s
+/// create-as-a-side-effect would be the wrong behavior for a domain nobody
+/// has registered yet. A missing domain is left for the underlying
+/// add/update/delete call to naturally report NOT_FOUND.
+fn require_domain_owner_if_exists(
+    c: &Arc<CloudState>,
+    h: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    domain: &str,
+) -> Result<String, (StatusCode, String)> {
+    let t = tenant(c, h, claims);
+    if let Some(rec) = c.domains.get(domain) {
+        if norm(&rec.tenant) != norm(&t) {
+            return Err((StatusCode::FORBIDDEN, "domain belongs to a different team".into()));
+        }
+    }
+    Ok(t)
+}
+
+/// Pure core of the platform-operator check (no env/global deps, so it's
+/// unit-testable without touching the process-global `HIVE_JWT_SECRET` other
+/// tests already own). Gate on `platform_admin`, NOT `role` — `role: "owner"`
+/// only ever means "owner of `tenant`", and every user is the owner of their
+/// own personal namespace. Using `role` here let any signed-up user reach
+/// global WAF/CDN/routing mutations. `platform_admin` is independently
+/// derived at mint time from this backend's own `owner_email`, never
+/// client-asserted.
+fn operator_allowed(claims: Option<&crate::auth::Claims>, enforced: bool) -> bool {
+    if !enforced {
+        return true;
+    }
+    matches!(claims, Some(cl) if cl.platform_admin)
+}
+
+/// Platform-operator guard for GLOBAL (non-tenant) infrastructure mutations —
+/// WAF rules, bot policy, CDN purge, routing, runtime-cache. When JWT auth is
+/// enforced, only a genuine platform operator may mutate; in dev (no
+/// enforcement) it's open, matching the rest of the dev-mode API.
+pub(crate) fn require_operator(claims: Option<&crate::auth::Claims>) -> Result<(), (StatusCode, String)> {
+    if operator_allowed(claims, crate::auth::enforced()) {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "platform-level change requires a platform operator".into()))
+    }
 }
 
 /// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
@@ -1157,12 +1615,18 @@ async fn dep_create(
     // Tag the deployment (and the cells it spawns) with the caller's tenant so
     // compute is partitioned per team — mirrors gw.deploy()'s defaults otherwise.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Honor the request's environment + git metadata (previously both were forced —
+    // `production=true`, `git=None` — which made preview deployments and
+    // commit-scoped routing, e.g. microfrontend fallback resolution, unreachable via
+    // this route). A project's first deploy still claims the production alias inside
+    // `deploy_full` even when `production=false`, so URLs resolve.
+    let creator = req.creator.clone().unwrap_or_else(|| "you".into());
     let info = c.gw.deploy_full(
         req.root,
         req.manifest,
-        "you".into(),
-        None,
-        true,
+        creator,
+        req.git,
+        req.production,
         fluid_core::DeployState::Ready,
         t,
     );
@@ -1179,20 +1643,29 @@ pub(crate) async fn dep_promote(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
+    // Ownership check BEFORE the local-success path — this used to only be
+    // resolved for the cross-node proxy fallback below, so any caller with a
+    // valid JWT for ANY tenant could instantly repoint a DIFFERENT tenant's
+    // production alias to an arbitrary deployment id hosted on this node.
+    let t0 = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
+        if norm(&c.projects.team_of(&d.project)) != t0 {
+            return Err(StatusCode::NOT_FOUND);
+        }
+    }
     if let Some(info) = c.gw.promote(&id) {
         crate::persist::persist(&c);
         let ev = c.event(&c.region, "PROMOTE", &info.alias, "/", 200, "deploy", &format!("rolled back to {id}"));
         c.record(ev);
         crate::webhooks::dispatch(&c.webhooks, &info.project, "deployment.promoted",
-            json!({ "id": id, "project": info.project, "url": format!("https://{}", info.alias) }));
+            json!({ "id": id, "project": info.project, "url": c.deploy_url(&info.alias) }));
         return Ok(Json(json!(info)));
     }
     // Not hosted locally — the placement scheduler put this deployment on a peer.
     // Proxy the promote to its host NODE over iroh (FC nodes have no HTTP admin) so
     // instant rollback works cross-node.
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(node) = host_node_for_deployment(&c, &id) {
-        if let Some(v) = post_to_host(&c, &node, &format!("/v1/deployments/{id}/promote"), &t).await {
+        if let Some(v) = post_to_host(&c, &node, &format!("/v1/deployments/{id}/promote"), &t0).await {
             return Ok(Json(v));
         }
     }
@@ -1228,7 +1701,7 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
         .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
-        let p = format!("{path}{sep}team={team}");
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
         if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 15).await {
             return serde_json::from_slice(&b).ok();
         }
@@ -1272,6 +1745,105 @@ async fn dep_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims
     Ok(Json(json!({ "removed": id, "project": project })))
 }
 
+/// Full teardown of a deleted project's resources BEYOND its deployment
+/// records: provisioned databases (with queue/vector/blob payload purge, not
+/// just the catalog entry), backing podman volumes, the on-disk source
+/// checkout(s), and build history — plus a DURABLE audit record. Previously,
+/// deleting a project left all of these behind indefinitely (a real GDPR
+/// Art.17 gap: the only record of the deletion itself lived in a 500-entry,
+/// non-persisted ring buffer that could rotate out within minutes and never
+/// survived a restart). Called from both the local delete path and the
+/// mesh-cascade receiving arm so a project deleted from ANY node gets the
+/// same real cleanup.
+async fn purge_project_resources(c: &Arc<CloudState>, project: &str, team: &str, n_deployments: usize) {
+    c.audit.record(team, "user", "delete", "project", project, &format!("{n_deployments} deployment(s)"));
+
+    for d in c.databases.list(Some(project)) {
+        if !d.replicas.is_empty() {
+            crate::db_replicate::remove_replicas(c.clone(), d.clone());
+        }
+        if let Some(container) = d.container.clone() {
+            let _ = tokio::process::Command::new("podman")
+                .args(["rm", "-f", &container])
+                .env(
+                    "PATH",
+                    format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default()),
+                )
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
+        }
+        c.databases.remove_db_and_purge_data(&d.id, &d.team);
+    }
+
+    purge_project_podman_volumes(project).await;
+    c.builds.remove_for_project(project);
+    purge_project_source_dirs(project).await;
+}
+
+/// Remove every podman volume named `hive-vol-<project>` or
+/// `hive-vol-<project>-<service>` (compose/multi-service deployments each get
+/// their own suffixed volume) — these are created for app/compose/Containerfile
+/// deployments' persistent `/data` and, unlike the container itself, survive
+/// `podman rm` of whatever mounted them. Best-effort: an unreachable/missing
+/// podman must never fail the broader project-delete flow.
+async fn purge_project_podman_volumes(project: &str) {
+    let prefix = format!("hive-vol-{}", crate::git::sanitize_tag(project));
+    let path_env = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default());
+    let Ok(out) = tokio::process::Command::new("podman")
+        .args(["volume", "ls", "--filter", &format!("name={prefix}"), "--format", "{{.Name}}"])
+        .env("PATH", &path_env)
+        .output()
+        .await
+    else {
+        return;
+    };
+    if !out.status.success() {
+        return;
+    }
+    for name in String::from_utf8_lossy(&out.stdout).lines() {
+        let name = name.trim();
+        // Exact match or a `-`-delimited suffix only (the per-service naming
+        // shape from `container_volume_cfg`, e.g. "hive-vol-app-worker") — a
+        // plain substring match would also reap an unrelated project's volume
+        // whose name happens to CONTINUE the same characters with no
+        // delimiter (e.g. "app" must not touch "appearance"'s volume). This
+        // does NOT disambiguate a different project whose name is itself
+        // `<target>-<anything>` (e.g. "app" vs a real project literally named
+        // "app-v2") — project names are allocated to be globally unique (see
+        // the project-name allocator's own comment in git.rs), so that
+        // collision is not expected in practice, but is a known limit of this
+        // prefix-based scheme, not a claim this check fully closes.
+        if name.is_empty() || !(name == prefix || name.starts_with(&format!("{prefix}-"))) {
+            continue;
+        }
+        let _ = tokio::process::Command::new("podman")
+            .args(["volume", "rm", "-f", name])
+            .env("PATH", &path_env)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+    }
+}
+
+/// Synchronously remove every on-disk source checkout for `project`, rather
+/// than relying solely on the periodic `gc_build_dirs` timer (which could
+/// leave a leaked secret or PII in the raw source tree readable on the host
+/// disk for up to ~40 minutes after an explicit delete request — the timer
+/// polls every 10 minutes and only reaps dirs untouched for 30+ minutes).
+async fn purge_project_source_dirs(project: &str) {
+    let base = crate::git::deploy_root();
+    let prefix = format!("{project}-");
+    let Ok(mut rd) = tokio::fs::read_dir(&base).await else { return };
+    while let Ok(Some(e)) = rd.next_entry().await {
+        if e.file_name().to_string_lossy().starts_with(&prefix) {
+            let _ = tokio::fs::remove_dir_all(e.path()).await;
+        }
+    }
+}
+
 /// Delete an entire project: all its deployments + settings. By default this
 /// cascades across the mesh (removing the project from any peer node the
 /// placement scheduler put it on); `?cascade=false` deletes only on this node
@@ -1295,7 +1867,31 @@ async fn project_delete(
         || c.gw.list().iter().any(|d| d.project == project && norm(&d.tenant) == t)
         // …or hosted on a peer (project lives only on a scheduler-placed node)
         || c.peer_deployments.read().values().flatten().any(|d| d.project == project && norm(&d.tenant) == t);
+    // Not locally verifiable ≠ deniable: after a partial delete (or right after a
+    // restart) this node may hold NO trace of a project that still serves on a
+    // peer, and the gossip view can be sparse — a hard 404 here left ORPHANS
+    // undeletable. Every receiving node re-checks ownership against ITS OWN store
+    // before acting, so the safe behavior is: skip local teardown, but still
+    // broadcast the single-hop cascade and let owners tear down their copies.
     if !authorized {
+        if q.cascade.unwrap_or(true) {
+            let c2 = c.clone();
+            let project2 = project.clone();
+            let team2 = t.clone();
+            tokio::spawn(async move {
+                let peers: Vec<String> = c2
+                    .registry
+                    .nodes()
+                    .into_iter()
+                    .filter(|n| !n.is_self && n.healthy)
+                    .map(|n| n.name)
+                    .collect();
+                for node in peers {
+                    dispatch_project_delete(&c2, &node, &project2, &team2).await;
+                }
+            });
+            return Ok(Json(json!({ "project": project, "removed_deployments": [], "note": "not hosted here — cascade broadcast to peers" })));
+        }
         return Err(StatusCode::NOT_FOUND);
     }
     // Remove locally + persist FIRST, then respond — so the dashboard gets an
@@ -1304,46 +1900,93 @@ async fn project_delete(
     // succeeded (the "choppy: HTTP error, then it deletes" symptom).
     let ids = c.gw.remove_project(&project).await;
     record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
+    purge_project_resources(&c, &project, &t, ids.len()).await;
     c.projects.remove(&project);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
 
-    // Background cascade to peer hosts (cascade=false → single hop, no loops).
+    // Background cascade (cascade=false → single hop, no loops): BROADCAST the
+    // delete to EVERY healthy peer instead of a gossip-derived "hosting" set —
+    // peer_deployments/peer_routes can be sparse right after restarts, which made
+    // the cascade silently dispatch to NOBODY and leave remote copies serving
+    // (the "deleting a project doesn't work" bug). The receiving arm is
+    // team-checked and idempotent, and deletes are rare, so N-1 tiny messages is
+    // the correct trade.
     if q.cascade.unwrap_or(true) {
         let c2 = c.clone();
         let project2 = project.clone();
         let team2 = t.clone();
         tokio::spawn(async move {
-            // Compute the host set from gossip (guards dropped before any await).
-            let admins = c2.node_admins.read().clone();
-            let mut hosting: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (node, deps) in c2.peer_deployments.read().iter() {
-                if deps.iter().any(|d| d.project == project2) {
-                    hosting.insert(node.clone());
-                }
-            }
-            for (host, rs) in c2.peer_routes.read().iter() {
-                let sub = host.split('.').next().unwrap_or(host);
-                if sub == project2 || sub.starts_with(&format!("{project2}-")) {
-                    for r in rs {
-                        hosting.insert(r.node_id.clone());
-                    }
-                }
-            }
-            for (node, admin) in admins.iter() {
-                if hosting.contains(node) {
-                    let _ = c2
-                        .http
-                        .delete(format!("{admin}/v1/projects/{project2}?cascade=false"))
-                        .header("x-hive-team", team2.clone())
-                        .timeout(std::time::Duration::from_secs(15))
-                        .send()
-                        .await;
-                }
+            let peers: Vec<String> = c2
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self && n.healthy)
+                .map(|n| n.name)
+                .collect();
+            for node in peers {
+                dispatch_project_delete(&c2, &node, &project2, &team2).await;
             }
         });
     }
     Ok(Json(json!({ "project": project, "removed_deployments": ids })))
+}
+
+/// Tear down a project on ONE peer node, over whatever control-plane transport
+/// reaches it: the HTTP admin URL when known (local tunnel peers), else the iroh
+/// mesh (Firecracker fleet nodes — `node_admins` is EMPTY for them since the SSH
+/// tunnels were cut, which is exactly why HTTP-only cascade deletes silently
+/// never reached the hosting nodes and "deleting a project didn't work").
+/// `cascade=false` semantics on the receiving side: single hop, no loops.
+pub(crate) async fn dispatch_project_delete(c: &Arc<CloudState>, node: &str, project: &str, team: &str) {
+    if node == c.node_name {
+        return; // local copy already handled by the caller
+    }
+    // Bind out of the lock FIRST so no parking_lot guard is held across the await
+    // (the spawned cascade future must be `Send`).
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        let _ = c
+            .http
+            .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
+            .header("x-hive-team", team.to_string())
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await;
+        return;
+    }
+    // iroh mesh path: resolve the peer's cryptographic identity + address from the
+    // registry and dispatch the delete as a gossip POST (team rides as `?team=`).
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((id, addr)) = target {
+        let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
+        if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 15).await.is_none() {
+            tracing::warn!(node, project, "project delete dispatch over iroh failed (peer will be retried on next delete)");
+        }
+    } else {
+        tracing::warn!(node, project, "project delete: no route to hosting node (no admin URL, no iroh identity)");
+    }
+}
+
+/// LOCAL-ONLY project teardown used by the mesh delete arm (the receiving side of
+/// [`dispatch_project_delete`]): remove deployments + settings on THIS node,
+/// persist, and record the event. Team-checked by the caller. `team` is used
+/// only for the durable audit record and to resolve owned databases' team
+/// (falls back to this node's own `team_of` if the caller has none, e.g. a
+/// legacy single-hop dispatch that predates the `?team=` param).
+pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, team: &str) -> usize {
+    let ids = c.gw.remove_project(project).await;
+    record_event(c, project, "delete", &format!("deleted project {project} ({} deployment(s), mesh cascade)", ids.len()));
+    let team = if team.trim().is_empty() { norm(&c.projects.team_of(project)).to_string() } else { team.to_string() };
+    purge_project_resources(c, project, &team, ids.len()).await;
+    c.projects.remove(project);
+    crate::persist::persist(c);
+    ids.len()
 }
 
 /// Query for project_delete: `cascade=false` deletes only on this node (no mesh
@@ -1448,7 +2091,44 @@ fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
 /// GET a read-view from a host node by NAME: HTTP admin if we have one, else over the
 /// iroh mesh (resolve the node's id+addr from the gossip registry). Team rides as a
 /// query param on the iroh path (no HTTP headers over that transport).
-async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
+/// Aggregate per-function usage stats across the WHOLE fleet: the local node's
+/// live stats plus each peer's `/v1/functions` (over HTTP admin or iroh gossip).
+/// The billing meter loop uses this so a NAT'd coordinator still bills compute that
+/// actually ran on the Firecracker nodes. Each `FunctionStats` carries its `tenant`.
+pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::FunctionStats> {
+    let mut out: Vec<fluid_compute::FunctionStats> = c.fluid.stats();
+    let self_name = c.node_name.clone();
+    for n in c.registry.nodes() {
+        if n.name == self_name || !n.healthy {
+            continue;
+        }
+        if let Some(v) = fetch_from_host(c, &n.name, "/v1/functions", "").await {
+            if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
+                out.append(&mut stats);
+            }
+        }
+    }
+    out
+}
+
+/// Build the mesh tenant query segment: `team=<t>` plus a signed, short-lived
+/// (`&tok=<jwt>`) delegation token when JWT signing is configured. The host node
+/// verifies the token as an authoritative, expiring tenant assertion instead of
+/// trusting the raw `team=` param (see `gossip::team_claims`). Empty `team`
+/// yields an empty segment (callers append nothing).
+pub(crate) fn mesh_team_qs(team: &str) -> String {
+    if team.is_empty() {
+        return String::new();
+    }
+    if crate::auth::enforced() {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+            return format!("team={team}&tok={tok}");
+        }
+    }
+    format!("team={team}")
+}
+
+pub(crate) async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
     // Bind out of the lock FIRST so no parking_lot guard is held across the await
     // (the dispatched future must be `Send`).
     let admin = c.node_admins.read().get(node).cloned();
@@ -1465,7 +2145,7 @@ async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str
         .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
-        let p = format!("{path}{sep}team={team}");
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
         if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 10).await {
             return serde_json::from_slice(&b).ok();
         }
@@ -1501,6 +2181,8 @@ async fn project_redeploy(
         function_settings: None,
         redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
         zip_b64: None,
+        image_ref: None,
+        image_port: None,
     };
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
@@ -1519,12 +2201,16 @@ async fn gitops_projects(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
         }
         let git = c.gw.git_for_project(&project);
         let prod = c.gw.list().into_iter().find(|d| d.project == project && d.production);
+        // Enterprise deployment protection is part of the declarative config too —
+        // include mode/scope (never the password) so protection changes commit.
+        let prot = c.enterprise.protection(&project);
         out.push(json!({
             "project": project,
             "settings": c.projects.get_masked(&project),
             "git": git,
             "production": prod,
             "root_dir": settings.build.root_dir,
+            "protection": { "mode": prot.mode, "scope": prot.scope },
         }));
     }
     out.sort_by(|a, b| a["project"].as_str().unwrap_or("").cmp(b["project"].as_str().unwrap_or("")));
@@ -1691,6 +2377,8 @@ async fn git_webhook(
             function_settings: None,
             redeploy: false, // webhook push → start_build directly (bypasses git_deploy naming)
             zip_b64: None,
+            image_ref: None,
+            image_port: None,
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));
@@ -1874,16 +2562,26 @@ struct RateLimitBody {
     window_ms: u64,
 }
 
-async fn ratelimit_put(State(c): State<Arc<CloudState>>, Json(b): Json<RateLimitBody>) -> Json<Value> {
+async fn ratelimit_put(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<RateLimitBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // This mutates the NODE's single shared DDoS rate limiter — every other
+    // tenant hosted on this node relies on it. Unlike a per-tenant setting,
+    // any authenticated caller (of any role) could previously disable it
+    // fleet-wide, matching the operator-only gate already used for WAF/bot
+    // policy.
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.ratelimit.set(b.enabled, b.limit, b.window_ms);
-    Json(json!(c.ratelimit.stats()))
+    Ok(Json(json!(c.ratelimit.stats())))
 }
 
 async fn regions(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.registry.regions()))
 }
 
-async fn functions(State(c): State<Arc<CloudState>>) -> Json<Value> {
+pub async fn functions(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.fluid.stats()))
 }
 
@@ -1912,6 +2610,34 @@ async fn relay_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
                 "direct_bytes_tx": s.direct_bytes_tx,
                 "direct_bytes_rx": s.direct_bytes_rx,
                 "relayed_bytes_pct": relayed_pct,
+                // Per-peer, per-phase iroh timeout counters (#H4) — p2p_timeout{phase,node_id}.
+                "timeouts": s.timeouts.iter().map(|t| json!({
+                    "node_id": t.node_id,
+                    "phase": t.phase,
+                    "count": t.count,
+                })).collect::<Vec<_>>(),
+                // Vercel DNS reconciler (ngrok retirement) — leader-elected publish loop.
+                "dns_reconciler": {
+                    "passes": crate::vercel_dns::STATS.passes.load(std::sync::atomic::Ordering::Relaxed),
+                    "creates": crate::vercel_dns::STATS.creates.load(std::sync::atomic::Ordering::Relaxed),
+                    "deletes": crate::vercel_dns::STATS.deletes.load(std::sync::atomic::Ordering::Relaxed),
+                    "api_errors": crate::vercel_dns::STATS.api_errors.load(std::sync::atomic::Ordering::Relaxed),
+                    "empty_set_blocks": crate::vercel_dns::STATS.empty_set_blocks.load(std::sync::atomic::Ordering::Relaxed),
+                    "last_pass_ms": crate::vercel_dns::STATS.last_pass_ms.load(std::sync::atomic::Ordering::Relaxed),
+                },
+                // ACME/TLS state: which zones have an installed certificate.
+                "tls_zones": crate::acme::installed_zones(),
+                // Web3 gossip signature verification (staged log→enforce rollout).
+                "gossip_verify": {
+                    "mode": format!("{:?}", hive_p2p::verify_mode()).to_lowercase(),
+                    "sign_outbound": hive_p2p::gossip_sign_enabled(),
+                    "signed_ok": hive_p2p::verify_stats().0,
+                    "unsigned": hive_p2p::verify_stats().1,
+                    "bad_sig": hive_p2p::verify_stats().2,
+                    "stale_ts": hive_p2p::verify_stats().3,
+                    "signer_mismatch": hive_p2p::verify_stats().4,
+                    "rejected": hive_p2p::verify_stats().5,
+                },
             }))
         }
         None => Json(json!({ "enabled": false })),
@@ -2003,17 +2729,28 @@ async fn waf_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!({ "managed": c.waf.managed_enabled(), "rules": c.waf.rules() }))
 }
 
-async fn waf_add_rule(State(c): State<Arc<CloudState>>, Json(rule): Json<WafRule>) -> Json<Value> {
+async fn waf_add_rule(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(rule): Json<WafRule>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // WAF rules are GLOBAL edge infrastructure — operator-only when auth is on.
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.waf.add_rule(rule);
     crate::persist::persist(&c);
-    Json(json!({ "rules": c.waf.rules() }))
+    Ok(Json(json!({ "rules": c.waf.rules() })))
 }
 
-async fn waf_del_rule(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn waf_del_rule(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let kept: Vec<WafRule> = c.waf.rules().into_iter().filter(|r| r.id != id).collect();
     c.waf.set_rules(kept);
     crate::persist::persist(&c);
-    Json(json!({ "rules": c.waf.rules() }))
+    Ok(Json(json!({ "rules": c.waf.rules() })))
 }
 
 #[derive(Deserialize)]
@@ -2021,9 +2758,14 @@ struct ManagedBody {
     enabled: bool,
 }
 
-async fn waf_managed(State(c): State<Arc<CloudState>>, Json(b): Json<ManagedBody>) -> Json<Value> {
+async fn waf_managed(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<ManagedBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.waf.set_managed(b.enabled);
-    Json(json!({ "managed": c.waf.managed_enabled() }))
+    Ok(Json(json!({ "managed": c.waf.managed_enabled() })))
 }
 
 // ---- Bot management ----
@@ -2032,9 +2774,14 @@ async fn bot_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(*c.bot_policy.read()))
 }
 
-async fn bot_put(State(c): State<Arc<CloudState>>, Json(p): Json<BotPolicy>) -> Json<Value> {
+async fn bot_put(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(p): Json<BotPolicy>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     *c.bot_policy.write() = p;
-    Json(json!(*c.bot_policy.read()))
+    Ok(Json(json!(*c.bot_policy.read())))
 }
 
 // ---- CDN ----
@@ -2071,8 +2818,42 @@ async fn rc_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
     }))
 }
 
-async fn rc_get(State(c): State<Arc<CloudState>>, Query(q): Query<RcKey>) -> axum::response::Response {
+/// Runtime-cache scope authorization. The scope is `{project}:{env}`; project
+/// names are globally unique, so ownership is checked via the project's team.
+/// Requests carrying NO tenant context (no JWT / API key / x-hive-team) are the
+/// in-cell loopback data plane (HIVE_RUNTIME_CACHE_URL) — the admin port is
+/// loopback-bound + firewalled, so those pass through unchanged.
+fn rc_authorize(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    scope: &str,
+) -> Result<(), (StatusCode, String)> {
+    let has_ctx = claims.is_some()
+        || headers.contains_key("x-hive-team")
+        || headers.contains_key(axum::http::header::AUTHORIZATION);
+    if !has_ctx {
+        return Ok(());
+    }
+    let project = scope.split(':').next().unwrap_or("");
+    let t = tenant(c, headers, claims);
+    if norm(&c.projects.team_of(project)) == t {
+        Ok(())
+    } else {
+        Err((StatusCode::FORBIDDEN, "runtime-cache scope belongs to a different team".into()))
+    }
+}
+
+async fn rc_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Query(q): Query<RcKey>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if let Err(e) = rc_authorize(&c, &headers, claims.as_ref().map(|x| &x.0), &q.scope) {
+        return e.into_response();
+    }
     match c.runtime_cache.get(&q.scope, &q.key) {
         Some(v) => ([(axum::http::header::CONTENT_TYPE, "application/octet-stream")], v).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -2081,10 +2862,15 @@ async fn rc_get(State(c): State<Arc<CloudState>>, Query(q): Query<RcKey>) -> axu
 
 async fn rc_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Query(q): Query<RcKey>,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    if let Err(e) = rc_authorize(&c, &headers, claims.as_ref().map(|x| &x.0), &q.scope) {
+        return e.into_response();
+    }
     let tags: Vec<String> = q.tags.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(String::from).collect();
     match c.runtime_cache.set(&q.scope, &q.key, body.to_vec(), q.ttl, tags) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -2092,19 +2878,37 @@ async fn rc_put(
     }
 }
 
-async fn rc_delete(State(c): State<Arc<CloudState>>, Query(q): Query<RcKey>) -> StatusCode {
+async fn rc_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Query(q): Query<RcKey>,
+) -> StatusCode {
+    if rc_authorize(&c, &headers, claims.as_ref().map(|x| &x.0), &q.scope).is_err() {
+        return StatusCode::FORBIDDEN;
+    }
     c.runtime_cache.delete(&q.scope, &q.key);
     StatusCode::NO_CONTENT
 }
 
-async fn rc_revalidate(State(c): State<Arc<CloudState>>, Query(q): Query<RcTag>) -> Json<Value> {
+async fn rc_revalidate(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Query(q): Query<RcTag>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    rc_authorize(&c, &headers, claims.as_ref().map(|x| &x.0), &q.scope)?;
     let removed = c.runtime_cache.revalidate_tag(&q.scope, &q.tag);
-    Json(json!({ "removed": removed }))
+    Ok(Json(json!({ "removed": removed })))
 }
 
-async fn cdn_purge(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn cdn_purge(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.cdn.purge();
-    Json(json!({ "purged": true }))
+    Ok(Json(json!({ "purged": true })))
 }
 
 // ---- Concurrency scaling ----
@@ -2119,16 +2923,26 @@ async fn routing_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!({ "redirects": c.router.redirects(), "rewrites": c.router.rewrites() }))
 }
 
-async fn add_redirect(State(c): State<Arc<CloudState>>, Json(r): Json<Redirect>) -> Json<Value> {
+async fn add_redirect(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(r): Json<Redirect>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.router.add_redirect(r);
     crate::persist::persist(&c);
-    Json(json!({ "redirects": c.router.redirects() }))
+    Ok(Json(json!({ "redirects": c.router.redirects() })))
 }
 
-async fn add_rewrite(State(c): State<Arc<CloudState>>, Json(r): Json<Rewrite>) -> Json<Value> {
+async fn add_rewrite(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(r): Json<Rewrite>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     c.router.add_rewrite(r);
     crate::persist::persist(&c);
-    Json(json!({ "rewrites": c.router.rewrites() }))
+    Ok(Json(json!({ "rewrites": c.router.rewrites() })))
 }
 
 #[derive(Deserialize)]
@@ -2136,36 +2950,82 @@ struct BySource {
     source: String,
 }
 
-async fn del_redirect(State(c): State<Arc<CloudState>>, Json(b): Json<BySource>) -> Json<Value> {
+async fn del_redirect(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<BySource>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let kept: Vec<Redirect> = c.router.redirects().into_iter().filter(|r| r.source != b.source).collect();
     c.router.set_redirects(kept);
     crate::persist::persist(&c);
-    Json(json!({ "redirects": c.router.redirects() }))
+    Ok(Json(json!({ "redirects": c.router.redirects() })))
 }
 
-async fn del_rewrite(State(c): State<Arc<CloudState>>, Json(b): Json<BySource>) -> Json<Value> {
+async fn del_rewrite(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<BySource>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let kept: Vec<Rewrite> = c.router.rewrites().into_iter().filter(|r| r.source != b.source).collect();
     c.router.set_rewrites(kept);
     crate::persist::persist(&c);
-    Json(json!({ "rewrites": c.router.rewrites() }))
+    Ok(Json(json!({ "rewrites": c.router.rewrites() })))
 }
 
 // ---- Cron ----
 
-async fn cron_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.cron.list()))
+async fn cron_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Tenant-scoped: only this team's jobs. Legacy jobs (no tenant recorded) are
+    // attributed by their target project's owning team.
+    let jobs: Vec<CronJob> = c
+        .cron
+        .list()
+        .into_iter()
+        .filter(|j| {
+            let owner = if j.tenant.is_empty() { norm(&c.projects.team_of(&j.deployment)).to_string() } else { j.tenant.clone() };
+            owner == t
+        })
+        .collect();
+    Json(json!(jobs))
 }
 
-async fn cron_add(State(c): State<Arc<CloudState>>, Json(job): Json<CronJob>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn cron_add(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(mut job): Json<CronJob>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Stamp the caller's tenant (never trust a tenant in the body) and require
+    // the target project to belong to them.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &job.deployment)?;
+    job.tenant = t;
     match c.cron.add(job) {
         Ok(j) => Ok(Json(json!(j))),
         Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
-async fn cron_del(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn cron_del(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let owned = c.cron.list().into_iter().any(|j| {
+        j.id == id && {
+            let owner = if j.tenant.is_empty() { norm(&c.projects.team_of(&j.deployment)).to_string() } else { j.tenant.clone() };
+            owner == t
+        }
+    });
+    if !owned {
+        return Err((StatusCode::FORBIDDEN, "cron job belongs to a different team".into()));
+    }
     c.cron.remove(&id);
-    Json(json!({ "removed": id }))
+    Ok(Json(json!({ "removed": id })))
 }
 
 // ---- Workflows ----
@@ -2230,9 +3090,17 @@ pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap
     Json(json!(defs))
 }
 
-async fn wf_define(State(c): State<Arc<CloudState>>, Json(def): Json<WorkflowDef>) -> Json<Value> {
+async fn wf_define(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(def): Json<WorkflowDef>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // The workflow's project must belong to the caller's team.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &def.project)?;
     c.workflows.define(def);
-    Json(json!(c.workflows.defs()))
+    let defs: Vec<WorkflowDef> = c.workflows.defs().into_iter().filter(|d| wf_in_team(&c, &d.project, &t)).collect();
+    Ok(Json(json!(defs)))
 }
 
 pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {
@@ -2311,10 +3179,17 @@ pub(crate) async fn wf_run_detail(
     Path(id): Path<String>,
     Query(q): Query<WfQuery>,
 ) -> Result<Json<Value>, StatusCode> {
-    if let Some(r) = c.workflows.run(&id) {
-        return Ok(Json(json!(r)));
-    }
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(r) = c.workflows.run(&id) {
+        // This fast path (a run hosted on THIS node) used to skip the team
+        // check every other lookup branch below performs — any authenticated
+        // tenant who learned/guessed a run id could read a different
+        // tenant's full workflow step output.
+        if wf_in_team(&c, &r.project, &team) {
+            return Ok(Json(json!(r)));
+        }
+        return Err(StatusCode::NOT_FOUND);
+    }
     let found = |v: &Value| v.get("run").map(|r| !r.is_null()).unwrap_or(false);
     // 1) Explicit project (proxy to its host node over iroh if remote, else local).
     if let Some(project) = q.project.as_deref() {
@@ -2414,7 +3289,19 @@ pub(crate) async fn wf_summary(State(c): State<Arc<CloudState>>, headers: Header
     Json(json!(rows))
 }
 
-async fn wf_run(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn wf_run(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Only the owning team may trigger a workflow run.
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(def) = c.workflows.defs().into_iter().find(|d| d.id == id) {
+        if !wf_in_team(&c, &def.project, &t) {
+            return Err((StatusCode::FORBIDDEN, "workflow belongs to a different team".into()));
+        }
+    }
     let invoker = crate::wf_invoker(c.clone());
     match c.workflows.start(&id, invoker) {
         Ok(run_id) => Ok(Json(json!({ "run_id": run_id }))),
@@ -2509,12 +3396,29 @@ fn default_member_role() -> crate::teams::Role {
     crate::teams::Role::Member
 }
 
-async fn teams_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.teams.list()))
+/// Scoped to the caller's OWN team, matching a personal-namespace-style "list
+/// my teams" — never the global roster. A platform operator sees every team.
+async fn teams_list(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Json<Value> {
+    let cl = claims.as_ref().map(|e| &e.0);
+    if cl.map(|c| c.platform_admin).unwrap_or(false) {
+        return Json(json!(c.teams.list()));
+    }
+    let t = tenant(&c, &headers, cl);
+    Json(json!(c.teams.get(&t).into_iter().collect::<Vec<_>>()))
 }
 
-async fn team_get(State(c): State<Arc<CloudState>>, Path(slug): Path<String>) -> Result<Json<Value>, StatusCode> {
-    c.teams.get(&slug).map(|t| Json(json!(t))).ok_or(StatusCode::NOT_FOUND)
+async fn team_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &[])?;
+    c.teams.get(&slug).map(|t| Json(json!(t))).ok_or((StatusCode::NOT_FOUND, "no such team".into()))
 }
 
 async fn team_create(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeam>) -> Json<Value> {
@@ -2525,19 +3429,54 @@ async fn team_create(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeam>
 
 async fn team_add_member(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(slug): Path<String>,
     Json(b): Json<AddMember>,
-) -> Result<Json<Value>, StatusCode> {
-    let t = c.teams.add_member(&slug, &b.email, b.role).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner", "admin"])?;
+    // Only an Owner-rank caller may grant Owner to someone else — an Admin
+    // adding/promoting a member to Owner would be a lateral privilege
+    // escalation within the team.
+    if matches!(b.role, crate::teams::Role::Owner) {
+        let is_owner_caller = claims.as_ref().map(|e| e.0.platform_admin || e.0.role == "owner").unwrap_or(false);
+        if !is_owner_caller {
+            return Err((StatusCode::FORBIDDEN, "only an Owner may grant the Owner role".into()));
+        }
+    }
+    // Seat quota (business locking): block adding a NEW member past the plan's seat
+    // limit. Updating an existing member's role is always allowed.
+    let team = c.teams.get(&slug).ok_or((StatusCode::NOT_FOUND, "team not found".into()))?;
+    let is_new = team.member(&b.email).is_none();
+    if is_new {
+        let plan = c.billing.account(&slug).plan;
+        let max = crate::billing::plan_max_members(&plan);
+        if max > 0 && team.members.len() as u32 >= max {
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                format!(
+                    "Seat limit reached ({}/{max}) on the {plan} plan — upgrade to add more members.",
+                    team.members.len()
+                ),
+            ));
+        }
+    }
+    let t = c
+        .teams
+        .add_member(&slug, &b.email, b.role)
+        .ok_or((StatusCode::NOT_FOUND, "team not found".into()))?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
 
 async fn team_remove_member(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((slug, email)): Path<(String, String)>,
-) -> Result<Json<Value>, StatusCode> {
-    let t = c.teams.remove_member(&slug, &email).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner", "admin"])?;
+    let t = c.teams.remove_member(&slug, &email).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -2551,9 +3490,12 @@ struct SetPlan {
 /// sync so the compute allowance + plan label update together.
 async fn team_set_plan(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(slug): Path<String>,
     Json(b): Json<SetPlan>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner", "admin"])?;
     let plan = b.plan.to_lowercase();
     if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
         return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
@@ -2576,9 +3518,12 @@ struct SetSso {
 /// Toggle team/org SSO — Enterprise only.
 async fn team_set_sso(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(slug): Path<String>,
     Json(b): Json<SetSso>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner", "admin"])?;
     let team = c.teams.get(&slug).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
     if !crate::billing::plan_allows_sso(&team.plan) {
         return Err((StatusCode::FORBIDDEN, "SSO requires the Enterprise plan".into()));
@@ -2600,13 +3545,17 @@ fn default_true_b() -> bool {
 
 async fn project_team_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(b): Json<ProjectTeam>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Only the CURRENT owning team may move a project (or change its protection).
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_team(&project, &b.team);
     c.projects.set_preview_protection(&project, b.preview_protection);
     crate::persist::persist(&c);
-    Json(json!(c.projects.get_masked(&project)))
+    Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
 // ============================ API keys ============================
@@ -2640,6 +3589,166 @@ async fn apikey_revoke(State(c): State<Arc<CloudState>>, headers: HeaderMap, cla
     Json(json!({ "revoked": ok, "id": id }))
 }
 
+// ---- Connected integrations ----
+//
+// The team's linked third-party integrations as consumable resources. Every
+// endpoint is tenant-scoped, so a `hive_…` platform key (Authorization: Bearer)
+// transparently scopes the Vercel-compatible SDK to that key's team. The list/get
+// views are redacted; `/credentials` returns the secret token/connection.
+
+async fn integrations_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    Json(json!(c.integrations.list(&t).iter().map(|i| i.public()).collect::<Vec<_>>()))
+}
+
+async fn integration_upsert(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Json(b): Json<crate::integrations::UpsertReq>) -> Result<Json<Value>, (StatusCode, String)> {
+    if b.provider.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "provider is required".into()));
+    }
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let rec = c.integrations.upsert(&t, b);
+    crate::persist::persist(&c);
+    let ev = c.event(&c.region, "INTEGRATION", &rec.provider, "/", 200, "link",
+        &format!("integration {} linked for {} ({} env var(s))", rec.provider, t, rec.env.len()));
+    c.record(ev);
+    Ok(Json(rec.public()))
+}
+
+async fn integration_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    c.integrations.get(&t, &id).map(|i| Json(i.public())).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn integration_credentials(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    c.integrations.get(&t, &id).map(|i| Json(i.full())).ok_or(StatusCode::NOT_FOUND)
+}
+
+async fn integration_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let ok = c.integrations.delete(&t, &id);
+    crate::persist::persist(&c);
+    Json(json!({ "deleted": ok, "id": id }))
+}
+
+// ---- Intelligent service graph (Issue #2) ----
+//
+// The algorithmically-derived graph of services actually consumed by a deployment
+// (app/framework, bundled front+back nodes, workspace packages, databases). Scanned
+// async on build AND lazily on-demand (below) so EXISTING + FAILED deployments —
+// which predate the async scan — are backfilled the first time they're viewed.
+
+/// Scan a hosted deployment's on-disk source tree and store its service graph.
+/// Works for existing/failed deployments (the checkout is kept for live ones).
+async fn scan_root_graph(c: &Arc<CloudState>, project: &str, dep_id: &str, root_str: &str) -> Option<crate::svcgraph::ServiceGraph> {
+    let root = std::path::PathBuf::from(root_str);
+    if root_str.is_empty() || !root.exists() {
+        return None;
+    }
+    let root2 = root.clone();
+    let scan = tokio::task::spawn_blocking(move || {
+        let fw = fluid_build::detect(&root2);
+        let is_container = root2.join("Dockerfile").exists()
+            || root2.join("Containerfile").exists()
+            || crate::compose::compose_file(&root2).is_some();
+        crate::svcgraph::scan_dir(&root2, fw.slug, fw.name, is_container)
+    })
+    .await
+    .ok()?;
+    let env_keys: Vec<String> = c.projects.get_masked(project).env.iter().map(|e| e.key.clone()).collect();
+    let g = crate::svcgraph::build_graph(project, dep_id, &scan, &env_keys);
+    c.svcgraph.put(g.clone());
+    crate::persist::persist(c);
+    Some(g)
+}
+
+pub(crate) async fn scan_record_graph(c: &Arc<CloudState>, rec: &fluid_core::DeployRecord) -> Option<crate::svcgraph::ServiceGraph> {
+    scan_root_graph(c, &rec.project, &rec.id, &rec.root).await
+}
+
+/// The LOCAL service graph for a project: the stored one, else scanned on-demand
+/// from the newest locally-hosted deployment record. No fan-out (caller does that).
+pub(crate) async fn local_project_graph(c: &Arc<CloudState>, project: &str) -> Option<crate::svcgraph::ServiceGraph> {
+    if let Some(g) = c.svcgraph.latest_for_project(project) {
+        return Some(g);
+    }
+    // Try records newest-first, scanning the first whose checkout still exists on
+    // disk (a failed/newer redeploy may have a GC'd root while an older LIVE one
+    // is still present + serving).
+    let mut recs: Vec<_> = c.gw.deployment_records().into_iter().filter(|r| r.project == project).collect();
+    recs.sort_by_key(|r| r.created_at_ms);
+    while let Some(rec) = recs.pop() {
+        if let Some(g) = scan_record_graph(c, &rec).await {
+            return Some(g);
+        }
+    }
+    // No usable deployment RECORD here (e.g. a CONTAINER deploy: the record lives on
+    // the coordinator, but the container + source run on THIS lease-owner node). Fall
+    // back to the newest on-disk source checkout for the project.
+    if let Some(dir) = crate::git::newest_deploy_dir(project) {
+        return scan_root_graph(c, project, project, &dir.to_string_lossy()).await;
+    }
+    None
+}
+
+/// The LOCAL service graph for a deployment id: stored, else scanned on-demand from
+/// its locally-hosted record. No proxy (caller does that).
+pub(crate) async fn local_deployment_graph(c: &Arc<CloudState>, id: &str) -> Option<crate::svcgraph::ServiceGraph> {
+    if let Some(g) = c.svcgraph.get(id) {
+        return Some(g);
+    }
+    let rec = c.gw.deployment_records().into_iter().find(|r| r.id == id)?;
+    scan_record_graph(c, &rec).await
+}
+
+pub(crate) async fn deployment_service_graph(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Locally hosted? Return the stored graph, or scan its source on-demand (backfill
+    // for existing/failed deployments), team-checked.
+    if c.gw.deployment_records().iter().any(|r| r.id == id) {
+        if let Some(g) = local_deployment_graph(&c, &id).await {
+            if norm(&c.projects.team_of(&g.project)) == norm(&t) {
+                return Ok(Json(json!(g)));
+            }
+        }
+    }
+    // Not here — proxy to the node that hosts the deployment.
+    if let Some(node) = host_node_for_deployment(&c, &id) {
+        if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/deployments/{id}/service-graph"), &t).await {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
+async fn project_service_graph(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(project): Path<String>) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Team-gate only when this node KNOWS the project's team (it may not host it).
+    let known = c.projects.team_of(&project);
+    if !known.is_empty() && norm(&known) != norm(&t) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    // Stored, or scanned on-demand from a locally-hosted deployment (backfills
+    // existing/failed projects deployed here before the async scan existed).
+    if let Some(g) = local_project_graph(&c, &project).await {
+        return Ok(Json(json!(g)));
+    }
+    // Not hosted here — the graph (or the source to scan) lives on whichever node
+    // built the project. Fan out to every OTHER healthy peer and return the first
+    // that has it (each answers from its LOCAL store/scan + team-checks → no re-proxy
+    // loop, no cross-tenant leak). Registry is the reliable peer set (trunk-warmed).
+    let self_name = c.node_name.clone();
+    for n in c.registry.nodes() {
+        if n.name == self_name || n.iroh_addr.is_none() {
+            continue;
+        }
+        if let Some(v) = fetch_from_host(&c, &n.name, &format!("/v1/projects/{project}/service-graph"), &t).await {
+            return Ok(Json(v));
+        }
+    }
+    Err(StatusCode::NOT_FOUND)
+}
+
 // ============================ Webhooks ============================
 
 async fn webhook_events() -> Json<Value> {
@@ -2650,7 +3759,7 @@ async fn webhooks_all(State(c): State<Arc<CloudState>>, headers: HeaderMap, clai
     // Only the caller's own webhooks (the payload includes signing secrets, so
     // this must be tenant-scoped).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let list: Vec<_> = c.webhooks.snapshot().into_iter().filter(|w| norm(&w.team) == t).collect();
+    let list: Vec<_> = c.webhooks.snapshot().into_iter().filter(|w| norm(&w.team) == t).map(|w| w.decrypted()).collect();
     Json(json!(list))
 }
 
@@ -2685,6 +3794,7 @@ async fn webhook_create_team(State(c): State<Arc<CloudState>>, headers: HeaderMa
         }));
     }
     crate::persist::persist(&c);
+    let created: Vec<_> = created.into_iter().map(|w| w.decrypted()).collect();
     Json(json!(created))
 }
 
@@ -2694,7 +3804,8 @@ async fn webhooks_for_project(State(c): State<Arc<CloudState>>, headers: HeaderM
     if norm(&c.projects.team_of(&project)) != t {
         return Json(json!([]));
     }
-    Json(json!(c.webhooks.list(Some(&project))))
+    let list: Vec<_> = c.webhooks.list(Some(&project)).into_iter().map(|w| w.decrypted()).collect();
+    Json(json!(list))
 }
 
 #[derive(Deserialize)]
@@ -2727,7 +3838,7 @@ async fn webhook_create(
         created_ms: 0,
     });
     crate::persist::persist(&c);
-    Ok(Json(json!(wh)))
+    Ok(Json(json!(wh.decrypted())))
 }
 
 async fn webhook_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
@@ -2742,8 +3853,12 @@ async fn webhook_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, cl
     Ok(Json(json!({ "removed": id })))
 }
 
-async fn webhook_deliveries(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.webhooks.deliveries(100)))
+async fn webhook_deliveries(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.webhooks.deliveries(100))))
 }
 
 // ============================ Databases ============================
@@ -2761,8 +3876,12 @@ async fn databases_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, cl
 
 /// Platform-owner view: ALL databases across every tenant (the ops Database Fleet
 /// is global, unlike the tenant-scoped `/v1/databases`).
-async fn admin_databases_all(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.databases.list(None)))
+async fn admin_databases_all(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.databases.list(None))))
 }
 
 async fn databases_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(project): Path<String>) -> Json<Value> {
@@ -2793,18 +3912,82 @@ async fn database_credentials(State(c): State<Arc<CloudState>>, headers: HeaderM
     Ok(Json(json!(d)))
 }
 
+/// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning
+/// project so deployments reach it automatically — canonical names (DATABASE_URL,
+/// REDIS_URL, …) for the common single-DB case PLUS name-prefixed copies that are
+/// collision-free when a project has several DBs of the same kind. Pure — no side
+/// effects — so create (apply) and delete (remove by key) agree on the key set.
+fn db_egress_pairs(c: &Arc<CloudState>, d: &crate::databases::Database) -> Vec<(String, String, bool)> {
+    let api_base = c.api_base();
+    let prefix = crate::databases::env_prefix(&d.name);
+    let mut out: Vec<(String, String, bool)> = Vec::new();
+    for (k, v) in crate::databases::env_exports(d, &api_base) {
+        let kl = k.to_lowercase();
+        let sensitive = kl.contains("url") || kl.contains("token") || kl.contains("password") || kl.contains("key") || kl.contains("secret");
+        out.push((k.clone(), v.clone(), sensitive));
+        if !prefix.is_empty() {
+            out.push((format!("{prefix}_{k}"), v, sensitive));
+        }
+    }
+    out
+}
+
+fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Database) {
+    for (k, v, sensitive) in db_egress_pairs(c, d) {
+        c.projects.put_env(&d.project, crate::project_settings::EnvVar {
+            key: k, value: v, target: "all".into(), sensitive, updated_ms: now_ms(),
+        });
+    }
+}
+
+/// NON-SECRET directory of gateway-addressable DBs hosted on this node — the
+/// same payload as the `/v1/db-directory` gossip arm (routing metadata only:
+/// {id, db_host, host_node, kind}). The DNS leader fans this out to publish
+/// per-DB A records for DBs provisioned on other nodes.
+async fn db_directory(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Gating the HTTP path only — the iroh gossip fan-out this feeds
+    // (vercel_dns.rs's DNS reconciler, via `fetch_from_host`) has its own
+    // separate inline arm in gossip.rs that never calls this handler, so this
+    // does not break that legitimate mesh-internal use; it only stops a direct
+    // internet client from using this as cross-tenant DB-id recon (a stepping
+    // stone toward the `database_replica` finding).
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.databases.directory())))
+}
+
 async fn database_create(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut req): Json<crate::databases::ProvisionReq>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     let cloud = c.clone();
-    if req.team.trim().is_empty() {
-        req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Always the server-resolved tenant — a client-supplied `team` used to be
+    // trusted outright whenever non-empty, letting any caller register a
+    // database (and auto-inject its connection env) under a DIFFERENT tenant.
+    req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Only enforce project ownership when the project is ALREADY registered
+    // (has a team of record) — provisioning a database for a brand-new
+    // project name before its first deploy is a normal flow and must keep
+    // working. An EXISTING project owned by a different tenant is rejected.
+    if !req.project.is_empty() && c.projects.snapshot().contains_key(&req.project) {
+        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &req.project)?;
     }
     let project = req.project.clone();
-    let db = crate::databases::provision(c.databases.clone(), c.region.clone(), req, move |d| {
+    let db = crate::databases::provision(c.databases.clone(), c.region.clone(), req, c.db_domain.clone(), c.node_name.clone(), move |d| {
+        // EGRESS: auto-inject this DB's connection env into the owning project so
+        // its deployments can reach it with zero manual copy-paste. Only when the
+        // DB is actually ready (connection populated).
+        if !d.project.is_empty() && matches!(d.status, crate::databases::DbStatus::Ready) {
+            apply_db_egress(&cloud, &d);
+        }
+        // REPLICATION: if replica regions were configured, fan the DB out to them.
+        if !d.replicas.is_empty() {
+            crate::db_replicate::ensure_replicas(cloud.clone(), d.clone());
+        }
         crate::persist::persist(&cloud);
         crate::webhooks::dispatch(
             &cloud.webhooks,
@@ -2820,7 +4003,7 @@ async fn database_create(
         "database.created",
         json!({ "id": db.id, "name": db.name, "kind": db.kind }),
     );
-    Json(json!(db))
+    Ok(Json(json!(db)))
 }
 
 async fn database_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
@@ -2828,6 +4011,16 @@ async fn database_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
     if let Some(d) = c.databases.get_raw(&id) {
         if norm(&d.team) != t {
             return Err(StatusCode::NOT_FOUND);
+        }
+        // Remove the auto-injected egress env vars from the owning project.
+        if !d.project.is_empty() {
+            for (k, _, _) in db_egress_pairs(&c, &d) {
+                c.projects.delete_env(&d.project, &k);
+            }
+        }
+        // Tear down any cross-region replicas (before consuming `d.container`).
+        if !d.replicas.is_empty() {
+            crate::db_replicate::remove_replicas(c.clone(), d.clone());
         }
         if let Some(container) = d.container {
             // Best-effort teardown of the backing container.
@@ -2840,36 +4033,205 @@ async fn database_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
                 .await;
         }
     }
-    c.databases.remove_db(&id);
+    // Purges the actual queue/vector/blob PAYLOAD data too (keyed by a
+    // team-prefixed connection name, not the db id) — `remove_db` alone only
+    // ever removed the catalog entry, leaving customer data (which may
+    // include PII in vector metadata or queue message bodies) orphaned in
+    // memory/on-disk forever, re-persisted in every future snapshot.
+    c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
 }
 
+/// Mesh-internal: register or remove a cross-region REPLICA of a database on this
+/// node. Called by the primary node's replication fanout (peer-authenticated over
+/// the mesh, or via the loopback+firewalled admin API). On register we record the
+/// database locally as a `replica` in THIS node's region, auto-inject its egress
+/// env into the owning project (so in-region deployments reach it), and — for
+/// Postgres/Redis — provision a real in-region backing container.
+pub(crate) async fn database_replica(
+    State(c): State<Arc<CloudState>>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let op = body.get("op").and_then(|v| v.as_str()).unwrap_or("");
+    let mut db: crate::databases::Database = serde_json::from_value(body.get("db").cloned().unwrap_or(Value::Null))
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad db payload: {e}")))?;
+    // This RPC is reachable both over the (currently unauthenticated) mesh
+    // path and directly on the public HTTP admin router, and it used to fully
+    // trust a client-supplied `db` body — so a caller with no relationship to
+    // the target database could force-destroy or re-register it. Real
+    // mesh-peer authentication for this path is tracked separately (the
+    // gossip/peer-trust hardening work); as an immediate, scoped fix: when
+    // `db.id` already names an EXISTING record, require the request's team
+    // to match the REAL owning team on record before mutating it. A brand-new
+    // id (the normal "replicate to a new peer" case) has nothing to compare
+    // against yet and is unaffected.
+    if !db.id.trim().is_empty() {
+        if let Some(existing) = c.databases.get_raw(&db.id) {
+            if norm(&existing.team) != norm(&db.team) {
+                return Err((StatusCode::FORBIDDEN, "db belongs to a different team".into()));
+            }
+        }
+    }
+    match op {
+        "register" => {
+            db.role = "replica".into();
+            db.region = c.region.clone();
+            // Platform-native kinds serve from THIS node's in-process store (data
+            // arrives via write-mirroring); rewrite endpoint host to our API base.
+            // Postgres/Redis get a real local backing container so reads are local.
+            let backed = crate::databases::provision_replica_backing(c.databases.clone(), &db).await;
+            db.connection = backed.0;
+            db.container = backed.1;
+            db.mode = backed.2;
+            c.databases.upsert_replica(db.clone());
+            if !db.project.is_empty() {
+                apply_db_egress(&c, &db);
+            }
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "registered": db.id, "region": db.region })))
+        }
+        "remove" => {
+            if !db.project.is_empty() {
+                for (k, _, _) in db_egress_pairs(&c, &db) {
+                    c.projects.delete_env(&db.project, &k);
+                }
+            }
+            if let Some(existing) = c.databases.get_raw(&db.id) {
+                if let Some(container) = existing.container {
+                    let _ = tokio::process::Command::new("podman")
+                        .args(["rm", "-f", &container])
+                        .env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default()))
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .await;
+                }
+            }
+            c.databases.remove_db(&db.id);
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "removed": db.id })))
+        }
+        _ => Err((StatusCode::BAD_REQUEST, "op must be register|remove".into())),
+    }
+}
+
+/// Apply a MIRRORED storage write received over the iroh mesh (the HTTP admin
+/// path goes through the normal handlers). Parses `<team>` from `?team=` and the
+/// kind/name/key from the path, applying to the SAME tenant namespace so the
+/// replica holds identical data. Never re-mirrors (already a replicated write).
+pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: &[u8]) {
+    let team = qs(path, "team").unwrap_or_else(|| "personal".into());
+    let no_q = path.split('?').next().unwrap_or(path);
+    let segs: Vec<&str> = no_q.trim_start_matches('/').split('/').collect();
+    // segs: ["v1","storage",<kind>, ...]
+    let kind = segs.get(2).copied().unwrap_or("");
+    match kind {
+        "blob" => {
+            if let (Some(bucket), Some(key)) = (segs.get(3), segs.get(4)) {
+                c.databases.blob_put(&format!("{team}::{bucket}"), key, body.to_vec());
+            }
+        }
+        "queue" => {
+            if let Some(queue) = segs.get(3) {
+                if let Ok(v) = serde_json::from_slice::<Value>(body) {
+                    if let Some(msg) = v.get("message") {
+                        c.databases.queue_push(&format!("{team}::{queue}"), msg.to_string());
+                    }
+                }
+            }
+        }
+        "vector" => {
+            if let Some(index) = segs.get(3) {
+                if let Ok(v) = serde_json::from_slice::<VectorUpsert>(body) {
+                    c.databases.vector_upsert(&format!("{team}::{index}"), &v.id, v.vector, v.metadata);
+                }
+            }
+        }
+        "pubsub" => {
+            if let Some(topic) = segs.get(3) {
+                if let Ok(v) = serde_json::from_slice::<Value>(body) {
+                    if let Some(msg) = v.get("message") {
+                        c.databases.publish(&format!("{team}::{topic}"), msg.to_string());
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn qs(path: &str, key: &str) -> Option<String> {
+    let q = path.split_once('?')?.1;
+    q.split('&').find_map(|kv| {
+        let (k, v) = kv.split_once('=')?;
+        (k == key).then(|| v.to_string())
+    })
+}
+
 // ---- Functional storage REST (Blob / Queue / Vector) ----
+//
+// MULTI-TENANT: every namespace name (bucket/queue/index/topic/room) coming from
+// the request path is tenant-prefixed (`<tenant>::<name>`) before touching the
+// store, so two teams using the same name get DISJOINT storage. Responses echo
+// the caller's un-prefixed name.
+
+fn ns(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>, name: &str) -> String {
+    format!("{}::{}", tenant(c, h, claims), name)
+}
+
+/// Resolve the (team, is_mirror) scope for a storage WRITE. A mesh-internal
+/// mirrored write (`x-hive-mirror`) is a trusted replication call from a primary
+/// node — its `x-hive-team` is authoritative (reached over the authenticated mesh
+/// or the loopback+firewalled admin API), so replicated data lands in the SAME
+/// tenant namespace on the replica. Normal writes resolve the tenant as usual.
+fn write_scope(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>) -> (String, bool) {
+    let is_mirror = h.get("x-hive-mirror").is_some() || h.get("x-mirror").is_some();
+    if is_mirror {
+        let team = h.get("x-hive-team").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "personal".into());
+        (team, true)
+    } else {
+        (tenant(c, h, claims), false)
+    }
+}
 
 async fn blob_put(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((bucket, key)): Path<(String, String)>,
     body: axum::body::Bytes,
 ) -> Json<Value> {
+    let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let nsb = format!("{team}::{bucket}");
     let size = body.len();
-    c.databases.blob_put(&bucket, &key, body.to_vec());
+    c.databases.blob_put(&nsb, &key, body.to_vec());
+    crate::db_replicate::on_write(&c, is_mirror, &team, &bucket, "PUT", format!("/v1/storage/blob/{bucket}/{key}"), "application/octet-stream", body.to_vec());
     Json(json!({ "bucket": bucket, "key": key, "size": size, "url": format!("/v1/storage/blob/{bucket}/{key}") }))
 }
 
 async fn blob_get(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<axum::response::Response, StatusCode> {
     use axum::response::IntoResponse;
-    match c.databases.blob_get(&bucket, &key) {
+    let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
+    match c.databases.blob_get(&nsb, &key) {
         Some(data) => Ok(data.into_response()),
         None => Err(StatusCode::NOT_FOUND),
     }
 }
 
-async fn blob_list_keys(State(c): State<Arc<CloudState>>, Path(bucket): Path<String>) -> Json<Value> {
-    Json(json!({ "bucket": bucket, "keys": c.databases.blob_list(&bucket) }))
+async fn blob_list_keys(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(bucket): Path<String>,
+) -> Json<Value> {
+    let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
+    Json(json!({ "bucket": bucket, "keys": c.databases.blob_list(&nsb) }))
 }
 
 #[derive(Deserialize)]
@@ -2877,19 +4239,41 @@ struct QueueMsg {
     message: Value,
 }
 
-async fn queue_push(State(c): State<Arc<CloudState>>, Path(queue): Path<String>, Json(b): Json<QueueMsg>) -> Json<Value> {
-    let depth = c.databases.queue_push(&queue, b.message.to_string());
+async fn queue_push(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(queue): Path<String>,
+    Json(b): Json<QueueMsg>,
+) -> Json<Value> {
+    let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let nsq = format!("{team}::{queue}");
+    let depth = c.databases.queue_push(&nsq, b.message.to_string());
+    let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
+    crate::db_replicate::on_write(&c, is_mirror, &team, &queue, "POST", format!("/v1/storage/queue/{queue}"), "application/json", mirror_body);
     Json(json!({ "queue": queue, "depth": depth }))
 }
 
-async fn queue_pop(State(c): State<Arc<CloudState>>, Path(queue): Path<String>) -> Json<Value> {
-    let msg = c.databases.queue_pop(&queue);
+async fn queue_pop(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(queue): Path<String>,
+) -> Json<Value> {
+    let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
+    let msg = c.databases.queue_pop(&nsq);
     let parsed = msg.as_ref().and_then(|m| serde_json::from_str::<Value>(m).ok());
-    Json(json!({ "queue": queue, "message": parsed.or(msg.map(Value::String)), "depth": c.databases.queue_depth(&queue) }))
+    Json(json!({ "queue": queue, "message": parsed.or(msg.map(Value::String)), "depth": c.databases.queue_depth(&nsq) }))
 }
 
-async fn queue_depth(State(c): State<Arc<CloudState>>, Path(queue): Path<String>) -> Json<Value> {
-    Json(json!({ "queue": queue, "depth": c.databases.queue_depth(&queue) }))
+async fn queue_depth(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(queue): Path<String>,
+) -> Json<Value> {
+    let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
+    Json(json!({ "queue": queue, "depth": c.databases.queue_depth(&nsq) }))
 }
 
 #[derive(Deserialize)]
@@ -2900,8 +4284,18 @@ struct VectorUpsert {
     metadata: Value,
 }
 
-async fn vector_upsert(State(c): State<Arc<CloudState>>, Path(index): Path<String>, Json(b): Json<VectorUpsert>) -> Json<Value> {
-    c.databases.vector_upsert(&index, &b.id, b.vector, b.metadata);
+async fn vector_upsert(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(index): Path<String>,
+    Json(b): Json<VectorUpsert>,
+) -> Json<Value> {
+    let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let nsi = format!("{team}::{index}");
+    let mirror_body = serde_json::to_vec(&json!({ "id": b.id, "vector": b.vector, "metadata": b.metadata })).unwrap_or_default();
+    c.databases.vector_upsert(&nsi, &b.id, b.vector, b.metadata);
+    crate::db_replicate::on_write(&c, is_mirror, &team, &index, "POST", format!("/v1/storage/vector/{index}"), "application/json", mirror_body);
     Json(json!({ "index": index, "id": b.id, "upserted": true }))
 }
 
@@ -2915,31 +4309,56 @@ fn default_topk() -> usize {
     5
 }
 
-async fn vector_query(State(c): State<Arc<CloudState>>, Path(index): Path<String>, Json(b): Json<VectorQuery>) -> Json<Value> {
-    Json(json!({ "index": index, "matches": c.databases.vector_query(&index, &b.vector, b.top_k) }))
+async fn vector_query(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(index): Path<String>,
+    Json(b): Json<VectorQuery>,
+) -> Json<Value> {
+    let nsi = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &index);
+    Json(json!({ "index": index, "matches": c.databases.vector_query(&nsi, &b.vector, b.top_k) }))
 }
 
 // ---- Pub/Sub + Realtime (WebSocket secure streaming) ----
 
-async fn pubsub_info(State(c): State<Arc<CloudState>>, Path(topic): Path<String>) -> Json<Value> {
+async fn pubsub_info(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(topic): Path<String>,
+) -> Json<Value> {
+    let nst = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &topic);
     Json(json!({
         "topic": topic,
-        "subscribers": c.databases.subscriber_count(&topic),
-        "published": c.databases.published_count(&topic),
+        "subscribers": c.databases.subscriber_count(&nst),
+        "published": c.databases.published_count(&nst),
     }))
 }
 
-async fn pubsub_publish(State(c): State<Arc<CloudState>>, Path(topic): Path<String>, Json(b): Json<QueueMsg>) -> Json<Value> {
-    let delivered = c.databases.publish(&topic, b.message.to_string());
+async fn pubsub_publish(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(topic): Path<String>,
+    Json(b): Json<QueueMsg>,
+) -> Json<Value> {
+    let (team, is_mirror) = write_scope(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let nst = format!("{team}::{topic}");
+    let delivered = c.databases.publish(&nst, b.message.to_string());
+    let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
+    crate::db_replicate::on_write(&c, is_mirror, &team, &topic, "POST", format!("/v1/storage/pubsub/{topic}/publish"), "application/json", mirror_body);
     Json(json!({ "topic": topic, "delivered": delivered }))
 }
 
 async fn ws_pubsub(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(topic): Path<String>,
 ) -> axum::response::Response {
-    let mut rx = c.databases.subscribe(&topic);
+    let mut rx = c.databases.subscribe(&ns(&c, &headers, claims.as_ref().map(|e| &e.0), &topic));
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         let _ = socket
@@ -2963,8 +4382,11 @@ async fn ws_pubsub(
 async fn ws_realtime(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(room): Path<String>,
 ) -> axum::response::Response {
+    let room = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &room);
     let mut rx = c.databases.subscribe(&room);
     let db = c.databases.clone();
     ws.on_upgrade(move |mut socket| async move {
@@ -3014,8 +4436,15 @@ async fn securelink_create(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(mut req): Json<crate::securelink::ProvisionReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    if req.team.trim().is_empty() {
-        req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Always the server-resolved tenant — see the identical fix on
+    // database_create for why a client-supplied `team` must never be trusted.
+    req.team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Only enforce ownership when wiring into an ALREADY-registered project
+    // (an unset/new project name is a normal "create the tunnel first" flow).
+    if let Some(p) = req.project.as_deref().filter(|p| !p.is_empty()) {
+        if c.projects.snapshot().contains_key(p) {
+            require_project(&c, &headers, claims.as_ref().map(|e| &e.0), p)?;
+        }
     }
     let region = c.region.clone();
     let rec = c.securelinks.provision(req, &region).await.map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -3060,8 +4489,12 @@ struct MetricsQ {
 async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<MetricsQ>) -> Json<Value> {
     let minutes = q.minutes.unwrap_or(60).min(180);
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // TENANT-SCOPED: every series/status/path read is confined to the caller's
+    // tenant — no cross-tenant telemetry leak. (The owner ops console reads global
+    // metrics through the separate operator-gated `admin_overview`.)
+    let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    let series = c.metrics.series(minutes, now_ms(), project);
+    let series = c.metrics.series(minutes, now_ms(), scope, project);
     let total_req: u64 = series.iter().map(|b| b.requests).sum();
     let total_err: u64 = series.iter().map(|b| b.errors + b.client_err).sum();
     let total_blocked: u64 = series.iter().map(|b| b.blocked).sum();
@@ -3078,29 +4511,33 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
             "error_rate": err_rate,
             "cache_hit_ratio": cache_ratio,
         },
-        "status_distribution": c.metrics.status_distribution(),
-        "top_paths": c.metrics.top_paths(10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
-        "projects": c.metrics.project_totals(minutes, now_ms()).into_iter()
-            .filter(|(p, _)| norm(&c.projects.team_of(p)) == t)
+        "status_distribution": c.metrics.status_distribution(scope),
+        "top_paths": c.metrics.top_paths(scope, 10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
+        "projects": c.metrics.project_totals(minutes, now_ms(), scope).into_iter()
             .map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
     }))
 }
 
 // ============================ Owner / ops dashboard ============================
 
-async fn admin_overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn admin_overview(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let (reqs, blocked) = c.counters();
     let fstats = c.fluid.stats();
     let instances: usize = fstats.iter().map(|f| f.instances).sum();
     let nodes = c.registry.nodes();
     let dbs = c.databases.list(None);
     let live_dbs = dbs.iter().filter(|d| d.mode == "live").count();
-    // Recent error rate from the metrics buckets (last 30m).
-    let series = c.metrics.series(30, now_ms(), None);
+    // Recent error rate from the metrics buckets (last 30m), GLOBAL across all
+    // tenants — this is the operator ops console (owner-only), not tenant-facing.
+    let series = c.metrics.series(30, now_ms(), None, None);
     let req30: u64 = series.iter().map(|b| b.requests).sum();
     let err30: u64 = series.iter().map(|b| b.errors).sum();
     let err_rate = if req30 == 0 { 0.0 } else { err30 as f64 / req30 as f64 };
-    Json(json!({
+    Ok(Json(json!({
         "owner": c.owner_email,
         "teams": c.teams.count(),
         "projects": c.gw.list().iter().map(|d| d.project.clone()).collect::<std::collections::BTreeSet<_>>().len(),
@@ -3121,32 +4558,47 @@ async fn admin_overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
             "mem_total_mb": nodes.iter().map(|n| n.mem_total_mb).sum::<u64>(),
             "disk_total_gb": nodes.iter().map(|n| n.disk_total_gb).sum::<u64>(),
         },
-    }))
+    })))
 }
 
-async fn admin_audit(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn admin_audit(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     // The durable, append-only audit log of every state mutation (newest first).
-    Json(json!(c.audit.recent(300, None)))
+    Ok(Json(json!(c.audit.recent(300, None))))
 }
 
-async fn incidents_list(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.incidents.list()))
+async fn incidents_list(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.incidents.list())))
 }
 
-async fn incident_open(State(c): State<Arc<CloudState>>, Json(req): Json<crate::incidents::OpenReq>) -> Json<Value> {
+async fn incident_open(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(req): Json<crate::incidents::OpenReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let inc = c.incidents.open(req);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, "*", "incident.opened", json!({ "id": inc.id, "title": inc.title, "severity": inc.severity }));
-    Json(json!(inc))
+    Ok(Json(json!(inc)))
 }
 
 async fn incident_update(
     State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
     Json(req): Json<crate::incidents::UpdateReq>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let resolved = matches!(req.status, crate::incidents::IncidentStatus::Resolved);
-    let inc = c.incidents.update(&id, req).ok_or(StatusCode::NOT_FOUND)?;
+    let inc = c.incidents.update(&id, req).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
     if resolved {
         crate::webhooks::dispatch(&c.webhooks, "*", "incident.resolved", json!({ "id": inc.id, "title": inc.title }));
@@ -3269,9 +4721,22 @@ async fn notifications_list(State(c): State<Arc<CloudState>>, headers: HeaderMap
     Json(json!({ "unread": unread, "inbox": inbox, "items": items }))
 }
 
-async fn notification_archive(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Json<Value> {
+async fn notification_archive(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Only archive an id that actually belongs to the caller's own team's
+    // notification feed — this used to archive ANY id globally, letting one
+    // team hide another team's alert (e.g. a failed-deploy/error-rate
+    // notification) by guessing its predictable `deploy-<id>`/`anom-*` format.
+    if !build_notifications(&c, &team).iter().any(|n| n.id == id) {
+        return Err((StatusCode::NOT_FOUND, "no such notification".into()));
+    }
     c.notifications.archive(&id);
-    Json(json!({ "archived": id }))
+    Ok(Json(json!({ "archived": id })))
 }
 
 async fn notifications_archive_all(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
@@ -3343,7 +4808,16 @@ async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<Identit
         org_slug.as_deref(),
     );
     crate::persist::persist(&c);
-    Json(json!({ "ok": true, "tenant": tenant }))
+    // MULTI-TENANCY: tell the client whether this account is the PLATFORM OWNER.
+    // Personal-scope data historically lived under the single global "personal"
+    // namespace (the cross-account leak). The client now keys personal data by
+    // per-user id (`u_<uid>`); the owner alone keeps the legacy "personal"
+    // namespace so their pre-existing projects/deployments (local AND fleet-hosted,
+    // tagged tenant="personal") stay visible — without a risky mesh-wide retag.
+    // Every non-owner is isolated under their own `u_<uid>`.
+    let is_owner = !c.owner_email.trim().is_empty()
+        && req.user.email.eq_ignore_ascii_case(c.owner_email.trim());
+    Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
 // ============================ Billing & compute credits ============================
@@ -3351,11 +4825,34 @@ async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<Identit
 async fn billing_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let acc = c.billing.account(&t);
+    let plan = acc.plan.clone();
+    // Live quota usage (business-locking gauges) + the metered rate card + this
+    // period's draft invoice, so the UI shows limits/usage/invoicing in one place.
+    let projects_used = c.projects.count_for_team(&t) as u32;
+    let members_used = c.teams.get(&t).map(|team| team.members.len() as u32).unwrap_or(0);
     Json(json!({
         "account": acc,
         "plans": crate::billing::PLANS,
         "stripe": crate::billing::stripe_configured(),
+        "rate_card": crate::billing::RATE_CARD,
+        "limits": {
+            "max_projects": crate::billing::plan_max_projects(&plan),
+            "max_members": crate::billing::plan_max_members(&plan),
+            "max_duration_secs": crate::billing::plan_max_duration_secs(&plan),
+            "allows_failover": crate::billing::plan_allows_failover(&plan),
+            "allows_sso": crate::billing::plan_allows_sso(&plan),
+            "projects_used": projects_used,
+            "members_used": members_used,
+            "can_deploy": c.billing.can_deploy(&t).is_ok(),
+        },
+        "current_invoice": c.billing.current_invoice(&t),
     }))
+}
+
+/// Invoices for the tenant (finalized periods + current draft, newest first).
+async fn billing_invoices(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    Json(json!(c.billing.invoices(&t)))
 }
 
 async fn billing_ledger(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
@@ -3464,7 +4961,10 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
         ("projects", projects),
         ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
         ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
-        ("databases", c.databases.snapshot().into_iter().map(|d| json!(d)).collect()),
+        // MASKED — this feeds the ops-console data browser; even an operator
+        // should not see raw credentials here (a real "reveal" affordance, if
+        // ever added, should be its own explicit, individually-audited action).
+        ("databases", c.databases.list(None).into_iter().map(|d| json!(d)).collect()),
         ("domains", c.domains.snapshot().into_iter().map(|d| json!(d)).collect()),
         ("secure_links", c.securelinks.all().into_iter().map(|l| json!(l)).collect()),
         ("api_keys", c.apikeys.snapshot().into_iter().map(|k| json!(k)).collect()),
@@ -3482,7 +4982,11 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
 
 /// The tenant namespaces the platform store is partitioned into, with per-record
 /// counts — the multi-tenant schema of the guardian-db / snapshot.
-async fn data_namespaces(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn data_namespaces(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let snap = crate::persist::capture(&c);
     let docs = crate::persist::namespaced(&snap);
     let rows: Vec<Value> = docs
@@ -3499,14 +5003,17 @@ async fn data_namespaces(State(c): State<Arc<CloudState>>) -> Json<Value> {
             })
         })
         .collect();
-    Json(json!({ "namespaces": rows }))
+    Ok(Json(json!({ "namespaces": rows })))
 }
 
 /// Live status of the always-on GuardianDB durable store: the keys currently
 /// held in the iroh-docs `hive-state` KV (one per tenant namespace) plus a
 /// content sample proving data round-trips through the replicated store — not a
 /// mock. `online` is true once the iroh-backed store has opened.
-async fn guardian_status() -> Json<Value> {
+async fn guardian_status(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let mut keys = crate::guardian::keys().await;
     keys.sort();
     // Round-trip the first key to prove reads come back from GuardianDB itself.
@@ -3517,7 +5024,7 @@ async fn guardian_status() -> Json<Value> {
             .unwrap_or(Value::Null),
         None => Value::Null,
     };
-    Json(json!({
+    Ok(Json(json!({
         "store": "guardian-db",
         "engine": "iroh-docs (BLAKE3 · QUIC · Willow reconciliation)",
         "kv": "hive-state",
@@ -3525,10 +5032,14 @@ async fn guardian_status() -> Json<Value> {
         "key_count": keys.len(),
         "keys": keys,
         "sample": sample,
-    }))
+    })))
 }
 
-async fn data_collections(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn data_collections(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let mut cols: Vec<Value> = all_collections(&c)
         .into_iter()
         .map(|(name, rows)| json!({ "name": name, "count": rows.len(), "editable": false }))
@@ -3537,7 +5048,7 @@ async fn data_collections(State(c): State<Arc<CloudState>>) -> Json<Value> {
     for (name, count) in c.docs.collections() {
         cols.push(json!({ "name": name, "count": count, "editable": true }));
     }
-    Json(json!({ "collections": cols, "store": "guardian-db (iroh) · local snapshot" }))
+    Ok(Json(json!({ "collections": cols, "store": "guardian-db (iroh) · local snapshot" })))
 }
 
 #[derive(Deserialize)]
@@ -3556,12 +5067,14 @@ fn doc_rows(c: &Arc<CloudState>, collection: &str) -> Option<Vec<Value>> {
 
 async fn data_rows(
     State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(collection): Path<String>,
     Query(q): Query<DataQ>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let typed = all_collections(&c).into_iter().find(|(name, _)| *name == collection).map(|(_, r)| r);
     let editable = typed.is_none();
-    let rows = typed.or_else(|| doc_rows(&c, &collection)).ok_or(StatusCode::NOT_FOUND)?;
+    let rows = typed.or_else(|| doc_rows(&c, &collection)).ok_or((StatusCode::NOT_FOUND, "no such collection".into()))?;
     let needle = q.q.unwrap_or_default().to_lowercase();
     let total = rows.len();
     let mut filtered: Vec<Value> = rows
@@ -3582,6 +5095,7 @@ async fn data_create(
     Path(collection): Path<String>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Don't let custom docs shadow a typed platform collection.
     if all_collections(&c).iter().any(|(n, _)| *n == collection) {
@@ -3600,9 +5114,10 @@ async fn data_patch(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((collection, id)): Path<(String, String)>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let doc = c.docs.patch(&id, body).ok_or(StatusCode::NOT_FOUND)?;
+    let doc = c.docs.patch(&id, body).ok_or((StatusCode::NOT_FOUND, "no such document".into()))?;
     c.audit.record(&t, "user", "update", "document", &id, &collection);
     crate::persist::persist(&c);
     Ok(Json(json!(doc)))
@@ -3615,6 +5130,7 @@ async fn data_delete(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path((collection, id)): Path<(String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if c.docs.delete(&id) {
         c.audit.record(&t, "user", "delete", "document", &id, &collection);
@@ -3623,7 +5139,13 @@ async fn data_delete(
     }
     let ok = match collection.as_str() {
         "deployments" => c.gw.remove(&id).await.is_some(),
-        "databases" => { c.databases.remove_db(&id); true }
+        "databases" => {
+            // Use the RECORD's own owning team (not the operator's `t`) so the
+            // queue/vector namespace purge targets the correct tenant.
+            let owner = c.databases.get_raw(&id).map(|d| d.team).unwrap_or_else(|| t.clone());
+            c.databases.remove_db_and_purge_data(&id, &owner);
+            true
+        }
         "secure_links" => { c.securelinks.remove(&id); true }
         "webhooks" => { c.webhooks.remove(&id); true }
         _ => return Err((StatusCode::BAD_REQUEST, format!("'{collection}' rows are managed and can't be deleted here"))),
@@ -3695,9 +5217,19 @@ fn urlencode(s: &str) -> String {
 /// cached per deployment. Falls back to a generated SVG card if capture fails.
 async fn project_thumbnail(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
+    // Don't render another tenant's app content as a preview — mirrors the
+    // check `project_preview` already performs; this handler independently
+    // captures/serves the actual image bytes and previously had no check at
+    // all (also bypassing `preview_protection` for a password-gated project).
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if norm(&c.projects.team_of(&project)) != t {
+        return (StatusCode::NOT_FOUND, "no deployment").into_response();
+    }
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
         .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
@@ -3827,6 +5359,7 @@ mod tenant_isolation_tests {
             role: "owner".into(),
             iat: 0,
             exp: 0,
+            platform_admin: false,
         }
     }
 
@@ -3857,15 +5390,168 @@ mod tenant_isolation_tests {
     }
 
     #[test]
-    fn enforced_without_jwt_ignores_header() {
-        // Enforced + no JWT + no API key: the spoofable header is NOT trusted.
+    fn enforced_without_jwt_is_anon_not_owner() {
+        // Enforced + no JWT + no API key: the spoofable header is NOT trusted, AND
+        // it does NOT fall back to "personal" (the owner's namespace) — an
+        // unauthenticated read must own NOTHING, never leak the owner's data.
         let resolved = resolve_tenant(None, None, Some("team-b".to_string()), true);
-        assert_eq!(resolved, "personal", "enforced mode ignores x-hive-team without a JWT");
+        assert_eq!(resolved, super::ANON_TENANT, "unauthenticated enforced request is anonymous, not the owner");
+        assert_ne!(resolved, "personal", "must not default to the owner tenant");
+    }
+
+    #[test]
+    fn dev_mode_default_is_personal_when_no_header() {
+        // Dev (unenforced), no header → the single local user is the owner.
+        assert_eq!(resolve_tenant(None, None, None, false), "personal");
     }
 
     #[test]
     fn api_key_team_used_when_no_jwt() {
         let resolved = resolve_tenant(None, Some("key-team".to_string()), Some("team-b".to_string()), true);
         assert_eq!(resolved, "key-team", "API key team wins over header");
+    }
+
+    // --- require_operator / platform_admin (privilege-escalation fix) ---
+
+    #[test]
+    fn tenant_owner_role_no_longer_grants_platform_operator_access() {
+        // REGRESSION TEST for a real, confirmed vulnerability: every signed-up
+        // user was minted `role: "owner"` for their OWN personal tenant, and
+        // `require_operator` used to accept that role directly — letting any
+        // customer reach global WAF/CDN/routing mutation endpoints. A tenant
+        // "owner" (role="owner", platform_admin=false, the ordinary case for
+        // every non-owner user) must now be REJECTED.
+        let claims = Claims {
+            sub: "user-1".into(),
+            tenant: "some-customer-team".into(),
+            role: "owner".into(),
+            iat: 0,
+            exp: 0,
+            platform_admin: false,
+        };
+        assert!(
+            !super::operator_allowed(Some(&claims), true),
+            "a tenant-scoped \"owner\" role must NOT satisfy the platform-operator check"
+        );
+    }
+
+    #[test]
+    fn genuine_platform_admin_claim_grants_operator_access() {
+        let claims = Claims {
+            sub: "real-owner".into(),
+            tenant: "personal".into(),
+            role: "owner".into(),
+            iat: 0,
+            exp: 0,
+            platform_admin: true,
+        };
+        assert!(super::operator_allowed(Some(&claims), true));
+    }
+
+    #[test]
+    fn no_claims_denied_when_enforced_but_open_in_dev_mode() {
+        assert!(!super::operator_allowed(None, true), "no claims + enforced must be denied");
+        assert!(super::operator_allowed(None, false), "dev mode (unenforced) stays open");
+    }
+
+    #[test]
+    fn ct_eq_matches_ordinary_equality_semantics() {
+        assert!(super::ct_eq("same-secret", "same-secret"));
+        assert!(!super::ct_eq("same-secret", "different"));
+        assert!(!super::ct_eq("short", "shorter-value"));
+        assert!(super::ct_eq("", ""));
+    }
+}
+
+#[cfg(test)]
+mod project_purge_tests {
+    use super::*;
+
+    /// REGRESSION TEST for a real, confirmed GDPR Art.17 gap: nothing ever
+    /// removed a project's backing podman volume — `podman rm` of the
+    /// container that mounted it leaves the NAMED volume (and the customer
+    /// data inside it) on host disk forever. Real podman calls (no mocking):
+    /// creates two projects' volumes (one with a per-service suffix, matching
+    /// a compose deployment), purges one, and confirms the OTHER project's
+    /// volume — including one whose name is a superstring of the deleted
+    /// project's — survives untouched.
+    #[tokio::test]
+    async fn purge_project_podman_volumes_removes_only_the_target_project() {
+        let Ok(v) = tokio::process::Command::new("podman").arg("--version").output().await else {
+            eprintln!("skipping: podman not found");
+            return;
+        };
+        if !v.status.success() {
+            eprintln!("skipping: podman not usable");
+            return;
+        }
+        let suffix = std::process::id();
+        let target = format!("purgetest-{suffix}");
+        // A different project whose name CONTINUES the same characters with
+        // no delimiter — the exact false-positive case the exact-or-`-`-
+        // suffix check exists to exclude (see the function's doc comment for
+        // the case it does NOT cover: a different project literally named
+        // `<target>-<anything>`).
+        let other = format!("purgetest-{suffix}other");
+
+        for name in [
+            format!("hive-vol-{target}"),
+            format!("hive-vol-{target}-worker"), // per-service (compose) suffix
+            format!("hive-vol-{other}"),
+        ] {
+            let _ = tokio::process::Command::new("podman").args(["volume", "create", &name]).output().await;
+        }
+
+        purge_project_podman_volumes(&target).await;
+
+        let list = tokio::process::Command::new("podman")
+            .args(["volume", "ls", "--format", "{{.Name}}"])
+            .output()
+            .await
+            .expect("podman volume ls must run");
+        let names: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().map(|s| s.trim().to_string()).collect();
+
+        assert!(!names.contains(&format!("hive-vol-{target}")), "target project's base volume must be removed");
+        assert!(!names.contains(&format!("hive-vol-{target}-worker")), "target project's per-service volume must be removed");
+        assert!(names.contains(&format!("hive-vol-{other}")), "a DIFFERENT project whose name is a superstring must survive");
+
+        // Cleanup whatever's left (the `other` volume this test created).
+        let _ = tokio::process::Command::new("podman").args(["volume", "rm", "-f", &format!("hive-vol-{other}")]).output().await;
+    }
+
+    #[tokio::test]
+    async fn purge_project_source_dirs_removes_only_matching_checkouts() {
+        // Real filesystem, real `deploy_root()` — confirms the synchronous
+        // cleanup (added so a deleted project's source, which can carry
+        // committed secrets/PII, doesn't linger for up to ~40 minutes waiting
+        // on the periodic gc_build_dirs timer) removes the target project's
+        // checkout dir(s) — including a `-building-<ms>` in-progress checkout,
+        // the OTHER real naming shape this repo uses (git.rs:3391) — while
+        // leaving an unrelated project's checkout untouched. Uses the same
+        // `<project>-<stamp>` prefix convention as `newest_deploy_dir`
+        // (git.rs) — like that existing function, this is a prefix match, not
+        // a delimiter-exact one, which is a pre-existing, accepted property
+        // of this convention (project names are allocated to be globally
+        // unique, per the "Pick a globally-unique project name" comment on
+        // git.rs's project-name allocator), not a new gap introduced here.
+        let base = crate::git::deploy_root();
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let suffix = std::process::id();
+        let project = format!("purge-src-{suffix}");
+        let target_dir = base.join(format!("{project}-abc123"));
+        let target_building_dir = base.join(format!("{project}-building-999999"));
+        let unrelated_dir = base.join(format!("purge-src-unrelated-{suffix}-xyz789"));
+        tokio::fs::create_dir_all(&target_dir).await.unwrap();
+        tokio::fs::create_dir_all(&target_building_dir).await.unwrap();
+        tokio::fs::create_dir_all(&unrelated_dir).await.unwrap();
+        tokio::fs::write(target_dir.join("secret.env"), b"DATABASE_URL=leaked").await.unwrap();
+
+        purge_project_source_dirs(&project).await;
+
+        assert!(!target_dir.exists(), "target project's checkout must be removed");
+        assert!(!target_building_dir.exists(), "target project's in-progress -building- checkout must also be removed");
+        assert!(unrelated_dir.exists(), "an unrelated project's checkout must survive");
+
+        let _ = tokio::fs::remove_dir_all(&unrelated_dir).await;
     }
 }

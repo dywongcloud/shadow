@@ -60,7 +60,7 @@ const MARKETPLACE: Provider[] = [
 ];
 
 export default function StoragePage() {
-  const { data: dbs, refresh } = usePoll<Database[]>("/v1/databases", 3000);
+  const { data: dbs, error, refresh } = usePoll<Database[]>("/v1/databases", 3000);
   const [open, setOpen] = useState(false);
   // Deep-link: /storage?browse opens the Browse Storage panel directly.
   useEffect(() => {
@@ -77,7 +77,14 @@ export default function StoragePage() {
         action={<Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Database</Button>}
       />
 
-      {!dbs?.length ? (
+      {error && !dbs?.length ? (
+        <Card className="flex flex-col items-center gap-3 py-16 text-center">
+          <DbIcon className="h-8 w-8 text-muted" />
+          <div className="text-sm font-medium">Couldn&apos;t load databases</div>
+          <p className="max-w-sm text-sm text-secondary">{String(error).replace(/^Error:\s*/, "")}</p>
+          <Button variant="outline" onClick={refresh}>Retry</Button>
+        </Card>
+      ) : !dbs?.length ? (
         <Card className="flex flex-col items-center gap-3 py-16 text-center">
           <DbIcon className="h-8 w-8 text-muted" />
           <div className="text-sm font-medium">No databases yet</div>
@@ -98,9 +105,16 @@ export default function StoragePage() {
                 <Td className="text-secondary">{d.provider || KIND_NAME[d.kind]}</Td>
                 <Td>{kindBadge(d.kind)}</Td>
                 <Td className="text-secondary">{d.project || "—"}</Td>
-                <Td><Badge tone="blue">{d.region}</Badge></Td>
+                <Td>
+                  <div className="flex flex-wrap items-center gap-1">
+                    <Badge tone="blue">{d.region}</Badge>
+                    {(d.replicas ?? []).map((r) => (
+                      <span key={r} title="read replica"><Badge tone="default">↳ {r}</Badge></span>
+                    ))}
+                  </div>
+                </Td>
                 <Td><StatusBadge status={d.status} mode={d.mode} /></Td>
-                <Td className="text-secondary">{timeAgo(d.created_ms)} ago</Td>
+                <Td className="text-secondary">{d.created_ms ? `${timeAgo(d.created_ms)} ago` : "—"}</Td>
               </tr>
             ))}
           </tbody>
@@ -127,8 +141,16 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
   // configure step
   const [name, setName] = useState("");
   const [project, setProject] = useState("");
-  const [region, setRegion] = useState("iad1");
+  const [region, setRegion] = useState("san-jose");
+  const [replicas, setReplicas] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  // Live mesh regions for the replica selector (falls back to the known set).
+  const { data: catalog } = usePoll<Record<string, { id: string; label: string }[]>>("/v1/regions/catalog", 30000);
+  const allRegions: string[] = catalog
+    ? Array.from(new Set(Object.values(catalog).flat().map((r) => r.id)))
+    : ["los-angeles", "san-jose", "virginia", "bangkok"];
+  const toggleReplica = (r: string) =>
+    setReplicas((cur) => (cur.includes(r) ? cur.filter((x) => x !== r) : [...cur, r]));
 
   const ql = q.toLowerCase();
   const native = NATIVE.filter((n) => !ql || n.name.toLowerCase().includes(ql) || n.desc.toLowerCase().includes(ql));
@@ -144,6 +166,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
         kind: sel.kind,
         region,
         provider: sel.provider,
+        replicas: replicas.filter((r) => r !== region),
       });
       onCreated();
     } catch (e) { alert(String(e)); setBusy(false); }
@@ -231,11 +254,44 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                   <Input value={project} onChange={(e) => setProject(e.target.value)} placeholder="my-project" />
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium text-secondary">Region</label>
-                  <Input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="iad1" />
+                  <label className="mb-1 block text-xs font-medium text-secondary">Primary region</label>
+                  <select
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
+                    className="w-full rounded-md border border-border bg-bg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-border"
+                  >
+                    {allRegions.map((r) => (
+                      <option key={r} value={r}>{r}</option>
+                    ))}
+                  </select>
                 </div>
               </div>
-              <p className="flex items-center gap-1.5 text-xs text-muted"><Gauge className="h-3.5 w-3.5" /> Credentials are generated automatically and injectable into the project.</p>
+              <div>
+                <label className="mb-1 block text-xs font-medium text-secondary">Replica regions <span className="text-muted">(cross-region reads)</span></label>
+                <div className="flex flex-wrap gap-2">
+                  {allRegions.filter((r) => r !== region).map((r) => (
+                    <button
+                      key={r}
+                      type="button"
+                      onClick={() => toggleReplica(r)}
+                      className={
+                        "rounded-md border px-2.5 py-1 text-xs transition-colors " +
+                        (replicas.includes(r)
+                          ? "border-fg bg-fg text-bg"
+                          : "border-border text-secondary hover:bg-subtle")
+                      }
+                    >
+                      {r}{replicas.includes(r) ? " ✓" : ""}
+                    </button>
+                  ))}
+                </div>
+                {replicas.length > 0 ? (
+                  <p className="mt-1.5 text-xs text-muted">
+                    Replicated to {replicas.filter((r) => r !== region).join(", ")} — reads served locally in each region.
+                  </p>
+                ) : null}
+              </div>
+              <p className="flex items-center gap-1.5 text-xs text-muted"><Gauge className="h-3.5 w-3.5" /> Credentials are generated automatically and injected into the project&apos;s environment variables.</p>
             </div>
           )}
         </div>

@@ -80,6 +80,14 @@ impl Webhook {
     fn subscribed(&self, event: &str) -> bool {
         self.enabled && (self.events.is_empty() || self.events.iter().any(|e| e == event))
     }
+    /// For API responses TO THE OWNING TENANT ONLY: decrypt `secret` back to
+    /// its real value (they need it to verify signatures on their receiving
+    /// endpoint) — the stored/persisted form is AEAD-sealed. `decrypt` is a
+    /// safe no-op passthrough for an already-plaintext legacy record.
+    pub fn decrypted(mut self) -> Self {
+        self.secret = crate::secrets::decrypt(&self.secret);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -132,6 +140,15 @@ impl WebhookStore {
         if w.secret.is_empty() {
             w.secret = format!("whsec_{}", uuid::Uuid::new_v4().simple());
         }
+        // AEAD-encrypt the HMAC signing secret before it's stored/persisted —
+        // this platform already has this exact primitive wired in for
+        // sensitive project env vars (secrets.rs), but the webhook secret
+        // (which, if leaked from a snapshot/backup/GuardianDB replica, lets
+        // an attacker forge signed webhook deliveries) was persisted in
+        // plaintext in the same snapshot files that primitive protects
+        // everything else in. `encrypt` is idempotent (passthrough if already
+        // sealed), so re-adding an already-encrypted secret is safe.
+        w.secret = crate::secrets::encrypt(&w.secret);
         w.created_ms = now_ms();
         self.hooks.write().push(w.clone());
         w
@@ -204,7 +221,9 @@ pub fn dispatch(store: &Arc<WebhookStore>, project: &str, event: &str, payload: 
         let body_str = body_str.clone();
         let event = event.to_string();
         tokio::spawn(async move {
-            let sig = sign(&w.secret, &body_str);
+            // decrypt() is a safe no-op passthrough for an already-plaintext
+            // legacy secret (backward compatible with pre-existing webhooks).
+            let sig = sign(&crate::secrets::decrypt(&w.secret), &body_str);
             let res = store
                 .http
                 .post(&w.url)
@@ -243,5 +262,48 @@ pub fn dispatch(store: &Arc<WebhookStore>, project: &str, event: &str, payload: 
             };
             store.record_delivery(delivery);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// REGRESSION TEST for a real, confirmed gap: webhook HMAC signing secrets
+    /// used to be persisted in PLAINTEXT in the same snapshot files this
+    /// platform's own secrets.rs primitive protects everything else in — a
+    /// leaked snapshot/backup/GuardianDB replica let an attacker forge signed
+    /// webhook deliveries to a customer's endpoint. Confirms: (1) the STORED
+    /// record is sealed (never the raw secret), (2) the owner-facing
+    /// `.decrypted()` view still returns the real value, (3) a pre-existing
+    /// plaintext legacy secret (from before this fix) still round-trips
+    /// correctly through the same decrypt call (backward compatible).
+    #[test]
+    fn webhook_secret_is_encrypted_at_rest_but_recoverable_for_owner_and_signing() {
+        let store = WebhookStore::new();
+        let created = store.add(Webhook {
+            id: String::new(),
+            team: "acme".into(),
+            project: "*".into(),
+            url: "https://example.com/hook".into(),
+            events: vec![],
+            secret: "whsec_realvalue123".into(),
+            enabled: true,
+            created_ms: 0,
+        });
+
+        // The record actually held in the store (== what gets persisted) must
+        // NOT be the plaintext secret.
+        let stored = store.snapshot().into_iter().find(|w| w.id == created.id).unwrap();
+        assert_ne!(stored.secret, "whsec_realvalue123", "stored secret must be sealed, not plaintext");
+        assert!(stored.secret.starts_with("enc:v1:"), "stored secret must use the AEAD envelope");
+
+        // The owner-facing decrypted view recovers the real value.
+        assert_eq!(stored.clone().decrypted().secret, "whsec_realvalue123");
+
+        // A legacy, already-plaintext record (persisted before this fix
+        // shipped) must still decrypt correctly (passthrough, not garbled).
+        let legacy = Webhook { secret: "whsec_legacy_plaintext".into(), ..stored.clone() };
+        assert_eq!(legacy.decrypted().secret, "whsec_legacy_plaintext");
     }
 }

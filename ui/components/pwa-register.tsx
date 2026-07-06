@@ -34,5 +34,27 @@ export function PwaRegister() {
 
     return () => navigator.serviceWorker.removeEventListener("controllerchange", onControllerChange);
   }, []);
+
+  // Remove Clerk's development-instance floating badge (the white rounded box in
+  // the bottom-right corner). CSS handles the common cases; this JS sweep is the
+  // robust catch-all across Clerk's shifting class names — hide any FIXED-position
+  // anchor pointing at clerk.com (never a legit in-page link on our surfaces).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const sweep = () => {
+      document.querySelectorAll<HTMLElement>('a[href*="clerk.com"], .cl-badge, [data-localization-key="badge__development"]').forEach((el) => {
+        const fixed = getComputedStyle(el).position === "fixed" || el.className.toString().includes("badge");
+        if (fixed) el.style.setProperty("display", "none", "important");
+      });
+    };
+    sweep();
+    const obs = new MutationObserver(sweep);
+    obs.observe(document.body, { childList: true, subtree: true });
+    const t = setTimeout(() => obs.disconnect(), 15000); // badge injects early; stop watching after
+    return () => {
+      clearTimeout(t);
+      obs.disconnect();
+    };
+  }, []);
   return null;
 }

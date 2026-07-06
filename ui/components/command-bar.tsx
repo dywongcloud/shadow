@@ -8,6 +8,7 @@ import {
   BookOpen, Triangle, CornerDownLeft,
 } from "lucide-react";
 import { apiGet, type Deployment } from "@/lib/api";
+import { useIsPlatformOwner } from "@/lib/owner";
 
 /* The platform command bar (⌘K / Ctrl-K). Opens from the global shortcut or via
  * the `open-command-bar` window event (dispatched by the Projects search bar).
@@ -27,6 +28,7 @@ const ic = "h-4 w-4";
 
 export function CommandBar() {
   const router = useRouter();
+  const isOwner = useIsPlatformOwner();
   const [open, setOpen] = useState(false);
   const [q, setQ] = useState("");
   const [idx, setIdx] = useState(0);
@@ -88,7 +90,10 @@ export function CommandBar() {
     const actions: Cmd[] = [
       { id: "new", label: "New Project", group: "Actions", hint: "Deploy", icon: <Plus className={ic} />, keywords: "create deploy import", run: go("/new") },
       { id: "docs", label: "Documentation", group: "Actions", icon: <BookOpen className={ic} />, keywords: "docs api guide help", run: go("/docs") },
-      { id: "ops", label: "Operations Console", group: "Actions", icon: <ShieldHalf className={ic} />, keywords: "admin ops", run: go("/admin") },
+      // Ops entry — platform owner only (middleware enforces; this just hides it).
+      ...(isOwner
+        ? [{ id: "ops", label: "Operations Console", group: "Actions", icon: <ShieldHalf className={ic} />, keywords: "admin ops", run: go("/admin") } as Cmd]
+        : []),
     ];
     const pages: Cmd[] = nav.map(([label, href, icon]) => ({
       id: "nav-" + href,
@@ -107,7 +112,7 @@ export function CommandBar() {
       run: go(`/projects/${encodeURIComponent(p)}`),
     }));
     return [...actions, ...pages, ...projects];
-  }, [deps]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [deps, isOwner]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     const s = q.trim().toLowerCase();

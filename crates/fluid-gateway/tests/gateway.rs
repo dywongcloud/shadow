@@ -182,6 +182,106 @@ async fn max_duration_504_and_error_isolation() {
     assert_eq!(normal_ok, 10, "normal requests must survive (error isolation)");
 }
 
+fn bun() -> Option<String> {
+    for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"] {
+        let cand = std::path::PathBuf::from(dir).join("bun");
+        if cand.is_file() {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    let cand = std::path::PathBuf::from(home).join(".bun/bin/bun");
+    cand.is_file().then(|| cand.to_string_lossy().into_owned())
+}
+
+/// waitUntil (background continuation) through the FULL real stack — gateway
+/// -> Fluid pool -> mock instance -> multiplexed tunnel -> a genuine Bun
+/// process (`examples/bun-basic-api/server.js`'s `/api/bg` handler) — proving
+/// this mechanism is exactly as runtime-agnostic as the rest of the pipeline:
+/// it is driven entirely by the `x-fluid-wait-until-ms` RESPONSE header
+/// (`fluid-gateway/src/lib.rs` parses it off whatever process answered, never
+/// caring what language/runtime produced it). The client gets an immediate
+/// response, but the instance's lease must stay held (`inflight >= 1`) for
+/// roughly the declared window afterward, then drop to 0 once it elapses.
+#[tokio::test]
+async fn wait_until_lease_held_open_after_response_for_a_bun_function() {
+    let Some(bun) = bun() else {
+        eprintln!("skipping: bun not found");
+        return;
+    };
+    let backend = Arc::new(MockBackend::new(MockConfig {
+        root: std::env::temp_dir().join(format!("gw-bun-wu-{}", std::process::id())),
+        provision_latency: Duration::from_millis(10),
+        cache_root: std::env::temp_dir().join(format!("gw-bun-wu-cache-{}", std::process::id())),
+    }));
+    let fluid = Fluid::start(backend, FluidConfig::default());
+    let fluid_for_stats = fluid.clone();
+    let gw = Gateway::new(fluid, "default".into());
+
+    let dir = format!("{}/../../examples/bun-basic-api", env!("CARGO_MANIFEST_DIR"));
+    let dep = gw.deploy(
+        dir,
+        Manifest {
+            project: "bun-basic-api".into(),
+            static_dir: None,
+            functions: vec![FunctionConfig {
+                name: "api".into(),
+                runtime: "bun".into(),
+                start_cmd: vec![bun, "server.js".into()],
+                env: BTreeMap::new(),
+                vcpus: 1,
+                memory_mib: 128,
+                max_concurrency: 5,
+                min_instances: 0,
+                max_instances: 2,
+                idle_ttl_secs: 30,
+                max_duration_secs: 300,
+                ..Default::default()
+            }],
+            routes: vec![Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) }],
+            ..Default::default()
+        },
+    );
+    let key = fluid_compute::func_key(dep.id.as_str(), "api");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, fluid_gateway::public_router(gw)).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // Cold-start + confirm the response itself is correct and immediate.
+    let resp = client.get(format!("{base}/api/bg")).send().await.expect("request must succeed");
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(body.contains("bg via waitUntil"), "unexpected body: {body}");
+
+    // Immediately after the response, the lease must still be held (the
+    // gateway is asleep in the background waitUntil window, not yet released).
+    let inflight_right_after = fluid_for_stats
+        .stats()
+        .into_iter()
+        .find(|s| s.key == key)
+        .map(|s| s.inflight)
+        .unwrap_or(0);
+    assert!(
+        inflight_right_after >= 1,
+        "lease should still be held immediately after responding (waitUntil window active), got inflight={inflight_right_after}"
+    );
+
+    // After the declared window (600ms) plus margin, it must have been released.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let inflight_after_window = fluid_for_stats
+        .stats()
+        .into_iter()
+        .find(|s| s.key == key)
+        .map(|s| s.inflight)
+        .unwrap_or(0);
+    assert_eq!(inflight_after_window, 0, "lease must be released once the waitUntil window elapses");
+}
+
 /// #17 context-leak runtime test (full stack): many concurrent requests forced
 /// onto ONE instance (max_instances=1, high max_concurrency) each carry a unique
 /// path, `x-ctx` header, and body. Every response must reflect EXACTLY its own

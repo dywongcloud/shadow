@@ -27,7 +27,7 @@ export function ProjectTabs({ project, active }: { project: string; active: Proj
   const Tab = ({ k, label }: { k: ProjectTab; label: string }) => (
     <Link
       href={hrefFor(k)}
-      className={`relative px-3 py-2 text-sm ${active === k ? "text-fg" : "text-secondary hover:text-fg"}`}
+      className={`relative shrink-0 whitespace-nowrap px-3 py-2 text-sm ${active === k ? "text-fg" : "text-secondary hover:text-fg"}`}
     >
       {label}
       {active === k && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-fg" />}
@@ -35,7 +35,7 @@ export function ProjectTabs({ project, active }: { project: string; active: Proj
   );
 
   return (
-    <div className="mb-6 flex items-center gap-1 overflow-x-auto border-b border-border">
+    <div className="no-scrollbar mb-6 flex items-center gap-1 overflow-x-auto border-b border-border">
       {IN_PAGE.map(([k, label]) => (
         <Tab key={k} k={k} label={label} />
       ))}

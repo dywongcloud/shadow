@@ -8,23 +8,14 @@ import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide
 const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), { ssr: false });
 const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.SparkAreaChart), { ssr: false });
 import { Card } from "@/components/ui";
-import { usePoll, type Overview, type FunctionStats, type BillingInfo } from "@/lib/api";
+import { usePoll, type Overview, type FunctionStats, type BillingInfo, type Metrics } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-const DAYS = 18;
-
-// Build a plausible cumulative daily series for the billing cycle from current
-// totals, so the consumption chart looks live without historical storage.
-function series(total: number) {
-  const out: number[] = [];
-  let acc = 0;
-  for (let i = 0; i < DAYS; i++) {
-    acc += (total / DAYS) * (0.6 + (i / DAYS) * 0.9);
-    out.push(Math.round(acc));
-  }
-  // normalize so the last point equals total
-  const last = out[out.length - 1] || 1;
-  return out.map((v) => Math.round((v / last) * total));
+// A flat sparkline at the real current level — used for metrics we track as a
+// running total but NOT as a time-series (CPU/memory/instances). Honest: it shows
+// the real magnitude without fabricating a growth curve we don't have data for.
+function flat(value: number, n: number) {
+  return Array.from({ length: n }, () => Math.round(value));
 }
 
 function fmt(n: number) {
@@ -37,6 +28,10 @@ export default function UsagePage() {
   const { data: ov } = usePoll<Overview>("/v1/overview", 3000);
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 3000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 5000);
+  // Real per-tenant traffic time-series (buckets over the last few hours). The
+  // scoped `/v1/metrics` backs the consumption chart with ACTUAL requests/cache/
+  // blocked over time — not a fabricated curve.
+  const { data: metrics } = usePoll<Metrics>("/v1/metrics?minutes=180", 15000);
   const [gran, setGran] = useState<"Daily" | "Weekly" | "Monthly">("Daily");
   const [cumulative, setCumulative] = useState(true);
 
@@ -50,14 +45,17 @@ export default function UsagePage() {
   const activeCpuMs = (fns ?? []).reduce((a, f) => a + (f.active_cpu_ms ?? 0), 0);
   const memGbHrs = (fns ?? []).reduce((a, f) => a + (f.memory_gb_hrs ?? 0), 0);
 
-  // Real billing data drives the credit figures (so issued/purchased credits
-  // and actual compute charges reflect here), falling back to an estimate model.
-  // Function compute is billed the Fluid way: Active CPU ($/CPU-hr) + Memory GB-hrs.
-  const edgeCharge = (requests / 1_000_000) * 2.0;
-  const cpuCharge = (activeCpuMs / 1000 / 3600) * 0.128; // active CPU-hours
-  const memCharge = memGbHrs * 0.0106; // provisioned memory GB-hours
+  // Charges are computed from the AUTHORITATIVE rate card the billing API returns
+  // (crates/hive-cloud/src/billing.rs RATE_CARD) — never hardcoded multipliers.
+  // rate_card cents are: per active-CPU-hour, per memory-GB-hour, per 1M requests,
+  // per 1M WAF-blocked. Fall back to 0 (shows $0.00) until the card loads, rather
+  // than inventing a price.
+  const rc = billing?.rate_card;
+  const edgeCharge = (requests / 1_000_000) * ((rc?.requests_per_million_cents ?? 0) / 100);
+  const cpuCharge = (activeCpuMs / 1000 / 3600) * ((rc?.active_cpu_hr_cents ?? 0) / 100);
+  const memCharge = memGbHrs * ((rc?.mem_gb_hr_cents ?? 0) / 100);
   const fnCharge = cpuCharge + memCharge;
-  const wafCharge = (blocked / 1_000_000) * 0.6;
+  const wafCharge = (blocked / 1_000_000) * ((rc?.waf_per_million_cents ?? 0) / 100);
   const acc = billing?.account;
   const includedTotal = acc ? acc.included_cents / 100 : 20;
   const includedUsed = acc ? acc.used_cents / 100 : Math.min(includedTotal, edgeCharge + fnCharge + wafCharge);
@@ -65,23 +63,30 @@ export default function UsagePage() {
   const creditBalance = acc ? acc.balance_cents / 100 : 0;
   const planName = (acc?.plan ?? (ov?.concurrency.plan === "enterprise" ? "enterprise" : "hobby"));
 
-  // Stacked chart data.
-  const edgeS = series(requests);
-  const fnS = series(invocations * 30);
-  const cacheS = series(cacheHits);
-  const start = new Date();
-  start.setDate(start.getDate() - DAYS + 1);
-  const chart = Array.from({ length: DAYS }, (_, i) => {
-    const d = new Date(start);
-    d.setDate(start.getDate() + i);
-    const label = d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
-    return {
-      date: label,
-      "Edge Requests": cumulative ? edgeS[i] : Math.max(1, edgeS[i] - (edgeS[i - 1] || 0)),
-      "Function Invocations": cumulative ? fnS[i] : Math.max(1, fnS[i] - (fnS[i - 1] || 0)),
-      "Cache Hits": cumulative ? cacheS[i] : Math.max(0, cacheS[i] - (cacheS[i - 1] || 0)),
-    };
-  });
+  // REAL per-tenant time-series from the metrics buckets (per-minute). Edge
+  // requests, cache hits and blocked requests are tracked over time, so their
+  // charts + sparklines are actual data. Invocations/CPU/memory/instances are
+  // running totals with no time-series → flat sparks at the real level.
+  const buckets = metrics?.series ?? [];
+  const perBucketEdge = buckets.map((b) => b.requests);
+  const perBucketCache = buckets.map((b) => b.cache_hits);
+  const perBucketBlocked = buckets.map((b) => b.blocked);
+  const cum = (arr: number[]) => {
+    let acc = 0;
+    return arr.map((v) => (acc += v));
+  };
+  // Sparklines mirror the chart mode; cumulative = running sum of the real buckets.
+  const edgeS = cumulative ? cum(perBucketEdge) : perBucketEdge;
+  const cacheS = cumulative ? cum(perBucketCache) : perBucketCache;
+  const blockedS = cumulative ? cum(perBucketBlocked) : perBucketBlocked;
+  const N = Math.max(buckets.length, 1);
+  const fnS = flat(invocations, N);
+  const chart = buckets.map((b, i) => ({
+    date: new Date(b.t_ms).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }),
+    "Edge Requests": edgeS[i] ?? 0,
+    "Cache Hits": cacheS[i] ?? 0,
+    "Blocked": blockedS[i] ?? 0,
+  }));
 
   const pct = Math.min(100, includedTotal ? (includedUsed / includedTotal) * 100 : 0);
 
@@ -153,8 +158,8 @@ export default function UsagePage() {
         <BarChart
           data={chart}
           index="date"
-          categories={["Edge Requests", "Function Invocations", "Cache Hits"]}
-          colors={["blue", "amber", "emerald"]}
+          categories={["Edge Requests", "Cache Hits", "Blocked"]}
+          colors={["blue", "emerald", "rose"]}
           stack
           showLegend={false}
           showAnimation
@@ -169,15 +174,15 @@ export default function UsagePage() {
           </div>
 
           <GroupHeader name="OpenEdge Delivery Network" />
-          <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={`${fmt(requests)} / 10M`} charge={edgeCharge} />
+          <Row color="bg-blue-500" name="Edge Requests" spark={edgeS} usage={`${fmt(requests)}`} charge={edgeCharge} />
           <Row color="bg-emerald-500" name="Cache Hits" spark={cacheS} usage={`${fmt(cacheHits)}`} charge={0} />
-          <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={series(blocked)} usage={`${fmt(blocked)}`} charge={wafCharge} />
+          <Row color="bg-rose-500" name="Firewall — Blocked Requests" spark={blockedS} usage={`${fmt(blocked)}`} charge={wafCharge} />
 
           <GroupHeader name="OpenEdge Functions (Fluid · Active CPU pricing)" />
           <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
-          <Row color="bg-purple-500" name="Active CPU" spark={series(activeCpuMs)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
-          <Row color="bg-teal-500" name="Provisioned Memory" spark={series(Math.round(memGbHrs * 1000))} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
-          <Row color="bg-cyan-500" name="Provisioned Instances" spark={series((ov?.instances ?? 0) * 100)} usage={`${ov?.instances ?? 0}`} charge={0} />
+          <Row color="bg-purple-500" name="Active CPU" spark={flat(activeCpuMs, N)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
+          <Row color="bg-teal-500" name="Provisioned Memory" spark={flat(Math.round(memGbHrs * 1000), N)} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
+          <Row color="bg-cyan-500" name="Provisioned Instances" spark={flat((ov?.instances ?? 0) * 100, N)} usage={`${ov?.instances ?? 0}`} charge={0} />
         </div>
       </Card>
     </div>

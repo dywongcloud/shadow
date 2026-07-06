@@ -14,10 +14,11 @@ import {
   Check,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { apiSend, type Deployment } from "@/lib/api";
+import { apiSend, currentTeam, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentHost } from "@/lib/deploy-url";
 import { toast } from "@/components/toast";
+import { addPendingBuild } from "@/lib/pending-builds";
 
 type Env = "production" | "preview";
 
@@ -66,6 +67,8 @@ export function RedeployModal({
         target: env,
         use_cache: useCache,
       });
+      // Persist the in-flight build so its "Building" row survives navigation/reload.
+      addPendingBuild({ id: r.build_id, project: deployment.project, team: currentTeam(), env });
       toast("New Deployment Created");
       onDone?.(r.build_id, env);
       onClose();

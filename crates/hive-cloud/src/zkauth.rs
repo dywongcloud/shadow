@@ -373,13 +373,23 @@ struct RegisterReq {
 /// `HIVE_INTERNAL_TOKEN` in `x-hive-internal`. When the token is unset (dev) the
 /// guard is open; set it in any multi-user/production deployment.
 fn internal_ok(headers: &HeaderMap) -> bool {
+    // Fail CLOSED when JWT auth is enforced but HIVE_INTERNAL_TOKEN is
+    // missing — mirrors `admin::mint_allowed`'s pattern exactly. This used to
+    // fail OPEN (`_ => true`) whenever no token was configured, so a single
+    // fleet node missing this one env var silently let ANY external caller
+    // self-enroll into (and mint a preview-access proof for) any tenant's
+    // zkauth roster — and because rosters are gossiped mesh-wide, that bogus
+    // membership then verified on every peer node too.
+    if !crate::auth::enforced() {
+        return true; // dev mode (no HIVE_JWT_SECRET) — unchanged, open like the rest of the dev-mode API
+    }
     match std::env::var("HIVE_INTERNAL_TOKEN") {
         Ok(t) if !t.trim().is_empty() => headers
             .get("x-hive-internal")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == t)
+            .map(|v| crate::admin::ct_eq(v, &t))
             .unwrap_or(false),
-        _ => true, // dev-open (no token configured)
+        _ => false,
     }
 }
 

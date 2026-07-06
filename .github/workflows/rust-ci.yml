@@ -51,6 +51,56 @@ jobs:
         continue-on-error: true
         run: cargo clippy --workspace --all-targets
 
+  # Security gate: dependency vulnerability audit (Rust + npm dashboard) + a
+  # secret-material scan. `cargo audit` and `npm audit` were absent, so the CVEs
+  # and advisories in docs/COMPLIANCE_AUDIT.md would never surface automatically.
+  # Kept non-blocking (continue-on-error) initially so the existing advisory
+  # backlog doesn't wedge every PR; flip to blocking once the backlog is clear.
+  security-audit:
+    name: security audit (cargo-audit + npm audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      # RustSec advisory scan over the committed Cargo.lock. Reported now,
+      # gate-worthy once the deferred advisories are resolved.
+      - name: cargo audit (Rust dependencies)
+        continue-on-error: true
+        run: cargo audit
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # npm audit for the dashboard (this is the ONLY place ui/ is checked in CI).
+      - name: npm audit (dashboard)
+        continue-on-error: true
+        working-directory: ui
+        run: npm audit --audit-level=high
+
+      # Dashboard must at least install + build in CI (previously never checked).
+      - name: Dashboard build
+        continue-on-error: true
+        working-directory: ui
+        run: |
+          npm ci || npm install
+          npm run build
+
+      # Cheap secret-material scan: fail on obvious committed private keys. Bounded
+      # to tracked files, excludes example/fixture dirs and lockfiles.
+      - name: Committed-secret scan
+        continue-on-error: true
+        run: |
+          if git grep -nE "BEGIN (RSA|EC|OPENSSH|PGP) PRIVATE KEY" -- . ':(exclude)*.lock' ':(exclude)examples/**'; then
+            echo "::warning::possible committed private key material found"
+          fi
+
   # A focused, fast feedback job for just the deployment/runtime + edge crates the
   # build/serve path depends on (P2P node registry, gateway, build pipeline).
   core-tests:

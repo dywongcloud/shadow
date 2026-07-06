@@ -55,16 +55,16 @@ export default function GettingStarted() {
             <li><strong className="text-fg">Builds</strong> — turn a git repo into build output (framework detection or a Dockerfile).</li>
             <li><strong className="text-fg">Fluid compute</strong> — serve functions on long-lived instances that handle many concurrent requests, autoscale, and scale to zero.</li>
           </ul>
-          <p>Everything below talks to a node&apos;s <strong className="text-fg">admin API</strong> (default <In>127.0.0.1:8786</In>); the public gateway serves traffic on <In>:8787</In>.</p>
+          <p>Everything below talks to the platform <strong className="text-fg">API</strong> at <In>https://api.shadw.cloud</In>. (Self-hosting? The same endpoints live on your node&apos;s admin API — default <In>127.0.0.1:8786</In>.)</p>
         </Section>
 
         <Section id="quickstart" eyebrow="Get started" title="Quickstart">
           <p>From the dashboard, click <strong className="text-fg">New Project</strong>, pick a template or paste a Git URL, and deploy. Or via the API:</p>
-          <One lang="bash" filename="deploy.sh" code={`curl -X POST http://127.0.0.1:8786/v1/git/deploy \\
+          <One lang="bash" filename="deploy.sh" code={`curl -X POST https://api.shadw.cloud/v1/git/deploy \\
   -H 'content-type: application/json' -H 'x-hive-team: personal' \\
   -d '{ "repo_url": "https://github.com/acme/app", "project": "my-app", "production": true }'
 # -> { "build_id": "dpl-…", "project": "my-app" }`} />
-          <p>Your deployment is reachable instantly at <In>my-app.localhost:8787</In> (a self-refreshing <em>Building…</em> page shows until the build finishes).</p>
+          <p>Your deployment is reachable instantly at its deployment URL (a self-refreshing <em>Building…</em> page shows until the build finishes).</p>
         </Section>
 
         <Section id="deploying" eyebrow="Builds" title="Deploying apps">
@@ -82,7 +82,7 @@ export default function GettingStarted() {
           <p>Set variables when creating a project or under <strong className="text-fg">Settings → Environment Variables</strong>. They&apos;re injected into <strong className="text-fg">both build and runtime</strong> — so <In>NEXT_PUBLIC_*</In>, <In>VITE_*</In> and server config all work.</p>
           <H3>Secrets are encrypted at rest</H3>
           <p>Variables marked <strong className="text-fg">Sensitive</strong> are sealed with ChaCha20-Poly1305 before they touch disk — stored as <In>enc:v1:…</In>, masked in API responses, and decrypted only when injected.</p>
-          <One lang="bash" filename="env.sh" code={`curl -X POST http://127.0.0.1:8786/v1/projects/my-app/env \\
+          <One lang="bash" filename="env.sh" code={`curl -X POST https://api.shadw.cloud/v1/projects/my-app/env \\
   -H 'content-type: application/json' -H 'x-hive-team: personal' \\
   -d '{ "key": "API_KEY", "value": "sk-live-…", "target": "all", "sensitive": true }'`} />
           <Callout tone="warn">Back up <In>$HIVE_DATA/secret.key</In> (or set <In>HIVE_SECRET_KEY</In>) — without it, sealed secrets can&apos;t be decrypted.</Callout>
@@ -110,7 +110,7 @@ export default function GettingStarted() {
         </Section>
 
         <Section id="domains" eyebrow="Networking" title="Domains & TLS">
-          <p>Every project gets <In>&lt;project&gt;.localhost:8787</In>. Deployments route purely by subdomain, so the same project is reachable at <In>&lt;project&gt;.&lt;your-domain&gt;</In> once the gateway is exposed there.</p>
+          <p>Every project gets its own subdomain. Deployments route purely by the first host label, so the same project is reachable at <In>&lt;project&gt;.&lt;your-domain&gt;</In> once the gateway is exposed there.</p>
           <p>The gateway terminates TLS (self-signed locally, or your cert via <In>HIVE_TLS_CERT</In>/<In>HIVE_TLS_KEY</In>) and runs an authoritative DNS server. Add custom domains under <strong className="text-fg">Domains</strong>.</p>
         </Section>
 
@@ -122,7 +122,7 @@ hivectl submit --image node:20 -c 'npm ci' -c 'npm run build' --follow`} />
         </Section>
 
         <Section id="api" eyebrow="Reference" title="API reference">
-          <p>All endpoints live on a node&apos;s <strong className="text-fg">admin API</strong> (default <In>:8786</In>). Scope a request with the <In>x-hive-team</In> header; when <In>HIVE_JWT_SECRET</In> is set, mutations require a <In>Bearer</In> token.</p>
+          <p>All endpoints live under <In>https://api.shadw.cloud</In> (self-hosting: your node&apos;s admin API). Authenticate with a platform <strong className="text-fg">API key</strong> (<In>hive_…</In>, created under Settings → API Keys or <In>POST /v1/apikeys</In>) via <In>Authorization: Bearer</In> — the key is bound to its team, so no team header is needed. Without a key, the <In>x-hive-team</In> header scopes requests in dev mode; when <In>HIVE_JWT_SECRET</In> is set, mutations require a JWT minted with <In>POST /v1/token</In>.</p>
           <ApiTable />
         </Section>
 
@@ -168,6 +168,8 @@ function ApiTable() {
     { m: "GET", path: "/v1/nodes", desc: "Mesh nodes (region, geo, capacity, health)" },
     { m: "GET", path: "/v1/overview", desc: "Overview analytics" },
     { m: "POST", path: "/v1/sandbox", desc: "Run code in an isolated cell" },
+    { m: "POST", path: "/v1/apikeys", desc: "Create a platform API key (hive_…, shown once)" },
+    { m: "POST", path: "/v1/token", desc: "Mint a short-lived JWT (needs HIVE_JWT_SECRET)" },
   ];
   const color = (m: string) =>
     m === "GET" ? "text-emerald-600 dark:text-emerald-400"

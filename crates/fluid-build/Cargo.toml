@@ -13,3 +13,10 @@ license.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+
+[dev-dependencies]
+# Test-only: the `bun_fixtures` integration test cross-checks a parsed
+# `vercel.json`'s runtime string against `hive_core::Runtime`'s own parsing —
+# this crate's own production code has no `Runtime` dependency (that
+# resolution happens one layer up, in hive-cloud/git.rs, by design).
+hive-core = { workspace = true }

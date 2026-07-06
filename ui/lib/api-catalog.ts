@@ -419,33 +419,68 @@ export const API_CATEGORIES: ApiCategory[] = [
     name: "Tokens & API Keys",
     endpoints: [
       {
-        slug: "mint-a-token",
-        name: "Mint a token",
+        slug: "create-an-api-key",
+        name: "Create an API key",
         method: "POST",
-        path: "/v1/token",
-        summary: "Mint a short-lived bearer token scoped to a team + role.",
+        path: "/v1/apikeys",
+        summary:
+          "Create a long-lived platform API key (hive_…) bound to the active team. The plaintext token is returned exactly once — only its SHA-256 hash is stored. Present it as `Authorization: Bearer hive_…` to scope requests to the key's team.",
         bodyParams: [
-          { name: "tenant", type: "string", desc: "Team slug the token is scoped to." },
-          { name: "role", type: '"owner" | "member"', desc: "Role embedded in the token." },
+          { name: "name", type: "string", required: true, desc: 'A label for the key (e.g. "ci").' },
+          { name: "role", type: '"owner" | "member"', desc: 'Role bound to the key (default "member").' },
         ],
-        response: `{ "token": "…", "tenant": "personal", "role": "owner" }`,
+        response: `{
+  "id": "key_9f2a1c7b04d14e3e",
+  "name": "ci",
+  "prefix": "hive_0f3a62b…",
+  "team": "acme",
+  "role": "member",
+  "created_ms": 1781906630000,
+  "last_used_ms": 0,
+  "token": "hive_…"
+}`,
       },
       {
         slug: "list-api-keys",
         name: "List API keys",
         method: "GET",
         path: "/v1/apikeys",
-        summary: "List the long-lived API keys for the active team.",
-        response: `[ { "id": "key_1", "team": "acme", "created_ms": 1781906630000 } ]`,
+        summary:
+          "List the API keys for the active team. Only the display prefix is returned — the full token is shown once at creation and never stored.",
+        response: `[
+  {
+    "id": "key_9f2a1c7b04d14e3e",
+    "name": "ci",
+    "prefix": "hive_0f3a62b…",
+    "team": "acme",
+    "role": "member",
+    "created_ms": 1781906630000,
+    "last_used_ms": 1781909999000
+  }
+]`,
       },
       {
         slug: "delete-an-api-key",
-        name: "Delete an API key",
+        name: "Revoke an API key",
         method: "DELETE",
         path: "/v1/apikeys/{id}",
-        summary: "Revoke an API key.",
+        summary: "Revoke an API key. Requests presenting the revoked token stop resolving immediately.",
         pathParams: [{ name: "id", type: "string", required: true, desc: "The API key id." }],
-        response: `{ "deleted": true }`,
+        response: `{ "revoked": true, "id": "key_9f2a1c7b04d14e3e" }`,
+      },
+      {
+        slug: "mint-a-token",
+        name: "Mint a token",
+        method: "POST",
+        path: "/v1/token",
+        summary:
+          "Mint a short-lived (8 h) JWT bearer token scoped to a team + role. Requires HIVE_JWT_SECRET to be configured on the node (returns 400 otherwise). When JWT auth is enforced, mutating requests must present a JWT.",
+        bodyParams: [
+          { name: "sub", type: "string", desc: 'Subject / user id embedded in the token (default "user").' },
+          { name: "tenant", type: "string", desc: 'Team slug the token is scoped to (default "default").' },
+          { name: "role", type: '"owner" | "member" | "service"', desc: 'Role embedded in the token (default "owner").' },
+        ],
+        response: `{ "token": "eyJhbGciOiJIUzI1NiJ9…", "expires_in": 28800 }`,
       },
     ],
   },
@@ -518,7 +553,10 @@ export function endpointUrl(ep: ApiEndpoint): string {
   return `${API_BASE}${ep.path}`;
 }
 
-/** Generate the TypeScript / Next.js / cURL request snippets for the code panel. */
+/** Generate the TypeScript / Next.js / cURL request snippets for the code panel.
+ * Examples authenticate with a platform API key (`hive_…`, created under
+ * Settings → API Keys or via POST /v1/apikeys); a short-lived JWT from
+ * POST /v1/token works in the same header. */
 export function codeExamples(ep: ApiEndpoint): { typescript: string; nextjs: string; curl: string } {
   const url = endpointUrl(ep);
   const hasBody = !!ep.bodyParams?.length;
@@ -529,7 +567,7 @@ ${ep.bodyParams!.map((p) => `    ${JSON.stringify(p.name)}: ${exampleValue(p)}`)
     : null;
 
   const tsHeaders = `{
-    'Authorization': 'Bearer YOUR_ACCESS_TOKEN',${hasBody ? `\n    'Content-Type': 'application/json',` : ""}
+    'Authorization': 'Bearer YOUR_API_KEY', // hive_… (Settings → API Keys)${hasBody ? `\n    'Content-Type': 'application/json',` : ""}
   }`;
   const typescript = `const response = await fetch('${url}', {
   method: '${ep.method}',
@@ -544,7 +582,8 @@ export async function GET() {
   const res = await fetch('${url}', {
     method: '${ep.method}',
     headers: {
-      Authorization: \`Bearer \${process.env.SHADW_TOKEN}\`,${hasBody ? `\n      'Content-Type': 'application/json',` : ""}
+      // A platform API key (hive_…) — create one under Settings → API Keys.
+      Authorization: \`Bearer \${process.env.HIVE_API_KEY}\`,${hasBody ? `\n      'Content-Type': 'application/json',` : ""}
     },${bodyObj ? `\n    body: JSON.stringify(${bodyObj}),` : ""}
   });
   return Response.json(await res.json());
@@ -554,7 +593,7 @@ export async function GET() {
     ? ` \\\n  -H 'Content-Type: application/json' \\\n  -d '${curlJson(ep)}'`
     : "";
   const curl = `curl -X ${ep.method} ${url} \\
-  -H 'Authorization: Bearer YOUR_ACCESS_TOKEN'${curlBody}`;
+  -H 'Authorization: Bearer YOUR_API_KEY'${curlBody}`;
 
   return { typescript, nextjs, curl };
 }

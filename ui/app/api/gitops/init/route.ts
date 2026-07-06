@@ -45,7 +45,12 @@ export async function POST(req: NextRequest) {
       const r = await createRepo(entity, { name: randomConfigRepoName(), org, isPrivate });
       if (r.ok && r.full_name) { made = r; break; }
       if (!r.conflict) {
-        return NextResponse.json({ ok: false, error: r.error || "Failed to create repository." }, { status: 502 });
+        // Forward the org OAuth-restriction approval URL so the UI can render an
+        // actionable "approve this app" link instead of raw GitHub JSON.
+        return NextResponse.json(
+          { ok: false, error: r.error || "Failed to create repository.", approve_url: r.approve_url, restricted: r.restricted },
+          { status: r.restricted ? 403 : 502 }
+        );
       }
       // conflict → loop and try another random name
     }

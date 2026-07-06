@@ -127,7 +127,8 @@ impl FunctionPool {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct FunctionStats {
     pub key: String,
     pub instances: usize,
@@ -228,8 +229,28 @@ pub struct Fluid {
     cold_start_sem: Arc<tokio::sync::Semaphore>,
 }
 
-/// Max cold starts in flight at once across the whole node.
-const MAX_CONCURRENT_COLD_STARTS: usize = 4;
+/// Max cold starts in flight at once across the whole node (ALL pools share this
+/// one ceiling — it exists to bound process-table/container-lock pressure on the
+/// HOST, not to throttle any single function). Was a flat `4` regardless of the
+/// node's actual capacity, which head-of-line-blocks a multi-tenant burst (many
+/// DIFFERENT functions cold-starting at once, e.g. on a fleet node serving dozens
+/// of projects) to 4-at-a-time even on a 96-core bare-metal box. Scales with the
+/// host's core count instead, floored at the original conservative `4` (small/mock
+/// nodes keep today's exact behavior) and capped at `32` (still a real ceiling —
+/// this bounds HOST pressure, not per-function throughput, so it must not grow
+/// unbounded on very large boxes). `HIVE_MAX_COLD_STARTS` overrides both ends when
+/// a node operator has measured a different safe number for their hardware.
+fn max_concurrent_cold_starts() -> usize {
+    if let Ok(v) = std::env::var("HIVE_MAX_COLD_STARTS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    (cores / 2).clamp(4, 32)
+}
 
 /// Compose the per-function key.
 pub fn func_key(deployment: &str, function: &str) -> String {
@@ -240,8 +261,9 @@ pub fn func_key(deployment: &str, function: &str) -> String {
 /// different in-instance concurrency before a new instance is warranted, so the
 /// initial safe-concurrency BASELINE is runtime-aware (the adaptive hook can still
 /// move it within bounds later):
-///   * node / edge isolate — single-threaded but I/O-friendly event loop: keep the
-///     full configured concurrency (multiplexing I/O waits is the whole point).
+///   * node / bun / edge isolate — single-threaded but I/O-friendly event loop:
+///     keep the full configured concurrency (multiplexing I/O waits is the whole
+///     point; Bun's own event loop has the identical characteristic).
 ///   * python — the GIL serializes CPU work, so cap concurrency lower (scale out).
 ///   * container / microVM — process/cgroup-level pressure varies; moderate cap.
 ///   * wasm / unknown — trust the configured value (sandbox limits already apply).
@@ -249,7 +271,7 @@ pub fn func_key(deployment: &str, function: &str) -> String {
 /// deployment's configured `max_concurrency`.
 pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
     let cap = match runtime.trim().to_ascii_lowercase().as_str() {
-        "node" | "nodejs" | "js" | "edge" | "isolate" | "edge-isolate" => configured_max,
+        "node" | "nodejs" | "js" | "bun" | "edge" | "isolate" | "edge-isolate" => configured_max,
         "python" | "py" => configured_max.min(8),
         "container" | "docker" | "microvm" | "firecracker" => configured_max.min(16),
         "wasm" | "wasi" => configured_max,
@@ -296,7 +318,7 @@ impl Fluid {
             backend,
             cfg,
             registry: Mutex::new(HashMap::new()),
-            cold_start_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_COLD_STARTS)),
+            cold_start_sem: Arc::new(tokio::sync::Semaphore::new(max_concurrent_cold_starts())),
         });
         let f = fluid.clone();
         tokio::spawn(async move { f.autoscaler_loop().await });
@@ -605,6 +627,12 @@ impl Fluid {
                 workdir: Some(pool.workdir.clone()),
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
+                // Carry the container memory ceiling to the backend's podman path.
+                memory_mib: pool.cfg.memory_mib,
+                // The single resolved runtime signal for this launch — explicit
+                // config wins, else inferred from argv. Every backend/guest agent
+                // reads THIS instead of re-sniffing start_cmd independently.
+                runtime: hive_core::Runtime::resolve(&pool.cfg.runtime, &pool.cfg.start_cmd),
             };
             (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
         };
@@ -1034,6 +1062,27 @@ mod tests {
         // Boundary semantics: exactly LOW recovers, exactly HIGH backs off.
         assert_eq!(aimd_step(AIMD_CPU_LOW, 8, max), 9);
         assert_eq!(aimd_step(AIMD_CPU_HIGH, 8, max), 4);
+    }
+
+    #[test]
+    fn max_concurrent_cold_starts_env_override_and_clamping() {
+        // One test, not two: HIVE_MAX_COLD_STARTS is process-global, and cargo
+        // runs tests on multiple threads within the same process by default —
+        // two separate #[test]s mutating the same var would race each other.
+        std::env::set_var("HIVE_MAX_COLD_STARTS", "7");
+        assert_eq!(max_concurrent_cold_starts(), 7);
+
+        std::env::set_var("HIVE_MAX_COLD_STARTS", "not-a-number");
+        let n = max_concurrent_cold_starts();
+        assert!((4..=32).contains(&n), "must stay within the [4,32] host-scaled bounds, got {n}");
+
+        std::env::set_var("HIVE_MAX_COLD_STARTS", "0");
+        let n = max_concurrent_cold_starts();
+        assert!((4..=32).contains(&n), "zero override must be rejected (would deadlock every cold start), got {n}");
+
+        std::env::remove_var("HIVE_MAX_COLD_STARTS");
+        let n = max_concurrent_cold_starts();
+        assert!((4..=32).contains(&n), "no override must also stay within the host-scaled bounds, got {n}");
     }
 
     // A backend that reports a fixed CPU% — drives the adapt_concurrency() loop

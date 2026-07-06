@@ -157,6 +157,11 @@ impl Default for FunctionConfig {
     }
 }
 
+// `Runtime` (the language/engine selector) lives in `hive_core` — the lower
+// crate in the dependency graph, reachable from `hive-cell-agent`/
+// `hive-backend` (which do NOT depend on fluid-core) as well as from here.
+pub use hive_core::Runtime;
+
 /// What a route serves.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -730,6 +735,13 @@ pub struct Manifest {
     /// caching/retry without changing the common (empty) case.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub route_policies: Vec<RoutePolicy>,
+    /// The origin/SSR function a Static route falls through to when the requested
+    /// asset doesn't exist on disk (the CDN→function model). Used by adapter
+    /// frameworks (OpenNext, vinext) whose server function renders dynamic routes
+    /// while immutable assets are served from `static_dir`. `None` (the default)
+    /// means a Static miss stays a 404/SPA-fallback — behavior unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_function: Option<String>,
 }
 
 impl Manifest {
@@ -1095,6 +1107,17 @@ pub struct GitDeployRequest {
     /// after extraction so it is never persisted or logged.
     #[serde(default)]
     pub zip_b64: Option<String>,
+    /// A PRE-BUILT OCI image reference to run directly (Docker Hub / Quay / any
+    /// registry), e.g. `fruitbox12/simplifi:latest` or `quay.io/org/img:tag`. When
+    /// set, the deploy SKIPS clone + build entirely: the target node `podman pull`s
+    /// the image, auto-detects its port, and runs it as a container with an automatic
+    /// persistent volume + the project's env vars. Rides the normal placement/fanout.
+    #[serde(default)]
+    pub image_ref: Option<String>,
+    /// Optional explicit container port for an `image_ref` deploy. When None, the port
+    /// is auto-detected from the image's `ExposedPorts` (falling back to 8080).
+    #[serde(default)]
+    pub image_port: Option<u16>,
 }
 fn default_prod() -> bool {
     true

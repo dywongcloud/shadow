@@ -7,6 +7,7 @@ import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
 import { apiSend, currentTeam } from "@/lib/api";
+import { addPendingBuild } from "@/lib/pending-builds";
 import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
@@ -95,12 +96,17 @@ function Monogram({ t, className = "h-10 w-10" }: { t: Template; className?: str
 
 export default function NewProjectPage() {
   const router = useRouter();
+  // Single unified source input: accepts a Git repository URL OR a container image
+  // / registry reference (auto-detected on submit).
   const [url, setUrl] = useState("");
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState("");
-  // Env vars for the quick git-URL deploy (Issue #6) — collapsible editor.
+  // Collapsible options for the unified source card: env vars + optional project
+  // name + optional container port (port applies only to a container-image source).
   const [urlEnvOpen, setUrlEnvOpen] = useState(false);
   const [urlEnvRows, setUrlEnvRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
+  const [name, setName] = useState("");
+  const [port, setPort] = useState("");
   const [gh, setGh] = useState<{ configured: boolean; connected: boolean }>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   const [repoQ, setRepoQ] = useState("");
@@ -169,7 +175,67 @@ export default function NewProjectPage() {
       const src = ownerRepo(repoUrl) + (root ? `/${root}` : "");
       const fallbackName = slug(template?.name || ownerRepo(repoUrl).split("/").pop() || "project");
       const dest = `${GIT_SCOPE}/${project || fallbackName}`;
+      // Persist the in-flight build so it shows as "Building" in the deployments
+      // lists if the user navigates there before the build finishes.
+      addPendingBuild({ id: res.build_id, project: project || fallbackName, team: currentTeam(), env: "production" });
       setPreparing({ template: template ?? null, team: currentTeam(), src, dest });
+      setTimeout(() => router.push(`/deploy/${res.build_id}`), PREPARING_MS);
+    } catch (e) {
+      setError(String(e));
+      setDeploying(false);
+    }
+  }
+
+  // Classify the unified source input. It's a CONTAINER IMAGE / registry reference
+  // UNLESS it clearly looks like a git URL (a scheme, a known git host, or `.git`).
+  // So `fruitbox12/simplifi:latest`, `quay.io/org/img:tag`, `nginx`, `docker.io/...`
+  // are images; `https://github.com/owner/repo(.git)`, `git@…`, `ssh://…` are git.
+  function isImageRef(s: string): boolean {
+    const v = s.trim();
+    if (!v) return false;
+    if (/^image:\/\//i.test(v)) return true;
+    if (/^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(v)) return false;
+    if (/\.git($|[?#])/i.test(v)) return false;
+    if (/(github\.com|gitlab\.com|bitbucket\.org|dev\.azure\.com|sourcehut\.org)/i.test(v)) return false;
+    return true;
+  }
+
+  // Unified submit for the source card. Routes a git URL through the git build
+  // pipeline (clone → build → deploy), or a container image ref through the
+  // registry-image pipeline (CREATE PROJECT → build (pull the image) → DEPLOY) —
+  // a first-class deployment, NOT a bare container run. Both land on the same
+  // build-logs flow.
+  async function submit() {
+    const v = url.trim();
+    if (!v || deploying) return;
+    if (isImageRef(v)) {
+      await deployFromImage(v);
+    } else {
+      await deploy(v, undefined, name.trim() ? slug(name) : undefined, undefined, urlEnv());
+    }
+  }
+
+  // Create a project + build + deployment FROM a registry image. The backend
+  // (/v1/deploy/image → start_named_deploy) creates the project, runs a build that
+  // pulls the image + auto-detects the port (or uses the override) + attaches a
+  // persistent ≥1 GB volume + injects env, and registers a real deployment.
+  async function deployFromImage(ref: string) {
+    setDeploying(true);
+    setError("");
+    const env = urlEnv();
+    const p = parseInt(port, 10);
+    try {
+      const res = await apiSend<{ build_id: string; project: string }>("POST", "/v1/deploy/image", {
+        image: ref,
+        creator: "you",
+        project: name.trim() ? slug(name) : undefined,
+        port: Number.isFinite(p) && p > 0 ? p : undefined,
+        env: Object.keys(env).length ? env : undefined,
+      });
+      const guessed = slug(ref.split("/").pop()?.split(":")[0] || "app");
+      const proj = res.project || (name.trim() ? slug(name) : guessed);
+      addPendingBuild({ id: res.build_id, project: proj, team: currentTeam(), env: "production" });
+      setPreparing({ template: null, team: currentTeam(), src: ref, dest: `${GIT_SCOPE}/${proj}` });
       setTimeout(() => router.push(`/deploy/${res.build_id}`), PREPARING_MS);
     } catch (e) {
       setError(String(e));
@@ -203,31 +269,44 @@ export default function NewProjectPage() {
       </Link>
       <h1 className="mb-6 text-2xl sm:text-3xl font-semibold tracking-tight">Let&apos;s build something new</h1>
 
-      {/* Git URL bar */}
+      {/* Unified source bar — a Git repository URL OR a container image / registry
+          reference. The source type is auto-detected on submit and routed to the
+          matching build → deploy pipeline. */}
       <Card className="mb-2 p-2">
         <div className="flex items-center gap-2">
           <Input
-            placeholder="Enter a Git repository URL to deploy…"
+            placeholder="Git repository URL or container image… e.g. github.com/owner/repo, fruitbox12/simplifi:latest, quay.io/org/img:tag"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && deploy(url, undefined, undefined, undefined, urlEnv())}
+            onKeyDown={(e) => e.key === "Enter" && submit()}
             className="border-0 focus:ring-0"
           />
-          <Button onClick={() => deploy(url, undefined, undefined, undefined, urlEnv())} disabled={deploying || !url}>
+          <Button onClick={() => submit()} disabled={deploying || !url}>
             {deploying ? <Loader2 className="h-4 w-4 animate-spin" /> : "Deploy"}
           </Button>
         </div>
-        {/* Environment Variables (Issue #6): set env on the quick URL deploy too. */}
+        {url.trim() ? (
+          <p className="px-2 pt-1 text-xs text-muted">
+            Detected source: <span className="font-medium text-secondary">{isImageRef(url) ? "container image (build → deploy from registry)" : "Git repository (clone → build → deploy)"}</span>
+          </p>
+        ) : null}
+        {/* Options: env vars + optional project name + optional container port. */}
         <button
           type="button"
           onClick={() => setUrlEnvOpen((o) => !o)}
           className="mt-1 flex w-full items-center gap-1.5 px-2 py-1.5 text-left text-xs text-secondary hover:text-fg"
         >
           <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", urlEnvOpen ? "" : "-rotate-90")} />
-          Environment Variables{(() => { const n = Object.keys(urlEnv()).length; return n ? ` (${n})` : ""; })()}
+          Environment Variables &amp; Options{(() => { const n = Object.keys(urlEnv()).length; return n ? ` (${n})` : ""; })()}
         </button>
         {urlEnvOpen && (
           <div className="space-y-2 px-2 pb-2">
+            <div className="flex items-center gap-2">
+              <Input className="flex-1 text-xs" placeholder="Project name (optional — derived from the source)"
+                value={name} onChange={(e) => setName(e.target.value)} />
+              <Input className="w-44 text-xs" placeholder="Container port (image only)"
+                value={port} onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))} />
+            </div>
             {urlEnvRows.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
                 <Input className="flex-1 font-mono text-xs" placeholder="KEY" value={row.k}
@@ -243,12 +322,16 @@ export default function NewProjectPage() {
             <Button variant="outline" onClick={() => setUrlEnvRows((c) => [...c, { k: "", v: "" }])}>
               <Plus className="h-3.5 w-3.5" /> Add Variable
             </Button>
-            <p className="text-xs text-muted">Tip: paste a .env file into a KEY field to import many at once.</p>
+            <p className="text-xs text-muted">
+              Env is applied to the build/runtime. A container-image project gets a persistent ≥1&nbsp;GB volume at{" "}
+              <span className="font-mono">/data</span>. Tip: paste a .env file into a KEY field to import many at once.
+            </p>
           </div>
         )}
       </Card>
       <p className="mb-8 text-center text-sm text-muted">
-        Paste any public Git repo URL — OpenEdge clones, builds, and deploys it.{" "}
+        Paste a Git repo URL, or a container image from Docker Hub / Quay / any registry — OpenEdge
+        creates the project and builds → deploys it (clone &amp; build, or pull the image).{" "}
         <Link href="/new/upload" className="text-secondary underline decoration-dotted underline-offset-2 hover:text-fg">
           No repository? Upload a .zip instead
         </Link>

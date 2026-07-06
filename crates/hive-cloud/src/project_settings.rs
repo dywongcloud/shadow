@@ -31,6 +31,15 @@ pub struct BuildConfig {
     pub build_command: String,
     pub output_dir: String,
     pub root_dir: String,
+    /// Explicit runtime override ("nodejs"/"bun"/empty). Empty = infer from the
+    /// detected start command (today's behavior, unchanged). Distinct from
+    /// package-manager detection — a `bun.lock` in the repo picks `bun install`
+    /// as the installer without this field ever being set; only an explicit
+    /// choice here (or `vercel.json`'s `runtime`/`bunVersion`) selects the Bun
+    /// RUNTIME. `#[serde(default)]` so every already-persisted project setting
+    /// (written before this field existed) still deserializes.
+    #[serde(default)]
+    pub runtime: String,
 }
 impl Default for BuildConfig {
     fn default() -> Self {
@@ -44,6 +53,7 @@ impl Default for BuildConfig {
             build_command: String::new(),
             output_dir: String::new(),
             root_dir: String::new(),
+            runtime: String::new(),
         }
     }
 }
@@ -104,6 +114,11 @@ pub struct ProjectSettings {
     /// members — anonymous requests to a preview host get a 401.
     #[serde(default = "default_true")]
     pub preview_protection: bool,
+    /// Explicit project-level opt-in for `sudo` inside this project's
+    /// Sandboxes (default false) — the ZeroTrust invariant "sudo only if
+    /// explicitly enabled by project policy" reads this flag.
+    #[serde(default)]
+    pub sandbox_allow_sudo: bool,
 }
 fn default_team() -> String {
     "personal".into()
@@ -122,6 +137,7 @@ impl Default for ProjectSettings {
             team: default_team(),
             production_branch: String::new(),
             preview_protection: true,
+            sandbox_allow_sudo: false,
         }
     }
 }
@@ -143,6 +159,15 @@ impl ProjectStore {
     /// Full snapshot (project -> settings) for persistence.
     pub fn snapshot(&self) -> HashMap<String, ProjectSettings> {
         self.map.read().clone()
+    }
+
+    /// Case-insensitive lookup of an existing project KEY, holding only a read
+    /// lock and cloning a single string — NOT the whole map + every project's
+    /// env/build/function config. Used on the hot deploy path (name-collision
+    /// checks run on every deploy/create) where the old `snapshot()` clone was
+    /// O(all projects × settings size). Semantics-preserving.
+    pub fn find_key_ci(&self, name: &str) -> Option<String> {
+        self.map.read().keys().find(|k| k.eq_ignore_ascii_case(name)).cloned()
     }
 
     /// Replace the whole store (used on boot).
@@ -187,12 +212,28 @@ impl ProjectStore {
     /// written to disk / the replicated snapshot in plaintext.
     pub fn put_env(&self, project: &str, mut v: EnvVar) {
         v.updated_ms = now_ms();
-        if v.sensitive && !v.value.is_empty() {
-            v.value = crate::secrets::encrypt(&v.value);
-        }
         let mut m = self.map.write();
         let s = m.entry(project.to_string()).or_default();
-        if let Some(existing) = s.env.iter_mut().find(|e| e.key == v.key && e.target == v.target) {
+        // EDIT semantics: sensitive values are masked to "" in every read, so the
+        // dashboard's editor can't echo them back. An upsert of an EXISTING key
+        // with an EMPTY value means "keep the stored value" (retarget/re-flag
+        // only) — never silently blank a secret. The kept value is already
+        // encrypted when the previous entry was sensitive (don't re-encrypt).
+        if v.value.is_empty() {
+            if let Some(prev) = s.env.iter().find(|e| e.key == v.key) {
+                v.value = prev.value.clone();
+                if v.sensitive && !prev.sensitive && !v.value.is_empty() {
+                    v.value = crate::secrets::encrypt(&v.value);
+                }
+            }
+        } else if v.sensitive {
+            v.value = crate::secrets::encrypt(&v.value);
+        }
+        // Upsert by KEY — one row per key, matching `delete_env` and the
+        // dashboard's list model. (Previously keyed by (key, target): editing a
+        // var's environment DUPLICATED the row, and the duplicate persisted —
+        // the "my variable disappeared/duplicated after I left the page" bug.)
+        if let Some(existing) = s.env.iter_mut().find(|e| e.key == v.key) {
             *existing = v;
         } else {
             s.env.push(v);
@@ -241,6 +282,12 @@ impl ProjectStore {
     /// Team slug owning a project (defaults to "personal").
     pub fn team_of(&self, project: &str) -> String {
         self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(|| "personal".into())
+    }
+
+    /// Count of projects owned by a team/tenant (for plan-quota enforcement).
+    pub fn count_for_team(&self, team: &str) -> usize {
+        let t = team.trim().to_lowercase();
+        self.map.read().values().filter(|s| s.team.trim().to_lowercase() == t).count()
     }
 
     /// Whether previews for a project are protected (defaults to true).
@@ -342,6 +389,27 @@ mod tests {
         assert_eq!(s.team_of("app"), "personal");
         s.set_team("app", "acme");
         assert_eq!(s.team_of("app"), "acme");
+    }
+
+    #[test]
+    fn find_key_ci_matches_snapshot_collision_semantics() {
+        // find_key_ci must return the SAME collision decision the old
+        // snapshot()+eq_ignore_ascii_case scan produced — the hot-path clone
+        // replacement is purely a performance change, not a behavior change.
+        let s = ProjectStore::new();
+        s.set_team("MyApp", "acme");
+        // exact + case-insensitive hits return the actual stored key
+        assert_eq!(s.find_key_ci("MyApp").as_deref(), Some("MyApp"));
+        assert_eq!(s.find_key_ci("myapp").as_deref(), Some("MyApp"));
+        assert_eq!(s.find_key_ci("MYAPP").as_deref(), Some("MyApp"));
+        // miss
+        assert_eq!(s.find_key_ci("other"), None);
+        // equivalence with the previous snapshot-based check across the map
+        let snap = s.snapshot();
+        for probe in ["MyApp", "myapp", "nope", "my-app"] {
+            let old = snap.keys().find(|k| k.eq_ignore_ascii_case(probe)).cloned();
+            assert_eq!(s.find_key_ci(probe), old, "find_key_ci disagrees for {probe}");
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { Check, CreditCard, Coins, Zap, Loader2 } from "lucide-react";
 import { Card, Button, PageHeader, Badge } from "@/components/ui";
-import { apiSend, usePoll, type BillingInfo, type LedgerEntry } from "@/lib/api";
+import { apiSend, usePoll, type BillingInfo, type LedgerEntry, type Invoice } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 function usd(cents: number) {
@@ -24,6 +24,7 @@ function BillingInner() {
   const params = useSearchParams();
   const { data, refresh } = usePoll<BillingInfo>("/v1/billing", 5000);
   const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 5000);
+  const { data: invoices } = usePoll<Invoice[]>("/v1/billing/invoices", 10000);
   const [busy, setBusy] = useState("");
   const [msg, setMsg] = useState("");
 
@@ -90,6 +91,42 @@ function BillingInner() {
         </Card>
       )}
 
+      {/* Plan limits / quota (business locking) */}
+      {data?.limits && (
+        <Card className="mb-6 p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <span className="text-base font-semibold">Plan limits</span>
+            {!data.limits.can_deploy && (
+              <Badge tone="red">Deploys locked — add credits or upgrade</Badge>
+            )}
+          </div>
+          <div className="grid grid-cols-2 gap-5 md:grid-cols-4">
+            <Quota
+              label="Projects"
+              used={data.limits.projects_used}
+              max={data.limits.max_projects}
+            />
+            <Quota
+              label="Team members"
+              used={data.limits.members_used}
+              max={data.limits.max_members}
+            />
+            <Feature label="Max function runtime" value={`${data.limits.max_duration_secs}s`} on />
+            <Feature label="Auto multi-region failover" value={data.limits.allows_failover ? "Enabled" : "Locked"} on={data.limits.allows_failover} />
+            <Feature label="Team / Org SSO" value={data.limits.allows_sso ? "Enabled" : "Locked"} on={data.limits.allows_sso} />
+          </div>
+          {data.rate_card && (
+            <div className="mt-5 border-t border-border pt-4 text-xs text-secondary">
+              <span className="font-medium text-fg">Usage rate card:</span>{" "}
+              ${(data.rate_card.active_cpu_hr_cents / 100).toFixed(3)}/active-CPU-hr ·{" "}
+              ${(data.rate_card.mem_gb_hr_cents / 100).toFixed(4)}/GB-hr ·{" "}
+              ${(data.rate_card.requests_per_million_cents / 100).toFixed(2)}/M requests ·{" "}
+              ${(data.rate_card.waf_per_million_cents / 100).toFixed(2)}/M WAF-blocked
+            </div>
+          )}
+        </Card>
+      )}
+
       {/* Plans */}
       <div className="mb-3 text-base font-semibold">Plans</div>
       <div className="mb-8 grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -140,6 +177,46 @@ function BillingInner() {
         ))}
       </Card>
 
+      {/* Invoices */}
+      <div className="mb-3 text-base font-semibold">Invoices</div>
+      <div className="mb-8 overflow-hidden rounded-xl border border-border bg-card">
+        <div className="grid grid-cols-[1fr_auto_auto_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
+          <span>Invoice</span><span>Period</span><span>Status</span><span>Total</span>
+        </div>
+        {(invoices ?? []).length === 0 ? (
+          <div className="px-4 py-10 text-center text-sm text-secondary">No invoices yet.</div>
+        ) : (
+          (invoices ?? []).map((inv) => (
+            <details key={inv.id} className="border-b border-border last:border-0">
+              <summary className="grid cursor-pointer grid-cols-[1fr_auto_auto_auto] items-center gap-4 px-4 py-2.5 text-sm hover:bg-subtle/50">
+                <span className="font-mono text-xs">{inv.number}</span>
+                <span className="text-xs text-secondary">
+                  {new Date(inv.period_start_ms).toLocaleDateString()} – {new Date(inv.period_end_ms).toLocaleDateString()}
+                </span>
+                <span>
+                  <Badge tone={inv.status === "paid" ? "green" : inv.status === "draft" ? "default" : "amber"}>
+                    {inv.status}
+                  </Badge>
+                </span>
+                <span className="tabular-nums font-medium">{usd(inv.total_cents)}</span>
+              </summary>
+              <div className="border-t border-border bg-subtle/30 px-4 py-3">
+                {inv.lines.map((l, i) => (
+                  <div key={i} className="flex items-center justify-between py-1 text-sm">
+                    <span className="text-secondary">{l.description}</span>
+                    <span className="tabular-nums">{usd(l.amount_cents)}</span>
+                  </div>
+                ))}
+                <div className="mt-2 flex items-center justify-between border-t border-border pt-2 text-sm font-semibold">
+                  <span>Total</span>
+                  <span className="tabular-nums">{usd(inv.total_cents)}</span>
+                </div>
+              </div>
+            </details>
+          ))
+        )}
+      </div>
+
       {/* Ledger */}
       <div className="mb-3 text-base font-semibold">Transaction history</div>
       <div className="overflow-hidden rounded-xl border border-border bg-card">
@@ -161,6 +238,33 @@ function BillingInner() {
           ))
         )}
       </div>
+    </div>
+  );
+}
+
+function Quota({ label, used, max }: { label: string; used: number; max: number }) {
+  const unlimited = max === 0;
+  const pct = unlimited ? 0 : Math.min(100, (used / max) * 100);
+  const over = !unlimited && used >= max;
+  return (
+    <div>
+      <div className="text-xs text-muted">{label}</div>
+      <div className="text-lg font-semibold tabular-nums">
+        {used}
+        <span className="text-sm font-normal text-muted"> / {unlimited ? "∞" : max}</span>
+      </div>
+      <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-subtle">
+        <div className={`h-full rounded-full ${over ? "bg-red-500" : "bg-fg"}`} style={{ width: `${pct}%` }} />
+      </div>
+    </div>
+  );
+}
+
+function Feature({ label, value, on }: { label: string; value: string; on: boolean }) {
+  return (
+    <div>
+      <div className="text-xs text-muted">{label}</div>
+      <div className={`text-lg font-semibold ${on ? "" : "text-muted"}`}>{value}</div>
     </div>
   );
 }

@@ -30,7 +30,21 @@ pub struct VercelConfig {
     /// Framework slug, or `null` to mean "Other" (both deserialize to `None`).
     pub framework: Option<String>,
     pub ignore_command: Option<String>,
+    /// Vercel's Bun beta selector — a MAJOR-version-only string (e.g. `"1.x"`),
+    /// never a specific patch. Presence alone means "use Bun" but does not by
+    /// itself pin an exact version (Vercel's own semantics); see [`Self::runtime`]
+    /// for this platform's more explicit native selector.
     pub bun_version: Option<String>,
+    /// This platform's native, explicit runtime selector — `{"runtime":"bun"}` or
+    /// `{"runtime":"nodejs"}` in `vercel.json`. Deliberately SEPARATE from
+    /// `bun_version`/package-manager detection: selecting Bun as a package
+    /// manager (a `bun.lock` in the repo) must NOT by itself select Bun as the
+    /// RUNTIME — these are orthogonal axes. Precedence when resolving the
+    /// effective runtime (see `hive-cloud/src/git.rs`): this field wins if set,
+    /// else `bun_version` presence means Bun, else Project Settings' explicit
+    /// override, else infer from the detected start command (today's behavior,
+    /// unchanged for every existing Node deployment).
+    pub runtime: Option<String>,
 
     // ---- routing ----
     pub clean_urls: Option<bool>,
@@ -183,6 +197,7 @@ impl VercelConfig {
             && self.framework.is_none()
             && self.ignore_command.is_none()
             && self.bun_version.is_none()
+            && self.runtime.is_none()
             && self.clean_urls.is_none()
             && self.trailing_slash.is_none()
             && self.redirects.is_empty()

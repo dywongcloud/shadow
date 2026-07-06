@@ -1,7 +1,7 @@
 "use client";
 
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
-import { usePoll, type Event } from "@/lib/api";
+import { useOpsPoll, type Event } from "@/lib/api";
 
 interface AuditEvent extends Event {
   project: string;
@@ -19,7 +19,7 @@ const tone: Record<string, "green" | "red" | "amber" | "blue" | "default"> = {
 };
 
 export default function AuditPage() {
-  const { data: events } = usePoll<AuditEvent[]>("/v1/admin/audit", 4000);
+  const { data: events } = useOpsPoll<AuditEvent[]>("/v1/admin/audit", 4000);
 
   return (
     <div>

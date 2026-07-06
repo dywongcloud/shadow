@@ -1,5 +1,10 @@
 /** @type {import('next').NextConfig} */
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
+// Ops/admin console API base. The developer/API-key surface is `/cloud` -> ADMIN
+// (api.shadw.cloud); the operator console (/admin pages) proxies through `/ops`
+// -> ADMIN_OPS (admin.shadw.cloud) so ops traffic uses the dedicated host.
+// Defaults to ADMIN so nothing breaks before the admin host is live.
+const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
 
 // Multi-Zones: other Next.js apps can own path prefixes and be proxied here, so
 // the platform can be split into independently-deployed zones (docs, marketing,
@@ -42,6 +47,8 @@ const nextConfig = {
       { source: "/cloud/v1/zkauth/:path*", destination: "/api/blocked" },
       // Proxy dashboard API calls to a hive-cloud node's admin API (avoids CORS).
       { source: "/cloud/:path*", destination: `${ADMIN}/:path*` },
+      // Ops console → the dedicated admin host (admin.shadw.cloud).
+      { source: "/ops/:path*", destination: `${ADMIN_OPS}/:path*` },
       // Multi-zone proxies (env-driven).
       ...zoneRewrites(),
     ];
@@ -94,6 +101,48 @@ const nextConfig = {
       "/docs/:path*",
       "/status/:path*",
     ];
+    // CSP is now ENFORCING (promoted from report-only). The policy allows the
+    // app's real origins (verified from the codebase: client data goes
+    // same-origin through /cloud + /api/* server proxies → `connect-src 'self'`;
+    // Clerk auth origins; GitHub avatar images via `img-src https:`). `script-src`
+    // carries `'unsafe-inline'` because Next.js emits inline hydration/bootstrap
+    // scripts and this build has no per-request nonce pipeline — the OTHER
+    // directives still deliver the high-value protections (connect-src bounds
+    // exfiltration destinations; object-src/base-uri/form-action/frame-ancestors
+    // close clickjacking, base-href hijack and cross-origin form posting).
+    const CSP_ENFORCED = [
+      "default-src 'self'",
+      "script-src 'self' 'unsafe-inline' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "font-src 'self' data:",
+      "connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud",
+      "frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      "worker-src 'self' blob:",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'self'",
+      "upgrade-insecure-requests",
+    ].join("; ");
+    // Report-Only carries the STRICTER next target: the same policy WITHOUT
+    // `script-src 'unsafe-inline'`. Violations reported here map exactly the
+    // inline scripts a future per-request-nonce middleware must cover before
+    // `'unsafe-inline'` can be dropped from the enforcing policy above.
+    const CSP_REPORT_ONLY = [
+      "default-src 'self'",
+      "script-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      "style-src 'self' 'unsafe-inline'",
+      "img-src 'self' data: blob: https:",
+      "font-src 'self' data:",
+      "connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud",
+      "frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      "worker-src 'self' blob:",
+      "object-src 'none'",
+      "base-uri 'self'",
+      "form-action 'self'",
+      "frame-ancestors 'self'",
+    ].join("; ");
     return [
       {
         source: "/:path*",
@@ -101,6 +150,12 @@ const nextConfig = {
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "SAMEORIGIN" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()" },
+          { key: "Content-Security-Policy", value: CSP_ENFORCED },
+          { key: "Content-Security-Policy-Report-Only", value: CSP_REPORT_ONLY },
+          // Only meaningful over HTTPS; harmless (browsers ignore it) when
+          // served over plain HTTP in local dev.
+          { key: "Strict-Transport-Security", value: "max-age=63072000; includeSubDomains; preload" },
         ],
       },
       // Immutable hashed build assets — cache for a year.

@@ -3,7 +3,6 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Triangle } from "@/components/ui";
-import { ProjectTabs } from "@/components/project-tabs";
 import { cn } from "@/lib/utils";
 
 const sections = [
@@ -12,6 +11,7 @@ const sections = [
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },
   { slug: "routing", label: "Routing" },
+  { slug: "microfrontends", label: "Microfrontends" },
   { slug: "webhooks", label: "Webhooks" },
   { slug: "secure-compute", label: "Secure Compute" },
   { slug: "team", label: "Team & Privacy" },
@@ -37,9 +37,8 @@ export default function SettingsLayout({
           <h1 className="text-xl font-semibold">{name}</h1>
         </div>
       </div>
-      {/* Project-scope sub-tabs (Overview … Settings) so settings pages keep the
-          same project navigation as the rest of the project, with Settings active. */}
-      <ProjectTabs project={name} active="settings" />
+      {/* Project sub-tabs now live in the top nav (breadcrumb-tabs model) with
+          Settings active; the settings-section list below is the inner nav. */}
       <div className="grid grid-cols-1 gap-8 md:grid-cols-[200px_1fr]">
         <nav className="flex flex-row gap-1 overflow-x-auto md:flex-col">
           {sections.map((s) => {

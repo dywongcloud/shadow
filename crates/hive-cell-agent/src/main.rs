@@ -26,7 +26,7 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use hive_core::{
-        now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, FunctionLaunch, LogLine,
+        now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, ExecRequest, FunctionLaunch, LogLine,
         LogStream, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
     };
     use std::io::{BufRead, BufReader, Read, Write};
@@ -36,12 +36,13 @@ mod linux {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-    /// Node-family start command? (the V8 compile-cache env applies only to these —
-    /// never static sites, Python, or containers). Matches on the basename.
-    fn is_node_start_cmd(start_cmd: &[String]) -> bool {
-        let Some(first) = start_cmd.first() else { return false };
-        let base = first.rsplit('/').next().unwrap_or(first);
-        matches!(base, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next")
+
+    /// Live exec child PIDs, keyed by `ExecRequest.id`, so a `KillExec` arriving
+    /// on a SEPARATE connection can signal a command started on another
+    /// connection/thread. Guest-process-global (single agent process per cell).
+    static EXEC_REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
+    fn exec_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
+        EXEC_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
     pub fn run() {
@@ -148,35 +149,38 @@ mod linux {
             }
             // SAFETY: conn_fd is a valid connected SOCK_STREAM fd; UnixStream is
             // just a typed wrapper around read()/write() on it.
-            let mut stream = unsafe { UnixStream::from_raw_fd(conn_fd) };
-            match handle_conn(&mut stream) {
+            let stream = unsafe { UnixStream::from_raw_fd(conn_fd) };
+            match handle_conn(stream) {
                 Ok(true) => return Ok(()), // a build ran; cell is single-use
-                Ok(false) => continue,     // ping/keepalive; keep listening
+                Ok(false) => continue,     // ping/keepalive/exec/function; keep listening
                 Err(e) => eprintln!("connection error: {e}"),
             }
         }
     }
 
     /// Returns Ok(true) if a build was executed (caller should stop serving).
-    fn handle_conn(stream: &mut UnixStream) -> std::io::Result<bool> {
-        let frame = read_frame(stream)?;
+    /// Takes the stream BY VALUE (not `&mut`): the `Exec` branch moves it into a
+    /// dedicated thread that outlives this call, so the accept loop can serve
+    /// the next connection without waiting for the command to finish.
+    fn handle_conn(mut stream: UnixStream) -> std::io::Result<bool> {
+        let frame = read_frame(&mut stream)?;
         let req: AgentRequest = serde_json::from_slice(&frame)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         match req {
             AgentRequest::Ping => {
-                send(stream, &AgentEvent::Pong)?;
+                send(&mut stream, &AgentEvent::Pong)?;
                 Ok(false)
             }
             AgentRequest::Run(job) => {
-                let result = run_build(stream, &job)?;
-                send(stream, &AgentEvent::Done(result))?;
+                let result = run_build(&mut stream, &job)?;
+                send(&mut stream, &AgentEvent::Done(result))?;
                 let _ = stream.flush();
                 Ok(true)
             }
             AgentRequest::StartFunction(launch) => {
                 match start_function(&launch) {
-                    Ok(()) => send(stream, &AgentEvent::FunctionReady)?,
-                    Err(e) => send(stream, &AgentEvent::FunctionError(e.to_string()))?,
+                    Ok(()) => send(&mut stream, &AgentEvent::FunctionReady)?,
+                    Err(e) => send(&mut stream, &AgentEvent::FunctionError(e.to_string()))?,
                 }
                 let _ = stream.flush();
                 // Keep serving control conns; the function bridge runs in threads.
@@ -184,6 +188,174 @@ mod linux {
             }
             // Only valid as a reply during a build (handled in cache_restore).
             AgentRequest::CacheData { .. } => Ok(false),
+            AgentRequest::Exec(req) => {
+                // Hand the connection to a thread so the accept loop can keep
+                // serving other connections immediately — unlike `Run`, a
+                // sandbox exec must not block new exec/kill requests, and a
+                // sandbox cell never self-destructs after one command.
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    run_exec(&mut stream, req);
+                });
+                Ok(false)
+            }
+            AgentRequest::KillExec { id } => {
+                // SIGKILL delivered here; the ORIGINAL exec's own connection/
+                // thread observes the process die and sends the authoritative
+                // `ExecDone{exit_code: None}` — this ack just confirms the
+                // signal was (or wasn't, if already gone) delivered.
+                kill_registered_exec(&id);
+                send(&mut stream, &AgentEvent::Pong)?;
+                let _ = stream.flush();
+                Ok(false)
+            }
+        }
+    }
+
+    /// Run one `ExecRequest` to completion on its OWN dedicated connection,
+    /// streaming `ExecOutput` lines with stdout/stderr kept distinct, then a
+    /// final `ExecDone`. Registers/deregisters the child PID so `KillExec`
+    /// (arriving on a different connection) can find and signal it.
+    fn run_exec(stream: &mut UnixStream, req: ExecRequest) {
+        let id = req.id.clone();
+        let exit_code = match spawn_exec(stream, &req) {
+            Ok(code) => code,
+            Err(e) => {
+                let _ = send(
+                    stream,
+                    &AgentEvent::ExecOutput { id: id.clone(), stream: LogStream::System, line: format!("exec failed: {e}") },
+                );
+                None
+            }
+        };
+        exec_registry().lock().unwrap().remove(&id);
+        let _ = send(stream, &AgentEvent::ExecDone { id, exit_code });
+        let _ = stream.flush();
+    }
+
+    fn spawn_exec(stream: &mut UnixStream, req: &ExecRequest) -> std::io::Result<Option<i32>> {
+        let mut cmd = if req.shell {
+            // Explicit, informed opt-in only (validated one layer up too).
+            let mut full = req.cmd.clone();
+            for a in &req.args {
+                full.push(' ');
+                full.push_str(a);
+            }
+            let mut c = Command::new("/bin/sh");
+            c.arg("-c").arg(full);
+            c
+        } else {
+            // Default: real argv exec, no shell — shell injection is
+            // structurally impossible on this path (no string is ever
+            // reparsed by a shell).
+            let mut c = Command::new(&req.cmd);
+            c.args(&req.args);
+            c
+        };
+
+        if req.sudo {
+            // Only ever honored if `sudo` actually exists in this guest image;
+            // otherwise fail loudly rather than silently running unprivileged.
+            let sudo_path = ["/usr/bin/sudo", "/bin/sudo"].iter().find(|p| std::path::Path::new(p).exists());
+            match sudo_path {
+                Some(sudo) => {
+                    let mut wrapped = Command::new(sudo);
+                    wrapped.arg("-n"); // never prompt for a password
+                    if req.shell {
+                        wrapped.arg("/bin/sh").arg("-c");
+                        let mut full = req.cmd.clone();
+                        for a in &req.args {
+                            full.push(' ');
+                            full.push_str(a);
+                        }
+                        wrapped.arg(full);
+                    } else {
+                        wrapped.arg(&req.cmd).args(&req.args);
+                    }
+                    cmd = wrapped;
+                }
+                None => {
+                    let _ = send(
+                        stream,
+                        &AgentEvent::ExecOutput {
+                            id: req.id.clone(),
+                            stream: LogStream::System,
+                            line: "sudo requested but not available in this sandbox image".into(),
+                        },
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+
+        let cwd = if req.cwd.is_empty() { "/build" } else { req.cwd.as_str() };
+        let _ = std::fs::create_dir_all(cwd);
+        cmd.current_dir(cwd)
+            .env_clear()
+            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env("HOME", "/root")
+            .envs(req.env.iter())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = cmd.spawn()?;
+        exec_registry().lock().unwrap().insert(req.id.clone(), child.id());
+
+        // Two reader threads (stdout/stderr) so neither pipe's backpressure can
+        // stall the other — both feed the SAME connection, guarded by a mutex
+        // (UnixStream doesn't support concurrent writers safely otherwise).
+        let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let mut handles = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            handles.push(spawn_reader(out, stream.try_clone()?, req.id.clone(), LogStream::Stdout, write_lock.clone()));
+        }
+        if let Some(err) = child.stderr.take() {
+            handles.push(spawn_reader(err, stream.try_clone()?, req.id.clone(), LogStream::Stderr, write_lock.clone()));
+        }
+        for h in handles {
+            let _ = h.join();
+        }
+        let status = child.wait()?;
+        Ok(status.code())
+    }
+
+    fn spawn_reader(
+        pipe: impl Read + Send + 'static,
+        mut stream: UnixStream,
+        id: String,
+        which: LogStream,
+        write_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let reader = BufReader::new(pipe);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                let _guard = write_lock.lock().unwrap();
+                if send(&mut stream, &AgentEvent::ExecOutput { id: id.clone(), stream: which, line }).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    /// Deliver SIGKILL to a live exec's child process by request id. Returns
+    /// true if a live registration was found (does not guarantee the process
+    /// had not already exited — that race is harmless: `kill` on a reaped pid
+    /// just errors, ignored).
+    fn kill_registered_exec(id: &str) -> bool {
+        let pid = exec_registry().lock().unwrap().get(id).copied();
+        match pid {
+            Some(pid) => {
+                unsafe {
+                    libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                }
+                true
+            }
+            None => false,
         }
     }
 
@@ -209,11 +381,17 @@ mod linux {
         // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
         // WRITABLE cache dir under the workdir. The build shipped precompiled bytecode
         // there; Node >=22.1 picks it up automatically (skips parse/compile on a cold
-        // start) and appends entries for modules the build didn't pre-cache. Node-family
-        // only, and opt-out via HIVE_COMPILE_CACHE=0 in the deployment env. Never fails
-        // boot: a missing/invalid/unwritable cache just means Node recompiles.
+        // start) and appends entries for modules the build didn't pre-cache. Genuinely
+        // Node/V8-only (`launch.runtime` is the single explicit signal, set by the
+        // scheduler at cold-start — Bun uses JavaScriptCore and never reads this env
+        // var, so gating on it instead of re-sniffing argv fixes a latent bug where a
+        // Bun process used to get NODE_COMPILE_CACHE set for no effect). Bun's own
+        // bytecode cache (a `.jsc` sidecar produced by `bun build --bytecode` at build
+        // time) needs NO runtime env var at all — `bun run <entry>` auto-loads it, so
+        // the Bun path here correctly does nothing. Opt-out via HIVE_COMPILE_CACHE=0.
+        // Never fails boot: a missing/invalid/unwritable cache just means recompiling.
         let cc_off = launch.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
-        if !cc_off && is_node_start_cmd(&launch.start_cmd) {
+        if !cc_off && launch.runtime.uses_v8_compile_cache() {
             let cache_dir = format!("{}/.hive-compile-cache", workdir.trim_end_matches('/'));
             if std::fs::create_dir_all(&cache_dir).is_ok() {
                 cmd.env("NODE_COMPILE_CACHE", &cache_dir);
