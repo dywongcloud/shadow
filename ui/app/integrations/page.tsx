@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check } from "lucide-react";
 import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/ui";
 import { cachedJson } from "@/lib/cache";
+import { currentTeam } from "@/lib/api";
 
 function Logo({ kind }: { kind: string }) {
   // White tile behind every icon (glyphs forced dark so they read on white in dark mode).
@@ -102,6 +103,42 @@ export default function IntegrationsPage() {
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
   const [connecting, setConnecting] = useState<string | null>(null);
+  const [linkMsg, setLinkMsg] = useState<{ tone: "ok" | "warn"; text: string } | null>(null);
+
+  // On return from a toolkit OAuth (`?connected=<slug>`), link the connection as a
+  // consumable platform resource and auto-inject its env vars into deployments.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const slug = params.get("connected");
+    if (!slug) return;
+    params.delete("connected");
+    const qs = params.toString();
+    window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    setLinkMsg({ tone: "ok", text: `Linking ${slug} resources…` });
+    (async () => {
+      try {
+        const r = await fetch("/api/integrations/link", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ slug, team: currentTeam() }),
+        });
+        const d = await r.json();
+        if (d.ok) {
+          const n = Array.isArray(d.env) ? d.env.length : 0;
+          setLinkMsg({
+            tone: "ok",
+            text: n
+              ? `Linked ${slug} — ${n} env var${n === 1 ? "" : "s"} injected into your deployments (${d.injected} write${d.injected === 1 ? "" : "s"}). Consume them via the SDK with a hive_ key.`
+              : `Connected ${slug}. No extractable credentials to inject.`,
+          });
+        } else {
+          setLinkMsg({ tone: "warn", text: d.error || `Connected ${slug}, but linking resources failed.` });
+        }
+      } catch {
+        setLinkMsg({ tone: "warn", text: `Connected ${slug}, but linking resources failed.` });
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     // GitHub status: short cache (reflects connection state).
@@ -177,6 +214,18 @@ export default function IntegrationsPage() {
         title="Integrations"
         desc="Connect your stack — deploy from Git and link 1,000+ tools via Composio."
       />
+
+      {linkMsg && (
+        <div
+          className={`mb-6 rounded-md border px-3 py-2 text-sm ${
+            linkMsg.tone === "ok"
+              ? "border-green/30 bg-green/10 text-green"
+              : "border-amber-500/30 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+          }`}
+        >
+          {linkMsg.text}
+        </div>
+      )}
 
       <h2 className="mb-3 text-base font-semibold">Connected</h2>
       <div className="mb-10 grid grid-cols-1 gap-4 md:grid-cols-3">

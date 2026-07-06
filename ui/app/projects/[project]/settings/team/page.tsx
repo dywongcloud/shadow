@@ -39,18 +39,50 @@ export default function TeamPrivacySettings({ params }: { params: { project: str
     }
   }
 
+  // Enterprise deployment protection (password / scope).
+  const [protMode, setProtMode] = useState<"off" | "standard" | "password">("off");
+  const [protScope, setProtScope] = useState<"preview" | "all" | "production">("preview");
+  const [protPassword, setProtPassword] = useState("");
+  const [protHasPw, setProtHasPw] = useState(false);
+  const [protSaved, setProtSaved] = useState(false);
+  const [protErr, setProtErr] = useState<string | null>(null);
+
   useEffect(() => {
     apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`).then((s) => {
       setSettings(s);
       setTeam(s.team ?? "personal");
       setProtect(s.preview_protection ?? true);
     });
+    apiGet<{ mode: string; scope: string; has_password: boolean }>(`/v1/enterprise/projects/${encodeURIComponent(project)}/protection`)
+      .then((p) => {
+        setProtMode((p.mode as "off" | "standard" | "password") ?? "off");
+        setProtScope((p.scope as "preview" | "all" | "production") ?? "preview");
+        setProtHasPw(p.has_password);
+      })
+      .catch(() => {});
   }, [project]);
 
   async function save() {
     await apiSend("PUT", `/v1/projects/${encodeURIComponent(project)}/team`, { team, preview_protection: protect });
     setSaved(true);
     setTimeout(() => setSaved(false), 1500);
+  }
+
+  async function saveProtection() {
+    setProtErr(null);
+    try {
+      await apiSend("PUT", `/v1/enterprise/projects/${encodeURIComponent(project)}/protection`, {
+        mode: protMode,
+        scope: protScope,
+        password: protPassword || undefined,
+      });
+      setProtPassword("");
+      setProtHasPw(protMode === "password");
+      setProtSaved(true);
+      setTimeout(() => setProtSaved(false), 1500);
+    } catch (e) {
+      setProtErr(String(e).replace(/^Error:\s*/, ""));
+    }
   }
 
   return (
@@ -82,6 +114,59 @@ export default function TeamPrivacySettings({ params }: { params: { project: str
           <Switch checked={protect} onChange={setProtect} label="Preview protection" />
           <span className="flex items-center gap-1.5 text-sm text-secondary"><Lock className="h-4 w-4" /> {protect ? "Protected (team only)" : "Public"}</span>
         </div>
+      </SettingCard>
+
+      {/* Enterprise deployment protection — password / scope ("only production"). */}
+      <SettingCard
+        title="Deployment Protection"
+        desc="Require authentication or a shared password to view deployments. Choose which deployments are protected — previews, all, or only production."
+        footer={
+          protMode === "off"
+            ? "Deployments follow the preview-protection setting above."
+            : `${protMode === "password" ? "Password" : "Team member"} required for ${protScope === "all" ? "all" : protScope === "production" ? "production" : "preview"} deployments.`
+        }
+        footerAction={<Button onClick={saveProtection}>{protSaved ? "Saved" : "Save"}</Button>}
+      >
+        <div className="grid gap-4 sm:grid-cols-2">
+          <label className="text-sm">
+            <span className="mb-1 block text-secondary">Protection mode</span>
+            <select
+              value={protMode}
+              onChange={(e) => setProtMode(e.target.value as "off" | "standard" | "password")}
+              className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm text-fg focus:outline-none"
+            >
+              <option value="off">Off</option>
+              <option value="standard">Standard (team members)</option>
+              <option value="password">Password</option>
+            </select>
+          </label>
+          <label className="text-sm">
+            <span className="mb-1 block text-secondary">Applies to</span>
+            <select
+              value={protScope}
+              onChange={(e) => setProtScope(e.target.value as "preview" | "all" | "production")}
+              disabled={protMode === "off"}
+              className="w-full rounded-md border border-border bg-card px-3 py-2 text-sm text-fg focus:outline-none disabled:opacity-50"
+            >
+              <option value="preview">Preview deployments</option>
+              <option value="all">All deployments</option>
+              <option value="production">Only production deployments</option>
+            </select>
+          </label>
+        </div>
+        {protMode === "password" ? (
+          <label className="mt-3 block text-sm">
+            <span className="mb-1 block text-secondary">Password{protHasPw ? " — set (leave blank to keep)" : ""}</span>
+            <input
+              type="password"
+              value={protPassword}
+              onChange={(e) => setProtPassword(e.target.value)}
+              placeholder={protHasPw ? "••••••" : "Enter a password"}
+              className="w-full max-w-sm rounded-md border border-border bg-card px-3 py-2 text-sm text-fg placeholder:text-muted focus:outline-none"
+            />
+          </label>
+        ) : null}
+        {protErr ? <p className="mt-3 text-sm text-red-500">{protErr}</p> : null}
       </SettingCard>
 
       {/* Plan & Enterprise capabilities for the owning team. */}

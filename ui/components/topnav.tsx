@@ -11,7 +11,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { VercelMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { WithIdentity, type Identity } from "@/components/identity";
-import { usePoll, type Team } from "@/lib/api";
+import { usePoll, switchTeam, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
@@ -37,7 +37,7 @@ const teamTabs = [
  *  SUB-tabs for that level take the top tab-bar position. Returns the tab set +
  *  the active key for the current URL. `tabParam` is the reactive `?tab=` value. */
 type TabItem = { href: string; label: string; key: string };
-function contextTabs(pathname: string, tabParam: string | null): { items: TabItem[]; activeKey: string } | null {
+function contextTabs(pathname: string, tabParam: string | null, wfParam: string | null): { items: TabItem[]; activeKey: string } | null {
   // Deployment detail: /deployments/<id>
   const dep = pathname.match(/^\/deployments\/([^/]+)/);
   if (dep) {
@@ -55,6 +55,18 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
   if (proj) {
     const p = proj[1];
     const base = `/projects/${p}`;
+    // Drilled into a project's Workflows (breadcrumb Team / Project / Workflows):
+    // the top bar shows the workflow SUB-tabs (Runs / Workflows / Hooks via `?wf=`),
+    // mirroring the platform /workflows model — NOT the project's main tabs.
+    if (tabParam === "workflows" && !pathname.includes("/settings") && !pathname.includes("/logs")) {
+      const items: TabItem[] = [
+        { href: `${base}?tab=workflows&wf=runs`, label: "Runs", key: "runs" },
+        { href: `${base}?tab=workflows&wf=workflows`, label: "Workflows", key: "workflows" },
+        { href: `${base}?tab=workflows&wf=hooks`, label: "Hooks", key: "hooks" },
+      ];
+      const activeKey = ["runs", "workflows", "hooks"].includes(wfParam ?? "") ? wfParam! : "runs";
+      return { items, activeKey };
+    }
     const items: TabItem[] = [
       { href: `${base}?tab=overview`, label: "Overview", key: "overview" },
       { href: `${base}?tab=graph`, label: "Service Graph", key: "graph" },
@@ -62,11 +74,13 @@ function contextTabs(pathname: string, tabParam: string | null): { items: TabIte
       { href: `${base}?tab=resources`, label: "Resources", key: "resources" },
       { href: `${base}?tab=deployments`, label: "Deployments", key: "deployments" },
       { href: `${base}/logs`, label: "Logs", key: "logs" },
+      { href: `${base}/sandboxes`, label: "Sandboxes", key: "sandboxes" },
       { href: `${base}/settings`, label: "Settings", key: "settings" },
     ];
     let activeKey = "overview";
     if (pathname.includes("/settings")) activeKey = "settings";
     else if (pathname.includes("/logs")) activeKey = "logs";
+    else if (pathname.includes("/sandboxes")) activeKey = "sandboxes";
     else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
     return { items, activeKey };
   }
@@ -131,6 +145,11 @@ export function TopNav() {
                 <Triangle className="h-5 w-5 shrink-0" />
                 <span className="truncate">{projectSeg}</span>
               </Link>
+              {/* Deeper crumb (Project / Workflows) when drilled into the project's
+                  Workflows. Suspense-bounded: it reads `?tab=` (useSearchParams). */}
+              <Suspense fallback={null}>
+                <ProjectWorkflowsCrumb project={projectSeg} />
+              </Suspense>
             </>
           )}
           {deploymentSeg && (
@@ -191,6 +210,27 @@ export function TopNav() {
   );
 }
 
+/** Breadcrumb crumb rendered after the project when drilled into its Workflows
+ *  (`/projects/<p>?tab=workflows`): `… / Project / Workflows`. Reads `?tab=`, so it
+ *  must live under a Suspense boundary (kept out of the static-page render path).
+ *  Links back to the project's Workflows root (the Runs sub-tab). */
+function ProjectWorkflowsCrumb({ project }: { project: string }) {
+  const tab = useSearchParams().get("tab");
+  if (tab !== "workflows") return null;
+  return (
+    <>
+      <Slash />
+      <Link
+        href={`/projects/${encodeURIComponent(project)}?tab=workflows`}
+        className="flex min-w-0 items-center gap-2 rounded-md px-1.5 py-1 font-medium hover:bg-subtle"
+      >
+        <Workflow className="h-4 w-4 shrink-0" />
+        <span className="truncate">Workflows</span>
+      </Link>
+    </>
+  );
+}
+
 /** The section tab bar: a single underline row that scrolls horizontally on narrow
  *  screens instead of collapsing into a dropdown. Keeps the active tab in view.
  *  Context-aware: team tabs at the top level, or the project/deployment SUB-tabs
@@ -199,7 +239,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const navRef = useRef<HTMLDivElement>(null);
-  const ctx = contextTabs(pathname, searchParams.get("tab"));
+  const ctx = contextTabs(pathname, searchParams.get("tab"), searchParams.get("wf"));
   // Center the active tab within the scroll container (it may start off-screen on
   // mobile). Only touches the container's scrollLeft — never scrolls the page.
   useEffect(() => {
@@ -385,15 +425,15 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     return () => document.removeEventListener("mousedown", onClick);
   }, []);
 
-  // Switch tenant: our selection + persisted hive_team flip immediately (data +
-  // navbar), then Clerk's active org is aligned best-effort (never blocking).
+  // Switch tenant: `switchTeam` persists the selection, RE-MINTS the hive_jwt
+  // cookie for the new tenant (validated server-side), and only then fires
+  // hive-team-changed so pollers re-fetch with the correct cookie. Clerk's active
+  // org is aligned best-effort afterwards (no longer drives the tenant — that's
+  // the cookie now — so it never blocks or gates the view).
   async function pick(tenantSlug: string) {
     setOpen(false);
     setSelected(tenantSlug);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("hive_team", tenantSlug);
-      window.dispatchEvent(new Event("hive-team-changed"));
-    }
+    await switchTeam(tenantSlug);
     const org = tenantSlug === PERSONAL ? null : orgBySlug(tenantSlug) ?? null;
     const orgId = org ? org.id : null;
     try {
@@ -402,7 +442,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       try {
         await setActive?.({ organization: orgId });
       } catch {
-        /* best-effort — our selection already drives the view */
+        /* best-effort — the cookie already drives the view */
       }
     }
   }
@@ -483,8 +523,12 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
 
 /** Toggleable team switcher — a personal ("just my name") view plus any teams. */
 function TeamSwitcher({ identity }: { identity: Identity }) {
-  const { data: teams } = usePoll<Team[]>("/v1/teams", 10000);
   const [open, setOpen] = useState(false);
+  // Team membership rarely changes — one fetch to populate the topnav label,
+  // then only re-poll while the dropdown is actually open (instead of forever
+  // in the background on every page). `choose()` already force-refreshes via
+  // `hive-team-changed` on switch, so freshness on interaction is unaffected.
+  const { data: teams } = usePoll<Team[]>("/v1/teams", 10000, open);
   const [sel, setSel] = useState<string>(PERSONAL);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -496,8 +540,8 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
     if (param) {
       const slug = param === "personal" ? PERSONAL : param;
       setSel(slug);
-      localStorage.setItem("hive_team", slug);
-      window.dispatchEvent(new Event("hive-team-changed"));
+      // Re-mint the cookie for the deep-linked team (validated) before re-fetch.
+      void switchTeam(slug);
       return;
     }
     const saved = localStorage.getItem("hive_team");
@@ -513,11 +557,8 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
 
   function choose(slug: string) {
     setSel(slug);
-    if (typeof window !== "undefined") {
-      localStorage.setItem("hive_team", slug);
-      // Tell every usePoll to re-fetch with the new tenant immediately.
-      window.dispatchEvent(new Event("hive-team-changed"));
-    }
+    // Persist + re-mint the cookie for the new tenant BEFORE pollers re-fetch.
+    void switchTeam(slug);
     setOpen(false);
   }
 

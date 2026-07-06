@@ -6,7 +6,8 @@ import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type Database } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import { timeAgo, copyText } from "@/lib/utils";
+import { toast } from "@/components/toast";
 
 export default function DatabaseDetail({ params }: { params: { id: string } }) {
   const id = params.id;
@@ -15,14 +16,45 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
 
-  async function reveal() {
-    const full = await apiGet<Database>(`/v1/databases/${id}/credentials`);
-    setRevealed(full.connection);
+  // The list/detail poll returns the connection with secrets MASKED (any key with
+  // url/password/token/secret). Copying that yields "••••" junk. So both Reveal
+  // AND Copy fetch the UNMASKED credentials from the tenant-scoped `/credentials`
+  // endpoint; we cache them so a copy never depends on the user clicking Reveal.
+  async function fetchCreds(): Promise<Record<string, string>> {
+    if (revealed) return revealed;
+    const full = await apiGet<Database>(`/v1/databases/${id}/credentials`, { fresh: true });
+    const conn = full.connection ?? {};
+    return conn;
   }
-  function copy(k: string, v: string) {
-    navigator.clipboard.writeText(v);
-    setCopied(k);
-    setTimeout(() => setCopied(""), 1200);
+  async function reveal() {
+    try {
+      setRevealed(await fetchCreds());
+    } catch (e) {
+      toast(`Couldn't load credentials: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    }
+  }
+  // Copy the REAL value (fetches unmasked creds on demand), via a clipboard helper
+  // that falls back to execCommand when the async API is unavailable — so the
+  // button works everywhere, and reports success/failure instead of silently no-op.
+  async function copy(k: string) {
+    try {
+      const conn = await fetchCreds();
+      const value = conn[k];
+      if (!value) {
+        toast(`No value available for ${k}`, {});
+        return;
+      }
+      const ok = await copyText(value);
+      if (ok) {
+        setCopied(k);
+        setTimeout(() => setCopied(""), 1200);
+        toast(`Copied ${k}`, { tone: "blue" });
+      } else {
+        toast("Copy failed — select the value and copy manually", {});
+      }
+    } catch (e) {
+      toast(`Couldn't copy: ${String(e).replace(/^Error:\s*/, "")}`, {});
+    }
   }
   async function destroy() {
     if (!confirm(`Delete ${db?.name}? This tears down the backing service.`)) return;
@@ -68,6 +100,33 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
         <Mini label="Created" value={db.created_ms ? `${timeAgo(db.created_ms)} ago` : "unknown"} />
       </div>
 
+      {db.mode === "simulated" && (
+        <Card className="mb-4 border-amber-500/40 bg-amber-500/5 text-sm">
+          <div className="flex items-center gap-2 font-medium text-amber-500">This database is simulated</div>
+          <p className="mt-1 text-secondary">
+            No live backing engine was provisioned, so the connection details below don&apos;t point at a
+            running instance yet. Delete and recreate it once the region has a container engine available.
+          </p>
+        </Card>
+      )}
+
+      {/* Primary connection string — the value most people want to copy. */}
+      {(() => {
+        const primaryKey = conn["DATABASE_URL"] ? "DATABASE_URL" : conn["REDIS_URL"] ? "REDIS_URL" : conn["endpoint"] ? "endpoint" : "";
+        if (!primaryKey) return null;
+        return (
+          <Card className="mb-4">
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">{primaryKey}</div>
+            <div className="flex items-center gap-3">
+              <code className="min-w-0 flex-1 truncate rounded-md border border-border bg-subtle/50 px-3 py-2 font-mono text-xs">{conn[primaryKey]}</code>
+              <Button variant="outline" onClick={() => copy(primaryKey)}>
+                {copied === primaryKey ? <><Check className="h-4 w-4 text-green" /> Copied</> : <><Copy className="h-4 w-4" /> Copy</>}
+              </Button>
+            </div>
+          </Card>
+        );
+      })()}
+
       <Card>
         <div className="mb-4 flex items-center justify-between">
           <h3 className="text-sm font-semibold">Connection</h3>
@@ -83,7 +142,7 @@ export default function DatabaseDetail({ params }: { params: { id: string } }) {
               <div key={k} className="flex items-center gap-3 py-2.5">
                 <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
                 <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{v}</div>
-                <button onClick={() => copy(k, v)} className="shrink-0 text-muted hover:text-fg">
+                <button onClick={() => copy(k)} className="shrink-0 text-muted hover:text-fg" title={`Copy ${k}`}>
                   {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
                 </button>
               </div>

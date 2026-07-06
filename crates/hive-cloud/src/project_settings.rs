@@ -31,6 +31,15 @@ pub struct BuildConfig {
     pub build_command: String,
     pub output_dir: String,
     pub root_dir: String,
+    /// Explicit runtime override ("nodejs"/"bun"/empty). Empty = infer from the
+    /// detected start command (today's behavior, unchanged). Distinct from
+    /// package-manager detection — a `bun.lock` in the repo picks `bun install`
+    /// as the installer without this field ever being set; only an explicit
+    /// choice here (or `vercel.json`'s `runtime`/`bunVersion`) selects the Bun
+    /// RUNTIME. `#[serde(default)]` so every already-persisted project setting
+    /// (written before this field existed) still deserializes.
+    #[serde(default)]
+    pub runtime: String,
 }
 impl Default for BuildConfig {
     fn default() -> Self {
@@ -44,6 +53,7 @@ impl Default for BuildConfig {
             build_command: String::new(),
             output_dir: String::new(),
             root_dir: String::new(),
+            runtime: String::new(),
         }
     }
 }
@@ -104,6 +114,11 @@ pub struct ProjectSettings {
     /// members — anonymous requests to a preview host get a 401.
     #[serde(default = "default_true")]
     pub preview_protection: bool,
+    /// Explicit project-level opt-in for `sudo` inside this project's
+    /// Sandboxes (default false) — the ZeroTrust invariant "sudo only if
+    /// explicitly enabled by project policy" reads this flag.
+    #[serde(default)]
+    pub sandbox_allow_sudo: bool,
 }
 fn default_team() -> String {
     "personal".into()
@@ -122,6 +137,7 @@ impl Default for ProjectSettings {
             team: default_team(),
             production_branch: String::new(),
             preview_protection: true,
+            sandbox_allow_sudo: false,
         }
     }
 }

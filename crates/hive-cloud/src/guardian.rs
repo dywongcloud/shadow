@@ -91,14 +91,29 @@ pub fn init_background() {
     });
 }
 
-/// Replicate a snapshot into GuardianDB, one document per tenant namespace.
-/// Spawned so persistence is never blocked on replication.
+/// This node's name (set once at boot) — keys the per-node full-snapshot replica
+/// used by the restore-on-rollback guard.
+static NODE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn set_node_name(name: &str) {
+    let _ = NODE_NAME.set(name.to_string());
+}
+
+fn snapshot_key() -> Option<String> {
+    NODE_NAME.get().map(|n| format!("node/{n}/snapshot"))
+}
+
+/// Replicate a snapshot into GuardianDB, one document per tenant namespace, PLUS
+/// the full snapshot under this node's own key (`node/<name>/snapshot`) — the
+/// durable copy the boot-time rollback guard restores from when the local file
+/// regressed. Spawned so persistence is never blocked on replication.
 pub fn replicate(snap: &PlatformSnapshot) {
     let docs = crate::persist::namespaced(snap);
     let payloads: Vec<(String, Vec<u8>)> = docs
         .into_iter()
         .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
         .collect();
+    let full = serde_json::to_vec(snap).ok();
     tokio::spawn(async move {
         let h = match handle().await {
             Ok(h) => h,
@@ -113,6 +128,52 @@ pub fn replicate(snap: &PlatformSnapshot) {
                 tracing::debug!(namespace = %ns, error = %e, "GuardianDB put failed");
             }
         }
+        if let (Some(key), Some(bytes)) = (snapshot_key(), full) {
+            if let Err(e) = h.kv.put(&key, bytes).await {
+                tracing::debug!(error = %e, "GuardianDB full-snapshot put failed");
+            }
+        }
+    });
+}
+
+/// The replicated full snapshot for THIS node, if GuardianDB holds one.
+pub async fn fetch_node_snapshot() -> Option<PlatformSnapshot> {
+    let key = snapshot_key()?;
+    let bytes = get(&key).await?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Boot-time restore-on-rollback guard: once GuardianDB is online, compare its
+/// replicated snapshot's `saved_ms` against the CURRENT on-disk snapshot. If the
+/// replica is NEWER, the local file regressed (crash-restored old disk, wiped
+/// data dir, bad copy) — adopt the replica: restore it into the live state and
+/// rewrite the local file. The comparison re-reads the disk at adoption time, so
+/// any post-boot user mutation (which bumps the local `saved_ms` past the
+/// replica's) automatically vetoes adoption — no clobbering live changes.
+/// Opt-out: `HIVE_GUARDIAN_RESTORE=0`.
+pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
+    if std::env::var("HIVE_GUARDIAN_RESTORE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+        return;
+    }
+    tokio::spawn(async move {
+        let Some(replica) = fetch_node_snapshot().await else {
+            tracing::debug!("guardian restore guard: no replicated snapshot for this node yet");
+            return;
+        };
+        let local = crate::persist::load();
+        if replica.saved_ms <= local.saved_ms {
+            tracing::debug!(replica_ms = replica.saved_ms, local_ms = local.saved_ms, "guardian restore guard: local snapshot is current");
+            return;
+        }
+        tracing::warn!(
+            replica_ms = replica.saved_ms,
+            local_ms = local.saved_ms,
+            behind_secs = (replica.saved_ms.saturating_sub(local.saved_ms)) / 1000,
+            "SNAPSHOT ROLLBACK DETECTED — local state older than the GuardianDB replica; restoring from replica"
+        );
+        crate::persist::restore(&cloud, replica);
+        crate::persist::persist(&cloud); // rewrite the local file from the restored state
+        tracing::info!("guardian restore guard: state restored from replicated snapshot");
     });
 }
 
@@ -120,6 +181,19 @@ pub fn replicate(snap: &PlatformSnapshot) {
 pub async fn get(key: &str) -> Option<Vec<u8>> {
     let h = handle().await.ok()?;
     h.kv.get(key).await.ok().flatten()
+}
+
+/// Write an arbitrary key into GuardianDB (replicated). Best-effort — used for
+/// cluster-shared artifacts like AEAD-encrypted TLS bundles (`tls/…`).
+pub async fn put(key: &str, bytes: Vec<u8>) {
+    match handle().await {
+        Ok(h) => {
+            if let Err(e) = h.kv.put(key, bytes).await {
+                tracing::warn!(%key, error = %e, "GuardianDB put failed");
+            }
+        }
+        Err(e) => tracing::warn!(%key, error = %e, "GuardianDB unavailable for put"),
+    }
 }
 
 /// Snapshot of all keys currently stored in GuardianDB (durable copy).

@@ -1,21 +1,138 @@
 "use client";
 
 import Link from "next/link";
+import { useEffect, useState } from "react";
 import { ArrowRight } from "lucide-react";
 import { MarqueeBanner } from "@/components/marquee-banner";
 import { MarketingShell } from "@/components/marketing-shell";
 import { GlobeWireframe } from "@/components/globe-wireframe";
-import { NetworkCode } from "@/components/network-code";
 
 /* ------------------------------------------------------------------ *
  * shadw — public landing page. Renders inside the shared MarketingShell
  * (top nav + footer) and forces a dark palette regardless of app theme.
  * ------------------------------------------------------------------ */
 
+/** The rotating aurora glow ring from the reference video: a conic
+ *  rose→violet→teal gradient (violet at top/bottom, rose left, teal right —
+ *  sampled from the recording) masked into a soft ring and heavily blurred.
+ *  Rotating the element spins the gradient, so the visible arc cycles color
+ *  every ~2s exactly like the video. Size/position it via `className`. */
+function GlowRing({
+  className = "",
+  duration = 2.2,
+  style,
+}: {
+  className?: string;
+  duration?: number;
+  style?: React.CSSProperties;
+}) {
+  // Soft-feathered ring mask + heavy blur — the video's arc is diffuse, not a
+  // hard band, so the mask ramps gently on both edges.
+  const ring = "radial-gradient(closest-side, transparent 48%, rgba(0,0,0,0.55) 62%, black 72%, rgba(0,0,0,0.55) 84%, transparent 96%)";
+  return (
+    <div
+      aria-hidden
+      className={`pointer-events-none rounded-full ${className}`}
+      style={{
+        background:
+          "conic-gradient(from 0deg, rgba(124,92,196,0.55), rgba(63,160,140,0.6) 25%, rgba(124,92,196,0.55) 50%, rgba(192,80,110,0.62) 75%, rgba(124,92,196,0.55))",
+        WebkitMaskImage: ring,
+        maskImage: ring,
+        filter: "blur(min(42px,3.3vw))",
+        animation: `glow-ring-spin ${duration}s linear infinite`,
+        ...style,
+      }}
+    />
+  );
+}
+
+/** Intro loading animation (reference video 1): a full-screen black overlay with
+ *  the shadw ghost logo centered inside the rotating GlowRing. ~2s of spin, then
+ *  the overlay fades to reveal the hero. Plays on EVERY page load (matching the
+ *  video); skipped only for prefers-reduced-motion. Rendered from first paint
+ *  (SSR) so there's no pre-hydration flash of the hero. All layout is inline
+ *  styles — deterministic, no class-generation dependency. */
+function IntroLoader() {
+  const [phase, setPhase] = useState<"show" | "fade" | "done">("show");
+  useEffect(() => {
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      setPhase("done");
+      return;
+    }
+    // Lock scrolling while the intro plays so the viewport-anchored overlay
+    // can't be scrolled away mid-animation.
+    document.documentElement.style.overflow = "hidden";
+    const t1 = setTimeout(() => setPhase("fade"), 2000); // ring + logo hold (~2s like the video)
+    const t2 = setTimeout(() => setPhase("done"), 2750); // overlay gone
+    return () => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      document.documentElement.style.overflow = "";
+    };
+  }, []);
+  useEffect(() => {
+    if (phase === "done") document.documentElement.style.overflow = "";
+  }, [phase]);
+  if (phase === "done") return null;
+  const size = "min(30rem, 86vw)";
+  return (
+    // NOTE: `position:fixed` is a TRAP here — MarketingShell's page wrapper is
+    // CSS-transformed (`-translate-x-1/2`), which turns any fixed descendant
+    // into an absolute one against the PAGE-TALL wrapper: the overlay then spans
+    // the whole document and its centered children land thousands of px below
+    // the fold (the "just a black screen" bug). Anchor to the FIRST VIEWPORT
+    // instead (absolute + 100vh, page always loads at scroll-top) and center
+    // with flex.
+    <div
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        right: 0,
+        height: "100vh",
+        zIndex: 100,
+        background: "#0c0d10",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        opacity: phase === "fade" ? 0 : 1,
+        transition: "opacity 700ms ease",
+        pointerEvents: phase === "fade" ? "none" : "auto",
+      }}
+    >
+      <div
+        style={{
+          position: "relative",
+          width: size,
+          height: size,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <GlowRing style={{ position: "absolute", inset: 0 }} />
+        <img
+          src="/shadw-logo-dark.png"
+          alt="shadw"
+          style={{
+            position: "relative",
+            zIndex: 1,
+            height: "2.4rem",
+            width: "auto",
+            animation: "intro-logo-pan 2.2s ease-in-out infinite",
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 /* eslint-disable @next/next/no-img-element */
 export function Landing() {
   return (
     <MarketingShell>
+      {/* Intro loading animation (once per session): ring + logo, then fade. */}
+      <IntroLoader />
       {/* ---------------- Hero ---------------- */}
       <section className="relative overflow-hidden">
         {/* Aurora glows: two equal sources on the left and right that bleed inward
@@ -48,8 +165,10 @@ export function Landing() {
             they shrink and pull inward on small screens while staying pixel-exact
             to the Solutions hero at ≥1280px. */}
         <div className="pointer-events-none absolute inset-0">
-          <div className="absolute left-[max(-10rem,-12.5vw)] top-0 h-[min(40rem,50vw)] w-[min(40rem,50vw)] rounded-full bg-violet-700/25 blur-[min(140px,10.94vw)]" />
-          <div className="absolute left-[max(-5rem,-6.25vw)] top-[min(4rem,5vw)] h-[min(22rem,27.5vw)] w-[min(22rem,27.5vw)] rounded-full bg-pink-500/30 blur-[min(110px,8.59vw)]" />
+          {/* Leftmost glow = the reference video's animated ring: a big rotating
+              conic ring anchored off-screen top-left so only its lower-right arc
+              sweeps the corner, its colors cycling rose↔violet↔teal as it spins. */}
+          <GlowRing className="absolute left-[max(-24rem,-30vw)] top-[max(-22rem,-27.5vw)] h-[min(44rem,55vw)] w-[min(44rem,55vw)]" />
           <div className="absolute right-[max(-10rem,-12.5vw)] top-[min(10rem,12.5vw)] h-[min(34rem,42.5vw)] w-[min(34rem,42.5vw)] rounded-full bg-cyan-500/15 blur-[min(140px,10.94vw)]" />
           <div className="absolute right-[max(-4rem,-5vw)] top-[min(13rem,16.25vw)] h-[min(20rem,25vw)] w-[min(20rem,25vw)] rounded-full bg-sky-400/30 blur-[min(110px,8.59vw)]" />
         </div>
@@ -87,9 +206,6 @@ export function Landing() {
 
       {/* ---------------- Scrolling "Own Your Cloud." banner (after the globe) ---------------- */}
       <MarqueeBanner />
-
-      {/* ---------------- P2P network graphic + code-art overlay (below the banner) ---------------- */}
-      <NetworkCode />
 
       {/* ---------------- Device showcase (dead space above for contrast) ---------------- */}
       <section id="demo" className="relative scroll-mt-20 px-6 pb-28 pt-36 sm:pt-44">

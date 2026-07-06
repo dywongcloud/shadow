@@ -14,6 +14,29 @@ export const dynamic = "force-dynamic";
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const TOKEN = process.env.HIVE_INTERNAL_TOKEN || "";
 const PERSONAL = new Set(["personal", "__personal__", ""]);
+const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
+
+/**
+ * Is `host` a platform-issued deployment domain? Blocks the open-redirect /
+ * ZK-proof-exfiltration vector where an attacker sets `?host=attacker.example`
+ * on a crafted link — the real proof/message minted for a legitimate member
+ * would otherwise be shipped straight to that arbitrary external origin.
+ *
+ * Covers every STANDARD alias shape (`.localhost` dev, region-encoded
+ * `*.<code>.ngrok.pizza`, and the configured `NEXT_PUBLIC_DEPLOYMENT_DOMAIN`).
+ * KNOWN GAP: a project's own CUSTOM domain (the Domains feature) is not in
+ * this list — this check intentionally only defends against a truly
+ * arbitrary third-party host; a stronger fix would resolve the deployment's
+ * exact registered host(s) for `project` server-side and require an exact
+ * match, which needs new backend plumbing beyond this pass's scope.
+ */
+function isKnownDeploymentHost(host: string): boolean {
+  const h = host.toLowerCase();
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (h.endsWith(".ngrok.pizza")) return true;
+  if (DEPLOY_DOMAIN && (h === DEPLOY_DOMAIN || h.endsWith(`.${DEPLOY_DOMAIN}`))) return true;
+  return false;
+}
 
 /** Is `userId` a member of the Clerk org whose slug (or id) == `team`? */
 async function isOrgMember(userId: string, team: string): Promise<boolean> {
@@ -37,6 +60,9 @@ export async function GET(req: NextRequest) {
   const team = sp.get("team") || "personal";
   const next = sp.get("next") || "/";
   if (!host || !project) return NextResponse.json({ ok: false, error: "missing deployment info" }, { status: 400 });
+  if (!isKnownDeploymentHost(host)) {
+    return NextResponse.json({ ok: false, error: "unrecognized deployment host" }, { status: 400 });
+  }
 
   const { userId } = await auth();
   if (!userId) return NextResponse.json({ ok: false, signin: true, error: "sign in required" }, { status: 401 });

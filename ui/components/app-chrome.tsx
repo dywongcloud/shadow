@@ -1,11 +1,27 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { SignedIn } from "@clerk/nextjs";
 import { TopNav } from "@/components/topnav";
 import { Footer } from "@/components/footer";
-import { GitOps } from "@/components/gitops";
-import { CommandBar } from "@/components/command-bar";
 import { ZkPreviewAuth } from "@/components/zk-preview-auth";
+import { PendingBuildsProvider } from "@/components/pending-builds-provider";
+import { SessionToken } from "@/components/session-token";
+
+// Both mount on EVERY authenticated page but render nothing until the user
+// actively opens them (⌘K for the command bar; the onboarding/repo flow for
+// GitOps) — so their JS has no business being in every page's initial bundle.
+// ssr:false is safe: they're pure client overlays with zero SEO surface, and
+// `loading: () => null` is correct since their own first render is invisible
+// too (no layout shift from the swap).
+const GitOps = dynamic(() => import("@/components/gitops").then((m) => m.GitOps), {
+  ssr: false,
+  loading: () => null,
+});
+const CommandBar = dynamic(() => import("@/components/command-bar").then((m) => m.CommandBar), {
+  ssr: false,
+  loading: () => null,
+});
 
 // Auth-gated dashboard chrome (top nav + footer + overlays). This MUST be a client
 // component: when it lived in the server root layout, Clerk's `<SignedIn>` was
@@ -34,6 +50,7 @@ export function ChromeBottom() {
         <Footer />
         <GitOps />
         <CommandBar />
+        <PendingBuildsProvider />
       </>
     );
   }
@@ -43,6 +60,8 @@ export function ChromeBottom() {
       <GitOps />
       <CommandBar />
       <ZkPreviewAuth />
+      <PendingBuildsProvider />
+      <SessionToken />
     </SignedIn>
   );
 }

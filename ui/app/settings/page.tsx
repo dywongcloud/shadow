@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Webhook, Bell, KeyRound, ChevronRight } from "lucide-react";
+import { Webhook, Bell, KeyRound, ChevronRight, ShieldCheck } from "lucide-react";
 import { Card, PageHeader, Badge, Button } from "@/components/ui";
 import { ActivityFeed } from "@/components/activity-feed";
 import { usePoll, type Overview, type NodeInfo } from "@/lib/api";
@@ -18,6 +18,7 @@ export default function SettingsPage() {
         <NavCard href="/settings/api-keys" icon={<KeyRound className="h-4 w-4" />} title="API Keys" desc="Tenant-scoped tokens for the platform API." />
         <NavCard href="/settings/webhooks" icon={<Webhook className="h-4 w-4" />} title="Webhooks" desc="Send signed events to your endpoints." />
         <NavCard href="/settings/notifications" icon={<Bell className="h-4 w-4" />} title="Notifications" desc="Web, email, push & SMS preferences." />
+        <NavCard href="/settings/enterprise" icon={<ShieldCheck className="h-4 w-4" />} title="Enterprise" desc="SSO, SCIM, SIEM, IP blocking, conformance." />
       </div>
 
       <General ov={ov} nodes={nodes} />

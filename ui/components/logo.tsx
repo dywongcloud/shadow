@@ -13,6 +13,17 @@ export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
   );
 }
 
+// The classic Vercel triangle brand mark — theme-aware via `currentColor`
+// (`text-fg` is black on light backgrounds, white on dark), so it inverts with
+// the theme without any image swap or hydration flash. Size with a height util.
+export function VercelMark({ className = "h-5 w-auto" }: { className?: string }) {
+  return (
+    <svg viewBox="0 0 76 65" className={`${className} text-fg`} fill="currentColor" aria-label="Vercel" role="img">
+      <path d="M37.5274 0L75.0548 65H0L37.5274 0Z" />
+    </svg>
+  );
+}
+
 // Forced-color variants for surfaces that are always one theme (e.g. the
 // always-dark landing page uses <LogoWhite/>).
 export function LogoWhite({ className = "h-6 w-auto" }: { className?: string }) {

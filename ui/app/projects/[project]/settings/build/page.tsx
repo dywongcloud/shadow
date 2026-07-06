@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type BuildConfig, type ProjectSettings } from "@/lib/api";
 
-const FRAMEWORKS = ["Other", "Next.js", "Vite", "Astro", "SvelteKit", "Nuxt", "Remix", "Static", "Python (FastAPI)", "Node (Express)"];
+const FRAMEWORKS = ["Other", "Next.js", "OpenNext", "vinext", "Vite", "Astro", "SvelteKit", "Nuxt", "Remix", "Static", "Python (FastAPI)", "Node (Express)"];
 
 export default function BuildSettings({ params }: { params: { project: string } }) {
   const project = decodeURIComponent(params.project);

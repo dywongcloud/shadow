@@ -91,6 +91,51 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         }
         "/v1/nodes" => jb(crate::admin::nodes(State(cloud.clone())).await),
         "/v1/serve-hosts" => jb(crate::admin::serve_hosts(State(cloud.clone())).await),
+        // TLS bundle distribution over the authenticated mesh (see acme.rs::
+        // bundle_for_mesh — key decrypted in transit inside peer-authenticated
+        // QUIC only; receiver re-encrypts with its own node key).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/tls/bundle") => {
+            let name = p.split_once("name=").map(|(_, n)| n.split('&').next().unwrap_or(n)).unwrap_or("");
+            crate::acme::bundle_for_mesh(name)
+        }
+        // NON-SECRET directory of gateway-addressable DBs hosted on this node
+        // ({id, db_host, host_node, kind} — no credentials). The DNS leader fans
+        // this out to publish per-DB `<slug>.{db_domain}` A records for DBs that
+        // provisioned on other nodes (DB records themselves are not gossiped).
+        // Prefix match: fetch_from_host appends `?team=`.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/db-directory") => {
+            serde_json::to_vec(&cloud.databases.directory()).unwrap_or_default()
+        }
+        // Local per-function usage stats (each node meters its own compute) — the
+        // billing meter loop on the coordinator fans this out to sum fleet usage.
+        // Prefix match: `fetch_from_host` appends `?team=` so an exact arm misses.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/functions") => {
+            jb(crate::admin::functions(State(cloud.clone())).await)
+        }
+        // Mesh project-delete cascade (single hop): the coordinator's cross-node
+        // teardown for hosting nodes reachable only over iroh. Team must OWN the
+        // project on THIS node (or the project must be absent — idempotent).
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/projects/") && p.contains("/delete") => {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let team = p.split_once("?team=").map(|(_, t)| t.to_string()).unwrap_or_default();
+            let owner = cloud.projects.team_of(&project);
+            let owns_settings = crate::admin::norm(&owner) == crate::admin::norm(&team);
+            let owns_deploys = cloud
+                .gw
+                .list()
+                .iter()
+                .any(|d| d.project == project && crate::admin::norm(&d.tenant) == crate::admin::norm(&team));
+            if project.is_empty() || !(owns_settings || owns_deploys) {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" })).unwrap_or_default();
+            }
+            let removed = crate::admin::delete_project_local(&cloud, &project, &team).await;
+            serde_json::to_vec(&serde_json::json!({ "project": project, "removed": removed })).unwrap_or_default()
+        }
         "/v1/fleet-deployments" => jb(crate::admin::fleet_deployments(State(cloud.clone())).await),
         "/v1/leases" => jb(crate::admin::leases_get(State(cloud.clone())).await),
         #[cfg(feature = "zkauth")]
@@ -126,7 +171,7 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // target's build into its own record so the dashboard UX is unchanged).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/builds/") => {
             let id = p.trim_start_matches("/v1/builds/").split('?').next().unwrap_or("").to_string();
-            match crate::admin::build_get(State(cloud.clone()), axum::extract::Path(id)).await {
+            match crate::admin::build_get(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
@@ -138,6 +183,39 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/resources") => {
             let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
             jb(crate::admin::deployment_resources(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await)
+        }
+        // Build record + logs for a deployment hosted on THIS node (proxied by the
+        // coordinator when the deployment was placed here — build logs live where it built).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/build") => {
+            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
+            match crate::admin::deployment_build(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
+        // Intelligent service graph for a deployment hosted on THIS node (scanned here).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/service-graph") => {
+            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
+            match crate::admin::deployment_service_graph(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
+        // Project's latest service graph, served LOCALLY (the coordinator fans this
+        // out to the node that built the project). Local-only → no re-proxy loop.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/service-graph") => {
+            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+            let team = qparam(p, "team").unwrap_or_default();
+            // Only return it to the owning tenant (this node built it, so it has the
+            // project→team mapping). Empty team = trusted/no-scope caller.
+            let owner = cloud.projects.team_of(&project);
+            let owner_ns = if owner.trim().is_empty() { "personal".to_string() } else { owner };
+            let team_ns = if team.trim().is_empty() { String::new() } else { team };
+            // On-demand scan if not yet stored (backfills existing/failed deployments).
+            match crate::admin::local_project_graph(&cloud, &project).await {
+                Some(g) if team_ns.is_empty() || team_ns == owner_ns => jb(axum::Json(serde_json::json!(g))),
+                _ => Vec::new(),
+            }
         }
         // A single run's DETAIL — must match before the runs LIST arm below.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/runs/") => {
@@ -162,6 +240,23 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // so this node returns only its own events (no re-fan-out → no loop).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
             jb(crate::admin::logs(State(cloud.clone()), team_headers(p), team_claims(p), logs_query(p)).await)
+        }
+        // Cross-region DB replica control (register/remove) over the mesh.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => match crate::admin::database_replica(State(cloud.clone()), axum::Json(v)).await {
+                    Ok(j) => jb(j),
+                    Err((_, e)) => jb(axum::Json(serde_json::json!({ "error": e }))),
+                },
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+            }
+        }
+        // Mirrored storage writes over the mesh (replication data plane). The team
+        // rides as `?team=` and is applied to the SAME tenant namespace on this
+        // replica; these NEVER re-mirror (they're already replicated writes).
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/storage/") && (qparam(p, "mirror").as_deref() == Some("1")) => {
+            crate::admin::apply_mirrored_write(&cloud, p, body).await;
+            jb(axum::Json(serde_json::json!({ "ok": true })))
         }
         _ => Vec::new(),
     }
@@ -193,10 +288,33 @@ fn qparam(path: &str, key: &str) -> Option<String> {
 /// from these claims — under enforced JWT auth the synthesized `x-hive-team`
 /// header is ignored, so without this the tenant would be lost on the host node.
 fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
+    // PREFERRED: a signed, short-lived delegation token (`?tok=`) minted by the
+    // originating node from the verified user tenant. Verifying it here yields an
+    // AUTHORITATIVE, integrity-protected, expiring tenant assertion — closing the
+    // raw-`?team=` spoofing class: the value can no longer be an arbitrary
+    // attacker-set query param, it must be a validly-signed unexpired JWT.
+    // (Residual, inherent to a shared HIVE_JWT_SECRET mesh: a compromised
+    // *trusted peer node* can still mint any tenant — that requires per-node
+    // signing keys to close and is bounded by the peer-trust allowlist gate.)
+    if let Some(tok) = qparam(path, "tok") {
+        if let Ok(mut claims) = crate::auth::verify(&tok) {
+            claims.platform_admin = false;
+            return Some(axum::Extension(claims));
+        }
+        if crate::auth::enforced() {
+            tracing::warn!(%path, "mesh delegation token present but INVALID; rejecting tenant assertion");
+            return None;
+        }
+    }
     let team = qparam(path, "team")?;
     let team = team.trim();
     if team.is_empty() {
         return None;
+    }
+    // FALLBACK: raw `?team=`. Retained for dev/unenforced mode and rolling
+    // upgrades (an origin node predating token-minting sends only `team=`).
+    if crate::auth::enforced() {
+        tracing::warn!(%path, "mesh call carried raw team= without a signed token (rolling-upgrade fallback)");
     }
     Some(axum::Extension(crate::auth::Claims {
         sub: "mesh-internal".into(),
@@ -204,6 +322,7 @@ fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
         role: "service".into(),
         iat: 0,
         exp: 0,
+        platform_admin: false,
     }))
 }
 
@@ -228,10 +347,49 @@ fn wf_query(path: &str) -> axum::extract::Query<crate::admin::WfQuery> {
 }
 
 /// The iroh gossip handler `serve_tunnels` invokes for inbound `STREAM_GOSSIP`.
+/// Pure core of the mesh-mutation authorization decision (no CloudState/env
+/// deps, unit-testable directly). `signer_trusted`: `None` when no trust set
+/// is configured at all (nothing to check against — permissionless, today's
+/// default); `Some(bool)` when a trust set IS configured, carrying whether
+/// the (possibly-absent, mapped to `false`) verified signer is a member.
+fn mesh_mutation_authorized(method: u8, signer_trusted: Option<bool>) -> bool {
+    method == hive_p2p::GOSSIP_GET || signer_trusted.unwrap_or(true)
+}
+
 pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
-    Arc::new(move |method, path, body| {
+    // `signer` is the message's VERIFIED ed25519 identity (Some only when the
+    // request carried a valid signature bound to the QUIC peer).
+    //
+    // The iroh gossip transport carries no HTTP headers, so it never passes
+    // through `auth::require_auth` (the JWT middleware) at all — an operator
+    // who believes they've secured the API by setting HIVE_JWT_SECRET has
+    // only secured the HTTP admin surface; this mesh path answered the exact
+    // same privileged handlers (deploy, project delete, database_replica,
+    // storage mirror writes, promote) with NO authorization check whatsoever,
+    // regardless of that configuration. The only authorization signal this
+    // transport can carry is a verified, trust-set-member signer, so: when a
+    // trust set is actually configured (non-empty — matches the HTTP side's
+    // "only enforce what's actually configured" pattern, e.g. `require_auth`/
+    // `require_operator`), require it for every MUTATING call. Reads remain
+    // open here (each handler still applies its own tenant/team scoping) —
+    // this mirrors the HTTP side's "reads are always allowed" policy rather
+    // than introducing an inconsistent new read-side gate. With no trust set
+    // configured (today's default), this is unchanged/permissionless.
+    Arc::new(move |method, path, body, signer: Option<String>| {
         let cloud = cloud.clone();
-        Box::pin(async move { dispatch(&cloud, method, &path, &body).await })
+        Box::pin(async move {
+            if let Some(s) = &signer {
+                tracing::trace!(signer = %s, %path, "verified signed gossip");
+            }
+            let trust_configured = cloud.trusted_peer_ids.read().map(|s| !s.is_empty()).unwrap_or(false);
+            let signer_trusted = trust_configured
+                .then(|| signer.as_deref().map(|s| hive_p2p::peer_trusted(&cloud.trusted_peer_ids, s)).unwrap_or(false));
+            if !mesh_mutation_authorized(method, signer_trusted) {
+                tracing::warn!(%path, signer = ?signer, "REJECTED mutating gossip: no verified+trusted signer (trust set configured)");
+                return serde_json::to_vec(&serde_json::json!({ "error": "untrusted or unsigned mesh caller" })).unwrap_or_default();
+            }
+            dispatch(&cloud, method, &path, &body).await
+        })
     })
 }
 
@@ -285,5 +443,59 @@ pub async fn fetch(
     match req.timeout(Duration::from_secs(4)).send().await {
         Ok(r) if r.status().is_success() => r.bytes().await.ok().map(|b| b.to_vec()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod mesh_auth_tests {
+    use super::*;
+
+    // REGRESSION TESTS for a real, confirmed vulnerability: the iroh gossip
+    // transport carries no HTTP headers, so it never passed through
+    // `auth::require_auth` at all — mutating handlers reachable via gossip
+    // (deploy, project delete, database_replica, storage mirror writes,
+    // promote) had NO authorization check whatsoever, regardless of
+    // HIVE_JWT_SECRET/HIVE_PEER_TRUST configuration.
+
+    #[test]
+    fn reads_are_always_allowed_regardless_of_trust_config() {
+        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_GET, None));
+        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_GET, Some(false)));
+        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_GET, Some(true)));
+    }
+
+    #[test]
+    fn mutations_are_permissionless_when_no_trust_set_is_configured() {
+        // Today's default — unchanged behavior when HIVE_PEER_TRUST is unset.
+        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_POST, None));
+    }
+
+    #[test]
+    fn mutations_require_a_trusted_signer_once_a_trust_set_is_configured() {
+        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_POST, Some(true)), "a verified, trusted signer must be allowed");
+        assert!(
+            !mesh_mutation_authorized(hive_p2p::GOSSIP_POST, Some(false)),
+            "an unsigned or untrusted-signer mutation must be REJECTED once trust is configured"
+        );
+    }
+
+    #[test]
+    fn mesh_team_qs_round_trips_a_signed_token_into_authoritative_claims() {
+        // Env-independent: verify + issue are driven off an explicit secret via
+        // the auth helpers, not global process state, so this can't race the
+        // suite's other enforced()-sensitive tests. A signed token's tenant is
+        // AUTHORITATIVE over a spoofed `?team=`; a garbled token yields no claims.
+        let tok = crate::auth::issue_with_secret("mesh-internal", "acme", "service", false, 60, "sekret").unwrap();
+        let path = format!("/v1/git/deploy?team=SPOOFED&tok={tok}");
+        let (tok_in_path, _) = (super::qparam(&path, "tok").unwrap(), ());
+        let claims = crate::auth::verify_with_secret(&tok_in_path, "sekret").unwrap();
+        assert_eq!(claims.tenant, "acme", "signed token tenant is authoritative over the raw param");
+        assert!(crate::auth::verify_with_secret("not-a-jwt", "sekret").is_err());
+
+        // The raw `?team=` fallback (no token) still resolves a tenant for
+        // dev/rolling-upgrade — this path needs no secret.
+        let claims = team_claims("/v1/logs?team=personal").expect("raw team fallback").0;
+        assert_eq!(claims.tenant, "personal");
+        assert!(team_claims("/v1/logs").is_none(), "no team and no token yields no claims");
     }
 }

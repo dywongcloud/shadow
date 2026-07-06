@@ -28,6 +28,17 @@ fn set(resp: &mut Response, name: &'static str, val: &str) {
     }
 }
 
+/// Stamp the microfrontend debug headers on a served response (non-production
+/// only — `dbg` is `None` for production requests, so nothing is added there).
+fn set_mfe(resp: &mut Response, dbg: &Option<[String; 4]>) {
+    if let Some([group, project, route, fallback]) = dbg {
+        set(resp, "x-mfe-group", group);
+        set(resp, "x-mfe-project", project);
+        set(resp, "x-mfe-route", route);
+        set(resp, "x-mfe-fallback", fallback);
+    }
+}
+
 /// Build a structured failure response (#18): correct status + a stable public code
 /// body + `x-hive-error` header. Internal detail stays in the recorded event/log.
 fn fail_response(class: fluid_core::FailureClass, region: &str, rid: &str) -> Response {
@@ -41,6 +52,7 @@ fn fail_response(class: fluid_core::FailureClass, region: &str, rid: &str) -> Re
 
 pub async fn edge_pipeline(
     State(cloud): State<Arc<CloudState>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
@@ -49,7 +61,7 @@ pub async fn edge_pipeline(
     // a mesh-proxied one already carries the peer's stamp (copied through from the
     // peer's own pipeline), which we leave intact. Pairs with `x-hive-routed-to`.
     let node = cloud.node_name.clone();
-    let mut resp = edge_pipeline_inner(State(cloud), req, next).await;
+    let mut resp = edge_pipeline_inner(State(cloud), peer, req, next).await;
     if !resp.headers().contains_key("x-hive-served-by") {
         set(&mut resp, "x-hive-served-by", &node);
     }
@@ -58,6 +70,7 @@ pub async fn edge_pipeline(
 
 async fn edge_pipeline_inner(
     State(cloud): State<Arc<CloudState>>,
+    peer: std::net::SocketAddr,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -86,11 +99,39 @@ async fn edge_pipeline_inner(
         }
     }
     let ua = hget(&req, "user-agent").unwrap_or_default();
-    let ip = hget(&req, "x-forwarded-for")
-        .map(|s| s.split(',').next().unwrap_or("").trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // Real TCP peer address, NOT the client-supplied `x-forwarded-for` header.
+    // There is no reverse proxy (nginx/haproxy/ngrok) in front of this listener
+    // on any fleet node — hive-cloud terminates TLS and binds 0.0.0.0:80/443
+    // directly — so XFF has no legitimate source and is pure attacker-controlled
+    // input; trusting it let any client spoof their IP past rate limiting and
+    // the enterprise IP-block/allowlist firewall below.
+    let ip = peer.ip().to_string();
     let region = cloud.region.clone();
+
+    // DB-gateway HTTP REST surface: `<slug>.{db_domain}` hosts are the per-tenant
+    // database endpoints (Upstash-style redis REST / SQL-over-HTTP), NOT app
+    // deployments — branch before the deploy-suffix host validation below would
+    // 404 them. Auth is per-DB bearer inside the handler (ZeroTrust: the edge
+    // pipeline's WAF/preview gates are deployment concepts and don't apply), but
+    // the generic per-IP flood shedder still applies — this is the only path on
+    // the shared 443 listener that would otherwise have ZERO L7 rate limiting.
+    if !cloud.db_domain.is_empty() {
+        let hp = host.split(':').next().unwrap_or(&host).to_ascii_lowercase();
+        if hp == cloud.db_domain || hp.ends_with(&format!(".{}", cloud.db_domain)) {
+            let status_host = hp.clone();
+            if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
+                let ev = cloud.event(&region, &method, &status_host, &path, 429, "rate-limited", &ip);
+                cloud.record(ev);
+                let mut resp = (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED").into_response();
+                set(&mut resp, "x-hive-ratelimit", "exceeded");
+                return resp;
+            }
+            let resp = crate::db_rest::handle(cloud.clone(), hp, req).await;
+            let ev = cloud.event(&region, &method, &status_host, &path, resp.status().as_u16(), "db-rest", &status_host);
+            cloud.record(ev);
+            return resp;
+        }
+    }
 
     // Vercel Web Analytics / Speed Insights beacons are infrastructure endpoints
     // served by the gateway itself — let them pass straight through, bypassing the
@@ -100,26 +141,70 @@ async fn edge_pipeline_inner(
         return next.run(req).await;
     }
 
-    // Microfrontends: compose child projects under the host project's domain. If
-    // this host is a microfrontend group's host project and the path matches a
-    // child's prefix, rewrite the host subdomain to the child project so the rest
-    // of the pipeline resolves and serves the CHILD's production deployment for
-    // that path — one domain, many projects. (Fast-guarded: only runs when a
-    // microfrontend group exists.)
+    // Microfrontends: compose child projects under the default (host) project's
+    // domain. If this host is a group's default project and the path matches a
+    // child's route, resolve the child's TARGET deployment (honoring the group's
+    // fallback-environment policy for preview requests) and rewrite the host to
+    // that deployment so the existing alias-resolution + dispatch serves it — one
+    // domain, many projects, no second runtime path. (Fast-guarded: only runs when
+    // some microfrontend group exists locally or via gossip.)
+    let mut mfe_dbg: Option<[String; 4]> = None;
     if !host.is_empty() && cloud.enterprise.has_mfe() {
         if let Some(dep) = cloud.gw.deployment_for_host(&host) {
             let team = cloud.projects.team_of(&dep.project);
-            if let Some(child) = cloud.enterprise.mfe_child_for(&team, &dep.project, &path) {
-                let rest = host.split_once('.').map(|(_, r)| r.to_string());
-                host = match rest {
-                    Some(r) => format!("{child}.{r}"),
-                    None => child.clone(),
-                };
-                if let Ok(v) = HeaderValue::from_str(&host) {
-                    req.headers_mut().insert(axum::http::header::HOST, v);
+            if let Some(group) = cloud.enterprise.mfe_group_for_host(&team, &dep.project) {
+                if let Some((child, matched)) = crate::microfrontends::resolve_child(&group, &path) {
+                    // The request environment/commit come from the DEFAULT app's
+                    // resolved deployment (production alias vs a preview commit URL).
+                    let req_env = if dep.production || dep.target == "production" { "production" } else { "preview" };
+                    let req_commit = dep.git.as_ref().map(|g| g.commit.clone()).unwrap_or_default();
+                    let cands: Vec<crate::microfrontends::DeployCand> = cloud
+                        .gw
+                        .list()
+                        .into_iter()
+                        .filter(|d| d.project == child)
+                        .map(|d| crate::microfrontends::DeployCand {
+                            id: d.id.to_string(),
+                            env: if d.production || d.target == "production" { "production".into() } else { "preview".into() },
+                            commit: d.git.as_ref().map(|g| g.commit.clone()).unwrap_or_default(),
+                            production: d.production,
+                        })
+                        .collect();
+                    if let Ok(target) = crate::microfrontends::resolve_child_target(&group, &child, req_env, &req_commit, &cands) {
+                        // The target deployment id is a served-host alias label
+                        // (published locally + gossiped), so rewriting the host's
+                        // first label routes to that exact deployment via the same
+                        // path the public router uses — no second HTTP hop.
+                        let rest = host.split_once('.').map(|(_, r)| r.to_string());
+                        host = match rest {
+                            Some(r) => format!("{}.{}", target.deployment_id, r),
+                            None => target.deployment_id.clone(),
+                        };
+                        if let Ok(v) = HeaderValue::from_str(&host) {
+                            req.headers_mut().insert(axum::http::header::HOST, v);
+                        }
+                        // Debug/trace headers, non-production only (so prod responses
+                        // never leak internal composition). Set on the REQUEST (seen
+                        // by the child + across mesh hops) and stamped on the local
+                        // response below.
+                        if req_env != "production" {
+                            let dbg = [group.id.clone(), child.clone(), matched.clone(), target.fallback.clone()];
+                            for (k, val) in [
+                                ("x-mfe-group", &dbg[0]),
+                                ("x-mfe-project", &dbg[1]),
+                                ("x-mfe-route", &dbg[2]),
+                                ("x-mfe-fallback", &dbg[3]),
+                            ] {
+                                if let Ok(v) = HeaderValue::from_str(val) {
+                                    req.headers_mut().insert(HeaderName::from_static(k), v);
+                                }
+                            }
+                            mfe_dbg = Some(dbg);
+                        }
+                        let ev = cloud.event(&region, &method, &host, &path, 0, "mfe-route", &child);
+                        cloud.record(ev);
+                    }
                 }
-                let ev = cloud.event(&region, &method, &host, &path, 0, "mfe-route", &child);
-                cloud.record(ev);
             }
         }
     }
@@ -669,13 +754,27 @@ async fn edge_pipeline_inner(
         }
     }
 
-    // 4) Concurrency admission (per-region burst limit) for compute requests.
+    // 4a) Per-DEPLOYMENT concurrency admission (host-keyed burst budget). A
+    // single busy deployment can only exhaust its OWN budget, so it cannot
+    // starve every other tenant on this node — the node-wide backstop below no
+    // longer conflates one noisy tenant with genuine total overload.
+    if !cloud.admission.check(&host, hive_core::now_ms()) {
+        let ev = cloud.event(&region, &method, &host, &path, 503, "throttled", "FUNCTION_THROTTLED");
+        cloud.record(ev);
+        let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "FUNCTION_THROTTLED").into_response();
+        set(&mut resp, "x-hive-region", &region);
+        set(&mut resp, "x-hive-error", "FUNCTION_THROTTLED");
+        set(&mut resp, "x-hive-throttle", "deployment");
+        return resp;
+    }
+    // 4b) Node-wide concurrency backstop (total-overload self-protection).
     if !cloud.limiter.try_admit() {
         let ev = cloud.event(&region, &method, &host, &path, 503, "throttled", "FUNCTION_THROTTLED");
         cloud.record(ev);
         let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "FUNCTION_THROTTLED").into_response();
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-error", "FUNCTION_THROTTLED");
+        set(&mut resp, "x-hive-throttle", "node");
         return resp;
     }
 
@@ -702,12 +801,14 @@ async fn edge_pipeline_inner(
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-cache", CacheState::Miss.header());
         set_anycast(&mut resp, &anycast);
+        set_mfe(&mut resp, &mfe_dbg);
         resp
     } else {
         let mut resp = resp;
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-cache", CacheState::Miss.header());
         set_anycast(&mut resp, &anycast);
+        set_mfe(&mut resp, &mfe_dbg);
         resp
     }
 }

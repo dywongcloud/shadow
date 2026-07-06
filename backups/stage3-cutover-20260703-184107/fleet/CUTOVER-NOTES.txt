@@ -1,0 +1,4 @@
+HIVE_ADMIN flipped node-a(127.0.0.1:8786) -> https://api.shadw.cloud
+Revert: set HIVE_ADMIN=http://127.0.0.1:8786 in ui/.env.local, then: cd ui && npm run build && restart :3002
+Fleet drop-ins added: owner.conf (HIVE_OWNER_EMAIL), HIVE_INTERNAL_TOKEN appended to ingress.conf
+Fleet revert: rm owner.conf + remove token line, daemon-reload, restart (falls back to enforced-but-no-owner)

@@ -13,7 +13,9 @@ mod billing;
 mod cluster;
 mod compose;
 mod databases;
+mod db_gateway;
 mod db_replicate;
+mod db_rest;
 mod dns;
 mod dnsserver;
 mod docstore;
@@ -30,11 +32,17 @@ mod identity;
 mod incidents;
 mod integrations;
 mod metrics;
+mod microfrontends;
+mod microfrontends_api;
 mod notifications;
 mod persist;
 mod project_settings;
 mod resources;
+mod resp;
 mod retry;
+mod sandboxes;
+mod sandboxes_api;
+mod sandboxes_platform;
 mod schedule;
 mod world;
 mod secrets;
@@ -127,14 +135,18 @@ async fn main() -> anyhow::Result<()> {
             fc_cfg.boot_args = ba;
         }
     }
-    let firecracker = FirecrackerBackend::new(fc_cfg);
+    let firecracker = Arc::new(FirecrackerBackend::new(fc_cfg));
     // Backend kind ("firecracker"|"mock") captured alongside the backend — gossiped
     // so the placement scheduler only auto-targets real-microVM nodes (never the
-    // local/mock Mac nodes).
+    // local/mock Mac nodes). `sandbox_fc` retains the CONCRETE type (Sandboxes'
+    // exec/kill methods are Firecracker-specific, not part of the generic
+    // `CellBackend` trait object every other subsystem sees).
+    let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
+    let sandbox_fc: Option<Arc<FirecrackerBackend>> = sandbox_fc_supported.then(|| firecracker.clone());
     let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) =
-        if firecracker.is_supported() && !force_mock {
+        if sandbox_fc_supported {
             tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
-            (Arc::new(firecracker), "firecracker")
+            (firecracker, "firecracker")
         } else {
             if force_mock {
                 tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
@@ -292,6 +304,7 @@ async fn main() -> anyhow::Result<()> {
         gw.clone(),
         fluid,
         hive,
+        sandbox_fc,
     );
 
     // Restore persisted platform state from disk (deployments, settings, WAF…).
@@ -484,8 +497,21 @@ async fn main() -> anyhow::Result<()> {
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())
         .layer(axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline));
+    // Connection-level DoS bounds on the control plane (the admin router has no
+    // streaming/SSE endpoints and deploys enqueue-then-return, so a bounded
+    // per-request timeout and body cap are safe — unlike the public gateway,
+    // which streams tenant responses and already caps request bodies at 16 MiB
+    // + per-IP rate-limits in the edge pipeline). Env-tunable.
+    let admin_max_body: usize = std::env::var("HIVE_ADMIN_MAX_BODY_MIB")
+        .ok().and_then(|v| v.parse().ok()).unwrap_or(64) * 1024 * 1024;
+    let admin_req_timeout = Duration::from_secs(
+        std::env::var("HIVE_ADMIN_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
+    );
     let admin_router = admin::router(cloud.clone())
-        .layer(axum::middleware::from_fn(auth::require_auth));
+        .layer(axum::middleware::from_fn(auth::require_auth))
+        .layer(axum::middleware::from_fn(admin::admin_rate_limit))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(admin_max_body))
+        .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
     }
@@ -505,13 +531,16 @@ async fn main() -> anyhow::Result<()> {
             public
         } else {
             let api_host = format!("api.{}", cloud.platform_domain);
+            // Ops/admin console host — the operator surface, distinct from the
+            // developer/API-key `api.` host (both currently reach the admin router).
+            let admin_host = format!("admin.{}", cloud.platform_domain);
             // Dashboard hosts (apex + www): reverse-proxied to the dashboard
             // origin (`HIVE_DASHBOARD_UPSTREAM`, e.g. the ngrok origin until the
             // dashboard moves onto a node). Empty upstream = no dashboard hosts.
             let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM").ok().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty());
             let dash_hosts = vec![cloud.platform_domain.clone(), format!("www.{}", cloud.platform_domain)];
-            tracing::info!(%api_host, dashboard = ?dash_upstream, "host-based dispatch active (api host → admin router; apex/www → dashboard proxy)");
-            host_switch_router(api_host, dash_hosts, dash_upstream, cloud.http.clone(), admin_router.clone(), public)
+            tracing::info!(%api_host, %admin_host, dashboard = ?dash_upstream, "host-based dispatch active (api/admin hosts → admin router; apex/www → dashboard proxy)");
+            host_switch_router(cloud.clone(), api_host, admin_host, dash_hosts, dash_upstream, cloud.http.clone(), admin_router.clone(), public)
         }
     } else {
         public
@@ -530,6 +559,12 @@ async fn main() -> anyhow::Result<()> {
             tracing::warn!(error=%e, %tls_addr, "TLS listener failed (continuing with HTTP)");
         }
     });
+
+    // Per-tenant DB gateway (Neon/Upstash model): Postgres :5432 + Redis :6379
+    // TLS-SNI proxies to each tenant DB's container. Spawns only when the gateway
+    // is enabled (HIVE_DB_DOMAIN set); the wildcard `*.{db_domain}` cert comes from
+    // the same ACME-managed SNI resolver. High ports (>1024) — no capability needed.
+    db_gateway::spawn(cloud.clone());
 
     // Real-DNS ingress listeners (ngrok retirement): a public HTTPS listener with
     // the hot-swappable SNI resolver (wildcard apps cert + api cert; ACME-managed)
@@ -551,7 +586,7 @@ async fn main() -> anyhow::Result<()> {
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(acme::server_config());
             tracing::info!(%https_addr, "public HTTPS listener (SNI resolver, ACME-managed certs)");
             if let Err(e) = axum_server::bind_rustls(https_addr, cfg)
-                .serve(https_router.into_make_service())
+                .serve(https_router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
                 tracing::error!(error = %e, %https_addr, "HTTPS listener failed (check CAP_NET_BIND_SERVICE / port availability)");
@@ -594,13 +629,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` →
-/// the admin router, anything else → the deployment edge pipeline. Implemented
-/// as a fallback handler that oneshots into the matching inner router, so the
-/// x-hive-proxied loop guard, WS upgrade path and everything else inside each
-/// router are untouched. Host matching is case-insensitive and strips `:port`.
+/// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the
+/// PLATFORM API + API-key surface) AND `admin.{platform_domain}` (the ops/admin
+/// console surface) → the admin router; the dashboard hosts → the dashboard
+/// proxy; anything else → the deployment edge pipeline. Implemented as a fallback
+/// handler that oneshots into the matching inner router, so the x-hive-proxied
+/// loop guard, WS upgrade path and everything else inside each router are
+/// untouched. Host matching is case-insensitive and strips `:port`. api and admin
+/// share one router today (same auth); the split is by HOSTNAME so `api.` reads
+/// as the developer API and `admin.` as the operator console, and the two can
+/// diverge (separate auth/route sets) without touching this dispatch.
 fn host_switch_router(
+    cloud: Arc<CloudState>,
     api_host: String,
+    admin_host: String,
     dash_hosts: Vec<String>,
     dash_upstream: Option<String>,
     http: reqwest::Client,
@@ -609,9 +651,11 @@ fn host_switch_router(
 ) -> axum::Router {
     use axum::{body::Body, http::Request};
     let handler = move |req: Request<Body>| {
+        let cloud = cloud.clone();
         let admin = admin.clone();
         let public = public.clone();
         let api_host = api_host.clone();
+        let admin_host = admin_host.clone();
         let dash_hosts = dash_hosts.clone();
         let dash_upstream = dash_upstream.clone();
         let http = http.clone();
@@ -630,11 +674,10 @@ fn host_switch_router(
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if host == api_host {
-                return match tower::ServiceExt::oneshot(admin, req).await {
-                    Ok(resp) => resp,
-                    Err(never) => match never {},
-                };
+            if host == api_host || host == admin_host {
+                // Pass the MATCHED host so a leader-forward pins to the right SNI
+                // (the platform cert covers both api. and admin.).
+                return admin_ingress(cloud, admin, host, req).await;
             }
             // Dashboard hosts: reverse-proxy to the configured origin so
             // `shadw.cloud` replaces the ngrok dashboard URL immediately (the
@@ -649,6 +692,151 @@ fn host_switch_router(
         }
     };
     axum::Router::new().fallback(handler)
+}
+
+/// Regional AdminAPI ingress for `api.{platform_domain}`. Runs on EVERY healthy
+/// node — clients reach the nearest via health-aware DNS. It authenticates the
+/// request, then serves locally IF this node is the control-plane leader, else
+/// forwards to the leader over HTTPS (pinned to the leader's IP, SNI = api host).
+/// A loop-guard header prevents re-forwarding. First-slice policy: after auth,
+/// forward ALL requests (reads + writes) to the leader. Entirely dormant unless a
+/// node runs with `HIVE_INGRESS!=ngrok` AND `HIVE_JWT_SECRET` set (see caller).
+async fn admin_ingress(
+    cloud: Arc<CloudState>,
+    admin: axum::Router,
+    api_host: String,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    async fn serve_local(admin: axum::Router, req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+        match tower::ServiceExt::oneshot(admin, req).await {
+            Ok(resp) => resp,
+            Err(never) => match never {},
+        }
+    }
+    // Loop guard + anti-forgery: a request carrying the internal forward marker is
+    // served locally ONLY if we are (still) the control-plane leader. The marker
+    // rides the same public `api` host, so a client can forge it — we therefore
+    // never trust its mere presence to place a write on a non-leader. If leadership
+    // changed mid-flight, or a client forged the marker toward a non-leader, refuse
+    // mutations with 503 (the client retries and re-resolves to the current
+    // leader); reads may serve locally best-effort. This closes both the spoof
+    // (forced write on a non-leader) and the stale-forward split-brain, while still
+    // terminating any forward chain (a forwarded request is never re-forwarded).
+    if req.headers().contains_key("x-hive-admin-forwarded") {
+        if cloud.is_control_plane_leader() {
+            return serve_local(admin, req).await;
+        }
+        if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
+            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not control-plane leader").into_response();
+        }
+        return serve_local(admin, req).await;
+    }
+    // Auth-first: with enforcement on, reject a mutation lacking a valid token
+    // BEFORE forwarding (fail fast). Reads pass (the leader re-verifies anyway).
+    if crate::auth::enforced() {
+        let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+        let path = req.uri().path();
+        let open = path == "/healthz" || path == "/v1/token" || path == "/v1/git/webhook";
+        if is_mutation && !open {
+            let ok = crate::auth::extract_token(req.headers()).and_then(|t| crate::auth::verify(&t).ok()).is_some();
+            if !ok {
+                return (axum::http::StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+            }
+        }
+    }
+    // Leader serves locally.
+    if cloud.is_control_plane_leader() {
+        return serve_local(admin, req).await;
+    }
+    // Forward to the leader. Build the SNI-pinned client up front: a leader with no
+    // reachable IP — OR a malformed registry IP that won't parse to a socket addr —
+    // must FAIL CLOSED (never fall back to plain DNS, which could send the write
+    // anywhere). In that case avoid split-brain: serve reads locally (best effort),
+    // refuse mutations with 503.
+    let leader_ip = cloud.leader_node().and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
+    if let Some(ip) = leader_ip {
+        if let Some(client) = leader_client(&ip, &api_host) {
+            return admin_forward_to_leader(client, &api_host, req).await;
+        }
+    }
+    if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
+        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "control-plane leader unreachable").into_response()
+    } else {
+        serve_local(admin, req).await
+    }
+}
+
+/// A no-redirect reqwest client that resolves `api_host` to a specific leader
+/// IP:443 — so the forward deterministically hits the leader with a valid SNI +
+/// cert (the wildcard/api bundle covers `api_host`). Cached per (ip, host).
+/// Returns `None` when `ip` doesn't parse to an address or the client can't be
+/// built, so the caller FAILS CLOSED rather than falling back to plain DNS (which
+/// would resolve `api_host` to an arbitrary node and mis-route the forward).
+fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let key = format!("{ip}|{api_host}");
+    if let Some(c) = cache.lock().unwrap().get(&key) {
+        return Some(c.clone());
+    }
+    let addr = std::net::SocketAddr::new(ip.parse::<std::net::IpAddr>().ok()?, 443);
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(api_host, addr)
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?;
+    cache.lock().unwrap().insert(key, client.clone());
+    Some(client)
+}
+
+/// Forward an admin request to the leader over HTTPS (pinned to the leader IP,
+/// SNI/Host = api host). Adds the loop-guard header; preserves method, path+query,
+/// headers (incl. Authorization/Cookie), and body; streams the response back.
+async fn admin_forward_to_leader(
+    client: reqwest::Client,
+    api_host: &str,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (parts, body) = req.into_parts();
+    let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(_) => return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+    };
+    let path_q = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    let url = format!("https://{api_host}{path_q}");
+    let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(_) => return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response(),
+    };
+    let mut rb = client.request(method, &url).header("x-hive-admin-forwarded", "1");
+    for (k, v) in parts.headers.iter() {
+        let n = k.as_str().to_ascii_lowercase();
+        if matches!(n.as_str(), "host" | "content-length" | "connection") {
+            continue;
+        }
+        rb = rb.header(k, v);
+    }
+    rb = rb.header(reqwest::header::HOST, api_host).body(body.to_vec());
+    match rb.send().await {
+        Ok(resp) => {
+            let mut out = axum::http::Response::builder().status(resp.status().as_u16());
+            for (k, v) in resp.headers().iter() {
+                let n = k.as_str().to_ascii_lowercase();
+                if matches!(n.as_str(), "connection" | "transfer-encoding" | "content-length") {
+                    continue;
+                }
+                out = out.header(k.as_str(), v.as_bytes());
+            }
+            let bytes = resp.bytes().await.unwrap_or_default();
+            out.body(axum::body::Body::from(bytes))
+                .unwrap_or_else(|_| (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response())
+        }
+        Err(_) => (axum::http::StatusCode::BAD_GATEWAY, "control-plane leader forward failed").into_response(),
+    }
 }
 
 /// Minimal streaming reverse proxy for the dashboard hosts. Forwards method,
@@ -791,7 +979,7 @@ async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
     };
     tracing::info!(%addr, "HTTPS (TLS) gateway listening");
     axum_server::bind_rustls(addr, config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await?;
     Ok(())
 }
@@ -869,7 +1057,7 @@ async fn serve(router: axum::Router, addr: SocketAddr, label: &str) -> anyhow::R
     }
     let mut tasks = Vec::new();
     for l in listeners {
-        let r = router.clone();
+        let r = router.clone().into_make_service_with_connect_info::<SocketAddr>();
         tasks.push(tokio::spawn(async move { axum::serve(l, r).await }));
     }
     for t in tasks {

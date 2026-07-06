@@ -233,14 +233,23 @@ function AnycastRouting() {
   const { data: rl, refresh } = usePoll<RateLimitStats>("/v1/ratelimit", 4000);
   const [limit, setLimit] = useState("");
   const [windowS, setWindowS] = useState("");
+  const [saveErr, setSaveErr] = useState("");
 
   async function save(enabled: boolean) {
-    await apiSend("PUT", "/v1/ratelimit", {
-      enabled,
-      limit: Number(limit) || rl?.limit || 100,
-      window_ms: (Number(windowS) || (rl ? rl.window_ms / 1000 : 10)) * 1000,
-    });
-    refresh();
+    // This is a node-wide (not per-tenant) safety control, so the backend
+    // restricts it to platform operators — surface a clear message instead of
+    // a silently-swallowed console error for anyone else.
+    setSaveErr("");
+    try {
+      await apiSend("PUT", "/v1/ratelimit", {
+        enabled,
+        limit: Number(limit) || rl?.limit || 100,
+        window_ms: (Number(windowS) || (rl ? rl.window_ms / 1000 : 10)) * 1000,
+      });
+      refresh();
+    } catch (e) {
+      setSaveErr(String(e));
+    }
   }
 
   return (
@@ -294,6 +303,7 @@ function AnycastRouting() {
           <Button onClick={() => save(true)} className="flex-1">Apply</Button>
           <Button variant="outline" onClick={() => save(!rl?.enabled)}>{rl?.enabled ? "Disable" : "Enable"}</Button>
         </div>
+        {saveErr && <p className="mt-2 text-xs text-red-500">{saveErr}</p>}
       </Card>
     </div>
   );

@@ -12,9 +12,11 @@ const HERO_TABS = [
     label: "cURL",
     lang: "bash" as const,
     filename: "deploy.sh",
-    code: `curl -X POST http://127.0.0.1:8786/v1/git/deploy \\
+    code: `# Auth: an API key (hive_…) binds the request to its team.
+# Local dev (no HIVE_JWT_SECRET): 'x-hive-team: personal' works too.
+curl -X POST https://api.shadw.cloud/v1/git/deploy \\
   -H 'content-type: application/json' \\
-  -H 'x-hive-team: personal' \\
+  -H 'Authorization: Bearer hive_YOUR_API_KEY' \\
   -d '{
     "repo_url": "https://github.com/acme/app",
     "project": "my-app",
@@ -25,9 +27,13 @@ const HERO_TABS = [
     label: "TypeScript",
     lang: "ts" as const,
     filename: "deploy.ts",
-    code: `const res = await fetch("http://127.0.0.1:8786/v1/git/deploy", {
+    code: `const res = await fetch("https://api.shadw.cloud/v1/git/deploy", {
   method: "POST",
-  headers: { "content-type": "application/json", "x-hive-team": "personal" },
+  headers: {
+    "content-type": "application/json",
+    // API key (Settings → API Keys) — binds the request to its team.
+    Authorization: \`Bearer \${process.env.HIVE_API_KEY}\`,
+  },
   body: JSON.stringify({
     repo_url: "https://github.com/acme/app",
     project: "my-app",
@@ -40,11 +46,13 @@ const { build_id } = await res.json();`,
     label: "Python",
     lang: "python" as const,
     filename: "deploy.py",
-    code: `import requests
+    code: `import os
+import requests
 
 res = requests.post(
-    "http://127.0.0.1:8786/v1/git/deploy",
-    headers={"x-hive-team": "personal"},
+    "https://api.shadw.cloud/v1/git/deploy",
+    # API key (Settings → API Keys) — binds the request to its team.
+    headers={"Authorization": f"Bearer {os.environ['HIVE_API_KEY']}"},
     json={
         "repo_url": "https://github.com/acme/app",
         "project": "my-app",
@@ -83,7 +91,7 @@ export default function DocsIndex() {
             <Link href="/docs/getting-started" className="inline-flex items-center gap-2 rounded-md bg-fg px-4 py-2.5 text-sm font-semibold text-bg transition-opacity hover:opacity-90">
               Get started guide <ArrowRight className="h-4 w-4" />
             </Link>
-            <Link href="/sign-in" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
+            <Link href="/settings/api-keys" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">Get an API key</Link>
             <Link href="/docs/getting-started#api" className="rounded-md border border-border px-4 py-2.5 text-sm font-medium hover:bg-subtle">API reference</Link>
           </div>
         </div>

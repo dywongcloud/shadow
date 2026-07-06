@@ -6,12 +6,12 @@ import {
   Users, FolderGit2, Rocket, Database, Server, Activity, ShieldX, Siren, Boxes, Webhook,
 } from "lucide-react";
 import { Card, Badge } from "@/components/ui";
-import { usePoll, type AdminOverview, type Metrics, type Incident } from "@/lib/api";
+import { useOpsPoll, type AdminOverview, type Metrics, type Incident } from "@/lib/api";
 
 export default function AdminOverviewPage() {
-  const { data: ov } = usePoll<AdminOverview>("/v1/admin/overview", 4000);
-  const { data: metrics } = usePoll<Metrics>("/v1/metrics?minutes=60", 5000);
-  const { data: incidents } = usePoll<Incident[]>("/v1/incidents", 6000);
+  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 4000);
+  const { data: metrics } = useOpsPoll<Metrics>("/v1/metrics?minutes=60", 5000);
+  const { data: incidents } = useOpsPoll<Incident[]>("/v1/incidents", 6000);
 
   const series = (metrics?.series ?? []).map((b) => ({
     time: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),

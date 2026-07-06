@@ -77,21 +77,26 @@ export function MarketingShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const html = document.documentElement;
     const body = document.body;
-    const prev = {
-      htmlBg: html.style.backgroundColor,
-      bodyBg: body.style.backgroundColor,
-      scheme: html.style.colorScheme,
-      overflowX: body.style.overflowX,
-    };
+    // Capture ONLY the color-scheme next-themes owns, to hand it back on unmount.
+    // Background + overflow overrides are reverted to "" (the stylesheet/theme
+    // value) DETERMINISTICALLY rather than to a captured snapshot.
+    //
+    // Why not snapshot-and-restore the background too: on a fast logout→login the
+    // shell can re-mount while the forced dark values are still applied, so a
+    // snapshot would capture `#0c0d10` and then "restore" it onto the dashboard —
+    // leaving the dashboard on a dark body (looks unstyled/broken) until a manual
+    // refresh. Clearing to "" reverts to `--background` every time, regardless of
+    // mount ordering / StrictMode double-invoke.
+    const prevScheme = html.style.colorScheme;
     html.style.backgroundColor = "#0c0d10";
     body.style.backgroundColor = "#0c0d10";
     html.style.colorScheme = "dark";
     body.style.overflowX = "clip";
     return () => {
-      html.style.backgroundColor = prev.htmlBg;
-      body.style.backgroundColor = prev.bodyBg;
-      html.style.colorScheme = prev.scheme;
-      body.style.overflowX = prev.overflowX;
+      html.style.backgroundColor = "";
+      body.style.backgroundColor = "";
+      html.style.colorScheme = prevScheme; // never inherit our forced "dark"
+      body.style.overflowX = "";
     };
   }, []);
 

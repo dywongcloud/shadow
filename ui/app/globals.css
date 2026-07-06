@@ -29,9 +29,9 @@
 
 /* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {
-  --background: 0 0% 100%;
+  --background: 0 0% 98%; /* #FAFAFA — root page background */
   --subtle: 0 0% 98%;
-  --card: 0 0% 100%;
+  --card: 0 0% 100%; /* cards/components stay pure white */
   --foreground: 0 0% 4%;
   --secondary: 0 0% 40%;
   --muted: 0 0% 56%;
@@ -58,14 +58,15 @@
   --green: 145 65% 49%;
 }
 
-/* De-zoom ~13%: rem-based spacing & type scale down proportionally so the whole
-   dashboard reads sleeker / less zoomed-in. */
+/* De-zoom ~13%, plus an additional 5% default zoom-out on top: rem-based
+   spacing & type scale down proportionally so the whole dashboard reads
+   sleeker / less zoomed-in. (87.5% * 0.95 = 83.125%, 90% * 0.95 = 85.5%.) */
 html {
-  font-size: 87.5%;
+  font-size: 83.125%;
 }
 @media (min-width: 1536px) {
   html {
-    font-size: 90%;
+    font-size: 85.5%;
   }
 }
 

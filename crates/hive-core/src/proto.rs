@@ -122,6 +122,110 @@ pub const CELL_FUNCTION_PORT: u32 = 5353;
 /// Guest context id for the cell's vsock device.
 pub const CELL_GUEST_CID: u32 = 3;
 
+// ---------------------------------------------------------------------------
+// Runtime — the ONE source of truth for "what language/engine executes this
+// function's process", replacing what used to be FOUR independent copies of
+// argv-basename sniffing scattered across hive-cloud/git.rs, hive-backend's
+// mock.rs and firecracker.rs, and hive-cell-agent/main.rs. Orthogonal to
+// `FunctionConfig::protocol` (wire protocol) and to package-manager choice (a
+// BUILD-time-only concept that never reaches this struct) — a project can use
+// `bun install` while still running on `runtime=nodejs`, and vice versa. Lives
+// in `hive-core` (not `fluid-core`) so it's reachable from `hive-cell-agent`
+// and `hive-backend`, neither of which depend on `fluid-core`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Runtime {
+    Node,
+    Bun,
+    Python,
+    /// Podman container (the `__container__` start_cmd sentinel).
+    Container,
+    /// Anything else — a raw command/binary, or genuinely unknown.
+    Command,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        Runtime::Command
+    }
+}
+
+impl Runtime {
+    /// The canonical lowercase name, matching `FunctionConfig.runtime` values
+    /// this platform WRITES going forward ("nodejs"/"bun"/"python"/"container").
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Runtime::Node => "nodejs",
+            Runtime::Bun => "bun",
+            Runtime::Python => "python",
+            Runtime::Container => "container",
+            Runtime::Command => "command",
+        }
+    }
+
+    /// Parse a persisted/configured `FunctionConfig.runtime` string. Backward
+    /// compatible with every value this codebase has ever written: `"auto"`
+    /// (the build pipeline's historical "infer it" sentinel) and `""`/`"command"`
+    /// both mean "no explicit runtime — caller must fall back to
+    /// [`Runtime::infer_from_argv`]", returned here as `None` rather than
+    /// guessing `Command` so a real basename-based inference still happens.
+    pub fn from_config_str(s: &str) -> Option<Runtime> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "node" | "nodejs" | "js" | "edge" | "isolate" | "edge-isolate" => Some(Runtime::Node),
+            "bun" => Some(Runtime::Bun),
+            "python" | "py" => Some(Runtime::Python),
+            "container" | "docker" | "microvm" | "firecracker" => Some(Runtime::Container),
+            "" | "auto" | "command" => None,
+            _ => None,
+        }
+    }
+
+    /// Infer the runtime from a raw argv (`start_cmd`) — the fallback path when
+    /// no explicit config value was resolved. Matches on the basename so an
+    /// absolute path (`/usr/bin/node`, `.../bin/bun`) still counts. This is the
+    /// SINGLE canonical replacement for the repo's four independent
+    /// `is_node_start_cmd`-style helpers; `bun` and `node` are deliberately
+    /// DISTINGUISHED here (the old helpers conflated them, which silently made
+    /// Bun processes "eligible" for a V8-only bytecode cache that could never
+    /// produce anything for them).
+    pub fn infer_from_argv(start_cmd: &[String]) -> Runtime {
+        if start_cmd.first().map(String::as_str) == Some("__container__") {
+            return Runtime::Container;
+        }
+        let Some(first) = start_cmd.first() else { return Runtime::Command };
+        let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+        match base {
+            "bun" | "bunx" => Runtime::Bun,
+            "node" | "npm" | "npx" | "pnpm" | "yarn" | "next" => Runtime::Node,
+            "python" | "python3" => Runtime::Python,
+            _ => Runtime::Command,
+        }
+    }
+
+    /// Resolve the effective runtime for a function: an explicit config value
+    /// wins; otherwise infer from argv. This is the ONE call every producer
+    /// (build pipeline) and consumer (fluid-compute, backends, guest agent)
+    /// should use instead of re-deriving it independently.
+    pub fn resolve(config_runtime: &str, start_cmd: &[String]) -> Runtime {
+        Runtime::from_config_str(config_runtime).unwrap_or_else(|| Runtime::infer_from_argv(start_cmd))
+    }
+
+    /// Does this runtime use Node's V8 `NODE_COMPILE_CACHE` mechanism? Only
+    /// genuine Node — Bun uses JavaScriptCore and has its own, structurally
+    /// different bytecode-cache path (build-time bundling with `bun build
+    /// --bytecode`, not a runtime env var).
+    pub fn uses_v8_compile_cache(&self) -> bool {
+        matches!(self, Runtime::Node)
+    }
+
+    /// Does this runtime have a Bun-native ahead-of-time bytecode cache path?
+    pub fn uses_bun_bytecode_cache(&self) -> bool {
+        matches!(self, Runtime::Bun)
+    }
+}
+
 /// How to launch a long-lived function server inside a cell (Fluid compute).
 /// The process MUST listen on `$PORT` (Vercel/Heroku convention).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,10 +241,53 @@ pub struct FunctionLaunch {
     /// Max concurrent requests one instance handles (tunnel server uses it to nack).
     #[serde(default = "default_max_conc")]
     pub max_concurrency: u32,
+    /// Memory ceiling (MiB) for a CONTAINER function's cgroup (podman `--memory`).
+    /// 0 = use the node's generous default. Ignored for microVM/process functions.
+    #[serde(default)]
+    pub memory_mib: u32,
+    /// The resolved runtime — the SINGLE explicit signal every backend/guest
+    /// agent uses to decide bytecode-cache behavior, replacing ad hoc argv
+    /// re-sniffing. Always set explicitly by the constructor (fluid-compute's
+    /// `cold_start`); `#[serde(default)]` only guards deserialization of a
+    /// hypothetical older/foreign message, never relied on as real inference.
+    #[serde(default)]
+    pub runtime: Runtime,
 }
 
 fn default_max_conc() -> u32 {
     10
+}
+
+/// A single argv command to run inside an already-booted, long-lived cell —
+/// the Sandboxes exec path. Deliberately separate from [`BuildJob`]/`Run`
+/// (build-only: shell-string steps, merged stdout/stderr, fixed `/build` cwd,
+/// no kill support, cell self-destructs after one build): Exec preserves argv
+/// (no shell unless `shell` is explicitly set), keeps stdout/stderr distinct,
+/// supports an explicit cwd, and can be killed by `id` from a separate
+/// connection while it's still running.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecRequest {
+    /// Caller-chosen id (echoed back on every `ExecOutput`/`ExecDone` event and
+    /// used to target `KillExec`) — the platform's `SandboxCommandRecord.id`.
+    pub id: String,
+    pub cmd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Empty = agent picks its default working directory.
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// Run as root. The agent honors this only if a `sudo` binary is present in
+    /// the guest; otherwise it fails the request loudly (`ExecDone` with a
+    /// nonzero/absent exit code), never silently drops the privilege request.
+    #[serde(default)]
+    pub sudo: bool,
+    /// Explicit, informed opt-in to shell interpretation (`sh -c "<cmd> <args
+    /// joined>"`). Default false = argv exec (`execvp(cmd, args)`), which makes
+    /// shell injection structurally impossible for the default path.
+    #[serde(default)]
+    pub shell: bool,
 }
 
 /// Message the box daemon (host) sends to the cell daemon (guest) over vsock.
@@ -155,6 +302,14 @@ pub enum AgentRequest {
     CacheData { tar: Vec<u8> },
     /// Liveness probe; agent replies with `AgentEvent::Pong`.
     Ping,
+    /// Run one argv command (Sandboxes). Sent on its OWN dedicated connection;
+    /// the agent spawns a thread for it and keeps accepting other connections
+    /// (unlike `Run`, this does NOT stop the accept loop).
+    Exec(ExecRequest),
+    /// Kill a still-running `Exec` by id, sent on any (typically a fresh)
+    /// connection — the agent tracks live exec child PIDs in a process-global
+    /// registry keyed by `ExecRequest.id`.
+    KillExec { id: String },
 }
 
 /// Messages the cell daemon streams back to the box daemon over vsock.
@@ -174,4 +329,90 @@ pub enum AgentEvent {
     /// Agent -> box daemon: persist this cache tarball for `key` (build cache
     /// save, after a successful build).
     CachePut { key: String, tar: Vec<u8> },
+    /// One line of an `Exec`'s stdout/stderr (`LogStream::System` unused here).
+    ExecOutput { id: String, stream: LogStream, line: String },
+    /// An `Exec` finished. `exit_code = None` means it was killed or the agent
+    /// could not determine an exit status (e.g. sudo requested but
+    /// unavailable) — the caller must NEVER treat `None` as success.
+    ExecDone { id: String, exit_code: Option<i32> },
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+
+    #[test]
+    fn config_str_parsing_is_backward_compatible() {
+        assert_eq!(Runtime::from_config_str("node"), Some(Runtime::Node));
+        assert_eq!(Runtime::from_config_str("nodejs"), Some(Runtime::Node));
+        assert_eq!(Runtime::from_config_str("edge"), Some(Runtime::Node));
+        assert_eq!(Runtime::from_config_str("bun"), Some(Runtime::Bun));
+        assert_eq!(Runtime::from_config_str("BUN"), Some(Runtime::Bun));
+        assert_eq!(Runtime::from_config_str("python"), Some(Runtime::Python));
+        assert_eq!(Runtime::from_config_str("container"), Some(Runtime::Container));
+        assert_eq!(Runtime::from_config_str("firecracker"), Some(Runtime::Container));
+        // Legacy sentinels that must fall through to argv inference.
+        assert_eq!(Runtime::from_config_str("auto"), None);
+        assert_eq!(Runtime::from_config_str("command"), None);
+        assert_eq!(Runtime::from_config_str(""), None);
+        assert_eq!(Runtime::from_config_str("bogus"), None);
+    }
+
+    #[test]
+    fn argv_inference_distinguishes_node_and_bun() {
+        assert_eq!(Runtime::infer_from_argv(&["node".into(), "server.js".into()]), Runtime::Node);
+        assert_eq!(Runtime::infer_from_argv(&["/usr/local/bin/node".into()]), Runtime::Node);
+        assert_eq!(Runtime::infer_from_argv(&["npm".into(), "start".into()]), Runtime::Node);
+        assert_eq!(Runtime::infer_from_argv(&["bun".into(), "run".into(), "server.js".into()]), Runtime::Bun);
+        assert_eq!(Runtime::infer_from_argv(&["bunx".into(), "next".into()]), Runtime::Bun);
+        assert_eq!(Runtime::infer_from_argv(&["python3".into(), "app.py".into()]), Runtime::Python);
+        assert_eq!(Runtime::infer_from_argv(&["__container__".into(), "img".into()]), Runtime::Container);
+        assert_eq!(Runtime::infer_from_argv(&["./my-binary".into()]), Runtime::Command);
+        assert_eq!(Runtime::infer_from_argv(&[]), Runtime::Command);
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_config_over_argv_inference() {
+        // Explicit "bun" wins even if argv looks like node (e.g. a proxy shim).
+        assert_eq!(Runtime::resolve("bun", &["node".into(), "server.js".into()]), Runtime::Bun);
+        // "auto"/"command"/empty defer to argv.
+        assert_eq!(Runtime::resolve("auto", &["bun".into(), "server.js".into()]), Runtime::Bun);
+        assert_eq!(Runtime::resolve("command", &["node".into()]), Runtime::Node);
+        assert_eq!(Runtime::resolve("", &["python3".into()]), Runtime::Python);
+    }
+
+    #[test]
+    fn bytecode_cache_eligibility_is_runtime_specific() {
+        assert!(Runtime::Node.uses_v8_compile_cache());
+        assert!(!Runtime::Bun.uses_v8_compile_cache());
+        assert!(Runtime::Bun.uses_bun_bytecode_cache());
+        assert!(!Runtime::Node.uses_bun_bytecode_cache());
+        assert!(!Runtime::Python.uses_v8_compile_cache() && !Runtime::Python.uses_bun_bytecode_cache());
+    }
+
+    #[test]
+    fn function_launch_serializes_runtime_field() {
+        let launch = FunctionLaunch {
+            start_cmd: vec!["bun".into(), "run".into(), "server.js".into()],
+            env: Default::default(),
+            workdir: None,
+            port: 3000,
+            max_concurrency: 10,
+            memory_mib: 0,
+            runtime: Runtime::Bun,
+        };
+        let json = serde_json::to_string(&launch).unwrap();
+        assert!(json.contains("\"runtime\":\"bun\""));
+        let back: FunctionLaunch = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.runtime, Runtime::Bun);
+    }
+
+    #[test]
+    fn function_launch_runtime_defaults_when_absent_from_wire() {
+        // A hypothetical older/foreign message with no `runtime` key must still
+        // deserialize (never a hard wire-compat break).
+        let json = r#"{"start_cmd":["node","server.js"],"env":{},"workdir":null,"port":3000,"max_concurrency":10,"memory_mib":0}"#;
+        let launch: FunctionLaunch = serde_json::from_str(json).unwrap();
+        assert_eq!(launch.runtime, Runtime::Command);
+    }
 }

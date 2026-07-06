@@ -55,25 +55,33 @@ export default function ApiReferencePage() {
 
         <H2 id="authentication">Authentication</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          Access tokens are required to authenticate and use the API. Include the token in the{" "}
-          <Code>Authorization</Code> header:
+          Authenticate with a platform <strong className="text-fg">API key</strong> — a long-lived,
+          team-bound token prefixed <Code>hive_</Code>. Create one under{" "}
+          <strong className="text-fg">Settings → API Keys</strong> (or with{" "}
+          <Code>POST /v1/apikeys</Code>). The full token is shown exactly once at creation; only its
+          SHA-256 hash is stored. Include it in the <Code>Authorization</Code> header:
         </p>
         <div className="mt-4">
-          <CodeBlock tabs={[{ label: "Authorization", lang: "bash", code: "Authorization: Bearer <TOKEN>" }]} />
+          <CodeBlock tabs={[{ label: "Authorization", lang: "bash", code: "Authorization: Bearer hive_…" }]} />
         </div>
         <p className="mt-4 text-[15px] leading-relaxed text-secondary">
-          Mint a short-lived token with <Code>POST /v1/token</Code>, or create a long-lived API key
-          (<Code>shadw_…</Code>) in your account settings.
+          Alternatively, mint a short-lived (8&nbsp;hour) JWT with <Code>POST /v1/token</Code> and
+          present it in the same header. Minting requires <Code>HIVE_JWT_SECRET</Code> to be
+          configured on the node; when JWT auth is enforced, mutating requests (POST/PUT/DELETE)
+          must present a JWT.
         </p>
 
         <H2 id="accessing-team-resources">Accessing team resources</H2>
         <p className="text-[15px] leading-relaxed text-secondary">
-          Requests are scoped to a team. Send the <Code>x-hive-team</Code> header with the team slug
-          to act on that team&apos;s resources; an API key carries its own team and needs no header.
+          Every request resolves to a team (tenant), in this priority order: a JWT&apos;s{" "}
+          <Code>tenant</Code> claim wins; otherwise an API key scopes the request to the team it was
+          created under — no extra header needed; otherwise, on nodes without JWT enforcement (no{" "}
+          <Code>HIVE_JWT_SECRET</Code>, e.g. local dev), the <Code>x-hive-team</Code> header is
+          honored. With none of these, requests fall back to the <Code>personal</Code> team.
         </p>
         <div className="mt-4">
           <CodeBlock
-            tabs={[{ label: "cURL", lang: "bash", code: `curl ${API_BASE}/v1/overview \\\n  -H 'Authorization: Bearer <TOKEN>' \\\n  -H 'x-hive-team: acme'` }]}
+            tabs={[{ label: "cURL", lang: "bash", code: `# An API key is already bound to its team — no team header needed.\ncurl ${API_BASE}/v1/overview \\\n  -H 'Authorization: Bearer hive_…'` }]}
           />
         </div>
 

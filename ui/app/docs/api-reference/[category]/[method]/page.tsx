@@ -79,7 +79,12 @@ export default function MethodPage({ params }: { params: { category: string; met
             <code className="font-mono text-sm font-medium">Authorization</code>
             <span className="rounded bg-subtle px-1.5 py-0.5 font-mono text-xs text-secondary">bearerToken</span>
           </div>
-          <p className="mt-1.5 text-sm text-secondary">Default authentication mechanism.</p>
+          <p className="mt-1.5 text-sm text-secondary">
+            A platform API key (<code className="font-mono text-xs">hive_…</code>, created under
+            Settings → API Keys) or a short-lived JWT minted with{" "}
+            <code className="font-mono text-xs">POST /v1/token</code>. An API key scopes the request
+            to the team it was created under.
+          </p>
         </Section>
 
         {ep.pathParams?.length ? (

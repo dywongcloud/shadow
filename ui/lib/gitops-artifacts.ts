@@ -103,6 +103,8 @@ export interface OrgConfigInput {
     git?: { repo_url?: string; branch?: string; commit?: string } | null;
     production?: any;
     root_dir?: string;
+    /** Enterprise deployment protection (mode/scope only — never the password). */
+    protection?: { mode?: string; scope?: string } | null;
   }>;
 }
 
@@ -139,6 +141,9 @@ export function projectNode(p: ProjectInput): { [k: string]: Y } {
   };
   if (Array.isArray(s.domains) && s.domains.length) node.domains = s.domains;
   if (envKeys.length) node.env = envKeys;
+  if (p.protection?.mode && p.protection.mode !== "off") {
+    node.protection = { mode: p.protection.mode, scope: p.protection.scope || "preview" };
+  }
   return node;
 }
 
@@ -171,6 +176,18 @@ function slugFile(s: string): string {
 export interface ArtifactInput extends OrgConfigInput {
   region?: string;
   rootPath?: string; // canonical config file name (default openedge.yaml)
+  /** Platform-level declarative config (CDN routing, enterprise governance).
+   *  Secrets are NEVER included — counts/modes only. */
+  platform?: {
+    routing?: { redirects?: any[]; rewrites?: any[] };
+    enterprise?: {
+      ipBlocks?: { prefix: string; note?: string }[];
+      siem?: { enabled: boolean; format?: string };
+      saml?: { enabled: boolean; enforced?: boolean };
+      scim?: { enabled: boolean };
+      microfrontends?: { name: string; host: string; children: { project: string; path: string }[] }[];
+    };
+  };
 }
 
 /**
@@ -214,6 +231,30 @@ export function buildArtifacts(input: ArtifactInput): { path: string; content: s
         kind: "Project",
         org: input.org.slug,
         spec: projectNode(p),
+      }),
+    });
+  }
+
+  // Platform-level config (routing + enterprise governance) — committed whenever
+  // present so those dashboard changes reflect in git too.
+  if (input.platform && (input.platform.routing || input.platform.enterprise)) {
+    files.push({
+      path: ".openedge/platform.yaml",
+      content: toYaml({
+        apiVersion: "openedge.dev/v1",
+        kind: "Platform",
+        org: input.org.slug,
+        routing: input.platform.routing
+          ? {
+              redirects: (input.platform.routing.redirects || []).map((r: any) => ({
+                source: r.source, destination: r.destination, status: r.status,
+              })),
+              rewrites: (input.platform.routing.rewrites || []).map((r: any) => ({
+                source: r.source, destination: r.destination,
+              })),
+            }
+          : undefined,
+        enterprise: input.platform.enterprise,
       }),
     });
   }

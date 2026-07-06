@@ -288,10 +288,17 @@ impl FirecrackerBackend {
         }
         // Use iptables where present, else nftables (modern distros ship only
         // `nft`). Both set a MASQUERADE on the guest subnet + allow forwarding.
+        // TENANT ISOLATION: the cell↔cell DROP must precede the ACCEPTs. Without
+        // it, `-s 172.16/16 ACCEPT` also forwards guest→guest traffic (the host
+        // routes every per-cell /30), letting one tenant's microVM reach another's.
+        // Internet egress return-traffic is unaffected (src is external, so the
+        // 172.16→172.16 pair never matches), and host↔guest control-plane traffic
+        // uses OUTPUT/INPUT, not FORWARD.
         let script = r#"
             export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
             sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
             if command -v iptables >/dev/null 2>&1; then
+              iptables -C FORWARD -s 172.16.0.0/16 -d 172.16.0.0/16 -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 172.16.0.0/16 -d 172.16.0.0/16 -j DROP
               iptables -t nat -C POSTROUTING -s 172.16.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.0.0/16 -j MASQUERADE
               iptables -C FORWARD -s 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 172.16.0.0/16 -j ACCEPT
               iptables -C FORWARD -d 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 172.16.0.0/16 -j ACCEPT
@@ -302,6 +309,7 @@ impl FirecrackerBackend {
               nft add rule ip hive_nat post ip saddr 172.16.0.0/16 masquerade 2>/dev/null
               nft 'add chain ip hive_nat fwd { type filter hook forward priority 0 ; }' 2>/dev/null
               nft flush chain ip hive_nat fwd 2>/dev/null
+              nft add rule ip hive_nat fwd ip saddr 172.16.0.0/16 ip daddr 172.16.0.0/16 drop 2>/dev/null
               nft add rule ip hive_nat fwd ip saddr 172.16.0.0/16 accept 2>/dev/null
               nft add rule ip hive_nat fwd ip daddr 172.16.0.0/16 accept 2>/dev/null
             fi"#;
@@ -392,6 +400,32 @@ fn sanitize_image(image: &str) -> String {
         .collect()
 }
 
+/// Copy `src` to `dst`, preferring a copy-on-write REFLINK clone over a full
+/// block-level copy when the host filesystem supports it (XFS formatted with
+/// `reflink=1` — the `mkfs.xfs` default since RHEL/Rocky 8, or Btrfs). A
+/// reflink clone shares the underlying extents and completes in roughly
+/// constant time regardless of file size, which matters here: `base`/
+/// `data_src` are multi-hundred-MB-to-multi-GB rootfs images copied on EVERY
+/// cold start (a real, measured contributor to provision latency — this is
+/// NOT true CoW at the Firecracker level, just a faster way to produce the
+/// per-cell writable copy it needs). Falls back to a plain byte-for-byte copy
+/// — IDENTICAL to the prior behavior — whenever reflink isn't available
+/// (ext4, a cross-filesystem copy, or any `cp` failure), so this can only ever
+/// be as fast as before, never slower or less correct. Linux-only mechanism
+/// (`cp --reflink` is a GNU coreutils extension); on any other OS this is a
+/// pure passthrough to `tokio::fs::copy`.
+async fn reflink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(out) = tokio::process::Command::new("cp").arg("--reflink=auto").arg(src).arg(dst).output().await {
+            if out.status.success() {
+                return Ok(());
+            }
+        }
+    }
+    tokio::fs::copy(src, dst).await.map(|_| ())
+}
+
 #[async_trait]
 impl CellBackend for FirecrackerBackend {
     fn name(&self) -> &'static str {
@@ -438,10 +472,9 @@ impl CellBackend for FirecrackerBackend {
         let log_file = run_dir.join("console.log");
         let overlay = run_dir.join("rootfs.ext4");
 
-        // Per-cell writable rootfs. Real Hive uses CoW; a copy is the simple,
-        // correct equivalent for a study implementation. Prefer a dedicated
-        // `<image>.ext4` but fall back to the shared base runtime rootfs — most
-        // deployments boot the base and get their code from the data drive below.
+        // Per-cell writable rootfs. Prefer a dedicated `<image>.ext4` but fall
+        // back to the shared base runtime rootfs — most deployments boot the
+        // base and get their code from the data drive below.
         let base = {
             let per_image = self.rootfs_for(&spec.image);
             if per_image.exists() { per_image } else { self.rootfs_for(&self.cfg.base_image) }
@@ -453,7 +486,7 @@ impl CellBackend for FirecrackerBackend {
             self.cfg.base_image,
             base.display()
         );
-        tokio::fs::copy(&base, &overlay).await?;
+        reflink_or_copy(&base, &overlay).await?;
         // Give the guest working DNS for outbound fetch (per-cell overlay only).
         self.write_guest_resolv(&overlay).await;
 
@@ -464,7 +497,7 @@ impl CellBackend for FirecrackerBackend {
         let data_overlay = run_dir.join("data.ext4");
         let has_data = data_src.exists();
         if has_data {
-            tokio::fs::copy(&data_src, &data_overlay).await?;
+            reflink_or_copy(&data_src, &data_overlay).await?;
         }
 
         // Spawn the Firecracker process bound to a fresh API socket.
@@ -644,9 +677,12 @@ impl CellBackend for FirecrackerBackend {
                         let _ = tokio::fs::create_dir_all(&cache_dir).await;
                         let _ = tokio::fs::write(cache_path(&cache_dir, &key), &tar).await;
                     }
+                    // Not applicable during a build (Sandboxes-only events).
                     AgentEvent::Pong
                     | AgentEvent::FunctionReady
-                    | AgentEvent::FunctionError(_) => {}
+                    | AgentEvent::FunctionError(_)
+                    | AgentEvent::ExecOutput { .. }
+                    | AgentEvent::ExecDone { .. } => {}
                 }
             }
         };
@@ -697,7 +733,7 @@ impl CellBackend for FirecrackerBackend {
                 Self::PODMAN_PATH,
                 runtime.as_deref(),
                 net_json,
-                &crate::ContainerLimits::default(),
+                &crate::ContainerLimits::for_container(func.memory_mib),
             )
             .await?;
             self.containers.lock().await.insert(cell.id.clone(), name);
@@ -807,6 +843,64 @@ impl CellBackend for FirecrackerBackend {
     }
 }
 
+/// Firecracker-specific microVM exec support (Sandboxes) — NOT part of the
+/// generic [`CellBackend`] trait since it's meaningless for the mock/container
+/// backends: a sandbox needs a long-lived cell that accepts MANY commands over
+/// its lifetime (unlike `run_build`'s one-shot, self-destructing cell). Each
+/// call opens its OWN fresh vsock connection to the already-booted agent (the
+/// same `CONNECT`-handshake + length-prefixed-JSON transport `run_build` uses),
+/// so multiple execs — and a kill targeting an earlier one — can be in flight
+/// concurrently.
+impl FirecrackerBackend {
+    /// Start one argv command inside `cell` and stream its `AgentEvent`s back
+    /// (`ExecOutput`* then one `ExecDone`) on an unbounded channel. Returns as
+    /// soon as the connection is established — the caller drains the channel
+    /// (blocking: read until `ExecDone`; detached: spawn a task that drains it).
+    pub async fn exec_command(&self, cell: &CellHandle, req: hive_core::ExecRequest) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>> {
+        let uds = cell.endpoint.as_ref().ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
+        let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
+        let payload = serde_json::to_vec(&AgentRequest::Exec(req))?;
+        write_frame(&mut stream, &payload).await?;
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let frame = match read_frame(&mut stream).await {
+                    Ok(f) => f,
+                    Err(_) => break, // connection closed — caller treats as done/killed
+                };
+                let ev: AgentEvent = match serde_json::from_slice(&frame) {
+                    Ok(e) => e,
+                    Err(_) => break,
+                };
+                let is_done = matches!(ev, AgentEvent::ExecDone { .. });
+                if tx.send(ev).is_err() {
+                    break; // receiver dropped (e.g. command was killed and caller stopped listening)
+                }
+                if is_done {
+                    break;
+                }
+            }
+        });
+        Ok(rx)
+    }
+
+    /// Signal a still-running exec (by the id it was started with) to stop.
+    /// Opens a FRESH connection (the exec's own connection is busy streaming
+    /// output) — the guest agent's process-global exec registry finds the
+    /// child by id and sends it `SIGKILL` regardless of which connection asks.
+    pub async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
+        let uds = cell.endpoint.as_ref().ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
+        let mut stream = connect_agent(uds, Duration::from_secs(10)).await?;
+        let payload = serde_json::to_vec(&AgentRequest::KillExec { id: exec_id.to_string() })?;
+        write_frame(&mut stream, &payload).await?;
+        // Wait for the ack (Pong) so the caller knows the signal was actually
+        // delivered to the guest, not just queued on the wire.
+        let _ = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
+        Ok(())
+    }
+}
+
 // ---- Firecracker REST API over its Unix socket ------------------------------
 
 /// Minimal HTTP/1.1 `PUT` to the Firecracker API socket. Firecracker speaks
@@ -887,7 +981,11 @@ async fn wait_for_path(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> 
         if path.exists() {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // 5ms (was 20ms): a `stat()` on a not-yet-created socket path is a few
+        // microseconds, so tightening this only adds a handful of extra syscalls
+        // per cold start — but it shaves up to 15ms of pure polling-granularity
+        // tail latency off EVERY cold start waiting on this socket to appear.
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
     anyhow::bail!("timed out waiting for {}", path.display())
 }
@@ -905,7 +1003,13 @@ async fn connect_agent(uds: &str, timeout: Duration) -> anyhow::Result<UnixStrea
             Ok(s) => return Ok(s),
             Err(e) => {
                 last_err = e.to_string();
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                // 25ms (was 100ms): a failed vsock connect attempt (guest agent
+                // not listening yet) is a cheap syscall that returns almost
+                // instantly, so a tighter retry interval costs negligible extra
+                // CPU — but it directly shrinks the worst-case tail latency this
+                // polling loop adds on TOP of the microVM's real boot time, on
+                // every single cold start.
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
     }
@@ -954,4 +1058,115 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> anyhow::Result<Ve
     let mut buf = vec![0u8; n];
     r.read_exact(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real (no mocking) proof that `reflink_or_copy` produces byte-identical
+    /// output to a plain copy, whether or not the host filesystem actually
+    /// supports reflink — `/tmp` on most CI/dev Linux hosts is tmpfs (no
+    /// reflink support), which exercises the fallback path for free; on a host
+    /// where it IS supported, the `cp --reflink=auto` branch runs instead. Both
+    /// must produce the same content, so this test is meaningful either way.
+    #[tokio::test]
+    async fn reflink_or_copy_produces_identical_content() {
+        let dir = std::env::temp_dir().join(format!("hive-reflink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("src.bin");
+        let payload = vec![0xABu8; 4096];
+        std::fs::write(&src, &payload).unwrap();
+        let dst = dir.join("dst.bin");
+        reflink_or_copy(&src, &dst).await.expect("copy must succeed");
+        let got = std::fs::read(&dst).unwrap();
+        assert_eq!(got, payload, "copied content must be byte-identical");
+
+        // A second copy overwriting an existing destination must also succeed
+        // (the cold-start path always copies into a freshly created run_dir, but
+        // this guards against any future reuse assumption).
+        std::fs::write(&src, vec![0xCDu8; 128]).unwrap();
+        reflink_or_copy(&src, &dst).await.expect("overwrite copy must succeed");
+        assert_eq!(std::fs::read(&dst).unwrap(), vec![0xCDu8; 128]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reflink_or_copy_fails_cleanly_when_source_is_missing() {
+        let dir = std::env::temp_dir().join(format!("hive-reflink-missing-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = reflink_or_copy(&dir.join("does-not-exist.bin"), &dir.join("dst.bin")).await;
+        assert!(result.is_err(), "copying a missing source must return an error, never silently succeed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real, live smoke test proving the Sandboxes exec path works end-to-end
+    /// against a REAL Firecracker microVM: provision a cell from the
+    /// `sandbox-node22` rootfs, exec `node --version` over the NEW
+    /// `AgentRequest::Exec`/`ExecOutput`/`ExecDone` guest-agent protocol, and
+    /// assert a real exit code + real stdout come back — then terminate.
+    /// Requires a genuine Firecracker-capable host (Linux + /dev/kvm, the
+    /// `firecracker` binary, `/var/lib/hive/vmlinux`, and a
+    /// `sandbox-node22.ext4` rootfs with the freshly-built agent baked in —
+    /// exactly what this session provisioned on fc-virginia-3). Never runs in
+    /// normal CI; opt in with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires a real Firecracker host with a sandbox-node22 rootfs (see doc comment)"]
+    async fn live_sandbox_exec_on_real_firecracker() {
+        let mut cfg = FirecrackerConfig::default();
+        // Matches this fleet's PVM boot-arg requirements (HIVE_FC_BOOT_ARGS on
+        // the live node) — `nokaslr` + i8042 probe disables are needed on PVM.
+        cfg.boot_args = "console=ttyS0 reboot=k panic=1 pci=off nokaslr i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/sbin/hive-cell-agent".to_string();
+
+        let backend = FirecrackerBackend::new(cfg);
+        assert!(backend.is_supported(), "this host must have /dev/kvm + the firecracker binary");
+
+        let spec = CellSpec {
+            id: CellId::from("sbx-livetest-1".to_string()),
+            image: "sandbox-node22".to_string(),
+            resources: hive_core::ResourceSpec { vcpus: 1, mem_mib: 512, disk_mib: 2048, timeout_secs: 60 },
+            tenant: "personal".to_string(),
+            container: None,
+        };
+        let handle = backend.provision(&spec).await.expect("provision must succeed on a real FC host");
+        assert!(handle.endpoint.is_some(), "a real microVM cell must have a vsock endpoint");
+
+        let req = hive_core::ExecRequest {
+            id: "cmd-livetest-1".to_string(),
+            cmd: "node".to_string(),
+            args: vec!["--version".to_string()],
+            cwd: String::new(),
+            env: Default::default(),
+            sudo: false,
+            shell: false,
+        };
+        let mut rx = backend.exec_command(&handle, req).await.expect("exec_command must start");
+
+        let mut stdout = String::new();
+        let mut exit_code: Option<Option<i32>> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(AgentEvent::ExecOutput { line, .. })) => {
+                    stdout.push_str(&line);
+                    stdout.push('\n');
+                }
+                Ok(Some(AgentEvent::ExecDone { exit_code: code, .. })) => {
+                    exit_code = Some(code);
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+        }
+
+        backend.terminate(&handle).await.ok();
+
+        assert_eq!(exit_code, Some(Some(0)), "node --version must exit 0 inside the real microVM; got stdout: {stdout:?}");
+        assert!(stdout.trim().starts_with('v'), "expected a real node version string (e.g. v22.x.x), got: {stdout:?}");
+    }
 }

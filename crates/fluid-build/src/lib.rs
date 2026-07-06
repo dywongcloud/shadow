@@ -20,7 +20,10 @@ pub mod per_route;
 pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
-pub use framework::{detect, package_manager, plan_build, BuildPlan, FrameworkPreset, Primitive, PRESETS};
+pub use framework::{
+    detect, detect_package_manager, package_manager, plan_build, BuildPlan, FrameworkPreset, PackageManagerDetection,
+    PackageManagerSource, Primitive, PRESETS,
+};
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
 pub use vercel_config::{

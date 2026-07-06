@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { Search, Play, RotateCw, X, ChevronDown, MapPin, ShieldCheck, Zap } from "lucide-react";
 import { Triangle, Badge } from "@/components/ui";
-import { ProjectTabs } from "@/components/project-tabs";
 import { apiGet, type Event } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -60,8 +59,7 @@ export default function ProjectLogs({ params }: { params: { project: string } })
           <span className="text-lg font-semibold">Logs</span>
         </div>
       </div>
-      {/* Project-scope sub-tabs so Logs keeps the same project navigation. */}
-      <ProjectTabs project={project} active="logs" />
+      {/* Project sub-tabs now live in the top nav (breadcrumb-tabs model). */}
 
       <div className="grid grid-cols-1 gap-0 overflow-hidden rounded-xl border border-border lg:grid-cols-[200px_1fr]">
         {/* Filters sidebar */}

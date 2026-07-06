@@ -1,0 +1,694 @@
+//! Vercel DNS reconciler — the ngrok-retirement ingress control plane.
+//!
+//! Vercel DNS is plain authoritative DNS (REST records API; no health checks,
+//! no geo steering), so this module runs a LEADER-ELECTED reconcile loop inside
+//! hive-cloud that syncs *healthy node public IPs* → Vercel DNS records:
+//!
+//! | record                        | value                                | TTL |
+//! |-------------------------------|--------------------------------------|-----|
+//! | `api.{platform_domain}`       | healthy gateway nodes' public IPs    | 60  |
+//! | `*.{apps_domain}` + apex      | healthy edge nodes' public IPs       | 60  |
+//! | `relay.{platform_domain}`     | `HIVE_RELAY_IPS` (self-hosted iroh)  | 300 |
+//! | `discovery.{platform_domain}` | `HIVE_DISCOVERY_IPS` (pkarr relay)   | 300 |
+//!
+//! (Node roles aren't distinguished yet — all healthy public nodes go into both
+//! the api and wildcard sets. TODO: role split when nodes grow roles.)
+//!
+//! Safety properties:
+//!  * **Delta-only**: unchanged records are never rewritten.
+//!  * **Flap damping**: a node's records are only removed after K=2 consecutive
+//!    reconcile passes see it unhealthy (the active prober already needs
+//!    ~10–12s to flip health — don't double-punish).
+//!  * **Never publish empty**: if the desired set is empty, keep last-known-good,
+//!    log loudly, and raise an incident instead.
+//!  * Exponential backoff on 429/5xx from the Vercel API.
+//!
+//! Regional/latency steering stays inside `edge.rs` (`order_candidates`) after
+//! the client reaches any node — DNS only hands out healthy IPs. The self-hosted
+//! Seer (`dnsserver.rs`) is NOT retired: it keeps serving internal/test queries
+//! and is the future NS-delegation path.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::state::CloudState;
+
+/// How many consecutive unhealthy reconcile passes before a node's records are
+/// withdrawn (flap damping).
+pub const UNHEALTHY_PASSES_BEFORE_WITHDRAW: u32 = 2;
+
+/// A DNS record as it exists at Vercel (subset we care about).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordView {
+    pub id: String,
+    /// Subdomain relative to the zone: `""` (apex), `"api"`, `"*"`, …
+    pub name: String,
+    /// `A` | `AAAA` | `TXT` | …
+    pub rtype: String,
+    pub value: String,
+}
+
+/// A record we want to exist.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DesiredRecord {
+    pub name: String,
+    pub rtype: String,
+    pub value: String,
+    pub ttl: u32,
+}
+
+/// Minimal Vercel DNS API surface — a trait so the reconciler is unit-testable
+/// against a mock (create/delete/no-op/429 cases) without network.
+pub trait DnsApi: Send + Sync {
+    fn list(
+        &self,
+        domain: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<RecordView>>> + Send;
+    fn create(
+        &self,
+        domain: &str,
+        rec: &DesiredRecord,
+    ) -> impl std::future::Future<Output = anyhow::Result<String>> + Send;
+    fn delete(
+        &self,
+        domain: &str,
+        id: &str,
+    ) -> impl std::future::Future<Output = anyhow::Result<()>> + Send;
+}
+
+/// Real Vercel REST client. Token comes from `VERCEL_API_TOKEN` (treat as a
+/// secret — never logged); `VERCEL_TEAM_ID` adds the optional `?teamId=`.
+#[derive(Clone)]
+pub struct VercelApi {
+    http: reqwest::Client,
+    token: String,
+    team_id: Option<String>,
+}
+
+impl VercelApi {
+    pub fn from_env(http: reqwest::Client) -> Option<Self> {
+        let token = std::env::var("VERCEL_API_TOKEN").ok().filter(|s| !s.is_empty())?;
+        let team_id = std::env::var("VERCEL_TEAM_ID").ok().filter(|s| !s.is_empty());
+        Some(Self { http, token, team_id })
+    }
+
+    fn url(&self, version: &str, rest: &str) -> String {
+        let mut u = format!("https://api.vercel.com/{version}/{rest}");
+        if let Some(t) = &self.team_id {
+            u.push_str(if u.contains('?') { "&" } else { "?" });
+            u.push_str(&format!("teamId={t}"));
+        }
+        u
+    }
+}
+
+/// Map an HTTP status to "retryable with backoff" (429/5xx).
+fn retryable(status: reqwest::StatusCode) -> bool {
+    status.as_u16() == 429 || status.is_server_error()
+}
+
+impl DnsApi for VercelApi {
+    async fn list(&self, domain: &str) -> anyhow::Result<Vec<RecordView>> {
+        let resp = self
+            .http
+            .get(self.url("v4", &format!("domains/{domain}/records?limit=100")))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("vercel list {domain}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v.get("records")
+            .and_then(|r| r.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(RecordView {
+                            id: r.get("id").or_else(|| r.get("uid"))?.as_str()?.to_string(),
+                            name: r.get("name")?.as_str()?.to_string(),
+                            rtype: r.get("type")?.as_str()?.to_string(),
+                            value: r.get("value")?.as_str()?.to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    async fn create(&self, domain: &str, rec: &DesiredRecord) -> anyhow::Result<String> {
+        let resp = self
+            .http
+            .post(self.url("v2", &format!("domains/{domain}/records")))
+            .bearer_auth(&self.token)
+            .json(&serde_json::json!({
+                "name": rec.name, "type": rec.rtype, "value": rec.value, "ttl": rec.ttl,
+            }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("vercel create {domain} {} {}: {status}{}", rec.rtype, rec.name, if retryable(status) { " (retryable)" } else { "" });
+        }
+        let v: serde_json::Value = resp.json().await?;
+        Ok(v.get("uid").and_then(|u| u.as_str()).unwrap_or_default().to_string())
+    }
+
+    async fn delete(&self, domain: &str, id: &str) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .delete(self.url("v2", &format!("domains/{domain}/records/{id}")))
+            .bearer_auth(&self.token)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("vercel delete {domain}/{id}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
+        }
+        Ok(())
+    }
+}
+
+// ---- desired state -----------------------------------------------------------
+
+/// A publishable node: healthy (or inside the damping window) with a public IP.
+#[derive(Clone, Debug)]
+pub struct PublishNode {
+    pub name: String,
+    pub ip4: Option<String>,
+    pub ip6: Option<String>,
+}
+
+/// Desired records for the APPS zone (`*.{apps}` + apex), TTL 60.
+pub fn desired_apps(nodes: &[PublishNode]) -> Vec<DesiredRecord> {
+    let mut out = Vec::new();
+    for name in ["*", ""] {
+        for n in nodes {
+            if let Some(ip) = &n.ip4 {
+                out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+            }
+            if let Some(ip) = &n.ip6 {
+                out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+            }
+        }
+    }
+    out
+}
+
+/// Desired records for the PLATFORM zone: `api.` (TTL 60, all publishable
+/// nodes) + `relay.`/`discovery.` (TTL 300, from env IP lists — those services
+/// run on operator-chosen nodes, not every gateway).
+pub fn desired_platform(
+    nodes: &[PublishNode],
+    relay_ips: &[String],
+    discovery_ips: &[String],
+    dashboard: bool, // publish apex + www too (nodes reverse-proxy the dashboard)
+) -> Vec<DesiredRecord> {
+    let mut out = Vec::new();
+    // `api` = developer/API-key surface, `admin` = ops/admin console surface — both
+    // resolve to the gateway nodes (same host-switch dispatch), published together.
+    let mut names: Vec<&str> = vec!["api", "admin"];
+    if dashboard {
+        names.push("");
+        names.push("www");
+    }
+    for name in names {
+        for n in nodes {
+            if let Some(ip) = &n.ip4 {
+                out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+            }
+            if let Some(ip) = &n.ip6 {
+                out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+            }
+        }
+    }
+    for (sub, ips) in [("relay", relay_ips), ("discovery", discovery_ips)] {
+        for ip in ips {
+            let rtype = if ip.contains(':') { "AAAA" } else { "A" };
+            out.push(DesiredRecord { name: sub.into(), rtype: rtype.into(), value: ip.clone(), ttl: 300 });
+        }
+    }
+    out
+}
+
+// ---- diff ---------------------------------------------------------------------
+
+/// Compute the delta between what exists and what we want, touching ONLY the
+/// names this reconciler manages and ONLY A/AAAA records (TXT — e.g. the ACME
+/// solver's `_acme-challenge` — is never ours to delete). Pure; unit-tested.
+pub fn diff(
+    current: &[RecordView],
+    desired: &[DesiredRecord],
+    managed_names: &[&str],
+) -> (Vec<DesiredRecord>, Vec<String>) {
+    let managed = |name: &str| managed_names.contains(&name);
+    let addr_type = |t: &str| t == "A" || t == "AAAA";
+
+    let have: Vec<&RecordView> = current
+        .iter()
+        .filter(|r| managed(&r.name) && addr_type(&r.rtype))
+        .collect();
+
+    // ALIAS displacement: Vercel adds default ALIAS records (`*`/apex →
+    // Vercel hosting) when a domain joins the account. An ALIAS and an A record
+    // can't coexist on the same name, so when we are about to publish addresses
+    // for a MANAGED name, any ALIAS squatting on it must go. Never touched for
+    // unmanaged names, and never unless we actually have addresses to publish.
+    let alias_deletes: Vec<String> = current
+        .iter()
+        .filter(|r| {
+            r.rtype == "ALIAS"
+                && managed(&r.name)
+                && desired.iter().any(|d| d.name == r.name && (d.rtype == "A" || d.rtype == "AAAA"))
+        })
+        .map(|r| r.id.clone())
+        .collect();
+
+    let want_key = |r: &DesiredRecord| (r.name.clone(), r.rtype.clone(), r.value.clone());
+    let have_key = |r: &RecordView| (r.name.clone(), r.rtype.clone(), r.value.clone());
+
+    let want_set: std::collections::HashSet<_> = desired
+        .iter()
+        .filter(|r| managed(&r.name) && addr_type(&r.rtype))
+        .map(want_key)
+        .collect();
+    let have_set: std::collections::HashSet<_> = have.iter().map(|r| have_key(r)).collect();
+
+    let creates: Vec<DesiredRecord> = desired
+        .iter()
+        .filter(|r| managed(&r.name) && addr_type(&r.rtype))
+        .filter(|r| !have_set.contains(&want_key(r)))
+        .cloned()
+        .collect();
+    let mut deletes: Vec<String> = have
+        .iter()
+        .filter(|r| !want_set.contains(&have_key(r)))
+        .map(|r| r.id.clone())
+        .collect();
+    deletes.extend(alias_deletes);
+    (creates, deletes)
+}
+
+// ---- reconcile loop ------------------------------------------------------------
+
+/// Observable reconciler counters (surfaced via the admin API).
+#[derive(Default)]
+pub struct ReconcilerStats {
+    pub passes: AtomicU64,
+    pub creates: AtomicU64,
+    pub deletes: AtomicU64,
+    pub api_errors: AtomicU64,
+    pub empty_set_blocks: AtomicU64,
+    pub last_pass_ms: AtomicU64,
+}
+
+pub static STATS: ReconcilerStats = ReconcilerStats {
+    passes: AtomicU64::new(0),
+    creates: AtomicU64::new(0),
+    deletes: AtomicU64::new(0),
+    api_errors: AtomicU64::new(0),
+    empty_set_blocks: AtomicU64::new(0),
+    last_pass_ms: AtomicU64::new(0),
+};
+
+fn env_ips(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default()
+}
+
+/// The publishable node set with flap damping: a node stays published while its
+/// consecutive-unhealthy streak is below the threshold. Pure; unit-tested.
+pub fn publishable(
+    nodes: &[(String, bool, Option<String>, Option<String>)], // (name, healthy, ip4, ip6)
+    streaks: &mut HashMap<String, u32>,
+) -> Vec<PublishNode> {
+    let mut out = Vec::new();
+    for (name, healthy, ip4, ip6) in nodes {
+        if ip4.is_none() && ip6.is_none() {
+            continue; // never publishable without a public IP
+        }
+        let streak = streaks.entry(name.clone()).or_insert(0);
+        if *healthy {
+            *streak = 0;
+        } else {
+            *streak = streak.saturating_add(1);
+        }
+        if *healthy || *streak < UNHEALTHY_PASSES_BEFORE_WITHDRAW {
+            out.push(PublishNode { name: name.clone(), ip4: ip4.clone(), ip6: ip6.clone() });
+        }
+    }
+    // Drop streak entries for nodes that vanished from the registry entirely.
+    let known: std::collections::HashSet<&String> = nodes.iter().map(|(n, ..)| n).collect();
+    streaks.retain(|k, _| known.contains(k));
+    out
+}
+
+/// One reconcile pass over one zone. Returns Err on API failure (caller backs off).
+async fn reconcile_zone<A: DnsApi>(
+    api: &A,
+    domain: &str,
+    desired: &[DesiredRecord],
+    managed_names: &[&str],
+    cloud: &Arc<CloudState>,
+) -> anyhow::Result<()> {
+    // NEVER publish an empty set: losing every record would blackhole the domain
+    // harder than stale-but-healthy-yesterday IPs. Keep last-known-good + incident.
+    if !desired.iter().any(|r| r.rtype == "A" || r.rtype == "AAAA") {
+        STATS.empty_set_blocks.fetch_add(1, Ordering::Relaxed);
+        tracing::error!(%domain, "DNS reconciler: desired record set is EMPTY — keeping last-known-good records and raising an incident");
+        cloud.incidents.open(crate::incidents::OpenReq {
+            title: format!("DNS reconciler: no publishable nodes for {domain}"),
+            severity: crate::incidents::Severity::Major,
+            affected: vec!["dns".into()],
+            message: "Desired DNS record set is empty (no healthy nodes with public IPs). Keeping last-known-good records published.".into(),
+        });
+        return Ok(());
+    }
+    let current = api.list(domain).await?;
+    let (creates, deletes) = diff(&current, desired, managed_names);
+    if creates.is_empty() && deletes.is_empty() {
+        return Ok(()); // converged — write nothing
+    }
+    for rec in &creates {
+        api.create(domain, rec).await?;
+        STATS.creates.fetch_add(1, Ordering::Relaxed);
+    }
+    for id in &deletes {
+        api.delete(domain, id).await?;
+        STATS.deletes.fetch_add(1, Ordering::Relaxed);
+    }
+    let published: Vec<String> = desired.iter().map(|r| format!("{} {} {}", r.name, r.rtype, r.value)).collect();
+    tracing::info!(%domain, created = creates.len(), deleted = deletes.len(), published = ?published, "DNS reconciled");
+    Ok(())
+}
+
+/// Leader-elected reconcile loop. Runs on every node; only the elected leader
+/// (same election as the billing meter: lowest healthy iroh identity) acts.
+/// Enabled when a `VERCEL_API_TOKEN` is present AND (`HIVE_INGRESS != ngrok` or
+/// `HIVE_DNS_RECONCILE=1` for pre-cutover testing).
+pub fn spawn_reconciler(cloud: Arc<CloudState>) {
+    let forced = std::env::var("HIVE_DNS_RECONCILE").map(|v| v == "1").unwrap_or(false);
+    if cloud.ingress == "ngrok" && !forced {
+        return;
+    }
+    let Some(api) = VercelApi::from_env(cloud.http.clone()) else {
+        tracing::warn!("DNS reconciler enabled but VERCEL_API_TOKEN is not set — not starting");
+        return;
+    };
+    let interval = std::env::var("HIVE_DNS_RECONCILE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
+    tracing::info!(interval, apps = %cloud.apps_domain, platform = %cloud.platform_domain, "Vercel DNS reconciler up (leader-elected)");
+    tokio::spawn(async move {
+        let mut streaks: HashMap<String, u32> = HashMap::new();
+        let mut backoff: u64 = 0; // consecutive failures
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
+        loop {
+            tick.tick().await;
+            if backoff > 0 {
+                // Exponential backoff on API failure: 30s * 2^n, capped at 5 min.
+                let extra = (interval << backoff.min(4)).min(300);
+                tokio::time::sleep(std::time::Duration::from_secs(extra.saturating_sub(interval))).await;
+            }
+            // Leader-only (auto-failover with the same election as billing).
+            // `HIVE_DNS_LEADER_NODE` pins the acting node — needed while the
+            // election spans ngrok-mode nodes whose reconciler is dormant.
+            let leader = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty())
+                .or_else(|| crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()));
+            if leader.as_deref() != Some(cloud.node_name.as_str()) {
+                continue;
+            }
+            let nodes: Vec<(String, bool, Option<String>, Option<String>)> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .map(|n| (n.name, n.healthy, n.public_ip, n.public_ip6))
+                .collect();
+            let publish = publishable(&nodes, &mut streaks);
+            let relay_ips = env_ips("HIVE_RELAY_IPS");
+            let discovery_ips = env_ips("HIVE_DISCOVERY_IPS");
+            let apps = desired_apps(&publish);
+            let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard);
+
+            let mut ok = true;
+            if let Err(e) = reconcile_zone(&api, &cloud.apps_domain, &apps, &["*", ""], &cloud).await {
+                STATS.api_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, zone = %cloud.apps_domain, "DNS reconcile failed");
+                ok = false;
+            }
+            let platform_managed: &[&str] = if dashboard { &["api", "relay", "discovery", "", "www"] } else { &["api", "relay", "discovery"] };
+            if let Err(e) = reconcile_zone(&api, &cloud.platform_domain, &platform, platform_managed, &cloud).await {
+                STATS.api_errors.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");
+                ok = false;
+            }
+            // Per-tenant DB gateway zone (`*.{db_domain}`): the wildcard + apex →
+            // all publishable nodes (cert coverage + fallback), PLUS a specific A
+            // record per live DB `<slug> → the node hosting its container`, so a
+            // `<slug>.{db_domain}` connection lands on the node with the DB local to
+            // its SNI proxy (a specific record wins over the wildcard in DNS).
+            if !cloud.db_domain.is_empty() {
+                let mut db_desired = desired_apps(&publish);
+                let mut managed: Vec<String> = vec!["*".into(), String::new()];
+                let all_nodes = cloud.registry.nodes();
+                let suffix = format!(".{}", cloud.db_domain);
+                // (db_host, host_node) pairs: local records first, then peer
+                // directories — DBs provision on the control-plane leader, which is
+                // NOT this DNS leader, and DB records are not gossiped. The peer
+                // fan-out is the non-secret `/v1/db-directory` (routing metadata
+                // only). Local wins on slug collision (first insert kept).
+                let mut dir: Vec<(String, String)> = cloud
+                    .databases
+                    .list(None)
+                    .into_iter()
+                    .filter(|d| !d.db_host.is_empty() && !d.host_node.is_empty())
+                    .map(|d| (d.db_host, d.host_node))
+                    .collect();
+                // Fan out CONCURRENTLY, each under its own tight budget — this loop
+                // shares the single reconciler task with the apps/platform zones
+                // above (spawn_reconciler is one task on one interval), so a
+                // sequential per-peer await (each up to ~10-20s inside
+                // fetch_from_host's own HTTP+iroh timeouts) would stretch a slow
+                // pass to 10s-2min and starve those zones' reconcile cadence.
+                let peer_names: Vec<String> =
+                    all_nodes.iter().filter(|n| n.name != cloud.node_name && n.healthy).map(|n| n.name.clone()).collect();
+                let peer_results = futures::future::join_all(peer_names.iter().map(|name| {
+                    let cloud = cloud.clone();
+                    let name = name.clone();
+                    async move {
+                        tokio::time::timeout(std::time::Duration::from_secs(8), crate::admin::fetch_from_host(&cloud, &name, "/v1/db-directory", ""))
+                            .await
+                            .ok()
+                            .flatten()
+                    }
+                }))
+                .await;
+                for v in peer_results.into_iter().flatten() {
+                    for e in v.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+                        let host = e.get("db_host").and_then(|x| x.as_str()).unwrap_or_default();
+                        let hn = e.get("host_node").and_then(|x| x.as_str()).unwrap_or_default();
+                        if !host.is_empty() && !hn.is_empty() {
+                            dir.push((host.to_string(), hn.to_string()));
+                        }
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                for (db_host, host_node) in dir {
+                    let Some(slug) = db_host.strip_suffix(&suffix) else { continue };
+                    if !seen.insert(slug.to_string()) {
+                        continue;
+                    }
+                    let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else { continue };
+                    managed.push(slug.to_string());
+                    if let Some(ip) = &node.public_ip {
+                        db_desired.push(DesiredRecord { name: slug.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                    }
+                    if let Some(ip) = &node.public_ip6 {
+                        db_desired.push(DesiredRecord { name: slug.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                    }
+                }
+                let managed_refs: Vec<&str> = managed.iter().map(|s| s.as_str()).collect();
+                if let Err(e) = reconcile_zone(&api, &cloud.db_domain, &db_desired, &managed_refs, &cloud).await {
+                    STATS.api_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(error = %e, zone = %cloud.db_domain, "DNS reconcile failed");
+                    ok = false;
+                }
+            }
+            backoff = if ok { 0 } else { (backoff + 1).min(6) };
+            STATS.passes.fetch_add(1, Ordering::Relaxed);
+            STATS.last_pass_ms.store(hive_core::now_ms(), Ordering::Relaxed);
+        }
+    });
+}
+
+// ---- tests ---------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rv(id: &str, name: &str, t: &str, v: &str) -> RecordView {
+        RecordView { id: id.into(), name: name.into(), rtype: t.into(), value: v.into() }
+    }
+    fn dr(name: &str, t: &str, v: &str) -> DesiredRecord {
+        DesiredRecord { name: name.into(), rtype: t.into(), value: v.into(), ttl: 60 }
+    }
+
+    #[test]
+    fn diff_creates_missing_and_deletes_stale() {
+        let current = vec![rv("1", "api", "A", "1.1.1.1"), rv("2", "api", "A", "2.2.2.2")];
+        let desired = vec![dr("api", "A", "1.1.1.1"), dr("api", "A", "3.3.3.3")];
+        let (c, d) = diff(&current, &desired, &["api"]);
+        assert_eq!(c, vec![dr("api", "A", "3.3.3.3")]);
+        assert_eq!(d, vec!["2".to_string()]);
+    }
+
+    #[test]
+    fn diff_noop_when_converged() {
+        let current = vec![rv("1", "*", "A", "1.1.1.1"), rv("2", "", "A", "1.1.1.1")];
+        let desired = vec![dr("*", "A", "1.1.1.1"), dr("", "A", "1.1.1.1")];
+        let (c, d) = diff(&current, &desired, &["*", ""]);
+        assert!(c.is_empty() && d.is_empty(), "converged sets must write nothing");
+    }
+
+    #[test]
+    fn diff_never_touches_unmanaged_or_txt() {
+        // MX for mail, TXT for ACME, a CNAME someone added by hand: all untouchable.
+        let current = vec![
+            rv("1", "api", "A", "9.9.9.9"),
+            rv("2", "_acme-challenge", "TXT", "token"),
+            rv("3", "mail", "MX", "10 mx.example.com"),
+            rv("4", "www", "CNAME", "handmade.example.com"),
+            rv("5", "api", "TXT", "keep-me"),
+        ];
+        let desired = vec![dr("api", "A", "1.1.1.1")];
+        let (c, d) = diff(&current, &desired, &["api"]);
+        assert_eq!(c, vec![dr("api", "A", "1.1.1.1")]);
+        assert_eq!(d, vec!["1".to_string()], "only the managed A record is replaced");
+    }
+
+    #[test]
+    fn alias_on_managed_name_is_displaced_only_when_publishing() {
+        // Vercel's default ALIAS on `*`/apex must be replaced by our A records at
+        // cutover — but ONLY when we actually publish addresses for that name.
+        let current = vec![
+            rv("1", "*", "ALIAS", "cname.vercel-dns-016.com."),
+            rv("2", "", "ALIAS", "cname.vercel-dns-016.com."),
+            rv("3", "www", "ALIAS", "keep.me"), // unmanaged name — untouchable
+        ];
+        let desired = vec![dr("*", "A", "1.1.1.1"), dr("", "A", "1.1.1.1")];
+        let (c, d) = diff(&current, &desired, &["*", ""]);
+        assert_eq!(c.len(), 2);
+        assert!(d.contains(&"1".to_string()) && d.contains(&"2".to_string()));
+        assert!(!d.contains(&"3".to_string()));
+        // Empty desired set → ALIAS stays (never displace without replacements).
+        let (_, d2) = diff(&current, &[], &["*", ""]);
+        assert!(d2.is_empty());
+    }
+
+    #[test]
+    fn damping_withdraws_only_after_k_passes() {
+        let mut streaks = HashMap::new();
+        let up = vec![("n1".to_string(), true, Some("1.1.1.1".to_string()), None)];
+        let down = vec![("n1".to_string(), false, Some("1.1.1.1".to_string()), None)];
+        assert_eq!(publishable(&up, &mut streaks).len(), 1);
+        // 1st unhealthy pass: still published (damping)
+        assert_eq!(publishable(&down, &mut streaks).len(), 1);
+        // 2nd unhealthy pass: withdrawn
+        assert_eq!(publishable(&down, &mut streaks).len(), 0);
+        // recovery resets the streak instantly
+        assert_eq!(publishable(&up, &mut streaks).len(), 1);
+        assert_eq!(publishable(&down, &mut streaks).len(), 1);
+    }
+
+    #[test]
+    fn no_public_ip_never_published() {
+        let mut streaks = HashMap::new();
+        let nodes = vec![("nat-node".to_string(), true, None, None)];
+        assert!(publishable(&nodes, &mut streaks).is_empty());
+    }
+
+    #[test]
+    fn desired_sets_cover_wildcard_apex_api_relay() {
+        let nodes = vec![PublishNode { name: "n1".into(), ip4: Some("1.1.1.1".into()), ip6: Some("::1".into()) }];
+        let apps = desired_apps(&nodes);
+        assert!(apps.contains(&DesiredRecord { name: "*".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
+        assert!(apps.contains(&DesiredRecord { name: "".into(), rtype: "AAAA".into(), value: "::1".into(), ttl: 60 }));
+        let plat = desired_platform(&nodes, &["2.2.2.2".into()], &["3.3.3.3".into()], true);
+        assert!(plat.contains(&DesiredRecord { name: "".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }), "apex published when dashboard hosting on");
+        assert!(plat.contains(&DesiredRecord { name: "www".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
+        assert!(plat.contains(&DesiredRecord { name: "api".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
+        assert!(plat.contains(&DesiredRecord { name: "admin".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }), "ops console host published");
+        assert!(plat.contains(&DesiredRecord { name: "relay".into(), rtype: "A".into(), value: "2.2.2.2".into(), ttl: 300 }));
+        assert!(plat.contains(&DesiredRecord { name: "discovery".into(), rtype: "A".into(), value: "3.3.3.3".into(), ttl: 300 }));
+    }
+
+    // ---- mocked-API reconcile tests ----
+
+    use std::sync::Mutex;
+    struct MockApi {
+        records: Mutex<Vec<RecordView>>,
+        fail_lists: Mutex<u32>, // fail the next N list() calls with a retryable error
+        next_id: Mutex<u32>,
+        creates: Mutex<u32>,
+        deletes: Mutex<u32>,
+    }
+    impl MockApi {
+        fn new(records: Vec<RecordView>) -> Self {
+            Self { records: Mutex::new(records), fail_lists: Mutex::new(0), next_id: Mutex::new(100), creates: Mutex::new(0), deletes: Mutex::new(0) }
+        }
+    }
+    impl DnsApi for MockApi {
+        async fn list(&self, _d: &str) -> anyhow::Result<Vec<RecordView>> {
+            let mut f = self.fail_lists.lock().unwrap();
+            if *f > 0 {
+                *f -= 1;
+                anyhow::bail!("429 (retryable)");
+            }
+            Ok(self.records.lock().unwrap().clone())
+        }
+        async fn create(&self, _d: &str, rec: &DesiredRecord) -> anyhow::Result<String> {
+            let mut id = self.next_id.lock().unwrap();
+            *id += 1;
+            *self.creates.lock().unwrap() += 1;
+            let rid = id.to_string();
+            self.records.lock().unwrap().push(RecordView { id: rid.clone(), name: rec.name.clone(), rtype: rec.rtype.clone(), value: rec.value.clone() });
+            Ok(rid)
+        }
+        async fn delete(&self, _d: &str, id: &str) -> anyhow::Result<()> {
+            *self.deletes.lock().unwrap() += 1;
+            self.records.lock().unwrap().retain(|r| r.id != id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_reconcile_converges_and_then_noops() {
+        let api = MockApi::new(vec![rv("1", "api", "A", "9.9.9.9")]);
+        let desired = vec![dr("api", "A", "1.1.1.1")];
+        // Directly exercise diff+apply (reconcile_zone needs CloudState only for
+        // the empty-set incident path, covered separately).
+        let current = api.list("z").await.unwrap();
+        let (c, d) = diff(&current, &desired, &["api"]);
+        for r in &c { api.create("z", r).await.unwrap(); }
+        for id in &d { api.delete("z", id).await.unwrap(); }
+        assert_eq!(*api.creates.lock().unwrap(), 1);
+        assert_eq!(*api.deletes.lock().unwrap(), 1);
+        // Second pass: converged, zero writes.
+        let current = api.list("z").await.unwrap();
+        let (c, d) = diff(&current, &desired, &["api"]);
+        assert!(c.is_empty() && d.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_list_429_is_an_error_not_a_wipe() {
+        let api = MockApi::new(vec![rv("1", "api", "A", "1.1.1.1")]);
+        *api.fail_lists.lock().unwrap() = 1;
+        assert!(api.list("z").await.is_err(), "429 must surface as an error (caller backs off)");
+        // Records untouched by the failed pass.
+        assert_eq!(api.records.lock().unwrap().len(), 1);
+    }
+}

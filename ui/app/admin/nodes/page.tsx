@@ -2,12 +2,12 @@
 
 import { Server, Globe2 } from "lucide-react";
 import { Card, Badge, Table, Th, Td } from "@/components/ui";
-import { usePoll, type NodeInfo, type AdminOverview } from "@/lib/api";
+import { useOpsPoll, type NodeInfo, type AdminOverview } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 export default function AdminNodesPage() {
-  const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
-  const { data: ov } = usePoll<AdminOverview>("/v1/admin/overview", 4000);
+  const { data: nodes } = useOpsPoll<NodeInfo[]>("/v1/nodes", 3000);
+  const { data: ov } = useOpsPoll<AdminOverview>("/v1/admin/overview", 4000);
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (

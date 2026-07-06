@@ -648,7 +648,27 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     let extra_headers = dep.manifest.headers_for(&orig_path, &ctx);
 
     let resp = match dep.manifest.resolve(&path) {
-        RouteTarget::Static => serve_static(&dep, &path).await,
+        RouteTarget::Static => {
+            // Adapter frameworks (OpenNext / vinext): immutable assets serve from
+            // `static_dir`; on a MISS the request falls through to the origin/SSR
+            // function (the CDN→function model) so dynamic routes still render.
+            // When no `origin_function` is set (the common case) this is exactly
+            // the previous behavior — `serve_static` with its SPA/404 fallback.
+            match dep.manifest.origin_function.clone() {
+                Some(origin) => match read_static_file(&dep, &path).await {
+                    Some(r) => r,
+                    None => {
+                        let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                            Ok(b) => b,
+                            Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
+                        };
+                        proxy_function(&gw, &dep, &origin, &parts.method, &path_q, &parts.headers, body_bytes)
+                            .await
+                    }
+                },
+                None => serve_static(&dep, &path).await,
+            }
+        }
         RouteTarget::Function(name) => {
             let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
                 Ok(b) => b,
@@ -769,6 +789,52 @@ fn is_hashed_asset(file: &str) -> bool {
     file.split(['.', '-']).any(|seg| {
         seg.len() >= 8 && seg.bytes().all(|b| b.is_ascii_hexdigit()) && seg.bytes().any(|b| b.is_ascii_digit())
     })
+}
+
+/// Try to read a concrete static asset for `path` from the deployment's
+/// `static_dir`. Returns `Some(response)` only when an actual file (or its
+/// cleanUrls `.html` sibling) exists; returns `None` on a miss WITHOUT the
+/// SPA-index/404 fallback, so the caller can fall through to an origin function.
+async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
+    let static_dir = dep.manifest.static_dir.clone().unwrap_or_else(|| ".".into());
+    let base = dep.root.join(static_dir);
+    let rel = path.trim_start_matches('/');
+    let mut file = base.join(rel);
+    if path.ends_with('/') || rel.is_empty() {
+        file = file.join("index.html");
+    }
+    if !is_within(&base, &file) {
+        return None;
+    }
+    if let Ok(bytes) = tokio::fs::read(&file).await {
+        let ctype = content_type(&file);
+        return Some(
+            (
+                [(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, static_cache_control(path))],
+                bytes,
+            )
+                .into_response(),
+        );
+    }
+    // cleanUrls: `/about` -> `about.html`.
+    if dep.manifest.clean_urls && !rel.is_empty() && !path.ends_with('/') {
+        let html = base.join(format!("{rel}.html"));
+        if is_within(&base, &html) {
+            if let Ok(bytes) = tokio::fs::read(&html).await {
+                return Some(
+                    (
+                        [
+                            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
+                        ],
+                        bytes,
+                    )
+                        .into_response(),
+                );
+            }
+        }
+    }
+    None
 }
 
 async fn serve_static(dep: &Deployment, path: &str) -> Response {

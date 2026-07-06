@@ -4,8 +4,12 @@ import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import { Loader2, Search, Radio, Plus, X } from "lucide-react";
 import { timeAgo } from "@/lib/utils";
-import { apiSend, usePoll, type RunStatus, type WorkflowRun } from "@/lib/api";
+import { apiSend, usePoll, type RunStatus, type WorkflowRun, type WorkflowDef } from "@/lib/api";
 import { Button, Input } from "@/components/ui";
+
+/** The three project-scoped workflow sub-views (mirrors the platform /workflows
+ *  page), selected by the top-nav breadcrumb sub-tabs. */
+export type WdkView = "runs" | "workflows" | "hooks";
 
 /* ---- status mapping (Vercel vocabulary) ---- */
 export interface StatusView { label: string; dot: string; text: string }
@@ -160,12 +164,18 @@ function useNow(ms = 1000) {
   return now;
 }
 
-export function ProjectWorkflows({ project }: { project: string }) {
+export function ProjectWorkflows({ project, view = "runs" }: { project: string; view?: WdkView }) {
   const { data: rawRuns, refresh } = usePoll<WorkflowRun[]>(
     `/v1/workflows/runs?project=${encodeURIComponent(project)}`,
     2000
   );
+  // Workflow DEFINITIONS for this project (drives the Workflows + Hooks sub-views).
+  const { data: rawDefs, refresh: refreshDefs } = usePoll<WorkflowDef[]>("/v1/workflows", 5000);
   const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
+  const defs = useMemo(
+    () => (rawDefs ?? []).filter((d) => (d.project || "") === project),
+    [rawDefs, project],
+  );
   const now = useNow();
   const [q, setQ] = useState("");
   const [live, setLive] = useState(true);
@@ -177,6 +187,14 @@ export function ProjectWorkflows({ project }: { project: string }) {
       (r) => r.name.toLowerCase().includes(needle) || r.id.toLowerCase().includes(needle)
     );
   }, [runs, q]);
+
+  // Workflows + Hooks sub-views are project-scoped mirrors of the platform page.
+  if (view === "workflows") {
+    return <ProjectDefsView project={project} defs={defs} onChanged={refreshDefs} />;
+  }
+  if (view === "hooks") {
+    return <ProjectHooksView defs={defs} />;
+  }
 
   return (
     <div>
@@ -197,13 +215,68 @@ export function ProjectWorkflows({ project }: { project: string }) {
         </Button>
       </div>
 
-      {creating && <ProjectDefiner project={project} onDone={() => { setCreating(false); refresh(); }} />}
+      {creating && <ProjectDefiner project={project} onDone={() => { setCreating(false); refresh(); refreshDefs(); }} />}
 
       <div className="mb-4">
         <StatusChips runs={runs ?? []} />
       </div>
 
       <RunsTable runs={filtered} now={now} />
+    </div>
+  );
+}
+
+/** Project-scoped "Workflows" definitions list (mirror of the platform view). */
+function ProjectDefsView({ project, defs, onChanged }: { project: string; defs: WorkflowDef[]; onChanged: () => void }) {
+  const [creating, setCreating] = useState(false);
+  async function run(id: string) {
+    await apiSend("POST", `/v1/workflows/${encodeURIComponent(id)}/run`).catch(() => {});
+  }
+  return (
+    <div className="space-y-4">
+      <div className="flex justify-end">
+        <Button variant="outline" onClick={() => setCreating((v) => !v)}>
+          {creating ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />} {creating ? "Close" : "New Workflow"}
+        </Button>
+      </div>
+      {creating && <ProjectDefiner project={project} onDone={() => { setCreating(false); onChanged(); }} />}
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <div className="grid grid-cols-[1.6fr_1.6fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
+          <span>Workflow</span><span>Steps</span><span></span>
+        </div>
+        {defs.length === 0 ? (
+          <div className="px-4 py-12 text-center text-sm text-secondary">No workflows defined for this project yet — use “New Workflow”, or deploy an app using the Vercel WDK.</div>
+        ) : (
+          defs.map((d) => (
+            <div key={d.id} className="grid grid-cols-[1.6fr_1.6fr_auto] items-center gap-3 border-b border-border px-4 py-3 text-sm last:border-0">
+              <span className="truncate font-mono font-medium">{d.name}</span>
+              <span className="truncate font-mono text-xs text-muted">{d.steps.map((s) => s.name).join(" → ") || "—"}</span>
+              <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => run(d.id)}>Run</Button>
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Project-scoped "Hooks" view — the trigger URL for each workflow. */
+function ProjectHooksView({ defs }: { defs: WorkflowDef[] }) {
+  return (
+    <div className="space-y-3">
+      <p className="text-sm text-secondary">Trigger workflows from anything — POST to a hook URL to start a run.</p>
+      {defs.length === 0 ? (
+        <div className="rounded-xl border border-border bg-card px-4 py-12 text-center text-sm text-secondary">No hooks — define a workflow for this project first.</div>
+      ) : (
+        defs.map((d) => (
+          <div key={d.id} className="rounded-xl border border-border bg-card p-4">
+            <div className="mb-1 font-mono text-sm font-medium">{d.name}</div>
+            <code className="block overflow-x-auto rounded-md border border-border bg-subtle/50 px-3 py-2 font-mono text-xs text-secondary">
+              POST /cloud/v1/workflows/{d.id}/run
+            </code>
+          </div>
+        ))
+      )}
     </div>
   );
 }

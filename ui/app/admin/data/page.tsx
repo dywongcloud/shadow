@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { Search, Database, RefreshCw, ChevronRight, Code2, Plus, Trash2, Save, Pencil } from "lucide-react";
-import { apiGet, apiSend } from "@/lib/api";
+import { opsGet, opsSend } from "@/lib/api";
 
 interface Collection { name: string; count: number; editable?: boolean }
 interface CollectionsResp { collections: Collection[]; store: string }
@@ -82,7 +82,7 @@ export default function DataBrowserPage() {
     setErr("");
     try {
       // data_patch MERGES, so sending just this field is non-destructive.
-      await apiSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(editCell.id)}`, {
+      await opsSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(editCell.id)}`, {
         [editCell.col]: coerce(cellDraft),
       });
       setEditCell(null);
@@ -95,15 +95,15 @@ export default function DataBrowserPage() {
   }
 
   function loadCollections() {
-    apiGet<CollectionsResp>("/v1/admin/data").then(setMeta).catch(() => {});
-    apiGet<{ namespaces: Namespace[] }>("/v1/admin/namespaces").then((d) => setNamespaces(d.namespaces || [])).catch(() => {});
+    opsGet<CollectionsResp>("/v1/admin/data").then(setMeta).catch(() => {});
+    opsGet<{ namespaces: Namespace[] }>("/v1/admin/namespaces").then((d) => setNamespaces(d.namespaces || [])).catch(() => {});
   }
   useEffect(() => { loadCollections(); }, []);
 
   function loadRows(col: string, query: string) {
     setLoading(true);
     setSelected(null);
-    apiGet<RowsResp>(`/v1/admin/data/${encodeURIComponent(col)}?q=${encodeURIComponent(query)}&limit=500`)
+    opsGet<RowsResp>(`/v1/admin/data/${encodeURIComponent(col)}?q=${encodeURIComponent(query)}&limit=500`)
       .then(setRows)
       .catch(() => setRows({ collection: col, total: 0, matched: 0, rows: [] }))
       .finally(() => setLoading(false));
@@ -120,7 +120,7 @@ export default function DataBrowserPage() {
         const patch: Record<string, any> = {};
         for (const [col, raw] of Object.entries(drafts[id])) patch[col] = coerce(raw);
         if (Object.keys(patch).length) {
-          await apiSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(id)}`, patch);
+          await opsSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(id)}`, patch);
         }
       }
       setDrafts({}); setEditMode(false); loadRows(active, q);
@@ -170,7 +170,7 @@ export default function DataBrowserPage() {
     setBusy(true);
     try {
       const body = JSON.parse(newBody);
-      await apiSend("POST", `/v1/admin/data/${encodeURIComponent(newCollection)}`, body);
+      await opsSend("POST", `/v1/admin/data/${encodeURIComponent(newCollection)}`, body);
       setNewOpen(false);
       loadCollections();
       setActive(newCollection);
@@ -184,7 +184,7 @@ export default function DataBrowserPage() {
     setErr(""); setBusy(true);
     try {
       const body = JSON.parse(editText);
-      await apiSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(selected.id)}`, body);
+      await opsSend("PUT", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(selected.id)}`, body);
       setSelected(null);
       loadRows(active, q);
     } catch (e) { setErr(e instanceof SyntaxError ? "Invalid JSON" : String(e)); }
@@ -195,7 +195,7 @@ export default function DataBrowserPage() {
     if (!id || !confirm("Delete this entry? This cannot be undone.")) return;
     setBusy(true);
     try {
-      await apiSend("DELETE", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(id)}`);
+      await opsSend("DELETE", `/v1/admin/data/${encodeURIComponent(active)}/${encodeURIComponent(id)}`);
       setSelected(null);
       loadCollections();
       loadRows(active, q);

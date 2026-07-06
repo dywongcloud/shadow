@@ -1,13 +1,13 @@
 /* ------------------------------------------------------------------ *
  * Landing-page marquee banner.
  *
- * A WHITE banner with a thin black outline whose exact silhouette — a tab on the
- * top edge (left-of-centre) and a tab on the bottom edge (right) — is rendered
- * from the source path (2048×69) as an inline SVG (fill white + non-scaling black
- * stroke). An infinitely-scrolling "OWN YOUR CLOUD. ·" ticker rides inside the
- * solid strip band (y 23–55 of the 69-tall viewBox) in black. It sits after the
- * hero globe with a little black space above for contrast, and generous space
- * below before the device showcase.
+ * A NEAR-BLACK (dark-grey) banner with a thin, sleek white outline whose exact
+ * silhouette — a tab on the top edge (left-of-centre) and a tab on the bottom
+ * edge (right) — is rendered from the source path (2048×69) as an inline SVG
+ * (dark fill + non-scaling white stroke). An infinitely-scrolling
+ * "OWN YOUR CLOUD. ·" ticker rides inside the solid strip band (y 23–55 of the
+ * 69-tall viewBox) in white. It sits after the hero globe with a little black
+ * space above for contrast, and generous space below before the device showcase.
  * ------------------------------------------------------------------ */
 
 const PHRASE = "Own Your Cloud";
@@ -30,12 +30,12 @@ function Track({ "aria-hidden": ariaHidden }: { "aria-hidden"?: boolean }) {
       {Array.from({ length: 12 }).map((_, i) => (
         <span key={i} className="flex items-center">
           <span
-            className="whitespace-nowrap px-8 font-bold uppercase tracking-[0.22em] text-black"
-            style={{ WebkitTextStroke: "0.7px #000" }}
+            className="whitespace-nowrap px-8 font-bold uppercase tracking-[0.22em] text-white"
+            style={{ WebkitTextStroke: "0.7px #fff" }}
           >
             {PHRASE}
           </span>
-          <span aria-hidden className="inline-block shrink-0 rounded-full bg-black" style={{ width: "0.42em", height: "0.42em" }} />
+          <span aria-hidden className="inline-block shrink-0 rounded-full bg-white" style={{ width: "0.42em", height: "0.42em" }} />
         </span>
       ))}
     </div>
@@ -47,14 +47,14 @@ export function MarqueeBanner() {
     <section aria-label="Own Your Cloud" className="relative z-10 w-full pt-4 pb-12 sm:pt-6 sm:pb-16">
       {/* The element keeps the shape's native aspect ratio so the tabs aren't distorted. */}
       <div className="relative w-full" style={{ aspectRatio: "2048 / 69" }}>
-        {/* White banner with a clean thin black outline. */}
+        {/* Near-black banner with a clean, thin, sleek white outline trace. */}
         <svg
           viewBox="0 0 2048 69"
           className="absolute inset-0 h-full w-full"
           preserveAspectRatio="none"
           aria-hidden="true"
         >
-          <path d={SHAPE} fill="white" stroke="black" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+          <path d={SHAPE} fill="#131316" stroke="rgba(255,255,255,0.92)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
         </svg>
 
         {/* Scrolling ticker, confined to the solid strip band (full-width, no tabs).

@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import {
   Github,
   RotateCcw,
@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
-import { ProjectWorkflows } from "@/components/workflows";
+import { ProjectWorkflows, type WdkView } from "@/components/workflows";
 import { DeploymentResources } from "@/components/deployment-resources";
 import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
@@ -38,69 +38,59 @@ const ServiceGraph = dynamic(
     ),
   }
 );
-import { apiGet, apiSend, usePoll, type Build, type Deployment, type Overview } from "@/lib/api";
+import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
+import { usePendingBuilds } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
 
+// The project sub-tabs now live in the TOP NAV (breadcrumb-tabs model, issue 3);
+// they drive this page via `?tab=`. The page reads that param REACTIVELY so a tab
+// click in the header switches the in-page view without a remount. Wrapped in
+// Suspense (useSearchParams requirement) at the export.
 export default function ProjectDetail({ params }: { params: { project: string } }) {
+  return (
+    <Suspense fallback={null}>
+      <ProjectDetailInner params={params} />
+    </Suspense>
+  );
+}
+
+function ProjectDetailInner({ params }: { params: { project: string } }) {
   const name = decodeURIComponent(params.project);
   const router = useRouter();
+  const searchParams = useSearchParams();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
-  const [tab, setTab] = useState<"overview" | "graph" | "workflows" | "resources" | "deployments">("overview");
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    const t = new URLSearchParams(window.location.search).get("tab");
-    if (t === "graph" || t === "deployments" || t === "overview" || t === "workflows" || t === "resources") setTab(t);
-  }, []);
+  const tabParam = searchParams.get("tab");
+  const tab: "overview" | "graph" | "workflows" | "resources" | "deployments" =
+    tabParam === "graph" || tabParam === "deployments" || tabParam === "workflows" || tabParam === "resources"
+      ? tabParam
+      : "overview";
+  const setTab = (t: "overview" | "graph" | "workflows" | "resources" | "deployments") =>
+    router.replace(`/projects/${encodeURIComponent(name)}?tab=${t}`, { scroll: false });
+  // Workflows sub-view (Runs / Workflows / Hooks), driven by the top-nav breadcrumb
+  // sub-tabs via `?wf=`; defaults to "runs".
+  const wfParam = searchParams.get("wf");
+  const wfView: WdkView = wfParam === "workflows" || wfParam === "hooks" ? wfParam : "runs";
   const [busy, setBusy] = useState("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   // A redeploy doesn't create a deployment row until its build FINISHES (the live
-  // version keeps serving meanwhile), so the table looked frozen after pressing
-  // Redeploy. Show an immediate optimistic "Building" row keyed by the build id;
-  // when that build reaches ready/error we refresh (the REAL deployment row — a
-  // DIFFERENT id from the build id — appears) and drop the optimistic one.
-  const [pending, setPending] = useState<{ id: string; env: "production" | "preview"; at: number }[]>([]);
-  const pendingKey = pending.map((p) => p.id).join(",");
+  // version keeps serving meanwhile). The in-flight "Building" rows come from a
+  // PERSISTENT store (localStorage) so they survive navigating away + reload — the
+  // global PendingBuildsProvider polls each build and removes it on completion, at
+  // which point the REAL deployment row (a different id from the build id) appears.
+  const pendingRows = usePendingBuilds({ project: name });
 
   const mine = (deps ?? []).filter((d) => d.project === name);
-  const pendingRows = pending;
 
-  // Poll each in-flight redeploy build; on completion refresh the table (so the
-  // real deployment row lands) and remove the optimistic row.
+  // When a pending build completes (dropped from the store), pull the finished
+  // deployment in immediately instead of waiting for the next poll tick.
+  const pendingCount = pendingRows.length;
   useEffect(() => {
-    if (!pendingKey) return;
-    let stop = false;
-    const ids = pendingKey.split(",");
-    const poll = async () => {
-      for (const id of ids) {
-        try {
-          const b = await apiGet<Build>(`/v1/builds/${id}`);
-          if (!stop && (b.state === "ready" || b.state === "error")) {
-            await refresh();
-            if (!stop) setPending((cur) => cur.filter((x) => x.id !== id));
-          }
-        } catch {
-          /* build record not visible yet — keep polling */
-        }
-      }
-    };
-    poll();
-    const t = setInterval(poll, 1500);
-    return () => {
-      stop = true;
-      clearInterval(t);
-    };
-  }, [pendingKey, refresh]);
-
-  // Safety valve: drop any optimistic row that never resolved within 5 min.
-  useEffect(() => {
-    if (!pending.length) return;
-    const t = setInterval(() => setPending((cur) => cur.filter((x) => Date.now() - x.at < 5 * 60_000)), 30_000);
-    return () => clearInterval(t);
-  }, [pending.length]);
+    refresh();
+  }, [pendingCount, refresh]);
   const prod = mine.find((d) => d.production) ?? mine[0];
   const rollbackTarget = mine.find((d) => !d.production); // newest non-prod build
 
@@ -180,36 +170,15 @@ export default function ProjectDetail({ params }: { params: { project: string } 
         </div>
       </div>
 
-      {/* sub tabs */}
-      <div className="mb-6 flex items-center gap-1 border-b border-border">
-        {(["overview", "graph", "workflows", "resources", "deployments"] as const).map((t) => (
-          <button
-            key={t}
-            onClick={() => setTab(t)}
-            className={`relative px-3 py-2 text-sm capitalize ${tab === t ? "text-fg" : "text-secondary hover:text-fg"}`}
-          >
-            {t === "graph" ? "Service Graph" : t}
-            {tab === t && <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-fg" />}
-          </button>
-        ))}
-        <Link
-          href={`/projects/${encodeURIComponent(name)}/logs`}
-          className="relative px-3 py-2 text-sm text-secondary hover:text-fg"
-        >
-          Logs
-        </Link>
-        <Link
-          href={`/projects/${encodeURIComponent(name)}/settings`}
-          className="relative px-3 py-2 text-sm text-secondary hover:text-fg"
-        >
-          Settings
-        </Link>
-      </div>
+      {/* Sub-tabs moved to the top nav (breadcrumb-tabs model, issue 3) — the
+          header's row-2 now carries Overview/Service Graph/Workflows/Resources/
+          Deployments/Logs/Settings for the selected project. */}
+      <div className="mb-6" />
 
       {tab === "graph" ? (
         <ServiceGraph project={name} prod={prod} />
       ) : tab === "workflows" ? (
-        <ProjectWorkflows project={name} />
+        <ProjectWorkflows project={name} view={wfView} />
       ) : tab === "resources" ? (
         <DeploymentResources deploymentId={prod?.id} />
       ) : tab === "overview" ? (
@@ -345,13 +314,16 @@ export default function ProjectDetail({ params }: { params: { project: string } 
               </tr>
             ))}
             {mine.map((d) => (
-              <tr key={d.id}>
-                {/* The production-promoted row links via the project production
-                    alias (my-app.<domain>); every other row links to its OWN
-                    immutable URL (commit / id URL), so a preview opens that
-                    preview — not production. */}
+              <tr
+                key={d.id}
+                onClick={() => router.push(`/deployments/${encodeURIComponent(d.id)}`)}
+                className="cursor-pointer transition-colors hover:bg-subtle/50"
+                title="View deployment details"
+              >
+                {/* Click the row → deployment detail (logs, status, domains). The id
+                    link opens the LIVE deployment URL (stops row navigation). */}
                 <Td className="px-2 font-mono text-xs">
-                  <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias), d.region_code)} target="_blank" rel="noreferrer">{d.id}</a>
+                  <a className="text-link hover:underline" href={deploymentUrl(d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias), d.region_code)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{d.id}</a>
                 </Td>
                 <Td className="px-2">
                   <span className="inline-flex items-center gap-1.5">
@@ -382,14 +354,16 @@ export default function ProjectDetail({ params }: { params: { project: string } 
                 <Td className="px-2 text-secondary hidden sm:table-cell">{timeAgo(d.created_at_ms)} ago</Td>
                 <Td className="px-2 text-secondary hidden lg:table-cell">{d.creator}</Td>
                 <Td className="px-2">
-                  <DeploymentRowMenu
-                    canRollback={!d.production}
-                    canRedeploy={!!d.git}
-                    busy={busy === d.id}
-                    onRollback={() => promote(d.id)}
-                    onRedeploy={() => setRedeployFor(d)}
-                    onDelete={() => removeDeployment(d.id)}
-                  />
+                  <div onClick={(e) => e.stopPropagation()}>
+                    <DeploymentRowMenu
+                      canRollback={!d.production}
+                      canRedeploy={!!d.git}
+                      busy={busy === d.id}
+                      onRollback={() => promote(d.id)}
+                      onRedeploy={() => setRedeployFor(d)}
+                      onDelete={() => removeDeployment(d.id)}
+                    />
+                  </div>
                 </Td>
               </tr>
             ))}
@@ -404,10 +378,9 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           deployment={redeployFor}
           prodAlias={prod?.alias || `${name}.localhost`}
           onClose={() => setRedeployFor(null)}
-          onDone={(buildId, env) => {
-            // Show the building row immediately, jump to the deployments tab so
-            // it's visible, and refresh (the real row replaces it when ready).
-            setPending((p) => [{ id: buildId, env, at: Date.now() }, ...p]);
+          onDone={() => {
+            // The modal already persisted the in-flight build to the store (so its
+            // "Building" row survives navigation); just surface the deployments tab.
             setTab("deployments");
             refresh();
           }}
@@ -419,8 +392,7 @@ export default function ProjectDetail({ params }: { params: { project: string } 
           repoUrl={prod?.git?.repo_url ?? ""}
           branch={prod?.git?.branch}
           onClose={() => setCreateOpen(false)}
-          onDone={(buildId, env) => {
-            setPending((p) => [{ id: buildId, env, at: Date.now() }, ...p]);
+          onDone={() => {
             setTab("deployments");
             refresh();
           }}

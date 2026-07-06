@@ -218,3 +218,57 @@ export function Triangle({ className }: { className?: string }) {
     </span>
   );
 }
+
+/* ---------------------------------------------------------------------- *
+ * Loading-shell primitives — for route-level `loading.tsx` files. A shell
+ * should resemble the final layout as closely as possible (same PageHeader +
+ * Card/Table shape), so the page doesn't visibly "pop" once real data lands.
+ * ---------------------------------------------------------------------- */
+
+/** A single pulsing placeholder block. */
+export function Skeleton({ className }: { className?: string }) {
+  return <div className={cn("animate-pulse rounded-md bg-subtle", className)} aria-hidden />;
+}
+
+/** Placeholder matching `<PageHeader>`'s title/description/action layout. */
+export function SkeletonPageHeader({ withAction }: { withAction?: boolean }) {
+  return (
+    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+      <div className="flex flex-col gap-2">
+        <Skeleton className="h-7 w-48" />
+        <Skeleton className="h-4 w-72 max-w-full" />
+      </div>
+      {withAction ? <Skeleton className="h-9 w-28 shrink-0" /> : null}
+    </div>
+  );
+}
+
+/** Placeholder matching a `<Card>` — a bordered block with a couple of
+ *  internal lines, sized like a stat/summary card. */
+export function SkeletonCard({ className }: { className?: string }) {
+  return (
+    <div className={cn("rounded-xl border border-border bg-card p-4 sm:p-5 shadow-card", className)}>
+      <Skeleton className="mb-3 h-3.5 w-24" />
+      <Skeleton className="h-7 w-20" />
+    </div>
+  );
+}
+
+/** Placeholder matching a `<Table>` — a header row + N body rows. */
+export function SkeletonTable({ rows = 6 }: { rows?: number }) {
+  return (
+    <div className="overflow-hidden rounded-xl border border-border bg-card">
+      <div className="flex items-center gap-4 border-b border-border bg-subtle/40 px-4 py-2.5">
+        <Skeleton className="h-3 w-24" />
+        <Skeleton className="h-3 w-32" />
+      </div>
+      {Array.from({ length: rows }).map((_, i) => (
+        <div key={i} className="flex items-center gap-4 border-b border-border px-4 py-3.5 last:border-0">
+          <Skeleton className="h-8 w-8 shrink-0 rounded-full" />
+          <Skeleton className="h-4 flex-1 max-w-56" />
+          <Skeleton className="h-4 w-20 shrink-0" />
+        </div>
+      ))}
+    </div>
+  );
+}

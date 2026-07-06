@@ -3,11 +3,26 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Search, ChevronDown, Calendar, Plus, X } from "lucide-react";
+import dynamic from "next/dynamic";
+import { Search, ChevronDown, Calendar, Plus, Loader2, X } from "lucide-react";
 import { Button, Input, Triangle, PageHeader } from "@/components/ui";
 import { apiSend, usePoll, type WorkflowRun, type WorkflowDef } from "@/lib/api";
 import { StatusChips, RunsTable, normalizeRun } from "@/components/workflows";
-import { WorkflowDefGraph } from "@/components/workflow-graph";
+
+// reactflow (the graph renderer) only mounts once a workflow definition is
+// opened — dynamic + ssr:false keeps its ~considerable bundle out of every
+// /workflows page load (the default "Runs" tab never touches it).
+const WorkflowDefGraph = dynamic(
+  () => import("@/components/workflow-graph").then((m) => m.WorkflowDefGraph),
+  {
+    ssr: false,
+    loading: () => (
+      <div className="flex h-[480px] items-center justify-center rounded-xl border border-border bg-bg">
+        <Loader2 className="h-5 w-5 animate-spin text-muted" />
+      </div>
+    ),
+  }
+);
 
 const RANGES: Record<string, number> = {
   "Last 1 hour": 3600_000,

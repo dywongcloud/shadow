@@ -15,6 +15,12 @@
 
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
 
+// Ingress mode (mirrors the node's HIVE_INGRESS): "ngrok" (default) keeps the
+// region-encoded `<sub>.<code>.ngrok.pizza` URLs; "dual"/"dns" emit plain
+// `<sub>.<apps-domain>` — Vercel-DNS wildcards match ONE label, and regional
+// steering happens inside the edge after connect, not in the hostname.
+const INGRESS = (process.env.NEXT_PUBLIC_INGRESS || "ngrok").trim().toLowerCase();
+
 /** True for any host that is the local machine (localhost, *.localhost, loopback IPs). */
 function isLocalHostname(h: string): boolean {
   const host = h.toLowerCase();
@@ -64,6 +70,7 @@ function subOf(alias: string): string {
 function publicDeployDomain(regionCode?: string | null): string {
   const domain = activeDeployDomain();
   if (!domain) return ""; // localhost session — never region-encode
+  if (INGRESS !== "ngrok") return domain; // real-DNS ingress: single-label alias on the apps domain
   const code = (regionCode || "").trim().toLowerCase();
   return code ? `${code}.ngrok.pizza` : domain;
 }

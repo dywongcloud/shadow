@@ -245,7 +245,41 @@ function AdderNode({ data }: { data: any }) {
   );
 }
 
-const nodeTypes = { ingress: IngressNode, service: ServiceNode, resource: ResourceNode, adder: AdderNode };
+/** A node from the intelligently-scanned service graph (Issue #2): the app and its
+ *  framework, bundled frontend/backend (same container), or a workspace package. */
+function ComputedNode({ data }: { data: any }) {
+  const icon =
+    data.kind === "frontend" ? <FileCode className="h-4 w-4 text-sky-500" />
+    : data.kind === "backend" ? <Server className="h-4 w-4 text-purple-500" />
+    : data.kind === "worker" ? <Zap className="h-4 w-4 text-amber-500" />
+    : data.kind === "package" ? <Container className="h-4 w-4 text-muted" />
+    : <Boxes className="h-4 w-4 text-fg" />;
+  return (
+    <div className="w-[230px] rounded-xl border border-border bg-card px-3 py-2.5 shadow-card">
+      <div className="flex items-center gap-2">
+        {icon}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium">{data.name}</div>
+          <div className="truncate text-[11px] text-muted">{data.tech}{data.detail ? ` · ${data.detail}` : ""}</div>
+        </div>
+        {data.tech ? <span className="shrink-0 rounded border border-border bg-bg px-1.5 py-0.5 text-[9px] text-secondary">{data.kind}</span> : null}
+      </div>
+      {data.grouped ? (
+        <div className="mt-1.5 inline-flex items-center gap-1 rounded border border-border bg-bg px-1.5 py-0.5 text-[9px] text-secondary" title="Runs in the same container / PID">
+          <Container className="h-2.5 w-2.5" /> same container
+        </div>
+      ) : null}
+      <Handle type="target" id="in" position={Position.Left} style={handleStyle} />
+      <Handle type="source" id="out" position={Position.Right} style={handleStyle} />
+    </div>
+  );
+}
+
+const nodeTypes = { ingress: IngressNode, service: ServiceNode, resource: ResourceNode, adder: AdderNode, computed: ComputedNode };
+
+interface SgNode { id: string; kind: string; name: string; tech: string; group?: string | null; detail: string; source: string }
+interface SgEdge { from: string; to: string; label?: string }
+interface SvcGraph { project: string; deployment_id: string; nodes: SgNode[]; edges: SgEdge[]; env_keys: string[]; readme?: string }
 
 /** Fit the graph, then zoom out 6% for a calmer default framing. */
 function fitOut(i: ReactFlowInstance) {
@@ -265,6 +299,10 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
   const { data: settings } = usePoll<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`, 10000);
   const { data: gitopsLink } = usePoll<GitOpsLink>("/v1/gitops", 30000);
   const gitops = !!(gitopsLink?.connected && gitopsLink?.repo);
+  // Intelligently-scanned service graph (Issue #2) — computed async on deploy. When
+  // present it drives the graph (app/framework, bundled front+back, packages,
+  // consumed databases); otherwise we fall back to the derived view below.
+  const { data: sg } = usePoll<SvcGraph>(`/v1/projects/${encodeURIComponent(project)}/service-graph`, 15000);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
@@ -304,11 +342,67 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     }
   }, [project, refreshDbs]);
 
-  const key = JSON.stringify([prod?.id, prod?.state, kind, instances, memory, ddos, cdnActive, conns.map((c) => c.id), gitops]);
+  const sgKey = sg ? [sg.deployment_id, sg.nodes.map((n) => n.id).join(",")] : null;
+  const key = JSON.stringify([prod?.id, prod?.state, kind, instances, memory, ddos, cdnActive, conns.map((c) => c.id), gitops, sgKey]);
 
   useEffect(() => {
     if (key === lastKey.current) return;
     lastKey.current = key;
+
+    // ---- Intelligent computed graph (Issue #2) ----
+    const appNodesSg = (sg?.nodes ?? []).filter((n) => n.kind !== "ingress" && n.kind !== "database");
+    if (sg && appNodesSg.length) {
+      const groupCounts: Record<string, number> = {};
+      for (const n of sg.nodes) if (n.group) groupCounts[n.group] = (groupCounts[n.group] || 0) + 1;
+      const sgDbs = sg.nodes.filter((n) => n.kind === "database");
+      const techToKind: Record<string, string> = {
+        PostgreSQL: "postgres", Prisma: "postgres", Drizzle: "postgres", TypeORM: "postgres", Sequelize: "postgres", Knex: "postgres",
+        MySQL: "mysql", MongoDB: "mongo", Redis: "redis", "Upstash Redis": "redis", SQLite: "sqlite",
+      };
+      const provisionedKinds = new Set((dbs ?? []).map((d) => d.kind));
+      // A detected DB the user hasn't explicitly provisioned → show it (consumed).
+      const detected = sgDbs.filter((n) => !provisionedKinds.has((techToKind[n.tech] || "") as never));
+
+      const ns: Node[] = [
+        { id: "ingress", type: "ingress", position: { x: 0, y: 180 }, data: { ddos, cdn: cdnActive } },
+        ...appNodesSg.map((n, i) => ({
+          id: n.id, type: "computed" as const, position: { x: 340, y: i * 108 },
+          data: { name: n.name, tech: n.tech, kind: n.kind, detail: n.detail, grouped: n.group ? groupCounts[n.group] > 1 : false },
+        })),
+      ];
+      let ry = 0;
+      for (const c of conns) {
+        ns.push({ id: `res-${c.id}`, type: "resource", position: { x: 820, y: ry }, data: { name: c.name, sub: c.sub, img: c.img, tunnel: c.tunnel, envKey: c.envKey } });
+        ry += 92;
+      }
+      for (const n of detected) {
+        ns.push({ id: n.id, type: "resource", position: { x: 820, y: ry }, data: { name: n.name, sub: `Detected · ${n.source}`, img: providerImg(n.tech), tunnel: false, envKey: null } });
+        ry += 92;
+      }
+      ns.push({ id: "adder", type: "adder", position: { x: 820, y: ry + (ry ? 8 : 0) }, data: { project, onAdd, gitops } });
+
+      const primary = appNodesSg[0].id;
+      const es: Edge[] = [
+        { id: "e-ingress", type: "smoothstep", source: "ingress", sourceHandle: "out", target: primary, targetHandle: "in", animated: true, style: { stroke: "#f5a623", strokeWidth: 2 } },
+      ];
+      // Internal app↔app + app→package edges from the scan (skip ingress + deduped dbs).
+      for (const e of sg.edges) {
+        if (e.from === "ingress" || e.to === "ingress") continue;
+        const okTarget = appNodesSg.some((a) => a.id === e.to) || detected.some((d) => d.id === e.to);
+        if (!okTarget) continue;
+        es.push({ id: `e-${e.from}-${e.to}`, type: "smoothstep", source: e.from, sourceHandle: "out", target: e.to, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
+      }
+      // Provisioned resources hang off the primary app node.
+      for (const c of conns) {
+        es.push({ id: `e-res-${c.id}`, type: "smoothstep", source: primary, sourceHandle: "out", target: `res-${c.id}`, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
+      }
+      es.push({ id: "e-adder", type: "smoothstep", source: primary, sourceHandle: "out", target: "adder", targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 1.5, strokeDasharray: "5 5" } });
+
+      setNodes(ns);
+      setEdges(es);
+      setTimeout(() => rf.current && fitOut(rf.current), 80);
+      return;
+    }
 
     const procLabel = kind === "container" ? "Container" : kind === "static" ? "Static Site" : "Web Process";
     const ns: Node[] = [
@@ -350,7 +444,7 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
     setEdges(es);
     // Refit (zoomed out 6%) once the (async-loaded) nodes are in place.
     setTimeout(() => rf.current && fitOut(rf.current), 80);
-  }, [key, project, kind, prod, instances, memory, ddos, cdnActive, conns, gitops, onAdd, setNodes, setEdges]);
+  }, [key, project, kind, prod, instances, memory, ddos, cdnActive, conns, gitops, sg, dbs, onAdd, setNodes, setEdges]);
 
   const dark = resolvedTheme === "dark";
 

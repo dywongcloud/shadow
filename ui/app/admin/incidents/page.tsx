@@ -3,13 +3,13 @@
 import { useState } from "react";
 import { Siren, Plus, X } from "lucide-react";
 import { Card, Badge, Button, Input } from "@/components/ui";
-import { apiSend, usePoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
+import { opsSend, useOpsPoll, type Incident, type Severity, type IncidentStatus } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 const STATUSES: IncidentStatus[] = ["investigating", "identified", "monitoring", "resolved"];
 
 export default function IncidentsPage() {
-  const { data: incidents, refresh } = usePoll<Incident[]>("/v1/incidents", 4000);
+  const { data: incidents, refresh } = useOpsPoll<Incident[]>("/v1/incidents", 4000);
   const [open, setOpen] = useState(false);
 
   return (
@@ -53,7 +53,7 @@ function IncidentCard({ inc, onChange }: { inc: Incident; onChange: () => void }
 
   async function post() {
     if (!msg.trim()) return;
-    await apiSend("POST", `/v1/incidents/${inc.id}/updates`, { status, message: msg });
+    await opsSend("POST", `/v1/incidents/${inc.id}/updates`, { status, message: msg });
     setMsg("");
     onChange();
   }
@@ -111,7 +111,7 @@ function DeclareModal({ onClose, onCreated }: { onClose: () => void; onCreated: 
 
   async function declare() {
     if (!title.trim()) return;
-    await apiSend("POST", "/v1/incidents", {
+    await opsSend("POST", "/v1/incidents", {
       title,
       severity,
       affected: affected.split(",").map((s) => s.trim()).filter(Boolean),

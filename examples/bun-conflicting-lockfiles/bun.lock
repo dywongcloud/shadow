@@ -1,0 +1,10 @@
+{
+  "lockfileVersion": 1,
+  "configVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "bun-conflicting-lockfiles",
+    },
+  },
+  "packages": {}
+}

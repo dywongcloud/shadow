@@ -4,8 +4,9 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { Github, GitBranch, Loader2, Plus, Trash2, ChevronDown } from "lucide-react";
 import { Button, Input } from "@/components/ui";
-import { apiSend } from "@/lib/api";
+import { apiSend, currentTeam } from "@/lib/api";
 import { toast } from "@/components/toast";
+import { addPendingBuild } from "@/lib/pending-builds";
 
 type Env = "production" | "preview";
 
@@ -94,6 +95,8 @@ export function CreateDeploymentModal({
         // a new-project create — keep the name verbatim, never 409 / suffix.
         redeploy: true,
       });
+      // Persist the in-flight build so its "Building" row survives navigation/reload.
+      addPendingBuild({ id: r.build_id, project, team: currentTeam(), env: target });
       toast("New Deployment Created");
       onDone?.(r.build_id, target);
       onClose();

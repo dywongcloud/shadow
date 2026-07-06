@@ -197,6 +197,19 @@ export async function ensureRepo(dir: string, defaultBranch = "main"): Promise<b
   }
 }
 
+/** List the repo's currently-tracked files (from the index/HEAD). Lets the GitOps
+ *  mirror prune artifact files that no longer exist before committing a fresh tree
+ *  onto a freshly-cloned remote checkout. */
+export async function listTrackedFiles(dir: string): Promise<string[]> {
+  const fs = await getFs();
+  const { git } = await gitMods();
+  try {
+    return (await git.listFiles({ fs, dir })) as string[];
+  } catch {
+    return [];
+  }
+}
+
 /** Read a file from the working dir as text (or null if absent). */
 export async function readFile(dir: string, filepath: string): Promise<string | null> {
   const fs = (await getFs()) as { promises: { readFile: (p: string, e: string) => Promise<string> } };

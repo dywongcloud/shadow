@@ -255,6 +255,20 @@ impl CellBackend for MockBackend {
                 args.push("-e".into());
                 args.push(format!("{k}={v}"));
             }
+            // Automatic persistent volume (start_cmd[3] `vol`/`volpath`): a host-backed
+            // named volume (≥1 GB) mounted so the container's data survives restarts.
+            // Same behavior as `podman_run_container` (used by the Firecracker backend).
+            if let Some((vname, vpath)) = net.as_ref().and_then(|n| {
+                let name = n.get("vol").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
+                let path = n.get("volpath").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/data");
+                Some((name.to_string(), path.to_string()))
+            }) {
+                let _ = Command::new("podman").args(["volume", "create", &vname]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                args.push("-e".into());
+                args.push(format!("HIVE_VOLUME={vpath}"));
+                args.push("-v".into());
+                args.push(format!("{vname}:{vpath}"));
+            }
             if let Some(n) = &net {
                 if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                     args.push("--network".into());
@@ -272,9 +286,9 @@ impl CellBackend for MockBackend {
                 }
             }
             // Resource ceilings + privilege drop (DoS / escalation defense) —
-            // podman run OPTIONS, so they precede the image name. Mirrors the
-            // shared `podman_run_container` path's `ContainerLimits::default()`.
-            args.extend(crate::ContainerLimits::default().podman_run_flags());
+            // podman run OPTIONS, so they precede the image name. Honors the
+            // deployment's requested memory (else the generous env-tunable default).
+            args.extend(crate::ContainerLimits::for_container(func.memory_mib).podman_run_flags());
             args.push("-p".into());
             args.push(format!("127.0.0.1:{port}:{internal}"));
             args.push(image.clone());
@@ -283,10 +297,22 @@ impl CellBackend for MockBackend {
                 .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
                 .output()
                 .await?;
-            anyhow::ensure!(status.status.success(), "podman run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
-            self.containers.lock().await.insert(cell.id.clone(), name);
+            if !status.status.success() {
+                // Reclaim the podman lock a failed start may leak (see the same
+                // fix in lib.rs::podman_run_container — leaked `created` shells
+                // exhaust the 2048-lock pool → CAPACITY_EXHAUSTED fleet-wide).
+                let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                anyhow::bail!("podman run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
+            }
+            self.containers.lock().await.insert(cell.id.clone(), name.clone());
             let func_addr = format!("127.0.0.1:{port}");
-            wait_tcp_ready(&func_addr, Duration::from_secs(60)).await?;
+            // Readiness failure must ALSO remove the container (else a crash-looping
+            // image leaks a lock every keep-warm tick).
+            if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
+                let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                self.containers.lock().await.remove(&cell.id);
+                return Err(e);
+            }
             // Front the container with the multiplexed tunnel server.
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let tunnel_addr = listener.local_addr()?.to_string();
@@ -335,11 +361,17 @@ impl CellBackend for MockBackend {
             .kill_on_drop(true);
         // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
         // writable cache dir under the workdir so cold starts reuse precompiled
-        // bytecode (Node >=22.1 auto-loads it). Node-family only; opt-out via
-        // HIVE_COMPILE_CACHE=0 in the deployment env. Mirrors the microVM cell-agent.
+        // bytecode (Node >=22.1 auto-loads it). Genuinely Node/V8-only — Bun uses
+        // JavaScriptCore and does not read NODE_COMPILE_CACHE at all, so setting
+        // it for a Bun process used to be a silent no-op (wasted a directory
+        // create, produced zero speedup). Bun's bytecode cache is a build-time
+        // artifact (a `.jsc` sidecar bundled next to the entry file by
+        // `bun build --bytecode`) that `bun run <entry>` auto-loads with NO
+        // runtime env var needed at all — so the Bun path here is correctly a
+        // no-op, not a workaround. Opt-out via HIVE_COMPILE_CACHE=0. Mirrors the
+        // microVM cell-agent.
         let cc_off = func.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
-        let first = func.start_cmd[0].rsplit('/').next().unwrap_or(&func.start_cmd[0]);
-        if !cc_off && matches!(first, "node" | "npm" | "npx" | "pnpm" | "yarn" | "bun" | "next") {
+        if !cc_off && func.runtime.uses_v8_compile_cache() {
             let cache_dir = workdir.join(".hive-compile-cache");
             if std::fs::create_dir_all(&cache_dir).is_ok() {
                 cmd.env("NODE_COMPILE_CACHE", &cache_dir);

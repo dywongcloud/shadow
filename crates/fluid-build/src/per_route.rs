@@ -276,7 +276,15 @@ mod tests {
     }
 
     fn fixture() -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!("nft-fixture-{}", std::process::id()));
+        // A unique-per-call suffix (not just the process id) — three separate
+        // tests call this and cargo runs tests on multiple threads within the
+        // same process by default, so a shared path let one test's
+        // `remove_dir_all` race another's still-in-progress reads/writes
+        // (a pre-existing, occasionally-flaky test-isolation bug).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let id = N.fetch_add(1, Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("nft-fixture-{}-{}", std::process::id(), id));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         // App Router: an SSR page, a route handler, plus an API + an edge route.

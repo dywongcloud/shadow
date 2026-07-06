@@ -31,6 +31,7 @@ serde_yaml = "0.9"
 reqwest = { workspace = true }
 parking_lot = { workspace = true }
 futures = { workspace = true }
+async-trait = { workspace = true }
 hyper = { version = "1", features = ["http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 uuid = { workspace = true }
@@ -38,20 +39,42 @@ jsonwebtoken = "9"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 hmac = "0.12"
 sha2 = "0.10"
+# Memory-hard password KDF for deployment password-protection (replaces the
+# brute-forceable sha256(project:password) hash). PHC-string output embeds the
+# random salt + params, so a hash computed once on the owner node stays
+# verifiable on every peer it's gossiped to.
+argon2 = { version = "0.5", features = ["std"] }
 sysinfo = "0.32"
 # Seer: the platform's own pkarr discovery relay (verify/serve signed node records).
 # `signed_packet` only — no DHT/client/network deps. Pinned to iroh's pkarr version.
 pkarr = { version = "3.10", default-features = false, features = ["signed_packet"] }
+tower = { version = "0.5", features = ["util", "limit"] }
+# Connection/request-level DoS bounds on the HTTP listeners: per-request wall
+# timeout, request body size cap, and global in-flight concurrency ceiling.
+tower-http = { version = "0.6", features = ["timeout", "limit"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen"] }
+arc-swap = "1"
+rustls-pemfile = "2"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Raw-TCP TLS accept for the DB gateway (Postgres/Redis SNI proxy). Matches the
+# rustls 0.23 already in the tree (transitive via axum-server); made direct here.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 ring = "0.17"
 base64 = "0.22"
 serde_cbor = "0.11"
+# DB-gateway HTTP REST surface: SQL-over-HTTP for managed Postgres. Real client
+# with real parameter binding (extended protocol) — never string interpolation.
+# chrono/serde_json/uuid decode features match crates already in the tree.
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+# URL-decode for the Upstash-style `GET /<CMD>/<arg>` redis REST path segments.
+# Already in the tree transitively (2.3.x); made direct here.
+percent-encoding = "2"
 
 # Always-on: iroh-native, P2P-replicated durable store (iroh-docs + iroh-blobs).
 # Every platform snapshot is replicated here, in local/dev and production alike.
-guardian-db = { version = "0.16" }
+guardian-db = { version = "0.17" }
 
 # Optional: production-grade Raft consensus (full log + state machine). The
 # always-on lightweight coordinator in cluster.rs is the default; `--features
@@ -61,6 +84,7 @@ openraft = { version = "0.9", optional = true }
 # Optional EXPERIMENT: anonymous team/role membership demo endpoints (`zkauth`
 # feature). Off by default; mounts /v1/zkauth/* and is not part of real auth.
 hive-zkauth = { workspace = true, optional = true }
+rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
 
 [features]
 default = []

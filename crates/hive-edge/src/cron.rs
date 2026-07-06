@@ -31,6 +31,10 @@ pub struct CronJob {
     /// config-sourced set on each deploy without touching manual jobs.
     #[serde(default = "default_cron_source")]
     pub source: String,
+    /// Owning team/tenant slug (empty = "personal" for jobs persisted before
+    /// multi-tenant scoping). The API filters list/delete by this.
+    #[serde(default)]
+    pub tenant: String,
 }
 
 fn default_cron_source() -> String {
@@ -141,6 +145,7 @@ mod tests {
                 next_run_ms: None,
                 runs: 0,
                 source: "manual".into(),
+                tenant: String::new(),
             })
             .expect("valid");
         assert!(job.next_run_ms.is_some());
@@ -164,6 +169,7 @@ mod tests {
             next_run_ms: None,
             runs: 0,
             source: "manual".into(),
+            tenant: String::new(),
         });
         assert!(r.is_err());
     }

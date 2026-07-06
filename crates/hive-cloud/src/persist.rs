@@ -89,6 +89,11 @@ pub struct PlatformSnapshot {
     /// [`crate::enterprise::EnterpriseSnapshot`].
     #[serde(default)]
     pub enterprise: crate::enterprise::EnterpriseSnapshot,
+    /// Sandboxes (records only — live cell handles/vsock sockets don't survive
+    /// a restart and are re-provisioned on next use). See
+    /// [`crate::sandboxes::SandboxesSnapshot`].
+    #[serde(default)]
+    pub sandboxes: crate::sandboxes::SandboxesSnapshot,
 }
 
 pub fn data_dir() -> PathBuf {
@@ -287,6 +292,10 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         gitops: cloud.gitops.snapshot(),
         workflow_defs: cloud.workflows.defs(),
         enterprise: cloud.enterprise.snapshot(),
+        sandboxes: {
+            let (sandboxes, commands, snapshots, mounts) = cloud.sandboxes.snapshot();
+            crate::sandboxes::SandboxesSnapshot { sandboxes, commands, snapshots, mounts }
+        },
     }
 }
 
@@ -442,6 +451,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.docs.load(snap.docs);
     cloud.gitops.load(snap.gitops);
     cloud.enterprise.load(snap.enterprise);
+    cloud.sandboxes.load(snap.sandboxes.sandboxes, snap.sandboxes.commands, snap.sandboxes.snapshots, snap.sandboxes.mounts);
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }

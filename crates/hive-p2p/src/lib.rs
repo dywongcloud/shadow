@@ -45,20 +45,172 @@ const STREAM_RAW: u8 = 0x01;
 /// run over authenticated QUIC instead of HTTP-over-SSH (the trust gate on the
 /// connection already authenticates the peer's identity). Method: 0=GET, 1=POST.
 const STREAM_GOSSIP: u8 = 0x02;
+/// SIGNED control-plane gossip (web3 trustlessness): same request framing as
+/// [`STREAM_GOSSIP`] followed by a trailer `[32B signer pubkey][8B ts_ms][64B sig]`.
+/// The ed25519 signature covers a domain-separated preimage of the whole request
+/// (`hive-gossip-v1 || method || path || body || ts`), so the receiver verifies the
+/// MESSAGE cryptographically — not just the transport — and additionally binds the
+/// signer to the QUIC connection's authenticated remote identity (signer == remote,
+/// so a signed message can't be replayed by a third party from another channel).
+const STREAM_GOSSIP_SIGNED: u8 = 0x03;
 const GOSSIP_METHOD_GET: u8 = 0;
 const GOSSIP_METHOD_POST: u8 = 1;
+/// Domain separator for gossip signatures (versioned; bump on format change).
+const GOSSIP_SIG_DOMAIN: &[u8] = b"hive-gossip-v1";
 /// Cap on a single gossip frame (request path/body or response) — gossip payloads
 /// are small JSON rosters; this just bounds a malformed/hostile length prefix.
 const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
 
-/// Serves one gossip request: `(method, path, body) -> response body bytes`. The
-/// caller (hive-cloud) wires this to dispatch onto its local admin handlers, so the
-/// exact same endpoints that answer HTTP gossip answer iroh gossip.
+/// Serves one gossip request: `(method, path, body, verified_signer) -> response
+/// body bytes`. The caller (hive-cloud) wires this to dispatch onto its local admin
+/// handlers, so the exact same endpoints that answer HTTP gossip answer iroh gossip.
+/// `verified_signer` is `Some(node_id)` when the request carried a VALID ed25519
+/// signature bound to the connection's remote identity (see [`STREAM_GOSSIP_SIGNED`]),
+/// `None` for legacy-unsigned requests (only admitted outside enforce mode).
 pub type GossipHandler = Arc<
-    dyn Fn(u8, String, Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+    dyn Fn(u8, String, Vec<u8>, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
         + Send
         + Sync,
 >;
+
+/// Gossip signature-verification mode (staged rollout so enforcement can't
+/// partition a mixed-version fleet): `HIVE_GOSSIP_VERIFY` = `off` | `log` (default:
+/// verify + count + warn, but still serve unsigned/invalid) | `enforce` (reject
+/// anything but a valid signature from the connected peer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerifyMode {
+    Off,
+    Log,
+    Enforce,
+}
+
+/// Whether outbound gossip is signed (`HIVE_GOSSIP_SIGN=1`). Default OFF until the
+/// whole fleet runs a binary that understands [`STREAM_GOSSIP_SIGNED`].
+pub fn gossip_sign_enabled() -> bool {
+    std::env::var("HIVE_GOSSIP_SIGN").map(|v| v == "1" || v == "true").unwrap_or(false)
+}
+
+pub fn verify_mode() -> VerifyMode {
+    match std::env::var("HIVE_GOSSIP_VERIFY").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "off" => VerifyMode::Off,
+        "enforce" | "strict" | "1" => VerifyMode::Enforce,
+        _ => VerifyMode::Log,
+    }
+}
+
+/// Max allowed clock skew / age for a signed gossip message (replay guard),
+/// env-tunable via `HIVE_GOSSIP_TS_WINDOW_SECS` (default 300).
+fn gossip_ts_window_ms() -> u64 {
+    std::env::var("HIVE_GOSSIP_TS_WINDOW_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(300) * 1000
+}
+
+/// Mesh-wide message-verification counters (surfaced via `/v1/relay` for
+/// observability during the staged log→enforce rollout).
+#[derive(Default)]
+pub struct VerifyStats {
+    pub signed_ok: AtomicU64,
+    pub unsigned: AtomicU64,
+    pub bad_sig: AtomicU64,
+    pub stale_ts: AtomicU64,
+    pub signer_mismatch: AtomicU64,
+    pub rejected: AtomicU64,
+}
+
+static VERIFY_STATS: VerifyStats = VerifyStats {
+    signed_ok: AtomicU64::new(0),
+    unsigned: AtomicU64::new(0),
+    bad_sig: AtomicU64::new(0),
+    stale_ts: AtomicU64::new(0),
+    signer_mismatch: AtomicU64::new(0),
+    rejected: AtomicU64::new(0),
+};
+
+/// Snapshot of the verification counters:
+/// `(signed_ok, unsigned, bad_sig, stale_ts, signer_mismatch, rejected)`.
+pub fn verify_stats() -> (u64, u64, u64, u64, u64, u64) {
+    (
+        VERIFY_STATS.signed_ok.load(Ordering::Relaxed),
+        VERIFY_STATS.unsigned.load(Ordering::Relaxed),
+        VERIFY_STATS.bad_sig.load(Ordering::Relaxed),
+        VERIFY_STATS.stale_ts.load(Ordering::Relaxed),
+        VERIFY_STATS.signer_mismatch.load(Ordering::Relaxed),
+        VERIFY_STATS.rejected.load(Ordering::Relaxed),
+    )
+}
+
+/// The domain-separated byte string an ed25519 gossip signature covers. Pure, so
+/// signer and verifier can't drift.
+fn gossip_sig_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u8> {
+    let mut m = Vec::with_capacity(GOSSIP_SIG_DOMAIN.len() + 1 + 8 + 8 + path.len() + body.len() + 8);
+    m.extend_from_slice(GOSSIP_SIG_DOMAIN);
+    m.push(method);
+    m.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    m.extend_from_slice(path.as_bytes());
+    m.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    m.extend_from_slice(body);
+    m.extend_from_slice(&ts_ms.to_be_bytes());
+    m
+}
+
+/// Sign a gossip request with this node's iroh identity key. Returns the 104-byte
+/// trailer `[32B signer pubkey][8B ts_ms][64B sig]` appended to the framed request.
+pub fn sign_gossip(secret: &iroh::SecretKey, method: u8, path: &str, body: &[u8], ts_ms: u64) -> [u8; 104] {
+    let sig = secret.sign(&gossip_sig_preimage(method, path, body, ts_ms));
+    let mut out = [0u8; 104];
+    out[..32].copy_from_slice(secret.public().as_bytes());
+    out[32..40].copy_from_slice(&ts_ms.to_be_bytes());
+    out[40..104].copy_from_slice(&sig.to_bytes());
+    out
+}
+
+/// Verify a signed-gossip trailer. `remote_id` is the QUIC connection's
+/// authenticated remote identity — the signer must BE that peer. Returns the
+/// verified signer id string, or a &'static str reason (also counted).
+pub fn verify_gossip(
+    trailer: &[u8],
+    method: u8,
+    path: &str,
+    body: &[u8],
+    remote_id: &str,
+    now_ms: u64,
+) -> Result<String, &'static str> {
+    if trailer.len() != 104 {
+        VERIFY_STATS.bad_sig.fetch_add(1, Ordering::Relaxed);
+        return Err("malformed signature trailer");
+    }
+    let mut pk = [0u8; 32];
+    pk.copy_from_slice(&trailer[..32]);
+    let mut tsb = [0u8; 8];
+    tsb.copy_from_slice(&trailer[32..40]);
+    let ts = u64::from_be_bytes(tsb);
+    let mut sigb = [0u8; 64];
+    sigb.copy_from_slice(&trailer[40..104]);
+    let Ok(signer) = iroh::PublicKey::from_bytes(&pk) else {
+        VERIFY_STATS.bad_sig.fetch_add(1, Ordering::Relaxed);
+        return Err("invalid signer key");
+    };
+    let sig = iroh::Signature::from_bytes(&sigb);
+    if signer.verify(&gossip_sig_preimage(method, path, body, ts), &sig).is_err() {
+        VERIFY_STATS.bad_sig.fetch_add(1, Ordering::Relaxed);
+        return Err("signature invalid");
+    }
+    // Replay guard: reject messages outside the freshness window (either direction —
+    // covers clock skew AND recorded-replay).
+    let window = gossip_ts_window_ms();
+    if now_ms.abs_diff(ts) > window {
+        VERIFY_STATS.stale_ts.fetch_add(1, Ordering::Relaxed);
+        return Err("timestamp outside freshness window");
+    }
+    // Transport binding: the signer must be the connection's authenticated peer, so
+    // a valid signed message lifted from one channel can't be injected via another.
+    let signer_s = signer.to_string();
+    if !remote_id.is_empty() && signer_s != remote_id {
+        VERIFY_STATS.signer_mismatch.fetch_add(1, Ordering::Relaxed);
+        return Err("signer does not match connection identity");
+    }
+    VERIFY_STATS.signed_ok.fetch_add(1, Ordering::Relaxed);
+    Ok(signer_s)
+}
 
 /// Method code for a GET gossip request.
 pub const GOSSIP_GET: u8 = GOSSIP_METHOD_GET;
@@ -113,6 +265,101 @@ pub struct RelayStats {
     pub relayed_bytes_rx: u64,
     pub direct_bytes_tx: u64,
     pub direct_bytes_rx: u64,
+    /// Per-peer, per-phase iroh timeout counters (#H4) — `p2p_timeout{phase,node_id}`.
+    pub timeouts: Vec<PeerTimeout>,
+}
+
+/// One peer/phase timeout counter, surfaced via [`PeerPool::relay_stats`].
+#[derive(Clone, Debug)]
+pub struct PeerTimeout {
+    pub node_id: String,
+    pub phase: &'static str,
+    pub count: u64,
+}
+
+// ---- H4: bounded iroh data plane ------------------------------------------------
+//
+// Every iroh phase gets a timeout budget so a holepunched-but-silent or
+// accept-but-no-answer peer can't hang a request forever (and, because edge.rs
+// walks candidates sequentially, block the whole queue). Budgets respect the
+// pre-send vs post-send retry rule already encoded in `request_stream`.
+
+/// Read a millisecond budget from env, falling back to `default_ms`. A value of 0
+/// (or unparseable) falls back to the default — we never allow an unbounded await.
+fn env_ms(key: &str, default_ms: u64) -> Duration {
+    let ms = std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default_ms);
+    Duration::from_millis(ms)
+}
+/// Connect (holepunch + handshake) budget — pre-send. Holepunch can be slow.
+fn connect_budget() -> Duration { env_ms("HIVE_P2P_CONNECT_MS", 5_000) }
+/// `open_bi` budget — pre-send. Cheap once the conn is live; a hang = half-dead trunk.
+fn open_budget() -> Duration { env_ms("HIVE_P2P_OPEN_MS", 2_000) }
+/// First-byte / response-headers budget — post-send. Generous: the cell may be cold.
+fn firstbyte_budget() -> Duration { env_ms("HIVE_P2P_FIRSTBYTE_MS", 15_000) }
+/// Body inter-chunk IDLE budget — post-send. Not a wall-clock cap; reset per chunk
+/// so SSE / long streams survive, only killed on inactivity.
+fn idle_budget() -> Duration { env_ms("HIVE_P2P_IDLE_MS", 45_000) }
+
+const PHASE_CONNECT: usize = 0;
+const PHASE_OPEN: usize = 1;
+const PHASE_FIRSTBYTE: usize = 2;
+const PHASE_IDLE: usize = 3;
+const PHASE_NAMES: [&str; 4] = ["connect", "open", "firstbyte", "idle"];
+
+/// Marker error: a **pre-send** iroh phase (connect or `open_bi`) timed out — the
+/// strongest possible "this peer is dead" signal. The caller (edge gateway) should
+/// mark the peer unhealthy so candidate ranking stops choosing it; downcast the
+/// returned `anyhow::Error` to detect it.
+#[derive(Clone, Debug)]
+pub struct DeadPeerTimeout {
+    pub node_id: String,
+    pub phase: &'static str,
+    pub budget_ms: u64,
+}
+impl std::fmt::Display for DeadPeerTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "p2p {} timeout to {} after {}ms (peer presumed dead)", self.phase, self.node_id, self.budget_ms)
+    }
+}
+impl std::error::Error for DeadPeerTimeout {}
+
+/// Marker error: a **post-send** iroh phase (first byte or body idle) timed out.
+/// NOT a dead-peer signal — the request was already on the wire, so the caller must
+/// fail over (never silently retry a possibly-side-effecting call).
+#[derive(Clone, Debug)]
+pub struct PostSendTimeout {
+    pub node_id: String,
+    pub phase: &'static str,
+    pub budget_ms: u64,
+}
+impl std::fmt::Display for PostSendTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "p2p {} timeout to {} after {}ms (post-send; no retry)", self.phase, self.node_id, self.budget_ms)
+    }
+}
+impl std::error::Error for PostSendTimeout {}
+
+/// Per-peer, per-phase timeout counters (#H4 observability).
+#[derive(Default)]
+struct TimeoutCounters {
+    map: Mutex<HashMap<String, [u64; 4]>>,
+}
+impl TimeoutCounters {
+    async fn bump(&self, node_id: &str, phase: usize) {
+        self.map.lock().await.entry(node_id.to_string()).or_insert([0; 4])[phase] += 1;
+    }
+    async fn snapshot(&self) -> Vec<PeerTimeout> {
+        let m = self.map.lock().await;
+        let mut out = Vec::new();
+        for (node, counts) in m.iter() {
+            for (i, &c) in counts.iter().enumerate() {
+                if c > 0 {
+                    out.push(PeerTimeout { node_id: node.clone(), phase: PHASE_NAMES[i], count: c });
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A response collected from a single P2P tunnel request (gateway side).
@@ -134,12 +381,39 @@ pub struct TunnelStream {
     /// consumed — dropping the client early would reset the send stream and can
     /// truncate the response. The owning [`TunnelStream`] outlives the body drain.
     _client: fluid_tunnel::TunnelClient,
+    /// Inter-chunk idle budget (#H4) — reset per chunk, so a long-lived but active
+    /// stream (SSE) survives and only an idle/wedged one is killed.
+    idle: Duration,
+    node_id: String,
+    timeouts: Arc<TimeoutCounters>,
+    /// Set once the idle budget elapses, so the buffered [`PeerPool::request`]
+    /// drain can distinguish "killed on inactivity" from a clean EOF.
+    idle_timed_out: bool,
 }
 
 impl TunnelStream {
-    /// Next body chunk, or `None` at the end of the response body.
+    /// Next body chunk, or `None` at end-of-body — OR when the inter-chunk idle
+    /// budget elapses (the peer went silent mid-stream). Each chunk resets the
+    /// budget, so an active stream is never killed.
     pub async fn recv(&mut self) -> Option<bytes::Bytes> {
-        self.body.recv().await
+        if self.idle_timed_out {
+            return None;
+        }
+        match tokio::time::timeout(self.idle, self.body.recv()).await {
+            Ok(opt) => opt,
+            Err(_) => {
+                self.idle_timed_out = true;
+                self.timeouts.bump(&self.node_id, PHASE_IDLE).await;
+                tracing::warn!(node_id = %self.node_id, idle_ms = self.idle.as_millis() as u64, "p2p body idle timeout");
+                None
+            }
+        }
+    }
+
+    /// Whether the stream ended because of an idle timeout (vs a clean EOF). Lets a
+    /// buffered caller turn a mid-stream stall into an explicit error.
+    pub fn timed_out(&self) -> bool {
+        self.idle_timed_out
     }
 }
 
@@ -162,6 +436,7 @@ pub struct PeerPool {
     trunks: Mutex<HashMap<String, Trunk>>,
     opened: AtomicU64,
     reused: AtomicU64,
+    timeouts: Arc<TimeoutCounters>,
 }
 
 impl PeerPool {
@@ -172,12 +447,28 @@ impl PeerPool {
             trunks: Mutex::new(HashMap::new()),
             opened: AtomicU64::new(0),
             reused: AtomicU64::new(0),
+            timeouts: Arc::new(TimeoutCounters::default()),
         })
     }
 
     /// `(opened, reused)` connection counters — for diagnostics and tests.
     pub fn stats(&self) -> (u64, u64) {
         (self.opened.load(Ordering::Relaxed), self.reused.load(Ordering::Relaxed))
+    }
+
+    /// Proactively ensure a live trunk to `node_id` exists — dial (holepunch) if
+    /// missing/dead, reuse if already warm — WITHOUT opening a request stream. Lets
+    /// a background maintainer keep the whole mesh pre-trunked so a request-time
+    /// dial/holepunch is the rare exception (peer just restarted), not the norm.
+    /// Connect is bounded by the H4 budget, so a dead peer can't wedge the warmer.
+    /// Returns whether a live trunk is now cached.
+    pub async fn warm(&self, node_id: &str, addr_json: &str) -> bool {
+        self.acquire(node_id, addr_json).await.is_ok()
+    }
+
+    /// Number of currently-cached (live-or-not) trunks — for diagnostics / tests.
+    pub async fn trunk_count(&self) -> usize {
+        self.trunks.lock().await.len()
     }
 
     /// Relay cost accounting (#23): classify each live trunk as relay vs direct via
@@ -205,6 +496,8 @@ impl PeerPool {
                 s.relayed_bytes_rx += rx;
             }
         }
+        drop(map);
+        s.timeouts = self.timeouts.snapshot().await;
         s
     }
 
@@ -227,9 +520,26 @@ impl PeerPool {
             }
         } // lock dropped: trunk missing or dead → dial below
 
-        // Slow path: dial OUTSIDE the lock.
+        // Slow path: dial OUTSIDE the lock, BOUNDED by the connect budget (#H4).
+        // A holepunch that never completes would otherwise hang here forever and —
+        // since edge.rs walks candidates sequentially — block the whole queue.
         let addr: EndpointAddr = serde_json::from_str(addr_json)?;
-        let conn = self.ep.connect(addr, HIVE_ALPN).await?;
+        let budget = connect_budget();
+        let conn = match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                // Pre-send timeout: nothing was sent. Strongest "peer dead" signal.
+                self.timeouts.bump(node_id, PHASE_CONNECT).await;
+                self.evict(node_id).await; // no trunk yet, but keep the invariant
+                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p connect timeout");
+                return Err(anyhow::Error::new(DeadPeerTimeout {
+                    node_id: node_id.to_string(),
+                    phase: "connect",
+                    budget_ms: budget.as_millis() as u64,
+                }));
+            }
+        };
 
         // Re-lock to publish the trunk. A concurrent first-contact may double-dial;
         // that's fine — last insert wins and the extra connection drops (closes).
@@ -274,6 +584,15 @@ impl PeerPool {
         while let Some(chunk) = s.recv().await {
             buf.extend_from_slice(&chunk);
         }
+        // A mid-stream idle timeout (post-send) becomes an explicit error rather
+        // than a silently-truncated body.
+        if s.timed_out() {
+            return Err(anyhow::Error::new(PostSendTimeout {
+                node_id: node_id.to_string(),
+                phase: "idle",
+                budget_ms: idle_budget().as_millis() as u64,
+            }));
+        }
         Ok(TunnelResp { status: s.status, headers: s.headers, body: buf })
     }
 
@@ -295,16 +614,36 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = self.acquire(node_id, addr_json).await?;
-            // `open_bi` is PRE-SEND: an error means no request bytes left this node.
-            let (mut send, recv) = match conn.open_bi().await {
-                Ok(pair) => pair,
+            // ACQUIRE (connect is bounded inside `acquire`). A connect timeout /
+            // failure is PRE-SEND → evict + retry once (safe even for POST).
+            let conn = match self.acquire(node_id, addr_json).await {
+                Ok(c) => c,
                 Err(e) => {
                     self.evict(node_id).await;
                     if attempt < 2 {
-                        continue; // re-dial + resend exactly once
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            // OPEN_BI — PRE-SEND, bounded by the open budget. An error OR a timeout
+            // means no request bytes left this node → evict + retry once.
+            let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
                     }
                     return Err(e.into());
+                }
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_OPEN).await;
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(self.dead_peer(node_id, "open", open_budget()));
                 }
             };
             // Select the multiplexed tunnel mode for the owner's dispatcher.
@@ -312,8 +651,27 @@ impl PeerPool {
             send.flush().await?;
             // Past this point the request may be on the wire → do NOT retry in-call.
             let client = fluid_tunnel::TunnelClient::new(tokio::io::join(recv, send));
+            // FIRST BYTE / response headers — POST-SEND, bounded by the firstbyte
+            // budget (generous: the far cell may be cold-starting). On timeout we
+            // return Err so edge.rs candidate failover decides — never retry here.
             // `to_vec` per attempt so a retry still owns the headers.
-            let resp = client.request(method, path, headers.to_vec(), body).await?;
+            let resp = match tokio::time::timeout(
+                firstbyte_budget(),
+                client.request(method, path, headers.to_vec(), body),
+            )
+            .await
+            {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
+                    return Err(anyhow::Error::new(PostSendTimeout {
+                        node_id: node_id.to_string(),
+                        phase: "firstbyte",
+                        budget_ms: firstbyte_budget().as_millis() as u64,
+                    }));
+                }
+            };
             // Move the client INTO the stream so it lives until the body is drained
             // (keeping the QUIC streams open); see `TunnelStream::_client`.
             return Ok(TunnelStream {
@@ -321,8 +679,21 @@ impl PeerPool {
                 headers: resp.headers,
                 body: resp.body,
                 _client: client,
+                idle: idle_budget(),
+                node_id: node_id.to_string(),
+                timeouts: self.timeouts.clone(),
+                idle_timed_out: false,
             });
         }
+    }
+
+    /// Build a [`DeadPeerTimeout`] anyhow error for a pre-send phase.
+    fn dead_peer(&self, node_id: &str, phase: &'static str, budget: Duration) -> anyhow::Error {
+        anyhow::Error::new(DeadPeerTimeout {
+            node_id: node_id.to_string(),
+            phase,
+            budget_ms: budget.as_millis() as u64,
+        })
     }
 
     /// Open a RAW bidirectional byte stream to a peer over its trunk, for upgraded
@@ -333,15 +704,32 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = self.acquire(node_id, addr_json).await?;
-            let (mut send, recv) = match conn.open_bi().await {
-                Ok(pair) => pair,
+            let conn = match self.acquire(node_id, addr_json).await {
+                Ok(c) => c,
                 Err(e) => {
                     self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
+                    return Err(e);
+                }
+            };
+            let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
                     return Err(e.into());
+                }
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_OPEN).await;
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(self.dead_peer(node_id, "open", open_budget()));
                 }
             };
             send.write_all(&[STREAM_RAW]).await?;
@@ -365,26 +753,75 @@ impl PeerPool {
         let mut attempt = 0u8;
         loop {
             attempt += 1;
-            let conn = self.acquire(node_id, addr_json).await?;
-            let (mut send, mut recv) = match conn.open_bi().await {
-                Ok(pair) => pair,
+            let conn = match self.acquire(node_id, addr_json).await {
+                Ok(c) => c,
                 Err(e) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
                     self.evict(node_id).await;
                     if attempt < 2 {
                         continue;
                     }
                     return Err(e.into());
                 }
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_OPEN).await;
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(self.dead_peer(node_id, "open", open_budget()));
+                }
             };
-            send.write_all(&[STREAM_GOSSIP, method]).await?;
-            send.write_all(&(path.len() as u32).to_be_bytes()).await?;
-            send.write_all(path.as_bytes()).await?;
-            send.write_all(&(body.len() as u32).to_be_bytes()).await?;
-            send.write_all(body).await?;
+            // SIGN outbound gossip (web3 trustlessness): receivers verify the
+            // MESSAGE cryptographically, not just the QUIC transport. Env-gated
+            // (`HIVE_GOSSIP_SIGN=1`) because an OLD receiver would misparse the new
+            // stream mode as a tunnel — staged rollout is: (1) ship binary fleet-wide
+            // (receivers understand both modes), (2) flip signing on everywhere,
+            // (3) flip `HIVE_GOSSIP_VERIFY=enforce`. Each phase is mixed-fleet safe.
+            if gossip_sign_enabled() {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let trailer = sign_gossip(self.ep.secret_key(), method, path, body, ts);
+                send.write_all(&[STREAM_GOSSIP_SIGNED, method]).await?;
+                send.write_all(&(path.len() as u32).to_be_bytes()).await?;
+                send.write_all(path.as_bytes()).await?;
+                send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                send.write_all(body).await?;
+                send.write_all(&trailer).await?;
+            } else {
+                send.write_all(&[STREAM_GOSSIP, method]).await?;
+                send.write_all(&(path.len() as u32).to_be_bytes()).await?;
+                send.write_all(path.as_bytes()).await?;
+                send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                send.write_all(body).await?;
+            }
             send.flush().await?;
             let _ = send.finish();
-            // Response: [u32 len][bytes].
-            let resp = read_frame(&mut recv).await?;
+            // Response: [u32 len][bytes]. POST-SEND read bounded by the firstbyte
+            // budget so a peer that accepts the stream but never answers can't hang.
+            let resp = match tokio::time::timeout(firstbyte_budget(), read_frame(&mut recv)).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
+                    return Err(anyhow::Error::new(PostSendTimeout {
+                        node_id: node_id.to_string(),
+                        phase: "firstbyte",
+                        budget_ms: firstbyte_budget().as_millis() as u64,
+                    }));
+                }
+            };
             return Ok(resp);
         }
     }
@@ -613,8 +1050,17 @@ pub type P2pStream = tokio::io::Join<iroh::endpoint::RecvStream, iroh::endpoint:
 /// the `STREAM_TUNNEL` mode byte so the owner's dispatcher treats it as a
 /// `fluid-tunnel` session (the caller wraps the returned stream in a `TunnelClient`).
 pub async fn dial(ep: &Endpoint, addr: impl Into<EndpointAddr>) -> Result<P2pStream> {
-    let conn = ep.connect(addr, HIVE_ALPN).await?;
-    let (mut send, recv) = conn.open_bi().await?;
+    // Bound connect + open_bi (#H4) so a standalone dial can't hang unbounded.
+    let conn = match tokio::time::timeout(connect_budget(), ep.connect(addr, HIVE_ALPN)).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("dial connect timeout after {}ms", connect_budget().as_millis())),
+    };
+    let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => return Err(e.into()),
+        Err(_) => return Err(anyhow::anyhow!("dial open_bi timeout after {}ms", open_budget().as_millis())),
+    };
     send.write_all(&[STREAM_TUNNEL]).await?;
     send.flush().await?;
     Ok(tokio::io::join(recv, send))
@@ -641,14 +1087,19 @@ pub async fn serve_tunnels(
                 Ok(c) => c,
                 Err(_) => return,
             };
+            // The connection's cryptographic remote identity (ed25519, from the QUIC
+            // TLS handshake — unspoofable). Used for the optional #20 allowlist AND
+            // to bind signed-gossip messages to their sender (web3 verification).
+            let remote_id = conn.remote_id().to_string();
             // #20 peer trust/attestation: when an allowlist is configured, only
-            // admit endpoints whose cryptographic iroh identity (from their TLS
-            // cert, unspoofable) is trusted. Dropping `conn` closes the QUIC
-            // connection, so an untrusted peer can open no streams.
+            // admit endpoints whose cryptographic iroh identity is trusted. Dropping
+            // `conn` closes the QUIC connection, so an untrusted peer can open no
+            // streams. (With signed gossip, participation is otherwise permissionless
+            // — any peer may connect, but only cryptographically valid messages are
+            // honored in enforce mode.)
             if let Some(trust) = &trust {
-                let rid = conn.remote_id().to_string();
-                if !peer_trusted(trust, &rid) {
-                    tracing::warn!(peer = %rid, "rejected untrusted P2P peer (#20 peer trust)");
+                if !peer_trusted(trust, &remote_id) {
+                    tracing::warn!(peer = %remote_id, "rejected untrusted P2P peer (#20 peer trust)");
                     return;
                 }
             }
@@ -658,6 +1109,8 @@ pub async fn serve_tunnels(
             while let Ok((send, mut recv)) = conn.accept_bi().await {
                 let local = local.clone();
                 let gossip = gossip.clone();
+                let rid = remote_id.clone();
+                let trust = trust.clone();
                 tokio::spawn(async move {
                     // Read the 1-byte mode selector that prefixes every stream.
                     let mut mode = [0u8; 1];
@@ -665,9 +1118,9 @@ pub async fn serve_tunnels(
                         return;
                     }
                     match mode[0] {
-                        STREAM_GOSSIP => {
+                        STREAM_GOSSIP | STREAM_GOSSIP_SIGNED => {
                             if let Some(h) = gossip {
-                                serve_gossip(recv, send, h).await;
+                                serve_gossip(recv, send, h, mode[0] == STREAM_GOSSIP_SIGNED, rid, trust).await;
                             }
                         }
                         STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
@@ -686,11 +1139,41 @@ pub async fn serve_tunnels(
     }
 }
 
-/// Server side of a [`STREAM_GOSSIP`] stream: read the framed `(method, path,
-/// body)` request, run the caller-provided handler (which dispatches onto the local
-/// admin), and frame the response back. The mode byte has already been consumed.
-async fn serve_gossip<R, W>(mut recv: R, mut send: W, handler: GossipHandler)
-where
+/// Test/diagnostic helper (#H4): accept P2P connections + bi streams but NEVER
+/// write a response — the "accept-but-silent" peer. Holds both stream halves open
+/// without answering, so a caller's first-byte timeout must fire. Not used in
+/// production; exposed so the timeout tests can stand up a real silent owner.
+#[doc(hidden)]
+pub async fn serve_silent(ep: Endpoint) {
+    while let Some(incoming) = ep.accept().await {
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            while let Ok((send, recv)) = conn.accept_bi().await {
+                tokio::spawn(async move {
+                    let _keep = (send, recv); // hold open, never respond
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+    }
+}
+
+/// Server side of a [`STREAM_GOSSIP`]/[`STREAM_GOSSIP_SIGNED`] stream: read the
+/// framed `(method, path, body)` request (+ signature trailer when signed), VERIFY
+/// it per the configured [`VerifyMode`], run the caller-provided handler, and frame
+/// the response back. The mode byte has already been consumed. `remote_id` is the
+/// QUIC connection's authenticated peer identity.
+async fn serve_gossip<R, W>(
+    mut recv: R,
+    mut send: W,
+    handler: GossipHandler,
+    signed: bool,
+    remote_id: String,
+    trust: Option<TrustSet>,
+) where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -706,7 +1189,72 @@ where
         Ok(b) => b,
         Err(_) => return,
     };
-    let resp = handler(m[0], path, body).await;
+    let mode = verify_mode();
+    // Verify: a signed request must check out; an unsigned one is only admitted
+    // below enforce. `verified_signer` flows to the handler for signer-based authz.
+    let mut verified_signer: Option<String> = None;
+    if signed {
+        let mut trailer = [0u8; 104];
+        if recv.read_exact(&mut trailer).await.is_err() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        match verify_gossip(&trailer, m[0], &path, &body, &remote_id, now) {
+            Ok(signer) => {
+                // Signature validity proves the sender POSSESSES the private
+                // key for `signer` — it does NOT prove `signer` is a real
+                // fleet member (anyone can generate a fresh ed25519 keypair
+                // for free and self-sign with it). When a trust set is
+                // actually configured, additionally require `signer` to be a
+                // member of it before treating the message as authoritative;
+                // an unlisted key is handled exactly like an invalid
+                // signature (rejected in Enforce, logged in Log mode). No
+                // trust set configured => unchanged behavior (today's
+                // default, tracked as a separate infra-level decision).
+                let trusted = trust.as_ref().map(|t| peer_trusted(t, &signer)).unwrap_or(true);
+                if trusted {
+                    verified_signer = Some(signer);
+                } else if mode == VerifyMode::Enforce {
+                    VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %remote_id, %path, %signer, "REJECTED gossip (signature valid but signer is not a trusted fleet member)");
+                    let _ = send.write_all(&0u32.to_be_bytes()).await;
+                    let _ = send.flush().await;
+                    return;
+                } else {
+                    if mode == VerifyMode::Log {
+                        tracing::warn!(peer = %remote_id, %path, %signer, "gossip signer NOT in trust set (log mode — serving anyway)");
+                    }
+                    verified_signer = Some(signer);
+                }
+            }
+            Err(reason) => {
+                if mode == VerifyMode::Enforce {
+                    VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %remote_id, %path, %reason, "REJECTED gossip (signature verification failed, enforce mode)");
+                    // Explicit empty response: the peer sees a clean failure, not a hang.
+                    let _ = send.write_all(&0u32.to_be_bytes()).await;
+                    let _ = send.flush().await;
+                    return;
+                }
+                if mode == VerifyMode::Log {
+                    tracing::warn!(peer = %remote_id, %path, %reason, "gossip signature INVALID (log mode — serving anyway)");
+                }
+            }
+        }
+    } else {
+        VERIFY_STATS.unsigned.fetch_add(1, Ordering::Relaxed);
+        if mode == VerifyMode::Enforce {
+            VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(peer = %remote_id, %path, "REJECTED unsigned gossip (enforce mode)");
+            let _ = send.write_all(&0u32.to_be_bytes()).await;
+            let _ = send.flush().await;
+            return;
+        }
+    }
+    let resp = handler(m[0], path, body, verified_signer).await;
     let len = (resp.len() as u32).to_be_bytes();
     let _ = send.write_all(&len).await;
     let _ = send.write_all(&resp).await;

@@ -37,8 +37,16 @@ function errorHeadline(build: Build | null): string {
 
 export default function DeploymentDetailPage({ params }: { params: { id: string } }) {
   // useSearchParams (the top-nav `?tab=` selector) must sit under a Suspense boundary.
+  // The fallback is a VISIBLE loading state, never an empty div — if hydration or
+  // the searchParams read is slow, the user sees "Loading…", never a blank screen.
   return (
-    <Suspense fallback={<div className="mx-auto max-w-5xl pb-16" />}>
+    <Suspense
+      fallback={
+        <div className="mx-auto flex max-w-5xl items-center gap-2 pb-16 pt-10 text-sm text-secondary">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading deployment…
+        </div>
+      }
+    >
       <DeploymentDetail id={params.id} />
     </Suspense>
   );
