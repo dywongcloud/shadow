@@ -50,11 +50,20 @@ export async function mintSessionToken(team?: string): Promise<void> {
   if (typeof window === "undefined") return;
   const t = team ?? currentTeam();
   try {
-    await fetch("/api/token", {
+    const r = await fetch("/api/token", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ team: t }),
     });
+    // A failed mint (mint-failed-403 when the UI server is missing
+    // HIVE_INTERNAL_TOKEN, mint-unreachable, …) leaves the dashboard with no
+    // hive_jwt cookie at all — every /cloud call then 403s and each page just
+    // renders empty. Don't let that be silent: log the reason so the console
+    // names the real fault instead of a wall of anonymous 403s.
+    if (!r.ok) {
+      const reason = await r.json().then((d) => d?.reason).catch(() => undefined);
+      console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
+    }
   } catch {
     /* dev/no-clerk or unreachable — the backend is unenforced there */
   }
@@ -100,9 +109,13 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
     }
   };
   const r = await once();
-  // 401 only — a 403 is a real authorization decision (wrong tenant/role), not an
-  // expired session, so re-minting the same identity would loop without helping.
-  if (r.status === 401 && typeof window !== "undefined" && CLERK_ON) {
+  // 401 = expired/invalid session. 403 ALSO covers the no-cookie-at-all case:
+  // the enforced ingress answers a missing hive_jwt with 403 (operator/tenant
+  // guard), not 401 — e.g. right after sign-in before the first mint landed, or
+  // when an earlier mint failed. Both get ONE transparent re-mint + retry; a
+  // genuine authorization denial (wrong tenant/role) simply fails again on the
+  // retry and propagates, so this cannot loop.
+  if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && CLERK_ON) {
     await mintSessionToken();
     return once();
   }
