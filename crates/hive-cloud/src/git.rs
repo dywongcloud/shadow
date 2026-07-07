@@ -782,20 +782,29 @@ async fn run_build(
         log(format!("Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."));
     }
 
-    // Managed World Queue auto-wiring: any project detected to use the Vercel
+    // Managed World auto-wiring: any project detected to use the Vercel
     // Workflow SDK (JS/TS via the .well-known manifest just ingested above, or
-    // Python via a vercel.json experimentalServices __wkf_* worker) gets hive's
-    // own native queue endpoint injected by DEFAULT -- unless it already
-    // brought its own Upstash/Redis world config (BYO opt-out) or sets
-    // fluid.json `{"workflow":{"world":"external"}}`. Persisted via put_env
-    // (same mechanism/timing as every other project env var -- takes effect
+    // Python via a vercel.json experimentalServices __wkf_* worker) gets BOTH
+    // halves of hive's own native World -- Queue (this dispatcher) and Storage
+    // (a real provisioned Redis, same provision() path as a database created
+    // from the dashboard) -- wired in by DEFAULT, unless it already brought
+    // its own Upstash/Redis world config (BYO opt-out) or sets fluid.json
+    // `{"workflow":{"world":"external"}}`. Persisted via put_env (same
+    // mechanism/timing as every other project env var -- takes effect
     // starting the NEXT deploy, since this build's function manifest is
-    // already finalized by this point in the pipeline). Deliberately does NOT
-    // set WORKFLOW_TARGET_WORLD: no @open-workflow/world-hive-equivalent
-    // package is published for tenant apps to import yet, and forcing that env
-    // var without a resolvable module would break the app rather than help
-    // it -- what's wired now makes the backing service ready the moment a
-    // compatible World package is present.
+    // already finalized by this point in the pipeline). Idempotent across
+    // redeploys: once Storage is provisioned, apply_db_egress sets
+    // UPSTASH_REDIS_REST_URL, which workflow_world_opted_out treats as BYO on
+    // every later deploy, so this block runs at most once per project.
+    // Deliberately does NOT set WORKFLOW_TARGET_WORLD: no
+    // @open-workflow/world-hive-equivalent package is published for tenant
+    // apps to import yet, and forcing that env var without a resolvable
+    // module would break the app rather than help it -- what's wired now
+    // makes both backing services ready the moment a compatible World
+    // package is present, and world.rs's dashboard reader already falls back
+    // to UPSTASH_REDIS_REST_URL/_TOKEN so the Workflows tab lights up
+    // immediately once Storage finishes provisioning, independent of the
+    // World package.
     {
         let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
         if (ingested > 0 || py_wdk) && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir) {
@@ -809,11 +818,27 @@ async fn run_build(
                 cloud.projects.put_env(&info.project, crate::project_settings::EnvVar {
                     key: "HIVE_QUEUE_TOKEN".into(), value: queue_token, target: "all".into(), sensitive: true, updated_ms: now_ms(),
                 });
-                log(format!(
-                    "Detected Vercel Workflow SDK ({}): auto-wired hive's managed Queue (HIVE_QUEUE_ENDPOINT/_TOKEN, active from the next deploy). Storage still needs a Redis-backed World package pointed at a managed or your own Redis.",
-                    if ingested > 0 { "JS/TS" } else { "Python" }
-                ));
             }
+            let req = crate::databases::ProvisionReq {
+                name: "workflow-storage".into(),
+                project: info.project.clone(),
+                team,
+                kind: crate::databases::DbKind::Redis,
+                region: Some(cloud.region.clone()),
+                provider: None,
+                replicas: Vec::new(),
+            };
+            let cloud_ready = cloud.clone();
+            crate::databases::provision(cloud.databases.clone(), cloud.region.clone(), req, cloud.db_domain.clone(), cloud.node_name.clone(), move |d| {
+                if matches!(d.status, crate::databases::DbStatus::Ready) {
+                    crate::admin::apply_db_egress(&cloud_ready, &d);
+                }
+                crate::persist::persist(&cloud_ready);
+            });
+            log(format!(
+                "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
+                if ingested > 0 { "JS/TS" } else { "Python" }
+            ));
         }
     }
 

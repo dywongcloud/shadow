@@ -4189,7 +4189,7 @@ fn db_egress_pairs(c: &Arc<CloudState>, d: &crate::databases::Database) -> Vec<(
     out
 }
 
-fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Database) {
+pub(crate) fn apply_db_egress(c: &Arc<CloudState>, d: &crate::databases::Database) {
     for (k, v, sensitive) in db_egress_pairs(c, d) {
         c.projects.put_env(&d.project, crate::project_settings::EnvVar {
             key: k, value: v, target: "all".into(), sensitive, updated_ms: now_ms(),
