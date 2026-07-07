@@ -89,7 +89,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             }
             Vec::new()
         }
-        "/v1/nodes" => jb(crate::admin::nodes(State(cloud.clone())).await),
+        "/v1/nodes" => match crate::admin::nodes(State(cloud.clone()), mesh_operator_claims()).await {
+            Ok(j) => jb(j),
+            Err(_) => Vec::new(),
+        },
         "/v1/serve-hosts" => jb(crate::admin::serve_hosts(State(cloud.clone())).await),
         // TLS bundle distribution over the authenticated mesh (see acme.rs::
         // bundle_for_mesh — key decrypted in transit inside peer-authenticated
@@ -110,7 +113,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // billing meter loop on the coordinator fans this out to sum fleet usage.
         // Prefix match: `fetch_from_host` appends `?team=` so an exact arm misses.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/functions") => {
-            jb(crate::admin::functions(State(cloud.clone())).await)
+            match crate::admin::functions(State(cloud.clone()), mesh_operator_claims()).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
         }
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
@@ -323,6 +329,24 @@ fn team_claims(path: &str) -> Option<axum::Extension<crate::auth::Claims>> {
         iat: 0,
         exp: 0,
         platform_admin: false,
+    }))
+}
+
+/// Synthetic operator identity for GLOBAL (non-tenant) admin reads proxied over the
+/// mesh (`/v1/nodes`, `/v1/functions`) — these endpoints require `require_operator`
+/// (platform_admin) on the public HTTP router, but a peer reaching THIS dispatch
+/// function has already passed the P2P layer's own trust/admission gate
+/// (STREAM_JOIN / trusted_peer_ids), a boundary this code never crosses on behalf
+/// of an untrusted caller. Scoped to this mesh-dispatch surface only — never
+/// constructed from request-supplied data.
+fn mesh_operator_claims() -> Option<axum::Extension<crate::auth::Claims>> {
+    Some(axum::Extension(crate::auth::Claims {
+        sub: "mesh-internal".into(),
+        tenant: "".into(),
+        role: "service".into(),
+        iat: 0,
+        exp: 0,
+        platform_admin: true,
     }))
 }
 

@@ -202,10 +202,18 @@ pub fn on_write(
             let ok = if let Some(admin) = &t.admin {
                 let url = format!("{admin}{rel_path}");
                 let rb = if method == "PUT" { cloud.http.put(&url) } else { cloud.http.post(&url) };
-                rb.header("x-hive-team", team.clone())
+                // Short-lived signed proof of tenant identity for the receiving node's
+                // write_scope() to verify — mirrors mesh_team_qs's iroh-path token so a
+                // client-forged x-hive-mirror/x-hive-team pair can never redirect a write
+                // into another tenant's namespace (see admin.rs write_scope).
+                let mut rb = rb
+                    .header("x-hive-team", team.clone())
                     .header("x-hive-mirror", "1")
-                    .header("content-type", content_type.clone())
-                    .body(body.clone())
+                    .header("content-type", content_type.clone());
+                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
+                    rb = rb.header("x-hive-mirror-tok", tok);
+                }
+                rb.body(body.clone())
                     .timeout(std::time::Duration::from_secs(10))
                     .send()
                     .await

@@ -1056,6 +1056,15 @@ pub(crate) async fn start_named_deploy(
             }
         }
     }
+    // Ownership check: a project already owned by a DIFFERENT tenant must never be
+    // silently reassigned here, regardless of no_fanout/redeploy_existing — closes
+    // the no_fanout cross-tenant hijack (naming an existing victim project with
+    // no_fanout=true used to skip straight to set_team below with no check at all).
+    if let Some(existing_key) = c.projects.find_key_ci(&project) {
+        if norm(&c.projects.team_of(&existing_key)) != t {
+            return Err((StatusCode::FORBIDDEN, "project belongs to a different team".into()));
+        }
+    }
     req.project = Some(project.clone());
     c.projects.set_team(&project, &t);
     // Persist the subdirectory so future redeploys keep building it.
@@ -1265,13 +1274,17 @@ pub(crate) async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> 
 /// REAL cluster resource accounting: this node's live CPU/mem/disk/network usage
 /// (sysinfo) plus cluster TOTALS = sum of every live node's capacity (gossiped via
 /// NodeInfo). Answers "available compute / storage / bandwidth across the mesh".
-async fn resources_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn resources_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let nodes = c.registry.nodes();
     let cpu_cores: u64 = nodes.iter().map(|n| n.cpu_cores as u64).sum();
     let mem_total_mb: u64 = nodes.iter().map(|n| n.mem_total_mb).sum();
     let disk_total_gb: u64 = nodes.iter().map(|n| n.disk_total_gb).sum();
     let usage = crate::resources::live().await;
-    Json(json!({
+    Ok(Json(json!({
         "cluster": {
             "nodes": nodes.len(),
             "cpu_cores": cpu_cores,
@@ -1284,7 +1297,7 @@ async fn resources_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
             "cpu_cores": n.cpu_cores, "mem_total_mb": n.mem_total_mb, "disk_total_gb": n.disk_total_gb,
             "city": n.city, "country": n.country, "healthy": n.healthy,
         })).collect::<Vec<_>>(),
-    }))
+    })))
 }
 
 /// Serve a build-cache blob to mesh peers (the P2P side of the build cache).
@@ -2185,9 +2198,12 @@ pub(crate) async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str,
 
 async fn project_redeploy(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(body): Json<RedeployBody>,
 ) -> Result<Json<Value>, StatusCode> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project).map_err(|(code, _)| code)?;
     let git = git_for_project_fleet(&c, &project).ok_or(StatusCode::NOT_FOUND)?;
     let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
     // Environment chosen in the modal: "production" | "preview". When absent the
@@ -2554,13 +2570,17 @@ async fn mesh_admit(
     Ok(Json(json!({ "admitted": id, "trusted_peer_count": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0) })))
 }
 
-async fn overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn overview(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let (reqs, blocked) = c.counters();
     let (hits, misses, stale, entries, ratio) = c.cdn.stats();
     let fstats = c.fluid.stats();
     let instances: usize = fstats.iter().map(|f| f.instances).sum();
     let cc = c.limiter.stats();
-    Json(json!({
+    Ok(Json(json!({
         "node": c.node_name,
         "region": c.region,
         "regions": c.registry.regions(),
@@ -2589,16 +2609,24 @@ async fn overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
             "enforced": std::env::var("HIVE_PEER_TRUST").map(|v| v == "1" || v == "true").unwrap_or(false),
             "trusted_peers": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0),
         },
-    }))
+    })))
 }
 
-pub(crate) async fn nodes(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.registry.nodes()))
+pub(crate) async fn nodes(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.registry.nodes())))
 }
 
-async fn cluster_status(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn cluster_status(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let members: Vec<String> = c.registry.nodes().into_iter().map(|n| n.id).collect();
-    Json(json!(c.cluster.status(members)))
+    Ok(Json(json!(c.cluster.status(members))))
 }
 
 /// Anycast routing table: every node with latency/health, and the node this edge
@@ -2665,25 +2693,41 @@ async fn ratelimit_put(
     Ok(Json(json!(c.ratelimit.stats())))
 }
 
-async fn regions(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.registry.regions()))
+async fn regions(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.registry.regions())))
 }
 
-pub async fn functions(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.fluid.stats()))
+pub async fn functions(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.fluid.stats())))
 }
 
 /// Tunnel reuse + #14 byte/backpressure metering for this node's gateway.
-async fn tunnels(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(c.gw.tunnel_stats().await))
+async fn tunnels(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(c.gw.tunnel_stats().await)))
 }
 
 /// Relay cost accounting (#23): relay-vs-direct connection + byte breakdown for
 /// this node's mesh trunks. `relayed_*` bytes transit a relay server (a real cost
 /// + a holepunch-failure signal). Empty when P2P (iroh) isn't enabled on the node.
-async fn relay_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn relay_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let pool = c.mesh.read().clone();
-    match pool {
+    Ok(match pool {
         Some(pool) => {
             let s = pool.relay_stats().await;
             let total = s.relayed_bytes_tx + s.relayed_bytes_rx + s.direct_bytes_tx + s.direct_bytes_rx;
@@ -2729,7 +2773,7 @@ async fn relay_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
             }))
         }
         None => Json(json!({ "enabled": false })),
-    }
+    })
 }
 
 #[derive(Deserialize)]
@@ -2842,8 +2886,12 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
 
 // ---- WAF ----
 
-async fn waf_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!({ "managed": c.waf.managed_enabled(), "rules": c.waf.rules() }))
+async fn waf_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!({ "managed": c.waf.managed_enabled(), "rules": c.waf.rules() })))
 }
 
 async fn waf_add_rule(
@@ -2887,8 +2935,12 @@ async fn waf_managed(
 
 // ---- Bot management ----
 
-async fn bot_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!(*c.bot_policy.read()))
+async fn bot_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(*c.bot_policy.read())))
 }
 
 async fn bot_put(
@@ -2903,9 +2955,13 @@ async fn bot_put(
 
 // ---- CDN ----
 
-async fn cdn_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
+async fn cdn_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
     let (hits, misses, stale, entries, ratio) = c.cdn.stats();
-    Json(json!({ "hits": hits, "misses": misses, "stale": stale, "entries": entries, "hit_ratio": ratio }))
+    Ok(Json(json!({ "hits": hits, "misses": misses, "stale": stale, "entries": entries, "hit_ratio": ratio })))
 }
 
 // ---- Runtime Cache (Vercel-style regional data cache) ----
@@ -3036,8 +3092,12 @@ async fn concurrency_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
 
 // ---- Routing layer ----
 
-async fn routing_get(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    Json(json!({ "redirects": c.router.redirects(), "rewrites": c.router.rewrites() }))
+async fn routing_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!({ "redirects": c.router.redirects(), "rewrites": c.router.rewrites() })))
 }
 
 async fn add_redirect(
@@ -4376,13 +4436,34 @@ fn ns(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>, 
 }
 
 /// Resolve the (team, is_mirror) scope for a storage WRITE. A mesh-internal
-/// mirrored write (`x-hive-mirror`) is a trusted replication call from a primary
-/// node — its `x-hive-team` is authoritative (reached over the authenticated mesh
-/// or the loopback+firewalled admin API), so replicated data lands in the SAME
-/// tenant namespace on the replica. Normal writes resolve the tenant as usual.
+/// mirrored write is a trusted replication call from a primary node — its team
+/// is authoritative, so replicated data lands in the SAME tenant namespace on the
+/// replica. This MUST be bound to a verified identity, not header presence: this
+/// admin router is bound to the public API host (main.rs), so an arbitrary
+/// internet caller can set `x-hive-mirror`/`x-hive-team` themselves. `x-hive-mirror-tok`
+/// carries a short-lived signed token (minted the same way as `mesh_team_qs`,
+/// `crate::auth::issue("mesh-internal", team, "service", false, 60)`) — only a
+/// caller holding `HIVE_JWT_SECRET` can produce one, closing the cross-tenant
+/// write bypass. When JWT enforcement is off (dev/single-node), the raw header
+/// is trusted as before (nothing to forge against). Normal writes resolve the
+/// tenant as usual.
 fn write_scope(c: &Arc<CloudState>, h: &HeaderMap, claims: Option<&crate::auth::Claims>) -> (String, bool) {
     let is_mirror = h.get("x-hive-mirror").is_some() || h.get("x-mirror").is_some();
     if is_mirror {
+        if crate::auth::enforced() {
+            let team = h
+                .get("x-hive-mirror-tok")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|tok| crate::auth::verify(tok).ok())
+                .map(|claims| claims.tenant);
+            return match team {
+                Some(team) if !team.is_empty() => (team, true),
+                _ => {
+                    tracing::warn!("mirror write rejected: missing/invalid x-hive-mirror-tok under enforced auth");
+                    (tenant(c, h, claims), false)
+                }
+            };
+        }
         let team = h.get("x-hive-team").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "personal".into());
         (team, true)
     } else {
