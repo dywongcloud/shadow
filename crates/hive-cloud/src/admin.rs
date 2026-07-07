@@ -4628,7 +4628,7 @@ async fn wqueue_enqueue(
     if t == ANON_TENANT {
         return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
     }
-    let id = c.world_queue.enqueue(b.target_url, b.headers, b.payload, b.delay_seconds, b.max_attempts);
+    let id = c.world_queue.enqueue(t, b.target_url, b.headers, b.payload, b.delay_seconds, b.max_attempts);
     Ok(Json(json!({ "message_id": id })))
 }
 

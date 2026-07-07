@@ -216,6 +216,20 @@ pub async fn put(key: &str, bytes: Vec<u8>) {
     }
 }
 
+/// Remove a key from GuardianDB (replicated tombstone). Best-effort, same
+/// failure posture as `put` -- used to retire transient mesh-shared entries
+/// (e.g. a delivered/dead-lettered world_queue job) once no longer needed.
+pub async fn delete(key: &str) {
+    match handle().await {
+        Ok(h) => {
+            if let Err(e) = h.kv.delete(key).await {
+                tracing::warn!(%key, error = %e, "GuardianDB delete failed");
+            }
+        }
+        Err(e) => tracing::warn!(%key, error = %e, "GuardianDB unavailable for delete"),
+    }
+}
+
 /// Snapshot of all keys currently stored in GuardianDB (durable copy).
 pub async fn keys() -> Vec<String> {
     match handle().await {

@@ -567,7 +567,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
     // World interface -- no external queue dependency).
-    tokio::spawn(crate::world_queue::run_delivery_loop(cloud.http.clone(), cloud.world_queue.clone()));
+    tokio::spawn(crate::world_queue::run_delivery_loop(cloud.clone(), cloud.world_queue.clone()));
 
     // Vercel DNS reconciler (ngrok retirement): leader-elected loop publishing
     // healthy node IPs to api.{platform}/*.{apps} via the Vercel API. No-op in

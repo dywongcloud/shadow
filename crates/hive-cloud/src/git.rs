@@ -782,6 +782,41 @@ async fn run_build(
         log(format!("Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."));
     }
 
+    // Managed World Queue auto-wiring: any project detected to use the Vercel
+    // Workflow SDK (JS/TS via the .well-known manifest just ingested above, or
+    // Python via a vercel.json experimentalServices __wkf_* worker) gets hive's
+    // own native queue endpoint injected by DEFAULT -- unless it already
+    // brought its own Upstash/Redis world config (BYO opt-out) or sets
+    // fluid.json `{"workflow":{"world":"external"}}`. Persisted via put_env
+    // (same mechanism/timing as every other project env var -- takes effect
+    // starting the NEXT deploy, since this build's function manifest is
+    // already finalized by this point in the pipeline). Deliberately does NOT
+    // set WORKFLOW_TARGET_WORLD: no @open-workflow/world-hive-equivalent
+    // package is published for tenant apps to import yet, and forcing that env
+    // var without a resolvable module would break the app rather than help
+    // it -- what's wired now makes the backing service ready the moment a
+    // compatible World package is present.
+    {
+        let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
+        if (ingested > 0 || py_wdk) && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir) {
+            let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
+                .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
+            let team = crate::admin::norm(&cloud.projects.team_of(&info.project)).to_string();
+            if let Ok(queue_token) = crate::auth::issue("world-queue-client", &team, "service", false, 365 * 24 * 3600) {
+                cloud.projects.put_env(&info.project, crate::project_settings::EnvVar {
+                    key: "HIVE_QUEUE_ENDPOINT".into(), value: queue_url, target: "all".into(), sensitive: false, updated_ms: now_ms(),
+                });
+                cloud.projects.put_env(&info.project, crate::project_settings::EnvVar {
+                    key: "HIVE_QUEUE_TOKEN".into(), value: queue_token, target: "all".into(), sensitive: true, updated_ms: now_ms(),
+                });
+                log(format!(
+                    "Detected Vercel Workflow SDK ({}): auto-wired hive's managed Queue (HIVE_QUEUE_ENDPOINT/_TOKEN, active from the next deploy). Storage still needs a Redis-backed World package pointed at a managed or your own Redis.",
+                    if ingested > 0 { "JS/TS" } else { "Python" }
+                ));
+            }
+        }
+    }
+
     if build_failed {
         log(format!("Deployment created (build failed). Aliased to {}", info.alias));
     } else {
