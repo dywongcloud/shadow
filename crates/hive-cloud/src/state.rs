@@ -162,6 +162,9 @@ pub struct CloudState {
     pub fluid: Arc<Fluid>,
     pub hive: Arc<Hive>,
     pub http: reqwest::Client,
+    /// Hive's own native Queue backend for the Vercel WDK `World` interface
+    /// (managed-world service) -- no external queue dependency.
+    pub world_queue: Arc<crate::world_queue::WorldQueue>,
     pub projects: crate::project_settings::ProjectStore,
     pub builds: crate::git::BuildStore,
     pub cluster: Arc<crate::cluster::Cluster>,
@@ -444,6 +447,7 @@ impl CloudState {
             fluid,
             hive,
             http: reqwest::Client::new(),
+            world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
             cluster,

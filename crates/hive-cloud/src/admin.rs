@@ -32,6 +32,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/anycast", get(anycast_table))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
         .route("/v1/regions", get(regions))
+        .route("/v1/wqueue/enqueue", post(wqueue_enqueue))
+        .route("/v1/wqueue/stats", get(wqueue_stats))
         .route("/v1/logs", get(logs))
         .route("/v1/functions", get(functions))
         .route("/v1/tunnels", get(tunnels))
@@ -4594,6 +4596,44 @@ async fn vector_query(
 ) -> Json<Value> {
     let nsi = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &index);
     Json(json!({ "index": index, "matches": c.databases.vector_query(&nsi, &b.vector, b.top_k) }))
+}
+
+// ---- Managed World Queue (Vercel WDK, hive-native, no external queue dep) ----
+
+#[derive(Deserialize)]
+struct WqueueEnqueueReq {
+    target_url: String,
+    #[serde(default)]
+    headers: std::collections::BTreeMap<String, String>,
+    payload: Value,
+    #[serde(default)]
+    delay_seconds: u64,
+    #[serde(default = "default_wqueue_max_attempts")]
+    max_attempts: u32,
+}
+fn default_wqueue_max_attempts() -> u32 {
+    10
+}
+
+async fn wqueue_enqueue(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<WqueueEnqueueReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Tenant-scoped like every other /v1/storage/*-style mutation; the target
+    // URL is caller-supplied so it must resolve to a real, authenticated caller
+    // (never let an anonymous/ANON_TENANT caller schedule arbitrary HTTP callbacks).
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if t == ANON_TENANT {
+        return Err((StatusCode::UNAUTHORIZED, "authentication required".into()));
+    }
+    let id = c.world_queue.enqueue(b.target_url, b.headers, b.payload, b.delay_seconds, b.max_attempts);
+    Ok(Json(json!({ "message_id": id })))
+}
+
+async fn wqueue_stats(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(c.world_queue.stats())
 }
 
 // ---- Pub/Sub + Realtime (WebSocket secure streaming) ----

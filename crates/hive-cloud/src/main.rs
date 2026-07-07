@@ -45,6 +45,7 @@ mod sandboxes_api;
 mod sandboxes_platform;
 mod schedule;
 mod world;
+mod world_queue;
 mod secrets;
 mod vercel_dns;
 mod acme;
@@ -563,6 +564,10 @@ async fn main() -> anyhow::Result<()> {
     // window keeps a flapping health view from double-charging during transitions.
     // `HIVE_BILLING_COORDINATOR_NODE` remains as an explicit manual PIN override.
     spawn_billing_meter_loop(cloud.clone());
+
+    // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
+    // World interface -- no external queue dependency).
+    tokio::spawn(crate::world_queue::run_delivery_loop(cloud.http.clone(), cloud.world_queue.clone()));
 
     // Vercel DNS reconciler (ngrok retirement): leader-elected loop publishing
     // healthy node IPs to api.{platform}/*.{apps} via the Vercel API. No-op in

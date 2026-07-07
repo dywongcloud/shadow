@@ -7,13 +7,14 @@ target/
 .gm/*
 !.gm/constraints.md
 !.gm/disciplines/
+.gm/disciplines/*
 !.gm/disciplines/default/
 !.gm/disciplines/default/**
 !.gm/disciplines/rs-learn_router/
 !.gm/disciplines/rs-learn_router/**
-# codeinsight/codeinsight-manifest/codeinsight-vec are a regenerable per-file
-# code-search index+embedding cache (rebuilt automatically on digest mismatch,
-# see gm-plugkit's codeinsight_rebuild) -- thousands of tiny derived files,
-# never durable discipline content. Stays ignored even though disciplines/
-# itself is tracked.
+# codeinsight/codeinsight-manifest/codeinsight-vec (matched by the
+# .gm/disciplines/* line above, with no re-include below) are a regenerable
+# per-file code-search index+embedding cache (rebuilt automatically on digest
+# mismatch, see gm-plugkit's codeinsight_rebuild) -- thousands of tiny derived
+# files, never durable discipline content.
 .gm/pw-sock-*/
