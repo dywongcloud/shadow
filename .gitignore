@@ -2,6 +2,8 @@ target/
 .env
 .env.local
 **/.env.local
+**/.env.local.*.bak
+**/.env.*.bak
 .DS_Store
 **/.DS_Store
 .gm/*
@@ -18,3 +20,5 @@ target/
 # mismatch, see gm-plugkit's codeinsight_rebuild) -- thousands of tiny derived
 # files, never durable discipline content.
 .gm/pw-sock-*/
+.gm/browser-profile/
+.gm/browser-profile-*/
