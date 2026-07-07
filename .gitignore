@@ -8,3 +8,4 @@ target/
 !.gm/constraints.md
 !.gm/disciplines/
 !.gm/disciplines/**
+.gm/pw-sock-*/
