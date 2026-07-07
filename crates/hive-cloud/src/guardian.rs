@@ -95,8 +95,20 @@ pub fn init_background() {
 /// used by the restore-on-rollback guard.
 static NODE_NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
+/// Handle of the main tokio runtime, captured at boot. `replicate` is called
+/// from the dedicated `hive-persister` OS thread, which has NO runtime context —
+/// a bare `tokio::spawn` there panics ("must be called from the context of a
+/// Tokio runtime"), killing the persister thread and silently dropping every
+/// periodic GuardianDB replication. Spawn onto this handle instead.
+static RUNTIME: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
+
 pub fn set_node_name(name: &str) {
     let _ = NODE_NAME.set(name.to_string());
+    // Called from async main → the runtime is current here; remember it for
+    // spawns from non-runtime threads (the persister).
+    if let Ok(h) = tokio::runtime::Handle::try_current() {
+        let _ = RUNTIME.set(h);
+    }
 }
 
 fn snapshot_key() -> Option<String> {
@@ -114,7 +126,7 @@ pub fn replicate(snap: &PlatformSnapshot) {
         .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
         .collect();
     let full = serde_json::to_vec(snap).ok();
-    tokio::spawn(async move {
+    let task = async move {
         let h = match handle().await {
             Ok(h) => h,
             Err(e) => {
@@ -133,7 +145,15 @@ pub fn replicate(snap: &PlatformSnapshot) {
                 tracing::debug!(error = %e, "GuardianDB full-snapshot put failed");
             }
         }
-    });
+    };
+    // Callers include the runtime-less `hive-persister` OS thread — a bare
+    // `tokio::spawn` would panic there and kill the persister (see RUNTIME).
+    match tokio::runtime::Handle::try_current().ok().or_else(|| RUNTIME.get().cloned()) {
+        Some(rt) => {
+            rt.spawn(task);
+        }
+        None => tracing::debug!("no tokio runtime; guardian replication skipped (snapshot on disk only)"),
+    }
 }
 
 /// The replicated full snapshot for THIS node, if GuardianDB holds one.

@@ -50,8 +50,10 @@ pub struct MockBackend {
     funcs: Arc<AsyncMutex<HashMap<CellId, tokio::process::Child>>>,
     /// Per-cell tunnel-server accept loops, aborted on terminate.
     tunnels: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
-    /// Per-cell podman container names (Railway-style container deploys).
-    containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
+    /// Per-cell container name (Railway-style container deploys) + which CLI
+    /// created it (`true` = Apple's `container`, `false` = podman), so
+    /// teardown uses the matching `delete`/`rm` verb.
+    containers: Arc<AsyncMutex<HashMap<CellId, (String, bool)>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2).
     sampler: Arc<crate::CpuSampler>,
 }
@@ -229,20 +231,38 @@ impl CellBackend for MockBackend {
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
             let name = format!("hive-{}", cell.id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
-            let _ = std::process::Command::new("podman").args(["rm", "-f", &name]).output();
+            // A real multi-service (compose) deploy pins a static IP + sibling
+            // `/etc/hosts` — podman-only (see `container_cli::needs_podman_networking`'s
+            // doc: Apple's `container` tool has no static-IP flag, no
+            // --add-host, no name-based DNS between containers on a shared
+            // network, and a correct macOS equivalent needs a two-phase
+            // launch this per-cell call has no visibility to orchestrate
+            // across siblings). Every OTHER deploy — including a "standalone"
+            // single container, which still gets its own project-scoped
+            // network purely for TENANT isolation, no static IP — is fully
+            // Apple-`container`-eligible.
+            let apple = !net.as_ref().map(crate::container_cli::needs_podman_networking).unwrap_or(false) && crate::container_cli::is_apple_default();
+            let bin = if apple { "container" } else { "podman" };
+            let path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
+            let _ = std::process::Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).output();
             if let Some(n) = &net {
                 if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                    let mut c = vec!["network".to_string(), "create".to_string(), "--disable-dns".to_string()];
+                    let mut c = vec!["network".to_string(), "create".to_string()];
+                    if !apple {
+                        c.push("--disable-dns".to_string());
+                    }
                     if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
                         c.push("--subnet".into());
                         c.push(s.to_string());
                     }
-                    if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        c.push("--gateway".into());
-                        c.push(g.to_string());
+                    if !apple {
+                        if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            c.push("--gateway".into());
+                            c.push(g.to_string());
+                        }
                     }
                     c.push(netname.to_string());
-                    let _ = Command::new("podman").args(&c).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                    let _ = Command::new(bin).args(&c).env("PATH", path_env).output().await;
                 }
             }
             let port = func.port;
@@ -263,7 +283,7 @@ impl CellBackend for MockBackend {
                 let path = n.get("volpath").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/data");
                 Some((name.to_string(), path.to_string()))
             }) {
-                let _ = Command::new("podman").args(["volume", "create", &vname]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                let _ = Command::new(bin).args(["volume", "create", &vname]).env("PATH", path_env).output().await;
                 args.push("-e".into());
                 args.push(format!("HIVE_VOLUME={vpath}"));
                 args.push("-v".into());
@@ -285,31 +305,31 @@ impl CellBackend for MockBackend {
                     }
                 }
             }
-            // Resource ceilings + privilege drop (DoS / escalation defense) —
-            // podman run OPTIONS, so they precede the image name. Honors the
-            // deployment's requested memory (else the generous env-tunable default).
-            args.extend(crate::ContainerLimits::for_container(func.memory_mib).podman_run_flags());
+            // Resource ceilings + privilege drop (DoS / escalation defense) — `run`
+            // OPTIONS, so they precede the image name. Honors the deployment's
+            // requested memory (else the generous env-tunable default).
+            args.extend(crate::container_cli::resource_flags(apple, &crate::ContainerLimits::for_container(func.memory_mib)));
             args.push("-p".into());
             args.push(format!("127.0.0.1:{port}:{internal}"));
             args.push(image.clone());
-            let status = Command::new("podman")
+            let status = Command::new(bin)
                 .args(&args)
-                .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+                .env("PATH", path_env)
                 .output()
                 .await?;
             if !status.status.success() {
                 // Reclaim the podman lock a failed start may leak (see the same
                 // fix in lib.rs::podman_run_container — leaked `created` shells
                 // exhaust the 2048-lock pool → CAPACITY_EXHAUSTED fleet-wide).
-                let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
-                anyhow::bail!("podman run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
+                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+                anyhow::bail!("{bin} run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
             }
-            self.containers.lock().await.insert(cell.id.clone(), name.clone());
+            self.containers.lock().await.insert(cell.id.clone(), (name.clone(), apple));
             let func_addr = format!("127.0.0.1:{port}");
             // Readiness failure must ALSO remove the container (else a crash-looping
             // image leaks a lock every keep-warm tick).
             if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
-                let _ = Command::new("podman").args(["rm", "-f", &name]).env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin").output().await;
+                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
                 self.containers.lock().await.remove(&cell.id);
                 return Err(e);
             }
@@ -342,10 +362,12 @@ impl CellBackend for MockBackend {
         // container deploys work regardless of how the node was launched.
         let base_path = std::env::var("PATH").unwrap_or_default();
         let path = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{base_path}");
-        // Containers (podman) take longer to publish their port than a plain
-        // process, especially on macOS rootless networking.
-        let is_container = func.start_cmd.join(" ").contains("podman")
-            || func.start_cmd.join(" ").contains("docker");
+        // Containers (podman, or Apple's `container` on macOS) take longer to
+        // publish their port than a plain process, especially on macOS rootless
+        // networking. `"container run "` (not the bare word) avoids false
+        // positives on unrelated start commands that happen to contain "container".
+        let joined = func.start_cmd.join(" ");
+        let is_container = joined.contains("podman") || joined.contains("docker") || joined.contains("container run ");
         let ready_timeout = if is_container { 60 } else { 15 };
 
         let mut cmd = Command::new(&func.start_cmd[0]);
@@ -416,8 +438,9 @@ impl CellBackend for MockBackend {
             task.abort();
         }
         // Remove any container bound to this cell.
-        if let Some(name) = self.containers.lock().await.remove(&cell.id) {
-            let _ = Command::new("podman").args(["rm", "-f", &name]).output().await;
+        if let Some((name, apple)) = self.containers.lock().await.remove(&cell.id) {
+            let bin = if apple { "container" } else { "podman" };
+            let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).output().await;
         }
         // Kill any function process bound to this cell.
         if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {

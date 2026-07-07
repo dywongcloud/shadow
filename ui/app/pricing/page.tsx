@@ -49,17 +49,19 @@ const TIERS: Tier[] = [
   },
   {
     name: "Enterprise",
-    price: "Custom",
+    price: "$1,000",
+    period: "/month",
     tagline: "Self-host across your own global mesh.",
     features: [
       "Everything in Pro",
+      "$1,000 of included compute / month",
       "Self-hosted nodes",
       "Data residency & leases",
       "SSO/SAML",
       "Audit logs",
       "Dedicated support & SLA",
     ],
-    cta: { label: "Contact sales", href: "/contact" },
+    cta: { label: "Start Enterprise", href: "/sign-up" },
     variant: "outline",
   },
 ];

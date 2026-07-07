@@ -57,6 +57,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/routing/rewrites/delete", post(del_rewrite))
         .route("/v1/cron", get(cron_list).post(cron_add))
         .route("/v1/cron/:id", delete(cron_del))
+        .route("/v1/cron/:id/run", post(cron_run))
         .route("/v1/workflows", get(wf_list).post(wf_define))
         .route("/v1/workflows/summary", get(wf_summary))
         .route("/v1/workflows/runs", get(wf_runs))
@@ -85,6 +86,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
         .route("/v1/nodes/announce", post(node_announce))
+        .route("/v1/mesh/roster", get(mesh_roster_get))
+        .route("/v1/mesh/admit", post(mesh_admit))
         .route("/v1/token", post(mint_token))
         .route("/v1/whoami", get(whoami))
         .route("/v1/auth", get(auth_status))
@@ -92,6 +95,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/settings", get(project_settings_get))
         .route("/v1/projects/:project/build", put(project_build_put))
         .route("/v1/projects/:project/functions", put(project_functions_put))
+        .route("/v1/projects/:project/cron-enabled", put(project_cron_enabled_put))
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route("/v1/projects/:project/service-graph", get(project_service_graph))
@@ -180,6 +184,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/checkout/:id", get(billing_checkout_get))
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
+        .route("/v1/billing/webhook", post(billing_webhook))
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -1763,6 +1768,12 @@ async fn purge_project_resources(c: &Arc<CloudState>, project: &str, team: &str,
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
         }
         if let Some(container) = d.container.clone() {
+            // DB containers are ALWAYS podman-created, even on macOS — see
+            // `databases.rs::ensure_project_db_net`'s doc comment (static-IP
+            // networking has no Apple `container` equivalent). Every
+            // `podman rm`/DB-container teardown site in this file (this one,
+            // plus the two below in `database_delete`/the "remove" op) stays
+            // hardcoded to podman for that reason, unconditionally.
             let _ = tokio::process::Command::new("podman")
                 .args(["rm", "-f", &container])
                 .env(
@@ -1782,49 +1793,47 @@ async fn purge_project_resources(c: &Arc<CloudState>, project: &str, team: &str,
     purge_project_source_dirs(project).await;
 }
 
-/// Remove every podman volume named `hive-vol-<project>` or
-/// `hive-vol-<project>-<service>` (compose/multi-service deployments each get
-/// their own suffixed volume) — these are created for app/compose/Containerfile
-/// deployments' persistent `/data` and, unlike the container itself, survive
-/// `podman rm` of whatever mounted them. Best-effort: an unreachable/missing
-/// podman must never fail the broader project-delete flow.
+/// Remove every volume named `hive-vol-<project>` or `hive-vol-<project>-<service>`
+/// (compose/multi-service deployments each get their own suffixed volume) — these
+/// are created for app/compose/Containerfile deployments' persistent `/data` and,
+/// unlike the container itself, survive removal of whatever mounted them.
+/// Best-effort: an unreachable/missing container CLI must never fail the broader
+/// project-delete flow.
+///
+/// Checks BOTH backends on macOS: a project's volume could live in podman's store
+/// (compose/multi-service deploys always use podman there — see
+/// `hive_backend::container_cli`'s module doc) or in Apple `container`'s store
+/// (single-container app/Containerfile deploys), and this has no record of which
+/// one a given project actually used — only Linux fleet nodes ever have just one.
 async fn purge_project_podman_volumes(project: &str) {
     let prefix = format!("hive-vol-{}", crate::git::sanitize_tag(project));
     let path_env = format!("/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:{}", std::env::var("PATH").unwrap_or_default());
-    let Ok(out) = tokio::process::Command::new("podman")
-        .args(["volume", "ls", "--filter", &format!("name={prefix}"), "--format", "{{.Name}}"])
-        .env("PATH", &path_env)
-        .output()
-        .await
-    else {
-        return;
-    };
-    if !out.status.success() {
-        return;
-    }
-    for name in String::from_utf8_lossy(&out.stdout).lines() {
-        let name = name.trim();
-        // Exact match or a `-`-delimited suffix only (the per-service naming
-        // shape from `container_volume_cfg`, e.g. "hive-vol-app-worker") — a
-        // plain substring match would also reap an unrelated project's volume
-        // whose name happens to CONTINUE the same characters with no
-        // delimiter (e.g. "app" must not touch "appearance"'s volume). This
-        // does NOT disambiguate a different project whose name is itself
-        // `<target>-<anything>` (e.g. "app" vs a real project literally named
-        // "app-v2") — project names are allocated to be globally unique (see
-        // the project-name allocator's own comment in git.rs), so that
-        // collision is not expected in practice, but is a known limit of this
-        // prefix-based scheme, not a claim this check fully closes.
-        if name.is_empty() || !(name == prefix || name.starts_with(&format!("{prefix}-"))) {
-            continue;
+    let backends: &[bool] = if hive_backend::container_cli::is_apple_default() { &[false, true] } else { &[false] };
+    for &apple in backends {
+        let bin = hive_backend::container_cli::bin(apple);
+        for name in hive_backend::container_cli::list_volume_names(apple, &path_env).await {
+            // Exact match or a `-`-delimited suffix only (the per-service naming
+            // shape from `container_volume_cfg`, e.g. "hive-vol-app-worker") — a
+            // plain substring match would also reap an unrelated project's volume
+            // whose name happens to CONTINUE the same characters with no
+            // delimiter (e.g. "app" must not touch "appearance"'s volume). This
+            // does NOT disambiguate a different project whose name is itself
+            // `<target>-<anything>` (e.g. "app" vs a real project literally named
+            // "app-v2") — project names are allocated to be globally unique (see
+            // the project-name allocator's own comment in git.rs), so that
+            // collision is not expected in practice, but is a known limit of this
+            // prefix-based scheme, not a claim this check fully closes.
+            if name.is_empty() || !(name == prefix || name.starts_with(&format!("{prefix}-"))) {
+                continue;
+            }
+            let _ = tokio::process::Command::new(bin)
+                .args(hive_backend::container_cli::volume_rm_args(apple, &name))
+                .env("PATH", &path_env)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .await;
         }
-        let _ = tokio::process::Command::new("podman")
-            .args(["volume", "rm", "-f", name])
-            .env("PATH", &path_env)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
     }
 }
 
@@ -2086,6 +2095,27 @@ fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
         }
     }
     out.into_iter().collect()
+}
+
+/// Every deployment across the WHOLE fleet, ALL tenants (operator scope): the
+/// locally-hosted set plus every gossiped `peer_deployments` entry, deduped by id.
+/// The ops overview + data browser run on one node, but the placement scheduler
+/// hosts deployments on peers — a bare `c.gw.list()` returns only what this node
+/// hosts (often nothing on a coordinator), which is why the ops console showed
+/// "0 deployments" while peers served every project. This mirrors `dep_list`'s
+/// aggregation but WITHOUT the tenant filter (operator-only callers).
+fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
+    let mut list = c.gw.list();
+    let mut seen: std::collections::HashSet<String> = list.iter().map(|d| d.id.to_string()).collect();
+    for (_node, deps) in c.peer_deployments.read().iter() {
+        for d in deps {
+            if seen.insert(d.id.to_string()) {
+                list.push(d.clone());
+            }
+        }
+    }
+    list.sort_by_key(|d| std::cmp::Reverse(d.created_at_ms));
+    list.into_iter().map(|d| json!(d)).collect()
 }
 
 /// GET a read-view from a host node by NAME: HTTP admin if we have one, else over the
@@ -2425,6 +2455,13 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
+/// HMAC-SHA256, hex-encoded — shared by every webhook verifier in this crate
+/// (GitHub's `X-Hub-Signature-256`, Stripe's `Stripe-Signature`) so there's one
+/// implementation of the actual crypto primitive.
+pub(crate) fn hmac_sha256_hex(key: &[u8], msg: &[u8]) -> String {
+    hex_lower(&hmac_sha256(key, msg))
+}
+
 /// Minimal HMAC-SHA256 (avoids pulling a new crate). SHA-256 from `sha2` which is
 /// already in the dependency tree.
 fn hmac_sha256(key: &[u8], msg: &[u8]) -> [u8; 32] {
@@ -2464,6 +2501,57 @@ pub(crate) async fn node_announce(
 ) -> Json<Value> {
     c.registry.upsert_peer(node);
     Json(json!(c.registry.nodes()))
+}
+
+/// Observability for the hot-join mesh: the persisted key-addressed roster (this
+/// node's dial map, `endpoint_id -> (endpoint_id, iroh_addr)` — no IPs) plus the
+/// live trust-set size, so an operator can see who this node knows/trusts without
+/// SSH. Read-only; requires an operator token when JWT is enforced.
+async fn mesh_roster_get(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let roster: Vec<Value> = c
+        .peer_iroh
+        .read()
+        .iter()
+        .map(|(k, (nid, addr))| json!({ "key": k, "endpoint_id": nid, "iroh_addr": addr }))
+        .collect();
+    let trusted = c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0);
+    Ok(Json(json!({ "roster": roster, "trusted_peer_count": trusted })))
+}
+
+#[derive(Deserialize)]
+struct MeshAdmitReq {
+    endpoint_id: String,
+}
+
+/// Operator-initiated admission: pre-register an endpoint id into this node's
+/// trust set before it ever connects (e.g. onboarding a node whose key you got
+/// out-of-band). Redundant with — but not required by — the zero-touch join-proof
+/// path (`STREAM_JOIN`, hive-p2p): a node holding `HIVE_JWT_SECRET` self-admits on
+/// first contact without this call. This exists for HIVE_PEER_TRUST-enforced
+/// fleets that also want an explicit, audited allowlist edit. Does NOT propagate
+/// to peers directly; the admitted id becomes visible to them transitively the
+/// next time this node gossips a NodeInfo carrying that iroh_addr (main.rs:1264).
+async fn mesh_admit(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(req): Json<MeshAdmitReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let id = req.endpoint_id.trim();
+    if id.len() != 64 || !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err((StatusCode::BAD_REQUEST, "endpoint_id must be a 64-char hex iroh NodeId".into()));
+    }
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Ok(mut set) = c.trusted_peer_ids.write() {
+        set.insert(id.to_string());
+    }
+    c.audit.record(&t, "user", "admit", "mesh_peer", id, "manually admitted to the P2P trust set");
+    Ok(Json(json!({ "admitted": id, "trusted_peer_count": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0) })))
 }
 
 async fn overview(State(c): State<Arc<CloudState>>) -> Json<Value> {
@@ -2666,10 +2754,39 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
     evs.retain(|e| e.project.is_empty() || norm(&c.projects.team_of(&e.project)) == t);
     if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
         let pl = p.to_lowercase();
+        // EXACT project scoping. The old filter also kept any event whose `host`
+        // or `detail` merely CONTAINED the project name as a substring — so
+        // `/projects/ctest/logs` leaked in every other project's events that
+        // happened to mention "ctest" anywhere (and a short name like "css"
+        // matched "cssdemosite", "processor", …). Scope instead to: events
+        // tagged with this exact project, OR untagged/infra events whose `host`
+        // is one of THIS project's real deployment hostnames (exact label or a
+        // subdomain of it) — never a blind substring on free-text detail.
+        let hosts: std::collections::HashSet<String> = c
+            .gw
+            .list()
+            .into_iter()
+            .filter(|d| d.project.eq_ignore_ascii_case(&pl))
+            .flat_map(|d| {
+                [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
+                    .into_iter()
+                    .filter(|h| !h.is_empty())
+                    .map(|h| h.to_lowercase())
+            })
+            .collect();
         evs.retain(|e| {
-            e.project.to_lowercase() == pl
-                || e.host.to_lowercase().contains(&pl)
-                || e.detail.to_lowercase().contains(&pl)
+            if e.project.to_lowercase() == pl {
+                return true;
+            }
+            if !e.project.is_empty() {
+                return false; // tagged for a DIFFERENT project — never leak it.
+            }
+            // Untagged/infra event: keep only if its host is one of this
+            // project's deployment hosts (exact or a subdomain label boundary).
+            let h = e.host.to_lowercase();
+            hosts
+                .iter()
+                .any(|ph| h == *ph || h.starts_with(&format!("{ph}.")) || ph.starts_with(&format!("{h}.")))
         });
     }
     if let Some(s) = q.q.as_ref().filter(|s| !s.is_empty()) {
@@ -3028,6 +3145,56 @@ async fn cron_del(
     Ok(Json(json!({ "removed": id })))
 }
 
+/// A cron job's owning team — legacy jobs (no tenant recorded) are attributed
+/// by their target project's owning team, matching `cron_list`/`cron_del`.
+fn cron_job_owner(c: &Arc<CloudState>, job: &CronJob) -> String {
+    if job.tenant.is_empty() { norm(&c.projects.team_of(&job.deployment)).to_string() } else { job.tenant.clone() }
+}
+
+/// Manually trigger a cron job right now (the dashboard's "Run" button) — the
+/// SAME invocation path the scheduler's own tick loop uses
+/// (`spawn_cron_loop`/`invoke`), so a manual run behaves identically to a
+/// real firing, but stamped as a manual run in the recorded event and without
+/// touching the job's own `next_run_ms` (its schedule is unaffected).
+async fn cron_run(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let job = c.cron.get(&id).ok_or((StatusCode::NOT_FOUND, "no such cron job".into()))?;
+    if cron_job_owner(&c, &job) != t {
+        return Err((StatusCode::FORBIDDEN, "cron job belongs to a different team".into()));
+    }
+    let (status, detail) = match crate::invoke(&c, &job.deployment, &job.path).await {
+        Ok((s, _)) => (s, format!("cron {} -> {s} (manual run)", job.name)),
+        Err(e) => (0, format!("cron {} error: {e} (manual run)", job.name)),
+    };
+    let ev = c.event(&c.region, "CRON", &job.deployment, &job.path, status, "cron", &detail);
+    c.record(ev);
+    let updated = c.cron.record_manual_run(&id, now_ms());
+    Ok(Json(json!({ "status": status, "job": updated })))
+}
+
+async fn project_cron_enabled_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(b): Json<CronToggle>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_cron_enabled(&project, b.enabled);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+#[derive(Deserialize)]
+struct CronToggle {
+    enabled: bool,
+}
+
 // ---- Workflows ----
 
 #[derive(Deserialize)]
@@ -3381,6 +3548,15 @@ struct CreateTeam {
     name: String,
     #[serde(default = "default_plan")]
     plan: String,
+    /// Optional EXACT tenant slug (e.g. a Clerk-org-derived id/slug already in use
+    /// by existing tenant-scoped data — projects/deployments/billing accounts
+    /// that predate this team row and are tagged with a specific string). When
+    /// absent/empty, falls back to the original slugify(name)+uniqueness-suffix
+    /// behavior (unchanged for every existing caller). When present, the team is
+    /// created with exactly this slug so it lines up with data that already
+    /// exists under that tenant id — never silently re-derived.
+    #[serde(default)]
+    slug: String,
 }
 fn default_plan() -> String {
     "pro".into()
@@ -3421,10 +3597,29 @@ async fn team_get(
     c.teams.get(&slug).map(|t| Json(json!(t))).ok_or((StatusCode::NOT_FOUND, "no such team".into()))
 }
 
-async fn team_create(State(c): State<Arc<CloudState>>, Json(b): Json<CreateTeam>) -> Json<Value> {
-    let t = c.teams.create(&b.name, &b.plan, &c.owner_email);
+async fn team_create(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<CreateTeam>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // An exact-slug creation targets a specific pre-existing tenant id (e.g. one
+    // already used by real projects/billing) — that's an operator-level action,
+    // not the normal self-serve "create my own org" flow every signed-in user can
+    // do, so gate it the same way every other cross-tenant admin write is gated.
+    if !b.slug.trim().is_empty() {
+        require_operator(claims.as_ref().map(|e| &e.0))?;
+    }
+    let slug = b.slug.trim();
+    let t = if slug.is_empty() {
+        c.teams.create(&b.name, &b.plan, &c.owner_email)
+    } else {
+        c.teams
+            .create_with_slug(slug, &b.name, &b.plan, &c.owner_email)
+            .ok_or((StatusCode::CONFLICT, format!("team slug '{slug}' already exists")))?
+    };
     crate::persist::persist(&c);
-    Json(json!(t))
+    Ok(Json(json!(t)))
 }
 
 async fn team_add_member(
@@ -4537,11 +4732,29 @@ async fn admin_overview(
     let req30: u64 = series.iter().map(|b| b.requests).sum();
     let err30: u64 = series.iter().map(|b| b.errors).sum();
     let err_rate = if req30 == 0 { 0.0 } else { err30 as f64 / req30 as f64 };
+    // Fleet-aggregated counts (operator, all tenants): the ops overview runs on
+    // ONE node while the placement scheduler hosts deployments on peers, so a
+    // bare `c.gw.list()` under-counts to zero here. Deployments = local + gossiped
+    // peer_deployments (deduped by id). Projects = the tenant-tagged projects
+    // store (authoritative, gossiped) UNION any project that only shows up as a
+    // hosted deployment — so a project is counted even before its record replicates.
+    let fleet_deps = fleet_deployments_all(&c);
+    let deployments_count = fleet_deps.len();
+    let projects_count = {
+        let mut names: std::collections::BTreeSet<String> =
+            c.projects.snapshot().into_iter().map(|(k, _)| k).collect();
+        for d in &fleet_deps {
+            if let Some(p) = d.get("project").and_then(|v| v.as_str()) {
+                names.insert(p.to_string());
+            }
+        }
+        names.len()
+    };
     Ok(Json(json!({
         "owner": c.owner_email,
         "teams": c.teams.count(),
-        "projects": c.gw.list().iter().map(|d| d.project.clone()).collect::<std::collections::BTreeSet<_>>().len(),
-        "deployments": c.gw.list().len(),
+        "projects": projects_count,
+        "deployments": deployments_count,
         "databases": { "total": dbs.len(), "live": live_dbs },
         "nodes": nodes.len(),
         "regions": c.registry.regions(),
@@ -4790,15 +5003,92 @@ struct IdentitySyncReq {
 
 /// The dashboard syncs the signed-in user + active org from the identity provider
 /// (Clerk). We index them into the store, scoped to the active tenant namespace.
-async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<IdentitySyncReq>) -> Json<Value> {
-    let (tenant, org_slug) = match &req.org {
-        Some(o) => {
-            let slug = if o.slug.is_empty() { o.id.clone() } else { o.slug.clone() };
-            c.identity.upsert_org(&o.id, &slug, &o.name, &o.image_url);
-            (slug.clone(), Some(slug))
+///
+/// SECURITY (fixes a confirmed cross-tenant data leak): `is_owner` and the
+/// indexed tenant are now derived from the caller's OWN verified JWT claims
+/// (`platform_admin`/`tenant`) when auth is enforced — NEVER from the request
+/// body's `user.email`/`org`. The previous implementation trusted the body
+/// outright: this route requires SOME authenticated caller (any mutation not
+/// in `auth::require_auth`'s open list), but nothing checked that the caller
+/// actually WAS the identity/org they claimed — so any authenticated user,
+/// including one from a completely different, unprivileged tenant, could POST
+/// `{"user":{"email":"<owner's email>"},...}` and get back `is_owner: true`.
+/// The dashboard's own client then persisted that as `hive_is_owner=1` in
+/// their OWN browser's localStorage, and `currentTeam()` (ui/lib/api.ts) reads
+/// that flag to route EVERY subsequent request from that browser to the
+/// owner's "personal" tenant — exposing the owner's real projects,
+/// deployments, and billing data to that caller. Likewise, an org claimed in
+/// `req.org` is only honored if it matches the caller's own verified tenant
+/// (already Clerk-membership-checked at JWT-mint time in `/api/token`), so a
+/// caller can't index themselves into (or read as) an org they don't belong
+/// to. Unenforced (dev/local, no `HIVE_JWT_SECRET`) mode keeps the old
+/// body-trusting behavior — there is no tenant boundary to protect there.
+/// Pure decision core of `identity_sync` (no request/state deps, unit-testable):
+/// given the caller's OWN verified claims (if any), the enforcement mode, the
+/// org they're claiming (if any), and their raw user id, resolve `(tenant,
+/// org_slug_to_index, is_owner)`. `body_email_is_owner` is ONLY consulted in
+/// the unenforced-dev fallback (`auth_is_owner: None, enforced: false`) — it
+/// must never be trusted when `enforced` is true.
+fn resolve_identity_sync(
+    enforced: bool,
+    auth_tenant: Option<&str>,
+    auth_is_owner: Option<bool>,
+    claimed_org_slug: Option<&str>,
+    user_id: &str,
+    body_email_is_owner: bool,
+) -> (String, Option<String>, bool) {
+    let (tenant, org_slug) = match claimed_org_slug {
+        Some(slug) => {
+            if enforced && auth_tenant != Some(slug) {
+                // Authenticated as a DIFFERENT tenant than the org claimed here —
+                // never index (or report) an org the caller isn't verified to
+                // belong to. Fall back to their own real tenant.
+                (auth_tenant.map(str::to_string).unwrap_or_else(|| ANON_TENANT.to_string()), None)
+            } else {
+                (slug.to_string(), Some(slug.to_string()))
+            }
         }
-        None => ("personal".to_string(), None),
+        None => match auth_is_owner {
+            // Personal scope: the OWNER keeps the legacy "personal" namespace;
+            // every other verified caller is isolated under their own `u_<uid>`
+            // — never the shared literal "personal".
+            Some(true) => ("personal".to_string(), None),
+            Some(false) => (format!("u_{user_id}"), None),
+            None if !enforced => ("personal".to_string(), None), // dev/unenforced fallback
+            None => (ANON_TENANT.to_string(), None),
+        },
     };
+    let is_owner = match auth_is_owner {
+        Some(b) => b,
+        None if !enforced => body_email_is_owner,
+        None => false,
+    };
+    (tenant, org_slug, is_owner)
+}
+
+async fn identity_sync(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(req): Json<IdentitySyncReq>,
+) -> Json<Value> {
+    let enforced = crate::auth::enforced();
+    let verified = claims.as_ref().map(|e| &e.0);
+    let auth_tenant: Option<String> = verified.map(|cl| norm(&cl.tenant).to_string());
+    let auth_is_owner: Option<bool> = verified.map(|cl| cl.platform_admin);
+    let claimed_org_slug = req.org.as_ref().map(|o| if o.slug.is_empty() { o.id.clone() } else { o.slug.clone() });
+    let body_email_is_owner = !c.owner_email.trim().is_empty() && req.user.email.eq_ignore_ascii_case(c.owner_email.trim());
+
+    let (tenant, org_slug, is_owner) = resolve_identity_sync(
+        enforced,
+        auth_tenant.as_deref(),
+        auth_is_owner,
+        claimed_org_slug.as_deref(),
+        &req.user.id,
+        body_email_is_owner,
+    );
+    if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
+        c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
+    }
     c.identity.upsert_user(
         &req.user.id,
         &req.user.email,
@@ -4808,15 +5098,6 @@ async fn identity_sync(State(c): State<Arc<CloudState>>, Json(req): Json<Identit
         org_slug.as_deref(),
     );
     crate::persist::persist(&c);
-    // MULTI-TENANCY: tell the client whether this account is the PLATFORM OWNER.
-    // Personal-scope data historically lived under the single global "personal"
-    // namespace (the cross-account leak). The client now keys personal data by
-    // per-user id (`u_<uid>`); the owner alone keeps the legacy "personal"
-    // namespace so their pre-existing projects/deployments (local AND fleet-hosted,
-    // tagged tenant="personal") stay visible — without a risky mesh-wide retag.
-    // Every non-owner is isolated under their own `u_<uid>`.
-    let is_owner = !c.owner_email.trim().is_empty()
-        && req.user.email.eq_ignore_ascii_case(c.owner_email.trim());
     Json(json!({ "ok": true, "tenant": tenant, "is_owner": is_owner }))
 }
 
@@ -4877,14 +5158,24 @@ fn default_kind() -> String {
 
 async fn billing_checkout(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Json(req): Json<CheckoutReq>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let (plan, amount, label) = if req.kind == "credits" {
+    let (plan, amount, label, price_id) = if req.kind == "credits" {
         let amt = req.amount_cents.unwrap_or(1000);
-        ("".to_string(), amt, format!("OpenEdge credits (${:.2})", amt as f64 / 100.0))
+        ("".to_string(), amt, format!("OpenEdge credits (${:.2})", amt as f64 / 100.0), None)
     } else {
         let plan = req.plan.unwrap_or_else(|| "pro".into());
         let spec = crate::billing::plan_spec(&plan);
-        (plan, spec.price_cents, format!("OpenEdge {} plan", spec.name))
+        (plan, spec.price_cents, format!("OpenEdge {} plan", spec.name), spec.stripe_price_id)
     };
+    // A free plan (Hobby, or any future $0 tier) has nothing to charge —
+    // Stripe Checkout rejects a $0 payment/subscription outright, and there's
+    // no reason to round-trip it at all. Apply immediately, same as the mock
+    // path always did for this case.
+    if amount == 0 {
+        let acc = c.billing.set_plan(&t, &plan);
+        c.audit.record(&t, "user", "plan_change", "billing", &plan, "switched to a free plan (no checkout needed)");
+        crate::persist::persist(&c);
+        return Json(json!({ "url": "", "mock": false, "applied": true, "account": acc }));
+    }
     let co = c.billing.open_checkout(&t, &req.kind, &plan, amount);
 
     // Real Stripe Checkout when configured; otherwise the local mock checkout.
@@ -4892,8 +5183,11 @@ async fn billing_checkout(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
         let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
         let success = format!("{base}/billing?success={}", co.id);
         let cancel = format!("{base}/billing?canceled=1");
-        match crate::billing::stripe_checkout(&c.http, amount, &label, &success, &cancel).await {
-            Ok(url) => return Json(json!({ "url": url, "mock": false, "session": co.id })),
+        match crate::billing::stripe_checkout(&c.http, price_id, amount, &label, &success, &cancel, &co.id).await {
+            Ok((url, stripe_session_id)) => {
+                c.billing.attach_stripe_session(&co.id, &stripe_session_id);
+                return Json(json!({ "url": url, "mock": false, "session": co.id }));
+            }
             Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
         }
     }
@@ -4911,10 +5205,115 @@ struct ConfirmReq {
 
 async fn billing_confirm(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Json(req): Json<ConfirmReq>) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let co = c.billing.get_checkout(&req.session).ok_or(StatusCode::NOT_FOUND)?;
+    // A checkout may only be confirmed by the SAME tenant that opened it —
+    // without this, any authenticated caller who learns/guesses another
+    // tenant's checkout id could force-complete or grief it.
+    if norm(&co.tenant) != t {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    // When this was a REAL Stripe checkout, verify actual payment with Stripe
+    // before applying anything — the client hitting this endpoint (a redirect
+    // back from Stripe, or a direct call) is NOT proof of payment on its own;
+    // without this check, anyone could open a checkout and immediately call
+    // confirm without ever paying, and receive the plan/credits for free.
+    let mut stripe_customer = String::new();
+    let mut stripe_subscription = String::new();
+    if !co.stripe_session_id.is_empty() {
+        let status = crate::billing::stripe_verify_session(&c.http, &co.stripe_session_id)
+            .await
+            .map_err(|e| { tracing::warn!(error=%e, session=%co.stripe_session_id, "stripe session verification failed"); StatusCode::BAD_GATEWAY })?;
+        if !status.paid {
+            return Err(StatusCode::PAYMENT_REQUIRED);
+        }
+        stripe_customer = status.customer.unwrap_or_default();
+        stripe_subscription = status.subscription.unwrap_or_default();
+    }
     let (co, acc) = c.billing.confirm_checkout(&req.session).ok_or(StatusCode::NOT_FOUND)?;
+    if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
+        c.billing.set_stripe_ids(&co.tenant, &stripe_customer, &stripe_subscription);
+    }
     c.audit.record(&t, "user", "charge", "billing", &co.id, &format!("checkout {} {} ${:.2}", co.kind, co.plan, co.amount_cents as f64 / 100.0));
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true, "account": acc })))
+}
+
+/// Stripe's server-to-server notification of billing events — the
+/// authoritative sync path (unlike `billing_confirm`, which only fires when a
+/// user's browser happens to be present for the redirect back). Handles the
+/// checkout completing (in case the user closes the tab before that redirect)
+/// and subscription cancellation/renewal so a tenant's plan stays correct even
+/// when nobody is watching.
+///
+/// Auth: this route is in `auth::require_auth`'s `open` allowlist (Stripe
+/// can't present a platform JWT — it's authenticated by its own HMAC
+/// signature, verified below). Deliberately FAILS CLOSED when
+/// `STRIPE_WEBHOOK_SECRET` is unset — unlike `git_webhook`'s dev-open
+/// default, an unverifiable delivery must never be allowed to mutate a
+/// tenant's billing state.
+async fn billing_webhook(State(c): State<Arc<CloudState>>, headers: HeaderMap, body: axum::body::Bytes) -> Result<StatusCode, StatusCode> {
+    let secret = std::env::var("STRIPE_WEBHOOK_SECRET").unwrap_or_default();
+    if secret.is_empty() {
+        tracing::warn!("stripe webhook received but STRIPE_WEBHOOK_SECRET is not configured — rejecting (fail closed)");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let sig = headers.get("stripe-signature").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !crate::billing::verify_webhook_signature(&body, sig, &secret) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    let v: Value = serde_json::from_slice(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let event_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    let obj = v.get("data").and_then(|d| d.get("object")).cloned().unwrap_or_else(|| json!({}));
+
+    match event_type {
+        // Primary confirmation path — mirrors `billing_confirm`'s apply logic,
+        // keyed by the `checkout_id` we stamped into the session's metadata
+        // (see `stripe_checkout`) rather than a tenant header, since Stripe is
+        // the caller here, not an authenticated user.
+        "checkout.session.completed" => {
+            let checkout_id = obj.get("metadata").and_then(|m| m.get("checkout_id")).and_then(|s| s.as_str()).unwrap_or("");
+            if !checkout_id.is_empty() {
+                if let Some((co, _acc)) = c.billing.confirm_checkout(checkout_id) {
+                    let customer = obj.get("customer").and_then(|s| s.as_str()).unwrap_or("");
+                    let subscription = obj.get("subscription").and_then(|s| s.as_str()).unwrap_or("");
+                    if !customer.is_empty() || !subscription.is_empty() {
+                        c.billing.set_stripe_ids(&co.tenant, customer, subscription);
+                    }
+                    c.audit.record(&co.tenant, "system", "charge", "billing", &co.id, "stripe webhook: checkout.session.completed");
+                    crate::persist::persist(&c);
+                }
+                // Already confirmed via `billing_confirm` (the common case,
+                // since the user's browser is usually still present) —
+                // `confirm_checkout` is idempotent (removes on first success),
+                // so a `None` here just means nothing left to do.
+            }
+        }
+        // Cancellation (immediate or end-of-period, depending on Stripe
+        // dashboard/API settings) — downgrade to Hobby so quotas/business-locks
+        // re-engage even if nobody visits the dashboard again.
+        "customer.subscription.deleted" => {
+            let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
+            if let Some(tenant) = (!sub_id.is_empty()).then(|| c.billing.tenant_for_subscription(sub_id)).flatten() {
+                c.billing.set_plan(&tenant, "hobby");
+                c.audit.record(&tenant, "system", "plan_change", "billing", sub_id, "stripe webhook: subscription canceled -> downgraded to hobby");
+                crate::persist::persist(&c);
+            }
+        }
+        // A renewal failure (card declined etc.) surfaces as the subscription
+        // moving to "past_due"/"unpaid" — logged for now (no automatic
+        // downgrade on a transient failure; Stripe's own retry schedule and
+        // dunning emails run first, and `customer.subscription.deleted` is
+        // still the terminal signal once retries are exhausted).
+        "customer.subscription.updated" => {
+            let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
+            let status = obj.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            if let Some(tenant) = (!sub_id.is_empty()).then(|| c.billing.tenant_for_subscription(sub_id)).flatten() {
+                tracing::info!(%tenant, %sub_id, %status, "stripe webhook: subscription updated");
+            }
+        }
+        _ => {}
+    }
+    Ok(StatusCode::OK)
 }
 
 #[derive(Deserialize)]
@@ -4957,7 +5356,13 @@ fn all_collections(c: &Arc<CloudState>) -> Vec<(&'static str, Vec<Value>)> {
     let wf_defs: Vec<Value> = c.workflows.defs().into_iter().map(|d| json!(d)).collect();
 
     vec![
-        ("deployments", c.gw.list().into_iter().map(|d| json!(d)).collect()),
+        // Fleet-aggregated: this operator data browser runs on ONE node, but the
+        // placement scheduler hosts a project's deployments on peer nodes, so a
+        // bare `c.gw.list()` (locally-hosted only) showed "0 deployments" here
+        // while every deployment lived on a peer. Merge the gossiped
+        // peer_deployments (deduped by id) exactly as the tenant-facing
+        // `dep_list` does — the ops view spans ALL tenants (operator-only).
+        ("deployments", fleet_deployments_all(c)),
         ("projects", projects),
         ("orgs", c.identity.orgs().into_iter().map(|o| json!(o)).collect()),
         ("users", c.identity.users().into_iter().map(|u| json!(u)).collect()),
@@ -5303,6 +5708,91 @@ fn thumbnail_placeholder(project: &str) -> String {
 }
 
 #[cfg(test)]
+mod identity_sync_tests {
+    use super::resolve_identity_sync;
+
+    /// REGRESSION TEST for a real, confirmed cross-tenant data leak: the
+    /// original `identity_sync` derived `is_owner` from the REQUEST BODY's
+    /// `user.email`, trusted outright regardless of who the caller was
+    /// actually authenticated as. Any authenticated user — including one from
+    /// a completely different, unprivileged tenant — could claim the owner's
+    /// email in the body and get `is_owner: true` back; the dashboard's own
+    /// client then persisted that in ITS OWN browser's localStorage, routing
+    /// every subsequent request from that browser to the owner's "personal"
+    /// tenant. This is the confirmed root cause of "dylanwong007@gmail.com's
+    /// hobby-plan projects appearing under other accounts/orgs" — the fix
+    /// derives `is_owner`/tenant from the caller's OWN verified JWT claim,
+    /// never the body, once enforced.
+    #[test]
+    fn enforced_mode_never_trusts_a_forged_owner_email_in_the_body() {
+        // The attack: authenticated as "thoth-division" (a real, unprivileged
+        // tenant), claiming the owner's email in the body, no org claimed
+        // (personal-scope request) — exactly the shape the exploit sends.
+        let (tenant, org_slug, is_owner) = resolve_identity_sync(
+            /* enforced */ true,
+            /* auth_tenant */ Some("thoth-division"),
+            /* auth_is_owner (the REAL, server-verified value for this caller) */ Some(false),
+            /* claimed_org_slug */ None,
+            /* user_id */ "user_thoth_attacker",
+            /* body_email_is_owner (forged — irrelevant once enforced) */ true,
+        );
+        assert!(!is_owner, "a non-owner caller must never be granted is_owner, no matter what the body claims");
+        assert_eq!(tenant, "u_user_thoth_attacker", "must be isolated under their own per-user namespace");
+        assert_eq!(org_slug, None);
+        assert_ne!(tenant, "personal", "must never land in the owner's shared namespace");
+    }
+
+    #[test]
+    fn enforced_mode_grants_owner_only_via_the_verified_claim() {
+        let (tenant, _org, is_owner) = resolve_identity_sync(true, Some("personal"), Some(true), None, "user_real_owner", false);
+        assert!(is_owner);
+        assert_eq!(tenant, "personal");
+    }
+
+    #[test]
+    fn enforced_mode_rejects_claiming_an_org_the_caller_is_not_verified_for() {
+        // Authenticated as "acme" but the request body claims org "thoth-division"
+        // (e.g. a stale/forged client payload) — must fall back to the caller's
+        // OWN real tenant, never index or report the claimed org.
+        let (tenant, org_slug, _owner) = resolve_identity_sync(true, Some("acme"), Some(false), Some("thoth-division"), "user_x", false);
+        assert_eq!(tenant, "acme");
+        assert_eq!(org_slug, None, "an unverified org claim must never be indexed");
+    }
+
+    #[test]
+    fn enforced_mode_honors_an_org_claim_matching_the_verified_tenant() {
+        let (tenant, org_slug, _owner) = resolve_identity_sync(true, Some("thoth-division"), Some(false), Some("thoth-division"), "user_x", false);
+        assert_eq!(tenant, "thoth-division");
+        assert_eq!(org_slug.as_deref(), Some("thoth-division"));
+    }
+
+    #[test]
+    fn enforced_mode_with_no_claims_never_falls_back_to_personal() {
+        // Should be unreachable in practice (require_auth already rejects an
+        // unauthenticated mutation before this function runs), but the pure
+        // function must fail safe on its own regardless.
+        let (tenant, org_slug, is_owner) = resolve_identity_sync(true, None, None, None, "user_x", true);
+        assert_ne!(tenant, "personal");
+        assert!(!is_owner);
+        assert_eq!(org_slug, None);
+    }
+
+    #[test]
+    fn unenforced_dev_mode_keeps_the_legacy_body_trusting_fallback() {
+        // No JWT auth configured at all (local/dev) — no tenant boundary exists
+        // to protect, so the historical behavior (trust the body) is fine and
+        // intentionally preserved for zero-friction local development.
+        let (tenant, _org, is_owner) = resolve_identity_sync(false, None, None, None, "user_x", true);
+        assert!(is_owner);
+        assert_eq!(tenant, "personal");
+
+        let (tenant2, _org2, is_owner2) = resolve_identity_sync(false, None, None, None, "user_x", false);
+        assert!(!is_owner2);
+        assert_eq!(tenant2, "personal", "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)");
+    }
+}
+
+#[cfg(test)]
 mod dns_import_tests {
     use super::parse_zone;
 
@@ -5468,23 +5958,32 @@ mod project_purge_tests {
     use super::*;
 
     /// REGRESSION TEST for a real, confirmed GDPR Art.17 gap: nothing ever
-    /// removed a project's backing podman volume — `podman rm` of the
-    /// container that mounted it leaves the NAMED volume (and the customer
-    /// data inside it) on host disk forever. Real podman calls (no mocking):
+    /// removed a project's backing container volume — removing the container
+    /// that mounted it leaves the NAMED volume (and the customer data inside
+    /// it) on host disk forever. Real container-CLI calls (no mocking):
     /// creates two projects' volumes (one with a per-service suffix, matching
     /// a compose deployment), purges one, and confirms the OTHER project's
     /// volume — including one whose name is a superstring of the deleted
-    /// project's — survives untouched.
+    /// project's — survives untouched. On macOS, creates the target's volumes
+    /// in BOTH backends (podman + Apple `container`) to prove the dual-store
+    /// sweep in `purge_project_podman_volumes` actually cleans both.
     #[tokio::test]
     async fn purge_project_podman_volumes_removes_only_the_target_project() {
-        let Ok(v) = tokio::process::Command::new("podman").arg("--version").output().await else {
-            eprintln!("skipping: podman not found");
-            return;
-        };
-        if !v.status.success() {
-            eprintln!("skipping: podman not usable");
+        let path_env = std::env::var("PATH").unwrap_or_default();
+        let backends: &[bool] = if hive_backend::container_cli::is_apple_default() { &[false, true] } else { &[false] };
+        let mut usable: Vec<bool> = Vec::new();
+        for &apple in backends {
+            if hive_backend::container_cli::available(apple).await {
+                usable.push(apple);
+            } else {
+                eprintln!("skipping backend apple={apple}: CLI not found/usable");
+            }
+        }
+        if usable.is_empty() {
+            eprintln!("skipping: no container CLI available");
             return;
         }
+
         let suffix = std::process::id();
         let target = format!("purgetest-{suffix}");
         // A different project whose name CONTINUES the same characters with
@@ -5494,29 +5993,25 @@ mod project_purge_tests {
         // `<target>-<anything>`).
         let other = format!("purgetest-{suffix}other");
 
-        for name in [
-            format!("hive-vol-{target}"),
-            format!("hive-vol-{target}-worker"), // per-service (compose) suffix
-            format!("hive-vol-{other}"),
-        ] {
-            let _ = tokio::process::Command::new("podman").args(["volume", "create", &name]).output().await;
+        for &apple in &usable {
+            let bin = hive_backend::container_cli::bin(apple);
+            for name in [format!("hive-vol-{target}"), format!("hive-vol-{target}-worker"), format!("hive-vol-{other}")] {
+                let _ = tokio::process::Command::new(bin).args(["volume", "create", &name]).output().await;
+            }
         }
 
         purge_project_podman_volumes(&target).await;
 
-        let list = tokio::process::Command::new("podman")
-            .args(["volume", "ls", "--format", "{{.Name}}"])
-            .output()
-            .await
-            .expect("podman volume ls must run");
-        let names: Vec<String> = String::from_utf8_lossy(&list.stdout).lines().map(|s| s.trim().to_string()).collect();
+        for &apple in &usable {
+            let names = hive_backend::container_cli::list_volume_names(apple, &path_env).await;
+            assert!(!names.contains(&format!("hive-vol-{target}")), "target project's base volume must be removed (apple={apple})");
+            assert!(!names.contains(&format!("hive-vol-{target}-worker")), "target project's per-service volume must be removed (apple={apple})");
+            assert!(names.contains(&format!("hive-vol-{other}")), "a DIFFERENT project whose name is a superstring must survive (apple={apple})");
 
-        assert!(!names.contains(&format!("hive-vol-{target}")), "target project's base volume must be removed");
-        assert!(!names.contains(&format!("hive-vol-{target}-worker")), "target project's per-service volume must be removed");
-        assert!(names.contains(&format!("hive-vol-{other}")), "a DIFFERENT project whose name is a superstring must survive");
-
-        // Cleanup whatever's left (the `other` volume this test created).
-        let _ = tokio::process::Command::new("podman").args(["volume", "rm", "-f", &format!("hive-vol-{other}")]).output().await;
+            // Cleanup whatever's left (the `other` volume this test created).
+            let bin = hive_backend::container_cli::bin(apple);
+            let _ = tokio::process::Command::new(bin).args(hive_backend::container_cli::volume_rm_args(apple, &format!("hive-vol-{other}"))).output().await;
+        }
     }
 
     #[tokio::test]

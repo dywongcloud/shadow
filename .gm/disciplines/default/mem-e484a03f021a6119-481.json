@@ -1,0 +1,3 @@
+## Resolved mutable: pm-gossip-fetch-dial
+
+gossip.rs:399 fetch(peer): peer_iroh[peer] -> (node_id, addr_json) -> pool.gossip_request bounded 3s; failure evicts the entry and falls to HTTP url=peer+path (4s). Seed keys are 'seed:<id>'. Dynamic targets therefore key peer_iroh by ENDPOINT ID (64-hex); the HTTP fallback for eid keys fails fast (invalid URL) which is fine; registry re-inserts a fresh addr next round; dead nodes age out of registry (30s) and self-clean from targets.

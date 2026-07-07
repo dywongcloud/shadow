@@ -1,0 +1,3 @@
+## Resolved mutable: m-gitops-401-cause
+
+ui/lib/gitops-local.ts syncLocalGitops wraps apiGet('/v1/teams/${team}') and '/v1/gitops/projects' in .catch() so a team 401 does not throw the sync; admin.rs require_team:1432 returns 403 (not 401) on tenant!=slug. Therefore the surfaced 401 is an auth-layer/token issue (missing/expired hive_jwt on a setup mutation PUT /v1/gitops via admin_ingress) not tenant-mismatch. Fix: harden client sync to not surface a dependency 401 as hard failure + confirm exact call live via browser in VERIFY.

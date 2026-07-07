@@ -77,15 +77,36 @@ export async function switchTeam(slug: string): Promise<void> {
 }
 
 /** fetch with a hard timeout so a slow/unreachable backend (e.g. a far region)
- *  can't leave a request — and the tab that awaits it — hanging indefinitely. */
+ *  can't leave a request — and the tab that awaits it — hanging indefinitely.
+ *
+ *  SESSION RESILIENCE: the `hive_jwt` cookie the backend authenticates every
+ *  `/cloud` + `/ops` call against is minted with a 1-hour TTL and nothing used to
+ *  refresh it mid-session — so after an hour EVERY request (a gitops link/sync,
+ *  an env edit, a redeploy) 401'd and surfaced as a hard failure toast
+ *  ("gitops sync failed · HTTP 401"). On a 401 we now transparently re-mint the
+ *  cookie for the current tenant and retry the request ONCE; only a still-failing
+ *  retry propagates. Same-origin `/api/token` is unaffected by the backend's auth
+ *  (it authorizes via the server-side Clerk session), so the refresh works even
+ *  when the old cookie is already rejected. Guarded to a single retry so a
+ *  genuinely unauthorized call (not just an expired cookie) still fails fast. */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...init, signal: ctrl.signal });
-  } finally {
-    clearTimeout(t);
+  const once = async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...init, signal: ctrl.signal });
+    } finally {
+      clearTimeout(t);
+    }
+  };
+  const r = await once();
+  // 401 only — a 403 is a real authorization decision (wrong tenant/role), not an
+  // expired session, so re-minting the same identity would loop without helping.
+  if (r.status === 401 && typeof window !== "undefined" && CLERK_ON) {
+    await mintSessionToken();
+    return once();
   }
+  return r;
 }
 
 // Short-TTL, tenant-scoped GET cache + in-flight de-dup. The dashboard has no
@@ -515,6 +536,7 @@ export interface ProjectSettings {
   domains?: string[];
   team?: string;
   preview_protection?: boolean;
+  cron_enabled?: boolean;
 }
 
 export interface RegionEntry {

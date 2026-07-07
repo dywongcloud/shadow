@@ -53,6 +53,15 @@ const STREAM_GOSSIP: u8 = 0x02;
 /// signer to the QUIC connection's authenticated remote identity (signer == remote,
 /// so a signed message can't be replayed by a third party from another channel).
 const STREAM_GOSSIP_SIGNED: u8 = 0x03;
+/// MESH JOIN (hot-join): a NOT-YET-TRUSTED node introduces itself. Framing:
+/// `[u32 node_len][node_json][u32 proof_len][proof]` -> response `[u32 len][bytes]`
+/// (empty = rejected). The caller's identity is the QUIC connection's
+/// authenticated remote id (ed25519, unspoofable) — the join handler verifies a
+/// shared-secret HMAC over THAT id, so possession of the fleet secret admits the
+/// key without any per-node allowlist edit or restart. This is the ONLY stream
+/// mode an untrusted connection may use when a trust set is enforced; every
+/// other mode on an untrusted connection is dropped per-stream.
+const STREAM_JOIN: u8 = 0x04;
 const GOSSIP_METHOD_GET: u8 = 0;
 const GOSSIP_METHOD_POST: u8 = 1;
 /// Domain separator for gossip signatures (versioned; bump on format change).
@@ -69,6 +78,17 @@ const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
 /// `None` for legacy-unsigned requests (only admitted outside enforce mode).
 pub type GossipHandler = Arc<
     dyn Fn(u8, String, Vec<u8>, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Serves one MESH-JOIN request: `(remote_id, node_json, proof) -> response body`
+/// (empty = rejected). `remote_id` is the QUIC connection's authenticated peer
+/// identity — the handler verifies `proof` against IT (never against anything the
+/// body claims), admits the id into the trust set on success, and returns the
+/// current node roster so the joiner learns the whole mesh in one round trip.
+pub type JoinHandler = Arc<
+    dyn Fn(String, Vec<u8>, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
         + Send
         + Sync,
 >;
@@ -826,6 +846,72 @@ impl PeerPool {
         }
     }
 
+    /// MESH JOIN (hot-join): introduce this node to `node_id` (a seed, dialed by
+    /// KEY — iroh resolves the address via discovery/relay, no IP required).
+    /// `node_json` is our own NodeInfo; `proof` is HMAC(fleet secret, OUR endpoint
+    /// id). Returns the seed's node roster on admission (empty body = rejected).
+    /// Same trunk reuse + redial-once semantics as [`gossip_request`].
+    pub async fn join_request(
+        &self,
+        node_id: &str,
+        addr_json: &str,
+        node_json: &[u8],
+        proof: &str,
+    ) -> Result<Vec<u8>> {
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let conn = match self.acquire(node_id, addr_json).await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_OPEN).await;
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(self.dead_peer(node_id, "open", open_budget()));
+                }
+            };
+            send.write_all(&[STREAM_JOIN]).await?;
+            send.write_all(&(node_json.len() as u32).to_be_bytes()).await?;
+            send.write_all(node_json).await?;
+            send.write_all(&(proof.len() as u32).to_be_bytes()).await?;
+            send.write_all(proof.as_bytes()).await?;
+            send.flush().await?;
+            let _ = send.finish();
+            let resp = match tokio::time::timeout(firstbyte_budget(), read_frame(&mut recv)).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
+                    return Err(anyhow::Error::new(PostSendTimeout {
+                        node_id: node_id.to_string(),
+                        phase: "firstbyte",
+                        budget_ms: firstbyte_budget().as_millis() as u64,
+                    }));
+                }
+            };
+            return Ok(resp);
+        }
+    }
+
     /// Test/diagnostic helper: close + drop a peer's trunk so the next request
     /// re-dials a fresh connection.
     pub async fn close_peer(&self, node_id: &str) {
@@ -1078,10 +1164,32 @@ pub async fn serve_tunnels(
     trust: Option<TrustSet>,
     gossip: Option<GossipHandler>,
 ) {
+    serve_tunnels_with_join(ep, local_http, max_concurrency, trust, gossip, None).await
+}
+
+/// [`serve_tunnels`] plus a MESH-JOIN surface (hot-join). Trust semantics:
+/// * No trust set configured — identical to before, every mode permissionless.
+/// * Trust set configured, TRUSTED peer — identical to before, every mode served.
+/// * Trust set configured, UNTRUSTED peer — previously the whole connection was
+///   dropped; now the connection stays open but EVERY stream except
+///   [`STREAM_JOIN`] is dropped per-stream (fail-closed: tunnels/raw/gossip all
+///   refused). A successful join inserts the peer into the shared trust set, so
+///   the SAME connection's subsequent streams are served (trust is re-read per
+///   stream) — the joiner never has to redial.
+/// * No `join` handler — untrusted connections are dropped exactly as before.
+pub async fn serve_tunnels_with_join(
+    ep: Endpoint,
+    local_http: String,
+    max_concurrency: u32,
+    trust: Option<TrustSet>,
+    gossip: Option<GossipHandler>,
+    join: Option<JoinHandler>,
+) {
     while let Some(incoming) = ep.accept().await {
         let local = local_http.clone();
         let trust = trust.clone();
         let gossip = gossip.clone();
+        let join = join.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -1092,13 +1200,12 @@ pub async fn serve_tunnels(
             // to bind signed-gossip messages to their sender (web3 verification).
             let remote_id = conn.remote_id().to_string();
             // #20 peer trust/attestation: when an allowlist is configured, only
-            // admit endpoints whose cryptographic iroh identity is trusted. Dropping
-            // `conn` closes the QUIC connection, so an untrusted peer can open no
-            // streams. (With signed gossip, participation is otherwise permissionless
-            // — any peer may connect, but only cryptographically valid messages are
-            // honored in enforce mode.)
+            // admit endpoints whose cryptographic iroh identity is trusted. With no
+            // join surface, dropping `conn` closes the QUIC connection (original
+            // behavior); with one, the connection survives so the peer can present
+            // its join proof — but every non-JOIN stream is refused until it does.
             if let Some(trust) = &trust {
-                if !peer_trusted(trust, &remote_id) {
+                if !peer_trusted(trust, &remote_id) && join.is_none() {
                     tracing::warn!(peer = %remote_id, "rejected untrusted P2P peer (#20 peer trust)");
                     return;
                 }
@@ -1109,12 +1216,26 @@ pub async fn serve_tunnels(
             while let Ok((send, mut recv)) = conn.accept_bi().await {
                 let local = local.clone();
                 let gossip = gossip.clone();
+                let join = join.clone();
                 let rid = remote_id.clone();
                 let trust = trust.clone();
                 tokio::spawn(async move {
                     // Read the 1-byte mode selector that prefixes every stream.
                     let mut mode = [0u8; 1];
                     if recv.read_exact(&mut mode).await.is_err() {
+                        return;
+                    }
+                    // Trust is re-read PER STREAM (not cached from accept time) so a
+                    // connection that joins mid-life is served immediately after.
+                    let trusted = trust.as_ref().map(|t| peer_trusted(t, &rid)).unwrap_or(true);
+                    if mode[0] == STREAM_JOIN {
+                        if let Some(j) = join {
+                            serve_join(recv, send, j, rid).await;
+                        }
+                        return;
+                    }
+                    if !trusted {
+                        tracing::warn!(peer = %rid, mode = mode[0], "dropped stream from untrusted peer (join required first)");
                         return;
                     }
                     match mode[0] {
@@ -1137,6 +1258,28 @@ pub async fn serve_tunnels(
             }
         });
     }
+}
+
+/// Server side of a [`STREAM_JOIN`] stream: read `(node_json, proof)`, hand them to
+/// the join handler with the connection's authenticated remote identity, frame the
+/// handler's response back (empty = rejected). The mode byte is already consumed.
+async fn serve_join<R, W>(mut recv: R, mut send: W, handler: JoinHandler, remote_id: String)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let node_json = match read_frame(&mut recv).await {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let proof = match read_frame(&mut recv).await {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => return,
+    };
+    let resp = handler(remote_id, node_json, proof).await;
+    let _ = send.write_all(&(resp.len() as u32).to_be_bytes()).await;
+    let _ = send.write_all(&resp).await;
+    let _ = send.flush().await;
 }
 
 /// Test/diagnostic helper (#H4): accept P2P connections + bi streams but NEVER

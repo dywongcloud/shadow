@@ -21,6 +21,12 @@ pub struct PlanSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub price_cents: u64,
+    /// The real Stripe recurring Price id for this plan's subscription
+    /// (`price_...`), or `None` for a plan with no paid subscription (Hobby).
+    /// Checkout uses this directly (`mode=subscription`) instead of ad-hoc
+    /// `price_data` — required for a REAL recurring charge; ad-hoc price_data
+    /// only supports one-time payments.
+    pub stripe_price_id: Option<&'static str>,
     pub included_cents: u64,
     pub overage: bool,
     /// Max projects for the tenant (0 = unlimited).
@@ -45,6 +51,7 @@ pub const PLANS: &[PlanSpec] = &[
         id: "hobby",
         name: "Hobby",
         price_cents: 0,
+        stripe_price_id: None,
         included_cents: 500,
         overage: false,
         max_projects: 100,
@@ -65,6 +72,7 @@ pub const PLANS: &[PlanSpec] = &[
         id: "pro",
         name: "Pro",
         price_cents: 2000,
+        stripe_price_id: Some("price_1TqK9jRj0yq8r94Ek8Gjgl7d"),
         included_cents: 2000,
         overage: true,
         max_projects: 1000,
@@ -84,7 +92,10 @@ pub const PLANS: &[PlanSpec] = &[
     PlanSpec {
         id: "enterprise",
         name: "Enterprise",
-        price_cents: 50000,
+        // $1,000/mo flat — matches the real Stripe price exactly (was 50000 /
+        // $500, a stale mock value from before real pricing existed).
+        price_cents: 100000,
+        stripe_price_id: Some("price_1TqKCGRj0yq8r94E4B8VhCC3"),
         included_cents: 100000,
         overage: true,
         max_projects: 0,
@@ -265,6 +276,12 @@ pub struct BillingAccount {
     pub balance_cents: i64,
     #[serde(default)]
     pub stripe_customer: String,
+    /// The active Stripe Subscription id (`sub_...`) backing a paid plan, if
+    /// any — set from the checkout/webhook verification response. Lets a
+    /// `customer.subscription.deleted`/`.updated` webhook find the right
+    /// tenant to downgrade/sync without a separate index.
+    #[serde(default)]
+    pub stripe_subscription: String,
     pub period_start_ms: u64,
     pub period_end_ms: u64,
     pub updated_ms: u64,
@@ -282,6 +299,7 @@ impl BillingAccount {
             used_cents: 0,
             balance_cents: 0,
             stripe_customer: String::new(),
+            stripe_subscription: String::new(),
             period_start_ms: now,
             period_end_ms: now + MONTH_MS,
             updated_ms: now,
@@ -313,6 +331,12 @@ pub struct Checkout {
     pub kind: String,
     pub plan: String,
     pub amount_cents: u64,
+    /// The REAL Stripe Checkout Session id (`cs_...`), set once the real
+    /// session is created. Empty for a mock (no-Stripe) checkout. Lets
+    /// confirmation verify actual payment with Stripe instead of trusting an
+    /// unauthenticated client's say-so that they paid.
+    #[serde(default)]
+    pub stripe_session_id: String,
     pub created_ms: u64,
 }
 
@@ -552,15 +576,48 @@ impl BillingStore {
 
     pub fn open_checkout(&self, tenant: &str, kind: &str, plan: &str, amount_cents: u64) -> Checkout {
         let c = Checkout {
-            id: format!("cs_{}", &Uuid::new_v4().simple().to_string()[..18]),
+            id: format!("co_{}", &Uuid::new_v4().simple().to_string()[..18]),
             tenant: tenant.to_string(),
             kind: kind.to_string(),
             plan: plan.to_string(),
             amount_cents,
+            stripe_session_id: String::new(),
             created_ms: now_ms(),
         };
         self.checkouts.write().insert(c.id.clone(), c.clone());
         c
+    }
+
+    /// Record the REAL Stripe Checkout Session id for a just-created local
+    /// checkout (called right after the Stripe API call succeeds).
+    pub fn attach_stripe_session(&self, checkout_id: &str, stripe_session_id: &str) {
+        if let Some(co) = self.checkouts.write().get_mut(checkout_id) {
+            co.stripe_session_id = stripe_session_id.to_string();
+        }
+    }
+
+    /// Persist the Stripe customer/subscription ids backing a tenant's paid
+    /// plan (from a verified checkout or a `checkout.session.completed`
+    /// webhook). Empty strings are no-ops (never overwrite a known id with
+    /// nothing just because one event's payload omitted it).
+    pub fn set_stripe_ids(&self, tenant: &str, customer: &str, subscription: &str) {
+        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let mut m = self.accounts.write();
+        let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+        if !customer.is_empty() {
+            acc.stripe_customer = customer.to_string();
+        }
+        if !subscription.is_empty() {
+            acc.stripe_subscription = subscription.to_string();
+        }
+        acc.updated_ms = now_ms();
+    }
+
+    /// Find the tenant whose account is backed by a given Stripe subscription
+    /// id — used by the `customer.subscription.deleted`/`.updated` webhook,
+    /// which identifies the subscription but not our tenant slug directly.
+    pub fn tenant_for_subscription(&self, subscription_id: &str) -> Option<String> {
+        self.accounts.read().values().find(|a| a.stripe_subscription == subscription_id).map(|a| a.tenant.clone())
     }
 
     pub fn get_checkout(&self, id: &str) -> Option<Checkout> {
@@ -654,6 +711,113 @@ mod tests {
     use super::*;
 
     #[test]
+    fn real_plan_prices_and_stripe_price_ids_are_wired() {
+        // REGRESSION TEST: Pro and Enterprise must carry the REAL Stripe price
+        // ids (not ad-hoc price_data) and their amounts must match what those
+        // real prices actually charge — a mismatch here would mean the
+        // dashboard displays one number while Stripe charges another.
+        let pro = plan_spec("pro");
+        assert_eq!(pro.stripe_price_id, Some("price_1TqK9jRj0yq8r94Ek8Gjgl7d"));
+        assert_eq!(pro.price_cents, 2000, "Pro must be $20/mo, matching the real Stripe price");
+
+        let ent = plan_spec("enterprise");
+        assert_eq!(ent.stripe_price_id, Some("price_1TqKCGRj0yq8r94E4B8VhCC3"));
+        assert_eq!(ent.price_cents, 100_000, "Enterprise must be $1,000/mo, matching the real Stripe price");
+
+        // Hobby has no paid subscription — must never reference a Stripe price.
+        assert_eq!(plan_spec("hobby").stripe_price_id, None);
+    }
+
+    #[test]
+    fn webhook_signature_verifies_a_real_hmac_and_rejects_tampering() {
+        // Independent HMAC-SHA256 computation (not reusing the crate's own
+        // `hmac_sha256_hex` helper) so this test can't pass merely because
+        // both sides share the same bug.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let secret = "whsec_test_fixture_secret";
+        let payload = br#"{"id":"evt_test","type":"checkout.session.completed"}"#;
+        let ts = (now_ms() / 1000) as i64;
+        let mut signed = format!("{ts}.").into_bytes();
+        signed.extend_from_slice(payload);
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(&signed);
+        let sig_hex: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+
+        let header = format!("t={ts},v1={sig_hex}");
+        assert!(verify_webhook_signature(payload, &header, secret), "a genuinely valid signature must verify");
+
+        // Wrong secret.
+        assert!(!verify_webhook_signature(payload, &header, "whsec_wrong_secret"));
+        // Tampered payload (the classic webhook-forgery attempt).
+        assert!(!verify_webhook_signature(b"{}", &header, secret));
+        // Tampered signature.
+        let bad_header = format!("t={ts},v1=0000000000000000000000000000000000000000000000000000000000000000");
+        assert!(!verify_webhook_signature(payload, &bad_header, secret));
+        // Stale timestamp (older than Stripe's 5-minute tolerance) — replay defense.
+        let stale_header = format!("t={},v1={sig_hex}", ts - 301);
+        assert!(!verify_webhook_signature(payload, &stale_header, secret), "a >5-minute-old signature must be rejected");
+        // Missing v1 entirely.
+        assert!(!verify_webhook_signature(payload, &format!("t={ts}"), secret));
+        // Garbage header.
+        assert!(!verify_webhook_signature(payload, "not-a-real-header", secret));
+    }
+
+    #[test]
+    fn checkout_confirmation_requires_a_stripe_session_id_to_carry_payment_state() {
+        // REGRESSION TEST for a real, confirmed payment-integrity gap: the
+        // original `confirm_checkout` applied a plan/credits unconditionally
+        // for ANY checkout id — a caller could open a checkout and immediately
+        // confirm it without ever paying, since nothing checked with Stripe.
+        // The fix moved verification into the `billing_confirm` HANDLER (it
+        // needs the shared `reqwest::Client` + tenant-ownership context this
+        // store-level test doesn't have), gated on `Checkout.stripe_session_id`
+        // being non-empty. This test locks in the STORE-level contract the fix
+        // depends on: a checkout opened while Stripe is configured must carry
+        // a real session id once `attach_stripe_session` runs, and the field
+        // must default empty (mock mode) so the handler knows to skip
+        // Stripe verification there instead of failing closed on nothing to verify.
+        let s = BillingStore::new();
+        let co = s.open_checkout("acme", "plan", "pro", 2000);
+        assert!(co.stripe_session_id.is_empty(), "a freshly-opened checkout has no Stripe session yet");
+        s.attach_stripe_session(&co.id, "cs_test_realsession123");
+        let refreshed = s.get_checkout(&co.id).unwrap();
+        assert_eq!(refreshed.stripe_session_id, "cs_test_realsession123");
+    }
+
+    #[test]
+    fn stripe_ids_persist_and_resolve_subscription_to_tenant() {
+        let s = BillingStore::new();
+        s.set_plan("acme", "pro");
+        s.set_stripe_ids("acme", "cus_realcustomer", "sub_realsubscription");
+        let acc = s.account("acme");
+        assert_eq!(acc.stripe_customer, "cus_realcustomer");
+        assert_eq!(acc.stripe_subscription, "sub_realsubscription");
+        assert_eq!(s.tenant_for_subscription("sub_realsubscription").as_deref(), Some("acme"));
+        assert_eq!(s.tenant_for_subscription("sub_doesnotexist"), None);
+
+        // An empty id in a later call must NOT clobber a known one (a webhook
+        // payload that omits a field must not erase state a previous, more
+        // complete event already recorded).
+        s.set_stripe_ids("acme", "", "");
+        assert_eq!(s.account("acme").stripe_customer, "cus_realcustomer");
+    }
+
+    #[test]
+    fn checkout_confirmation_is_scoped_to_a_single_tenant() {
+        // Complements the tenant-ownership check enforced in the
+        // `billing_confirm` HANDLER (which this store-level test can't reach
+        // directly) by confirming the data the handler checks against is
+        // actually present and correct: `Checkout.tenant` is exactly the
+        // opening tenant, never inferable/overridable from the confirm call.
+        let s = BillingStore::new();
+        let co = s.open_checkout("victim-team", "plan", "enterprise", 100_000);
+        assert_eq!(co.tenant, "victim-team");
+        let fetched = s.get_checkout(&co.id).unwrap();
+        assert_eq!(fetched.tenant, "victim-team", "the handler's tenant-ownership check depends on this being immutable");
+    }
+
+    #[test]
     fn rate_card_cost_matches_ui() {
         // 1 CPU-hr = $0.128 = 12.8¢; 1 GB-hr = 1.06¢; 1M req = $2 = 200¢.
         let u = UsageTotals { active_cpu_ms: 3_600_000, mem_gb_hr_milli: 1000, requests: 1_000_000, blocked: 0 };
@@ -728,33 +892,123 @@ mod tests {
     }
 }
 
-/// Create a real Stripe Checkout Session (best-effort). Returns the hosted URL.
+/// Create a real Stripe Checkout Session (best-effort). `price_id` is `Some` for
+/// a plan upgrade — a REAL recurring subscription against that Stripe Price
+/// (`mode=subscription`); `None` for a one-time purchase (credit top-ups —
+/// `mode=payment` with ad-hoc `price_data`, since there's no fixed Price object
+/// for an arbitrary top-up amount). `checkout_id` is OUR internal `Checkout.id`,
+/// stamped into the session's `metadata` so the webhook handler (which only
+/// ever hears from Stripe, never from our own client) can find the matching
+/// local record. Returns `(hosted_checkout_url, stripe_session_id)` — the
+/// session id is stored via `BillingStore::attach_stripe_session` so
+/// `billing_confirm` can later verify real payment before applying anything.
 pub async fn stripe_checkout(
     http: &reqwest::Client,
+    price_id: Option<&str>,
     amount_cents: u64,
     product_name: &str,
     success_url: &str,
     cancel_url: &str,
-) -> anyhow::Result<String> {
+    checkout_id: &str,
+) -> anyhow::Result<(String, String)> {
     let key = std::env::var("STRIPE_SECRET_KEY")?;
-    let params = [
-        ("mode", "payment".to_string()),
-        ("success_url", success_url.to_string()),
-        ("cancel_url", cancel_url.to_string()),
-        ("line_items[0][quantity]", "1".to_string()),
-        ("line_items[0][price_data][currency]", "usd".to_string()),
-        ("line_items[0][price_data][unit_amount]", amount_cents.to_string()),
-        ("line_items[0][price_data][product_data][name]", product_name.to_string()),
+    let mut params: Vec<(String, String)> = vec![
+        ("success_url".into(), success_url.to_string()),
+        ("cancel_url".into(), cancel_url.to_string()),
+        ("metadata[checkout_id]".into(), checkout_id.to_string()),
+        ("line_items[0][quantity]".into(), "1".into()),
     ];
+    match price_id {
+        Some(pid) => {
+            params.push(("mode".into(), "subscription".into()));
+            params.push(("line_items[0][price]".into(), pid.to_string()));
+            // Subscriptions need the metadata on the SUBSCRIPTION object too
+            // (not just the checkout session) — that's what the
+            // `customer.subscription.*` webhooks carry, and the session's own
+            // metadata isn't copied onto it automatically.
+            params.push(("subscription_data[metadata][checkout_id]".into(), checkout_id.to_string()));
+        }
+        None => {
+            params.push(("mode".into(), "payment".into()));
+            params.push(("line_items[0][price_data][currency]".into(), "usd".into()));
+            params.push(("line_items[0][price_data][unit_amount]".into(), amount_cents.to_string()));
+            params.push(("line_items[0][price_data][product_data][name]".into(), product_name.to_string()));
+        }
+    }
     let resp = http
         .post("https://api.stripe.com/v1/checkout/sessions")
-        .basic_auth(key, Some(""))
+        .basic_auth(&key, Some(""))
         .form(&params)
         .send()
         .await?;
     let v: serde_json::Value = resp.json().await?;
-    v.get("url")
-        .and_then(|u| u.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({})", v))
+    let url = v.get("url").and_then(|u| u.as_str()).ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({v})"))?;
+    let session_id = v.get("id").and_then(|u| u.as_str()).ok_or_else(|| anyhow::anyhow!("stripe: no session id ({v})"))?;
+    Ok((url.to_string(), session_id.to_string()))
+}
+
+/// Real payment/subscription status of a Stripe Checkout Session, fetched
+/// directly from Stripe. `paid` is true when the session actually completed
+/// (`payment_status == "paid"` for a one-time charge, or `status ==
+/// "complete"` for a $0-due-now subscription setup) — this is the
+/// authoritative check `billing_confirm` uses instead of trusting an
+/// unauthenticated client's redirect-back as proof of payment.
+pub struct StripeSessionStatus {
+    pub paid: bool,
+    pub customer: Option<String>,
+    pub subscription: Option<String>,
+}
+
+pub async fn stripe_verify_session(http: &reqwest::Client, session_id: &str) -> anyhow::Result<StripeSessionStatus> {
+    let key = std::env::var("STRIPE_SECRET_KEY")?;
+    let resp = http
+        .get(format!("https://api.stripe.com/v1/checkout/sessions/{session_id}"))
+        .basic_auth(&key, Some(""))
+        .send()
+        .await?;
+    let v: serde_json::Value = resp.json().await?;
+    if v.get("error").is_some() {
+        anyhow::bail!("stripe: session lookup failed ({v})");
+    }
+    let paid = v.get("payment_status").and_then(|s| s.as_str()) == Some("paid")
+        || v.get("status").and_then(|s| s.as_str()) == Some("complete");
+    Ok(StripeSessionStatus {
+        paid,
+        customer: v.get("customer").and_then(|c| c.as_str()).map(|s| s.to_string()),
+        subscription: v.get("subscription").and_then(|c| c.as_str()).map(|s| s.to_string()),
+    })
+}
+
+/// Verify a Stripe webhook delivery's `Stripe-Signature` header
+/// (`t=<unix_ts>,v1=<hex_hmac_sha256>[,v1=<hex>...]`) against the RAW request
+/// body using `STRIPE_WEBHOOK_SECRET`. Matches Stripe's documented scheme:
+/// HMAC-SHA256 of `"{timestamp}.{raw_body}"`, constant-time compared against
+/// each `v1` value (Stripe may send more than one during a signing-secret
+/// rotation), with a 5-minute replay-tolerance window on the timestamp.
+pub fn verify_webhook_signature(payload: &[u8], sig_header: &str, secret: &str) -> bool {
+    let mut timestamp: Option<i64> = None;
+    let mut v1_sigs: Vec<&str> = Vec::new();
+    for part in sig_header.split(',') {
+        if let Some((k, v)) = part.split_once('=') {
+            match k.trim() {
+                "t" => timestamp = v.trim().parse().ok(),
+                "v1" => v1_sigs.push(v.trim()),
+                _ => {}
+            }
+        }
+    }
+    let Some(ts) = timestamp else { return false };
+    let now_s = (now_ms() / 1000) as i64;
+    if (now_s - ts).abs() > 300 {
+        return false;
+    }
+    if v1_sigs.is_empty() {
+        return false;
+    }
+    let mut signed = Vec::with_capacity(payload.len() + 20);
+    signed.extend_from_slice(ts.to_string().as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(payload);
+    let expected = crate::admin::hmac_sha256_hex(secret.as_bytes(), &signed);
+    v1_sigs.iter().any(|s| crate::admin::ct_eq(s, &expected))
 }

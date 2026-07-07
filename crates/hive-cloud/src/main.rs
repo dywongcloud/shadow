@@ -394,8 +394,57 @@ async fn main() -> anyhow::Result<()> {
         // when THEY have HIVE_GOSSIP_IROH on. The connection trust gate (#20) still
         // applies, so gossip is authenticated by the peer's iroh identity.
         let gossip_handler = crate::gossip::handler(cloud.clone());
-        tokio::spawn(hive_p2p::serve_tunnels(ep, gateway_addr, 256, trust, Some(gossip_handler)));
-        tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections");
+        // MESH HOT-JOIN: a not-yet-trusted node presents HMAC(HIVE_JWT_SECRET, its
+        // OWN endpoint id) over a dedicated join stream; the id is the QUIC
+        // connection's authenticated remote identity, so a valid proof admits
+        // exactly that key into the trust set — no allowlist edit, no restart
+        // anywhere. Only offered when the fleet secret is configured (fail-closed:
+        // without it, untrusted connections are dropped exactly as before).
+        let join_handler: Option<hive_p2p::JoinHandler> = std::env::var("HIVE_JWT_SECRET")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|secret| {
+                let cloud = cloud.clone();
+                let h: hive_p2p::JoinHandler = std::sync::Arc::new(move |remote_id: String, node_json: Vec<u8>, proof: String| {
+                    let cloud = cloud.clone();
+                    let secret = secret.clone();
+                    Box::pin(async move {
+                        let expect = crate::admin::hmac_sha256_hex(secret.as_bytes(), remote_id.as_bytes());
+                        // Constant-time-ish compare is overkill here (proof is an
+                        // HMAC over a public value; the secret never leaves HMAC),
+                        // but never admit on empty/short input.
+                        if proof.len() != expect.len() || proof != expect {
+                            tracing::warn!(peer = %remote_id, "REJECTED mesh join: invalid proof");
+                            return Vec::new();
+                        }
+                        let Ok(node) = serde_json::from_slice::<NodeInfo>(&node_json) else {
+                            tracing::warn!(peer = %remote_id, "REJECTED mesh join: unparseable NodeInfo");
+                            return Vec::new();
+                        };
+                        // The announced iroh identity must BE the proven QUIC identity —
+                        // a valid proof must not admit a NodeInfo that routes elsewhere.
+                        let announced_eid = node.iroh_addr.as_deref().and_then(hive_p2p::endpoint_id_from_addr_json);
+                        if announced_eid.as_deref() != Some(remote_id.as_str()) {
+                            tracing::warn!(peer = %remote_id, announced = ?announced_eid, "REJECTED mesh join: NodeInfo iroh identity mismatch");
+                            return Vec::new();
+                        }
+                        if let Ok(mut t) = cloud.trusted_peer_ids.write() {
+                            t.insert(remote_id.clone());
+                        }
+                        if let Some(addr) = node.iroh_addr.clone() {
+                            cloud.peer_iroh.write().insert(remote_id.clone(), (remote_id.clone(), addr));
+                        }
+                        let name = node.name.clone();
+                        cloud.registry.upsert_peer(node);
+                        cloud.audit.record("_global", "mesh", "join", "node", &name, &format!("endpoint {remote_id} admitted via join proof"));
+                        tracing::info!(peer = %remote_id, node = %name, "mesh join ADMITTED (hot-join, key-addressed)");
+                        serde_json::to_vec(&cloud.registry.nodes()).unwrap_or_default()
+                    })
+                });
+                h
+            });
+        tokio::spawn(hive_p2p::serve_tunnels_with_join(ep, gateway_addr, 256, trust, Some(gossip_handler), join_handler));
+        tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join surface on)");
     }
 
     // Initial cluster reconcile (single-node: this node is leader).
@@ -461,8 +510,40 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-    if !args.peers.is_empty() || !seed_targets.is_empty() {
-        spawn_gossip_loop(cloud.clone(), args.peers.clone(), seed_targets.clone());
+    // ALWAYS spawn the gossip loop: targets are now DYNAMIC (recomputed every
+    // round from CLI peers + seeds + the persisted/learned key-addressed roster),
+    // so a node started with zero peer config still gossips the moment a peer
+    // joins INTO it (inbound join populates peer_iroh) or the guardian-replicated
+    // roster lands. A zero-target round is a no-op.
+    spawn_gossip_loop(cloud.clone(), args.peers.clone(), seed_targets.clone());
+    // Roster fallback from GuardianDB (iroh-docs, replicated): when the local
+    // peer_iroh.json was lost (wiped data dir) and no seeds are configured, adopt
+    // the replicated roster so the node still rejoins the mesh by KEY. Best-effort,
+    // never blocks boot; existing entries are never clobbered.
+    {
+        let c = cloud.clone();
+        tokio::spawn(async move {
+            for _ in 0..12 {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if !c.peer_iroh.read().is_empty() {
+                    return; // seeds/CLI/live gossip already populated it
+                }
+                if let Some(bytes) = guardian::get("mesh/roster").await {
+                    if let Ok(map) = serde_json::from_slice::<std::collections::HashMap<String, (String, String)>>(&bytes) {
+                        let me = c.registry.me().peer_id;
+                        let mut pi = c.peer_iroh.write();
+                        for (k, v) in map {
+                            if Some(&v.0) == me.as_ref() {
+                                continue;
+                            }
+                            pi.entry(k).or_insert(v);
+                        }
+                        tracing::info!(entries = pi.len(), "mesh roster adopted from GuardianDB replica");
+                        return;
+                    }
+                }
+            }
+        });
     }
     // Active full-mesh health probing: direct, parallel probes of every public peer so
     // down-detection is fast (sub-interval) rather than transitive-gossip + staleness.
@@ -744,6 +825,21 @@ async fn admin_ingress(
                 return (axum::http::StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
             }
         }
+    }
+    // READS ARE FULLY DISTRIBUTED: every node serves GET/HEAD from its own
+    // gossip-replicated state (eventually-consistent, last-writer-wins — the
+    // same converged view the loopback admin always served). Forwarding reads
+    // to the leader (the original first-slice policy) put a cross-ocean RTT in
+    // front of EVERY dashboard fetch and made one node a global choke point —
+    // one wedged/far leader read as "the platform is down" even though every
+    // node held the data. Only MUTATIONS still serialize through the leader.
+    //
+    // `/v1/token` is exempt even though it's a POST: minting is pure HS256
+    // signing with the fleet-shared secret — no state is written — so login
+    // must never depend on leader reachability or distance.
+    let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+    if !is_mutation || req.uri().path() == "/v1/token" {
+        return serve_local(admin, req).await;
     }
     // Leader serves locally.
     if cloud.is_control_plane_leader() {
@@ -1188,6 +1284,13 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
             tokio::time::sleep(Duration::from_secs(1)).await;
             let due = cloud.cron.tick(now_ms());
             for job in due {
+                // Project-level kill switch: the schedule still advances (jobs
+                // keep being created/updated/deleted on deploy, matching
+                // Vercel's semantics), but a disabled project's jobs don't
+                // actually fire.
+                if !cloud.projects.cron_enabled(&job.deployment) {
+                    continue;
+                }
                 let cloud = cloud.clone();
                 tokio::spawn(async move {
                     let res = invoke(&cloud, &job.deployment, &job.path).await;
@@ -1227,7 +1330,49 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     let _ = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_POST, "/v1/nodes/announce", &me_bytes).await;
     let t0 = now_ms();
     let mut rtt = 0u64;
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await {
+    let mut nodes_bytes = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await;
+    // MESH HOT-JOIN (client side): a gossip failure to this target may mean we are
+    // not yet in ITS trust set (first contact of a brand-new node, or a wiped trust
+    // roster). When the fleet secret is configured, present a join proof —
+    // HMAC(secret, OUR endpoint id) — over the dedicated join stream; on admission
+    // the reply is the peer's full node roster, consumed exactly like /v1/nodes.
+    // The dial is by KEY (the eid/seed mapping in peer_iroh); no IP involved.
+    if nodes_bytes.is_none() {
+        if let Ok(secret) = std::env::var("HIVE_JWT_SECRET") {
+            if !secret.trim().is_empty() {
+                let me_id = cloud.registry.me().peer_id;
+                let target = {
+                    // fetch() may have evicted the mapping on failure; fall back to
+                    // re-deriving it (seed keys/eids ARE the identity).
+                    let pi = cloud.peer_iroh.read();
+                    pi.get(&peer).cloned()
+                }
+                .or_else(|| {
+                    let k = peer.strip_prefix("seed:").unwrap_or(&peer);
+                    (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| (k.to_string(), format!("{{\"id\":\"{k}\",\"addrs\":[]}}")))
+                });
+                let pool = cloud.mesh.read().clone();
+                if let (Some(me_id), Some((node_id, addr)), Some(pool)) = (me_id, target, pool) {
+                    let proof = crate::admin::hmac_sha256_hex(secret.as_bytes(), me_id.as_bytes());
+                    let attempt = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        pool.join_request(&node_id, &addr, &me_bytes, &proof),
+                    )
+                    .await;
+                    if let Ok(Ok(bytes)) = attempt {
+                        if !bytes.is_empty() {
+                            tracing::info!(peer = %node_id, "mesh join accepted — roster received");
+                            // Restore the transport mapping fetch() evicted.
+                            cloud.peer_iroh.write().entry(peer.clone()).or_insert((node_id, addr));
+                            nodes_bytes = Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if let Some(bytes) = nodes_bytes {
         rtt = now_ms().saturating_sub(t0);
         if let Ok(nodes) = serde_json::from_slice::<Vec<NodeInfo>>(&bytes) {
             let peer_self = nodes.first().cloned();
@@ -1258,7 +1403,18 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             }
         }
     } else {
-        let id = cloud.peer_iroh.read().get(&peer).map(|(id, _)| id.clone());
+        let id = cloud
+            .peer_iroh
+            .read()
+            .get(&peer)
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                // Key-addressed targets: the target string IS the endpoint id (or a
+                // seed:<id>), so a failed round still marks health even after
+                // fetch() evicted the transport mapping.
+                let k = peer.strip_prefix("seed:").unwrap_or(&peer);
+                (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())).then(|| k.to_string())
+            });
         if let Some(id) = id.filter(|s| !s.is_empty()) {
             cloud.registry.set_health(&id, 0, false);
         }
@@ -1328,9 +1484,11 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
 
 fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(String, String, String)>) {
     use std::collections::HashMap;
-    // Gossip targets = the configured --peer URLs (warm path, via persisted peer_iroh
-    // or HTTP) PLUS the bootstrap seed keys (always-available iroh rendezvous). The
-    // seed keys carry the cold/wiped node until its warm peer_iroh is repopulated.
+    // STATIC gossip targets = the configured --peer URLs (warm path, via persisted
+    // peer_iroh or HTTP) PLUS the bootstrap seed keys (always-available iroh
+    // rendezvous). The seed keys carry the cold/wiped node until its warm
+    // peer_iroh is repopulated. DYNAMIC targets (hot-join) are added per-round
+    // below from the registry + persisted key-addressed roster.
     let mut targets = peers.clone();
     for (key, _, _) in &seeds {
         if !targets.contains(key) {
@@ -1338,6 +1496,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
         }
     }
     tokio::spawn(async move {
+        // Content hash of the last roster replicated into GuardianDB, so the
+        // (5s-cadence) loop only writes the replicated doc when it CHANGES.
+        let mut roster_hash: u64 = 0;
         loop {
             // Re-assert the bootstrap seeds into peer_iroh each round: the gossip
             // timeout+evict drops a stale/dead target's entry, but seeds are
@@ -1349,6 +1510,65 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                     pi.entry(key.clone()).or_insert_with(|| (nid.clone(), addr.clone()));
                 }
             }
+            // DYNAMIC target set (hot-join, key-addressed): every round, dial the
+            // union of the static targets, every REGISTRY node with an iroh addr
+            // (learned transitively from any peer's /v1/nodes, or via an inbound
+            // join/announce), and every persisted key-addressed roster entry.
+            // Dedup by ENDPOINT ID; peers are dialed by KEY (iroh resolves the
+            // address via discovery/relay/holepunch — never by IP). This is what
+            // makes a new node visible fleet-wide with ZERO restarts: it joins one
+            // seed, the seed's /v1/nodes carries it everywhere, and every node's
+            // next round dials it first-hand.
+            let targets: Vec<String> = {
+                let mut round: Vec<String> = targets.clone();
+                let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+                if let Some(me) = cloud.registry.me().peer_id.clone() {
+                    covered.insert(me);
+                }
+                {
+                    let pi = cloud.peer_iroh.read();
+                    for t in &round {
+                        if let Some((nid, _)) = pi.get(t) {
+                            covered.insert(nid.clone());
+                        }
+                    }
+                }
+                // Registry-derived (freshest addr wins — a rejoined node's new addr
+                // must replace a stale persisted one).
+                let mut adds: Vec<(String, String)> = Vec::new();
+                for n in cloud.registry.nodes() {
+                    if n.is_self {
+                        continue;
+                    }
+                    let Some(addr) = n.iroh_addr else { continue };
+                    let Some(eid) = hive_p2p::endpoint_id_from_addr_json(&addr) else { continue };
+                    if covered.insert(eid.clone()) {
+                        adds.push((eid, addr));
+                    }
+                }
+                {
+                    let mut pi = cloud.peer_iroh.write();
+                    for (eid, addr) in &adds {
+                        pi.insert(eid.clone(), (eid.clone(), addr.clone()));
+                        round.push(eid.clone());
+                    }
+                }
+                // Persisted roster continuity: eid-keyed entries not covered above
+                // (e.g. right after a restart, before the registry re-converges).
+                {
+                    let pi = cloud.peer_iroh.read();
+                    for (k, (nid, _)) in pi.iter() {
+                        if k.len() == 64
+                            && k.chars().all(|c| c.is_ascii_hexdigit())
+                            && covered.insert(nid.clone())
+                        {
+                            round.push(k.clone());
+                        }
+                    }
+                }
+                round.truncate(64); // bound the per-round dial fan-out
+                round
+            };
             // Rebuild the cross-node routing table from scratch each cycle so stale
             // routes (peers that no longer host a deployment) age out.
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
@@ -1404,9 +1624,49 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             };
             *cloud.peer_deployments.write() = merged_deps;
             *cloud.container_holders.write() = holders;
+            // Roster hygiene: bound unbounded growth over a long uptime. Keep every
+            // entry the registry still vouches for (its own 30s staleness already
+            // prunes dead nodes) PLUS the static config-derived targets (CLI peers /
+            // bootstrap seeds — these must survive even while their node is briefly
+            // down, unlike a transitively-learned entry); drop everything else once
+            // the map exceeds the cap, oldest-looking (registry-unknown) first. A
+            // dead/unreachable roster entry can never wedge the loop regardless (H4
+            // per-phase iroh timeouts bound every individual dial).
+            const ROSTER_CAP: usize = 256;
+            {
+                let mut pi = cloud.peer_iroh.write();
+                if pi.len() > ROSTER_CAP {
+                    let keep: std::collections::HashSet<String> = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .filter_map(|n| n.iroh_addr.as_deref().and_then(hive_p2p::endpoint_id_from_addr_json))
+                        .chain(targets.iter().cloned())
+                        .collect();
+                    pi.retain(|k, (nid, _)| keep.contains(k) || keep.contains(nid));
+                }
+            }
             // Persist the gossip-transport map so the next restart bootstraps iroh
-            // gossip from disk (no SSH tunnel needed for rendezvous).
-            crate::persist::save_peer_iroh(&cloud.peer_iroh.read());
+            // gossip from disk (no SSH tunnel needed for rendezvous). This map IS
+            // the mesh roster: key-addressed (endpoint ids), never IPs.
+            let roster_json = {
+                let pi = cloud.peer_iroh.read();
+                crate::persist::save_peer_iroh(&pi);
+                serde_json::to_vec(&*pi).unwrap_or_default()
+            };
+            // Replicate the roster through GuardianDB (iroh-docs) so a node whose
+            // local file is lost can re-adopt it from the replicated store. Only
+            // written when the content actually changes (rosters are stable).
+            let h = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                roster_json.hash(&mut hasher);
+                hasher.finish()
+            };
+            if h != roster_hash && !roster_json.is_empty() {
+                roster_hash = h;
+                tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });

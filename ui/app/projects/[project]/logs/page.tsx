@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { Search, Play, RotateCw, X, ChevronDown, MapPin, ShieldCheck, Zap } from "lucide-react";
 import { Triangle, Badge } from "@/components/ui";
 import { apiGet, type Event } from "@/lib/api";
@@ -22,8 +23,12 @@ function fmtTime(ms: number) {
 
 export default function ProjectLogs({ params }: { params: { project: string } }) {
   const project = decodeURIComponent(params.project);
+  const searchParams = useSearchParams();
   const [events, setEvents] = useState<Event[]>([]);
-  const [q, setQ] = useState("");
+  // Seeded once from `?q=` (e.g. a deep link from a project's Cron Jobs
+  // settings page's "View Logs" button, filtered to that job's path) — the
+  // user can still edit the filter freely afterward.
+  const [q, setQ] = useState(() => searchParams.get("q") ?? "");
   const [live, setLive] = useState(true);
   const [sel, setSel] = useState<Event | null>(null);
   const [range, setRange] = useState("Last 30 minutes");

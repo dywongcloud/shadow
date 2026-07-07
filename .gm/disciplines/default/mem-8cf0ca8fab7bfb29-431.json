@@ -1,0 +1,3 @@
+## Resolved mutable: m-admin-data-endpoint
+
+admin.rs:5197 all_collections() line 5210 ('deployments', c.gw.list()...) is LOCAL only; feeds both data_rows (/v1/admin/data/:collection at 5318) and data_collections counts (5288). admin_overview:4587 derives projects from c.gw.list() too. dep_list:1536 shows correct fleet aggregation via c.peer_deployments.read(). Fix: aggregate peer_deployments in all_collections + admin_overview.

@@ -1,0 +1,3 @@
+## Resolved mutable: m-teams-store-vs-clerk
+
+admin.rs:4587 admin_overview teams=c.teams.count() (backend store) but projects=c.gw.list().map(project) (LOCAL deployments) → 0 when peers host them; all_collections:5198 projects DOES use c.projects.snapshot() (tenant-tagged). Fix admin_overview to count projects from c.projects.snapshot() distinct + fleet-aggregated deployments, independent of teams.count.

@@ -1,0 +1,3 @@
+## Resolved mutable: m-ctest-live-state
+
+journalctl fc-virginia (43.166.206.175): 'lease failed func=dpl-13f1ac054a/web error=podman run failed: IPAM error: requested ip address 10.128.204.12 is already allocated to container ID 7e3ccbf3...' looping ~60s; podman ps -a shows no container 7e3ccbf3 = leaked IPAM lease on hive-net-ctest. ctest.shadw.app currently 503.

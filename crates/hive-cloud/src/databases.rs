@@ -834,6 +834,12 @@ async fn provision_backing(
 /// containers reach it BY IP (the network has no DNS). The IP is a deterministic
 /// high host (.200+) derived from the db id to avoid colliding with compose
 /// service IPs (.11+). Returns None if podman/network setup is unavailable.
+///
+/// Podman-only, unconditionally, even on macOS: every DB provision attaches to
+/// this static-IP network (never optional — see the two callers below), and
+/// Apple's `container` tool has no static-IP-assignment flag at all (verified
+/// live: no equivalent to `--ip`) — the same hard gap documented for
+/// multi-service compose deploys in `hive_backend::container_cli`'s module doc.
 async fn ensure_project_db_net(project: &str, id: &str) -> Option<(String, String)> {
     let (net, subnet, gw) = crate::git::project_net(project);
     // subnet like "10.o2.o3.0/24" -> prefix "10.o2.o3"

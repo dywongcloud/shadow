@@ -1,0 +1,3 @@
+## Resolved mutable: pm-boot-seed-site
+
+main.rs:344 loads persisted peer_iroh at boot (roster continuity already half-built); :352-362 seed_targets ('seed:<id>' keys) merged into peer_iroh; :464 spawn_gossip_loop(peers, seed_targets) — gossip loop starts even with empty peers/seeds ONLY if condition changed (currently gated on non-empty; must also start when peer_iroh non-empty so a roster-only restart gossips). CloudState has peer_iroh, trusted_peer_ids, registry, mesh all available.

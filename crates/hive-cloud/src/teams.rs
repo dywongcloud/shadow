@@ -147,6 +147,34 @@ impl TeamStore {
         team
     }
 
+    /// Create a team at an EXACT, caller-supplied slug — never re-derived or
+    /// suffixed. For reconciling a team row with tenant-scoped data that already
+    /// exists under a specific external id (e.g. a Clerk-org-derived tenant string
+    /// with its own uniqueness suffix, which `create`'s slugify(name) scheme can
+    /// never reproduce). Returns `None` if that exact slug is already taken —
+    /// callers must not silently collide with or overwrite an existing team.
+    pub fn create_with_slug(&self, slug: &str, name: &str, plan: &str, owner_email: &str) -> Option<Team> {
+        let mut m = self.teams.write();
+        if m.contains_key(slug) {
+            return None;
+        }
+        let team = Team {
+            slug: slug.to_string(),
+            name: name.to_string(),
+            plan: plan.to_string(),
+            created_ms: now_ms(),
+            members: vec![Member {
+                email: owner_email.to_string(),
+                role: Role::Owner,
+                name: String::new(),
+                added_ms: now_ms(),
+            }],
+            sso_enabled: false,
+        };
+        m.insert(slug.to_string(), team.clone());
+        Some(team)
+    }
+
     /// Toggle team/org SSO (Enterprise-only — caller enforces the plan gate).
     pub fn set_sso(&self, slug: &str, enabled: bool) -> Option<Team> {
         let mut m = self.teams.write();

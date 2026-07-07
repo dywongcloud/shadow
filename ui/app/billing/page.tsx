@@ -44,7 +44,16 @@ function BillingInner() {
   async function checkout(kind: "plan" | "credits", body: Record<string, unknown>) {
     setBusy(kind + JSON.stringify(body));
     try {
-      const r = await apiSend<{ url: string; mock: boolean }>("POST", "/v1/billing/checkout", { kind, ...body });
+      const r = await apiSend<{ url: string; mock: boolean; applied?: boolean }>("POST", "/v1/billing/checkout", { kind, ...body });
+      // A free plan (Hobby) has nothing to charge — the backend applies it
+      // immediately and returns no checkout URL, so there's nothing to
+      // redirect to.
+      if (r.applied) {
+        setMsg("Plan updated.");
+        setBusy("");
+        refresh();
+        return;
+      }
       window.location.href = r.url;
     } catch (e) {
       setMsg(String(e));

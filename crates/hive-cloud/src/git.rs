@@ -1216,12 +1216,21 @@ async fn produce_manifest(
         // real monolith containers). This is baked into the manifest.
         let mem_mib = ovr.memory.as_deref().map(parse_mem_mib).unwrap_or(0);
         let t1 = now_ms();
-        let mut build = Command::new("podman");
+        // Single-image build, no compose networking involved (unlike
+        // `build_compose_manifest`, which stays on podman — see that
+        // function's own comment) — safe to use Apple's `container` on
+        // macOS. The image this produces is later RUN via the same OS
+        // default (`podman_run_container`/mock.rs's `__container__` path),
+        // so build and run always share one image store.
+        let apple = hive_backend::container_cli::is_apple_default();
+        let bin = hive_backend::container_cli::bin(apple);
+        let mut build = Command::new(bin);
         // `-f` so the detected file (Dockerfile OR Containerfile) is used explicitly,
-        // regardless of podman's own default-file precedence.
+        // regardless of the builder's own default-file precedence.
         build.arg("build").arg("-t").arg(&image).arg("-f").arg(&dockerfile);
-        // Resolve podman on both Linux Firecracker hosts (/usr/bin) and macOS
-        // (/opt/homebrew/bin) regardless of the service's inherited PATH.
+        // Resolve the container CLI on both Linux Firecracker hosts (/usr/bin,
+        // podman) and macOS (/opt/homebrew/bin, either CLI) regardless of the
+        // service's inherited PATH.
         let base_path = std::env::var("PATH").unwrap_or_default();
         build.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"));
         // Pass project env as --build-arg so a Dockerfile `ARG`/`ENV` can use them.
@@ -1241,7 +1250,7 @@ async fn produce_manifest(
         {
             log(format!("  {line}"));
         }
-        anyhow::ensure!(out.status.success(), "podman build failed");
+        anyhow::ensure!(out.status.success(), "{bin} build failed");
         log(format!("Image built: {image} ({}ms), port {exposed} ({protocol})", now_ms().saturating_sub(t1)));
         Ok(container_manifest(project, &image, exposed, &protocol, mem_mib))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
@@ -2901,6 +2910,15 @@ pub(crate) fn qualify_image_ref(image: &str) -> String {
 /// `podman pull` it on this (target) node, auto-detect its listening port from the
 /// image's `ExposedPorts` (unless overridden), and synthesize a container manifest
 /// with the automatic persistent volume. Project env is injected by the caller.
+///
+/// Podman-only, even on macOS (unlike the single-Dockerfile build path above,
+/// which does use Apple's `container` there): verified live that Apple's
+/// `container image inspect` does not expose the OCI `Config.ExposedPorts`
+/// field at all (podman: `{"80/tcp":{}}` for nginx; the identical field is
+/// simply absent from `container`'s inspect output for the same image) — so
+/// port auto-detection, a real shipped feature for registry-image deploys
+/// without an explicit override, would silently stop working. See
+/// `hive_backend::container_cli`'s module doc for the general policy.
 async fn image_container_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,

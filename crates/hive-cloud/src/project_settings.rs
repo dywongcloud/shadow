@@ -119,6 +119,13 @@ pub struct ProjectSettings {
     /// explicitly enabled by project policy" reads this flag.
     #[serde(default)]
     pub sandbox_allow_sudo: bool,
+    /// When false, this project's cron jobs stop firing (the scheduler's tick
+    /// loop skips invocation) without touching the jobs themselves — they
+    /// keep being created/updated/deleted on every deployment via
+    /// `vercel.json` and keep advancing their own schedule, matching Vercel's
+    /// project-level Cron Jobs kill switch. Default true (on).
+    #[serde(default = "default_true")]
+    pub cron_enabled: bool,
 }
 fn default_team() -> String {
     "personal".into()
@@ -138,6 +145,7 @@ impl Default for ProjectSettings {
             production_branch: String::new(),
             preview_protection: true,
             sandbox_allow_sudo: false,
+            cron_enabled: true,
         }
     }
 }
@@ -279,6 +287,17 @@ impl ProjectStore {
         m.entry(project.to_string()).or_default().preview_protection = on;
     }
 
+    pub fn set_cron_enabled(&self, project: &str, on: bool) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().cron_enabled = on;
+    }
+
+    /// Whether this project's cron jobs are allowed to fire (default true —
+    /// an unknown/never-configured project is not disabled).
+    pub fn cron_enabled(&self, project: &str) -> bool {
+        self.map.read().get(project).map(|s| s.cron_enabled).unwrap_or(true)
+    }
+
     /// Team slug owning a project (defaults to "personal").
     pub fn team_of(&self, project: &str) -> String {
         self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(|| "personal".into())
@@ -338,6 +357,17 @@ mod tests {
 
     fn ev(key: &str, value: &str, sensitive: bool) -> EnvVar {
         EnvVar { key: key.into(), value: value.into(), target: "all".into(), sensitive, updated_ms: 0 }
+    }
+
+    #[test]
+    fn cron_enabled_defaults_true_and_is_toggleable() {
+        let s = ProjectStore::new();
+        // An unconfigured/unknown project is never treated as disabled.
+        assert!(s.cron_enabled("never-touched"));
+        s.set_cron_enabled("app", false);
+        assert!(!s.cron_enabled("app"));
+        s.set_cron_enabled("app", true);
+        assert!(s.cron_enabled("app"));
     }
 
     #[test]

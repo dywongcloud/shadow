@@ -1,0 +1,3 @@
+## Resolved mutable: m-compose-launch-site
+
+hive-backend/src/lib.rs:369 podman_run_container applies static --ip from net_json (line ~493); all keep-warm + first-serve launches funnel through it; fix site = after run failure matching 'IPAM error: requested ip address X is already allocated to container ID Y', reap Y (network disconnect --force + rm -f) and retry run once. Single chokepoint, self-heals leaked leases on every relaunch.

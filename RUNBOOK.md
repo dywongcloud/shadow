@@ -119,3 +119,81 @@ raises an incident instead).
 - The dashboard itself (shadow.ngrok.pizza) and apex `shadw.cloud` marketing
   site are OUT of this migration's scope.
 - Custom customer domains and per-deployment certs are follow-ups.
+
+---
+
+# Adding a node to the mesh (hot-join, key-addressed)
+
+Peers dial each other by iroh **key** (a 64-hex NodeId), never by IP — iroh's
+QUIC transport resolves the address via discovery/relay/holepunch underneath.
+A public IP is only ever needed for the client-facing DNS ingress (Plane A),
+never for mesh membership.
+
+## Adding a node — the whole procedure
+
+On the NEW node, set env vars and start `hive-cloud` — no `--peer` HTTP URL,
+no existing node touched, no restart of anything already running:
+
+```
+HIVE_JWT_SECRET=<the fleet's shared secret>
+HIVE_BOOTSTRAP_PEERS=<any one existing node's 64-hex iroh NodeId>
+HIVE_DISCOVERY_DNS=<the fleet's self-hosted discovery URLs>
+```
+
+`HIVE_DISCOVERY_DNS` is REQUIRED on this fleet (not merely nice-to-have):
+every existing node runs `HIVE_DISCOVERY_N0=0`, opting OUT of iroh's public
+n0 pkarr discovery in favor of the self-hosted relay — a joiner that skips
+this env var can resolve n0-discoverable peers but never a fleet node, and
+the bare-key seed silently never connects. Copy the value from any running
+node's environment (`HIVE_DISCOVERY_DNS=http://<node-ip>:3350,...` — one
+entry per discovery-capable node). Verified live: a joiner WITHOUT this var
+sat inert (registered the seed, dialed nothing observable); adding it joined
+the fleet in under 5 seconds.
+
+The new node then:
+
+1. Dials the seed key (`HIVE_BOOTSTRAP_PEERS`) over iroh — discovery/relay/
+   holepunch resolve it, IP-free.
+2. Presents a join proof (`HMAC-SHA256(HIVE_JWT_SECRET, its own iroh NodeId)`)
+   over a dedicated join stream. The proof is checked against the QUIC
+   connection's cryptographically authenticated remote identity — never a
+   value the request body claims — so only a genuine holder of the fleet
+   secret can self-admit, and only for its own key.
+3. On admission the seed returns its live node list; the new node appears in
+   every node's `/v1/nodes` within one gossip round (~5s) as each node's
+   gossip loop dials the newly learned key directly (dynamic per-round
+   targets, not a fixed list computed once at boot).
+4. The roster (the key-addressed dial map, never IPs) is persisted to
+   `$HIVE_DATA/peer_iroh.json` and replicated into GuardianDB (iroh-docs),
+   so a wiped node re-adopts the mesh from the replicated copy if its local
+   file is lost.
+
+Leaving the mesh: stop the process. The node ages out of every peer's
+registry after ~30s of missed gossip; no cleanup step required.
+
+## Operator-side admission (optional, explicit allowlist)
+
+If a fleet runs with `HIVE_PEER_TRUST=1` (opt-in strict allowlist) and you'd
+rather pre-authorize a key out-of-band instead of relying on the join-proof
+self-admit:
+
+```
+POST /v1/mesh/admit  { "endpoint_id": "<64-hex NodeId>" }   (operator token)
+GET  /v1/mesh/roster                                          (operator token)
+```
+
+`admit` inserts the key into this node's trust set immediately (audited);
+it becomes visible to other nodes transitively the next time this node
+gossips a NodeInfo carrying that key's iroh address.
+
+## What does NOT change on a hot-join or on a restart
+
+- **DNS** (Plane A, `dnsserver.rs`/Vercel reconciler): entirely separate from
+  gossip; unaffected by any peer joining, leaving, or by a `hive-cloud`
+  restart on another node.
+- **The dashboard** (`ui/`, port 3002): its own OS process/launchd unit;
+  restarting or redeploying it never touches gossip/mesh/DNS state.
+- **Existing peers**: a hot-join needs zero restarts anywhere in the fleet.
+  A `hive-cloud` restart on ONE node re-joins the mesh from its own
+  persisted roster/GuardianDB replica + iroh's persistent identity —
+  it does not require reconfiguring or restarting any other node.

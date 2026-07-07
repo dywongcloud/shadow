@@ -1,0 +1,3 @@
+## Resolved mutable: pm-announce-shape
+
+dispatch (gossip.rs:86) parses bare NodeInfo -> admin::node_announce (admin.rs:2496, no signer available). DECISION: join does NOT ride announce (would need cross-version body change + signer plumb through two reject gates). Instead: new STREAM_JOIN mode in hive-p2p; identity = QUIC remote_id (unspoofable TLS handshake); proof = HMAC-SHA256(HIVE_JWT_SECRET, remote_id); handler admits remote_id to trusted_peer_ids, upserts the NodeInfo, replies with the full node list. Old binaries never receive STREAM_JOIN (only joiners send it).

@@ -11,6 +11,7 @@ const sections = [
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },
   { slug: "routing", label: "Routing" },
+  { slug: "cron", label: "Cron Jobs" },
   { slug: "microfrontends", label: "Microfrontends" },
   { slug: "webhooks", label: "Webhooks" },
   { slug: "secure-compute", label: "Secure Compute" },

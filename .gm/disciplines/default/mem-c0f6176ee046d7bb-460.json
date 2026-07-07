@@ -1,0 +1,3 @@
+## Resolved mutable: pm-trust-wiring
+
+main.rs:379-397: enforce = HIVE_PEER_TRUST in {1,true} -> serve_tunnels gets Some(cloud.trusted_peer_ids); set seeded from HIVE_TRUSTED_NODE_IDS (state.rs:454) and grown transitively (main.rs:1264-1269). SECOND gate: serve_gossip (hive-p2p lib.rs:1217-1225) rejects a VALID signature from an unlisted signer in Enforce mode. Join must bypass both -> dedicated STREAM_JOIN mode authenticated by QUIC remote_id + HMAC proof.

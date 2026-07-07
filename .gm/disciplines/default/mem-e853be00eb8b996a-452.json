@@ -1,0 +1,3 @@
+## Resolved mutable: pm-guardian-kv-boot
+
+guardian.rs:201 get / :208 put are async best-effort (handle().await; put warns on unavailable). Callable from the gossip loop (tokio ctx). Roster replication: put('mesh/roster', peer_iroh json) only when content hash changes (avoids 5s-cadence doc churn). Boot fallback: spawned task after init_background; if loaded peer_iroh empty, merge guardian copy when available (tolerates not-ready: get returns None).

@@ -85,6 +85,23 @@ impl CronScheduler {
         self.jobs.read().clone()
     }
 
+    /// Look up a single job by id.
+    pub fn get(&self, id: &str) -> Option<CronJob> {
+        self.jobs.read().iter().find(|j| j.id == id).cloned()
+    }
+
+    /// Record a manual (out-of-band) run's bookkeeping — bumps `runs` and
+    /// `last_run_ms` WITHOUT touching `next_run_ms`, since an ad-hoc trigger
+    /// (the dashboard's "Run" button) doesn't affect the job's own schedule.
+    /// Returns the job's updated state, or `None` if no such job exists.
+    pub fn record_manual_run(&self, id: &str, now: u64) -> Option<CronJob> {
+        let mut jobs = self.jobs.write();
+        let job = jobs.iter_mut().find(|j| j.id == id)?;
+        job.last_run_ms = Some(now);
+        job.runs += 1;
+        Some(job.clone())
+    }
+
     /// Return jobs due at `now`, advancing each one's schedule. The caller runs
     /// the invocations.
     pub fn tick(&self, now: u64) -> Vec<CronJob> {
@@ -118,9 +135,26 @@ impl Default for CronScheduler {
     }
 }
 
+/// Normalize a cron expression to the 6-field (seconds-first) form the `cron`
+/// crate requires. Standard 5-field cron (`min hour dom month dow` — the
+/// POSIX/Vercel spec `vercel.json` "crons" actually declare, e.g. `"0 0 * * *"`
+/// or `"*/5 * * * *"`) has no seconds field at all; without this, EVERY
+/// `vercel.json`-declared cron job failed to parse and was silently dropped
+/// (`set_source_jobs` skips jobs `next_after` can't compute a first run for).
+/// A 6-or-7-field expression (this platform's own native/manual-job format)
+/// passes through unchanged.
+fn normalize(expr: &str) -> String {
+    let fields = expr.split_whitespace().count();
+    if fields == 5 {
+        format!("0 {expr}")
+    } else {
+        expr.to_string()
+    }
+}
+
 /// Next fire time (epoch ms) strictly after `after_ms` for a cron expression.
 pub fn next_after(expr: &str, after_ms: u64) -> Option<u64> {
-    let sched = Schedule::from_str(expr).ok()?;
+    let sched = Schedule::from_str(&normalize(expr)).ok()?;
     let after = Utc.timestamp_millis_opt(after_ms as i64).single()?;
     sched.after(&after).next().map(|dt| dt.timestamp_millis() as u64)
 }
@@ -156,6 +190,34 @@ mod tests {
     }
 
     #[test]
+    fn record_manual_run_bumps_stats_without_touching_the_schedule() {
+        let sched = CronScheduler::new();
+        let job = sched
+            .add(CronJob {
+                id: "j2".into(),
+                name: "manual".into(),
+                schedule: "0 0 * * * *".into(), // hourly — next_run_ms far away
+                deployment: "dpl".into(),
+                path: "/api/cron".into(),
+                enabled: true,
+                last_run_ms: None,
+                next_run_ms: None,
+                runs: 0,
+                source: "manual".into(),
+                tenant: String::new(),
+            })
+            .expect("valid");
+        let original_next = job.next_run_ms;
+        let now = now_ms();
+        let updated = sched.record_manual_run("j2", now).expect("job exists");
+        assert_eq!(updated.runs, 1);
+        assert_eq!(updated.last_run_ms, Some(now));
+        assert_eq!(updated.next_run_ms, original_next, "a manual run must not disturb the real schedule");
+        assert!(sched.record_manual_run("no-such-id", now).is_none());
+        assert_eq!(sched.get("j2").unwrap().runs, 1);
+    }
+
+    #[test]
     fn rejects_bad_expression() {
         let sched = CronScheduler::new();
         let r = sched.add(CronJob {
@@ -172,5 +234,39 @@ mod tests {
             tenant: String::new(),
         });
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn standard_five_field_vercel_json_cron_expressions_now_parse() {
+        // REGRESSION TEST for a real, confirmed bug: `vercel.json`'s "crons"
+        // array uses standard 5-field POSIX cron (no seconds field) per
+        // Vercel's own spec — `set_source_jobs` (called on every deploy) fed
+        // these straight into `next_after`, which required 6/7-field
+        // expressions, so EVERY vercel.json-declared cron silently failed to
+        // register. `set_source_jobs`'s return count is the real, observable
+        // symptom: it reported 0 registered for a perfectly valid config.
+        let sched = CronScheduler::new();
+        let jobs = vec![
+            CronJob {
+                id: "vj1".into(), name: "hourly".into(), schedule: "0 0 * * *".into(),
+                deployment: "app".into(), path: "/api/cron".into(), enabled: true,
+                last_run_ms: None, next_run_ms: None, runs: 0, source: "vercel.json".into(), tenant: String::new(),
+            },
+            CronJob {
+                id: "vj2".into(), name: "every-5-min".into(), schedule: "*/5 * * * *".into(),
+                deployment: "app".into(), path: "/api/claw".into(), enabled: true,
+                last_run_ms: None, next_run_ms: None, runs: 0, source: "vercel.json".into(), tenant: String::new(),
+            },
+        ];
+        let registered = sched.set_source_jobs("app", "vercel.json", jobs);
+        assert_eq!(registered, 2, "both standard 5-field vercel.json crons must register");
+        assert_eq!(sched.list().len(), 2);
+        assert!(sched.list().iter().all(|j| j.next_run_ms.is_some()));
+
+        // The platform's own native 6-field format still works unchanged.
+        assert!(next_after("0 * * * * *", now_ms()).is_some());
+        assert!(next_after("0 0 0 * * *", now_ms()).is_some());
+        // Genuine garbage still rejected either way.
+        assert!(next_after("not a cron", now_ms()).is_none());
     }
 }
