@@ -106,6 +106,26 @@ async fn init_handle() -> anyhow::Result<Handle> {
     // clone shares the same underlying Arc<IrohBackend>/endpoint.
     let seed_client = client.clone();
 
+    // Seed known peers BEFORE the KV store opens. `key_value()` below runs
+    // exactly once (cached in the OnceCell `Handle`) and, on that single
+    // call, guardian-db tries automatic DocTicket exchange with whatever
+    // peers are already in `known_peers` (lowest-EndpointId node creates the
+    // namespace, everyone else imports its ticket — see
+    // IrohBackend::resolve_shared_ticket). Miss this window and every node
+    // independently creates its OWN namespace instead. `BOOT_SEED_PEERS`
+    // holds GuardianDB-specific addresses only (never hive-p2p mesh
+    // addresses — see seed_peer's doc comment for why that distinction is
+    // load-bearing, not cosmetic).
+    let mut boot_seeded = 0usize;
+    if let Some(addrs) = BOOT_SEED_PEERS.get() {
+        for addr_json in addrs {
+            if seed_peer(&client, addr_json).await {
+                boot_seeded += 1;
+            }
+        }
+    }
+    tracing::info!(count = boot_seeded, "guardian init: seeded known peers pre-open (for automatic DocTicket exchange)");
+
     // The database must share the client's iroh backend (its endpoint,
     // blobs + docs stores) — pass it explicitly in the options.
     let opts = NewGuardianDBOptions {
@@ -126,37 +146,83 @@ async fn init_handle() -> anyhow::Result<Handle> {
     Ok(Handle { _db: db, kv, client: seed_client })
 }
 
-/// Register every given peer's iroh address directly with GuardianDB's iroh
-/// client (`IrohClient::add_node_addr`, a real, tested upstream API — it adds
-/// a static `MemoryLookup` entry to the endpoint's own address-lookup
-/// services, exactly the mechanism hive-p2p's bootstrap-seed path already uses
-/// for the main mesh). `addr_json` entries are the SAME serialized
-/// `iroh::EndpointAddr` format hive-p2p stores in `NodeInfo.iroh_addr` /
-/// `peer_iroh` (both crates share one `iroh = "1.0.0"` resolution per
-/// Cargo.lock, so the type is literally identical, no translation needed).
-///
-/// Best-effort and idempotent — called on every gossip round (mirrors the
-/// bootstrap-seed re-assertion pattern) so a newly-joined or address-changed
-/// peer is picked up without a restart; a malformed/stale entry is skipped,
-/// never aborts the others. This does NOT touch GuardianDB's RELAY
-/// configuration (still n0's default relay, since `ClientConfig` exposes no
-/// override and iroh's relay mode is bind-time-only) — it only fixes peer
-/// DISCOVERY, which is what live evidence showed was actually broken (frozen,
-/// non-converging per-node key counts; a permanently-hung live read). If
-/// relay-mediated connectivity also proves insufficient after this lands,
-/// that's a distinct, separately-diagnosable follow-up.
-pub async fn seed_known_peers(addr_jsons: &[String]) {
-    let Ok(h) = handle().await else { return };
-    for addr_json in addr_jsons {
-        match serde_json::from_str::<iroh::EndpointAddr>(addr_json) {
-            Ok(addr) => {
-                if let Err(e) = h.client.add_node_addr(addr).await {
-                    tracing::debug!(error = %e, "guardian seed_known_peers: add_node_addr failed");
-                }
+/// Register a peer's iroh address AND mark it known, against a specific
+/// `IrohClient`. `add_node_addr` registers a static `MemoryLookup` entry
+/// (address resolution only). `note_known_peer` is the SEPARATE set that
+/// `IrohBackend::resolve_shared_ticket`'s automatic DocTicket exchange
+/// actually consults — `add_node_addr` alone never touches it. CALLERS MUST
+/// PASS THIS NODE'S GUARDIANDB-SPECIFIC ADDRESS, never its hive-p2p mesh
+/// address: GuardianDB runs its own, separate iroh identity per node (a
+/// different EndpointId — confirmed empirically, logged as a different
+/// node_id than the mesh's peer_id). Feeding a peer's mesh identity here
+/// previously caused a live, reverted retry-storm (endpoint.connect() to a
+/// NodeId nothing is listening as under this ALPN); this exists to prevent a
+/// repeat, not just document one. `addr_json` is a serialized
+/// `iroh::EndpointAddr` (same iroh version as hive-p2p, per Cargo.lock, but
+/// the VALUE must originate from `my_iroh_addr()` — see `NodeInfo.
+/// guardian_iroh_addr`'s doc comment for how it's gossiped). A malformed/
+/// unreachable entry is skipped, never aborts the others.
+async fn seed_peer(client: &IrohClient, addr_json: &str) -> bool {
+    match serde_json::from_str::<iroh::EndpointAddr>(addr_json) {
+        Ok(addr) => {
+            let peer_id = addr.id;
+            if let Err(e) = client.add_node_addr(addr).await {
+                tracing::debug!(error = %e, "guardian seed_peer: add_node_addr failed");
+                return false;
             }
-            Err(e) => tracing::debug!(error = %e, "guardian seed_known_peers: malformed addr_json"),
+            client.backend().note_known_peer(peer_id).await;
+            true
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "guardian seed_peer: malformed addr_json");
+            false
         }
     }
+}
+
+/// Seed known peers (GuardianDB-specific addresses — see `seed_peer`) against
+/// the already-open `Handle`'s client. Best-effort and idempotent — called on
+/// every gossip round so a newly-joined or address-changed peer is picked up
+/// without a restart. The KV store itself only opens once (cached in the
+/// `OnceCell`), so this cannot retroactively fix an already-diverged
+/// namespace on THIS node, but keeps `known_peers` fresh for any future
+/// re-open (retry after a prior init failure, etc).
+pub async fn seed_known_peers(guardian_addr_jsons: &[String]) {
+    let Ok(h) = handle().await else { return };
+    for addr_json in guardian_addr_jsons {
+        seed_peer(&h.client, addr_json).await;
+    }
+}
+
+/// Snapshot of peers' GuardianDB-specific addresses to seed the known-peer set
+/// with on the FIRST (only) GuardianDB KV-store open — the one window
+/// `resolve_shared_ticket`'s automatic DocTicket exchange is ever consulted
+/// in (see `init_handle`). Set once, from main.rs, right before
+/// `init_background()`; a second call is a no-op (`OnceLock`). Best-effort:
+/// an empty/stale snapshot just means this node falls back to creating its
+/// own namespace, never a hard failure. Ongoing peer changes after boot are
+/// covered by the periodic `seed_known_peers` above.
+static BOOT_SEED_PEERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Record peers' current GuardianDB-specific addresses for `init_handle` to
+/// seed on the FIRST GuardianDB KV-store open. Call before
+/// `init_background()`. CALLERS MUST PASS `guardian_iroh_addr`, never
+/// `iroh_addr` — see `seed_peer`'s doc comment.
+pub fn set_boot_seed_peers(guardian_addr_jsons: Vec<String>) {
+    let _ = BOOT_SEED_PEERS.set(guardian_addr_jsons);
+}
+
+/// This node's OWN GuardianDB-specific dialable address (serialized
+/// `iroh::EndpointAddr`), for the caller to gossip so PEERS can seed it
+/// correctly (see `NodeInfo.guardian_iroh_addr`). `None` until GuardianDB's
+/// client has finished binding — best-effort, never blocks; the caller
+/// re-polls this every gossip round until it resolves.
+pub async fn my_iroh_addr() -> Option<String> {
+    let h = handle().await.ok()?;
+    let endpoint_arc = h.client.backend().get_endpoint().await.ok()?;
+    let endpoint_lock = endpoint_arc.read().await;
+    let endpoint = endpoint_lock.as_ref()?;
+    serde_json::to_string(&endpoint.addr()).ok()
 }
 
 /// Warm the GuardianDB connection at startup so it is live before the first

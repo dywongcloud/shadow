@@ -851,8 +851,11 @@ impl IrohBackend {
     /// - If this node has the smallest id (or no one responded after the retries), returns `None`
     ///   and the caller creates a new namespace (taking the creator role).
     pub async fn resolve_shared_ticket(&self, store_key: &str) -> Option<String> {
+        let known_peer_count = self.known_peers.read().await.len();
+        debug!(store_key, known_peer_count, "resolve_shared_ticket: immediate attempt");
         // Immediate attempt.
         if let Some(ticket) = self.request_ticket_from_known_peers(store_key).await {
+            debug!(store_key, "resolve_shared_ticket: got ticket on immediate attempt");
             return Some(ticket);
         }
 
@@ -865,8 +868,10 @@ impl IrohBackend {
 
         if !lower_peer_exists {
             // We are the node with the smallest id (or have no peers): we take the creator role.
+            debug!(store_key, %my_id, "resolve_shared_ticket: no lower peer -> taking creator role");
             return None;
         }
+        debug!(store_key, %my_id, "resolve_shared_ticket: lower peer exists -> retrying for ticket");
 
         // There is a peer that should be the creator — give it time to create/register and try again.
         const MAX_RETRIES: u32 = 10;
@@ -881,6 +886,7 @@ impl IrohBackend {
                 return Some(ticket);
             }
         }
+        debug!(store_key, "resolve_shared_ticket: exhausted all retries, falling back to local cache/create");
 
         // Fallback: the creator did not respond in time; we take the namespace to avoid blocking.
         warn!(

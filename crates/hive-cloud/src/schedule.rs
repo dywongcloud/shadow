@@ -170,6 +170,7 @@ mod tests {
             public_ip6: None,
             peer_id: None,
             iroh_addr: None,
+            guardian_iroh_addr: None,
             last_seen_ms: 0,
             is_self: false,
             latency_ms: 0,

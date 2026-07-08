@@ -132,6 +132,41 @@ pub fn load_peer_iroh() -> std::collections::HashMap<String, (String, String)> {
         .unwrap_or_default()
 }
 
+fn peer_guardian_addr_path() -> PathBuf {
+    data_dir().join("peer_guardian_addr.json")
+}
+
+/// Persist peers' GuardianDB-specific addresses (node name -> serialized
+/// `iroh::EndpointAddr`) — a SEPARATE identity/endpoint from the mesh
+/// addresses in `peer_iroh.json` above (GuardianDB runs its own independent
+/// iroh client per node). Loaded at boot to seed `guardian::set_boot_seed_peers`
+/// before GuardianDB's one-time KV-store open (the only window its automatic
+/// DocTicket exchange is consulted in — see guardian.rs). On a node's FIRST
+/// ever boot with this feature, this file doesn't exist yet (nothing has ever
+/// gossiped a guardian address) — boot-seeding is empty and this node falls
+/// back to the pre-existing single-namespace-per-node behavior; the NEXT
+/// restart, after the gossip loop has had a chance to populate and persist
+/// this file, is when boot-seeding actually has something to work with.
+pub fn save_peer_guardian_addr(map: &std::collections::HashMap<String, String>) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("peer_guardian_addr.json.tmp");
+    let Ok(json) = serde_json::to_string(map) else { return };
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, peer_guardian_addr_path());
+    }
+}
+
+/// Load the persisted peer GuardianDB-address map (empty if none).
+pub fn load_peer_guardian_addr() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(peer_guardian_addr_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 fn dirs_home() -> PathBuf {
     std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
 }

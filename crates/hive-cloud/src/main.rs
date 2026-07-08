@@ -274,6 +274,11 @@ async fn main() -> anyhow::Result<()> {
         public_ip6,
         peer_id: iroh_ep.as_ref().map(|e| e.id().to_string()),
         iroh_addr: iroh_ep.as_ref().and_then(hive_p2p::addr_json),
+        // Not ready yet — GuardianDB's own iroh client hasn't bound at this
+        // point in boot. Filled in by the gossip loop via
+        // registry.set_self_guardian_addr() once guardian::my_iroh_addr()
+        // resolves (best-effort, usually within the first couple of rounds).
+        guardian_iroh_addr: None,
         last_seen_ms: now_ms(),
         is_self: true,
         latency_ms: 0,
@@ -474,6 +479,14 @@ async fn main() -> anyhow::Result<()> {
     // Warm the always-on GuardianDB (durable, iroh-replicated state store) so it
     // is live before the first snapshot. Best-effort; never blocks boot.
     guardian::set_node_name(&args.name);
+    // Seed known peers (GuardianDB-specific addresses — persist::
+    // save_peer_guardian_addr in the gossip loop, mirroring peer_iroh.json)
+    // BEFORE the KV store's one-time open. Empty on this node's first-ever
+    // boot with this feature (nothing has persisted a guardian address yet);
+    // has real data starting the restart after the gossip loop has had a
+    // chance to populate and persist it. See set_boot_seed_peers's doc
+    // comment for why this specific window matters.
+    guardian::set_boot_seed_peers(crate::persist::load_peer_guardian_addr().into_values().collect());
     guardian::init_background();
     // Restore-on-rollback guard: if the local snapshot regressed (older than the
     // GuardianDB replica — the failure that silently dropped shoomoo's env vars +
@@ -1672,23 +1685,37 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                 roster_hash = h;
                 tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
             }
-            // Seed GuardianDB's OWN iroh client with every currently-known peer
-            // address from the main mesh's gossip-derived registry (re-asserted
-            // every round, same rationale as the bootstrap-seed re-assertion
-            // above): GuardianDB's separate iroh client otherwise depends
-            // entirely on n0's public discovery to ever learn a peer's address,
-            // which this platform's cloud hosts can't reliably use (confirmed:
-            // frozen, non-converging per-node key counts; a permanently-hung
-            // live read). Best-effort, spawned so a slow/failed seed round never
-            // blocks the gossip loop's own cadence.
-            let guardian_addrs: Vec<String> = cloud
+            // Publish THIS node's own GuardianDB-specific address (a SEPARATE
+            // iroh identity from the mesh's iroh_addr above — GuardianDB runs
+            // its own independent client) once it's ready, so peers can gossip
+            // it and seed it correctly. `None` until GuardianDB's client has
+            // bound; self-heals within a few rounds after boot, never blocks.
+            let cloud_for_self_addr = cloud.clone();
+            tokio::spawn(async move {
+                if let Some(addr) = crate::guardian::my_iroh_addr().await {
+                    cloud_for_self_addr.registry.set_self_guardian_addr(Some(addr));
+                }
+            });
+            // Seed GuardianDB's OWN iroh client with every currently-known
+            // peer's GuardianDB-specific address (re-asserted every round,
+            // same rationale as the bootstrap-seed re-assertion above) — NOT
+            // the mesh iroh_addr above, which belongs to a DIFFERENT identity
+            // (see guardian::seed_peer's doc comment: feeding the wrong one
+            // in previously caused a live retry-storm, reverted). Best-effort,
+            // spawned so a slow/failed seed round never blocks the gossip
+            // loop's own cadence. Persisted (mirroring peer_iroh.json) so a
+            // restart's boot-time seed has real data once the mesh has had at
+            // least one round to gossip these addresses around.
+            let guardian_peer_map: std::collections::HashMap<String, String> = cloud
                 .registry
                 .nodes()
                 .into_iter()
                 .filter(|n| !n.is_self)
-                .filter_map(|n| n.iroh_addr)
+                .filter_map(|n| n.guardian_iroh_addr.clone().map(|a| (n.id.clone(), a)))
                 .collect();
-            if !guardian_addrs.is_empty() {
+            if !guardian_peer_map.is_empty() {
+                crate::persist::save_peer_guardian_addr(&guardian_peer_map);
+                let guardian_addrs: Vec<String> = guardian_peer_map.into_values().collect();
                 tokio::spawn(async move { crate::guardian::seed_known_peers(&guardian_addrs).await });
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
