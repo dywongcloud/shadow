@@ -415,8 +415,19 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // Leader-only (auto-failover with the same election as billing).
             // `HIVE_DNS_LEADER_NODE` pins the acting node — needed while the
             // election spans ngrok-mode nodes whose reconciler is dormant.
-            let leader = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty())
-                .or_else(|| crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()));
+            // Routed through billing_leader_with_pref (health + addressability
+            // validated, matching HIVE_CP_LEADER) rather than a raw env check —
+            // an unguarded pin has no auto-fallback: if the pinned node dies,
+            // published DNS records silently freeze (never publish-empty is a
+            // deliberate safety property, but it also masks the freeze). When
+            // unset, falls through to the control-plane election itself
+            // (honors HIVE_CP_LEADER) so DNS agrees with control-plane writes
+            // on who's authoritative unless an operator deliberately splits them.
+            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
+            let leader = match dns_pref {
+                Some(p) => crate::cluster::Cluster::billing_leader_with_pref(Some(&p), &cloud.registry.nodes()),
+                None => crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()),
+            };
             if leader.as_deref() != Some(cloud.node_name.as_str()) {
                 continue;
             }

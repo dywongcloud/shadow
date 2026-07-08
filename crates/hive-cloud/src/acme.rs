@@ -351,8 +351,21 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
             // Jittered interval: 5–7h.
             let jitter = (hive_core::now_ms() % 7200) as u64;
             let sleep = 5 * 3600 + jitter;
-            let leader = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty())
-                .or_else(|| crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()));
+            // Routed through billing_leader_with_pref (the SAME health- and
+            // addressability-validated pattern HIVE_CP_LEADER uses), not a raw
+            // env check: an unguarded pin here has no auto-fallback at all — if
+            // the pinned node ever goes unhealthy or unreachable, ACME/DNS work
+            // freezes silently (renewal misses only surface ~60-90d later at
+            // expiry). When HIVE_DNS_LEADER_NODE is unset, fall through to the
+            // control-plane election itself (billing_leader, which honors
+            // HIVE_CP_LEADER) rather than an unrelated raw election — so DNS/ACME
+            // agrees with control-plane writes on who's authoritative unless an
+            // operator deliberately splits them.
+            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
+            let leader = match dns_pref {
+                Some(p) => crate::cluster::Cluster::billing_leader_with_pref(Some(&p), &cloud.registry.nodes()),
+                None => crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()),
+            };
             if leader.as_deref() == Some(cloud.node_name.as_str()) {
                 for (bundle, names, zone) in bundles(&cloud) {
                     // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`

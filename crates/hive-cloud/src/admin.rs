@@ -23,6 +23,12 @@ use crate::state::CloudState;
 pub fn router(cloud: Arc<CloudState>) -> Router {
     let app = Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        // Distinct from /healthz: liveness ("is the process serving HTTP") tells
+        // you nothing about mesh MEMBERSHIP — a node can be process-alive,
+        // /healthz-green, and fully isolated from its fleet (the node-a/node-b
+        // incident). Unauthenticated like /healthz, for the same reason: the
+        // watchdog polling it has no JWT.
+        .route("/v1/mesh", get(mesh_health))
         .route("/v1/overview", get(overview))
         .route("/v1/nodes", get(nodes))
         .route("/v1/serve-hosts", get(serve_hosts))
@@ -2628,6 +2634,14 @@ async fn mesh_admit(
     Ok(Json(json!({ "admitted": id, "trusted_peer_count": c.trusted_peer_ids.read().map(|s| s.len()).unwrap_or(0) })))
 }
 
+/// Unauthenticated, liveness-adjacent mesh-membership probe (`/v1/mesh`) — no
+/// JWT, matching `/healthz`, since the watchdog/monitoring polling it has none.
+/// Deliberately separate from `/healthz`: liveness ("is the process serving
+/// HTTP") tells you nothing about mesh membership. See `MeshHealth`'s doc.
+async fn mesh_health(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(c.mesh_health()))
+}
+
 async fn overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -2646,6 +2660,7 @@ async fn overview(
             "control_plane": {
                 "last_gossip_ms": c.last_gossip_ms(),
                 "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
+                "mesh": c.mesh_health(),
             },
         })));
     }
@@ -2676,6 +2691,11 @@ async fn overview(
             // known-good state; this just makes the staleness observable.
             "last_gossip_ms": c.last_gossip_ms(),
             "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
+            // Membership health, distinct from the staleness check above: a node
+            // launched with no --peer args has zero configured peers, so
+            // `degraded` above is unconditionally false for it even when it's
+            // fully isolated from the fleet (see MeshHealth's doc).
+            "mesh": c.mesh_health(),
         },
         "peer_trust": {
             // #20: P2P admission control. enforced=true rejects iroh peers whose

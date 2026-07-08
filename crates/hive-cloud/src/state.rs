@@ -314,6 +314,44 @@ pub fn cp_degraded(last_ok_ms: u64, peer_count: usize, now_ms: u64, ttl_ms: u64)
     last_ok_ms == 0 || now_ms.saturating_sub(last_ok_ms) > ttl_ms
 }
 
+/// Live mesh-membership health, as reported by `CloudState::mesh_health`.
+#[derive(Clone, Serialize)]
+pub struct MeshHealth {
+    /// Peers this node is CONFIGURED to expect (from `HIVE_TRUSTED_NODE_IDS`,
+    /// excluding self) — static ground truth, independent of how this node was
+    /// launched.
+    pub expected_peers: usize,
+    /// Of those, how many are visible + healthy in the LIVE gossip-derived
+    /// registry right now.
+    pub visible_healthy_peers: usize,
+    /// True iff peers were expected but NONE are currently visible — the exact
+    /// shape of the node-a/node-b isolation incident (see `mesh_isolated`).
+    pub isolated: bool,
+}
+
+/// Pure core of mesh-isolation detection (unit-testable without a node). Compares
+/// the LIVE, gossip-derived set of healthy peer identities actually visible right
+/// now against the EXPECTED trusted peer set, rather than this node's own
+/// self-reported `--peer` CLI list.
+///
+/// `cp_degraded` above is structurally blind to a specific failure class: a node
+/// launched with zero `--peer` args (peers "announce themselves" to it instead,
+/// per `dev-cluster.sh`'s own comment) has `peers.len() == 0` by construction, so
+/// `cp_degraded` reports "not degraded" — "standalone node — no control plane to
+/// be degraded" — even when that node is fully isolated from an 8-node fleet it
+/// was supposed to join. This happened: an orphaned dev launch script started
+/// node-a this way, gossip-signature enforcement silently rejected its unsigned
+/// packets on every OTHER node (logged only on the REJECTING side), and nothing
+/// ever surfaced "node-a can see zero of its expected fleet."
+///
+/// `expected_peers` here comes from static config (`HIVE_TRUSTED_NODE_IDS`,
+/// present regardless of how the node was launched) instead of the dynamic peer
+/// list, so this closes the blind spot: a node with peers configured that
+/// currently sees none of them is isolated, full stop.
+pub fn mesh_isolated(expected_peers: usize, visible_healthy_peers: usize) -> bool {
+    expected_peers > 0 && visible_healthy_peers == 0
+}
+
 impl CloudState {
     /// The current control-plane WRITE authority (leader), identity-ordered over
     /// HEALTHY nodes (the same web3-style election as the billing coordinator, so
@@ -325,7 +363,27 @@ impl CloudState {
     }
 
     /// True when THIS node is the control-plane leader.
+    ///
+    /// Gated on mesh freshness first: `billing_leader` recomputes the election
+    /// fresh from `self.registry.nodes()` on EVERY call, with no persisted or
+    /// gossiped epoch/term — there is nothing that fences a stale computation
+    /// against a fresher one elsewhere in the mesh. That's fine for a node with
+    /// current gossip data (the common case: it converges within one ~5s
+    /// round). It's dangerous for a node whose OWN view is stale or isolated —
+    /// most concretely, a node in the first moments after a restart, before its
+    /// gossip loop has resynced. Such a node's `registry.nodes()` can still
+    /// show itself as the (or a) healthy lowest-identity candidate purely
+    /// because it hasn't yet learned the rest of the mesh already elected
+    /// someone else — a real, if short (bounded by one gossip round), split-
+    /// brain window on every leader restart. A node that can't currently see
+    /// its expected peers (`mesh_health().isolated`) must never assert
+    /// leadership from that view; `admin_ingress` already fails mutations
+    /// closed (503) when the resolved leader is unreachable, so refusing here
+    /// safely defers rather than risking a stale-data write.
     pub fn is_control_plane_leader(&self) -> bool {
+        if self.mesh_health().isolated {
+            return false;
+        }
         self.control_plane_leader() == self.node_name
     }
 
@@ -513,6 +571,30 @@ impl CloudState {
     pub fn control_plane_degraded(&self, ttl_ms: u64) -> bool {
         let peers = self.peers.read().len();
         cp_degraded(self.last_gossip_ms(), peers, now_ms(), ttl_ms)
+    }
+
+    /// Live mesh-membership health (see `mesh_isolated`'s doc for why this exists
+    /// alongside `control_plane_degraded`, which a zero-`--peer` launch fools).
+    pub fn mesh_health(&self) -> MeshHealth {
+        let self_pid = self.registry.me().peer_id;
+        let expected: std::collections::HashSet<String> = self
+            .trusted_peer_ids
+            .read()
+            .map(|g| g.iter().filter(|id| Some((*id).as_str()) != self_pid.as_deref()).cloned().collect())
+            .unwrap_or_default();
+        let visible: std::collections::HashSet<String> = self
+            .registry
+            .nodes()
+            .into_iter()
+            .filter(|n| !n.is_self && n.healthy)
+            .filter_map(|n| n.peer_id)
+            .filter(|pid| expected.contains(pid))
+            .collect();
+        MeshHealth {
+            expected_peers: expected.len(),
+            visible_healthy_peers: visible.len(),
+            isolated: mesh_isolated(expected.len(), visible.len()),
+        }
     }
 
     pub fn record(&self, ev: Event) {
@@ -706,5 +788,21 @@ mod tests {
         assert!(cp_degraded(now - (ttl + 1), 3, now, ttl));
         // Clock skew (last_ok in the future) saturates to 0 elapsed => healthy.
         assert!(!cp_degraded(now + 10_000, 3, now, ttl));
+    }
+
+    #[test]
+    fn mesh_isolated_closes_the_zero_peer_cli_blind_spot() {
+        // The exact node-a shape: no --peer CLI args at all, so `cp_degraded`
+        // (peer_count from self.peers) would report "not degraded" — but
+        // `mesh_isolated` uses the static trusted-peer-id EXPECTATION instead,
+        // so it correctly flags isolation even when cp_degraded is blind to it.
+        assert!(super::mesh_isolated(7, 0), "peers expected, none visible = isolated");
+        // Standalone-by-design (genuinely zero trusted peers configured) is never
+        // isolated — nothing was expected.
+        assert!(!super::mesh_isolated(0, 0));
+        // Seeing at least one expected peer, even far short of the full set
+        // (a mesh mid-reconverge), is not isolation.
+        assert!(!super::mesh_isolated(7, 1));
+        assert!(!super::mesh_isolated(7, 7));
     }
 }
