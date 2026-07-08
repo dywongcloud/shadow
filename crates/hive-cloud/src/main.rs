@@ -474,6 +474,20 @@ async fn main() -> anyhow::Result<()> {
     // Warm the always-on GuardianDB (durable, iroh-replicated state store) so it
     // is live before the first snapshot. Best-effort; never blocks boot.
     guardian::set_node_name(&args.name);
+    // Seed GuardianDB's known-peer set from whatever the mesh registry already
+    // holds (persisted peer_iroh.json + cold-start bootstrap seeds, loaded
+    // above) BEFORE the KV store's one-time open — see set_boot_seed_peers's
+    // doc comment: this is what lets guardian-db's built-in automatic
+    // DocTicket exchange actually find a peer to join instead of every node
+    // silently creating its own isolated namespace.
+    let guardian_boot_seed_addrs: Vec<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self)
+        .filter_map(|n| n.iroh_addr)
+        .collect();
+    guardian::set_boot_seed_peers(guardian_boot_seed_addrs);
     guardian::init_background();
     // Restore-on-rollback guard: if the local snapshot regressed (older than the
     // GuardianDB replica — the failure that silently dropped shoomoo's env vars +
