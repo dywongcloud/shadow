@@ -1,0 +1,346 @@
+name: GuardianDB ODM CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+      - benches/**
+      - guardian-db-derive/**
+      - packages/guardiandb-odm/**
+      - docs/ODM_BENCHMARKS.md
+      - .github/workflows/odm-ci.yml
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+      - benches/**
+      - guardian-db-derive/**
+      - packages/guardiandb-odm/**
+      - docs/ODM_BENCHMARKS.md
+      - .github/workflows/odm-ci.yml
+  workflow_dispatch:
+    inputs:
+      full_benchmarks:
+        description: Run full Rust Criterion and TypeScript benchmark suites instead of bounded CI smoke workloads.
+        required: false
+        default: false
+        type: boolean
+      large_document_mb:
+        description: Large-document payload size for manual benchmark probes.
+        required: false
+        default: '17'
+        type: string
+      run_replication:
+        description: Run network-sensitive replication integration tests.
+        required: false
+        default: true
+        type: boolean
+  schedule:
+    # Weekly full benchmark signal without slowing every pull request.
+    - cron: '0 9 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  NODE_VERSION: '22'
+
+jobs:
+  rust-odm:
+    name: Rust ODM tests and benchmark smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          protoc --version
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust build with ODM feature
+        run: cargo check --workspace --all-targets --features odm
+
+      - name: Run Rust clippy with ODM feature
+        run: cargo clippy --workspace --all-targets --features odm -- -D warnings
+
+      - name: Run Rust unit tests with ODM feature
+        run: cargo test --workspace --lib --features odm -- --test-threads=1
+     
+      - name: Run Rust doc tests with ODM feature
+        run: cargo test --workspace --doc --features odm -- --test-threads=1
+
+      - name: Run Rust ODM functional tests
+        run: cargo test --features odm --test odm -- --test-threads=1
+
+      - name: Run ODM benchmark reliability tests
+        run: cargo test --features odm --test odm_benchmark_reliability -- --test-threads=1
+
+      - name: Smoke-test benchmark harnesses without Criterion timing loop
+        # Single-threading is passed via RUST_TEST_THREADS (env) rather than the
+        # `--test-threads` CLI arg: Criterion 0.8's bench harness rejects unknown
+        # CLI args ("unexpected argument found"), but honors the libtest env var.
+        run: RUST_TEST_THREADS=1 cargo test --features odm --benches
+
+      - name: Compile Rust benchmark binary
+        run: cargo bench --features odm --bench odm_benchmark --no-run
+
+  rust-replication-integration:
+    name: Rust replication integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: rust-odm
+    continue-on-error: true
+    if: github.event_name != 'workflow_dispatch' || inputs.run_replication
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          protoc --version
+
+      - name: Run replication integration tests with one retry
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p target/ci-logs
+          cargo test --features odm --test integration_replication -- --test-threads=1 2>&1 | tee target/ci-logs/integration-replication-attempt-1.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          echo "Replication integration attempt 1 failed; retrying once because this suite is network/timing sensitive."
+          sleep 10
+          cargo test --features odm --test integration_replication -- --test-threads=1 2>&1 | tee target/ci-logs/integration-replication-attempt-2.log
+
+      - name: Upload replication integration logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-replication-integration-logs
+          path: target/ci-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  typescript-sdk:
+    name: TypeScript SDK tests and benchmark smoke / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node:
+          - '20'
+          - '22'
+
+    defaults:
+      run:
+        working-directory: packages/guardiandb-odm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+
+      - name: Install TypeScript SDK dependencies
+        run: npm ci
+
+      - name: Build TypeScript SDK
+        run: npm run build
+
+      - name: Run TypeScript SDK tests
+        run: npm test
+
+      - name: Verify TypeScript SDK package contents
+        run: npm pack --dry-run
+
+      - name: Run TypeScript ODM benchmark smoke
+        run: |
+          npm run bench -- \
+            --mode=runAll \
+            --docs=1000 \
+            --batch-size=250 \
+            --queries=250 \
+            --updates=250 \
+            --progress=false \
+            > benchmark-smoke-node-${{ matrix.node }}.json
+          cat benchmark-smoke-node-${{ matrix.node }}.json
+
+      - name: Run TypeScript large-document smoke probe
+        run: |
+          npm run bench -- \
+            --mode=large \
+            --large-mb=2 \
+            --progress=false \
+            > benchmark-large-smoke-node-${{ matrix.node }}.json
+          cat benchmark-large-smoke-node-${{ matrix.node }}.json
+
+      - name: Upload TypeScript smoke benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-smoke-benchmarks-node-${{ matrix.node }}
+          path: |
+            packages/guardiandb-odm/benchmark-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm/benchmark-large-smoke-node-${{ matrix.node }}.json
+          if-no-files-found: error
+          retention-days: 14
+
+  rust-full-benchmarks:
+    name: Rust ODM full benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    needs: rust-odm
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_benchmarks)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          protoc --version
+
+      - name: Run Rust Criterion ODM benchmarks
+        env:
+          GUARDIANDB_ODM_BENCH_DOCS: '5000'
+          GUARDIANDB_ODM_BENCH_BATCH_DOCS: '1000'
+          GUARDIANDB_ODM_BENCH_PAYLOAD_BYTES: '512'
+        run: cargo bench --features odm --bench odm_benchmark -- --noplot
+
+      - name: Run explicit Rust large-document limit probe
+        env:
+          GUARDIANDB_ODM_LARGE_DOC_MB: ${{ github.event.inputs.large_document_mb || '17' }}
+        run: cargo test --features odm --test odm_benchmark_reliability explicit_large_document_limit_probe -- --ignored --test-threads=1
+
+      - name: Upload Criterion reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rust-criterion-odm-reports
+          path: target/criterion/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  typescript-full-benchmarks:
+    name: TypeScript SDK full benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: typescript-sdk
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_benchmarks)
+
+    defaults:
+      run:
+        working-directory: packages/guardiandb-odm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+
+      - name: Install TypeScript SDK dependencies
+        run: npm ci
+
+      - name: Run TypeScript ODM benchmark suite
+        run: |
+          npm run bench -- \
+            --mode=runAll \
+            --docs=10000 \
+            --batch-size=1000 \
+            --queries=2500 \
+            --updates=2500 \
+            --progress=false \
+            > benchmark-full.json
+          cat benchmark-full.json
+
+      - name: Run TypeScript large-document benchmark probe
+        run: |
+          LARGE_MB="${{ github.event.inputs.large_document_mb }}"
+          if [ -z "$LARGE_MB" ]; then
+            LARGE_MB=17
+          fi
+
+          npm run bench -- \
+            --mode=large \
+            --large-mb="$LARGE_MB" \
+            --progress=false \
+            > benchmark-large-document.json
+          cat benchmark-large-document.json
+
+      - name: Upload TypeScript full benchmark artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: typescript-full-benchmarks
+          path: |
+            packages/guardiandb-odm/benchmark-full.json
+            packages/guardiandb-odm/benchmark-large-document.json
+          if-no-files-found: ignore
+          retention-days: 14

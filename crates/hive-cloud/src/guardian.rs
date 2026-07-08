@@ -31,53 +31,132 @@ use tokio::sync::OnceCell;
 use crate::persist::PlatformSnapshot;
 
 /// Live GuardianDB handle: the database (kept alive so its backend / iroh
-/// endpoint stays running) plus the opened key/value store.
+/// endpoint stays running), the opened key/value store, and a CLONE of the
+/// iroh client used to seed known-peer addresses after construction (see
+/// `seed_known_peers`). `IrohClient` is `#[derive(Clone)]` over an inner
+/// `Arc<IrohBackend>`, so this clone shares the exact same live endpoint
+/// `GuardianDB` itself uses internally — seeding through it reaches the real
+/// connection the docs/blobs Willow sync dials from.
 struct Handle {
     _db: GuardianDB,
     kv: Arc<dyn KeyValueStore<Error = GuardianError>>,
+    client: IrohClient,
 }
 
 static HANDLE: OnceCell<Handle> = OnceCell::const_new();
+
+/// Upper bound on the whole GuardianDB bring-up (iroh endpoint bind, keystore,
+/// docs/blobs spawn). Live evidence (2026-07-06 onward) showed init can wedge
+/// indefinitely with zero error and zero log output — `tokio::sync::OnceCell`
+/// then blocks every future caller forever, since a never-resolving init future
+/// never lets `get_or_try_init` return. A bounded timeout converts that into a
+/// clean, retryable failure: the in-flight future is dropped (its owned
+/// FsStore/redb/iroh Endpoint handles release synchronously on `Drop`, so a
+/// retry does not inherit stuck locks), and the NEXT call to `handle()` tries
+/// again from scratch instead of joining a wedged wait forever.
+const GUARDIAN_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Lazily open (once) the GuardianDB KV store, retrying on a previous failure.
 async fn handle() -> anyhow::Result<&'static Handle> {
     HANDLE
         .get_or_try_init(|| async {
-            let dir = crate::persist::data_dir().join("guardian");
-            std::fs::create_dir_all(&dir).ok();
-
-            // Its own iroh endpoint (random UDP port, n0 discovery) — independent
-            // of the request-routing mesh in hive-p2p. Persisted store on disk.
-            let cfg = ClientConfig {
-                data_store_path: Some(dir.join("iroh")),
-                enable_discovery_n0: true,
-                port: 0,
-                ..ClientConfig::default()
-            };
-            let client = IrohClient::new(cfg)
-                .await
-                .map_err(|e| anyhow::anyhow!("guardian iroh client: {e}"))?;
-            let node_id = client.node_id();
-
-            // The database must share the client's iroh backend (its endpoint,
-            // blobs + docs stores) — pass it explicitly in the options.
-            let opts = NewGuardianDBOptions {
-                directory: Some(dir.clone()),
-                backend: Some(client.backend().clone()),
-                ..Default::default()
-            };
-            let db = GuardianDB::new(client, Some(opts))
-                .await
-                .map_err(|e| anyhow::anyhow!("guardian open: {e}"))?;
-            let kv = db
-                .key_value("hive-state", None)
-                .await
-                .map_err(|e| anyhow::anyhow!("guardian kv open: {e}"))?;
-
-            tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
-            Ok::<Handle, anyhow::Error>(Handle { _db: db, kv })
+            match tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::anyhow!(
+                    "guardian init timed out after {GUARDIAN_INIT_TIMEOUT:?} (iroh endpoint bind / keystore / docs bring-up never completed); will retry on next call"
+                )),
+            }
         })
         .await
+}
+
+/// The actual GuardianDB bring-up, run under `handle()`'s timeout. Broken into
+/// its own function (rather than inlined in the `OnceCell` closure) so each
+/// major step logs a distinct marker — on a future stall, the log shows
+/// exactly which sub-step (iroh client vs. GuardianDB open vs. KV open) never
+/// returned, instead of the totally silent gap this replaces.
+async fn init_handle() -> anyhow::Result<Handle> {
+    let dir = crate::persist::data_dir().join("guardian");
+    std::fs::create_dir_all(&dir).ok();
+
+    // Its own iroh endpoint (random UDP port, n0 discovery for the
+    // INITIAL bind) — independent of the request-routing mesh in
+    // hive-p2p, but NOT independent of the platform's own known peer
+    // set: `seed_known_peers` (called periodically from the gossip
+    // loop, see main.rs) registers every mesh peer's iroh address
+    // directly via `add_node_addr`, so cross-node docs/blobs sync
+    // works from OUR OWN gossip-derived membership instead of
+    // depending on n0's public discovery service ever finding this
+    // node's peers (the same class of unreliable-from-cloud-hosts
+    // discovery the main mesh already moved off of; see hive-p2p's
+    // self-hosted relay/Seer migration history).
+    let cfg = ClientConfig {
+        data_store_path: Some(dir.join("iroh")),
+        enable_discovery_n0: true,
+        port: 0,
+        ..ClientConfig::default()
+    };
+    tracing::info!("guardian init: opening iroh client (endpoint bind + keystore)");
+    let client = IrohClient::new(cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("guardian iroh client: {e}"))?;
+    let node_id = client.node_id();
+    tracing::info!(%node_id, "guardian init: iroh client ready");
+    // Clone BEFORE GuardianDB::new consumes `client` by value — the
+    // clone shares the same underlying Arc<IrohBackend>/endpoint.
+    let seed_client = client.clone();
+
+    // The database must share the client's iroh backend (its endpoint,
+    // blobs + docs stores) — pass it explicitly in the options.
+    let opts = NewGuardianDBOptions {
+        directory: Some(dir.clone()),
+        backend: Some(client.backend().clone()),
+        ..Default::default()
+    };
+    let db = GuardianDB::new(client, Some(opts))
+        .await
+        .map_err(|e| anyhow::anyhow!("guardian open: {e}"))?;
+    tracing::info!("guardian init: GuardianDB open, opening 'hive-state' KV store");
+    let kv = db
+        .key_value("hive-state", None)
+        .await
+        .map_err(|e| anyhow::anyhow!("guardian kv open: {e}"))?;
+
+    tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
+    Ok(Handle { _db: db, kv, client: seed_client })
+}
+
+/// Register every given peer's iroh address directly with GuardianDB's iroh
+/// client (`IrohClient::add_node_addr`, a real, tested upstream API — it adds
+/// a static `MemoryLookup` entry to the endpoint's own address-lookup
+/// services, exactly the mechanism hive-p2p's bootstrap-seed path already uses
+/// for the main mesh). `addr_json` entries are the SAME serialized
+/// `iroh::EndpointAddr` format hive-p2p stores in `NodeInfo.iroh_addr` /
+/// `peer_iroh` (both crates share one `iroh = "1.0.0"` resolution per
+/// Cargo.lock, so the type is literally identical, no translation needed).
+///
+/// Best-effort and idempotent — called on every gossip round (mirrors the
+/// bootstrap-seed re-assertion pattern) so a newly-joined or address-changed
+/// peer is picked up without a restart; a malformed/stale entry is skipped,
+/// never aborts the others. This does NOT touch GuardianDB's RELAY
+/// configuration (still n0's default relay, since `ClientConfig` exposes no
+/// override and iroh's relay mode is bind-time-only) — it only fixes peer
+/// DISCOVERY, which is what live evidence showed was actually broken (frozen,
+/// non-converging per-node key counts; a permanently-hung live read). If
+/// relay-mediated connectivity also proves insufficient after this lands,
+/// that's a distinct, separately-diagnosable follow-up.
+pub async fn seed_known_peers(addr_jsons: &[String]) {
+    let Ok(h) = handle().await else { return };
+    for addr_json in addr_jsons {
+        match serde_json::from_str::<iroh::EndpointAddr>(addr_json) {
+            Ok(addr) => {
+                if let Err(e) = h.client.add_node_addr(addr).await {
+                    tracing::debug!(error = %e, "guardian seed_known_peers: add_node_addr failed");
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "guardian seed_known_peers: malformed addr_json"),
+        }
+    }
 }
 
 /// Warm the GuardianDB connection at startup so it is live before the first

@@ -1,0 +1,154 @@
+name: Guardian-DB CI
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  # Enable debug info for build dependencies to improve backtraces
+  CARGO_PROFILE_TEST_BUILD_OVERRIDE_DEBUG: true
+  CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: true
+
+jobs:
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rust:
+          - stable
+          - 1.95.0
+    continue-on-error: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ matrix.rust }}
+        components: rustfmt, clippy
+
+    - name: Install Protocol Buffers compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+        protoc --version
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-${{ matrix.rust }}-
+          ${{ runner.os }}-cargo-
+
+    - name: Check formatting
+      if: matrix.rust == 'stable'
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      if: matrix.rust == 'stable'
+      run: cargo clippy --all-targets --all-features -- -D warnings
+
+    - name: Build guardian-db
+      run: cargo build --verbose --all-features
+
+    - name: Run tests
+      run: cargo test --verbose --all-features -- --test-threads=1
+
+    - name: Build examples
+      run: cargo build --examples --all-features
+
+    - name: Check documentation
+      if: matrix.rust == 'stable'
+      run: cargo doc --no-deps --all-features
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install Protocol Buffers compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+
+    - name: Run security audit
+      # Keep these flags in sync with .cargo/audit.toml (rationale documented there).
+      run: cargo audit --ignore RUSTSEC-2026-0118 --ignore RUSTSEC-2026-0119 --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195
+
+  coverage:
+    name: Code coverage
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: llvm-tools-preview
+
+    - name: Install Protocol Buffers compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+        protoc --version
+
+    - name: Install coverage tools
+      run: |
+        # Install both coverage tools for flexibility
+        cargo install cargo-tarpaulin
+        cargo install cargo-llvm-cov
+
+    - name: Generate code coverage (LCOV for Codecov)
+      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info -- --test-threads=1
+
+    - name: Generate code coverage (XML for other tools)
+      run: |
+        # Generate XML coverage report using tarpaulin
+        cargo tarpaulin --all-features --workspace --out Xml --output-dir ./coverage/ -- --test-threads=1
+        # Also generate HTML for artifacts
+        cargo tarpaulin --all-features --workspace --out Html --output-dir ./coverage/ -- --test-threads=1
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        token: ${{ secrets.CODECOV_TOKEN }}
+        files: lcov.info,./coverage/cobertura.xml
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+        verbose: true
+
+    - name: Upload coverage artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: coverage-reports
+        path: |
+          lcov.info
+          ./coverage/
+        retention-days: 30

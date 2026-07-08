@@ -1672,6 +1672,25 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                 roster_hash = h;
                 tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
             }
+            // Seed GuardianDB's OWN iroh client with every currently-known peer
+            // address from the main mesh's gossip-derived registry (re-asserted
+            // every round, same rationale as the bootstrap-seed re-assertion
+            // above): GuardianDB's separate iroh client otherwise depends
+            // entirely on n0's public discovery to ever learn a peer's address,
+            // which this platform's cloud hosts can't reliably use (confirmed:
+            // frozen, non-converging per-node key counts; a permanently-hung
+            // live read). Best-effort, spawned so a slow/failed seed round never
+            // blocks the gossip loop's own cadence.
+            let guardian_addrs: Vec<String> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self)
+                .filter_map(|n| n.iroh_addr)
+                .collect();
+            if !guardian_addrs.is_empty() {
+                tokio::spawn(async move { crate::guardian::seed_known_peers(&guardian_addrs).await });
+            }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });

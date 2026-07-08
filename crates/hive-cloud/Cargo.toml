@@ -75,6 +75,11 @@ percent-encoding = "2"
 # Always-on: iroh-native, P2P-replicated durable store (iroh-docs + iroh-blobs).
 # Every platform snapshot is replicated here, in local/dev and production alike.
 guardian-db = { version = "0.17" }
+# Direct dependency (was transitive via guardian-db/hive-p2p only) so guardian.rs
+# can construct iroh::EndpointAddr to seed GuardianDB's known peers from the main
+# mesh's own gossip-derived roster. Same "1" range as hive-p2p — cargo unifies
+# both to one locked version (confirmed: single "iroh" entry in Cargo.lock).
+iroh = "1"
 
 # Optional: production-grade Raft consensus (full log + state machine). The
 # always-on lightweight coordinator in cluster.rs is the default; `--features

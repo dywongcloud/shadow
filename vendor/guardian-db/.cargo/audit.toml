@@ -1,0 +1,21 @@
+# cargo-audit policy for currently unavoidable transitive advisories.
+#
+# These exceptions are intentionally narrow and temporary. Keep the security
+# workflow blocking for every advisory not listed here.
+#
+# RUSTSEC-2026-0118 / RUSTSEC-2026-0119 (hickory-proto): remove when the Iroh
+# dependency family can move to Hickory 0.26.1 or newer.
+#
+# RUSTSEC-2026-0194 / RUSTSEC-2026-0195 (quick-xml 0.39, DoS-class parser
+# issues, fixed in >= 0.41.0): reached only through the Apple-target-only
+# chain iroh -> netwatch -> netdev -> plist -> quick-xml; the code is not
+# compiled on Linux CI targets. No plist release admits quick-xml >= 0.41 yet
+# (plist 1.9.0 pins ^0.39.2). Remove when plist updates its quick-xml
+# dependency and the chain can be bumped via `cargo update`.
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0118",
+    "RUSTSEC-2026-0119",
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

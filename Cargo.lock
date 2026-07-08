@@ -2136,8 +2136,6 @@ dependencies = [
 [[package]]
 name = "guardian-db"
 version = "0.17.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a699d5e116039b6e71f6067fcde3ee0ce3a41e6e6c81a6c592d58a2926247ba0"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2434,6 +2432,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "instant-acme",
+ "iroh",
  "jsonwebtoken",
  "openraft",
  "parking_lot",

@@ -1,0 +1,13 @@
+{
+  "name": "guardian-supabase-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Optional supabase-js compatibility smoke test for guardian-supabase (not part of Rust CI).",
+  "scripts": {
+    "test": "node smoke.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0"
+  }
+}
