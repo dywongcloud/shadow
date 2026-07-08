@@ -8,7 +8,24 @@ use hive_backend::mock::{MockBackend, MockConfig};
 use hive_controlplane::{BoxConfig, Hive, HiveConfig};
 use hive_core::{BuildJob, JobId, JobState, ResourceSpec};
 
+/// Every test in this file calls `test_hive` independently, and Rust's default
+/// test harness runs them CONCURRENTLY as separate threads within the SAME OS
+/// process — so keying the mock backend's storage dirs by `process::id()` alone
+/// gave every test in the file the identical directory, regardless of which test
+/// called it. Concurrent tests then raced on the same on-disk cell/cache state
+/// (`capacity_is_released_after_builds`, e.g., could see leftover cells another
+/// concurrently-running test hadn't torn down yet, spuriously failing the
+/// "capacity fully released" assertion). A process-wide atomic counter makes
+/// each call's directory unique regardless of concurrency, at zero added
+/// dependency cost.
+fn unique_test_id() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (std::process::id() as u64) << 32 | n
+}
+
 fn test_hive(warm: BTreeMap<String, usize>, provision_ms: u64) -> Arc<Hive> {
+    let uid = unique_test_id();
     let cfg = HiveConfig {
         hive_id: "hive-test".into(),
         boxes: vec![BoxConfig { vcpus: 8, mem_mib: 8192 }],
@@ -20,9 +37,9 @@ fn test_hive(warm: BTreeMap<String, usize>, provision_ms: u64) -> Arc<Hive> {
         autoscaler_interval: Duration::from_millis(50),
     };
     let backend = Arc::new(MockBackend::new(MockConfig {
-        root: std::env::temp_dir().join(format!("hive-test-{}", std::process::id())),
+        root: std::env::temp_dir().join(format!("hive-test-{uid}")),
         provision_latency: Duration::from_millis(provision_ms),
-        cache_root: std::env::temp_dir().join(format!("hive-test-cache-{}", std::process::id())),
+        cache_root: std::env::temp_dir().join(format!("hive-test-cache-{uid}")),
     }));
     Hive::start(cfg, backend)
 }
