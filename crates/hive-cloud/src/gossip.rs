@@ -135,7 +135,7 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 .gw
                 .list()
                 .iter()
-                .any(|d| d.project == project && crate::admin::norm(&d.tenant) == crate::admin::norm(&team));
+                .any(|d| d.project == project && crate::admin::record_tenant(&d.tenant) == crate::admin::norm(&team));
             if project.is_empty() || !(owns_settings || owns_deploys) {
                 return serde_json::to_vec(&serde_json::json!({ "error": "not owner" })).unwrap_or_default();
             }

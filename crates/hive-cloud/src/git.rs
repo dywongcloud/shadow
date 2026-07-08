@@ -984,7 +984,22 @@ async fn fanout_remote(
         // Dispatch over HTTP admin (preferred) OR the iroh mesh (NAT'd coordinator →
         // FC nodes, the SSH tunnels are gone). Both return `{ "build_id": ... }`.
         let resp_json: Option<serde_json::Value> = if let Some(admin) = &t.admin {
-            match cloud.http.post(format!("{admin}/v1/git/deploy")).header("x-hive-team", team.clone()).json(&dreq).timeout(Duration::from_secs(15)).send().await {
+            // `x-hive-team` alone is only trusted by the target's `tenant()`
+            // resolver in UNENFORCED/dev mode — under JWT enforcement (every
+            // production node) a request with no Authorization bearer resolves
+            // to ANON_TENANT regardless of this header, silently losing the
+            // project's real team on the target (or, prior to the UNTAGGED_TENANT
+            // fix, stamping it into the target's own personal namespace). Attach
+            // the SAME short-lived signed delegation token the iroh path uses
+            // (`mesh_team_qs`) as a real Bearer credential so this HTTP fanout
+            // authenticates identically to a normal request.
+            let mut rb = cloud.http.post(format!("{admin}/v1/git/deploy")).header("x-hive-team", team.clone());
+            if crate::auth::enforced() {
+                if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
+                    rb = rb.bearer_auth(tok);
+                }
+            }
+            match rb.json(&dreq).timeout(Duration::from_secs(15)).send().await {
                 Ok(r) => r.json::<serde_json::Value>().await.ok(),
                 Err(e) => { log(format!("✗ {}: dispatch failed: {e}", t.node)); all_ok = false; continue; }
             }

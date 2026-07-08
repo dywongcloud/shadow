@@ -1404,6 +1404,32 @@ fn resolve_tenant(
 /// Deliberately not a valid team slug so nothing is ever created under it.
 pub(crate) const ANON_TENANT: &str = "__anon__";
 
+/// Namespace for a STORED RECORD whose tenant tag was lost or never set — a
+/// gossiped `DeployRecord`/`DeploymentInfo` deserialized with `tenant: ""`
+/// (`#[serde(default)]`, e.g. from a pre-tenancy snapshot or a stale-binary peer),
+/// a restored snapshot record `Gateway::restore` never re-normalized, or a
+/// project absent from a node's local (never-gossiped) `ProjectStore`.
+///
+/// `norm()` maps that same empty string to the LITERAL "personal" slug — which
+/// is simultaneously the platform owner's real, live tenant — so every tag-loss
+/// event anywhere in the gossip/persist/restore pipeline used to fail OPEN into
+/// the owner's personal project list instead of failing closed (the multitenancy
+/// leak: an org's projects appearing under the owner's personal view). This
+/// mirrors `ANON_TENANT`'s fail-closed design for the read-request side; use it
+/// (never `norm`) wherever a STORED tag is being interpreted, so a lost tag is
+/// invisible to every tenant rather than adopted by the owner's.
+pub(crate) const UNTAGGED_TENANT: &str = "__untagged__";
+
+/// Interpret a STORED record's tenant tag: empty (tag-loss) resolves to the
+/// fail-closed `UNTAGGED_TENANT` sentinel, never to the owner's "personal"
+/// namespace. Use this instead of `norm()` for `DeployRecord.tenant`,
+/// `ProjectSettings.team`, and any other persisted/gossiped ownership tag;
+/// `norm()` remains correct for its existing callers that resolve a REQUEST's
+/// tenant (where an empty resolved value legitimately means personal/dev-mode).
+pub(crate) fn record_tenant(tag: &str) -> &str {
+    if tag.trim().is_empty() { UNTAGGED_TENANT } else { tag }
+}
+
 /// If a valid platform API key is presented, return its team.
 fn api_key_team(c: &Arc<CloudState>, h: &HeaderMap) -> Option<String> {
     let auth = h.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
@@ -1581,7 +1607,19 @@ async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: 
         .gw
         .list()
         .into_iter()
-        .filter(|d| norm(&c.projects.team_of(&d.project)) == t)
+        .filter(|d| {
+            // Trust the deployment's OWN tenant tag first — it's authoritative
+            // for who actually built/owns it (matches the peer branch below).
+            // `ProjectStore.team_of` is NODE-LOCAL and never gossiped, so on a
+            // node other than the one that ran `set_team` it can miss even for
+            // a correctly-tagged deployment; only consult it as a fallback when
+            // the record itself was never tagged, and even then fail CLOSED
+            // (never silently adopt into the owner's personal view).
+            let own = record_tenant(&d.tenant);
+            let effective =
+                if own == UNTAGGED_TENANT { record_tenant(&c.projects.team_of(&d.project)).to_string() } else { own.to_string() };
+            effective == t
+        })
         .collect();
     // Locally-hosted deployments run in THIS node's region.
     for d in &list {
@@ -1594,7 +1632,11 @@ async fn dep_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: 
     for (node, deps) in c.peer_deployments.read().iter() {
         let nr = node_region.get(node);
         for d in deps {
-            if norm(&d.tenant) != t {
+            // Fail CLOSED on a lost/never-set gossiped tag: `record_tenant`
+            // resolves empty to `UNTAGGED_TENANT`, which can never equal a real
+            // tenant slug — unlike `norm`, which would collapse it into the
+            // owner's literal "personal" namespace (the leak).
+            if record_tenant(&d.tenant) != t {
                 continue;
             }
             if let Some(r) = nr {
@@ -1902,9 +1944,9 @@ async fn project_delete(
     // project anywhere in the mesh.
     let authorized = c.projects.get_if_set(&project).map(|s| norm(&s.team) == t).unwrap_or(false)
         // a deployment of this project hosted locally under the requester's tenant
-        || c.gw.list().iter().any(|d| d.project == project && norm(&d.tenant) == t)
+        || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
         // …or hosted on a peer (project lives only on a scheduler-placed node)
-        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && norm(&d.tenant) == t);
+        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t);
     // Not locally verifiable ≠ deniable: after a partial delete (or right after a
     // restart) this node may hold NO trace of a project that still serves on a
     // peer, and the gossip view can be sparse — a hard 404 here left ORPHANS
@@ -2119,7 +2161,7 @@ fn peer_nodes_for_tenant(c: &Arc<CloudState>, team: &str) -> Vec<String> {
     let pd = c.peer_deployments.read();
     let mut out: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (node, deps) in pd.iter() {
-        if deps.iter().any(|d| norm(&d.tenant) == team) {
+        if deps.iter().any(|d| record_tenant(&d.tenant) == team) {
             out.insert(node.clone());
         }
     }

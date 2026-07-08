@@ -369,7 +369,15 @@ impl Gateway {
             } else {
                 rec.target
             },
-            tenant: rec.tenant,
+            // Unlike `deploy_full`'s own empty=>"personal" default (a deliberate,
+            // generic single-tenant convenience for callers that don't use
+            // tenancy at all), a RESTORED record's empty tag is tag LOSS — a
+            // pre-tenancy snapshot, or one written by a stale/rolling-upgrade
+            // binary. Collapsing that into the literal "personal" slug handed
+            // another tenant's deployment to the platform owner's real
+            // namespace on every restart of a node holding a stale snapshot.
+            // Fail closed: never adopt an untagged record into a live tenant.
+            tenant: if rec.tenant.trim().is_empty() { "__untagged__".to_string() } else { rec.tenant },
         };
         let project = dep.project.clone();
         let mut st = self.state.lock();

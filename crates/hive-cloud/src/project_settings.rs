@@ -127,8 +127,15 @@ pub struct ProjectSettings {
     #[serde(default = "default_true")]
     pub cron_enabled: bool,
 }
+/// A project settings row with no explicit owner (never `set_team`'d, or
+/// reloaded from a snapshot/serde-default that lost the tag) is UNOWNED, never
+/// the platform owner's "personal" namespace — that literal string is itself a
+/// live tenant, so defaulting into it used to make an untagged project silently
+/// visible under the owner's personal project list (the multitenancy leak).
+/// Mirrors `admin::UNTAGGED_TENANT`; `team_of()` relies on this same value for
+/// its own "row absent" fallback so both paths agree.
 fn default_team() -> String {
-    "personal".into()
+    crate::admin::UNTAGGED_TENANT.into()
 }
 fn default_true() -> bool {
     true
@@ -298,9 +305,11 @@ impl ProjectStore {
         self.map.read().get(project).map(|s| s.cron_enabled).unwrap_or(true)
     }
 
-    /// Team slug owning a project (defaults to "personal").
+    /// Team slug owning a project. A project absent from this store (never
+    /// `set_team`'d) is UNOWNED — resolves to `UNTAGGED_TENANT`, never the
+    /// owner's real "personal" namespace (see `default_team`).
     pub fn team_of(&self, project: &str) -> String {
-        self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(|| "personal".into())
+        self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(default_team)
     }
 
     /// Count of projects owned by a team/tenant (for plan-quota enforcement).
@@ -415,8 +424,10 @@ mod tests {
         assert_eq!(s.root_dir_of("app"), "examples/nextjs");
         s.set_production_branch("app", "main");
         assert_eq!(s.production_branch_of("app"), "main");
-        // default team is "personal" until set.
-        assert_eq!(s.team_of("app"), "personal");
+        // Unset team is UNOWNED, never the owner's real "personal" namespace
+        // (see UNTAGGED_TENANT / default_team's doc comment — the multitenancy
+        // leak this default used to cause).
+        assert_eq!(s.team_of("app"), crate::admin::UNTAGGED_TENANT);
         s.set_team("app", "acme");
         assert_eq!(s.team_of("app"), "acme");
     }

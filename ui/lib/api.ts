@@ -46,8 +46,13 @@ function teamHeaders(): Record<string, string> {
  * left every view stuck on the owner's "personal" tenant. Fire-and-forget safe:
  * awaiting lets callers sequence a re-fetch AFTER the new cookie is set.
  */
-export async function mintSessionToken(team?: string): Promise<void> {
-  if (typeof window === "undefined") return;
+/** Resolved tenant the mint actually granted, or `null` on failure. A caller
+ *  MUST treat `null` as "no valid session for this tenant exists" — never
+ *  proceed as if the switch succeeded (that's what let a team-switch UI action
+ *  broadcast `hive-team-changed` while the browser kept sending the OLD
+ *  tenant's cookie, rendering that tenant's data under the new view). */
+export async function mintSessionToken(team?: string): Promise<string | null> {
+  if (typeof window === "undefined") return null;
   const t = team ?? currentTeam();
   try {
     const r = await fetch("/api/token", {
@@ -56,16 +61,25 @@ export async function mintSessionToken(team?: string): Promise<void> {
       body: JSON.stringify({ team: t }),
     });
     // A failed mint (mint-failed-403 when the UI server is missing
-    // HIVE_INTERNAL_TOKEN, mint-unreachable, …) leaves the dashboard with no
-    // hive_jwt cookie at all — every /cloud call then 403s and each page just
-    // renders empty. Don't let that be silent: log the reason so the console
-    // names the real fault instead of a wall of anonymous 403s.
+    // HIVE_INTERNAL_TOKEN, mint-unreachable, rate-limited, …) leaves the
+    // dashboard with no hive_jwt cookie at all — but critically the OLD
+    // cookie (if any) is untouched and still valid, so silently continuing
+    // as if this succeeded renders the PREVIOUS tenant's data under the view
+    // the user just switched to. Don't let that be silent OR survivable.
     if (!r.ok) {
       const reason = await r.json().then((d) => d?.reason).catch(() => undefined);
       console.warn(`hive: session mint failed (${reason ?? `HTTP ${r.status}`}) — /cloud requests will be unauthenticated`);
+      return null;
     }
+    const d = (await r.json().catch(() => null)) as { ok?: boolean; tenant?: string; enforced?: boolean } | null;
+    if (!d?.ok) return null;
+    // enforced:false = dev/no-Clerk backend: no cookie is set (unenforced), but
+    // that is not a failure — every `/cloud` call is unauthenticated by design.
+    if (d.enforced === false) return t;
+    return d.tenant ?? t;
   } catch {
     /* dev/no-clerk or unreachable — the backend is unenforced there */
+    return null;
   }
 }
 
@@ -77,11 +91,29 @@ export async function mintSessionToken(team?: string): Promise<void> {
  */
 export async function switchTeam(slug: string): Promise<void> {
   if (typeof window === "undefined") return;
+  const before = currentTeam(); // snapshot BEFORE the write, to restore on failure
   localStorage.setItem("hive_team", slug);
   invalidateApiCache();
   // Mint with the RESOLVED tenant (currentTeam() maps the "__personal__" sentinel
   // to "personal"/`u_<uid>`), so the cookie's claim matches what the backend scopes.
-  await mintSessionToken();
+  const granted = await mintSessionToken();
+  if (granted === null) {
+    // The OLD cookie (whatever tenant it claimed) is still the only valid
+    // session the browser holds. Broadcasting here would tell every poller
+    // "the view is now `slug`" while `/cloud` keeps authenticating as the
+    // PREVIOUS tenant — rendering that tenant's data under the new view. Undo
+    // the localStorage write so `currentTeam()` still matches reality, and
+    // surface the failure instead of silently mis-scoping every subsequent read.
+    localStorage.setItem("hive_team", before);
+    console.error(`hive: switch to "${slug}" failed to mint a session — view not changed; retry`);
+    return;
+  }
+  // The backend can grant a DIFFERENT tenant than requested (e.g. the caller
+  // isn't a member of the requested org — route.ts silently falls back to
+  // their own personal namespace). Reconcile localStorage to what the COOKIE
+  // actually claims so the UI's belief about the active tenant never diverges
+  // from what reads are actually scoped to.
+  if (granted !== currentTeam()) localStorage.setItem("hive_team", granted);
   window.dispatchEvent(new Event("hive-team-changed"));
 }
 
@@ -167,6 +199,20 @@ export function invalidateApiCache(): void {
 }
 if (typeof window !== "undefined") {
   window.addEventListener("hive-team-changed", () => invalidateApiCache());
+  // Cross-tab sync: the `storage` event fires in every OTHER tab (never the tab
+  // that made the write) whenever `switchTeam` rewrites the shared
+  // `hive_team` key. Without this, a second open tab keeps its stale
+  // `usePoll`/`useOpsPoll` state (and, in the navbar, its stale `selected`
+  // label) while `currentTeam()` — read fresh from localStorage on every call —
+  // and the shared httpOnly cookie have ALREADY moved to the new tenant, so
+  // that tab's next poll tick silently renders the new tenant's data under its
+  // still-stale chrome. Re-dispatch the same-tab event locally so every
+  // existing `hive-team-changed` listener (cache invalidation, usePoll,
+  // useOpsPoll, the navbar's own selection) resyncs identically to a same-tab
+  // switch — no bespoke per-component storage listener needed.
+  window.addEventListener("storage", (e) => {
+    if (e.key === "hive_team") window.dispatchEvent(new Event("hive-team-changed"));
+  });
 }
 
 export async function apiGet<T>(path: string, opts?: { fresh?: boolean }): Promise<T> {
@@ -240,14 +286,25 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true) {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async (fresh: boolean) => {
+    // Snapshot the tenant THIS request is for. `apiGet` resolves with data
+    // authenticated by whichever cookie was attached when the fetch was SENT;
+    // if the user switches tenants while this request is still in flight, a
+    // slower response can resolve AFTER a newer, already-rendered request for
+    // the NEW tenant — JS promises settle in completion order, not issue
+    // order. Committing it unconditionally would silently overwrite the
+    // correct view with the previous tenant's data (the leak: a stale
+    // in-flight "test" org response clobbering the just-loaded "personal" list).
+    const team = currentTeam();
     try {
       const d = await apiGet<T>(path, fresh ? { fresh: true } : undefined);
+      if (currentTeam() !== team) return; // stale response for a tenant we've since left — discard
       setData(d);
       setError(null);
     } catch (e) {
+      if (currentTeam() !== team) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (currentTeam() === team) setLoading(false);
     }
   }, [path]);
   // Exposed to callers as a manual refresh (e.g. right after a mutation) — cache-
@@ -313,13 +370,20 @@ export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true) {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async (fresh: boolean) => {
+    // See usePoll's identical guard: discard a response that settles after the
+    // active tenant has since changed, so a slow prior-tenant request can never
+    // clobber the correctly-loaded new tenant's state.
+    const team = currentTeam();
     try {
-      setData(await opsGet<T>(path, fresh ? { fresh: true } : undefined));
+      const d = await opsGet<T>(path, fresh ? { fresh: true } : undefined);
+      if (currentTeam() !== team) return;
+      setData(d);
       setError(null);
     } catch (e) {
+      if (currentTeam() !== team) return;
       setError(String(e));
     } finally {
-      setLoading(false);
+      if (currentTeam() === team) setLoading(false);
     }
   }, [path]);
   const refresh = useCallback(() => load(false), [load]);

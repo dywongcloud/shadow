@@ -191,11 +191,11 @@ impl WorldQueue {
 /// (fresh gossip, single-node dev) rather than stranding jobs undelivered.
 async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
     let mut candidates: Vec<String> = Vec::new();
-    if cloud.gw.list().iter().any(|d| crate::admin::norm(&d.tenant) == team) {
+    if cloud.gw.list().iter().any(|d| crate::admin::record_tenant(&d.tenant) == team) {
         candidates.push(cloud.node_name.clone());
     }
     for (node, deps) in cloud.peer_deployments.read().iter() {
-        if deps.iter().any(|d| crate::admin::norm(&d.tenant) == team) && !candidates.contains(node) {
+        if deps.iter().any(|d| crate::admin::record_tenant(&d.tenant) == team) && !candidates.contains(node) {
             candidates.push(node.clone());
         }
     }
@@ -227,11 +227,11 @@ async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
 async fn sync_from_guardian(cloud: &Arc<CloudState>, queue: &Arc<WorldQueue>) {
     let mut hosted_teams: std::collections::HashSet<String> = std::collections::HashSet::new();
     for d in cloud.gw.list() {
-        hosted_teams.insert(crate::admin::norm(&d.tenant).to_string());
+        hosted_teams.insert(crate::admin::record_tenant(&d.tenant).to_string());
     }
     for deps in cloud.peer_deployments.read().values() {
         for d in deps {
-            hosted_teams.insert(crate::admin::norm(&d.tenant).to_string());
+            hosted_teams.insert(crate::admin::record_tenant(&d.tenant).to_string());
         }
     }
     if hosted_teams.is_empty() {

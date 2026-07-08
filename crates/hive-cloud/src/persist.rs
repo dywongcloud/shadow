@@ -183,8 +183,13 @@ fn ns_norm(team: &str) -> String {
 /// namespace. This is the schema that guardian-db replicates so data is scoped
 /// and isolated by namespace across the mesh.
 pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
+    // A project entirely absent from the snapshot's `projects` map (settings
+    // lost, or a record whose project was deleted out from under it) is
+    // UNOWNED, never the owner's real "personal" namespace — filing it there
+    // let another tenant's deployment/webhook re-materialize as personal-owned
+    // on any node that later restores/clones this namespace doc.
     let team_of = |project: &str| -> String {
-        snap.projects.get(project).map(|s| ns_norm(&s.team)).unwrap_or_else(|| "personal".into())
+        snap.projects.get(project).map(|s| ns_norm(&s.team)).unwrap_or_else(|| "__untagged__".into())
     };
     let mut docs: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
     let mut push = |ns: String, key: &str, val: Value| {

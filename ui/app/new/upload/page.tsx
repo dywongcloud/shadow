@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, Upload, Loader2, FileArchive, X, ChevronDown, Plus, KeyRound } from "lucide-react";
 import { Card, Button, Input } from "@/components/ui";
-import { currentTeam } from "@/lib/api";
+import { currentTeam, switchTeam } from "@/lib/api";
 import { TeamSelect } from "@/components/team-picker";
 import { cn } from "@/lib/utils";
 
@@ -76,10 +76,14 @@ export default function UploadProjectPage() {
     setUploading(true);
     try {
       const proj = name || slug(file.name.replace(/\.zip$/i, "")) || "project";
-      // Scope the new project to the chosen team (matches the New Project flow).
+      // Scope the new project to the chosen team. Await switchTeam (re-mints
+      // the hive_jwt cookie) BEFORE the upload fires — the backend derives the
+      // tenant from the cookie under JWT enforcement, so a raw localStorage
+      // write here let the upload land under whatever tenant the OLD cookie
+      // still claimed while the view had already moved on (matches the New
+      // Project flow's fix).
       if (typeof window !== "undefined") {
-        localStorage.setItem("hive_team", team === "personal" ? "__personal__" : team);
-        window.dispatchEvent(new Event("hive-team-changed"));
+        await switchTeam(team === "personal" ? "__personal__" : team);
       }
       const e = env();
       const meta = { project: proj, filename: file.name, env: Object.keys(e).length ? e : undefined, production: true };

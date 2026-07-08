@@ -343,21 +343,23 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     // (e.g. re-prompting the GitOps setup modal after it was already completed).
     if (!identity.id || identity.id === "local") return;
     const prev = localStorage.getItem("hive_uid");
-    if (prev && prev !== identity.id) {
+    const firstIdentity = prev !== identity.id; // includes unset -> set
+    if (prev && firstIdentity) {
       for (const k of ["hive_team", "hive_is_owner", "oe_favorites", "hive_onboarded", "hive_gitops_linked", "hive_notif", "oe_push_dismissed"]) {
         localStorage.removeItem(k);
       }
       initDone.current = false;
       setSelected(PERSONAL);
-      window.dispatchEvent(new Event("hive-team-changed"));
     }
-    const firstIdentity = prev !== identity.id; // includes unset -> set
     localStorage.setItem("hive_uid", identity.id);
     // When the user id is first established, the personal namespace changes from
-    // the pre-auth placeholder to `u_<uid>` — tell pollers to re-fetch so personal
-    // data loads under the correct per-account namespace (and never leaks across
-    // accounts via a shared literal "personal").
-    if (firstIdentity) window.dispatchEvent(new Event("hive-team-changed"));
+    // the pre-auth placeholder to `u_<uid>` — re-mint through switchTeam (never a
+    // raw dispatch) so pollers re-fetch under the CORRECT per-account namespace
+    // with a matching cookie. A raw dispatch here left the PREVIOUS account's
+    // hive_jwt cookie (up to 1h TTL, nothing else ever clears it) fully valid —
+    // it kept authenticating this session as the old user/tenant, silently
+    // serving their data under the freshly-signed-in account's view.
+    if (firstIdentity) void switchTeam(PERSONAL);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [identity.id]);
 
@@ -368,16 +370,45 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
     if (typeof window === "undefined" || initDone.current) return;
     const saved = localStorage.getItem("hive_team");
     if (saved) {
+      // Already-persisted selection: SessionToken's mount-time mint (which ran
+      // BEFORE this effect, reading this same localStorage value) already
+      // minted a matching cookie — nothing to re-mint here.
       setSelected(saved);
       initDone.current = true;
     } else if (isLoaded) {
       const slug = tenantOf(organization);
-      setSelected(slug);
-      localStorage.setItem("hive_team", slug);
-      window.dispatchEvent(new Event("hive-team-changed"));
+      // Set FIRST (synchronously, before the async switchTeam below runs) so a
+      // re-render triggered by switchTeam's own state changes can't re-enter
+      // this branch.
       initDone.current = true;
+      setSelected(slug);
+      // Route through switchTeam (persists + re-mints + THEN broadcasts) rather
+      // than a raw setItem+dispatch — the mount-time mint already ran with NO
+      // hive_team set (currentTeam() fell through to the pre-auth placeholder),
+      // so the cookie does not yet match this adopted org; broadcasting first
+      // told every poller "the view is now `slug`" while the browser kept
+      // sending that stale/placeholder-scoped cookie, rendering whatever it
+      // authenticated as under the newly-adopted org's view.
+      void switchTeam(slug);
     }
   }, [isLoaded, organization?.id]);
+
+  // Resync the navbar's selection with `hive_team` on every `hive-team-changed`
+  // — same-tab (a no-op here since `pick`/the effects above already set
+  // `selected` directly) AND cross-tab (lib/api.ts re-dispatches this event
+  // locally on a `storage` change from another tab). Without this, a second
+  // open tab's navbar keeps showing its OLD tenant's label while the shared
+  // cookie/localStorage — and therefore every poller's actual data — has
+  // already moved to whatever tenant the OTHER tab switched to.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const resync = () => {
+      const saved = localStorage.getItem("hive_team");
+      if (saved && saved !== selected) setSelected(saved);
+    };
+    window.addEventListener("hive-team-changed", resync);
+    return () => window.removeEventListener("hive-team-changed", resync);
+  }, [selected]);
 
   // Index the user + (resolved) org into the store for the active tenant. Keyed
   // on the selection, not Clerk's org, so it follows what the user picked.

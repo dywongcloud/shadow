@@ -6,7 +6,7 @@ import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, Extern
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
-import { apiSend, currentTeam } from "@/lib/api";
+import { apiSend, currentTeam, switchTeam } from "@/lib/api";
 import { addPendingBuild } from "@/lib/pending-builds";
 import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
@@ -623,11 +623,17 @@ function ConfigureTemplate({
         {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
 
         <Button
-          onClick={() => {
-            // Scope the new project to the chosen team (drives x-hive-team).
+          onClick={async () => {
+            // Scope the new project to the chosen team. MUST go through
+            // switchTeam (re-mints the hive_jwt cookie and awaits it) rather
+            // than a raw localStorage.setItem — the backend derives the tenant
+            // SOLELY from the cookie under JWT enforcement, so creating the
+            // project before the cookie catches up landed it under whichever
+            // tenant the browser's PREVIOUS cookie still claimed, while the
+            // view believed it was already on the new team (the personal/org
+            // project-list leak).
             if (typeof window !== "undefined") {
-              localStorage.setItem("hive_team", team === "personal" ? "__personal__" : team);
-              window.dispatchEvent(new Event("hive-team-changed"));
+              await switchTeam(team === "personal" ? "__personal__" : team);
             }
             onCreate(repoName || slug(template.name), buildEnv());
           }}
