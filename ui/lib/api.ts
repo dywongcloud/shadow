@@ -114,13 +114,21 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   // guard), not 401 — e.g. right after sign-in before the first mint landed, or
   // when an earlier mint failed. Both get ONE transparent re-mint + retry; a
   // genuine authorization denial (wrong tenant/role) simply fails again on the
-  // retry and propagates, so this cannot loop.
+  // retry and propagates, so this cannot loop per-request. The cooldown keeps a
+  // PERSISTENTLY-403 endpoint on a 3-4s poll from turning every cycle into an
+  // /api/token round trip: one automatic re-mint per window is plenty (a
+  // successful mint fixes every subsequent request anyway).
   if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && CLERK_ON) {
+    const now = Date.now();
+    if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;
+    lastAutoMintAt = now;
     await mintSessionToken();
     return once();
   }
   return r;
 }
+let lastAutoMintAt = 0;
+const AUTO_MINT_COOLDOWN_MS = 30_000;
 
 // Short-TTL, tenant-scoped GET cache + in-flight de-dup. The dashboard has no
 // client-side cache today: every click/poll/re-render that calls `apiGet` is a

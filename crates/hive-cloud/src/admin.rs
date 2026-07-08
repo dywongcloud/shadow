@@ -1537,6 +1537,20 @@ pub(crate) fn require_operator(claims: Option<&crate::auth::Claims>) -> Result<(
     }
 }
 
+/// Authenticated-READ guard for the topology views the dashboard shows every
+/// signed-in user (network page: nodes/cluster/overview). Any verified claims
+/// pass — the handler then decides between the full operator payload and the
+/// sanitized tenant view. Missing claims while enforced is 401, not 403: the
+/// dashboard's transparent cookie re-mint keys on 401, and "no session" is an
+/// authentication failure, not an authorization decision.
+pub(crate) fn require_auth_read(claims: Option<&crate::auth::Claims>) -> Result<(), (StatusCode, String)> {
+    if !crate::auth::enforced() || claims.is_some() {
+        Ok(())
+    } else {
+        Err((StatusCode::UNAUTHORIZED, "sign-in required".into()))
+    }
+}
+
 /// Public ingress region code for a region — the `<dep>.<code>.ngrok.pizza` label
 /// (virginia→iad, bangkok→sin, san-jose→sfo, los-angeles→lax). Unknown regions
 /// return "" so the dashboard falls back to the legacy region-agnostic zone URL.
@@ -2576,7 +2590,23 @@ async fn overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    if !operator_allowed(cl, crate::auth::enforced()) {
+        // Tenant-safe subset: topology shape only. Platform-wide counters
+        // (requests/WAF/deployments/concurrency) stay operator-only; tenant
+        // usage lives at the tenant-scoped /v1/metrics instead.
+        return Ok(Json(json!({
+            "node": c.node_name,
+            "region": c.region,
+            "regions": c.registry.regions(),
+            "nodes": c.registry.nodes().len(),
+            "control_plane": {
+                "last_gossip_ms": c.last_gossip_ms(),
+                "degraded": c.control_plane_degraded(crate::state::CP_DEGRADED_TTL_MS),
+            },
+        })));
+    }
     let (reqs, blocked) = c.counters();
     let (hits, misses, stale, entries, ratio) = c.cdn.stats();
     let fstats = c.fluid.stats();
@@ -2618,15 +2648,48 @@ pub(crate) async fn nodes(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!(c.registry.nodes())))
+    let cl = claims.as_ref().map(|e| &e.0);
+    require_auth_read(cl)?;
+    let list = c.registry.nodes();
+    // Operators (and the mesh-internal gossip path) get the full record —
+    // peer sync depends on iroh_addr/peer_id being present.
+    if operator_allowed(cl, crate::auth::enforced()) {
+        return Ok(Json(json!(list)));
+    }
+    // Every other signed-in user gets the sanitized topology: enough to render
+    // the network page (mesh map, health, capacity totals), none of the
+    // mesh-internal addressing (iroh_addr/peer_id/public_ip/public_url).
+    let sanitized: Vec<Value> = list
+        .into_iter()
+        .map(|n| {
+            json!({
+                "id": n.name,
+                "name": n.name,
+                "region": n.region,
+                "city": n.city,
+                "country": n.country,
+                "lat": n.lat,
+                "lon": n.lon,
+                "healthy": n.healthy,
+                "last_seen_ms": n.last_seen_ms,
+                "is_self": n.is_self,
+                "backend": n.backend,
+                "cpu_cores": n.cpu_cores,
+                "mem_total_mb": n.mem_total_mb,
+                "disk_total_gb": n.disk_total_gb,
+            })
+        })
+        .collect();
+    Ok(Json(json!(sanitized)))
 }
 
 async fn cluster_status(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_operator(claims.as_ref().map(|e| &e.0))?;
+    // Leader/term/member NAMES are the coordination view the network page shows
+    // every signed-in user; nothing mesh-internal is exposed here.
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
     let members: Vec<String> = c.registry.nodes().into_iter().map(|n| n.id).collect();
     Ok(Json(json!(c.cluster.status(members))))
 }

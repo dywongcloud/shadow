@@ -81,7 +81,8 @@ export default function NetworkPage() {
             <tr key={n.id}>
               <Td className="font-medium">{n.name}</Td>
               <Td><Badge tone="blue">{n.region}</Badge></Td>
-              <Td className="font-mono text-xs text-secondary">{n.public_url}</Td>
+              {/* Endpoint is operator-only; the sanitized tenant payload omits it. */}
+              <Td className="font-mono text-xs text-secondary">{n.public_url ?? "—"}</Td>
               <Td className="tabular-nums">{n.cpu_cores ?? "—"}</Td>
               <Td className="tabular-nums">{fmtMem(n.mem_total_mb)}</Td>
               <Td className="tabular-nums">{n.disk_total_gb ? `${n.disk_total_gb} GB` : "—"}</Td>
