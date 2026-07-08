@@ -4925,17 +4925,26 @@ async fn securelink_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap,
 struct MetricsQ {
     minutes: Option<usize>,
     project: Option<String>,
+    /// "minute" (default) | "hour" | "day" — the consumption-breakdown chart's
+    /// Daily/Weekly/Monthly toggle (ui/app/usage/page.tsx). Unrecognized/absent
+    /// falls back to "minute" (today's pre-existing behavior) via
+    /// `Granularity::parse` — never a 400, this is a display parameter.
+    gran: Option<String>,
 }
 
 async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<MetricsQ>) -> Json<Value> {
-    let minutes = q.minutes.unwrap_or(60).min(180);
+    let gran = crate::metrics::Granularity::parse(q.gran.as_deref());
+    // Clamp to what this resolution's ring buffer actually retains (Minute:
+    // 24h, Hour: 30d, Day: ~13mo — see metrics.rs's MAX_*_BUCKETS) so a caller
+    // can never request a span longer than the data that exists to answer it.
+    let minutes = q.minutes.unwrap_or(60).min(gran.max_span_minutes());
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // TENANT-SCOPED: every series/status/path read is confined to the caller's
     // tenant — no cross-tenant telemetry leak. (The owner ops console reads global
     // metrics through the separate operator-gated `admin_overview`.)
     let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    let series = c.metrics.series(minutes, now_ms(), scope, project);
+    let series = c.metrics.series(gran, minutes, now_ms(), scope, project);
     let total_req: u64 = series.iter().map(|b| b.requests).sum();
     let total_err: u64 = series.iter().map(|b| b.errors + b.client_err).sum();
     let total_blocked: u64 = series.iter().map(|b| b.blocked).sum();
@@ -4954,7 +4963,7 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
         },
         "status_distribution": c.metrics.status_distribution(scope),
         "top_paths": c.metrics.top_paths(scope, 10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
-        "projects": c.metrics.project_totals(minutes, now_ms(), scope).into_iter()
+        "projects": c.metrics.project_totals(gran, minutes, now_ms(), scope).into_iter()
             .map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
     }))
 }
@@ -4974,7 +4983,7 @@ async fn admin_overview(
     let live_dbs = dbs.iter().filter(|d| d.mode == "live").count();
     // Recent error rate from the metrics buckets (last 30m), GLOBAL across all
     // tenants — this is the operator ops console (owner-only), not tenant-facing.
-    let series = c.metrics.series(30, now_ms(), None, None);
+    let series = c.metrics.series(crate::metrics::Granularity::Minute, 30, now_ms(), None, None);
     let req30: u64 = series.iter().map(|b| b.requests).sum();
     let err30: u64 = series.iter().map(|b| b.errors).sum();
     let err_rate = if req30 == 0 { 0.0 } else { err30 as f64 / req30 as f64 };

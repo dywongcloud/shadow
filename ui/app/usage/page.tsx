@@ -24,16 +24,45 @@ function fmt(n: number) {
   return String(n);
 }
 
+type Gran = "Daily" | "Weekly" | "Monthly";
+
+// Each granularity maps to a real backend window + bucket resolution
+// (crates/hive-cloud/src/metrics.rs's Granularity enum/MAX_*_BUCKETS) — NOT a
+// client-side relabeling of the same 3-hour fetch. `minutes` is the span
+// requested; `apiGran` selects which ring buffer the backend reads from
+// (minute/hour/day); `pollMs` matches how often that resolution can actually
+// change (polling an hourly rollup every 15s wastes a request 239/240 times).
+const GRAN: Record<Gran, { minutes: number; apiGran: "minute" | "hour" | "day"; pollMs: number }> = {
+  Daily: { minutes: 1440, apiGran: "minute", pollMs: 60_000 },
+  Weekly: { minutes: 10_080, apiGran: "hour", pollMs: 300_000 },
+  Monthly: { minutes: 43_200, apiGran: "day", pollMs: 300_000 },
+};
+
+// Bucket label formatting keyed on granularity — an hourly bucket over 7 days
+// needs a weekday+hour label, a daily bucket over 30 days needs a month/day
+// label; both would otherwise render via the Daily hour:minute formatter and
+// (for Monthly specifically) collapse to the SAME "12:00 AM" label on every
+// point, since a day-floored t_ms always lands on local midnight.
+function bucketLabel(gran: Gran, t_ms: number) {
+  const d = new Date(t_ms);
+  if (gran === "Daily") return d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  if (gran === "Weekly") return d.toLocaleDateString("en-US", { weekday: "short", hour: "numeric" });
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
 export default function UsagePage() {
   const { data: ov } = usePoll<Overview>("/v1/overview", 3000);
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 3000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 5000);
-  // Real per-tenant traffic time-series (buckets over the last few hours). The
-  // scoped `/v1/metrics` backs the consumption chart with ACTUAL requests/cache/
-  // blocked over time — not a fabricated curve.
-  const { data: metrics } = usePoll<Metrics>("/v1/metrics?minutes=180", 15000);
-  const [gran, setGran] = useState<"Daily" | "Weekly" | "Monthly">("Daily");
+  const [gran, setGran] = useState<Gran>("Daily");
   const [cumulative, setCumulative] = useState(true);
+  const { minutes: granMinutes, apiGran, pollMs } = GRAN[gran];
+  // Real per-tenant traffic time-series, bucketed at the resolution the active
+  // Daily/Weekly/Monthly toggle selects. The scoped `/v1/metrics` backs the
+  // consumption chart with ACTUAL requests/cache/blocked over time — not a
+  // fabricated curve — at whichever of the three real backend resolutions
+  // (crates/hive-cloud/src/metrics.rs) `gran` is currently set to.
+  const { data: metrics } = usePoll<Metrics>(`/v1/metrics?minutes=${granMinutes}&gran=${apiGran}`, pollMs);
 
   const requests = ov?.requests ?? 0;
   const blocked = ov?.blocked ?? 0;
@@ -82,7 +111,7 @@ export default function UsagePage() {
   const N = Math.max(buckets.length, 1);
   const fnS = flat(invocations, N);
   const chart = buckets.map((b, i) => ({
-    date: new Date(b.t_ms).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }),
+    date: bucketLabel(gran, b.t_ms),
     "Edge Requests": edgeS[i] ?? 0,
     "Cache Hits": cacheS[i] ?? 0,
     "Blocked": blockedS[i] ?? 0,

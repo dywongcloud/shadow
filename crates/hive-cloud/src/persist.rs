@@ -56,6 +56,11 @@ pub struct PlatformSnapshot {
     /// restart like blob (disk) and the DB records themselves.
     #[serde(default)]
     pub database_data: crate::databases::DataSnapshot,
+    /// Hour/day consumption-breakdown rollups (Weekly/Monthly chart data) —
+    /// minute-resolution buckets are excluded (short retention, refill within
+    /// minutes; see metrics.rs's module doc comment for why).
+    #[serde(default)]
+    pub metrics_rollup: crate::metrics::RollupSnapshot,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
     #[serde(default)]
@@ -318,6 +323,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
+        metrics_rollup: cloud.metrics.rollup_snapshot(),
         incidents: cloud.incidents.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
         integrations: cloud.integrations.snapshot(),
@@ -480,6 +486,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
+    cloud.metrics.rollup_load(snap.metrics_rollup);
     cloud.incidents.load(snap.incidents);
     cloud.apikeys.load(snap.apikeys);
     cloud.integrations.load(snap.integrations);
