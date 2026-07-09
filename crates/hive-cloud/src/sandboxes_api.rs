@@ -73,6 +73,23 @@ fn plan_of(c: &Arc<CloudState>, team: &str) -> String {
 
 /// Authorize + resolve tenant for a project-scoped sandbox route in one call.
 fn require(c: &Arc<CloudState>, headers: &HeaderMap, claims: &Claims, project: &str) -> Result<String, (StatusCode, String)> {
+    // `ProjectSettingsStore` rows are node-local and never gossiped — the same
+    // gap `admin::deployment_build` already works around for builds. A node
+    // that has never locally seen `project` (most non-owner nodes, for most
+    // projects) gets `UNTAGGED_TENANT` back from `team_of`, which can never
+    // equal a real tenant — rejecting outright here would 403 a legitimate
+    // cross-node sandbox read before it ever reaches the local-miss ->
+    // `proxy_to_owner` fallback below. Trust the caller's own tenant claim
+    // provisionally in that case: mutations never execute this handler body
+    // except on the control-plane leader (admin_ingress forwards every
+    // POST/PUT/DELETE/PATCH there unconditionally), where the project row is
+    // guaranteed accurate for anything the leader has itself ever mutated;
+    // reads fall through to `proxy_to_owner`, whose target node re-runs this
+    // same check against ITS project row and rejects a genuinely wrong-team
+    // caller there instead.
+    if c.projects.team_of(project) == crate::admin::UNTAGGED_TENANT {
+        return Ok(tenant(c, headers, claims.as_ref().map(|e| &e.0)));
+    }
     require_project(c, headers, claims.as_ref().map(|e| &e.0), project)
 }
 
@@ -87,14 +104,53 @@ fn masked_sandbox(mut s: SandboxRecord) -> SandboxRecord {
     s
 }
 
+/// Cross-node fallback for sandbox READS. Every sandbox MUTATION (create/
+/// patch/delete/commands/...) is forwarded by `admin_ingress` to the single
+/// current control-plane owner — sandboxes have no independent placement/
+/// scheduler of their own, so that node is the sole node that ever writes a
+/// sandbox record. But GET/LIST requests serve locally per-node (the
+/// platform's "reads fully distributed" policy), so any node other than the
+/// current owner has NEVER heard of a sandbox created there — every read
+/// landing on a non-owner node 404s (`SANDBOX_NOT_FOUND`) even though the
+/// sandbox is real and running. Live-reproduced: create via one node,
+/// immediate GET via a different node returns 404 100% of the time.
+///
+/// Fix: when this node is not the current owner, proxy the read through to
+/// it (the existing `fetch_from_host` cross-node helper — same mechanism
+/// `deployment_build`/`logs` already use for analogous per-node state).
+/// Callers pass a fallback (`local`) to run first — only proxies when the
+/// local lookup came back empty/not-found, so an already-authoritative node
+/// never pays the network hop.
+async fn proxy_to_owner(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
+    if c.is_control_plane_leader() {
+        return None; // we ARE the sole writer; nothing upstream to proxy to
+    }
+    let leader = c.control_plane_leader();
+    crate::admin::fetch_from_host(c, &leader, path, team).await
+}
+
+/// True for every "not found" flavor `SandboxError` has — a missing command/
+/// snapshot/mount on a NON-owner node is exactly as likely to mean "this node
+/// never had the parent sandbox at all" as "the sandbox exists but this
+/// specific sub-resource doesn't"; the proxy fallback covers both correctly
+/// (a real 404 on the owner still 404s after the round trip).
+fn is_not_found(e: &SandboxError) -> bool {
+    matches!(e, SandboxError::NotFound(_) | SandboxError::CommandNotFound(_) | SandboxError::SnapshotNotFound(_) | SandboxError::MountNotFound(_))
+}
+
 // ---------------------------------------------------------------------------
 // Sandbox CRUD
 // ---------------------------------------------------------------------------
 
-async fn list_sandboxes(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path(project): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let list = c.sandboxes.list_sandboxes(&project).await.map_err(sandbox_err)?;
-    Ok(Json(json!({ "sandboxes": list.into_iter().map(masked_sandbox).collect::<Vec<_>>() })))
+pub(crate) async fn list_sandboxes(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path(project): Path<String>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    let local = c.sandboxes.list_sandboxes(&project).await.map_err(sandbox_err)?;
+    if local.is_empty() {
+        if let Some(v) = proxy_to_owner(&c, &format!("/v1/projects/{project}/sandboxes"), &t).await {
+            return Ok(Json(v));
+        }
+    }
+    Ok(Json(json!({ "sandboxes": local.into_iter().map(masked_sandbox).collect::<Vec<_>>() })))
 }
 
 #[derive(Deserialize)]
@@ -197,10 +253,18 @@ async fn create_sandbox(
     Ok(Json(json!(masked_sandbox(rec))))
 }
 
-async fn get_sandbox(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let rec = c.sandboxes.get_sandbox(&project, &sandbox_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!(masked_sandbox(rec))))
+pub(crate) async fn get_sandbox(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.get_sandbox(&project, &sandbox_id).await {
+        Ok(rec) => Ok(Json(json!(masked_sandbox(rec)))),
+        Err(e) if is_not_found(&e) => {
+            if let Some(v) = proxy_to_owner(&c, &format!("/v1/projects/{project}/sandboxes/{sandbox_id}"), &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -286,21 +350,38 @@ async fn run_command(
     Ok(Json(json!(rec)))
 }
 
-async fn list_commands(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let list = c.sandboxes.list_commands(&project, &sandbox_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!({ "commands": list })))
+pub(crate) async fn list_commands(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.list_commands(&project, &sandbox_id).await {
+        Ok(list) => Ok(Json(json!({ "commands": list }))),
+        Err(e) if is_not_found(&e) => {
+            if let Some(v) = proxy_to_owner(&c, &format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands"), &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
-async fn get_command(
+pub(crate) async fn get_command(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
     Path((project, sandbox_id, command_id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let rec = c.sandboxes.get_command(&project, &sandbox_id, &command_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!(rec)))
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.get_command(&project, &sandbox_id, &command_id).await {
+        Ok(rec) => Ok(Json(json!(rec))),
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands/{command_id}");
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 /// Log streaming, polling-style — matches the platform's existing build-log
@@ -308,23 +389,32 @@ async fn get_command(
 /// the full log array every call; the UI re-fetches on an interval). This
 /// endpoint returns the command's CURRENT stdout/stderr in full each call;
 /// growth between polls is what makes it "live" in the UI.
-async fn get_command_logs(
+pub(crate) async fn get_command_logs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
     Path((project, sandbox_id, command_id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let rec = c.sandboxes.get_command(&project, &sandbox_id, &command_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!({
-        "id": rec.id,
-        "status": rec.status,
-        "exit_code": rec.exit_code,
-        "stdout": rec.stdout,
-        "stderr": rec.stderr,
-        "started_at": rec.started_at,
-        "finished_at": rec.finished_at,
-    })))
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.get_command(&project, &sandbox_id, &command_id).await {
+        Ok(rec) => Ok(Json(json!({
+            "id": rec.id,
+            "status": rec.status,
+            "exit_code": rec.exit_code,
+            "stdout": rec.stdout,
+            "stderr": rec.stderr,
+            "started_at": rec.started_at,
+            "finished_at": rec.finished_at,
+        }))),
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands/{command_id}/logs");
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 async fn kill_command(
@@ -374,21 +464,35 @@ async fn write_files(
 }
 
 #[derive(Deserialize)]
-struct ReadFileQuery {
-    path: String,
+pub(crate) struct ReadFileQuery {
+    pub(crate) path: String,
 }
 
-async fn read_file(
+pub(crate) async fn read_file(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
     Path((project, sandbox_id)): Path<(String, String)>,
     Query(q): Query<ReadFileQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let bytes = c.sandboxes.read_file(&project, &sandbox_id, &q.path).await.map_err(sandbox_err)?;
-    use base64::Engine;
-    Ok(Json(json!({ "path": q.path, "content_b64": base64::engine::general_purpose::STANDARD.encode(bytes) })))
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.read_file(&project, &sandbox_id, &q.path).await {
+        Ok(bytes) => {
+            use base64::Engine;
+            Ok(Json(json!({ "path": q.path, "content_b64": base64::engine::general_purpose::STANDARD.encode(bytes) })))
+        }
+        Err(e) if is_not_found(&e) => {
+            let path = format!(
+                "/v1/projects/{project}/sandboxes/{sandbox_id}/files/read?path={}",
+                crate::admin::urlencode(&q.path)
+            );
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -415,10 +519,19 @@ async fn create_snapshot(
     Ok(Json(json!(rec)))
 }
 
-async fn list_snapshots(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let list = c.sandboxes.list_snapshots(&project, &sandbox_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!({ "snapshots": list })))
+pub(crate) async fn list_snapshots(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.list_snapshots(&project, &sandbox_id).await {
+        Ok(list) => Ok(Json(json!({ "snapshots": list }))),
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/snapshots");
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 async fn delete_snapshot(
@@ -503,10 +616,19 @@ fn masked_mount(mut m: SandboxMountRecord) -> SandboxMountRecord {
     m
 }
 
-async fn list_mounts(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let list = c.sandboxes.list_mounts(&project, &sandbox_id).await.map_err(sandbox_err)?;
-    Ok(Json(json!({ "mounts": list.into_iter().map(masked_mount).collect::<Vec<_>>() })))
+pub(crate) async fn list_mounts(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path((project, sandbox_id)): Path<(String, String)>) -> Result<Json<Value>, (StatusCode, String)> {
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.list_mounts(&project, &sandbox_id).await {
+        Ok(list) => Ok(Json(json!({ "mounts": list.into_iter().map(masked_mount).collect::<Vec<_>>() }))),
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/mounts");
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }
 
 async fn delete_mount(
@@ -541,18 +663,27 @@ async fn update_network_policy(
 }
 
 #[derive(Deserialize)]
-struct DomainQuery {
-    port: u16,
+pub(crate) struct DomainQuery {
+    pub(crate) port: u16,
 }
 
-async fn get_domain(
+pub(crate) async fn get_domain(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Claims,
     Path((project, sandbox_id)): Path<(String, String)>,
     Query(q): Query<DomainQuery>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require(&c, &headers, &claims, &project)?;
-    let url = c.sandboxes.domain(&project, &sandbox_id, q.port).await.map_err(sandbox_err)?;
-    Ok(Json(json!({ "url": url, "port": q.port })))
+    let t = require(&c, &headers, &claims, &project)?;
+    match c.sandboxes.domain(&project, &sandbox_id, q.port).await {
+        Ok(url) => Ok(Json(json!({ "url": url, "port": q.port }))),
+        Err(e) if is_not_found(&e) => {
+            let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/domain?port={}", q.port);
+            if let Some(v) = proxy_to_owner(&c, &path, &t).await {
+                return Ok(Json(v));
+            }
+            Err(sandbox_err(e))
+        }
+        Err(e) => Err(sandbox_err(e)),
+    }
 }

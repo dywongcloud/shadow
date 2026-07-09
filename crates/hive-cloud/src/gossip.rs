@@ -247,6 +247,89 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
             jb(crate::admin::logs(State(cloud.clone()), team_headers(p), team_claims(p), logs_query(p)).await)
         }
+        // Sandbox READS: every sandbox MUTATION forwards through admin_ingress to the
+        // single current control-plane owner (no independent placement), so that node
+        // is the sole holder of sandbox state. sandboxes_api.rs's own `fetch_from_host`
+        // fallback tries an HTTP admin URL first, then this iroh-mesh path — which,
+        // before this arm existed, had NO dispatch entry for any `/sandboxes` path, so
+        // the fallback silently returned nothing and every non-owner node 404'd on
+        // every sandbox read (live-reproduced). One consolidated arm dispatches on
+        // segment shape rather than N ordered prefix-checks, so there is no
+        // most-specific-first ordering hazard to maintain as sandbox routes grow.
+        p if method == hive_p2p::GOSSIP_GET && p.split('?').next().unwrap_or(p).contains("/sandboxes") => {
+            let (project, segs) = sandbox_path_project_and_segs(p);
+            let project = project.to_string();
+            let state = State(cloud.clone());
+            let hdrs = team_headers(p);
+            let clm = team_claims(p);
+            match segs.len() {
+                0 => match crate::sandboxes_api::list_sandboxes(state, hdrs, clm, axum::extract::Path(project)).await {
+                    Ok(j) => jb(j),
+                    Err(_) => Vec::new(),
+                },
+                1 => {
+                    let sandbox_id = segs[0].to_string();
+                    match crate::sandboxes_api::get_sandbox(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                2 if segs[1] == "commands" => {
+                    let sandbox_id = segs[0].to_string();
+                    match crate::sandboxes_api::list_commands(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                2 if segs[1] == "snapshots" => {
+                    let sandbox_id = segs[0].to_string();
+                    match crate::sandboxes_api::list_snapshots(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                2 if segs[1] == "mounts" => {
+                    let sandbox_id = segs[0].to_string();
+                    match crate::sandboxes_api::list_mounts(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                2 if segs[1] == "domain" => {
+                    let sandbox_id = segs[0].to_string();
+                    let port: u16 = qparam(p, "port").and_then(|s| s.parse().ok()).unwrap_or(0);
+                    match crate::sandboxes_api::get_domain(state, hdrs, clm, axum::extract::Path((project, sandbox_id)), axum::extract::Query(crate::sandboxes_api::DomainQuery { port })).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                3 if segs[1] == "commands" => {
+                    let sandbox_id = segs[0].to_string();
+                    let command_id = segs[2].to_string();
+                    match crate::sandboxes_api::get_command(state, hdrs, clm, axum::extract::Path((project, sandbox_id, command_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                3 if segs[1] == "files" && segs[2] == "read" => {
+                    let sandbox_id = segs[0].to_string();
+                    let q = crate::sandboxes_api::ReadFileQuery { path: qparam(p, "path").unwrap_or_default() };
+                    match crate::sandboxes_api::read_file(state, hdrs, clm, axum::extract::Path((project, sandbox_id)), axum::extract::Query(q)).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                4 if segs[1] == "commands" && segs[3] == "logs" => {
+                    let sandbox_id = segs[0].to_string();
+                    let command_id = segs[2].to_string();
+                    match crate::sandboxes_api::get_command_logs(state, hdrs, clm, axum::extract::Path((project, sandbox_id, command_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                _ => Vec::new(),
+            }
+        }
         // Cross-region DB replica control (register/remove) over the mesh.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
             match serde_json::from_slice::<serde_json::Value>(body) {
@@ -286,6 +369,21 @@ fn qparam(path: &str, key: &str) -> Option<String> {
         let (k, v) = kv.split_once('=')?;
         (k == key).then(|| v.to_string())
     })
+}
+
+/// Splits a dispatched `/v1/projects/<project>/sandboxes[/<rest>]` path (query
+/// string already ignored) into the project id and the remaining `/`-separated
+/// segments after `sandboxes`, e.g. `.../sandboxes/sbx_1/commands/cmd_1/logs`
+/// -> (`sbx_project`, [`sbx_1`, `commands`, `cmd_1`, `logs`]). Segment count +
+/// shape drives which sandbox handler a dispatched request maps to.
+fn sandbox_path_project_and_segs(path: &str) -> (&str, Vec<&str>) {
+    let p = path.split('?').next().unwrap_or(path);
+    let rest = p.trim_start_matches("/v1/projects/");
+    let mut it = rest.splitn(2, "/sandboxes");
+    let project = it.next().unwrap_or("");
+    let tail = it.next().unwrap_or("");
+    let segs = tail.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    (project, segs)
 }
 
 /// Build a verified-claims extension for a mesh-internal admin call. The iroh

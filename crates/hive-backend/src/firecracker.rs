@@ -500,23 +500,55 @@ impl CellBackend for FirecrackerBackend {
             reflink_or_copy(&data_src, &data_overlay).await?;
         }
 
-        // Spawn the Firecracker process bound to a fresh API socket.
-        let _ = tokio::fs::remove_file(&api_sock).await;
-        let console = std::fs::File::create(&log_file)?;
-        let child = Command::new(&self.cfg.firecracker_bin)
-            .arg("--api-sock")
-            .arg(&api_sock)
-            .arg("--id")
-            .arg(spec.id.as_str())
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(console.try_clone()?))
-            .stderr(Stdio::from(console))
-            .kill_on_drop(true)
-            .spawn()?;
-        self.procs.lock().await.insert(spec.id.clone(), child);
+        // Spawn the Firecracker process bound to a fresh API socket, retrying
+        // the spawn (not the whole provision — the rootfs copy above stays)
+        // up to twice as defense-in-depth against genuine transient failures
+        // (disk I/O stalls, real resource contention under heavy concurrent
+        // provisioning). NOT a fix for what was actually crashing every
+        // sandbox: coredump analysis (`coredumpctl info`, console.log capture)
+        // showed a 100%-deterministic firecracker-side panic —
+        // "Invalid instance ID: InvalidChar('_', 7)" — because firecracker's
+        // own `--id` validation rejects underscores and every sandbox cell id
+        // (`sbx-sbx_<hex>`) contains one (deployment cell ids use only
+        // hyphens, so they never hit this). Retrying the identical invalid id
+        // three times failed identically three times; the real fix is
+        // `firecracker_safe_id` below, sanitizing only the CLI arg.
+        const SPAWN_ATTEMPTS: u32 = 3;
+        let mut last_err = None;
+        for attempt in 1..=SPAWN_ATTEMPTS {
+            let _ = tokio::fs::remove_file(&api_sock).await;
+            let console = std::fs::File::create(&log_file)?;
+            let child = Command::new(&self.cfg.firecracker_bin)
+                .arg("--api-sock")
+                .arg(&api_sock)
+                .arg("--id")
+                .arg(firecracker_safe_id(spec.id.as_str()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(console.try_clone()?))
+                .stderr(Stdio::from(console))
+                .kill_on_drop(true)
+                .spawn()?;
+            self.procs.lock().await.insert(spec.id.clone(), child);
 
-        // Wait for the API socket to appear.
-        wait_for_path(&api_sock, Duration::from_secs(5)).await?;
+            match wait_for_path(&api_sock, Duration::from_secs(5)).await {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    // Dead/never-bound child — reap it before retrying so a
+                    // zombie doesn't linger under this cell id.
+                    if let Some(mut dead) = self.procs.lock().await.remove(&spec.id) {
+                        let _ = dead.kill().await;
+                    }
+                    tracing::warn!(cell = %spec.id, attempt, max = SPAWN_ATTEMPTS, error = %e, "firecracker spawn did not bind its API socket — retrying");
+                    last_err = Some(e);
+                }
+            }
+        }
+        if let Some(e) = last_err {
+            return Err(e);
+        }
 
         // Outbound networking: give the cell a host TAP + NAT egress so the app
         // can reach databases/APIs (Upstash, OpenAI, …). Best-effort — if it
@@ -988,6 +1020,16 @@ async fn wait_for_path(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> 
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     anyhow::bail!("timed out waiting for {}", path.display())
+}
+
+/// Firecracker's own `--id` validation accepts only `[a-zA-Z0-9-]`, up to 64
+/// chars, and rejects anything else by panicking (SIGABRT) straight out of
+/// its own `main()` instead of a clean parse error — cell ids elsewhere in
+/// this file (run-dir names, hashmap keys, vsock lookups) are untouched by
+/// this and keep using the real `spec.id` (which may contain `_`, as every
+/// sandbox cell id does).
+fn firecracker_safe_id(id: &str) -> String {
+    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).take(64).collect()
 }
 
 // ---- vsock host-initiated connection + framing ------------------------------

@@ -5958,7 +5958,7 @@ async fn project_preview(
     }
 }
 
-fn urlencode(s: &str) -> String {
+pub(crate) fn urlencode(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '~') { c.to_string() } else { format!("%{:02X}", c as u32) })
         .collect()
