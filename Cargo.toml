@@ -75,6 +75,16 @@ hive-edge = { path = "crates/hive-edge" }
 hive-p2p = { path = "crates/hive-p2p" }
 hive-zkauth = { path = "crates/hive-zkauth" }
 
+# Local fork of guardian-db 0.17.2 (vendor/guardian-db): its Iroh endpoint was
+# hardcoded to n0's public relay/discovery preset with no override — from
+# networks where n0's relay isn't reliably reachable, that made init hang
+# forever (see hive-cloud/src/guardian.rs's GUARDIAN_INIT_TIMEOUT comment for
+# the live evidence). The fork honors HIVE_RELAY_URLS, same as hive-p2p, so
+# GuardianDB's replication traffic transits the platform's own self-hosted
+# relay fleet instead.
+[patch.crates-io]
+guardian-db = { path = "vendor/guardian-db" }
+
 [profile.release]
 opt-level = 3
 lto = "thin"

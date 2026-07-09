@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check } from "lucide-react";
@@ -12,7 +12,14 @@ import { toast } from "@/components/toast";
 export default function DatabaseDetail({ params }: { params: { id: string } }) {
   const id = params.id;
   const router = useRouter();
-  const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, 3000);
+  // ADAPTIVE: a ready database record is essentially static — poll fast (3s)
+  // only while provisioning, 20s once ready (mutations invalidate the cache,
+  // so a delete/redeploy still reflects immediately).
+  const [provisioning, setProvisioning] = useState(true);
+  const { data: db, error } = usePoll<Database>(`/v1/databases/${id}`, provisioning ? 3000 : 20000);
+  useEffect(() => {
+    if (db) setProvisioning(db.status === "provisioning");
+  }, [db]);
   const [revealed, setRevealed] = useState<Record<string, string> | null>(null);
   const [copied, setCopied] = useState("");
 

@@ -56,6 +56,16 @@ pub struct PlatformSnapshot {
     /// restart like blob (disk) and the DB records themselves.
     #[serde(default)]
     pub database_data: crate::databases::DataSnapshot,
+    /// Hour/day consumption-breakdown rollups (Weekly/Monthly chart data) —
+    /// minute-resolution buckets are excluded (short retention, refill within
+    /// minutes; see metrics.rs's module doc comment for why).
+    #[serde(default)]
+    pub metrics_rollup: crate::metrics::RollupSnapshot,
+    /// Build records incl. logs (newest-capped; see BuildStore::snapshot) —
+    /// previously in-memory only, so every restart erased all build logs while
+    /// the deployments they built lived on.
+    #[serde(default)]
+    pub builds: Vec<crate::git::Build>,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
     #[serde(default)]
@@ -127,6 +137,41 @@ pub fn save_peer_iroh(map: &std::collections::HashMap<String, (String, String)>)
 /// Load the persisted gossip-transport map (empty if none).
 pub fn load_peer_iroh() -> std::collections::HashMap<String, (String, String)> {
     std::fs::read_to_string(peer_iroh_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn peer_guardian_addr_path() -> PathBuf {
+    data_dir().join("peer_guardian_addr.json")
+}
+
+/// Persist peers' GuardianDB-specific addresses (node name -> serialized
+/// `iroh::EndpointAddr`) — a SEPARATE identity/endpoint from the mesh
+/// addresses in `peer_iroh.json` above (GuardianDB runs its own independent
+/// iroh client per node). Loaded at boot to seed `guardian::set_boot_seed_peers`
+/// before GuardianDB's one-time KV-store open (the only window its automatic
+/// DocTicket exchange is consulted in — see guardian.rs). On a node's FIRST
+/// ever boot with this feature, this file doesn't exist yet (nothing has ever
+/// gossiped a guardian address) — boot-seeding is empty and this node falls
+/// back to the pre-existing single-namespace-per-node behavior; the NEXT
+/// restart, after the gossip loop has had a chance to populate and persist
+/// this file, is when boot-seeding actually has something to work with.
+pub fn save_peer_guardian_addr(map: &std::collections::HashMap<String, String>) {
+    let dir = data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("peer_guardian_addr.json.tmp");
+    let Ok(json) = serde_json::to_string(map) else { return };
+    if std::fs::write(&tmp, json).is_ok() {
+        let _ = std::fs::rename(&tmp, peer_guardian_addr_path());
+    }
+}
+
+/// Load the persisted peer GuardianDB-address map (empty if none).
+pub fn load_peer_guardian_addr() -> std::collections::HashMap<String, String> {
+    std::fs::read_to_string(peer_guardian_addr_path())
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
@@ -283,6 +328,8 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
+        metrics_rollup: cloud.metrics.rollup_snapshot(),
+        builds: cloud.builds.snapshot(),
         incidents: cloud.incidents.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
         integrations: cloud.integrations.snapshot(),
@@ -445,6 +492,8 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
+    cloud.metrics.rollup_load(snap.metrics_rollup);
+    cloud.builds.load(snap.builds);
     cloud.incidents.load(snap.incidents);
     cloud.apikeys.load(snap.apikeys);
     cloud.integrations.load(snap.integrations);

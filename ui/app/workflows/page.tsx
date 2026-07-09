@@ -51,20 +51,31 @@ export default function WorkflowsPage() {
 }
 
 function WorkflowsInner() {
-  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs", 2000);
-  const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
-  const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 5000);
-  const now = useNow();
-  const [q, setQ] = useState("");
-  const [range, setRange] = useState("Last 12 hours");
-  const [env, setEnv] = useState("All Environments");
-  const [creating, setCreating] = useState(false);
   // The active view (Runs / Workflows / Hooks) is driven by the TOP-NAV sub-tabs
   // (`?tab=`) — the breadcrumb-tabs model shared with the project/deployment pages —
   // instead of an in-page tab bar. Defaults to "runs".
   const searchParams = useSearchParams();
   const tab = searchParams.get("tab");
   const view: WdkView = tab === "workflows" || tab === "hooks" ? tab : "runs";
+  // ADAPTIVE polling: /v1/workflows/runs is the most expensive read on the
+  // dashboard (fleet fan-out + per-project Upstash world reads per call). Poll
+  // fast (3s) only while a run is actually in flight; 12s at rest. The
+  // definitions list only changes on deploy — long TTL, slow poll.
+  const [anyRunning, setAnyRunning] = useState(false);
+  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs?summary=1", anyRunning ? 3000 : 12000);
+  const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
+  useEffect(() => {
+    setAnyRunning((runs ?? []).some((r) => r.status === "running" || r.status === "pending"));
+  }, [runs]);
+  const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 15000);
+  // The 1s wall-clock re-render only matters while a duration is ticking (a
+  // run in flight); 5s otherwise keeps "x min ago" fresh without re-rendering
+  // the whole page every second.
+  const now = useNow(anyRunning ? 1000 : 5000);
+  const [q, setQ] = useState("");
+  const [range, setRange] = useState("Last 12 hours");
+  const [env, setEnv] = useState("All Environments");
+  const [creating, setCreating] = useState(false);
 
   // Time window, then environment scope. (Workflow runs execute on the deployed
   // app, so they default to "production"; the env filter narrows the same dataset.)

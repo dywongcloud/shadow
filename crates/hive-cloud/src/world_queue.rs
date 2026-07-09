@@ -182,13 +182,16 @@ impl WorldQueue {
     }
 }
 
-/// Deterministic tenant-scoped primary election, the SAME shape as
-/// `Cluster::billing_leader` (lowest healthy peer_id wins) but scoped to only
-/// the nodes currently hosting `team`'s deployments -- never the whole fleet,
-/// since a queue's delivery target (the app's own callback URL) is only
-/// meaningfully reachable/relevant from a node actually serving that tenant.
-/// Fails open (this node is primary) when hosting info isn't available yet
-/// (fresh gossip, single-node dev) rather than stranding jobs undelivered.
+/// Deterministic tenant-scoped primary election, scoped to only the nodes
+/// currently hosting `team`'s deployments -- never the whole fleet, since a
+/// queue's delivery target (the app's own callback URL) is only meaningfully
+/// reachable/relevant from a node actually serving that tenant. The vote
+/// itself is `Cluster::elect_among` -- the ONE shared candidate-set election
+/// (lowest healthy peer_id, deterministic name-order fallback when no
+/// electable identity is known yet), so this cannot drift from the
+/// control-plane machinery (audit proposal step 10). Fails open (this node is
+/// primary) when hosting info isn't available yet (fresh gossip, single-node
+/// dev) rather than stranding jobs undelivered.
 async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
     let mut candidates: Vec<String> = Vec::new();
     if cloud.gw.list().iter().any(|d| crate::admin::record_tenant(&d.tenant) == team) {
@@ -203,21 +206,7 @@ async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
         return true;
     }
     let nodes = cloud.registry.nodes();
-    let mut healthy_ids: Vec<(String, String)> = nodes
-        .iter()
-        .filter(|n| candidates.contains(&n.name) && n.healthy)
-        .filter_map(|n| n.peer_id.clone().map(|pid| (n.name.clone(), pid)))
-        .collect();
-    if healthy_ids.is_empty() {
-        // No election-eligible identity known for any candidate yet (e.g. iroh
-        // not bound) -- fall back to node-name ordering so a primary still
-        // exists deterministically rather than every node deferring forever.
-        let mut names = candidates.clone();
-        names.sort();
-        return names.first() == Some(&cloud.node_name);
-    }
-    healthy_ids.sort_by(|a, b| a.1.cmp(&b.1));
-    healthy_ids.first().map(|(name, _)| name.as_str()) == Some(cloud.node_name.as_str())
+    crate::cluster::Cluster::elect_among(&candidates, &nodes).as_deref() == Some(cloud.node_name.as_str())
 }
 
 /// Pull every job mirrored in GuardianDB for tenants THIS node currently hosts

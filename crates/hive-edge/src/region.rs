@@ -32,6 +32,23 @@ pub struct NodeInfo {
     /// open a QUIC tunnel to this node directly. Populated when P2P is bound.
     #[serde(default)]
     pub iroh_addr: Option<String>,
+    /// GuardianDB's OWN dialable iroh address (JSON `EndpointAddr`) — a SEPARATE
+    /// identity/endpoint from `iroh_addr` above (the request-routing mesh).
+    /// GuardianDB opens its own independent iroh client per node; a peer's mesh
+    /// address is a different, unrelated identity, and feeding one in place of
+    /// the other makes GuardianDB's automatic peer-discovery try to dial an
+    /// EndpointId nothing is actually listening as. `None` until this node's
+    /// GuardianDB client has finished its own bind (best-effort, filled in by a
+    /// later gossip round once ready — never blocks boot).
+    #[serde(default)]
+    pub guardian_iroh_addr: Option<String>,
+    /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
+    /// on every owner promotion/failover). Gossiped so the whole fleet converges
+    /// on the highest epoch — the fencing token that lets a node reject admin
+    /// mutations forwarded by a peer whose view of ownership is stale. `0` from
+    /// pre-upgrade peers (`serde(default)`), which fences nothing (safe).
+    #[serde(default)]
+    pub cp_epoch: u64,
     pub last_seen_ms: u64,
     #[serde(default)]
     pub is_self: bool,
@@ -115,25 +132,48 @@ pub fn continent_of(lat: f64, lon: f64) -> &'static str {
 }
 
 pub struct NodeRegistry {
-    me: NodeInfo,
+    me: RwLock<NodeInfo>,
     peers: RwLock<HashMap<String, NodeInfo>>,
 }
 
 impl NodeRegistry {
     pub fn new(me: NodeInfo) -> Arc<NodeRegistry> {
         Arc::new(NodeRegistry {
-            me,
+            me: RwLock::new(me),
             peers: RwLock::new(HashMap::new()),
         })
     }
 
     pub fn me(&self) -> NodeInfo {
-        let mut me = self.me.clone();
+        let mut me = self.me.read().clone();
         me.is_self = true;
         me.last_seen_ms = now_ms();
         me.latency_ms = 0;
         me.healthy = true;
         me
+    }
+
+    /// Update this node's own `guardian_iroh_addr` once GuardianDB's
+    /// independent iroh client has finished binding (it isn't ready at boot,
+    /// when `me` is first constructed — see the field's own doc comment).
+    /// Best-effort, idempotent, safe to call every gossip round: a no-op
+    /// write when the value hasn't changed, picked up by the very next
+    /// outgoing gossip broadcast since `nodes()`/`me()` always read fresh.
+    pub fn set_self_guardian_addr(&self, addr: Option<String>) {
+        let mut me = self.me.write();
+        if me.guardian_iroh_addr != addr {
+            me.guardian_iroh_addr = addr;
+        }
+    }
+
+    /// Update this node's gossiped control-plane epoch (see
+    /// `NodeInfo.cp_epoch`) — refreshed each gossip round from the cluster's
+    /// observed-owner tracker.
+    pub fn set_self_cp_epoch(&self, epoch: u64) {
+        let mut me = self.me.write();
+        if me.cp_epoch != epoch {
+            me.cp_epoch = epoch;
+        }
     }
 
     /// Record a peer's measured latency + health (from probing).
@@ -168,8 +208,8 @@ impl NodeRegistry {
         nodes
     }
 
-    pub fn region(&self) -> &str {
-        &self.me.region
+    pub fn region(&self) -> String {
+        self.me.read().region.clone()
     }
 
     /// Record/refresh a peer learned over gossip. Crucially, this does NOT bump
@@ -189,6 +229,19 @@ impl NodeRegistry {
             peer.latency_ms = existing.latency_ms;
             // Keep the freshest origin timestamp seen (a relayed copy may arrive stale).
             peer.last_seen_ms = peer.last_seen_ms.max(existing.last_seen_ms);
+            // Never regress guardian_iroh_addr to None. A peer's OWN direct
+            // announce carries its current value; a THIRD peer's relayed
+            // /v1/nodes response (this same round, processed concurrently)
+            // may carry an older, not-yet-propagated copy of that same peer's
+            // entry — still None if the relaying peer hasn't itself learned
+            // the address yet. Without this, whichever response is processed
+            // LAST this round wins regardless of freshness, so a stale relay
+            // arriving after the peer's own direct announce silently erases
+            // it (observed live: guardian_iroh_addr flapping Some -> None on
+            // the very next round with no code path that should clear it).
+            if peer.guardian_iroh_addr.is_none() {
+                peer.guardian_iroh_addr = existing.guardian_iroh_addr.clone();
+            }
         }
         peers.insert(peer.id.clone(), peer);
     }
@@ -243,6 +296,8 @@ mod tests {
             public_ip6: None,
             peer_id: None,
             iroh_addr: None,
+            guardian_iroh_addr: None,
+            cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,
             latency_ms: latency,

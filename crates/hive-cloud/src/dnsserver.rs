@@ -311,6 +311,8 @@ mod tests {
             public_ip6: ip6.map(|s| s.to_string()),
             peer_id: None,
             iroh_addr: None,
+            guardian_iroh_addr: None,
+            cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,
             latency_ms: latency,

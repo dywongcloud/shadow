@@ -23,13 +23,13 @@ use uuid::Uuid;
 
 use crate::state::CloudState;
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct LogLine {
     pub ts_ms: u64,
     pub line: String,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, serde::Deserialize)]
 pub struct Build {
     pub id: String,
     pub project: String,
@@ -39,11 +39,20 @@ pub struct Build {
     pub commit_message: String,
     pub state: DeployState,
     pub started_ms: u64,
+    #[serde(default)]
     pub finished_ms: Option<u64>,
+    #[serde(default)]
     pub deployment_id: Option<String>,
+    #[serde(default)]
     pub alias: Option<String>,
+    #[serde(default)]
     pub lines: Vec<LogLine>,
 }
+
+/// Cap on how many builds the snapshot persists (newest by `started_ms`) —
+/// bounds the state file while keeping every deployment a user can realistically
+/// navigate to covered with its build logs.
+const SNAPSHOT_BUILD_CAP: usize = 200;
 
 #[derive(Default)]
 pub struct BuildStore {
@@ -59,6 +68,33 @@ impl BuildStore {
     }
     pub fn list(&self) -> Vec<Build> {
         self.map.lock().values().cloned().collect()
+    }
+    /// Persistable view (newest `SNAPSHOT_BUILD_CAP` builds). Builds were
+    /// purely in-memory before this — every node restart silently erased all
+    /// build logs, which is why /deployments/<id> showed "No build record
+    /// found" for anything deployed before the last restart. DeployRecords
+    /// survived (they ARE persisted), making the loss invisible until a user
+    /// opened the build-logs panel.
+    pub fn snapshot(&self) -> Vec<Build> {
+        let mut v: Vec<Build> = self.map.lock().values().cloned().collect();
+        v.sort_by(|a, b| b.started_ms.cmp(&a.started_ms));
+        v.truncate(SNAPSHOT_BUILD_CAP);
+        v
+    }
+    /// Boot-time restore. A build persisted mid-flight (`Queued`/`Building`)
+    /// is dead — its process did not survive the restart — so it is finalized
+    /// as `Error` with an explanatory log line rather than presenting as
+    /// running forever.
+    pub fn load(&self, builds: Vec<Build>) {
+        let mut m = self.map.lock();
+        for mut b in builds {
+            if matches!(b.state, DeployState::Queued | DeployState::Building) {
+                b.state = DeployState::Error;
+                b.finished_ms.get_or_insert_with(now_ms);
+                b.lines.push(LogLine { ts_ms: now_ms(), line: "build interrupted: node restarted while the build was in flight".into() });
+            }
+            m.entry(b.id.clone()).or_insert(b);
+        }
     }
     fn insert(&self, b: Build) {
         self.map.lock().insert(b.id.clone(), b);
@@ -342,7 +378,10 @@ async fn run_build(
         // podman-capable node after the build (see the capability re-dispatch below).
         // EXCEPT a prebuilt-image deploy is known to be a container up front → place
         // it on a container-capable node immediately (no post-build re-home needed).
-        let targets = crate::schedule::place(cloud, &regions, req.image_ref.is_some());
+        // Lease-holder-sticky for redeploys: an existing container project's live
+        // lease pins the redeploy to its current serving node (see
+        // schedule::place_for_project); no lease / new project → normal policy.
+        let targets = crate::schedule::place_for_project(cloud, &project, &regions, req.image_ref.is_some());
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
@@ -1127,6 +1166,18 @@ async fn mirror_remote_build(
             return true;
         }
         if state.eq_ignore_ascii_case("error") {
+            // Link the FAILED remote build to its deployment too (the remote
+            // sets deployment_id on both success and failure): without this,
+            // the coordinator's mirror record was unlinked on failure, so
+            // /v1/deployments/:id/build could never answer locally for a
+            // failed fanout deploy and the detail page showed no logs at all —
+            // exactly when the user most needs them.
+            if let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) {
+                let dep = dep.to_string();
+                cloud.builds.update(bid, |b| {
+                    b.deployment_id = Some(dep.clone());
+                });
+            }
             cloud.builds.log(bid, format!("✗ {node}: build failed"));
             return false;
         }

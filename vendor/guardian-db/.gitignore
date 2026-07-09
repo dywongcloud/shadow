@@ -1,0 +1,7 @@
+/target
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Transient iroh node data created by tests/examples (never commit).
+/tmp/

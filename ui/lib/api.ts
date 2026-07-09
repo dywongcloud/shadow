@@ -187,6 +187,11 @@ const PATH_TTL: Array<[RegExp, number]> = [
   [/^\/v1\/billing/, 20_000], // account/plans/rate-card — slow-moving
   [/^\/v1\/apikeys/, 20_000],
   [/^\/v1\/domains/, 15_000],
+  [/^\/v1\/workflows$/, 15_000], // workflow DEFINITIONS — change on deploy only (runs keep the live default)
+  [/^\/v1\/ratelimit/, 15_000], // config — only this page's own mutations change it (which invalidate)
+  [/^\/v1\/cluster$/, 5_000], // leadership/epoch — changes at gossip cadence, not per-second
+  [/^\/v1\/nodes$/, 5_000], // mesh membership — same cadence
+  [/^\/v1\/anycast$/, 5_000],
 ];
 function pathTtl(path: string): number {
   for (const [re, ttl] of PATH_TTL) if (re.test(path)) return ttl;
@@ -319,7 +324,19 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true) {
     // redundant polls of the same endpoint into one network read per TTL window.
     // Mutations invalidate the cache, and refresh() below is available for
     // immediate post-write freshness, so nothing goes stale on a change.
-    const id = active ? setInterval(() => load(false), intervalMs) : null;
+    // Visibility gating: a hidden tab keeps ticking timers but skips the
+    // actual fetch — a dashboard left open in a background tab was polling
+    // every endpoint forever (per-tab, multiplying load browser → Next proxy →
+    // backend). On return to visibility, one immediate refresh catches up.
+    const tick = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
+      load(false);
+    };
+    const id = active ? setInterval(tick, intervalMs) : null;
+    const onVisible = () => {
+      if (typeof document !== "undefined" && document.visibilityState === "visible" && active) load(false);
+    };
+    if (typeof document !== "undefined") document.addEventListener("visibilitychange", onVisible);
     // On team/account switch (or logout), drop the previous tenant's data
     // IMMEDIATELY so it can never flash, then re-fetch for the new tenant.
     const onTeam = () => {
@@ -331,6 +348,7 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true) {
     if (typeof window !== "undefined") window.addEventListener("hive-team-changed", onTeam);
     return () => {
       if (id) clearInterval(id);
+      if (typeof document !== "undefined") document.removeEventListener("visibilitychange", onVisible);
       if (typeof window !== "undefined") window.removeEventListener("hive-team-changed", onTeam);
     };
   }, [load, intervalMs, active]);
@@ -492,6 +510,9 @@ export interface Event {
   action: string;
   detail: string;
   project?: string;
+  /** Exact deployment the request host aliased to at record time (empty when
+   * the host resolved to no deployment) — scopes the deployment-detail logs. */
+  deployment?: string;
 }
 
 export interface WafRule {

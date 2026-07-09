@@ -3,15 +3,17 @@
 import { useState } from "react";
 import { Globe2, Server, Share2, ShieldCheck, Database, Network } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
-import { apiSend, usePoll, type NodeInfo, type Overview, type AnycastTable, type RateLimitStats } from "@/lib/api";
+import { apiSend, usePoll, type NodeInfo, type AnycastTable, type RateLimitStats } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
 interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
 
 export default function NetworkPage() {
-  const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
-  const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
-  const { data: cluster } = usePoll<ClusterStatus>("/v1/cluster", 3000);
+  // Mesh membership/leadership change at gossip cadence (~5s) — 10s polling is
+  // fully live for this page (each fetch also shares the per-path TTL cache).
+  // The previous /v1/overview poll here was never read anywhere — deleted.
+  const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 10000);
+  const { data: cluster } = usePoll<ClusterStatus>("/v1/cluster", 10000);
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (
@@ -230,8 +232,10 @@ function Arch({ icon, title, desc }: { icon: React.ReactNode; title: string; des
 
 /** Anycast routing table + L7 DDoS rate limiting. */
 function AnycastRouting() {
-  const { data: any } = usePoll<AnycastTable>("/v1/anycast", 3000);
-  const { data: rl, refresh } = usePoll<RateLimitStats>("/v1/ratelimit", 4000);
+  // Anycast/ratelimit change at gossip cadence / via this page's own mutations
+  // (which invalidate the cache + refresh()) — slow polls lose nothing.
+  const { data: any } = usePoll<AnycastTable>("/v1/anycast", 10000);
+  const { data: rl, refresh } = usePoll<RateLimitStats>("/v1/ratelimit", 15000);
   const [limit, setLimit] = useState("");
   const [windowS, setWindowS] = useState("");
   const [saveErr, setSaveErr] = useState("");

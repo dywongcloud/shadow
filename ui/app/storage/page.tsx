@@ -60,7 +60,14 @@ const MARKETPLACE: Provider[] = [
 ];
 
 export default function StoragePage() {
-  const { data: dbs, error, refresh } = usePoll<Database[]>("/v1/databases", 3000);
+  // ADAPTIVE: the DB list only changes on create/delete/provision — poll fast
+  // (3s) only while a row is actually provisioning, 12s at rest (mutations
+  // invalidate the cache + refresh(), so creates still surface instantly).
+  const [provisioning, setProvisioning] = useState(false);
+  const { data: dbs, error, refresh } = usePoll<Database[]>("/v1/databases", provisioning ? 3000 : 12000);
+  useEffect(() => {
+    setProvisioning((dbs ?? []).some((d) => d.status === "provisioning"));
+  }, [dbs]);
   const [open, setOpen] = useState(false);
   // Deep-link: /storage?browse opens the Browse Storage panel directly.
   useEffect(() => {

@@ -52,6 +52,49 @@ fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
     m
 }
 
+/// `place` with lease-holder stickiness for REDEPLOYS (audit proposal step 11):
+/// when the project already has a LIVE container lease (`cloud.leases`, keyed by
+/// project), prefer the current holder — a redeploy of an existing stateful
+/// container should land where its state/lease already lives instead of being
+/// blindly re-placed (gratuitous migration: new node cold-starts, old node's
+/// lease lingers until expiry, any node-local volume state is left behind). The
+/// holder is honored only while healthy + reachable and (for region-pinned
+/// projects) inside an allowed region; otherwise this falls through to the
+/// normal placement policy unchanged.
+pub fn place_for_project(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    regions: &[String],
+    is_container: bool,
+) -> Vec<Target> {
+    if let Some(holder) = cloud.leases.owner_of(project) {
+        let nodes = cloud.registry.nodes();
+        if let Some(n) = nodes.iter().find(|n| n.name == holder) {
+            let region_ok = regions.is_empty()
+                || regions.iter().any(|r| r.trim().eq_ignore_ascii_case(&n.region));
+            let reachable = n.name == cloud.node_name
+                || cloud.node_admins.read().contains_key(&n.name)
+                || (n.peer_id.is_some() && n.iroh_addr.is_some());
+            if n.healthy && region_ok && reachable {
+                tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
+                let target = if n.name == cloud.node_name {
+                    Target { node: n.name.clone(), admin: None, iroh: None }
+                } else if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
+                    Target { node: n.name.clone(), admin: Some(a), iroh: None }
+                } else {
+                    let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
+                        (Some(id), Some(addr)) => Some((id, addr)),
+                        _ => None,
+                    };
+                    Target { node: n.name.clone(), admin: None, iroh }
+                };
+                return vec![target];
+            }
+        }
+    }
+    place(cloud, regions, is_container)
+}
+
 /// Choose placement targets. See module docs for the policy. `is_container` routes
 /// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
 /// mock/podman backend) — Firecracker nodes can't run them, so placing a container
@@ -170,6 +213,8 @@ mod tests {
             public_ip6: None,
             peer_id: None,
             iroh_addr: None,
+            guardian_iroh_addr: None,
+            cp_epoch: 0,
             last_seen_ms: 0,
             is_self: false,
             latency_ms: 0,
