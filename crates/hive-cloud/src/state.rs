@@ -430,22 +430,10 @@ impl CloudState {
             })
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| {
-                // `dns` ingress: ngrok is retired — the apps domain (handled
-                // separately in host_allowed) is the only public root; keep
-                // localhost for local dev. Otherwise (ngrok/dual): the legacy
-                // region-agnostic zone + per-region ingress zones + localhost.
-                if std::env::var("HIVE_INGRESS").as_deref() == Ok("dns") {
-                    vec!["localhost".into()]
-                } else {
-                    vec![
-                        "deployment.shadow.ngrok.pizza".into(),
-                        "iad.ngrok.pizza".into(),
-                        "sin.ngrok.pizza".into(),
-                        "sfo.ngrok.pizza".into(),
-                        "lax.ngrok.pizza".into(),
-                        "localhost".into(),
-                    ]
-                }
+                // ngrok is fully retired: the apps domain (handled separately
+                // in host_allowed) is the only public root; keep localhost for
+                // local dev. Extra roots come only from HIVE_DEPLOY_SUFFIXES.
+                vec!["localhost".into()]
             });
         // Real-DNS ingress config (ngrok retirement): the two-domain split is
         // deliberate (user content on apps_domain can never touch the platform
@@ -470,7 +458,9 @@ impl CloudState {
             .ok()
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| matches!(s.as_str(), "ngrok" | "dual" | "dns"))
-            .unwrap_or_else(|| "ngrok".into());
+            // ngrok is retired fleet-wide: real DNS ingress is the default.
+            // ("ngrok"/"dual" remain accepted as explicit break-glass values.)
+            .unwrap_or_else(|| "dns".into());
         let teams = crate::teams::TeamStore::new();
         teams.ensure_seed(&owner_email);
         let region_for_sandboxes = region.clone();

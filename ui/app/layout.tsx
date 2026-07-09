@@ -50,12 +50,12 @@ export const dynamic = "force-dynamic";
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 // Origins Clerk is allowed to redirect back to after sign-in / OAuth — i.e. the
-// app's callback URLs. This lets login work both locally and through an ngrok
-// tunnel at the same time. Override/extend via NEXT_PUBLIC_ALLOWED_ORIGINS
-// (comma-separated); the defaults cover the common local ports + the ngrok host.
+// app's callback URLs. This lets login work both locally and on the public
+// platform domain. Override/extend via NEXT_PUBLIC_ALLOWED_ORIGINS
+// (comma-separated); the defaults cover the common local ports + shadw.cloud.
 const allowedRedirectOrigins = (
   process.env.NEXT_PUBLIC_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://localhost:3002,https://shadow.ngrok.pizza"
+  "http://localhost:3000,http://localhost:3002,https://shadw.cloud"
 )
   .split(",")
   .map((s) => s.trim())

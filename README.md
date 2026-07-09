@@ -298,51 +298,31 @@ Gotchas worth knowing if you reproduce it:
 - The rootfs must be glibc-based (Ubuntu/Debian) to match the dynamically-linked
   agent — not Alpine/musl.
 
-## Public ingress over ngrok (pooled wildcard)
+## Public ingress over real DNS (shadw.cloud / *.shadw.app)
 
-Nodes have no public IPs, so deployments are exposed to the internet through an
-**ngrok** wildcard tunnel. A deployment routes by its **subdomain** (the first
-host label), so `https://my-app.deployment.shadow.ngrok.pizza/` reaches the
-gateway and serves the `my-app` deployment exactly like `http://my-app.localhost:8787/`
-does locally.
+Public ingress is plain DNS + self-terminated TLS (`HIVE_INGRESS=dns`, the
+default — ngrok is fully retired; see `RUNBOOK.md` for the migration history):
 
-The key idea is **endpoint pooling**: *every* node runs its own ngrok agent that
-binds the **same** wildcard endpoint with `pooling_enabled: true`. ngrok's edge
-then load-balances incoming requests across all pooled agents — a request for any
-subdomain can land on any node. That dovetails with the mesh router: whichever
-node ngrok hands the request to inspects the `Host`, looks up the deployment's
-owning node in the gossip registry, and either serves it locally or transparently
-proxies it over the iroh QUIC mesh (with region-aware failover). Net effect: **hit
-any node, reach any deployment** — and ingress has no single point of failure.
+- **`shadw.cloud`** (and `api.` / `admin.`) — the platform: dashboard, developer
+  API, ops console. Round-robin A records across every public fleet node.
+- **`*.shadw.app`** — deployments: a deployment routes by its **subdomain**
+  (the first host label), so `https://my-app.shadw.app/` reaches the gateway
+  and serves the `my-app` deployment exactly like `http://my-app.localhost:8787/`
+  does locally.
 
-ngrok is also **outbound-only** — the agent dials out to ngrok's edge, so no
-inbound ports, port-forwarding, or public IPs are required on the nodes.
+Every node terminates TLS itself (ACME DNS-01 wildcard via `acme.rs`) and runs
+the same edge: whichever node DNS hands the request to inspects the `Host`,
+looks up the deployment's owning node in the gossip registry, and either serves
+it locally or transparently proxies it over the iroh QUIC mesh (with
+region-aware failover). Net effect: **hit any node, reach any deployment** —
+and ingress has no single point of failure. The authoritative DNS server
+(`dnsserver.rs`) answers health-aware A/AAAA for the deploy zone, and the
+Vercel DNS reconciler (`vercel_dns.rs`) keeps the platform zone's records in
+sync with fleet health.
 
-Per-node config (`/etc/ngrok/ngrok.yml`, run as a `systemd` service on Linux
-nodes / a launchd agent on the Mac):
-
-```yaml
-version: "3"
-agent:
-  authtoken: <your-ngrok-authtoken>
-endpoints:
-  - name: deployments
-    url: https://*.deployment.shadow.ngrok.pizza   # the reserved wildcard domain
-    pooling_enabled: true                          # REQUIRED on every node to pool
-    upstream:
-      url: 8787                                     # the node's public gateway
-```
-
-The dashboard itself is exposed the same way at a non-wildcard endpoint
-(`https://shadow.ngrok.pizza` → `:3002`); preview-unlock redirects detect a public
-wildcard host and bounce to that public dashboard origin (`HIVE_PUBLIC_DASHBOARD_URL`)
-rather than `localhost`.
-
-> **Gotchas.** Pooling only works if **all** agents on the endpoint enable it —
-> otherwise you get `ERR_NGROK_334` ("endpoint already online"). `--pooling-enabled`
-> is **not** a valid `ngrok start` flag in v3; it's the per-endpoint
-> `pooling_enabled: true` config field. The wildcard domain must be reserved on
-> your ngrok account first.
+Preview-unlock redirects detect a public wildcard host and bounce to the public
+dashboard origin (`HIVE_PUBLIC_DASHBOARD_URL`, `https://shadw.cloud`) rather
+than `localhost`.
 
 ## Firecracker without KVM on plain cloud VMs (PVM)
 

@@ -7,19 +7,19 @@
 // The domain is resolved per-SESSION at runtime, not just at build time:
 //   • When the dashboard itself is opened over localhost (e.g. localhost:3002),
 //     deployment links point at the local gateway: `<sub>.localhost:8787`.
-//   • When the dashboard is opened over a public tunnel (e.g. the ngrok UI host
-//     shadow.ngrok.pizza), links use NEXT_PUBLIC_DEPLOYMENT_DOMAIN so they open
-//     from anywhere: `<sub>.deployment.shadow.ngrok.pizza`.
+//   • When the dashboard is opened on the public platform host (shadw.cloud),
+//     links use NEXT_PUBLIC_DEPLOYMENT_DOMAIN so they open from anywhere:
+//     `<sub>.shadw.app`.
 // This way one build serves both contexts correctly — a localhost session never
 // hands out tunnel URLs and vice-versa.
 
 const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().replace(/^\.+|\.+$/g, "");
 
-// Ingress mode (mirrors the node's HIVE_INGRESS): "ngrok" (default) keeps the
-// region-encoded `<sub>.<code>.ngrok.pizza` URLs; "dual"/"dns" emit plain
-// `<sub>.<apps-domain>` — Vercel-DNS wildcards match ONE label, and regional
-// steering happens inside the edge after connect, not in the hostname.
-const INGRESS = (process.env.NEXT_PUBLIC_INGRESS || "ngrok").trim().toLowerCase();
+// Ingress mode (mirrors the node's HIVE_INGRESS): "dns" (default — ngrok is
+// retired) emits plain `<sub>.<apps-domain>` — Vercel-DNS wildcards match ONE
+// label, and regional steering happens inside the edge after connect, not in
+// the hostname. "ngrok"/"dual" remain accepted as explicit break-glass values.
+const INGRESS = (process.env.NEXT_PUBLIC_INGRESS || "dns").trim().toLowerCase();
 
 /** True for any host that is the local machine (localhost, *.localhost, loopback IPs). */
 function isLocalHostname(h: string): boolean {

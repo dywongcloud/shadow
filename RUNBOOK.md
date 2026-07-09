@@ -60,7 +60,7 @@ Never serve user apps from a `shadw.cloud` subdomain.
 |---|---|---|
 | `HIVE_PLATFORM_DOMAIN` | platform domain | `shadw.cloud` |
 | `HIVE_APPS_DOMAIN` | wildcard apps domain | `shadw.app` |
-| `HIVE_INGRESS` | `ngrok` \| `dual` \| `dns` | `ngrok` |
+| `HIVE_INGRESS` | `ngrok` \| `dual` \| `dns` | `dns` (ngrok retired 2026-07; `ngrok`/`dual` = explicit break-glass only) |
 | `VERCEL_API_TOKEN` | Vercel REST token (secret) | — |
 | `VERCEL_TEAM_ID` | optional teamId | unset |
 | `HIVE_ACME_EMAIL` | ACME account email | `ops@shadw.cloud` |

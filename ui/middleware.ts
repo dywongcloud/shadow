@@ -114,8 +114,12 @@ async function isPlatformOwner(userId: string): Promise<boolean> {
 
 const clerk = clerkMiddleware(async (auth, req) => {
   if (isAdminRoute(req)) {
-    // Must be signed in AND on the owner allow-list.
-    auth().protect();
+    // Must be signed in AND on the owner allow-list. Deliberately does NOT
+    // call bare `auth().protect()` here (see the self-connect-storm note
+    // below) — the unauthenticated case is handled directly by the userId
+    // check right below, which already produces the right response shape
+    // per surface (JSON for /ops, redirect for /admin), so protect()'s own
+    // redirect/not-found branching would only be redundant — and buggy.
     const { userId } = auth();
     if (!userId || !(await isPlatformOwner(userId))) {
       // /ops/* is an API proxy (called by fetch, not page navigation) — an
@@ -128,14 +132,72 @@ const clerk = clerkMiddleware(async (auth, req) => {
       return withCache(req, NextResponse.redirect(new URL("/", req.url)));
     }
   } else if (!isPublic(req)) {
-    auth().protect();
+    // Explicit `unauthenticatedUrl` (self-hosted `next start` infinite
+    // self-connect storm, part 2): a bare `auth().protect()` picks between
+    // `redirectToSignIn()` (a real Location-header redirect — safe) and
+    // `notFound()` based on Clerk's own `isPageRequest()` heuristic (Accept:
+    // text/html / Sec-Fetch-Dest: document). Any request that heuristic
+    // misses — curl, most bare `fetch()` calls, health checks, some RSC/
+    // prefetch requests — falls into `notFound()`, which Clerk implements as
+    // an explicit `NextResponse.rewrite()` to a synthetic same-origin
+    // `/clerk_<timestamp>` path. That rewrite hits the exact same Next.js
+    // 14.2.35 self-hosted bug as the decorateRequest self-rewrite below (see
+    // `neutralizeClerkSelfRewrite`): the server re-dispatches it over the
+    // network instead of in-process, the synthetic path matches this same
+    // middleware matcher, protect() denies it again with a NEW timestamp,
+    // forever — confirmed live via strace as an unbounded self-connect storm
+    // that never returns a byte. Passing `unauthenticatedUrl` skips
+    // `isPageRequest()` entirely and always takes the safe `redirect()`
+    // path, for every request shape.
+    auth().protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(req.url)}`, req.url).toString() });
   }
   return withCache(req, NextResponse.next());
 });
 
+// WORKAROUND (self-hosted `next start` infinite self-connect storm): every
+// clerkMiddleware() invocation that ends in NextResponse.next() gets rewritten
+// by @clerk/nextjs's internal decorateRequest() into an explicit
+// `NextResponse.rewrite()` targeting the SAME absolute request URL — purely a
+// vehicle to smuggle auth-state (`x-clerk-auth-*`) onto the request via the
+// `x-middleware-override-headers` / `x-middleware-request-*` header protocol,
+// since @clerk/nextjs 5.7.6 (the final 5.x release; no later 5.x patch
+// exists) predates Clerk switching to the native `NextResponse.next({
+// request: { headers } })` form for this. On Vercel's edge network that
+// same-URL rewrite is a no-op signal handled in-process. Under plain
+// `next start` on this Next.js 14.2.35 build (also the final 14.2.x release),
+// an explicit rewrite whose target equals the incoming request's own URL
+// makes the server re-dispatch the request over the network instead of
+// continuing in-process — and the re-dispatched request gets decorated
+// identically by middleware, forever: confirmed live via strace as an
+// unbounded storm of the process connect()-ing to its own listening port,
+// every request carrying the same x-clerk-auth-*/cache-control headers,
+// never returning a byte to the original caller.
+//
+// Fix: downgrade that self-rewrite back into a plain "continue" signal
+// (`x-middleware-next: 1`) whenever its target is exactly the request's own
+// URL, while leaving `x-middleware-override-headers` / `x-middleware-request-*`
+// untouched — those are the actual header-carrier Next.js honors on a plain
+// continue too (this is exactly what `NextResponse.next({ request: {
+// headers } })` produces natively, which was verified NOT to loop). auth()/
+// currentUser() in Server Components still see Clerk's injected headers;
+// Next.js just no longer re-enters the network to deliver them.
+function neutralizeClerkSelfRewrite(req: Request, res: Response): Response {
+  const rewrite = res.headers.get("x-middleware-rewrite");
+  if (rewrite && rewrite === req.url) {
+    res.headers.delete("x-middleware-rewrite");
+    res.headers.set("x-middleware-next", "1");
+  }
+  return res;
+}
+
 // When bypassing, skip Clerk's middleware (and its dev-browser handshake) too,
 // but still apply cache headers.
-export default bypass ? (req: Request & { nextUrl: { pathname: string } }) => withCache(req, NextResponse.next()) : clerk;
+export default bypass
+  ? (req: Request & { nextUrl: { pathname: string } }) => withCache(req, NextResponse.next())
+  : async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
+      const res = await clerk(req, event);
+      return neutralizeClerkSelfRewrite(req, res ?? NextResponse.next());
+    };
 
 export const config = {
   // Run on app routes. Skip Next internals + static FILES (extension at the end),

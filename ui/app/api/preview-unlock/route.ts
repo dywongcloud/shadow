@@ -22,8 +22,8 @@ const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().r
  * on a crafted link — the real proof/message minted for a legitimate member
  * would otherwise be shipped straight to that arbitrary external origin.
  *
- * Covers every STANDARD alias shape (`.localhost` dev, region-encoded
- * `*.<code>.ngrok.pizza`, and the configured `NEXT_PUBLIC_DEPLOYMENT_DOMAIN`).
+ * Covers every STANDARD alias shape (`.localhost` dev and the configured
+ * `NEXT_PUBLIC_DEPLOYMENT_DOMAIN` apps wildcard; ngrok hosts are retired).
  * KNOWN GAP: a project's own CUSTOM domain (the Domains feature) is not in
  * this list — this check intentionally only defends against a truly
  * arbitrary third-party host; a stronger fix would resolve the deployment's
@@ -33,7 +33,6 @@ const DEPLOY_DOMAIN = (process.env.NEXT_PUBLIC_DEPLOYMENT_DOMAIN || "").trim().r
 function isKnownDeploymentHost(host: string): boolean {
   const h = host.toLowerCase();
   if (h === "localhost" || h.endsWith(".localhost")) return true;
-  if (h.endsWith(".ngrok.pizza")) return true;
   if (DEPLOY_DOMAIN && (h === DEPLOY_DOMAIN || h.endsWith(`.${DEPLOY_DOMAIN}`))) return true;
   return false;
 }

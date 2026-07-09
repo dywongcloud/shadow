@@ -38,7 +38,7 @@ FC="${FC:-1}"   # include the Firecracker-backed in-VM node as a managed agent
 DASH="${HIVE_DASHBOARD_URL:-http://localhost:3002}"
 # Public dashboard origin for protected-preview unlock redirects reached over the
 # wildcard tunnel (so the unlock screen stays on the tunnel, not localhost).
-PUB_DASH="${HIVE_PUBLIC_DASHBOARD_URL:-https://shadow.ngrok.pizza}"
+PUB_DASH="${HIVE_PUBLIC_DASHBOARD_URL:-https://shadw.cloud}"
 # Remote (Bangkok) node admin, reachable via the dev.shadw.peer-bkk forward tunnel
 # (Mac 127.0.0.1:18796 -> Bangkok admin). node-a peers it so it learns Bangkok's
 # deployment placement (mesh routing + the Network "serving" view). Empty = none.
