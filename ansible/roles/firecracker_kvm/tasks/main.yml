@@ -1,0 +1,63 @@
+---
+# Firecracker on a host with REAL hardware /dev/kvm -- no kernel work needed,
+# just install the binary + a guest kernel + build the default rootfs.
+
+- name: Assert /dev/kvm is present
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _devkvm
+
+- name: Fail loudly if this host has no hardware KVM
+  ansible.builtin.assert:
+    that: _devkvm.stat.exists
+    fail_msg: >-
+      /dev/kvm is not present on this host. It belongs in the [fc_pvm]
+      inventory group (roles/pvm_firecracker), not [fc_kvm].
+
+- name: Download + install the Firecracker release binary
+  ansible.builtin.unarchive:
+    src: "https://github.com/firecracker-microvm/firecracker/releases/download/{{ firecracker_version }}/firecracker-{{ firecracker_version }}-{{ firecracker_arch }}.tgz"
+    dest: /tmp
+    remote_src: true
+    creates: "/tmp/release-{{ firecracker_version }}-{{ firecracker_arch }}/firecracker-{{ firecracker_version }}-{{ firecracker_arch }}"
+
+- name: Install firecracker to /usr/local/bin
+  ansible.builtin.copy:
+    src: "/tmp/release-{{ firecracker_version }}-{{ firecracker_arch }}/firecracker-{{ firecracker_version }}-{{ firecracker_arch }}"
+    dest: /usr/local/bin/firecracker
+    mode: "0755"
+    remote_src: true
+
+- name: Download the guest kernel
+  ansible.builtin.get_url:
+    url: "{{ firecracker_kernel_url }}"
+    dest: /var/lib/hive/vmlinux
+    mode: "0644"
+
+- name: Ensure rootfs dir exists
+  ansible.builtin.file:
+    path: /var/lib/hive/rootfs
+    state: directory
+    mode: "0755"
+
+- name: docker -> podman shim (build-rootfs.sh expects `docker`; the fleet runs podman)
+  ansible.builtin.copy:
+    dest: /usr/local/bin/docker
+    mode: "0755"
+    content: |
+      #!/usr/bin/env bash
+      exec podman "$@"
+  when: hive_container_runtime == "runc"
+
+- name: Build the default rootfs (node:20-slim + hive-cell-agent) if not already present
+  ansible.builtin.command:
+    cmd: bash {{ hive_src_dir }}/scripts/build-rootfs.sh node:20-slim default 4096
+    creates: /var/lib/hive/rootfs/default.ext4
+  environment:
+    ROOTFS_DIR: /var/lib/hive/rootfs
+    AGENT_BIN: /usr/local/bin/hive-cell-agent
+  # Requires hive-cell-agent already built+installed -- see roles/hive_platform
+  # (this repo's cargo workspace also builds hive-cell-agent as part of the
+  # same `cargo build --release` when -p is omitted; add
+  # `-p hive-cell-agent` to hive_platform's build task if you need it here
+  # and it isn't already installed).

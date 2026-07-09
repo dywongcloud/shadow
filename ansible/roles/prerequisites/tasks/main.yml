@@ -1,0 +1,87 @@
+---
+# Base OS packages, Rust toolchain, container runtime, and the handful of
+# host settings every hive-cloud node needs regardless of KVM/PVM flavor.
+# Idempotent throughout -- safe to re-run.
+
+- name: "Assert a RHEL-family distro (matches the current fleet: TencentOS/Rocky 10)"
+  ansible.builtin.assert:
+    that: ansible_os_family == "RedHat"
+    fail_msg: >-
+      This role's package tasks are dnf-based (RHEL family). The fleet this
+      repo was built from runs TencentOS Server / Rocky Linux 10. Porting to
+      Debian/Ubuntu means swapping this task file's `dnf:` module for `apt:`
+      with the Debian-named equivalents of the same packages -- no other
+      role depends on the package manager.
+
+- name: Install base + build + runtime packages
+  ansible.builtin.dnf:
+    name:
+      - gcc
+      - gcc-c++
+      - make
+      - git
+      - curl
+      - wget
+      - rsync
+      - tar
+      - unzip
+      - podman
+      - firewalld
+      - policycoreutils-python-utils   # semanage, for podman/SELinux interplay
+      - jq
+    state: present
+
+- name: Ensure firewalld is running
+  ansible.builtin.systemd:
+    name: firewalld
+    state: started
+    enabled: true
+
+- name: Open 80/443 (public ingress) and podman/hive data dirs
+  ansible.posix.firewalld:
+    port: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop:
+    - "80/tcp"
+    - "443/tcp"
+  # Deliberately NOT opening 8786 (admin) or 8787 (mesh/serve) publicly --
+  # the fleet's own hive-lockdown.sh convention keeps those loopback/tunnel-
+  # only. See roles/mesh_bootstrap for how nodes reach each other's admin
+  # ports without a public listener.
+
+- name: Create hive data + run directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ hive_data_dir }}"
+    - "/var/lib/hive/rootfs"
+    - "/run/hive"
+
+- name: Install rustup + stable toolchain (root, for cargo build --release)
+  ansible.builtin.shell: |
+    set -e
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+  args:
+    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+
+- name: git safe.directory '*' (root building a cloned/synced repo)
+  community.general.git_config:
+    name: safe.directory
+    scope: system
+    value: "*"
+
+- name: Install Node.js LTS (needed by hive-cloud's own build/deploy pipeline for tenant apps, and for the dashboard build)
+  ansible.builtin.dnf:
+    name: nodejs
+    state: present
+
+- name: podman socket enabled (git.rs / sandboxes_platform.rs shell out to podman directly, not via the socket, but keep it available for tooling)
+  ansible.builtin.systemd:
+    name: podman.socket
+    state: started
+    enabled: true

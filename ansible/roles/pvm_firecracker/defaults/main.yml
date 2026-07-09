@@ -1,0 +1,41 @@
+---
+# ---------- Source repositories ----------
+# The Firecracker fork carrying the PVM forward-port (this role re-applies the
+# two essential source changes itself, so any reasonably-recent commit works).
+firecracker_repo: "https://github.com/rusternetes-labs/firecracker"
+firecracker_version: "main"
+
+# PVM host + guest kernel source (Linux 6.12.33 base).
+pvm_linux_repo: "https://github.com/virt-pvm/linux"
+pvm_linux_branch: "pvm-612"
+pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
+
+# Ubuntu rootfs published by the Firecracker CI (userland is PVM-independent).
+rootfs_squashfs_url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs"
+rootfs_size: "1G"
+
+# ---------- Working directories ----------
+build_root: "/root/pvm-build"            # scratch space for clones + compiles
+host_kernel_src: "{{ build_root }}/host-linux"
+guest_kernel_src: "{{ build_root }}/guest-linux"
+firecracker_src: "{{ build_root }}/firecracker"
+pvm_dir: "/root/pvm"                      # runtime artifacts live here
+
+# ---------- Build knobs ----------
+make_jobs: "{{ ansible_processor_vcpus | default(ansible_processor_cores) | default(4) }}"
+host_localversion: "-pvm"                 # host kernel becomes 6.12.33-pvm+
+guest_localversion: "-pvmguest"
+fc_target: "x86_64-unknown-linux-gnu"     # gnu build => empty seccomp filter, no libseccomp at runtime
+
+# ---------- Behaviour toggles ----------
+pvm_reboot: true                          # reboot into the PVM kernel at the end
+pvm_set_default_kernel: true              # make the PVM kernel the persistent default
+pvm_run_smoke_test: true                  # boot a microVM and prove it after reboot
+
+# ---------- microVM smoke-test settings ----------
+vm_vcpus: 2
+vm_mem_mib: 1024
+vm_tap_dev: "tap0"
+vm_host_ip: "172.16.0.1"
+vm_guest_ip: "172.16.0.2"
+vm_guest_mac: "06:00:AC:10:00:02"         # derives 172.16.0.2 in the CI rootfs

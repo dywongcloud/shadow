@@ -1,0 +1,35 @@
+---
+- name: Install toolchain, kernel-build, Firecracker-build and rootfs dependencies
+  ansible.builtin.dnf:
+    name:
+      # base toolchain
+      - gcc
+      - gcc-c++
+      - make
+      - git
+      - perl
+      - python3
+      - curl
+      - wget
+      - xz
+      - rsync
+      - hostname
+      # kernel build
+      - bison
+      - flex
+      - openssl-devel
+      - elfutils-libelf-devel
+      - bc
+      - dwarves
+      - ncurses-devel
+      - dracut
+      # Firecracker build (aws-lc-sys/bindgen/seccompiler)
+      - cmake
+      - clang
+      - clang-devel
+      - libseccomp-devel
+      # rootfs + microVM networking
+      - squashfs-tools
+      - e2fsprogs
+      - iptables
+    state: present

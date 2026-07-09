@@ -1,0 +1,17 @@
+# {{ ansible_managed }}
+# Matches RUNBOOK.md Phase-0 step 6 exactly.
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+Environment=HIVE_INGRESS={{ hive_ingress }}
+Environment=HIVE_APPS_DOMAIN={{ hive_apps_domain }}
+Environment=HIVE_PLATFORM_DOMAIN={{ hive_platform_domain }}
+Environment=VERCEL_API_TOKEN={{ vault_vercel_api_token }}
+{% if vault_vercel_team_id %}
+Environment=VERCEL_TEAM_ID={{ vault_vercel_team_id }}
+{% endif %}
+Environment=HIVE_ACME_EMAIL={{ hive_acme_email }}
+Environment=HIVE_ACME_STAGING={{ hive_acme_staging }}
+Environment=HIVE_PUBLIC_IP={{ hive_public_ip }}
+{% if hive_public_ip6 is defined and hive_public_ip6 %}
+Environment=HIVE_PUBLIC_IP6={{ hive_public_ip6 }}
+{% endif %}

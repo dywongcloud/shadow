@@ -1,0 +1,25 @@
+---
+- import_tasks: 00-preflight.yml
+  tags: [always, preflight]
+
+- import_tasks: 10-packages.yml
+  tags: [packages]
+
+- import_tasks: 20-firecracker.yml
+  tags: [firecracker]
+
+- import_tasks: 30-host-kernel.yml
+  tags: [host_kernel]
+
+- import_tasks: 40-guest-kernel.yml
+  tags: [guest_kernel]
+
+- import_tasks: 50-rootfs.yml
+  tags: [rootfs]
+
+- import_tasks: 60-boot.yml
+  tags: [boot]
+
+- import_tasks: 70-smoke-test.yml
+  tags: [smoke_test]
+  when: pvm_run_smoke_test | bool

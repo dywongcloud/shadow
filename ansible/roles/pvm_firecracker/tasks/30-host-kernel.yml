@@ -1,0 +1,71 @@
+---
+# Build + install the PVM host kernel. Based on the running distro kernel config
+# so all the cloud VM's drivers (virtio, ext4, ...) are retained, plus CONFIG_KVM_PVM.
+
+- name: Clone PVM host kernel source ({{ pvm_linux_branch }})
+  ansible.builtin.git:
+    repo: "{{ pvm_linux_repo }}"
+    dest: "{{ host_kernel_src }}"
+    version: "{{ pvm_linux_branch }}"
+    depth: 1
+    single_branch: true
+    force: false
+
+- name: Configure host kernel (running config + PVM + build fixes)
+  ansible.builtin.shell:
+    chdir: "{{ host_kernel_src }}"
+    cmd: |
+      set -euo pipefail
+      cp /boot/config-$(uname -r) .config
+      scripts/config --module   KVM_PVM
+      scripts/config --module   KVM
+      scripts/config --set-str  SYSTEM_TRUSTED_KEYS ""        # distro signing keys we don't have
+      scripts/config --set-str  SYSTEM_REVOCATION_KEYS ""
+      scripts/config --disable  MODULE_SIG_FORCE
+      scripts/config --disable  DEBUG_INFO_BTF                # speed/size; avoids pahole
+      scripts/config --disable  DEBUG_INFO_BTF_MODULES
+      scripts/config --disable  DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+      scripts/config --enable   DEBUG_INFO_NONE
+      scripts/config --set-str  LOCALVERSION "{{ host_localversion }}"
+      scripts/config --disable  LOCALVERSION_AUTO
+      scripts/config --disable  UAPI_HEADER_TEST              # PVM's pvm_para.h fails the standalone test
+      make olddefconfig
+  args:
+    creates: "{{ host_kernel_src }}/.config"
+
+- name: Build host kernel (long-running)
+  ansible.builtin.command:
+    cmd: make -j{{ make_jobs }}
+    chdir: "{{ host_kernel_src }}"
+    creates: "{{ host_kernel_src }}/arch/x86/boot/bzImage"
+  async: 5400
+  poll: 30
+
+- name: Read built kernel release string
+  ansible.builtin.slurp:
+    src: "{{ host_kernel_src }}/include/config/kernel.release"
+  register: _krelease
+
+- name: Set pvm_kernel_release fact (e.g. 6.12.33-pvm+)
+  ansible.builtin.set_fact:
+    pvm_kernel_release: "{{ (_krelease.content | b64decode) | trim }}"
+
+- name: Install modules + image (+ dracut initramfs + BLS entry)
+  ansible.builtin.shell:
+    chdir: "{{ host_kernel_src }}"
+    cmd: |
+      set -e
+      make -j{{ make_jobs }} modules_install
+      make install
+  args:
+    creates: "/boot/vmlinuz-{{ pvm_kernel_release }}"
+
+- name: Confirm kvm-pvm module was built and installed
+  ansible.builtin.stat:
+    path: "/lib/modules/{{ pvm_kernel_release }}/kernel/arch/x86/kvm/kvm-pvm.ko"
+  register: _kvmpvm_ko
+
+- name: Assert kvm-pvm.ko present
+  ansible.builtin.assert:
+    that: _kvmpvm_ko.stat.exists
+    fail_msg: "kvm-pvm.ko not found — CONFIG_KVM_PVM did not build."

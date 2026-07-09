@@ -1,0 +1,16 @@
+---
+# Fast path: redeploy just the hive-cloud binary fleet-wide, skipping
+# Firecracker/kernel/DNS work entirely. This is the exact pattern used
+# throughout this project's own sessions to roll out a code fix: sync
+# source, rebuild, restart, health-check -- one host at a time so mesh
+# quorum is never lost across more than one node at once.
+#
+# Usage:
+#   ansible-playbook playbooks/platform-only.yml
+#   ansible-playbook playbooks/platform-only.yml --limit fc_pvm
+- name: Redeploy hive-cloud binary only
+  hosts: platform
+  become: true
+  serial: 1
+  roles:
+    - role: hive_platform

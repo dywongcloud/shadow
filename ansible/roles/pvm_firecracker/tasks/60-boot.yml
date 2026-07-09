@@ -1,0 +1,65 @@
+---
+# Configure GRUB + module loading and (optionally) reboot into the PVM kernel.
+
+- name: Read current PVM kernel boot args
+  ansible.builtin.command: "grubby --info=/boot/vmlinuz-{{ pvm_kernel_release }}"
+  register: _grubinfo
+  changed_when: false
+
+- name: Ensure pti=off on the PVM kernel (PVM is incompatible with page-table isolation)
+  ansible.builtin.command: "grubby --update-kernel=/boot/vmlinuz-{{ pvm_kernel_release }} --args=pti=off"
+  when: "'pti=off' not in _grubinfo.stdout"
+
+- name: Auto-load kvm-pvm at boot
+  ansible.builtin.copy:
+    dest: /etc/modules-load.d/kvm-pvm.conf
+    content: "kvm-pvm\n"
+    mode: "0644"
+
+- name: Blacklist vendor KVM modules (cannot coexist with kvm-pvm)
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/blacklist-kvm-vendor.conf
+    content: "blacklist kvm_amd\nblacklist kvm_intel\n"
+    mode: "0644"
+
+- name: Make the PVM kernel the default boot entry
+  ansible.builtin.command: "grubby --set-default=/boot/vmlinuz-{{ pvm_kernel_release }}"
+  when: pvm_set_default_kernel | bool
+  changed_when: true
+
+- name: Reboot into the PVM kernel
+  ansible.builtin.reboot:
+    reboot_timeout: 900
+    msg: "Rebooting into PVM kernel {{ pvm_kernel_release }}"
+  when: pvm_reboot | bool
+
+# ---- post-reboot verification ----
+- name: Confirm we are running the PVM kernel
+  ansible.builtin.command: uname -r
+  register: _unr
+  changed_when: false
+  when: pvm_reboot | bool
+
+- name: Assert running kernel == built PVM kernel
+  ansible.builtin.assert:
+    that: _unr.stdout == pvm_kernel_release
+    fail_msg: "Booted '{{ _unr.stdout }}', expected '{{ pvm_kernel_release }}'. Check GRUB default / console."
+  when: pvm_reboot | bool
+
+- name: Load kvm-pvm now
+  ansible.builtin.command: modprobe kvm-pvm
+  changed_when: false
+  when: pvm_reboot | bool
+
+- name: Check /dev/kvm (the PVM software interface)
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _devkvm
+  when: pvm_reboot | bool
+
+- name: Assert /dev/kvm exists — PVM is active
+  ansible.builtin.assert:
+    that: _devkvm.stat.exists
+    success_msg: "PVM active: /dev/kvm present on {{ pvm_kernel_release }}."
+    fail_msg: "kvm-pvm did not create /dev/kvm. Check `dmesg | grep -i pvm` (FSGSBASE?)."
+  when: pvm_reboot | bool

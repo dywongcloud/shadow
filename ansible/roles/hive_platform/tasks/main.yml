@@ -1,0 +1,87 @@
+---
+# Deploy the hive-cloud binary + systemd unit to one node. Source is pushed
+# via rsync from the Ansible CONTROL host's own checkout of this repo (this
+# playbook lives inside the hive monorepo, so "the source" is always right
+# here) -- this mirrors exactly how every node in this session's real fleet
+# was actually built (scp/rsync crates/+Cargo.toml/lock+vendor, then `cargo
+# build --release` on the target), rather than depending on a git remote
+# existing/being reachable from every node.
+
+- name: Ensure the source directory exists on the target
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Sync crates/ (the whole Cargo workspace's source)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../crates/"
+    dest: "{{ hive_src_dir }}/crates/"
+    delete: true
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=.git"
+
+- name: Sync vendor/ (patched crates, e.g. guardian-db)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../vendor/"
+    dest: "{{ hive_src_dir }}/vendor/"
+    delete: true
+
+- name: Copy Cargo.toml + Cargo.lock (workspace manifest, exact-pinned)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../{{ item }}"
+    dest: "{{ hive_src_dir }}/{{ item }}"
+    mode: "0644"
+  loop:
+    - Cargo.toml
+    - Cargo.lock
+
+- name: Build hive-cloud (release) -- long-running, first build is the slow one
+  ansible.builtin.command:
+    cmd: cargo build --release -p hive-cloud
+    chdir: "{{ hive_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TARGET_DIR: "{{ hive_cargo_target_dir }}"
+  async: 1800
+  poll: 15
+  register: _build
+  notify: restart hive-node
+
+- name: Confirm the binary was produced
+  ansible.builtin.stat:
+    path: "{{ hive_binary_path }}"
+  register: _bin
+  failed_when: not _bin.stat.exists
+
+- name: Template the hive-node systemd unit
+  ansible.builtin.template:
+    src: hive-node.service.j2
+    dest: /etc/systemd/system/hive-node.service
+    mode: "0644"
+  notify: [reload systemd, restart hive-node]
+
+- name: Flush handlers now (so the health check below sees the final state)
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start hive-node
+  ansible.builtin.systemd:
+    name: hive-node
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the admin port to answer
+  ansible.builtin.uri:
+    url: "http://{{ hive_admin }}/v1/mesh"
+    method: GET
+    status_code: 200
+  register: _mesh
+  retries: 12
+  delay: 5
+  until: _mesh.status == 200
+
+- name: Report mesh health
+  ansible.builtin.debug:
+    msg: "{{ hive_name }}: /v1/mesh -> {{ _mesh.json }}"

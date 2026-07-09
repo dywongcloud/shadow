@@ -1,0 +1,3 @@
+---
+# Reboot is handled inline in tasks/60-boot.yml (it must be followed by
+# verification tasks in the same play), so no handlers are required here.

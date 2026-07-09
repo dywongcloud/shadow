@@ -1,0 +1,7 @@
+---
+# Vars specific to hosts with REAL hardware /dev/kvm (bare metal, or a cloud
+# VM with nested virtualization enabled). See roles/firecracker_kvm.
+firecracker_version: "v1.13.0"
+firecracker_arch: "x86_64"     # or aarch64
+firecracker_kernel_url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/{{ firecracker_arch }}/vmlinux-6.1.128"
+hive_container_runtime: "runc"

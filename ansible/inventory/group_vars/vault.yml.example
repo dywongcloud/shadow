@@ -1,0 +1,11 @@
+# Copy to group_vars/vault.yml, fill in real values, then encrypt it:
+#   ansible-vault encrypt inventory/group_vars/vault.yml
+# vault.yml (encrypted) is gitignored; only this .example (never real
+# secrets) is committed. See ansible/README.md's Secrets section for the
+# .vault_pass file ansible.cfg expects.
+---
+vault_hive_jwt_secret: "REPLACE_ME"          # HS256 secret shared by the whole fleet -- signs/verifies gossip + platform JWTs
+vault_hive_internal_token: "REPLACE_ME"      # gates server-only endpoints (x-hive-internal header), e.g. /v1/token minting
+vault_vercel_api_token: "REPLACE_ME"         # Vercel REST token, DNS-records scope, for the dns_vercel role
+vault_vercel_team_id: ""                      # optional -- only if the domains live in a Vercel team
+vault_stripe_secret_key: ""                   # optional -- only if billing is enabled

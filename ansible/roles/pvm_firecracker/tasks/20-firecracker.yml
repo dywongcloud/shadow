@@ -1,0 +1,69 @@
+---
+# Build the PVM-aware Firecracker. The fork's `main` tracks upstream and the
+# PVM source changes are tiny + surgical, so we re-apply them here idempotently
+# instead of depending on them being committed.
+
+- name: Install rustup + toolchain (user-space, no root toolchain needed)
+  ansible.builtin.shell: |
+    set -e
+    curl -sSf --proto '=https' --tlsv1.2 https://sh.rustup.rs -o /tmp/rustup-init.sh
+    sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+  args:
+    creates: "{{ ansible_env.HOME }}/.cargo/bin/cargo"
+
+- name: Clone the Firecracker fork
+  ansible.builtin.git:
+    repo: "{{ firecracker_repo }}"
+    dest: "{{ firecracker_src }}"
+    version: "{{ firecracker_version }}"
+    depth: 1
+    single_branch: true
+    force: false
+
+# ---- PVM forward-port: change #1 ----------------------------------------
+# Disable per-vCPU TSC scaling. PVM does not support KVM_CAP_TSC_CONTROL, so
+# the upstream call would fail and Firecracker would refuse to boot a guest.
+- name: "PVM patch: make set_tsc_khz() a no-op"
+  ansible.builtin.replace:
+    path: "{{ firecracker_src }}/src/vmm/src/arch/x86_64/vcpu.rs"
+    regexp: 'self\.fd\.set_tsc_khz\(tsc_freq\)\.map_err\(SetTscError\)'
+    replace: '{ let _ = tsc_freq; Ok(()) } // PVM: TSC scaling unsupported'
+
+# ---- PVM forward-port: change #2 ----------------------------------------
+# Relax the static-CPU-template model check so templates work across CPUs.
+# `return Err(InvalidCpuModel);` (note: no enum prefix) is unique to the live
+# code path; the test-only references use GetCpuTemplateError::InvalidCpuModel.
+- name: "PVM patch: relax static CPU-template model check"
+  ansible.builtin.replace:
+    path: "{{ firecracker_src }}/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs"
+    regexp: '^\s*return Err\(InvalidCpuModel\);'
+    replace: '                        { /* PVM: skip CPU-model compatibility check */ }'
+
+# A gnu-target build has no matching seccomp JSON, so Firecracker's build.rs
+# falls back to an empty filter automatically (no libseccomp at runtime).
+- name: Build Firecracker + jailer ({{ fc_target }}, release)
+  ansible.builtin.command:
+    cmd: cargo build --release --target {{ fc_target }} --package firecracker --package jailer
+    chdir: "{{ firecracker_src }}"
+    creates: "{{ firecracker_src }}/build/cargo_target/{{ fc_target }}/release/firecracker"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TERM_PROGRESS_WHEN: "never"
+  async: 1800
+  poll: 20
+
+- name: Install firecracker + jailer binaries
+  ansible.builtin.copy:
+    src: "{{ firecracker_src }}/build/cargo_target/{{ fc_target }}/release/{{ item }}"
+    dest: "{{ pvm_dir }}/{{ item }}"
+    mode: "0755"
+    remote_src: true
+  loop:
+    - firecracker
+    - jailer
+
+- name: Symlink firecracker into PATH
+  ansible.builtin.file:
+    src: "{{ pvm_dir }}/firecracker"
+    dest: /usr/local/bin/firecracker
+    state: link

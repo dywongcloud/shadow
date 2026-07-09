@@ -1,0 +1,43 @@
+---
+# End-to-end proof: boot a Firecracker microVM via PVM (no KVM hardware) and
+# verify the guest is reachable + SSH-able.
+
+- name: Check /dev/kvm is available for the test
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _devkvm_test
+
+- name: Skip smoke test when /dev/kvm is absent
+  ansible.builtin.debug:
+    msg: "Skipping smoke test: /dev/kvm not present (did you run with pvm_reboot=false?)."
+  when: not _devkvm_test.stat.exists
+
+- name: Run microVM smoke test
+  when: _devkvm_test.stat.exists
+  block:
+    - name: Render microVM config
+      ansible.builtin.template:
+        src: vmconfig.json.j2
+        dest: "{{ pvm_dir }}/vmconfig.json"
+        mode: "0644"
+
+    - name: Render run-test script
+      ansible.builtin.template:
+        src: run-test.sh.j2
+        dest: "{{ pvm_dir }}/run-test.sh"
+        mode: "0755"
+
+    - name: Execute end-to-end microVM test
+      ansible.builtin.command: "{{ pvm_dir }}/run-test.sh"
+      register: _smoke
+      changed_when: false
+
+    - name: Show smoke-test result
+      ansible.builtin.debug:
+        var: _smoke.stdout_lines
+
+    - name: Assert the guest booted and was reachable
+      ansible.builtin.assert:
+        that: "'RESULT_GUEST_UP=1' in _smoke.stdout"
+        success_msg: "microVM booted via PVM and the guest is reachable."
+        fail_msg: "microVM did not come up — see the smoke-test output above."

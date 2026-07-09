@@ -1,0 +1,36 @@
+# Copy this file to hosts.ini (gitignored) and fill in real hosts. hosts.ini
+# itself is never committed -- only this .example template is, so the repo
+# never carries real fleet IPs.
+#
+# Groups:
+#   [platform]  every node that runs hive-cloud (all of fc_kvm + fc_pvm)
+#   [fc_kvm]    hosts with REAL hardware /dev/kvm (bare metal, or a cloud VM
+#               with nested virtualization) -- Firecracker runs directly,
+#               no kernel work needed.
+#   [fc_pvm]    hosts WITHOUT hardware KVM (the common case on cloud VMs
+#               that don't expose nested virt) -- Firecracker runs via PVM,
+#               which needs a custom host + guest kernel build per host.
+#
+# A host belongs to exactly one of fc_kvm / fc_pvm, and always to platform.
+
+[platform:children]
+fc_kvm
+fc_pvm
+
+[fc_kvm]
+# bare-metal or nested-virt-enabled hosts; ansible_host = real IP.
+# hive_public_ip is required for this node to be published to DNS
+# (RUNBOOK.md Phase-0 step 4) -- omit it for an internal-only node.
+bkk-example ansible_host=203.0.113.10 ansible_user=root hive_name=fc-example1 hive_region=example-region hive_public_ip=203.0.113.10
+
+[fc_pvm]
+# cloud VMs without hardware KVM -- see roles/pvm_firecracker/README.md
+# for the hard fsgsbase requirement before adding a host here.
+va-example  ansible_host=203.0.113.20 ansible_user=root hive_name=fc-example2 hive_region=example-region-2 hive_public_ip=203.0.113.20
+sj-example  ansible_host=203.0.113.21 ansible_user=root hive_name=fc-example3 hive_region=example-region-2 hive_public_ip=203.0.113.21
+
+[platform:vars]
+ansible_python_interpreter=/usr/bin/python3
+# The control-plane owner chain (comma-separated hive_name values, most-
+# preferred first). See crates/hive-cloud/src/cluster.rs::control_plane_owner.
+hive_cp_owner_chain=fc-example1,fc-example2,fc-example3

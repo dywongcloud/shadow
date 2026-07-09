@@ -1,0 +1,40 @@
+---
+# DNS + TLS ingress via Vercel DNS + ACME DNS-01, matching RUNBOOK.md's
+# Phase 0 exactly. Only meaningful on hosts meant to be leader-capable /
+# publicly reachable (HIVE_PUBLIC_IP set) -- run this role against the
+# whole [platform] group; nodes without a public IP simply never get
+# published to DNS (safe no-op from the platform's own side).
+
+- name: Assert this host has a public IP configured (RUNBOOK.md Phase-0 step 4)
+  ansible.builtin.assert:
+    that: hive_public_ip is defined and hive_public_ip | length > 0
+    fail_msg: >-
+      hive_public_ip is not set for {{ hive_name }} (inventory hostvar).
+      Nodes without it are never published to DNS -- set it explicitly if
+      this host should be reachable, or skip this role for internal-only
+      nodes.
+  when: hive_ingress_enabled | default(true)
+
+- name: Open 80/443 (public ingress) -- redundant with prerequisites but explicit here since this role can run standalone
+  ansible.posix.firewalld:
+    port: "{{ item }}"
+    permanent: true
+    immediate: true
+    state: enabled
+  loop:
+    - "80/tcp"
+    - "443/tcp"
+  when: hive_ingress_enabled | default(true)
+
+- name: Ensure the systemd drop-in directory exists
+  ansible.builtin.file:
+    path: /etc/systemd/system/hive-node.service.d
+    state: directory
+    mode: "0755"
+
+- name: Template the ingress systemd drop-in (RUNBOOK.md Phase-0 step 6)
+  ansible.builtin.template:
+    src: ingress.conf.j2
+    dest: /etc/systemd/system/hive-node.service.d/ingress.conf
+    mode: "0644"
+  notify: [reload systemd, restart hive-node]

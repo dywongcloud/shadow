@@ -1,0 +1,41 @@
+#!/bin/bash
+# {{ ansible_managed }}
+# Boot a Firecracker microVM via PVM and prove the guest is up.
+set -u
+GUEST="{{ vm_guest_ip }}"; TAP="{{ vm_tap_dev }}"
+FCBIN="{{ pvm_dir }}/firecracker"; KEY="{{ pvm_dir }}/id_rsa"
+
+echo "host kernel: $(uname -r)"
+modprobe kvm-pvm 2>/dev/null
+if [ ! -e /dev/kvm ]; then echo "RESULT_DEVKVM=MISSING"; exit 1; fi
+echo "RESULT_DEVKVM=PRESENT"
+
+# host tap networking
+ip link del "$TAP" 2>/dev/null || true
+ip tuntap add dev "$TAP" mode tap
+ip addr add {{ vm_host_ip }}/24 dev "$TAP"
+ip link set "$TAP" up
+echo 1 > /proc/sys/net/ipv4/ip_forward
+iptables -P FORWARD ACCEPT 2>/dev/null || true
+chmod 600 "$KEY"
+
+cd "{{ pvm_dir }}"
+rm -f /tmp/fc.sock fc-console.log
+setsid "$FCBIN" --api-sock /tmp/fc.sock --config-file "{{ pvm_dir }}/vmconfig.json" \
+    >"{{ pvm_dir }}/fc-console.log" 2>&1 </dev/null &
+FCPID=$!
+
+UP=0
+for i in $(seq 1 30); do
+  sleep 2
+  if ping -c1 -W1 "$GUEST" >/dev/null 2>&1; then UP=1; echo "guest up after $((i*2))s"; break; fi
+  kill -0 "$FCPID" 2>/dev/null || { echo "firecracker exited early"; break; }
+done
+
+if [ "$UP" = 1 ]; then
+  ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 \
+      -i "$KEY" root@"$GUEST" 'echo GUEST_UNAME=$(uname -a); echo GUEST_BOOT_OK=1' 2>&1
+fi
+echo "RESULT_GUEST_UP=$UP"
+tail -20 "{{ pvm_dir }}/fc-console.log"
+kill "$FCPID" 2>/dev/null || true

@@ -1,0 +1,39 @@
+---
+# Read a running node's own iroh endpoint id from its /v1/nodes self-entry.
+# Used by playbooks/node-join.yml to learn a freshly-joined node's id so it
+# can be pushed into every other node's HIVE_TRUSTED_NODE_IDS (only matters
+# when hive_peer_trust_enabled -- the default self-admit path needs none of
+# this).
+
+- name: Mint a short-lived operator token (server-only, x-hive-internal)
+  ansible.builtin.uri:
+    url: "http://{{ hive_admin }}/v1/token"
+    method: POST
+    headers:
+      x-hive-internal: "{{ vault_hive_internal_token }}"
+    body_format: json
+    body:
+      sub: "{{ hive_owner_email }}"
+      tenant: "personal"
+      role: "owner"
+      email: "{{ hive_owner_email }}"
+    status_code: 200
+  register: _mint
+
+- name: Fetch this node's own /v1/nodes entry
+  ansible.builtin.uri:
+    url: "http://{{ hive_admin }}/v1/nodes"
+    method: GET
+    headers:
+      Authorization: "Bearer {{ _mint.json.token }}"
+    status_code: 200
+  register: _nodes
+
+- name: Extract this node's iroh endpoint id
+  ansible.builtin.set_fact:
+    captured_iroh_id: >-
+      {{ ((_nodes.json | selectattr('name', 'equalto', hive_name) | first).iroh_addr | from_json).id }}
+
+- name: Report captured id
+  ansible.builtin.debug:
+    msg: "{{ hive_name }} iroh endpoint id: {{ captured_iroh_id }}"

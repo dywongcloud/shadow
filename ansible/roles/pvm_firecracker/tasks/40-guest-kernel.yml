@@ -1,0 +1,48 @@
+---
+# Build the PVM guest kernel (a single uncompressed vmlinux ELF that Firecracker
+# boots directly). Uses a SEPARATE clone so it doesn't clash with the in-tree
+# host-kernel build objects.
+
+- name: Clone PVM guest kernel source (separate tree)
+  ansible.builtin.git:
+    repo: "{{ pvm_linux_repo }}"
+    dest: "{{ guest_kernel_src }}"
+    version: "{{ pvm_linux_branch }}"
+    depth: 1
+    single_branch: true
+    force: false
+
+- name: Download the canonical PVM guest kernel config
+  ansible.builtin.get_url:
+    url: "{{ pvm_guest_config_url }}"
+    dest: "{{ build_root }}/pvm-guest.config"
+    mode: "0644"
+
+- name: "Configure guest kernel (FC-ready virtio/ext4/serial built-in, PVM_GUEST=y)"
+  ansible.builtin.shell:
+    chdir: "{{ guest_kernel_src }}"
+    cmd: |
+      set -euo pipefail
+      cp {{ build_root }}/pvm-guest.config .config
+      scripts/config --enable   PVM_GUEST
+      scripts/config --enable   KVM_GUEST
+      scripts/config --disable  UAPI_HEADER_TEST
+      scripts/config --set-str  SYSTEM_TRUSTED_KEYS ""
+      scripts/config --set-str  SYSTEM_REVOCATION_KEYS ""
+      scripts/config --set-str  LOCALVERSION "{{ guest_localversion }}"
+      make olddefconfig
+  args:
+    creates: "{{ guest_kernel_src }}/.config"
+
+- name: Build guest vmlinux (long-running)
+  ansible.builtin.command:
+    cmd: make -j{{ make_jobs }} vmlinux
+    chdir: "{{ guest_kernel_src }}"
+    creates: "{{ guest_kernel_src }}/vmlinux"
+  async: 3600
+  poll: 30
+
+- name: Strip + install guest vmlinux
+  ansible.builtin.command:
+    cmd: objcopy --strip-debug "{{ guest_kernel_src }}/vmlinux" "{{ pvm_dir }}/vmlinux-pvm"
+    creates: "{{ pvm_dir }}/vmlinux-pvm"

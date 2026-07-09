@@ -1,0 +1,78 @@
+---
+# Fleet-wide defaults for every hive-cloud node. Override per-host in
+# hosts.ini (hive_name/hive_region) or per-group in group_vars/fc_kvm.yml /
+# group_vars/fc_pvm.yml. Secrets referenced here (vault_*) live in
+# group_vars/vault.yml, which is ansible-vault encrypted and gitignored --
+# see roles/README's Secrets section. This file documents every var this
+# repo's own fleet actually runs with; it is not the full set the codebase
+# recognizes (grep crates/hive-cloud/src/*.rs for `std::env::var("HIVE_` for
+# the exhaustive list if you need something not templated here).
+
+# ---------- Repo / build ----------
+hive_repo_url: "https://github.com/your-org/hive.git"   # or a private mirror
+hive_repo_ref: "main"
+hive_src_dir: "/root/hive"                                # flat (non-crates/-prefixed) layout mirrors fc-bangkok
+hive_cargo_target_dir: "/root/fc-target"                   # matches the fc_pvm hosts' convention; fc_kvm hosts can use hive_src_dir/target
+hive_binary_path: "{{ hive_cargo_target_dir }}/release/hive-cloud"
+hive_data_dir: "/var/lib/hive/data"
+
+# ---------- Identity / mesh ----------
+# hive_name and hive_region come from inventory (per-host vars).
+hive_listen: "0.0.0.0:8787"
+hive_admin: "127.0.0.1:8786"
+# HIVE_BOOTSTRAP_PEERS: one existing node's 64-hex iroh NodeId is enough for
+# a NEW node to join (see roles/mesh_bootstrap and playbooks/node-join.yml).
+# For a from-scratch fleet, leave the first node's bootstrap_peers empty.
+hive_bootstrap_peers: ""
+hive_discovery_dns: ""     # comma-separated http://<ip>:3350 of discovery-capable nodes
+hive_relay_urls: ""        # comma-separated http://<ip>:3340 of self-hosted iroh relays
+hive_discovery_n0: "0"     # 0 = opt out of public n0 discovery, use self-hosted only (fleet default)
+hive_gossip_iroh: "1"
+hive_gossip_sign: "1"
+hive_gossip_verify: "enforce"
+
+# Opt-in static peer-trust allowlist (see roles/mesh_bootstrap). Off by
+# default; the join-proof self-admit mechanism (RUNBOOK.md) is sufficient
+# for most fleets. Turn on only if you need an explicit pre-authorized list.
+hive_peer_trust_enabled: false
+hive_trusted_node_ids: []   # populated automatically by node-join.yml when enabled
+
+# ---------- Control plane ----------
+hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
+# hive_cp_owner_chain comes from inventory [platform:vars].
+
+# ---------- Ingress / domains ----------
+hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode
+hive_platform_domain: "shadw.cloud"
+hive_apps_domain: "shadw.app"
+hive_deploy_zone: "deploy.{{ hive_apps_domain }}"
+hive_public_dashboard_url: "https://{{ hive_platform_domain }}"
+hive_dashboard_url: "http://localhost:3002"
+hive_http_listen: "0.0.0.0:80"
+hive_https_listen: "0.0.0.0:443"
+hive_tls_addr: "127.0.0.1:8443"
+hive_dns_addr: "127.0.0.1:5354"
+hive_dns_leader_node: "{{ hive_cp_owner_chain.split(',')[0] }}"
+
+# ---------- DNS (Vercel) / ACME ----------
+hive_acme_email: "ops@{{ hive_platform_domain }}"
+hive_acme_staging: "1"     # 1 = Let's Encrypt staging (KEEP during setup/testing; prod has a 5-cert/week limit)
+hive_ingress_enabled: true  # set false per-host (hosts.ini) for an internal-only node never published to DNS
+# hive_public_ip / hive_public_ip6: NOT defaulted here -- set per-host in
+# hosts.ini for every node that should be published to DNS (RUNBOOK.md
+# Phase-0 step 4: a node without hive_public_ip is never published).
+
+# ---------- Extra --peer args (rarely needed -- HIVE_BOOTSTRAP_PEERS/
+# HIVE_DISCOVERY_DNS handle normal mesh join; this is for the SSH-tunnel-
+# bridged --peer http://127.0.0.1:<port> pattern used when admin ports
+# aren't directly reachable across hosts) ----------
+hive_extra_peers: []
+
+# ---------- Container runtime ----------
+hive_container_runtime: "runc"   # bkk/fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
+
+# ---------- Owner ----------
+hive_owner_email: "ops@{{ hive_platform_domain }}"
+
+# ---------- RUST_LOG ----------
+hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"

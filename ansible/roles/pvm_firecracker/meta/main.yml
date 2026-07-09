@@ -1,0 +1,17 @@
+---
+galaxy_info:
+  role_name: pvm_firecracker
+  author: deployment
+  description: Run Firecracker microVMs without KVM using PVM on regular cloud VMs.
+  license: Apache-2.0
+  min_ansible_version: "2.14"
+  platforms:
+    - name: EL
+      versions:
+        - "10"
+  galaxy_tags:
+    - firecracker
+    - pvm
+    - virtualization
+    - microvm
+dependencies: []

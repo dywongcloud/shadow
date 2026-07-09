@@ -1,0 +1,47 @@
+---
+# PVM has hard requirements. Fail loudly NOW rather than after a 30-minute build.
+
+- name: Require x86_64
+  ansible.builtin.assert:
+    that: ansible_architecture == "x86_64"
+    fail_msg: "PVM is x86_64-only (found {{ ansible_architecture }})."
+
+- name: Require a RHEL-family distro (Rocky/Alma/RHEL 10 tested)
+  ansible.builtin.assert:
+    that: ansible_os_family == "RedHat"
+    fail_msg: "This role targets the RHEL family (found {{ ansible_distribution }})."
+
+- name: Read CPU flags
+  ansible.builtin.command: grep -m1 '^flags' /proc/cpuinfo
+  register: cpuflags
+  changed_when: false
+
+- name: >-
+    Require FSGSBASE (the show-stopper). PVM's kvm-pvm module refuses to load
+    without it, and a cloud host that hides it from guest CPUID cannot run PVM.
+  ansible.builtin.assert:
+    that: "'fsgsbase' in cpuflags.stdout"
+    fail_msg: >-
+      This VM's vCPU does NOT expose `fsgsbase`, so PVM cannot run here.
+      Move to an instance type / CPU model that exposes it
+      (verify with: grep -o fsgsbase /proc/cpuinfo).
+    success_msg: "FSGSBASE present — PVM is viable on this host."
+
+- name: Detect pre-existing /dev/kvm (real KVM present — PVM not strictly needed)
+  ansible.builtin.stat:
+    path: /dev/kvm
+  register: _preexisting_kvm
+
+- name: Note if hardware KVM is already available
+  ansible.builtin.debug:
+    msg: "Note: /dev/kvm already exists; this host may have real KVM and not need PVM."
+  when: _preexisting_kvm.stat.exists
+
+- name: Ensure working directories exist
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop:
+    - "{{ build_root }}"
+    - "{{ pvm_dir }}"

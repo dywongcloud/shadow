@@ -1,0 +1,28 @@
+---
+# Build an ext4 rootfs for the microVM from the Firecracker CI Ubuntu image,
+# with an SSH key injected so the smoke test can log in.
+
+- name: Download Ubuntu rootfs (squashfs)
+  ansible.builtin.get_url:
+    url: "{{ rootfs_squashfs_url }}"
+    dest: "{{ build_root }}/rootfs.squashfs"
+    mode: "0644"
+
+- name: Generate guest SSH keypair
+  ansible.builtin.command:
+    cmd: ssh-keygen -t ed25519 -N "" -f "{{ pvm_dir }}/id_rsa"
+    creates: "{{ pvm_dir }}/id_rsa"
+
+- name: Build ext4 rootfs with the key injected
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      rm -rf "{{ build_root }}/squashfs-root"
+      unsquashfs -q -d "{{ build_root }}/squashfs-root" "{{ build_root }}/rootfs.squashfs"
+      mkdir -p "{{ build_root }}/squashfs-root/root/.ssh"
+      cp "{{ pvm_dir }}/id_rsa.pub" "{{ build_root }}/squashfs-root/root/.ssh/authorized_keys"
+      chown -R root:root "{{ build_root }}/squashfs-root"
+      truncate -s {{ rootfs_size }} "{{ pvm_dir }}/rootfs.ext4"
+      mkfs.ext4 -q -F -d "{{ build_root }}/squashfs-root" "{{ pvm_dir }}/rootfs.ext4"
+  args:
+    creates: "{{ pvm_dir }}/rootfs.ext4"

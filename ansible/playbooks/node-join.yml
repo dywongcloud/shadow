@@ -1,0 +1,110 @@
+---
+# Day-2: onboard ONE new node and, if the fleet runs the opt-in static
+# peer-trust allowlist, push its iroh id into every OTHER existing node's
+# HIVE_TRUSTED_NODE_IDS. This mirrors, verb for verb, the manual procedure
+# this project's own sessions used to bring a new node online: sync+build,
+# join the mesh, then (only if HIVE_PEER_TRUST=1) fix the exact gap a real
+# session hit -- a new node's id missing from every OTHER node's allowlist,
+# which silently rejects its gossip even though the new node's OWN view of
+# the mesh looks healthy.
+#
+# Usage:
+#   1. Add the new host to inventory/hosts.ini under [fc_kvm] or [fc_pvm].
+#   2. ansible-playbook playbooks/node-join.yml -e new_node=<inventory_hostname>
+#
+# If the fleet does NOT use HIVE_PEER_TRUST (the default -- join-proof
+# self-admit handles everything), this playbook still provisions the node
+# fully; it just skips the allowlist-propagation play (nothing to do).
+
+- name: Fail fast without a valid target
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: Assert new_node was passed
+      ansible.builtin.assert:
+        that: new_node is defined
+        fail_msg: "Usage: ansible-playbook playbooks/node-join.yml -e new_node=<inventory_hostname>"
+
+    - name: >-
+        Assert new_node is a REAL inventory hostname in [fc_kvm] or [fc_pvm]
+        -- a typo here would otherwise silently match zero hosts through
+        every provisioning play ("skipping: no hosts matched", easy to miss
+        in scroll-back) and only surface as a confusing undefined-variable
+        error much later, in the allowlist-propagation play.
+      ansible.builtin.assert:
+        that: new_node in (groups['fc_kvm'] + groups['fc_pvm'])
+        fail_msg: >-
+          '{{ new_node }}' is not in inventory under [fc_kvm] or [fc_pvm].
+          Add it to hosts.ini first. Known hosts:
+          {{ groups['fc_kvm'] + groups['fc_pvm'] }}
+
+- name: Provision the new node -- prerequisites
+  hosts: "{{ new_node }}"
+  become: true
+  gather_facts: true
+  roles:
+    - role: prerequisites
+
+- name: Provision the new node -- Firecracker (real KVM)
+  hosts: "{{ new_node }}"
+  become: true
+  roles:
+    - role: firecracker_kvm
+      when: "'fc_kvm' in group_names"
+
+- name: Provision the new node -- Firecracker (PVM)
+  hosts: "{{ new_node }}"
+  become: true
+  roles:
+    - role: pvm_firecracker
+      when: "'fc_pvm' in group_names"
+
+- name: Provision the new node -- hive-cloud platform binary + service
+  hosts: "{{ new_node }}"
+  become: true
+  roles:
+    - role: hive_platform
+
+- name: Provision the new node -- DNS / TLS ingress
+  hosts: "{{ new_node }}"
+  become: true
+  roles:
+    - role: dns_vercel
+
+- name: Capture the new node's iroh endpoint id
+  hosts: "{{ new_node }}"
+  become: true
+  tasks:
+    - ansible.builtin.include_role:
+        name: mesh_bootstrap
+        tasks_from: capture_id
+
+- name: Propagate the new node's id to every OTHER node's peer-trust allowlist
+  hosts: platform:!{{ new_node }}
+  become: true
+  serial: 1
+  vars:
+    # unique keeps this idempotent -- re-running node-join.yml for the same
+    # new_node (or after a partial failure) must not accumulate duplicate
+    # entries in HIVE_TRUSTED_NODE_IDS on every re-run.
+    hive_trusted_node_ids: "{{ ((hive_trusted_node_ids | default([])) + [hostvars[new_node].captured_iroh_id]) | unique }}"
+  tasks:
+    - name: Update peer-trust.conf on this existing node
+      ansible.builtin.include_role:
+        name: mesh_bootstrap
+      when: hive_peer_trust_enabled | bool
+
+    - name: Flush handlers (restart hive-node with the new allowlist)
+      ansible.builtin.meta: flush_handlers
+      when: hive_peer_trust_enabled | bool
+
+    - name: "Health-check this node before moving to the next (serial: 1 keeps quorum)"
+      ansible.builtin.uri:
+        url: "http://{{ hive_admin }}/v1/mesh"
+        method: GET
+        status_code: 200
+      register: _mesh
+      retries: 12
+      delay: 5
+      until: _mesh.status == 200
+      when: hive_peer_trust_enabled | bool

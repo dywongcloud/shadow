@@ -1,0 +1,4 @@
+# {{ ansible_managed }}
+[Service]
+Environment=HIVE_TRUSTED_NODE_IDS={{ hive_trusted_node_ids | join(',') }}
+Environment=HIVE_PEER_TRUST=1

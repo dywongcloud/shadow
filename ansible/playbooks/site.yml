@@ -1,0 +1,58 @@
+---
+# End-to-end fleet deployment: prerequisites -> Firecracker (KVM or PVM,
+# chosen per-host by inventory group) -> the hive-cloud platform binary ->
+# mesh trust config -> DNS/TLS ingress.
+#
+# Usage:
+#   ansible-playbook playbooks/site.yml
+#   ansible-playbook playbooks/site.yml --limit fc_pvm         # one flavor only
+#   ansible-playbook playbooks/site.yml --tags hive_platform    # redeploy code only (see also platbooks/platform-only.yml)
+#   ansible-playbook playbooks/site.yml --tags pvm_firecracker -e pvm_reboot=false
+#
+# Every role is independently idempotent (see each role's own tasks) so a
+# partial re-run after a failure picks up where it left off rather than
+# redoing expensive work (kernel/Firecracker/hive-cloud builds all guard on
+# `creates:`).
+
+- name: Base OS prerequisites
+  hosts: platform
+  become: true
+  gather_facts: true
+  roles:
+    - role: prerequisites
+      tags: [prerequisites]
+
+- name: Firecracker (real hardware KVM)
+  hosts: fc_kvm
+  become: true
+  roles:
+    - role: firecracker_kvm
+      tags: [firecracker, firecracker_kvm]
+
+- name: Firecracker (PVM, no hardware KVM)
+  hosts: fc_pvm
+  become: true
+  roles:
+    - role: pvm_firecracker
+      tags: [firecracker, pvm_firecracker]
+
+- name: hive-cloud platform binary + service
+  hosts: platform
+  become: true
+  roles:
+    - role: hive_platform
+      tags: [hive_platform, platform]
+
+- name: Mesh trust configuration
+  hosts: platform
+  become: true
+  roles:
+    - role: mesh_bootstrap
+      tags: [mesh_bootstrap, mesh]
+
+- name: DNS / TLS ingress (Vercel)
+  hosts: platform
+  become: true
+  roles:
+    - role: dns_vercel
+      tags: [dns_vercel, dns]

@@ -1,0 +1,50 @@
+# {{ ansible_managed }}
+[Unit]
+Description=shadw hive-cloud node ({{ hive_name }}, region {{ hive_region }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Environment=HIVE_CONTAINER_RUNTIME={{ hive_container_runtime }}
+Environment=RUST_LOG={{ hive_rust_log }}
+Environment=HIVE_DATA={{ hive_data_dir }}
+Environment=HOME={{ ansible_env.HOME | default('/root') }}
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{{ ansible_env.HOME | default('/root') }}/.cargo/bin
+Environment=HIVE_PUBLIC_DASHBOARD_URL={{ hive_public_dashboard_url }}
+Environment=HIVE_DASHBOARD_URL={{ hive_dashboard_url }}
+Environment=HIVE_APPS_DOMAIN={{ hive_apps_domain }}
+Environment=HIVE_PLATFORM_DOMAIN={{ hive_platform_domain }}
+Environment=HIVE_DEPLOY_ZONE={{ hive_deploy_zone }}
+Environment=HIVE_CP_LEADER={{ hive_cp_leader }}
+Environment=HIVE_CP_OWNER_CHAIN={{ hive_cp_owner_chain }}
+Environment=HIVE_GOSSIP_IROH={{ hive_gossip_iroh }}
+Environment=HIVE_GOSSIP_SIGN={{ hive_gossip_sign }}
+Environment=HIVE_GOSSIP_VERIFY={{ hive_gossip_verify }}
+Environment=HIVE_DISCOVERY_N0={{ hive_discovery_n0 }}
+{% if hive_discovery_dns %}
+Environment=HIVE_DISCOVERY_DNS={{ hive_discovery_dns }}
+{% endif %}
+{% if hive_relay_urls %}
+Environment=HIVE_RELAY_URLS={{ hive_relay_urls }}
+{% endif %}
+{% if hive_bootstrap_peers %}
+Environment=HIVE_BOOTSTRAP_PEERS={{ hive_bootstrap_peers }}
+{% endif %}
+{% if hive_fc_boot_args is defined %}
+Environment="HIVE_FC_BOOT_ARGS={{ hive_fc_boot_args }}"
+{% endif %}
+Environment=HIVE_OWNER_EMAIL={{ hive_owner_email }}
+Environment=HIVE_JWT_SECRET={{ vault_hive_jwt_secret }}
+Environment=HIVE_INTERNAL_TOKEN={{ vault_hive_internal_token }}
+{% if vault_stripe_secret_key %}
+Environment=STRIPE_SECRET_KEY={{ vault_stripe_secret_key }}
+{% endif %}
+ExecStart={{ hive_binary_path }} --region {{ hive_region }} --name {{ hive_name }} --listen {{ hive_listen }} --admin {{ hive_admin }}{% for p in (hive_extra_peers | default([])) %} --peer {{ p }}{% endfor %}
+
+WorkingDirectory={{ hive_src_dir }}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
