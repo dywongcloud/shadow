@@ -80,7 +80,7 @@ export function CommandBar() {
       ["Integrations", "/integrations", <Plug key="i" className={ic} />],
       ["Domains", "/domains", <Globe2 key="d" className={ic} />],
       ["Firewall", "/firewall", <ShieldHalf key="f" className={ic} />],
-      ["Network", "/network", <Network key="n" className={ic} />],
+      ["Constellation", "/network", <Network key="n" className={ic} />],
       ["Usage", "/usage", <BarChart3 key="u" className={ic} />],
       ["Billing", "/billing", <CreditCard key="b" className={ic} />],
       ["Settings", "/settings", <Settings key="se" className={ic} />],

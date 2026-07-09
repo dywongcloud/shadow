@@ -26,7 +26,7 @@ const teamTabs = [
   { href: "/integrations", label: "Integrations" },
   { href: "/domains", label: "Domains" },
   { href: "/firewall", label: "Firewall" },
-  { href: "/network", label: "Network" },
+  { href: "/network", label: "Constellation" },
   { href: "/usage", label: "Usage" },
   { href: "/billing", label: "Billing" },
   { href: "/settings", label: "Settings" },

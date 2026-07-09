@@ -19,7 +19,7 @@ export default function NetworkPage() {
   return (
     <div>
       <PageHeader
-        title="Network"
+        title="Constellation"
         desc="Your nodes form a peer-to-peer mesh over iroh QUIC. Gateways reach instances by endpoint id — no public IPs, NAT traversal and relay fallback handled automatically."
       />
 
