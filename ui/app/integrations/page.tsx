@@ -40,7 +40,7 @@ function ToolkitLogo({ tk }: { tk: Toolkit }) {
     return (
       <span className={wrap}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={tk.logo} alt={tk.name} className="h-8 w-8 object-contain" onError={() => setBroken(true)} />
+        <img src={tk.logo} alt={tk.name} loading="lazy" className="h-8 w-8 object-contain" onError={() => setBroken(true)} />
       </span>
     );
   }

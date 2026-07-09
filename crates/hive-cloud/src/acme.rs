@@ -351,21 +351,19 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
             // Jittered interval: 5–7h.
             let jitter = (hive_core::now_ms() % 7200) as u64;
             let sleep = 5 * 3600 + jitter;
-            // Routed through billing_leader_with_pref (the SAME health- and
-            // addressability-validated pattern HIVE_CP_LEADER uses), not a raw
-            // env check: an unguarded pin here has no auto-fallback at all — if
-            // the pinned node ever goes unhealthy or unreachable, ACME/DNS work
-            // freezes silently (renewal misses only surface ~60-90d later at
-            // expiry). When HIVE_DNS_LEADER_NODE is unset, fall through to the
-            // control-plane election itself (billing_leader, which honors
-            // HIVE_CP_LEADER) rather than an unrelated raw election — so DNS/ACME
-            // agrees with control-plane writes on who's authoritative unless an
-            // operator deliberately splits them.
+            // Same single-writer resolution as admin mutations and the billing
+            // meter (owner chain first, health+addressability gated; identity
+            // election fallback) — all four roles sit on ONE designation so the
+            // HIVE_CP_LEADER-vs-HIVE_DNS_LEADER_NODE drift class is structurally
+            // closed (proposal step 6). `HIVE_DNS_LEADER_NODE` remains honored
+            // as a deliberate LEGACY split-pin: when set it takes the pref slot
+            // on the fallback path (health-gated, never a raw unguarded check —
+            // an unguarded pin freezes ACME silently until certs expire).
             let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
-            let leader = match dns_pref {
-                Some(p) => crate::cluster::Cluster::billing_leader_with_pref(Some(&p), &cloud.registry.nodes()),
-                None => crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()),
-            };
+            let chain = crate::cluster::Cluster::owner_chain_from_env();
+            let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
+            let leader =
+                crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &cloud.registry.nodes());
             if leader.as_deref() == Some(cloud.node_name.as_str()) {
                 for (bundle, names, zone) in bundles(&cloud) {
                     // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`

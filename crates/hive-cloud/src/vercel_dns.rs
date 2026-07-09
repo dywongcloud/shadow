@@ -412,22 +412,19 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 let extra = (interval << backoff.min(4)).min(300);
                 tokio::time::sleep(std::time::Duration::from_secs(extra.saturating_sub(interval))).await;
             }
-            // Leader-only (auto-failover with the same election as billing).
-            // `HIVE_DNS_LEADER_NODE` pins the acting node — needed while the
-            // election spans ngrok-mode nodes whose reconciler is dormant.
-            // Routed through billing_leader_with_pref (health + addressability
-            // validated, matching HIVE_CP_LEADER) rather than a raw env check —
-            // an unguarded pin has no auto-fallback: if the pinned node dies,
-            // published DNS records silently freeze (never publish-empty is a
-            // deliberate safety property, but it also masks the freeze). When
-            // unset, falls through to the control-plane election itself
-            // (honors HIVE_CP_LEADER) so DNS agrees with control-plane writes
-            // on who's authoritative unless an operator deliberately splits them.
+            // Same single-writer resolution as admin mutations, ACME and the
+            // billing meter (owner chain first, health+addressability gated;
+            // identity election fallback) — one designation for every
+            // single-writer role, structurally closing the CP-vs-DNS pin drift
+            // (proposal step 6). `HIVE_DNS_LEADER_NODE` remains honored as a
+            // deliberate LEGACY split-pin on the fallback path (health-gated,
+            // never a raw unguarded check — an unguarded pin silently freezes
+            // published DNS if the pinned node dies).
             let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
-            let leader = match dns_pref {
-                Some(p) => crate::cluster::Cluster::billing_leader_with_pref(Some(&p), &cloud.registry.nodes()),
-                None => crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()),
-            };
+            let chain = crate::cluster::Cluster::owner_chain_from_env();
+            let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
+            let leader =
+                crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &cloud.registry.nodes());
             if leader.as_deref() != Some(cloud.node_name.as_str()) {
                 continue;
             }

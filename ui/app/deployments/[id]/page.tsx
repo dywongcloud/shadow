@@ -11,7 +11,7 @@ import { Button, Card, Badge } from "@/components/ui";
 import { BuildLogs } from "@/components/build-logs";
 import { ProjectWorkflows } from "@/components/workflows";
 import { RedeployModal } from "@/components/redeploy-modal";
-import { apiSend, usePoll, type Deployment, type Build } from "@/lib/api";
+import { apiSend, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
@@ -58,7 +58,10 @@ function DeploymentDetail({ id }: { id: string }) {
   const tab = searchParams.get("tab");
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   // The build behind this deployment (logs/timing/error). 404s until one exists.
-  const { data: build } = usePoll<Build>(`/v1/deployments/${encodeURIComponent(id)}/build`, 2000);
+  // `error` is surfaced (below the panel) so a fetch/proxy failure is
+  // distinguishable from "this deployment genuinely has no build record" —
+  // previously both rendered the identical "No logs." dead end.
+  const { data: build, error: buildError } = usePoll<Build>(`/v1/deployments/${encodeURIComponent(id)}/build`, 2000);
   const [redeploy, setRedeploy] = useState(false);
   const [busy, setBusy] = useState(false);
 
@@ -108,6 +111,16 @@ function DeploymentDetail({ id }: { id: string }) {
         // the same component the project page uses).
         dep ? (
           <ProjectWorkflows project={dep.project} />
+        ) : (
+          <div className="text-sm text-secondary">Loading…</div>
+        )
+      ) : tab === "logs" ? (
+        // Request-logs scope-tab: THIS deployment's own traffic (its immutable
+        // id/commit URLs plus whichever aliases it held when requests landed) —
+        // server-scoped via the `deployment` filter, never client-filtered.
+        // This tab existed in the top nav but rendered the overview before.
+        dep ? (
+          <DeploymentRequestLogs project={dep.project} deployment={id} />
         ) : (
           <div className="text-sm text-secondary">Loading…</div>
         )
@@ -231,7 +244,9 @@ function DeploymentDetail({ id }: { id: string }) {
 
       {!build && (
         <p className="mt-3 text-center text-xs text-muted">
-          No build record found for this deployment on this node.
+          {buildError
+            ? `Build logs unavailable: ${buildError.includes("404") ? "no build record found for this deployment (builds recorded before the last platform update are not retained)" : buildError}`
+            : "No build record found for this deployment on this node."}
         </p>
       )}
       </>
@@ -246,6 +261,71 @@ function DeploymentDetail({ id }: { id: string }) {
         />
       )}
     </div>
+  );
+}
+
+/** Request logs scoped to ONE deployment (`?tab=logs`). The server does the
+ * scoping (`deployment` filter: events tagged with this deployment id at
+ * record time, plus its immutable id-alias host) — the client renders exactly
+ * what it gets, same columns as the project logs view. */
+function DeploymentRequestLogs({ project, deployment }: { project: string; deployment: string }) {
+  const { data: events, error, loading } = usePoll<Event[]>(
+    `/v1/logs?limit=200&project=${encodeURIComponent(project)}&deployment=${encodeURIComponent(deployment)}`,
+    5000,
+  );
+  const fmt = (ms: number) => {
+    const d = new Date(ms);
+    return d
+      .toLocaleString("en-US", { month: "short", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
+      .toUpperCase();
+  };
+  return (
+    <Card className="p-0">
+      <div className="border-b border-border px-4 py-3">
+        <h2 className="text-sm font-semibold">Request Logs</h2>
+        <p className="mt-0.5 text-xs text-muted">
+          Traffic served by this deployment (its own URLs, scoped server-side).
+        </p>
+      </div>
+      {error ? (
+        <div className="px-4 py-8 text-center text-sm text-red-500">Failed to load logs: {error}</div>
+      ) : loading && !events ? (
+        <div className="flex items-center justify-center gap-2 px-4 py-8 text-sm text-secondary">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading logs…
+        </div>
+      ) : !events || events.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-muted">
+          No requests recorded for this deployment yet.
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead>
+              <tr className="border-b border-border text-xs uppercase tracking-wide text-muted">
+                <th className="px-4 py-2 font-medium">Time</th>
+                <th className="px-4 py-2 font-medium">Status</th>
+                <th className="px-4 py-2 font-medium">Host</th>
+                <th className="px-4 py-2 font-medium">Request</th>
+              </tr>
+            </thead>
+            <tbody>
+              {events.map((e, i) => (
+                <tr key={`${e.ts_ms}-${i}`} className="border-b border-border/60 font-mono text-xs">
+                  <td className="whitespace-nowrap px-4 py-2 text-secondary">{fmt(e.ts_ms)}</td>
+                  <td className="whitespace-nowrap px-4 py-2">
+                    <span className={e.status >= 500 ? "text-red-500" : e.status >= 400 ? "text-amber-500" : "text-green"}>
+                      {e.method} {e.status}
+                    </span>
+                  </td>
+                  <td className="whitespace-nowrap px-4 py-2 text-secondary">{e.host}</td>
+                  <td className="max-w-[320px] truncate px-4 py-2">{e.path}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
   );
 }
 

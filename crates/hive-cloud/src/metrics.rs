@@ -373,6 +373,7 @@ mod tests {
             action: "allow".into(),
             detail: String::new(),
             project: project.into(),
+            deployment: String::new(),
             request_id: String::new(),
         }
     }

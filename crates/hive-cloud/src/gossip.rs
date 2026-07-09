@@ -273,6 +273,7 @@ fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LimitQ> {
     axum::extract::Query(crate::admin::LimitQ {
         limit: qparam(path, "limit").and_then(|v| v.parse().ok()),
         project: qparam(path, "project"),
+        deployment: qparam(path, "deployment"),
         q: qparam(path, "q"),
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
     })
@@ -367,6 +368,7 @@ fn wf_query(path: &str) -> axum::extract::Query<crate::admin::WfQuery> {
     axum::extract::Query(crate::admin::WfQuery {
         project: qparam(path, "project"),
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
+        summary: qparam(path, "summary").map(|v| v == "true" || v == "1"),
     })
 }
 

@@ -279,6 +279,9 @@ async fn main() -> anyhow::Result<()> {
         // registry.set_self_guardian_addr() once guardian::my_iroh_addr()
         // resolves (best-effort, usually within the first couple of rounds).
         guardian_iroh_addr: None,
+        // Boot value; the gossip loop refreshes this every round from the
+        // cluster's observed-owner epoch (registry.set_self_cp_epoch).
+        cp_epoch: 1,
         last_seen_ms: now_ms(),
         is_self: true,
         latency_ms: 0,
@@ -453,8 +456,10 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join surface on)");
     }
 
-    // Initial cluster reconcile (single-node: this node is leader).
-    cloud.cluster.reconcile(cloud.registry.nodes().into_iter().map(|n| n.id).collect());
+    // Initial owner resolution (single-node: this node is owner) + seed the
+    // gossiped fencing epoch.
+    let _ = cloud.control_plane_leader();
+    cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
 
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
@@ -607,6 +612,7 @@ async fn main() -> anyhow::Result<()> {
         std::env::var("HIVE_ADMIN_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        .layer(axum::middleware::from_fn(admin_cache_headers))
         .layer(axum::middleware::from_fn(auth::require_auth))
         .layer(axum::middleware::from_fn(admin::admin_rate_limit))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(admin_max_body))
@@ -800,6 +806,46 @@ fn host_switch_router(
 /// A loop-guard header prevents re-forwarding. First-slice policy: after auth,
 /// forward ALL requests (reads + writes) to the leader. Entirely dormant unless a
 /// node runs with `HIVE_INGRESS!=ngrok` AND `HIVE_JWT_SECRET` set (see caller).
+/// Explicit cache policy on every admin GET response (previously NO `/v1/*`
+/// JSON carried any Cache-Control at all — every intermediary guessed).
+/// TENANT-SAFE BY CONSTRUCTION, two classes only:
+///
+/// - **Global, non-tenant catalogs** (`/v1/regions*`, `/v1/frameworks`):
+///   `public, s-maxage=3600, stale-while-revalidate=86400` — shared caches/CDNs
+///   may serve these to everyone (they contain zero tenant data) and keep
+///   serving stale while revalidating in the background; browsers get a short
+///   `max-age` so a catalog change still lands quickly.
+/// - **Everything else** (tenant-scoped data): `private, no-store` — NO shared
+///   cache (CDN/proxy) may store it (structurally eliminating the
+///   cross-tenant-cache-bleed class: there is nothing a tenant-blind cache key
+///   could ever mis-serve), and browsers don't persist it locally either. The
+///   tenant-keyed stale-while-revalidate layer for this data lives in the
+///   dashboard client (`ui/lib/api.ts`: cache keys are `${tenant}|${path}`,
+///   TTL+SWR-ish reuse, purged on every mutation and team switch) — the layer
+///   that can actually key on the VERIFIED tenant.
+///
+/// Handlers that set their own Cache-Control (project thumbnails) keep it.
+async fn admin_cache_headers(
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let is_get = req.method() == axum::http::Method::GET;
+    let path = req.uri().path().to_string();
+    let mut resp = next.run(req).await;
+    if is_get && !resp.headers().contains_key(axum::http::header::CACHE_CONTROL) {
+        let public_catalog = path == "/v1/frameworks" || path == "/v1/regions" || path.starts_with("/v1/regions/");
+        let value = if public_catalog {
+            "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        } else {
+            "private, no-store"
+        };
+        if let Ok(v) = axum::http::HeaderValue::from_str(value) {
+            resp.headers_mut().insert(axum::http::header::CACHE_CONTROL, v);
+        }
+    }
+    resp
+}
+
 async fn admin_ingress(
     cloud: Arc<CloudState>,
     admin: axum::Router,
@@ -823,10 +869,35 @@ async fn admin_ingress(
     // (forced write on a non-leader) and the stale-forward split-brain, while still
     // terminating any forward chain (a forwarded request is never re-forwarded).
     if req.headers().contains_key("x-hive-admin-forwarded") {
+        // Epoch fence (proposal step 5): a forwarded mutation carries the
+        // sender's control-plane epoch. If it is BEHIND ours, the sender's view
+        // of ownership is stale (it missed at least one promotion/failover) —
+        // refuse rather than apply a write routed under superseded ownership.
+        // Absent/unparsable header (pre-upgrade peers) fences nothing: the
+        // owner-recheck below still gates.
+        let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+        if is_mutation {
+            let sender_epoch = req
+                .headers()
+                .get("x-hive-cp-epoch")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            if let Some(e) = sender_epoch {
+                let ours = cloud.cluster.epoch();
+                if e < ours {
+                    tracing::warn!(sender_epoch = e, local_epoch = ours, "rejected forwarded mutation with stale control-plane epoch (fenced)");
+                    return (
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "stale control-plane epoch (ownership changed); retry",
+                    )
+                        .into_response();
+                }
+            }
+        }
         if cloud.is_control_plane_leader() {
             return serve_local(admin, req).await;
         }
-        if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
+        if is_mutation {
             return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not control-plane leader").into_response();
         }
         return serve_local(admin, req).await;
@@ -871,7 +942,7 @@ async fn admin_ingress(
     let leader_ip = cloud.leader_node().and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
     if let Some(ip) = leader_ip {
         if let Some(client) = leader_client(&ip, &api_host) {
-            return admin_forward_to_leader(client, &api_host, req).await;
+            return admin_forward_to_leader(client, &api_host, cloud.cluster.epoch(), req).await;
         }
     }
     if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
@@ -912,6 +983,7 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
 async fn admin_forward_to_leader(
     client: reqwest::Client,
     api_host: &str,
+    cp_epoch: u64,
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -926,7 +998,13 @@ async fn admin_forward_to_leader(
         Ok(m) => m,
         Err(_) => return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response(),
     };
-    let mut rb = client.request(method, &url).header("x-hive-admin-forwarded", "1");
+    // The forwarder's control-plane epoch rides along as the fencing token —
+    // the receiver refuses the write if this is behind ITS epoch (the sender's
+    // view of ownership is stale). See admin_ingress's forwarded branch.
+    let mut rb = client
+        .request(method, &url)
+        .header("x-hive-admin-forwarded", "1")
+        .header("x-hive-cp-epoch", cp_epoch.to_string());
     for (k, v) in parts.headers.iter() {
         let n = k.as_str().to_ascii_lowercase();
         if matches!(n.as_str(), "host" | "content-length" | "connection") {
@@ -1290,8 +1368,12 @@ fn spawn_cluster_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(3)).await;
-            let members: Vec<String> = cloud.registry.nodes().into_iter().map(|n| n.id).collect();
-            cloud.cluster.reconcile(members);
+            // Re-resolve the control-plane owner from the live registry
+            // (observe_owner inside bumps the fencing epoch exactly on real
+            // ownership transitions) and gossip our current epoch so the
+            // fleet's fencing tokens converge on the max witnessed.
+            let _ = cloud.control_plane_leader();
+            cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
         }
     });
 }
@@ -1409,6 +1491,9 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                             }
                         }
                     }
+                    // Converge the control-plane fencing epoch on the max
+                    // witnessed anywhere in the fleet (monotonic; see cluster.rs).
+                    cloud.cluster.adopt_epoch(n.cp_epoch);
                     cloud.registry.upsert_peer(n);
                 }
             }
@@ -1812,12 +1897,21 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
         loop {
             tick.tick().await;
             // Who should meter this tick? Manual pin wins when set; otherwise the
-            // ELECTED leader (lowest healthy cryptographic identity in the mesh).
+            // CONTROL-PLANE OWNER — same resolution as admin mutations, ACME and
+            // DNS (owner chain first, identity election fallback), so all four
+            // single-writer roles sit on exactly one designation and cannot
+            // drift apart (proposal step 6).
             let elected = match &manual_pin {
                 Some(pin) => Some(pin.clone()),
-                None => crate::cluster::Cluster::billing_leader(&cloud.registry.nodes()),
+                None => Some(cloud.control_plane_leader()),
             };
-            let am_leader = elected.as_deref() == Some(cloud.node_name.as_str());
+            // Isolation gate (same rationale as is_control_plane_leader): a node
+            // that can't see its expected peers must never self-elect as the
+            // metering coordinator from that blind view — another node with a
+            // live mesh view is (or will be) charging; charging twice is worse
+            // than charging one tick late.
+            let am_leader = elected.as_deref() == Some(cloud.node_name.as_str())
+                && !cloud.mesh_health().isolated;
             leader_ticks = if am_leader { leader_ticks.saturating_add(1) } else { 0 };
             // Stability window: act only after 2 consecutive leader ticks, so two
             // nodes with briefly divergent health views can't both charge a delta.

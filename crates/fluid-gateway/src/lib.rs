@@ -416,6 +416,24 @@ impl Gateway {
         self.state.lock().aliases.get(sub).map(|id| id.as_str().to_string())
     }
 
+    /// EXACT host attribution for event/log tagging: the `(deployment id,
+    /// project)` the host's subdomain alias actually names — with NO
+    /// default-deployment fallback. `select`'s fallback is correct for SERVING
+    /// (an unmatched host still gets an answer) but wrong for ATTRIBUTION: it
+    /// stamps every unmatched host (bot probes on the platform apex, other
+    /// tenants' DB hosts, peer-hosted projects routed through this node) with
+    /// whatever project happens to be this node's default deployment — which is
+    /// how foreign requests leaked into that project's log view. Unresolved
+    /// hosts return `None` and must be recorded UNATTRIBUTED.
+    pub fn attribution_for_host(&self, host: &str) -> Option<(String, String)> {
+        let h = host.split(':').next().unwrap_or(host);
+        let sub = h.split('.').next().unwrap_or(h);
+        let st = self.state.lock();
+        let id = st.aliases.get(sub)?.clone();
+        let project = st.deployments.get(&id)?.project.clone();
+        Some((id.as_str().to_string(), project))
+    }
+
     /// Does THIS node actually have a deployment aliased for `host`'s subdomain?
     /// Exact alias match (no default fallback) — used by mesh routing to decide
     /// whether to serve locally or proxy to the peer that really hosts it.

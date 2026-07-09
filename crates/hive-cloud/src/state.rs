@@ -106,6 +106,14 @@ pub struct Event {
     pub detail: String,
     #[serde(default)]
     pub project: String,
+    /// The exact deployment the request host ALIASED to at record time (empty
+    /// when the host resolved to no deployment on this node) — what scopes a
+    /// deployment-detail log view to that deployment's own traffic, including
+    /// historically (the production alias moves between deployments on promote;
+    /// this field pins each event to the deployment that actually held the
+    /// alias when the request landed).
+    #[serde(default)]
+    pub deployment: String,
     /// Correlation id for tracing a request across nodes (accepted from
     /// `x-hive-request-id` or generated at ingress; forwarded over the mesh).
     #[serde(default)]
@@ -353,13 +361,23 @@ pub fn mesh_isolated(expected_peers: usize, visible_healthy_peers: usize) -> boo
 }
 
 impl CloudState {
-    /// The current control-plane WRITE authority (leader), identity-ordered over
-    /// HEALTHY nodes (the same web3-style election as the billing coordinator, so
-    /// failover is automatic when the leader goes unhealthy). Returns the leader's
-    /// node name, or this node when no election is possible (single-node / no peers).
+    /// The current control-plane WRITE authority (owner). Resolution order (see
+    /// `cluster.rs` module doc): the operator-curated `HIVE_CP_OWNER_CHAIN`
+    /// (first healthy+public entry wins — static ownership, no open election),
+    /// falling back to the identity election (with the legacy `HIVE_CP_LEADER`
+    /// pin) only when no chain is configured or every chain entry is dark.
+    /// Returns the owner's node name, or this node when nothing is resolvable
+    /// (single-node / no peers). Every resolution feeds the cluster's
+    /// observed-owner tracker so the fencing epoch bumps exactly on real
+    /// ownership transitions.
     pub fn control_plane_leader(&self) -> String {
-        crate::cluster::Cluster::billing_leader(&self.registry.nodes())
-            .unwrap_or_else(|| self.node_name.clone())
+        let chain = crate::cluster::Cluster::owner_chain_from_env();
+        let pref = std::env::var("HIVE_CP_LEADER").ok();
+        let owner =
+            crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &self.registry.nodes())
+                .unwrap_or_else(|| self.node_name.clone());
+        self.cluster.observe_owner(&owner);
+        owner
     }
 
     /// True when THIS node is the control-plane leader.
@@ -663,12 +681,17 @@ impl CloudState {
     }
 
     pub fn event(&self, region: &str, method: &str, host: &str, path: &str, status: u16, action: &str, detail: &str) -> Event {
-        // Resolve which project this event belongs to (from the request host),
-        // so project-scoped logs work regardless of how the request arrived.
-        let project = self
-            .gw
-            .project_for_host(host)
-            .unwrap_or_else(|| detail.to_string());
+        // EXACT attribution only (no default-deployment fallback, no detail
+        // fallback): an event belongs to a project/deployment iff the request
+        // host's subdomain actually ALIASES one of this node's deployments.
+        // The old `project_for_host` path used the serving resolution, whose
+        // default-deployment fallback stamped every unmatched host — platform
+        // bot probes, other tenants' DB hosts, peer-hosted projects routed
+        // through this node — with this node's default project, leaking foreign
+        // request lines into that project's log view and corrupting its tenant's
+        // metrics attribution. Unresolved hosts stay UNATTRIBUTED (empty
+        // project/deployment) and are operator-only in the logs API.
+        let (deployment, project) = self.gw.attribution_for_host(host).unwrap_or_default();
         Event {
             ts_ms: now_ms(),
             region: region.to_string(),
@@ -679,6 +702,7 @@ impl CloudState {
             action: action.to_string(),
             detail: detail.to_string(),
             project,
+            deployment,
             request_id: String::new(),
         }
     }

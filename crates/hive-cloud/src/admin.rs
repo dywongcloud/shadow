@@ -1235,13 +1235,38 @@ pub(crate) async fn deployment_build(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Tenant gate with the same fallback dep_list uses: `team_of` is NODE-LOCAL
+    // (ProjectStore rows are never gossiped) and returns UNTAGGED for a project
+    // this node has no row for — which used to 404 a build that IS in the local
+    // map whenever the answering node lacked the project row (leader-forwarded
+    // dashboard reads, post-restore nodes). Fall back to the DEPLOYMENT
+    // record's own tenant tag (local gw record or the gossiped peer copy) —
+    // the same authority dep_list trusts for exactly this reason.
+    let dep_record_tenant: Option<String> = c
+        .gw
+        .deployment_records()
+        .into_iter()
+        .find(|r| r.id == id)
+        .map(|r| record_tenant(&r.tenant).to_string())
+        .or_else(|| {
+            c.peer_deployments
+                .read()
+                .values()
+                .flatten()
+                .find(|d| d.id.as_str() == id)
+                .map(|d| record_tenant(&d.tenant).to_string())
+        });
+    let team_ok = |b: &crate::git::Build| {
+        norm(&c.projects.team_of(&b.project)) == norm(&t)
+            || dep_record_tenant.as_deref() == Some(norm(&t))
+    };
     // Local build record (newest matching, team-scoped).
     let mut builds: Vec<_> = c
         .builds
         .list()
         .into_iter()
         .filter(|b| b.deployment_id.as_deref() == Some(id.as_str()))
-        .filter(|b| norm(&c.projects.team_of(&b.project)) == norm(&t))
+        .filter(team_ok)
         .collect();
     builds.sort_by_key(|b| b.started_ms);
     if let Some(b) = builds.pop() {
@@ -1804,6 +1829,7 @@ fn record_event(c: &Arc<CloudState>, project: &str, action: &str, detail: &str) 
         action: action.to_string(),
         detail: detail.to_string(),
         project: project.to_string(),
+        deployment: String::new(),
         request_id: String::new(),
     });
 }
@@ -2579,6 +2605,8 @@ pub(crate) async fn node_announce(
     State(c): State<Arc<CloudState>>,
     Json(node): Json<hive_edge::NodeInfo>,
 ) -> Json<Value> {
+    // Converge the control-plane fencing epoch on the max witnessed anywhere.
+    c.cluster.adopt_epoch(node.cp_epoch);
     c.registry.upsert_peer(node);
     Json(json!(c.registry.nodes()))
 }
@@ -2908,6 +2936,11 @@ pub(crate) struct LimitQ {
     pub(crate) limit: Option<usize>,
     /// Filter events to a project (matches the deployment host subdomain).
     pub(crate) project: Option<String>,
+    /// Filter events to ONE deployment: events tagged with this deployment id
+    /// at record time, plus untagged events on that deployment's own alias
+    /// hosts. Composes with `project` (the deployment-detail view sends both).
+    #[serde(default)]
+    pub(crate) deployment: Option<String>,
     /// Free-text search across path/host/detail.
     pub(crate) q: Option<String>,
     /// Internal: when set by a fleet-aggregation proxy, return ONLY this node's
@@ -2918,11 +2951,23 @@ pub(crate) struct LimitQ {
 
 pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<LimitQ>) -> Json<Value> {
     let limit = q.limit.unwrap_or(100);
-    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let cl = claims.as_ref().map(|e| &e.0);
+    let is_operator = operator_allowed(cl, crate::auth::enforced());
+    let t = tenant(&c, &headers, cl);
     let mut evs = c.recent_events(2000);
-    // Tenant scope: only events for projects owned by this team. Infra events
-    // (empty project) are shown to everyone.
-    evs.retain(|e| e.project.is_empty() || norm(&c.projects.team_of(&e.project)) == t);
+    // Tenant scope: only events for projects owned by this team. UNATTRIBUTED
+    // events (empty project: platform-apex bot probes, unresolved hosts,
+    // control-plane noise) are OPERATOR-ONLY in the unfiltered view — they are
+    // nobody's tenant traffic, and showing them to every signed-in team both
+    // leaks cross-tenant request metadata (hosts/paths) and buries the team's
+    // own logs in scanner noise. A project-scoped view below still re-admits
+    // the project's OWN untagged host traffic via the alias-host branch.
+    evs.retain(|e| {
+        if e.project.is_empty() {
+            return is_operator;
+        }
+        norm(&c.projects.team_of(&e.project)) == t
+    });
     if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
         let pl = p.to_lowercase();
         // EXACT project scoping. The old filter also kept any event whose `host`
@@ -2933,11 +2978,14 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
         // tagged with this exact project, OR untagged/infra events whose `host`
         // is one of THIS project's real deployment hostnames (exact label or a
         // subdomain of it) — never a blind substring on free-text detail.
+        // The deployment host set is TENANT-CHECKED (team_of == t): a
+        // same-named project belonging to another tenant must not contribute
+        // hosts that would pull its traffic into this view.
         let hosts: std::collections::HashSet<String> = c
             .gw
             .list()
             .into_iter()
-            .filter(|d| d.project.eq_ignore_ascii_case(&pl))
+            .filter(|d| d.project.eq_ignore_ascii_case(&pl) && norm(&c.projects.team_of(&d.project)) == t)
             .flat_map(|d| {
                 [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
                     .into_iter()
@@ -2960,6 +3008,26 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
                 .any(|ph| h == *ph || h.starts_with(&format!("{ph}.")) || ph.starts_with(&format!("{h}.")))
         });
     }
+    if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
+        let dl = d.to_lowercase();
+        // Deployment scope: events exactly tagged with this deployment id at
+        // record time (see Event.deployment), plus — for events recorded before
+        // the tag existed — untagged events whose host FIRST LABEL is the
+        // deployment id itself (the id_alias URL is unambiguous over time;
+        // project/branch aliases move between deployments on promote, so those
+        // are only trusted via the record-time tag).
+        evs.retain(|e| {
+            if e.deployment.to_lowercase() == dl {
+                return true;
+            }
+            if !e.deployment.is_empty() {
+                return false;
+            }
+            let h = e.host.to_lowercase();
+            let label = h.split(':').next().unwrap_or(&h).split('.').next().unwrap_or(&h);
+            label == dl
+        });
+    }
     if let Some(s) = q.q.as_ref().filter(|s| !s.is_empty()) {
         let sl = s.to_lowercase();
         evs.retain(|e| {
@@ -2979,6 +3047,9 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
             let mut s = format!("limit={}&local=true", limit);
             if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
                 s.push_str(&format!("&project={}", urlencode(p)));
+            }
+            if let Some(d) = q.deployment.as_ref().filter(|d| !d.is_empty()) {
+                s.push_str(&format!("&deployment={}", urlencode(d)));
             }
             if let Some(qq) = q.q.as_ref().filter(|s| !s.is_empty()) {
                 s.push_str(&format!("&q={}", urlencode(qq)));
@@ -3392,6 +3463,10 @@ pub(crate) struct WfQuery {
     /// node's local workflows (no further fan-out) — prevents proxy recursion.
     #[serde(default)]
     pub(crate) local: Option<bool>,
+    /// List-shape response: strip per-step `output` payloads (the runs TABLE
+    /// renders none of them; full detail lives on `/v1/workflows/runs/:id`).
+    #[serde(default)]
+    pub(crate) summary: Option<bool>,
 }
 
 /// Does this workflow's project belong to the requesting team?
@@ -3514,6 +3589,22 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
                                 runs.push(r.clone());
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+    // LIST-shape trim (`?summary=1`, sent by the dashboard's runs table): strip
+    // each step's `output` payload — the table renders name/status/duration
+    // only, but every poll was shipping full per-step output text for every
+    // run (the single biggest bytes item on the workflows page). The full
+    // detail stays on `/v1/workflows/runs/:id`.
+    if q.summary.unwrap_or(false) {
+        for r in runs.iter_mut() {
+            if let Some(steps) = r.get_mut("steps").and_then(|s| s.as_array_mut()) {
+                for s in steps.iter_mut() {
+                    if let Some(o) = s.as_object_mut() {
+                        o.remove("output");
                     }
                 }
             }

@@ -308,6 +308,48 @@ pub async fn fetch_node_snapshot() -> Option<PlatformSnapshot> {
     serde_json::from_slice(&bytes).ok()
 }
 
+/// The newest replicated snapshot from any OTHER node (`node/<peer>/snapshot`),
+/// discovered by enumerating the replicated store's own keys (no registry
+/// dependency — at the boot moment this runs, gossip may not have resynced
+/// yet, but replicated keys survive in the local guardian store). Returns the
+/// owning peer's name alongside the snapshot.
+pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> {
+    let me = NODE_NAME.get()?.as_str();
+    let mut best: Option<(String, PlatformSnapshot)> = None;
+    for key in keys().await {
+        let Some(name) = key.strip_prefix("node/").and_then(|r| r.strip_suffix("/snapshot")) else {
+            continue;
+        };
+        if name == me {
+            continue;
+        }
+        let Some(bytes) = get(&key).await else { continue };
+        let Ok(snap) = serde_json::from_slice::<PlatformSnapshot>(&bytes) else { continue };
+        if best.as_ref().is_none_or(|(_, b)| snap.saved_ms > b.saved_ms) {
+            best = Some((name.to_string(), snap));
+        }
+    }
+    best
+}
+
+/// Strip the NODE-LOCAL runtime portions from a snapshot before adopting it
+/// from a PEER: `deployments` are this-node cell/serving records (adopting a
+/// peer's would fabricate phantom deployments pointing at cells that only
+/// exist on the peer), `sandboxes` likewise, `metrics_rollup` is per-node
+/// observed traffic (adopting a peer's would double-count its traffic here),
+/// and `database_data` is the in-process store payload for locally-hosted DBs.
+/// Everything else — projects, teams, billing, domains, webhooks, DB records,
+/// workflow defs, enterprise config, users/orgs — is tenant/control-plane
+/// state shared fleet-wide via gossip, exactly what a wiped node needs back.
+fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
+    snap.deployments = Vec::new();
+    snap.sandboxes = Default::default();
+    snap.metrics_rollup = Default::default();
+    snap.database_data = Default::default();
+    snap.builds = Vec::new();
+    snap
+}
+
 /// Boot-time restore-on-rollback guard: once GuardianDB is online, compare its
 /// replicated snapshot's `saved_ms` against the CURRENT on-disk snapshot. If the
 /// replica is NEWER, the local file regressed (crash-restored old disk, wiped
@@ -315,14 +357,47 @@ pub async fn fetch_node_snapshot() -> Option<PlatformSnapshot> {
 /// rewrite the local file. The comparison re-reads the disk at adoption time, so
 /// any post-boot user mutation (which bumps the local `saved_ms` past the
 /// replica's) automatically vetoes adoption — no clobbering live changes.
+///
+/// PEER FALLBACK (audit proposal step 9): when this node has NO replicated
+/// snapshot of its own (guardian dir wiped alongside the local file — total
+/// loss), fall back to the newest PEER snapshot in the replicated store,
+/// adopting only its SHARED tenant/control-plane state (node-local runtime
+/// stripped — see `strip_node_local`). Before this, the guard could never
+/// recover a node's data from a peer's copy, defeating its own stated purpose.
+/// Retries for ~60s: after a wipe, the replicated keys only reappear once the
+/// guardian store has synced with a peer.
 /// Opt-out: `HIVE_GUARDIAN_RESTORE=0`.
 pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
     if std::env::var("HIVE_GUARDIAN_RESTORE").map(|v| v == "0" || v == "false").unwrap_or(false) {
         return;
     }
     tokio::spawn(async move {
-        let Some(replica) = fetch_node_snapshot().await else {
-            tracing::debug!("guardian restore guard: no replicated snapshot for this node yet");
+        let self_replica = fetch_node_snapshot().await;
+        let Some(replica) = self_replica else {
+            // No self-keyed replica — total-loss path. Give replication a
+            // window to pull peer keys in, then adopt the newest peer copy's
+            // SHARED state if it beats whatever the local file has.
+            for attempt in 1u32..=6 {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let Some((peer, snap)) = fetch_newest_peer_snapshot().await else { continue };
+                let local = crate::persist::load();
+                if snap.saved_ms <= local.saved_ms {
+                    tracing::debug!(peer = %peer, "guardian restore guard: peer snapshot not newer than local; keeping local");
+                    return;
+                }
+                tracing::warn!(
+                    peer = %peer,
+                    attempt,
+                    peer_ms = snap.saved_ms,
+                    local_ms = local.saved_ms,
+                    "TOTAL-LOSS RECOVERY — no self snapshot replicated; adopting SHARED state from newest peer snapshot (node-local runtime stripped)"
+                );
+                crate::persist::restore(&cloud, strip_node_local(snap));
+                crate::persist::persist(&cloud);
+                tracing::info!(peer = %peer, "guardian restore guard: shared state restored from peer snapshot");
+                return;
+            }
+            tracing::debug!("guardian restore guard: no replicated snapshot (self or peer) found");
             return;
         };
         let local = crate::persist::load();

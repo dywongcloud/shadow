@@ -42,6 +42,13 @@ pub struct NodeInfo {
     /// later gossip round once ready — never blocks boot).
     #[serde(default)]
     pub guardian_iroh_addr: Option<String>,
+    /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
+    /// on every owner promotion/failover). Gossiped so the whole fleet converges
+    /// on the highest epoch — the fencing token that lets a node reject admin
+    /// mutations forwarded by a peer whose view of ownership is stale. `0` from
+    /// pre-upgrade peers (`serde(default)`), which fences nothing (safe).
+    #[serde(default)]
+    pub cp_epoch: u64,
     pub last_seen_ms: u64,
     #[serde(default)]
     pub is_self: bool,
@@ -156,6 +163,16 @@ impl NodeRegistry {
         let mut me = self.me.write();
         if me.guardian_iroh_addr != addr {
             me.guardian_iroh_addr = addr;
+        }
+    }
+
+    /// Update this node's gossiped control-plane epoch (see
+    /// `NodeInfo.cp_epoch`) — refreshed each gossip round from the cluster's
+    /// observed-owner tracker.
+    pub fn set_self_cp_epoch(&self, epoch: u64) {
+        let mut me = self.me.write();
+        if me.cp_epoch != epoch {
+            me.cp_epoch = epoch;
         }
     }
 
@@ -280,6 +297,7 @@ mod tests {
             peer_id: None,
             iroh_addr: None,
             guardian_iroh_addr: None,
+            cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,
             latency_ms: latency,

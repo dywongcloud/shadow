@@ -61,6 +61,11 @@ pub struct PlatformSnapshot {
     /// minutes; see metrics.rs's module doc comment for why).
     #[serde(default)]
     pub metrics_rollup: crate::metrics::RollupSnapshot,
+    /// Build records incl. logs (newest-capped; see BuildStore::snapshot) —
+    /// previously in-memory only, so every restart erased all build logs while
+    /// the deployments they built lived on.
+    #[serde(default)]
+    pub builds: Vec<crate::git::Build>,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
     #[serde(default)]
@@ -324,6 +329,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
         metrics_rollup: cloud.metrics.rollup_snapshot(),
+        builds: cloud.builds.snapshot(),
         incidents: cloud.incidents.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
         integrations: cloud.integrations.snapshot(),
@@ -487,6 +493,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.metrics.rollup_load(snap.metrics_rollup);
+    cloud.builds.load(snap.builds);
     cloud.incidents.load(snap.incidents);
     cloud.apikeys.load(snap.apikeys);
     cloud.integrations.load(snap.integrations);
