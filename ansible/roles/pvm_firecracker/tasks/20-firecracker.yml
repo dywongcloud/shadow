@@ -1,7 +1,16 @@
 ---
-# Build the PVM-aware Firecracker. The fork's `main` tracks upstream and the
-# PVM source changes are tiny + surgical, so we re-apply them here idempotently
-# instead of depending on them being committed.
+# Build the PVM-aware Firecracker. Unlike the previous generic-fork-plus-
+# hand-patches approach, firecracker_repo (see defaults/main.yml) ALREADY
+# carries native PVM pagetable support as a first-class feature -- verified
+# by fetching its actual source: src/vmm/src/arch/x86_64/vcpu.rs's own
+# set_tsc_khz() is already a documented no-op ("Disable TSC scaling when
+# using PVM because it is unsupported on most virtualized platforms"), and
+# src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs's CPU-model
+# compatibility check is already commented out natively ("Disable the CPU
+# compatibility check to allow using templates like T2A on more modern
+# CPUs"). The two source patches this role used to re-apply against a
+# generic fork are therefore dead code against THIS fork and have been
+# removed rather than kept as silent no-ops.
 
 - name: Install rustup + toolchain (user-space, no root toolchain needed)
   ansible.builtin.shell: |
@@ -19,25 +28,6 @@
     depth: 1
     single_branch: true
     force: false
-
-# ---- PVM forward-port: change #1 ----------------------------------------
-# Disable per-vCPU TSC scaling. PVM does not support KVM_CAP_TSC_CONTROL, so
-# the upstream call would fail and Firecracker would refuse to boot a guest.
-- name: "PVM patch: make set_tsc_khz() a no-op"
-  ansible.builtin.replace:
-    path: "{{ firecracker_src }}/src/vmm/src/arch/x86_64/vcpu.rs"
-    regexp: 'self\.fd\.set_tsc_khz\(tsc_freq\)\.map_err\(SetTscError\)'
-    replace: '{ let _ = tsc_freq; Ok(()) } // PVM: TSC scaling unsupported'
-
-# ---- PVM forward-port: change #2 ----------------------------------------
-# Relax the static-CPU-template model check so templates work across CPUs.
-# `return Err(InvalidCpuModel);` (note: no enum prefix) is unique to the live
-# code path; the test-only references use GetCpuTemplateError::InvalidCpuModel.
-- name: "PVM patch: relax static CPU-template model check"
-  ansible.builtin.replace:
-    path: "{{ firecracker_src }}/src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs"
-    regexp: '^\s*return Err\(InvalidCpuModel\);'
-    replace: '                        { /* PVM: skip CPU-model compatibility check */ }'
 
 # A gnu-target build has no matching seccomp JSON, so Firecracker's build.rs
 # falls back to an empty filter automatically (no libseccomp at runtime).

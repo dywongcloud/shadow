@@ -16,16 +16,28 @@
   register: cpuflags
   changed_when: false
 
+- name: Check FSGSBASE / RDTSCP presence (informational only, not a hard requirement)
+  ansible.builtin.set_fact:
+    _has_fsgsbase: "{{ 'fsgsbase' in cpuflags.stdout }}"
+    _has_rdtscp: "{{ 'rdtscp' in cpuflags.stdout }}"
+
 - name: >-
-    Require FSGSBASE (the show-stopper). PVM's kvm-pvm module refuses to load
-    without it, and a cloud host that hides it from guest CPUID cannot run PVM.
-  ansible.builtin.assert:
-    that: "'fsgsbase' in cpuflags.stdout"
-    fail_msg: >-
-      This VM's vCPU does NOT expose `fsgsbase`, so PVM cannot run here.
-      Move to an instance type / CPU model that exposes it
-      (verify with: grep -o fsgsbase /proc/cpuinfo).
-    success_msg: "FSGSBASE present — PVM is viable on this host."
+    Note the fallback path this build will use. pvm_linux_repo (see
+    defaults/main.yml) is a patch series that converts PVM's historical hard
+    FSGSBASE/RDTSCP requirement into soft runtime fallbacks (MSR-based
+    GS-base switching, RDTSCP trap-and-emulate, guest FS-base hypercall
+    fallback) -- a host missing either feature still boots real Firecracker
+    microVMs via PVM, just measurably slower on syscall/fork-heavy paths
+    (fork+exec ~4.3x, getpid ~1.7x, per the patch series' own published
+    numbers) -- see this role's README for the full table. This is why the
+    OLD hard-fail assertion this task used to have is gone: it would
+    incorrectly reject hosts this exact kernel source was built to support.
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'FSGSBASE + RDTSCP both present — fast native path.'
+         if (_has_fsgsbase and _has_rdtscp)
+         else 'FSGSBASE=' + (_has_fsgsbase | string) + ' RDTSCP=' + (_has_rdtscp | string)
+              + ' — one or both masked; PVM will use the software fallback path (slower, still functional).' }}
 
 - name: Detect pre-existing /dev/kvm (real KVM present — PVM not strictly needed)
   ansible.builtin.stat:

@@ -1,13 +1,23 @@
 ---
 # ---------- Source repositories ----------
-# The Firecracker fork carrying the PVM forward-port (this role re-applies the
-# two essential source changes itself, so any reasonably-recent commit works).
-firecracker_repo: "https://github.com/rusternetes-labs/firecracker"
+# Firecracker fork with native PVM pagetable support (a loopholelabs fork,
+# not a generic upstream + hand-applied patches). See tasks/20-firecracker.yml
+# for the (likely now-redundant, kept as safe no-ops) legacy source patches
+# this role still re-applies defensively on top of it.
+firecracker_repo: "https://github.com/DecOperations/firecracker-next"
 firecracker_version: "main"
 
-# PVM host + guest kernel source (Linux 6.12.33 base).
-pvm_linux_repo: "https://github.com/virt-pvm/linux"
-pvm_linux_branch: "pvm-612"
+# PVM host + guest kernel source: a patch series on top of the SAME
+# virt-pvm/linux pvm-612 (Linux 6.12.33) base that converts PVM's hard
+# FSGSBASE/RDTSCP CPUID requirement into soft runtime fallbacks (MSR-based
+# GS-base switching, RDTSCP trap-and-emulate, guest FS-base hypercall
+# fallback) -- see tasks/00-preflight.yml and this role's README for what
+# that means for host eligibility. This repo's own branch is "main", not
+# upstream virt-pvm/linux's "pvm-612" naming.
+pvm_linux_repo: "https://github.com/dywongcloud/pvm-no-fsgsbase-rdtscp"
+pvm_linux_branch: "main"
+# The guest config is still the vanilla virt-pvm base config -- the fallback
+# patch series changes runtime capability gating, not guest Kconfig options.
 pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
 
 # Ubuntu rootfs published by the Firecracker CI (userland is PVM-independent).

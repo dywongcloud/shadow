@@ -15,17 +15,50 @@ download -- it is this project's own PVM engineering effort, just not
 previously checked into git. See `[[virginia-pvm]]` / `[[fc-virginia-3]]`-style
 session notes for the manual history this automates.
 
-## The one hard requirement
+## Source repos
 
-PVM needs the **`fsgsbase`** CPU feature exposed to the guest vCPU. Many cloud
-hosts hide it (for live-migration compatibility), and PVM **cannot** run
-there. Check first:
+- `firecracker_repo` (default: `DecOperations/firecracker-next`) -- a fork of
+  `loopholelabs/firecracker` with NATIVE PVM pagetable support built in
+  (PVM-aware KVM backend, paravirtualized-guest-compatible pagetable
+  handling). Verified directly against its fetched source: `set_tsc_khz()`
+  is already a documented no-op for PVM, and the static-CPU-template
+  compatibility check is already commented out -- this role no longer
+  re-applies hand patches for either (see `tasks/20-firecracker.yml`'s
+  comment for the exact verification).
+- `pvm_linux_repo` (default: `dywongcloud/pvm-no-fsgsbase-rdtscp`) -- a
+  patch series on top of the same `virt-pvm/linux` `pvm-612` base (see
+  below).
+
+## FSGSBASE / RDTSCP: no longer a hard requirement
+
+Historically PVM refused to load at all on a host whose vCPU hides
+`fsgsbase`/`rdtscp` from guest CPUID (common on cloud VMs, masked for
+live-migration compatibility). `pvm_linux_repo`'s patch series converts both
+from hard `-EOPNOTSUPP` failures into **soft runtime fallbacks**: an
+MSR-based GS-base switcher path, RDTSCP trap-and-emulation, and a guest
+FS-base hypercall fallback. `tasks/00-preflight.yml` checks for both and logs
+which path this host will use -- it no longer hard-fails when either is
+missing.
+
+The fallback path is real but has a cost (the patch series' own published
+numbers, single Tencent Cloud CVM):
+
+| Workload | Native | PVM fallback | Ratio |
+|---|---|---|---|
+| CPU compute loop | 0.957s | 1.113s | 1.16x |
+| `getpid` syscall | 445ns | 759ns | 1.7x |
+| `fork+exec` x3000 | 1.53s | 5.59s | 3.6x |
+| `fork` x3000 | 0.81s | 3.48s | 4.3x |
+| raw RDTSCP | n/a | ~3.35us (trap/emulated) | -- |
+
+Fork- and syscall-heavy workloads pay real overhead on a fallback-path host.
+A host that DOES expose fsgsbase/rdtscp uses the fast native path with no
+behavior change. Check which class a given host is in:
 
 ```bash
-grep -o fsgsbase /proc/cpuinfo   # must print "fsgsbase"
+grep -o fsgsbase /proc/cpuinfo   # empty output = fallback path
+grep -o rdtscp /proc/cpuinfo     # empty output = fallback path
 ```
-
-`tasks/00-preflight.yml` asserts this and stops immediately if it's missing.
 
 Other requirements: x86_64, RHEL family (Rocky/Alma/RHEL **10** tested), root
 via SSH, ~10 GB free disk, internet access. First run compiles two kernels +
@@ -51,9 +84,9 @@ build, try adding `nokaslr` before re-diagnosing further.
 
 | Tag | Stage |
 |-----|-------|
-| `preflight`     | assert x86_64 + RHEL + **fsgsbase**, make work dirs |
+| `preflight`     | assert x86_64 + RHEL, note fsgsbase/rdtscp presence (informational), make work dirs |
 | `packages`      | install build + runtime dependencies |
-| `firecracker`   | install Rust, clone the fork, re-apply the PVM source patches, build, install `firecracker`/`jailer` |
+| `firecracker`   | install Rust, clone the fork (native PVM support, no patches needed), build, install `firecracker`/`jailer` |
 | `host_kernel`   | build + install the `pvm-612` host kernel (`CONFIG_KVM_PVM=m`, `pti=off` fixes) |
 | `guest_kernel`  | build the PVM guest `vmlinux` (stripped) |
 | `rootfs`        | build an Ubuntu ext4 rootfs with an injected SSH key |
@@ -97,11 +130,11 @@ After a successful run the target has, in `/root/pvm/`: `firecracker`,
   the `bzImage`) or wipe `build_root`.
 - Live-migration support from the upstream fork is intentionally out of
   scope here (not needed to run microVMs without KVM).
-- Production hosts in this fleet may carry additional hand-applied hardening
-  patches accumulated across incident response (TSC/MSR/host-frame-restore
-  fixes on top of the two PVM forward-port changes this role applies) that
-  are not yet folded back into this role. If a from-source build here
-  produces a less stable guest than a hand-tuned production host, that gap
-  is the likely cause -- treat this role as the clean, reproducible
-  baseline, not a byte-for-byte mirror of every production node's exact
-  patch history.
+- Production hosts in this fleet predate the `firecracker-next` /
+  `pvm-no-fsgsbase-rdtscp` source pins this role now uses and may carry
+  additional hand-applied hardening patches from that earlier lineage
+  (MSR/host-frame-restore fixes on top of a generic fork + manual patches)
+  that are not part of either new repo. If a from-source build here produces
+  a less stable guest than a hand-tuned production host, that gap is the
+  likely cause -- treat this role as the clean, reproducible baseline, not a
+  byte-for-byte mirror of every production node's exact patch history.
