@@ -207,9 +207,11 @@ pub fn desired_platform(
     dashboard: bool, // publish apex + www too (nodes reverse-proxy the dashboard)
 ) -> Vec<DesiredRecord> {
     let mut out = Vec::new();
-    // `api` = developer/API-key surface, `admin` = ops/admin console surface — both
-    // resolve to the gateway nodes (same host-switch dispatch), published together.
-    let mut names: Vec<&str> = vec!["api", "admin"];
+    // `api` = developer/API-key surface, `admin` = ops/admin console surface,
+    // `webhook` = incoming GitOps/OpenEdge build-notification receiver
+    // (OPENEDGE_WEBHOOK_URL) — all three resolve to the gateway nodes (same
+    // host-switch dispatch), published together.
+    let mut names: Vec<&str> = vec!["api", "admin", "webhook"];
     if dashboard {
         names.push("");
         names.push("www");
@@ -447,7 +449,13 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 tracing::warn!(error = %e, zone = %cloud.apps_domain, "DNS reconcile failed");
                 ok = false;
             }
-            let platform_managed: &[&str] = if dashboard { &["api", "relay", "discovery", "", "www"] } else { &["api", "relay", "discovery"] };
+            // `admin`/`webhook` were previously absent from this managed-name
+            // list even though `desired_platform` already published records for
+            // them — meaning a created record could never be diffed/updated/
+            // removed by this reconciler again (a pre-existing gap, closed here
+            // rather than left adjacent to the `webhook` addition).
+            let platform_managed: &[&str] =
+                if dashboard { &["api", "admin", "webhook", "relay", "discovery", "", "www"] } else { &["api", "admin", "webhook", "relay", "discovery"] };
             if let Err(e) = reconcile_zone(&api, &cloud.platform_domain, &platform, platform_managed, &cloud).await {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");

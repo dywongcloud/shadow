@@ -22,3 +22,7 @@ target/
 .gm/pw-sock-*/
 .gm/browser-profile/
 .gm/browser-profile-*/
+
+# Agent-tool worktree/session scratch (isolated-worktree subagents, local
+# settings) -- transient tooling state, never durable repo content.
+.claude/

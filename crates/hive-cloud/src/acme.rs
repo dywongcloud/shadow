@@ -531,12 +531,14 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
         (
             "platform".to_string(),
             // api (developer/API-key surface) + admin (ops/admin console surface)
-            // + the dashboard hosts (apex/www — shadw.cloud replaces the ngrok
-            // dashboard URL; nodes reverse-proxy those hosts). There is no
-            // `*.{platform_domain}` wildcard — each host is an explicit SAN.
+            // + webhook (incoming GitOps/OpenEdge build-notification receiver,
+            // OPENEDGE_WEBHOOK_URL) + the dashboard hosts (apex/www — self-hosted
+            // on-node, no external tunnel). There is no `*.{platform_domain}`
+            // wildcard — each host is an explicit SAN.
             vec![
                 format!("api.{}", cloud.platform_domain),
                 format!("admin.{}", cloud.platform_domain),
+                format!("webhook.{}", cloud.platform_domain),
                 cloud.platform_domain.clone(),
                 format!("www.{}", cloud.platform_domain),
             ],
