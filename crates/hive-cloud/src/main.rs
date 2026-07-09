@@ -464,6 +464,7 @@ async fn main() -> anyhow::Result<()> {
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
     spawn_cluster_loop(cloud.clone());
+    spawn_guardian_snapshot_loop(cloud.clone());
     spawn_lease_loop(cloud.clone());
 
     // Self-management GC: reap stale clone/build working dirs under /tmp/hive-deploys
@@ -1392,6 +1393,30 @@ fn spawn_cluster_loop(cloud: Arc<CloudState>) {
             // fleet's fencing tokens converge on the max witnessed.
             let _ = cloud.control_plane_leader();
             cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
+        }
+    });
+}
+
+/// Periodic GuardianDB snapshot re-assert. `persist()` -> `guardian::replicate`
+/// only fires on a STATE MUTATION, so a node quiet since its last restart never
+/// writes its own `node/<name>/snapshot` key into the replicated doc — leaving
+/// the fleet's snapshot set permanently short of "every peer contributes one"
+/// (the observed gap: nodes with no tenant activity since restart had no
+/// snapshot anywhere in the shared KV). This loop captures + replicates on a
+/// fixed cadence so every node's snapshot is always PRESENT and FRESH,
+/// independent of mutation timing. Cheap at the blob layer when unchanged:
+/// iroh-docs content-addresses by BLAKE3, so re-putting identical bytes yields
+/// the same hash and stores no new blob — only a changed snapshot creates one.
+fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_GUARDIAN_SNAPSHOT_SECS", 120));
+    tokio::spawn(async move {
+        // Small initial delay so first-boot restore/seed settles before the
+        // first assert; then steady cadence.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        loop {
+            let snap = crate::persist::capture(&cloud);
+            crate::guardian::replicate(&snap);
+            tokio::time::sleep(interval).await;
         }
     });
 }

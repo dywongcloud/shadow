@@ -60,11 +60,15 @@ function Dashboard() {
 
   // Favorites (starred projects) — persisted client-side; collapsible section.
   const [favorites, setFavorites] = useState<string[]>([]);
-  const [favOpen, setFavOpen] = useState(true);
+  // COLLAPSED by default for everyone; only an explicit expand (persisted as
+  // oe_fav_open="1") re-opens it on later visits. The old polarity (default
+  // open, only "0" collapsed) had every end user start with the section
+  // expanded whether or not they ever used favorites.
+  const [favOpen, setFavOpen] = useState(false);
   useEffect(() => {
     if (typeof window === "undefined") return;
     try { const f = localStorage.getItem("oe_favorites"); if (f) setFavorites(JSON.parse(f)); } catch { /* ignore */ }
-    if (localStorage.getItem("oe_fav_open") === "0") setFavOpen(false);
+    if (localStorage.getItem("oe_fav_open") === "1") setFavOpen(true);
   }, []);
   function toggleFav(project: string) {
     setFavorites((prev) => {
