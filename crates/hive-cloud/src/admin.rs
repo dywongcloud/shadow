@@ -1825,7 +1825,10 @@ pub(crate) async fn dep_promote(
     // production alias to an arbitrary deployment id hosted on this node.
     let t0 = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        if norm(&c.projects.team_of(&d.project)) != t0 {
+        // Judge ownership from the record's OWN tenant tag (authoritative +
+        // present), falling back to the fleet-aware project predicate — the
+        // node-local project row is UNTAGGED on nodes that never ran the deploy.
+        if record_tenant(&d.tenant) != t0 && !project_owned_by(&c, &d.project, &t0) {
             return Err(StatusCode::NOT_FOUND);
         }
     }
@@ -1910,7 +1913,8 @@ async fn dep_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims
     // isn't ours, 404 (don't disclose another tenant's resource). If it doesn't
     // exist, fall through to the idempotent no-op remove (unchanged behavior).
     if let Some(d) = c.gw.list().into_iter().find(|d| d.id.0 == id) {
-        if norm(&c.projects.team_of(&d.project)) != t {
+        // Record's own tag first (authoritative), fleet-aware fallback second.
+        if record_tenant(&d.tenant) != t && !project_owned_by(&c, &d.project, &t) {
             return Err(StatusCode::NOT_FOUND);
         }
     }
@@ -3045,7 +3049,9 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
         if e.project.is_empty() {
             return is_operator;
         }
-        norm(&c.projects.team_of(&e.project)) == t
+        // Fleet-aware: an event's project is owned per the deployment tenant
+        // tags, not the node-local (row-missing on non-hosting nodes) project row.
+        project_owned_by(&c, &e.project, &t)
     });
     if let Some(p) = q.project.as_ref().filter(|p| !p.is_empty()) {
         let pl = p.to_lowercase();
@@ -3064,7 +3070,7 @@ pub(crate) async fn logs(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
             .gw
             .list()
             .into_iter()
-            .filter(|d| d.project.eq_ignore_ascii_case(&pl) && norm(&c.projects.team_of(&d.project)) == t)
+            .filter(|d| d.project.eq_ignore_ascii_case(&pl) && record_tenant(&d.tenant) == t)
             .flat_map(|d| {
                 [d.alias, d.commit_alias, d.branch_alias, d.id_alias]
                     .into_iter()
@@ -3287,7 +3293,7 @@ fn rc_authorize(
     }
     let project = scope.split(':').next().unwrap_or("");
     let t = tenant(c, headers, claims);
-    if norm(&c.projects.team_of(project)) == t {
+    if project_owned_by(c, project, &t) {
         Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, "runtime-cache scope belongs to a different team".into()))
@@ -3548,9 +3554,10 @@ pub(crate) struct WfQuery {
     pub(crate) summary: Option<bool>,
 }
 
-/// Does this workflow's project belong to the requesting team?
+/// Does this workflow's project belong to the requesting team? Fleet-aware —
+/// the node-local project row is UNTAGGED on a node that never ran the deploy.
 fn wf_in_team(c: &Arc<CloudState>, project: &str, team: &str) -> bool {
-    norm(&c.projects.team_of(project)) == norm(team)
+    project_owned_by(c, project, norm(team))
 }
 
 pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {
@@ -3640,7 +3647,10 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
                 for d in c.gw.list() {
-                    if norm(&c.projects.team_of(&d.project)) == team {
+                    // The deployment record's own tenant tag is authoritative and
+                    // present (local record); the project row is node-local and
+                    // UNTAGGED on nodes that never ran this deploy.
+                    if record_tenant(&d.tenant) == team {
                         s.insert(d.project);
                     }
                 }
@@ -3737,7 +3747,8 @@ pub(crate) async fn wf_run_detail(
     let locals: Vec<String> = {
         let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
         for d in c.gw.list() {
-            if norm(&c.projects.team_of(&d.project)) == team {
+            // Authoritative record tag, not the node-local project row.
+            if record_tenant(&d.tenant) == team {
                 s.insert(d.project);
             }
         }
@@ -4259,7 +4270,7 @@ pub(crate) async fn deployment_service_graph(State(c): State<Arc<CloudState>>, h
     // for existing/failed deployments), team-checked.
     if c.gw.deployment_records().iter().any(|r| r.id == id) {
         if let Some(g) = local_deployment_graph(&c, &id).await {
-            if norm(&c.projects.team_of(&g.project)) == norm(&t) {
+            if project_owned_by(&c, &g.project, norm(&t)) {
                 return Ok(Json(json!(g)));
             }
         }
@@ -4353,7 +4364,7 @@ async fn webhook_create_team(State(c): State<Arc<CloudState>>, headers: HeaderMa
 async fn webhooks_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(project): Path<String>) -> Json<Value> {
     // Don't expose another tenant's project webhooks (incl. their secrets).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if norm(&c.projects.team_of(&project)) != t {
+    if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
     }
     let list: Vec<_> = c.webhooks.list(Some(&project)).into_iter().map(|w| w.decrypted()).collect();
@@ -4376,7 +4387,7 @@ async fn webhook_create(
 ) -> Result<Json<Value>, StatusCode> {
     // A webhook may only be attached to a project the caller owns.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if norm(&c.projects.team_of(&project)) != t {
+    if !project_owned_by(&c, &project, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
     let wh = c.webhooks.add(crate::webhooks::Webhook {
@@ -4439,7 +4450,7 @@ async fn admin_databases_all(
 async fn databases_for_project(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Path(project): Path<String>) -> Json<Value> {
     // Only expose databases for a project the caller's tenant actually owns.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if norm(&c.projects.team_of(&project)) != t {
+    if !project_owned_by(&c, &project, &t) {
         return Json(json!([]));
     }
     Json(json!(c.databases.list(Some(&project))))
@@ -5258,7 +5269,9 @@ fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notificati
 
     // 1) Failed deployments.
     for d in c.gw.list() {
-        if norm(&c.projects.team_of(&d.project)) != team {
+        // Authoritative record tag (present on the local record), not the
+        // node-local project row which is UNTAGGED on a non-hosting node.
+        if record_tenant(&d.tenant) != team {
             continue;
         }
         if d.state == fluid_core::DeployState::Error {
@@ -5307,7 +5320,10 @@ fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notificati
         if ev.project.is_empty() {
             continue;
         }
-        if norm(&c.projects.team_of(&ev.project)) != team {
+        // Edge events carry no tenant tag — judge via the fleet-aware predicate
+        // (deployment tenant tags) so a member's error/usage alerts aren't
+        // dropped on a node whose project row is absent.
+        if !project_owned_by(c, &ev.project, &team) {
             continue;
         }
         if ev.status >= 500 {
@@ -6041,7 +6057,7 @@ async fn project_preview(
 ) -> Json<Value> {
     // Don't render another tenant's app content as a preview.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if norm(&c.projects.team_of(&project)) != t {
+    if !project_owned_by(&c, &project, &t) {
         return Json(json!({ "kind": "none" }));
     }
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
@@ -6098,7 +6114,7 @@ async fn project_thumbnail(
     // captures/serves the actual image bytes and previously had no check at
     // all (also bypassing `preview_protection` for a password-gated project).
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if norm(&c.projects.team_of(&project)) != t {
+    if !project_owned_by(&c, &project, &t) {
         return (StatusCode::NOT_FOUND, "no deployment").into_response();
     }
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
