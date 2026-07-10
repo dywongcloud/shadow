@@ -477,16 +477,30 @@ async fn run_build(
         ));
         let t0 = now_ms();
         let mut cmd = Command::new("git");
+        // Never let git fall back to an interactive credential prompt: this process
+        // has no controlling terminal (a daemon/service), so an inaccessible repo
+        // (private, mistyped, or deleted) makes git try to open /dev/tty and crash
+        // with a cryptic "No such device or address" instead of failing cleanly.
+        cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
         cmd.arg("clone").arg("--depth").arg("1");
         if !branch.is_empty() {
             cmd.arg("--branch").arg(&branch);
         }
         cmd.arg(&req.repo_url).arg(&dir);
         let out = cmd.output().await?;
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         anyhow::ensure!(
             out.status.success(),
-            "git clone failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            "{}",
+            if stderr.contains("could not read Username") || stderr.contains("Authentication failed") || stderr.contains("terminal prompts disabled") {
+                format!(
+                    "git clone failed: this repository is private or inaccessible over anonymous HTTPS. \
+                     Only public repositories can be deployed from a pasted URL today — for a private repo, \
+                     connect GitHub and deploy from your repository list instead. ({stderr})"
+                )
+            } else {
+                format!("git clone failed: {stderr}")
+            }
         );
         log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
         let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();

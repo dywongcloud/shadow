@@ -204,7 +204,7 @@ export default function DeployPage({ params }: { params: { id: string } }) {
     if (build?.state === "building" && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
     }
-  }, [build?.lines.length, build?.state]);
+  }, [build?.lines?.length, build?.state]);
 
   const state = build?.state ?? "queued";
   const elapsed = build ? Math.max(0, Math.round(((build.finished_ms ?? now) - build.started_ms) / 1000)) : 0;
@@ -261,7 +261,7 @@ export default function DeployPage({ params }: { params: { id: string } }) {
                 >
                   <Copy className="h-4 w-4" />
                 </button>
-                <span className="text-xs text-secondary">{build?.lines.length ?? 0} lines</span>
+                <span className="text-xs text-secondary">{build?.lines?.length ?? 0} lines</span>
                 <div className="relative ml-auto w-56">
                   <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted" />
                   <input

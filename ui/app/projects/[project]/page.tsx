@@ -266,7 +266,7 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
               <Metric label="Requests" value={ov?.requests ?? 0} />
               <Metric label="Function Invocations" value={ov?.instances ? (ov.requests) : 0} />
               <Metric label="Blocked (firewall)" value={ov?.blocked ?? 0} />
-              <Metric label="Cache hit ratio" value={`${Math.round((ov?.cdn.hit_ratio ?? 0) * 100)}%`} />
+              <Metric label="Cache hit ratio" value={`${Math.round((ov?.cdn?.hit_ratio ?? 0) * 100)}%`} />
             </Card>
 
             <Card className="flex flex-col items-center justify-center gap-3 p-5 text-center">

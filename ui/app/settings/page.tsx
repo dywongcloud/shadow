@@ -54,7 +54,7 @@ function General({ ov, nodes }: { ov: Overview | null; nodes: NodeInfo[] | null 
         <div className="mb-3 text-sm font-medium">Cloud</div>
         <Row label="Node" value={ov?.node ?? "—"} />
         <Row label="Region" value={ov?.region ?? "—"} />
-        <Row label="Plan" value={<Badge tone="blue">{ov?.concurrency.plan ?? "—"}</Badge>} />
+        <Row label="Plan" value={<Badge tone="blue">{ov?.concurrency?.plan ?? "—"}</Badge>} />
         <Row label="Nodes in mesh" value={String(ov?.nodes ?? "—")} />
         <Row label="Regions" value={(ov?.regions ?? []).join(", ") || "—"} />
       </Card>

@@ -89,7 +89,7 @@ export default function ObservabilityPage() {
     Invocations: b.blocked,
   }));
 
-  const totalReq = data?.totals.requests ?? 0;
+  const totalReq = data?.totals?.requests ?? 0;
   const totalXferBytes = totalReq * 4300;
   const totalMw = series.reduce((a, b) => a + b.blocked, 0);
 

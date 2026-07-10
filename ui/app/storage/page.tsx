@@ -253,7 +253,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
               </div>
               <div>
                 <label className="mb-1 block text-xs font-medium text-secondary">Database name</label>
-                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={`${sel?.provider.toLowerCase()}-db`} />
+                <Input value={name} onChange={(e) => setName(e.target.value)} placeholder={`${sel?.provider?.toLowerCase()}-db`} />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>

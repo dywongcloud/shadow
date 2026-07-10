@@ -66,7 +66,7 @@ export default function UsagePage() {
 
   const requests = ov?.requests ?? 0;
   const blocked = ov?.blocked ?? 0;
-  const cacheHits = ov?.cdn.hits ?? 0;
+  const cacheHits = ov?.cdn?.hits ?? 0;
   const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
   // Active CPU pricing (Vercel Fluid convention): bill ACTIVE CPU time + provisioned
   // MEMORY GB-hrs, not idle instance wall-time. `active_cpu_ms` excludes I/O-idle
@@ -90,7 +90,7 @@ export default function UsagePage() {
   const includedUsed = acc ? acc.used_cents / 100 : Math.min(includedTotal, edgeCharge + fnCharge + wafCharge);
   const onDemand = acc ? Math.max(0, -acc.balance_cents) / 100 : edgeCharge + fnCharge + wafCharge;
   const creditBalance = acc ? acc.balance_cents / 100 : 0;
-  const planName = (acc?.plan ?? (ov?.concurrency.plan === "enterprise" ? "enterprise" : "hobby"));
+  const planName = (acc?.plan ?? (ov?.concurrency?.plan === "enterprise" ? "enterprise" : "hobby"));
 
   // REAL per-tenant time-series from the metrics buckets (per-minute). Edge
   // requests, cache hits and blocked requests are tracked over time, so their
