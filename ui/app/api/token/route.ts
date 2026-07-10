@@ -146,7 +146,11 @@ export async function POST(req: NextRequest) {
   try {
     await fetch(`${ADMIN}/v1/identity/sync`, {
       method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${token}`, "x-hive-team": tenant },
+      // x-hive-internal proves this sync is the SERVER-SIDE mint (email is the
+      // Clerk-verified one) — the backend only mirrors org membership into the
+      // team roster for internally-proven syncs, so a browser-forged body
+      // can't write an arbitrary email into a roster.
+      headers: { "content-type": "application/json", authorization: `Bearer ${token}`, "x-hive-team": tenant, "x-hive-internal": INTERNAL },
       body: JSON.stringify({ user: { id: userId, email, name }, org: orgSlug ? { id: orgSlug, slug: orgSlug, name: orgSlug } : null }),
       cache: "no-store",
     });

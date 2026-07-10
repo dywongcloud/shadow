@@ -128,14 +128,23 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let team = p.split_once("?team=").map(|(_, t)| t.to_string()).unwrap_or_default();
+            // Same verified-token parse as the settings arm: under enforcement
+            // the query is `team=<t>&tok=<jwt>`, so the old raw
+            // `split_once("?team=")` swallowed the token into the team string
+            // and the ownership compares below always missed — silently
+            // breaking the cross-node delete cascade on enforced fleets.
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| if crate::auth::enforced() { None } else { qparam(p, "team") })
+                .unwrap_or_default();
             let owner = cloud.projects.team_of(&project);
-            let owns_settings = crate::admin::norm(&owner) == crate::admin::norm(&team);
-            let owns_deploys = cloud
-                .gw
-                .list()
-                .iter()
-                .any(|d| d.project == project && crate::admin::record_tenant(&d.tenant) == crate::admin::norm(&team));
+            let owns_settings = !team.is_empty() && crate::admin::norm(&owner) == team;
+            let owns_deploys = !team.is_empty()
+                && cloud
+                    .gw
+                    .list()
+                    .iter()
+                    .any(|d| d.project == project && crate::admin::record_tenant(&d.tenant) == team);
             if project.is_empty() || !(owns_settings || owns_deploys) {
                 return serde_json::to_vec(&serde_json::json!({ "error": "not owner" })).unwrap_or_default();
             }
@@ -189,6 +198,29 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/resources") => {
             let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
             jb(crate::admin::deployment_resources(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await)
+        }
+        // Project settings for a project whose (node-local, never-gossiped) row
+        // lives on THIS node — proxied by whichever node answered the dashboard
+        // read without a local row. Ownership is checked against THIS node's row
+        // or its own hosted deployments' tenant tags (the delete-cascade arm's
+        // exact gate); serving is local-only so there is no re-proxy loop.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/settings") => {
+            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+            // Tenant from the VERIFIED mesh delegation token (`?tok=`), never a
+            // raw `?team=` parse — under enforcement the query is
+            // `team=<t>&tok=<jwt>`, so `split_once("?team=")` swallows the
+            // token into the team string and every ownership compare misses.
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| if crate::auth::enforced() { None } else { qparam(p, "team") })
+                .unwrap_or_default();
+            if project.is_empty()
+                || team.is_empty()
+                || !crate::admin::project_owned_by(&cloud, &project, &team)
+            {
+                return Vec::new();
+            }
+            serde_json::to_vec(&serde_json::json!(cloud.projects.get_masked(&project))).unwrap_or_default()
         }
         // Build record + logs for a deployment hosted on THIS node (proxied by the
         // coordinator when the deployment was placed here — build logs live where it built).

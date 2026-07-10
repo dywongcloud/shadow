@@ -399,7 +399,22 @@ async fn project_settings_get(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // Settings rows are node-local. When THIS node has no row (reads are served
+    // by whichever node DNS picked; the row lives on the node that deployed the
+    // project), answering with the local defaults silently shows the user empty
+    // settings. Proxy to the hosting node instead — it has the row, so it
+    // answers directly (no re-proxy loop) — and fall back to local defaults
+    // only if the host is unreachable.
+    if crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT {
+        if let Some(node) = host_node_for_project(&c, &project) {
+            if let Some(v) =
+                fetch_from_host(&c, &node, &format!("/v1/projects/{project}/settings"), &t).await
+            {
+                return Ok(Json(v));
+            }
+        }
+    }
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
 
@@ -1488,12 +1503,49 @@ pub(crate) fn require_project(
     project: &str,
 ) -> Result<String, (StatusCode, String)> {
     let t = tenant(c, h, claims);
-    let owner = c.projects.team_of(project);
-    if norm(&owner) == t {
+    if project_owned_by(c, project, &t) {
         Ok(t)
     } else {
         Err((StatusCode::FORBIDDEN, "project belongs to a different team".into()))
     }
+}
+
+/// Whether `project` belongs to tenant `t`, judged fleet-aware. `ProjectStore`
+/// rows are NODE-LOCAL (never gossiped): on any node that never ran this
+/// project's deploy — including the control-plane leader for remotely-placed
+/// projects — `team_of` is UNTAGGED, so a row-only comparison 403'd the
+/// project's REAL team on every distributed read. Order of evidence:
+/// 1. Local settings row matches — owned.
+/// 2. Any deployment record (local gateway or gossiped peer copy) carries the
+///    tenant tag — owned. Same authority `dep_list`/`deployment_build` trust.
+/// 3. No row AND no deployment evidence anywhere in view: the project is
+///    unknown to this node — optimistically trust the caller's verified tenant
+///    (the sandboxes_api::require pattern). Deliberately narrower than that
+///    one: any visible deployment record for the project keeps this strict, so
+///    a wrong-team caller probing a real project still fails.
+pub(crate) fn project_owned_by(c: &Arc<CloudState>, project: &str, t: &str) -> bool {
+    let owner = c.projects.team_of(project);
+    if norm(&owner) == t {
+        return true;
+    }
+    let mut dep_seen = false;
+    for r in c.gw.deployment_records() {
+        if r.project.eq_ignore_ascii_case(project) {
+            dep_seen = true;
+            if record_tenant(&r.tenant) == t {
+                return true;
+            }
+        }
+    }
+    for d in c.peer_deployments.read().values().flatten() {
+        if d.project.eq_ignore_ascii_case(project) {
+            dep_seen = true;
+            if record_tenant(&d.tenant) == t {
+                return true;
+            }
+        }
+    }
+    record_tenant(&owner) == UNTAGGED_TENANT && !dep_seen
 }
 
 /// Multi-tenant ownership guard for TEAM-level resources: resolve the caller's
@@ -2153,14 +2205,24 @@ fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
 
 /// GET `path` from a peer admin, forwarding the team header; returns parsed JSON.
 async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str) -> Option<Value> {
-    let resp = c
+    let mut rb = c
         .http
         .get(format!("{admin}{path}"))
         .header("x-hive-team", team)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await
-        .ok()?;
+        .timeout(std::time::Duration::from_secs(10));
+    // Under JWT enforcement `x-hive-team` alone resolves to ANON on the target
+    // (headers are client-supplied, never trusted) — every tenant-gated read
+    // proxied here silently 403'd. Attach the same short-lived signed service
+    // delegation `fanout_remote` uses so this node-to-node read authenticates.
+    if crate::auth::enforced() {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+            rb = rb.bearer_auth(tok);
+        }
+    }
+    let resp = rb.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
     resp.json::<Value>().await.ok()
 }
 
@@ -5415,6 +5477,7 @@ fn resolve_identity_sync(
 
 async fn identity_sync(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<IdentitySyncReq>,
 ) -> Json<Value> {
@@ -5435,6 +5498,43 @@ async fn identity_sync(
     );
     if let (Some(slug), Some(o)) = (&org_slug, &req.org) {
         c.identity.upsert_org(&o.id, slug, &o.name, &o.image_url);
+    }
+    // Mirror VERIFIED org membership into the teams roster. Previously nothing
+    // ever did: `team_create` seeds only the platform owner, so every Clerk org
+    // member who signed in and used the team daily was invisible to
+    // GET /v1/teams. `org_slug` is only Some when the caller's verified JWT
+    // tenant equals the claimed org (Clerk-membership-checked at mint). Gated
+    // on `x-hive-internal` so the email is exactly the Clerk-verified one the
+    // server-side mint route posts — a browser-originated sync (no internal
+    // header) can't write an arbitrary body email into its org's roster.
+    if let Some(slug) = &org_slug {
+        let email = req.user.email.trim();
+        if !email.is_empty()
+            && mint_allowed(&headers)
+            && !email.eq_ignore_ascii_case(c.owner_email.trim())
+        {
+            if c.teams.get(slug).is_none() {
+                let name = req
+                    .org
+                    .as_ref()
+                    .map(|o| o.name.trim())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(slug.as_str());
+                let _ = c.teams.create_with_slug(slug, name, "pro", &c.owner_email);
+            }
+            // Add-if-absent only: `add_member` overwrites an existing member's
+            // role, and a manually granted Owner/Admin must never be demoted
+            // by a routine sync.
+            let already = c.teams.get(slug).map(|t| t.member(email).is_some()).unwrap_or(false);
+            if !already {
+                let role = if verified.map(|cl| cl.role == "admin").unwrap_or(false) {
+                    crate::teams::Role::Admin
+                } else {
+                    crate::teams::Role::Member
+                };
+                c.teams.add_member(slug, email, role);
+            }
+        }
     }
     c.identity.upsert_user(
         &req.user.id,

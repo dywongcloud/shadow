@@ -71,7 +71,9 @@ fn bad(msg: &str) -> (StatusCode, String) {
 /// group could compose another tenant's deployments.
 fn ensure_team_owns(c: &Arc<CloudState>, team: &str, projects: impl IntoIterator<Item = String>) -> Result<(), (StatusCode, String)> {
     for p in projects {
-        if crate::admin::norm(&c.projects.team_of(&p)) != team {
+        // Fleet-aware ownership (settings rows are node-local; remotely-placed
+        // projects are judged from their deployment tenant tags).
+        if !crate::admin::project_owned_by(c, &p, team) {
             return Err(mfe_err(MfeError::Unauthorized(format!("project '{p}' belongs to a different team"))));
         }
     }

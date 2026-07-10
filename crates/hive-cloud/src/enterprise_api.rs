@@ -627,8 +627,10 @@ async fn mfe_upsert(
     }
     // Every referenced project (host + children) must belong to THIS team — a
     // microfrontend group must never compose another tenant's deployments.
+    // Fleet-aware check: settings rows are node-local, so a remotely-placed
+    // project's ownership is judged from its deployment tenant tags.
     for p in std::iter::once(&b.host_project).chain(b.children.iter().map(|ch| &ch.project)) {
-        if crate::admin::norm(&c.projects.team_of(p)) != t {
+        if !crate::admin::project_owned_by(&c, p, &t) {
             return Err((StatusCode::FORBIDDEN, format!("project '{p}' belongs to a different team")));
         }
     }
