@@ -31,11 +31,8 @@ const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: false,
 
-  // Enable the instrumentation hook (Next 14). See instrumentation.ts.
-  // https://nextjs.org/docs/pages/guides/instrumentation
-  experimental: {
-    instrumentationHook: true,
-  },
+  // instrumentation.ts is a stable convention in Next 16 — the experimental
+  // `instrumentationHook` flag was removed (it now errors as an unknown key).
 
   async rewrites() {
     return [

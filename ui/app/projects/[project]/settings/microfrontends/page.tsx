@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { ChevronDown, MoreHorizontal, Plus, Trash2, X } from "lucide-react";
 import { Badge, Button, Card, Input, SettingCard, Switch, Triangle } from "@/components/ui";
 import { apiGet, apiSend } from "@/lib/api";
@@ -55,7 +55,8 @@ function errText(e: unknown): string {
   return s;
 }
 
-export default function MicrofrontendsSettings({ params }: { params: { project: string } }) {
+export default function MicrofrontendsSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [data, setData] = useState<ProjectMfe | null>(null);
   const [err, setErr] = useState("");

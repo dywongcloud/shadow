@@ -1,4 +1,5 @@
-"use client";
+"use client";;
+import { use } from "react";
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
@@ -18,13 +19,18 @@ const sections = [
   { slug: "team", label: "Team & Privacy" },
 ];
 
-export default function SettingsLayout({
-  children,
-  params,
-}: {
-  children: React.ReactNode;
-  params: { project: string };
-}) {
+export default function SettingsLayout(
+  props: {
+    children: React.ReactNode;
+    params: Promise<{ project: string }>;
+  }
+) {
+  const params = use(props.params);
+
+  const {
+    children
+  } = props;
+
   const pathname = usePathname();
   const name = decodeURIComponent(params.project);
   const base = `/projects/${encodeURIComponent(name)}/settings`;

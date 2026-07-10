@@ -1,12 +1,13 @@
 "use client";
 
-import { useState } from "react";
+import { useState, use } from "react";
 import { Webhook as WebhookIcon, Plus, Trash2, Check, X } from "lucide-react";
 import { Badge, Button, Input, SettingCard } from "@/components/ui";
 import { apiSend, usePoll, type Webhook, type Delivery } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
-export default function WebhooksSettings({ params }: { params: { project: string } }) {
+export default function WebhooksSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const { data: hooks, refresh } = usePoll<Webhook[]>(`/v1/projects/${encodeURIComponent(project)}/webhooks`, 5000);
   const { data: events } = usePoll<string[]>("/v1/webhooks/events", 60000);

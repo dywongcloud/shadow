@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { Button, Input, SettingCard, Badge } from "@/components/ui";
 import { apiGet, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
-export default function GeneralSettings({ params }: { params: { project: string } }) {
+export default function GeneralSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [dep, setDep] = useState<Deployment | null>(null);
   const [prodBranch, setProdBranch] = useState<string>("");

@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { Lock } from "lucide-react";
 import { Button, Switch, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type ProjectSettings, type Team } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-export default function TeamPrivacySettings({ params }: { params: { project: string } }) {
+export default function TeamPrivacySettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const { data: teams, refresh: refreshTeams } = usePoll<Team[]>("/v1/teams", 10000);
   const [settings, setSettings] = useState<ProjectSettings | null>(null);

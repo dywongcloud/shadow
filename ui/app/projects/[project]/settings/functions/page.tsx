@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { ChevronDown, ExternalLink } from "lucide-react";
 import { Button, Switch, Input, SettingCard } from "@/components/ui";
 import { RegionMap } from "@/components/region-map";
 import { apiGet, apiSend, type FunctionSettings, type RegionCatalog } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
-export default function FunctionsSettings({ params }: { params: { project: string } }) {
+export default function FunctionsSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [fs, setFs] = useState<FunctionSettings | null>(null);
   const [catalog, setCatalog] = useState<RegionCatalog>({});
@@ -94,7 +95,6 @@ export default function FunctionsSettings({ params }: { params: { project: strin
           <span className="text-sm font-medium">{fs.fluid_enabled ? "Enabled" : "Disabled"}</span>
         </div>
       </SettingCard>
-
       {/* CPU & Memory tier — one microVM per instance. */}
       <SettingCard
         title="CPU & Memory"
@@ -136,7 +136,6 @@ export default function FunctionsSettings({ params }: { params: { project: strin
           })}
         </div>
       </SettingCard>
-
       {/* Function Max Duration */}
       <SettingCard
         title="Function Max Duration"
@@ -172,7 +171,6 @@ export default function FunctionsSettings({ params }: { params: { project: strin
           </div>
         </div>
       </SettingCard>
-
       {/* Deployment Regions */}
       <SettingCard
         title="Deployment Regions"
@@ -268,7 +266,6 @@ export default function FunctionsSettings({ params }: { params: { project: strin
           })}
         </div>
       </SettingCard>
-
       {/* Function Failover — automatic multi-region fail-over is Enterprise-only. */}
       <SettingCard
         title="Automatic Region Fail-over"

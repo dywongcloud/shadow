@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState, use } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
 import {
@@ -160,7 +160,8 @@ function meta(s: string) {
   return STATUS_META[(s || "").toLowerCase()] || STATUS_META.pending;
 }
 
-export default function Page({ params }: { params: { id: string } }) {
+export default function Page(props: { params: Promise<{ id: string }> }) {
+  const params = use(props.params);
   return (
     <Suspense fallback={<div className="p-6 text-sm text-secondary">Loading run…</div>}>
       <RunDetail id={decodeURIComponent(params.id)} />

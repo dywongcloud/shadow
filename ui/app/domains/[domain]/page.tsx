@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, use } from "react";
 import Link from "next/link";
 import {
   ChevronRight, RefreshCw, ShieldCheck, Lock, Trash2, Plus, Loader2, Copy, MoreHorizontal,
@@ -19,7 +19,8 @@ function fmtDate(ms: number) {
   return new Date(ms).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
 }
 
-export default function DomainDetailPage({ params }: { params: { domain: string } }) {
+export default function DomainDetailPage(props: { params: Promise<{ domain: string }> }) {
+  const params = use(props.params);
   const domain = decodeURIComponent(params.domain);
   const { data, refresh } = usePoll<DomainDetail>(`/v1/domains/${encodeURIComponent(domain)}`, 6000);
   const [connectOpen, setConnectOpen] = useState(false);

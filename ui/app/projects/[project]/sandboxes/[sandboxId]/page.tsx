@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Loader2, Play, Plus, Square, Trash2, X } from "lucide-react";
@@ -25,7 +25,8 @@ function statusTone(s: string): "green" | "amber" | "red" | "default" {
   return "default";
 }
 
-export default function SandboxDetail({ params }: { params: { project: string; sandboxId: string } }) {
+export default function SandboxDetail(props: { params: Promise<{ project: string; sandboxId: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const sandboxId = params.sandboxId;
   const router = useRouter();

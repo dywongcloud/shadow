@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type BuildConfig, type ProjectSettings } from "@/lib/api";
 
 const FRAMEWORKS = ["Other", "Next.js", "OpenNext", "vinext", "Vite", "Astro", "SvelteKit", "Nuxt", "Remix", "Static", "Python (FastAPI)", "Node (Express)"];
 
-export default function BuildSettings({ params }: { params: { project: string } }) {
+export default function BuildSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [b, setB] = useState<BuildConfig | null>(null);
 

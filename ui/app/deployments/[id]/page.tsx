@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useMemo, useState } from "react";
+import { Suspense, useMemo, useState, use } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import {
@@ -35,7 +35,8 @@ function errorHeadline(build: Build | null): string {
   return anyErr ? anyErr.line.trim() : "Build failed";
 }
 
-export default function DeploymentDetailPage({ params }: { params: { id: string } }) {
+export default function DeploymentDetailPage(props: { params: Promise<{ id: string }> }) {
+  const params = use(props.params);
   // useSearchParams (the top-nav `?tab=` selector) must sit under a Suspense boundary.
   // The fallback is a VISIBLE loading state, never an empty div — if hydration or
   // the searchParams read is slow, the user sees "Loading…", never a blank screen.
@@ -105,25 +106,16 @@ function DeploymentDetail({ id }: { id: string }) {
       >
         <ArrowLeft className="h-4 w-4" /> {dep ? dep.project : "Deployments"}
       </Link>
-
       {tab === "workflows" ? (
         // Workflows scope-tab: this deployment's project workflows + runs (reuses
         // the same component the project page uses).
-        dep ? (
-          <ProjectWorkflows project={dep.project} />
-        ) : (
-          <div className="text-sm text-secondary">Loading…</div>
-        )
+        (dep ? (<ProjectWorkflows project={dep.project} />) : (<div className="text-sm text-secondary">Loading…</div>))
       ) : tab === "logs" ? (
         // Request-logs scope-tab: THIS deployment's own traffic (its immutable
         // id/commit URLs plus whichever aliases it held when requests landed) —
         // server-scoped via the `deployment` filter, never client-filtered.
         // This tab existed in the top nav but rendered the overview before.
-        dep ? (
-          <DeploymentRequestLogs project={dep.project} deployment={id} />
-        ) : (
-          <div className="text-sm text-secondary">Loading…</div>
-        )
+        (dep ? (<DeploymentRequestLogs project={dep.project} deployment={id} />) : (<div className="text-sm text-secondary">Loading…</div>))
       ) : (
       <>
       <Card className="mb-6 p-6">
@@ -251,7 +243,6 @@ function DeploymentDetail({ id }: { id: string }) {
       )}
       </>
       )}
-
       {redeploy && dep && (
         <RedeployModal
           deployment={dep}

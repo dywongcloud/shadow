@@ -103,7 +103,7 @@ async function isPlatformOwner(userId: string): Promise<boolean> {
   const hit = ownerCache.get(userId);
   if (hit && Date.now() - hit.at < OWNER_TTL_MS) return hit.owner;
   try {
-    const user = await clerkClient().users.getUser(userId);
+    const user = await (await clerkClient()).users.getUser(userId);
     const owner = user.emailAddresses.some((e) => ADMIN_EMAILS.has(e.emailAddress.toLowerCase()));
     ownerCache.set(userId, { at: Date.now(), owner });
     return owner;
@@ -120,7 +120,7 @@ const clerk = clerkMiddleware(async (auth, req) => {
     // check right below, which already produces the right response shape
     // per surface (JSON for /ops, redirect for /admin), so protect()'s own
     // redirect/not-found branching would only be redundant — and buggy.
-    const { userId } = auth();
+    const { userId } = await auth();
     if (!userId || !(await isPlatformOwner(userId))) {
       // /ops/* is an API proxy (called by fetch, not page navigation) — an
       // HTML redirect there would surface as a broken/unparsable response to
@@ -149,7 +149,7 @@ const clerk = clerkMiddleware(async (auth, req) => {
     // that never returns a byte. Passing `unauthenticatedUrl` skips
     // `isPageRequest()` entirely and always takes the safe `redirect()`
     // path, for every request shape.
-    auth().protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(req.url)}`, req.url).toString() });
+    await auth.protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(req.url)}`, req.url).toString() });
   }
   return withCache(req, NextResponse.next());
 });
@@ -191,8 +191,13 @@ function neutralizeClerkSelfRewrite(req: Request, res: Response): Response {
 }
 
 // When bypassing, skip Clerk's middleware (and its dev-browser handshake) too,
-// but still apply cache headers.
-export default bypass
+// but still apply cache headers. Next 16 renamed the `middleware` convention to
+// `proxy` (Node runtime only) — this file was `middleware.ts`; the named `proxy`
+// export is the new contract. The `neutralizeClerkSelfRewrite` workaround is now
+// a harmless no-op under @clerk/nextjs v7 (which emits the native
+// `NextResponse.next({ request: { headers } })` form, not the same-URL rewrite),
+// kept as a belt-and-braces guard.
+export const proxy = bypass
   ? (req: Request & { nextUrl: { pathname: string } }) => withCache(req, NextResponse.next())
   : async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
       const res = await clerk(req, event);

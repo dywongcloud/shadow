@@ -1,11 +1,12 @@
 "use client";
 
-import { useState } from "react";
+import { useState, use } from "react";
 import { Lock, Plus, X, Trash2, Loader2 } from "lucide-react";
 import { Badge, Button, Card, SettingCard, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type SecureLink } from "@/lib/api";
 
-export default function SecureComputeSettings({ params }: { params: { project: string } }) {
+export default function SecureComputeSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const { data: all, refresh } = usePoll<SecureLink[]>("/v1/securelinks", 4000);
   const [open, setOpen] = useState(false);

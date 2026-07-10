@@ -1,12 +1,18 @@
 import { NextResponse } from "next/server";
 import { composioConfigured, listToolkits } from "@/lib/composio";
 
-// Server-side caching kept (revalidate hourly) AND the response Cache-Control
-// header for the browser. On top of that we persist the catalog into the
-// platform's guardian-db (docstore) collection `integration_index`:
+// The cross-user/cross-device shared cache of the integrations catalog is the
+// platform's guardian-db (docstore) collection `integration_index`, PLUS the
+// response `Cache-Control: public, s-maxage=3600` header (honored by the edge
+// CDN + browser). Both are framework-independent, so they carry the exact same
+// behavior across the Next 16 upgrade:
 //   • first ever load (no collection) → fetch from Composio + index it
 //   • every load after → pull the stored index from guardian-db (no Composio hit)
-export const revalidate = 3600;
+// The route itself is dynamic: it reads guardian-db per request (the cache
+// lookup) and issues no-store fetches, so — unlike Next 14's route-segment
+// `revalidate` (which Next 16 rejects as a conflict with a no-store fetch) — the
+// route is not Full-Route-Cached; the guardian-db + s-maxage header ARE the cache.
+export const dynamic = "force-dynamic";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 const INDEX = "integration_index";

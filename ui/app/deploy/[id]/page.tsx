@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, use } from "react";
 import Link from "next/link";
 import {
   Loader2,
@@ -170,7 +170,8 @@ function HighlightLine({ line, q }: { line: string; q: string }) {
   );
 }
 
-export default function DeployPage({ params }: { params: { id: string } }) {
+export default function DeployPage(props: { params: Promise<{ id: string }> }) {
+  const params = use(props.params);
   const { id } = params;
   const [build, setBuild] = useState<Build | null>(null);
   const [logsOpen, setLogsOpen] = useState(true);

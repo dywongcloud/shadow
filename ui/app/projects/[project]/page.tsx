@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
@@ -47,7 +47,8 @@ import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/
 // they drive this page via `?tab=`. The page reads that param REACTIVELY so a tab
 // click in the header switches the in-page view without a remount. Wrapped in
 // Suspense (useSearchParams requirement) at the export.
-export default function ProjectDetail({ params }: { params: { project: string } }) {
+export default function ProjectDetail(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   return (
     <Suspense fallback={null}>
       <ProjectDetailInner params={params} />

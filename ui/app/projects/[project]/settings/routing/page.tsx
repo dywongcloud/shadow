@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { Button, Input, SettingCard } from "@/components/ui";
 import { apiGet, apiSend, type RoutingConfig } from "@/lib/api";
 
-export default function RoutingSettings({ params }: { params: { project: string } }) {
+export default function RoutingSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [cfg, setCfg] = useState<RoutingConfig | null>(null);
 

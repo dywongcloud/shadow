@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, use } from "react";
 import Link from "next/link";
 import { Box, Plus, X, Loader2 } from "lucide-react";
 import { Badge, Button, Card, Input, PageHeader, Table, Th, Td, Triangle } from "@/components/ui";
@@ -25,7 +25,8 @@ function timeRemaining(expiresAt?: number | null): string {
   return `${Math.floor(mins / 60)}h ${mins % 60}m`;
 }
 
-export default function SandboxesPage({ params }: { params: { project: string } }) {
+export default function SandboxesPage(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const { data, error, refresh } = usePoll<{ sandboxes: SandboxRecord[] }>(`/v1/projects/${encodeURIComponent(project)}/sandboxes`, 4000);
   const [open, setOpen] = useState(false);
@@ -43,7 +44,6 @@ export default function SandboxesPage({ params }: { params: { project: string } 
         desc="Create isolated Linux environments for running commands, testing code, and executing untrusted workloads."
         action={<Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Sandbox</Button>}
       />
-
       {error && !sandboxes.length ? (
         <Card className="flex flex-col items-center gap-3 py-16 text-center">
           <Box className="h-8 w-8 text-muted" />
@@ -107,7 +107,6 @@ export default function SandboxesPage({ params }: { params: { project: string } 
           </tbody>
         </Table>
       )}
-
       {open && (
         <CreateSandboxDialog
           project={project}

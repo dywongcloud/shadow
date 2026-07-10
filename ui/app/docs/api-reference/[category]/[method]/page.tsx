@@ -45,7 +45,8 @@ function ParamRow({ p }: { p: ApiParam }) {
   );
 }
 
-export default function MethodPage({ params }: { params: { category: string; method: string } }) {
+export default async function MethodPage(props: { params: Promise<{ category: string; method: string }> }) {
+  const params = await props.params;
   const found = findEndpoint(params.category, params.method);
   if (!found) notFound();
   const { endpoint: ep } = found;

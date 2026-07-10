@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { Search, Play, RotateCw, X, ChevronDown, MapPin, ShieldCheck, Zap } from "lucide-react";
@@ -21,7 +21,8 @@ function fmtTime(ms: number) {
   return `${d.toLocaleString("en-US", { month: "short", day: "2-digit" }).toUpperCase()} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 2).slice(0, 2)}`;
 }
 
-export default function ProjectLogs({ params }: { params: { project: string } }) {
+export default function ProjectLogs(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const searchParams = useSearchParams();
   const [events, setEvents] = useState<Event[]>([]);

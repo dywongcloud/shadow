@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
-import ReactFlow, {
+import {
+  ReactFlow,
   Background, BackgroundVariant, Controls, Handle, Position, MiniMap, Panel, MarkerType,
   useNodesState, useEdgesState, type Node, type Edge,
-} from "reactflow";
-import "reactflow/dist/style.css";
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import { useTheme } from "next-themes";
 import {
   CheckCircle2, XCircle, Loader2, Circle, PlayCircle, StopCircle, Zap, Box, Bot,
@@ -274,8 +275,8 @@ function Legend() {
 
 export function WorkflowDefGraph({ def }: { def: WorkflowDef }) {
   const laid = useMemo(() => layoutWdk(def.graph ?? { nodes: [], edges: [] }), [def.id, def.graph]);
-  const [nodes, setNodes, onNodesChange] = useNodesState(laid.nodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(laid.edges);
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>(laid.nodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(laid.edges);
 
   useEffect(() => {
     setNodes(laid.nodes);
@@ -308,8 +309,8 @@ export function WorkflowDefGraph({ def }: { def: WorkflowDef }) {
 
 export function WorkflowGraph({ run, now }: { run: WorkflowRun; now: number }) {
   const dark = useDark();
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const key = useMemo(
     () => JSON.stringify([run.id, run.steps.map((s) => [s.name, s.status])]),

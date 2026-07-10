@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check } from "lucide-react";
@@ -9,7 +9,8 @@ import { apiGet, apiSend, usePoll, type Database } from "@/lib/api";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
 
-export default function DatabaseDetail({ params }: { params: { id: string } }) {
+export default function DatabaseDetail(props: { params: Promise<{ id: string }> }) {
+  const params = use(props.params);
   const id = params.id;
   const router = useRouter();
   // ADAPTIVE: a ready database record is essentially static — poll fast (3s)

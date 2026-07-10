@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { ExternalLink } from "lucide-react";
 import { Button, SettingCard, Switch } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type CronJob, type ProjectSettings } from "@/lib/api";
@@ -28,7 +28,8 @@ function describeSchedule(expr: string): string | null {
   return null;
 }
 
-export default function CronSettings({ params }: { params: { project: string } }) {
+export default function CronSettings(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const { data: allJobs, refresh } = usePoll<CronJob[]>("/v1/cron", 5000);
   const [settings, setSettings] = useState<ProjectSettings | null>(null);

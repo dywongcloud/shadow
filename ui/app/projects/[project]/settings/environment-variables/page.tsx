@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, use } from "react";
 import { Search, Lock, Plus, Trash2 } from "lucide-react";
 import { Card, Button, Input, Badge, Switch } from "@/components/ui";
 import { apiGet, apiSend, type EnvVar, type ProjectSettings } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 
-export default function EnvVarsPage({ params }: { params: { project: string } }) {
+export default function EnvVarsPage(props: { params: Promise<{ project: string }> }) {
+  const params = use(props.params);
   const project = decodeURIComponent(params.project);
   const [vars, setVars] = useState<EnvVar[]>([]);
   const [q, setQ] = useState("");
@@ -81,7 +82,6 @@ export default function EnvVarsPage({ params }: { params: { project: string } })
           <Button onClick={() => setAdding((a) => !a)}><Plus className="h-4 w-4" /> Add Environment Variable</Button>
         </div>
       </div>
-
       {adding && (
         <Card className="mb-4">
           <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -116,7 +116,6 @@ export default function EnvVarsPage({ params }: { params: { project: string } })
           </div>
         </Card>
       )}
-
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <div className="relative min-w-[220px] flex-1">
           <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
@@ -132,14 +131,12 @@ export default function EnvVarsPage({ params }: { params: { project: string } })
           <option>Last Updated</option><option>Name</option>
         </select>
       </div>
-
       {loadErr && (
         <div className="mb-4 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-sm text-red-500">
           Could not load variables: {loadErr}{" "}
           <button className="underline" onClick={load}>Retry</button>
         </div>
       )}
-
       <Card className="p-0">
         {filtered.map((e, i) => (
           <div key={e.key + i} className="border-b border-border last:border-0">

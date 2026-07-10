@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import ReactFlow, {
+import {
+  ReactFlow,
   Background, BackgroundVariant, Controls, Handle, Position, MiniMap,
   useNodesState, useEdgesState, type Node, type Edge, type ReactFlowInstance,
-} from "reactflow";
-import "reactflow/dist/style.css";
+} from "@xyflow/react";
+import "@xyflow/react/dist/style.css";
 import Link from "next/link";
 import { useTheme } from "next-themes";
 import {
@@ -304,8 +305,8 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
   // consumed databases); otherwise we fall back to the derived view below.
   const { data: sg } = usePoll<SvcGraph>(`/v1/projects/${encodeURIComponent(project)}/service-graph`, 15000);
 
-  const [nodes, setNodes, onNodesChange] = useNodesState([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const lastKey = useRef("");
   const rf = useRef<ReactFlowInstance | null>(null);
   // Canvas locked by default (no pan/zoom/drag); unlock via the Controls lock button.

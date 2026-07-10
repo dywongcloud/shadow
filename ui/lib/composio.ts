@@ -37,13 +37,13 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!proces
 export async function resolveEntity(): Promise<string> {
   if (clerkEnabled) {
     try {
-      const { userId } = auth();
+      const { userId } = await auth();
       if (userId) return `gh_${userId}`;
     } catch {
       /* auth() unavailable (e.g. outside request scope) — fall through */
     }
   }
-  const cookieEntity = cookies().get("hive_entity")?.value;
+  const cookieEntity = (await cookies()).get("hive_entity")?.value;
   return cookieEntity || "default";
 }
 

@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
   }
   let userId: string | null = null;
   try {
-    userId = auth().userId ?? null;
+    userId = (await auth()).userId ?? null;
   } catch {
     /* auth() unavailable */
   }
@@ -94,7 +94,7 @@ export async function POST(req: NextRequest) {
   if (!wantsPersonal) {
     // An org slug — authorize against the user's actual Clerk org memberships.
     try {
-      const memberships = await clerkClient().users.getOrganizationMembershipList({ userId, limit: 100 });
+      const memberships = await (await clerkClient()).users.getOrganizationMembershipList({ userId, limit: 100 });
       const list = Array.isArray(memberships) ? memberships : memberships?.data ?? [];
       const m = list.find((mm: { organization: { slug?: string | null; id: string } }) => {
         const o = mm.organization;
