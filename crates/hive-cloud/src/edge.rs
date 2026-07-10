@@ -834,6 +834,7 @@ fn region_code(region: &str) -> String {
         "amsterdam" => "ams1",
         "stockholm" => "arn1",
         "singapore" => "sin1",
+        "hong-kong" | "hongkong" => "hkg1",
         "tokyo" => "hnd1",
         "osaka" => "kix1",
         "seoul" => "icn1",

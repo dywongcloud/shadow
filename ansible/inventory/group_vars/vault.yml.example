@@ -9,3 +9,8 @@ vault_hive_internal_token: "REPLACE_ME"      # gates server-only endpoints (x-hi
 vault_vercel_api_token: "REPLACE_ME"         # Vercel REST token, DNS-records scope, for the dns_vercel role
 vault_vercel_team_id: ""                      # optional -- only if the domains live in a Vercel team
 vault_stripe_secret_key: ""                   # optional -- only if billing is enabled
+# Clerk auth keys for the dashboard UI (hive_ui role). NEXT_PUBLIC_CLERK_*
+# bakes into the client bundle at build time. Omit both to build a UI with
+# Clerk auth disabled (dev/self-host without Clerk).
+vault_clerk_publishable_key: ""               # NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+vault_clerk_secret_key: ""                    # CLERK_SECRET_KEY

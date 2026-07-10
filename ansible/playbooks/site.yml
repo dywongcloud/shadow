@@ -43,6 +43,13 @@
     - role: hive_platform
       tags: [hive_platform, platform]
 
+- name: Platform dashboard UI (Next.js on loopback :3002)
+  hosts: platform
+  become: true
+  roles:
+    - role: hive_ui
+      tags: [hive_ui, ui]
+
 - name: Mesh trust configuration
   hosts: platform
   become: true

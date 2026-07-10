@@ -1617,6 +1617,7 @@ pub fn region_code(region: &str) -> &'static str {
         "bangkok" => "sin",
         "san-jose" => "sfo",
         "los-angeles" => "lax",
+        "hong-kong" => "hkg",
         _ => "",
     }
 }

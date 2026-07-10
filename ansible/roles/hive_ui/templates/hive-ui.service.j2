@@ -1,0 +1,19 @@
+# {{ ansible_managed }}
+[Unit]
+Description=shadw hive dashboard UI (Next.js) -> local node admin :8786
+After=network-online.target hive-node.service
+Wants=network-online.target
+
+[Service]
+WorkingDirectory={{ hive_src_dir }}/ui
+EnvironmentFile={{ hive_src_dir }}/ui/.env.local
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+Environment=PORT=3002
+ExecStart={{ hive_src_dir }}/ui/node_modules/.bin/next start -H 127.0.0.1 -p 3002
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

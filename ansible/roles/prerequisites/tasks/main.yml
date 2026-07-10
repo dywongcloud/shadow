@@ -85,3 +85,23 @@
     name: podman.socket
     state: started
     enabled: true
+
+# The fleet runs container/DB deployments under gVisor (HIVE_CONTAINER_RUNTIME=
+# runsc) for stronger isolation than plain runc. Without runsc installed, every
+# container/DB deployment fails at launch -- discovered live on a fresh node
+# that had the runsc env set but no gVisor binary. Install + register it with
+# podman so the runsc runtime the node is configured for actually exists.
+- name: Install gVisor runsc (the container runtime the fleet's HIVE_CONTAINER_RUNTIME=runsc needs)
+  ansible.builtin.get_url:
+    url: "https://storage.googleapis.com/gvisor/releases/release/latest/{{ ansible_architecture }}/runsc"
+    dest: /usr/local/bin/runsc
+    mode: "0755"
+
+- name: Register runsc as a podman runtime
+  ansible.builtin.blockinfile:
+    path: /etc/containers/containers.conf
+    create: true
+    marker: "# {mark} ANSIBLE MANAGED gvisor runtime"
+    block: |
+      [engine.runtimes]
+      runsc = ["/usr/local/bin/runsc"]

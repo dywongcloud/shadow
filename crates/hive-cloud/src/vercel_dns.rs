@@ -430,6 +430,20 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             if leader.as_deref() != Some(cloud.node_name.as_str()) {
                 continue;
             }
+            // Convergence guard: a node that was told to JOIN an existing fleet
+            // (HIVE_BOOTSTRAP_PEERS set) but currently sees ONLY itself in the
+            // registry has not yet synced gossip — its view of the healthy set
+            // is a transient single-self, and reconciling from it would DELETE
+            // every peer's A-record and publish only this node's IP fleet-wide
+            // (live-observed: a freshly-joined 9th node clobbered
+            // shadw.cloud/*.shadw.app to only-itself for ~30s until the real
+            // leader re-reconciled). A founding node (no bootstrap peers) has
+            // no peers to clobber, so it is exempt and still bootstraps DNS.
+            let has_bootstrap = std::env::var("HIVE_BOOTSTRAP_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            if has_bootstrap && cloud.registry.nodes().len() <= 1 {
+                tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
+                continue;
+            }
             let nodes: Vec<(String, bool, Option<String>, Option<String>)> = cloud
                 .registry
                 .nodes()

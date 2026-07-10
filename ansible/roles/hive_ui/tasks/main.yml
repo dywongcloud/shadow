@@ -1,0 +1,77 @@
+---
+# Host the Next.js platform dashboard UI on this node (hive-ui.service,
+# next start on loopback :3002, fronted by the node's own admin ingress).
+# Every fleet node that should serve the dashboard runs this; the source is
+# pushed from the Ansible control host's own checkout of this repo (same as
+# hive_platform), then built on the node so its .next matches its own
+# node_modules (a rebuild's content-hashed assets must be produced where they
+# are served -- see the fleet's dashboard-ui-serving note).
+
+- name: Ensure the ui directory exists on the target
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui"
+    state: directory
+    mode: "0755"
+
+- name: Sync ui/ source (exclude node_modules/.next/.git -- built on the node)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../ui/"
+    dest: "{{ hive_src_dir }}/ui/"
+    delete: false
+    rsync_opts:
+      - "--exclude=node_modules"
+      - "--exclude=.next"
+      - "--exclude=.git"
+
+- name: Template ui/.env.local (HIVE_ADMIN + Clerk + NEXT_PUBLIC bake vars)
+  ansible.builtin.template:
+    src: env.local.j2
+    dest: "{{ hive_src_dir }}/ui/.env.local"
+    mode: "0640"
+
+- name: npm ci (clean install matching package-lock)
+  ansible.builtin.command:
+    cmd: npm ci
+    chdir: "{{ hive_src_dir }}/ui"
+  environment:
+    PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
+  async: 900
+  poll: 15
+
+- name: npm run build (NEXT_PUBLIC_* bake in at build time from .env.local)
+  ansible.builtin.command:
+    cmd: npm run build
+    chdir: "{{ hive_src_dir }}/ui"
+  environment:
+    PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
+    NODE_ENV: production
+  async: 900
+  poll: 15
+  notify: restart hive-ui
+
+- name: Template the hive-ui systemd unit
+  ansible.builtin.template:
+    src: hive-ui.service.j2
+    dest: /etc/systemd/system/hive-ui.service
+    mode: "0644"
+  notify: [reload systemd, restart hive-ui]
+
+- name: Flush handlers so the health check sees the final state
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start hive-ui
+  ansible.builtin.systemd:
+    name: hive-ui
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the UI to answer on loopback :3002
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3002/"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _ui
+  retries: 12
+  delay: 5
+  until: _ui.status in [200, 307, 308]
