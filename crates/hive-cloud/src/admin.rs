@@ -4317,9 +4317,12 @@ pub(crate) async fn deployment_service_graph(State(c): State<Arc<CloudState>>, h
 
 async fn project_service_graph(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(project): Path<String>) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    // Team-gate only when this node KNOWS the project's team (it may not host it).
-    let known = c.projects.team_of(&project);
-    if !known.is_empty() && norm(&known) != norm(&t) {
+    // Fleet-aware ownership: `team_of` is UNTAGGED (never empty) on a node that
+    // doesn't host this project, so the old `!known.is_empty()` guard never
+    // relaxed and 404'd a member's own service graph everywhere but the host.
+    // project_owned_by trusts the deployment tenant tags and stays permissive
+    // for a fleet-unknown project (so the on-demand scan / host proxy below run).
+    if !project_owned_by(&c, &project, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
     // Stored, or scanned on-demand from a locally-hosted deployment (backfills
