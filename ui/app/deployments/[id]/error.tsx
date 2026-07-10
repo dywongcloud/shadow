@@ -11,7 +11,7 @@ import Link from "next/link";
  * user gets the message + a retry rather than a white screen. Purely additive:
  * never renders on success.
  */
-export default function DeploymentError({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
+export default function DeploymentError({ error }: { error: Error & { digest?: string }; reset: () => void }) {
   useEffect(() => {
     console.error("[deployment detail error]", error);
   }, [error]);
@@ -22,8 +22,10 @@ export default function DeploymentError({ error, reset }: { error: Error & { dig
         {error?.message || "An unexpected error occurred while rendering this deployment."}
       </p>
       <div className="mt-1 flex gap-2">
+        {/* Hard reload, not reset(): recovers stale-cached-bundle crashes too
+            (see app/error.tsx). */}
         <button
-          onClick={reset}
+          onClick={() => window.location.reload()}
           className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg hover:opacity-90"
         >
           Try again

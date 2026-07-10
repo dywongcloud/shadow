@@ -8,7 +8,7 @@ import { useEffect } from "react";
  * one user hit on /storage). Shows the message + a retry, and logs to the console
  * so the real cause is recoverable. Purely additive: never renders on success.
  */
-export default function Error({ error, reset }: { error: Error & { digest?: string }; reset: () => void }) {
+export default function Error({ error }: { error: Error & { digest?: string }; reset: () => void }) {
   useEffect(() => {
     console.error("[route error]", error);
   }, [error]);
@@ -19,8 +19,13 @@ export default function Error({ error, reset }: { error: Error & { digest?: stri
         {error?.message || "An unexpected error occurred while rendering."}
       </p>
       <div className="mt-1 flex gap-2">
+        {/* Full reload, not reset(): reset() re-renders the SAME page, so a crash
+            caused by a stale cached bundle (SWR-stale HTML referencing an old
+            immutable chunk in the browser's disk cache) can never recover through
+            it. A hard reload refetches the HTML, which past the SWR window
+            references the current fixed chunks. */}
         <button
-          onClick={reset}
+          onClick={() => window.location.reload()}
           className="rounded-md bg-accent px-3 py-1.5 text-sm font-medium text-accent-fg hover:opacity-90"
         >
           Try again

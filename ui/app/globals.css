@@ -3,29 +3,10 @@
 @tailwind utilities;
 
 /* ABC Diatype — the platform typeface (https://abcdinamo.com/typefaces/diatype).
-   It's a licensed font, so drop the woff2 files into /public/fonts/ to enable it;
-   until then the stack falls back to Geist automatically (see tailwind.config).
-   Files expected: ABCDiatype-{Regular,Medium,Bold}.woff2, ABCDiatypeMono-Regular.woff2 */
-@font-face {
-  font-family: "ABC Diatype";
-  src: url("/fonts/ABCDiatype-Regular.woff2") format("woff2");
-  font-weight: 400; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: "ABC Diatype";
-  src: url("/fonts/ABCDiatype-Medium.woff2") format("woff2");
-  font-weight: 500; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: "ABC Diatype";
-  src: url("/fonts/ABCDiatype-Bold.woff2") format("woff2");
-  font-weight: 700; font-style: normal; font-display: swap;
-}
-@font-face {
-  font-family: "ABC Diatype Mono";
-  src: url("/fonts/ABCDiatypeMono-Regular.woff2") format("woff2");
-  font-weight: 400; font-style: normal; font-display: swap;
-}
+   It's a licensed font that is NOT bundled; the Tailwind stack falls back to
+   Geist automatically. The @font-face block lives in /public/fonts/README.md —
+   paste it back here after dropping the woff2 files in. Declaring the faces
+   without the files made every visitor's console log four font 404s. */
 
 /* Semantic color tokens (HSL channels) — switched by the `.dark` class. */
 :root {

@@ -38,7 +38,7 @@ const ServiceGraph = dynamic(
     ),
   }
 );
-import { apiGet, apiSend, usePoll, type Deployment, type Overview } from "@/lib/api";
+import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview } from "@/lib/api";
 import { usePendingBuilds } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
@@ -61,6 +61,13 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   const searchParams = useSearchParams();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: ov } = usePoll<Overview>("/v1/overview", 4000);
+  // Per-project observability comes from the TENANT-SCOPED metrics endpoint, not
+  // /v1/overview: overview's counters (requests/cdn/concurrency) are platform-wide
+  // and operator-only — regular team members receive a stripped response without
+  // them, which both crashed the old unguarded read and would otherwise pin this
+  // card to permanent zeros. /v1/metrics?project= is member-accessible and filtered
+  // to this project. (180 is the backend's max window.)
+  const { data: pm } = usePoll<Metrics>(`/v1/metrics?minutes=180&project=${encodeURIComponent(name)}`, 8000);
   const tabParam = searchParams.get("tab");
   const tab: "overview" | "graph" | "workflows" | "resources" | "deployments" =
     tabParam === "graph" || tabParam === "deployments" || tabParam === "workflows" || tabParam === "resources"
@@ -263,10 +270,10 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 <span className="font-medium">Observability</span>
                 <ChevronRight className="h-4 w-4 text-muted" />
               </div>
-              <Metric label="Requests" value={ov?.requests ?? 0} />
-              <Metric label="Function Invocations" value={ov?.instances ? (ov.requests) : 0} />
-              <Metric label="Blocked (firewall)" value={ov?.blocked ?? 0} />
-              <Metric label="Cache hit ratio" value={`${Math.round((ov?.cdn?.hit_ratio ?? 0) * 100)}%`} />
+              <Metric label="Requests" value={pm?.totals?.requests ?? 0} />
+              <Metric label="Errors" value={pm?.totals?.errors ?? 0} />
+              <Metric label="Blocked (firewall)" value={pm?.totals?.blocked ?? 0} />
+              <Metric label="Cache hit ratio" value={`${Math.round((pm?.totals?.cache_hit_ratio ?? 0) * 100)}%`} />
             </Card>
 
             <Card className="flex flex-col items-center justify-center gap-3 p-5 text-center">
