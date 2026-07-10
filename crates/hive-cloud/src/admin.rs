@@ -511,14 +511,37 @@ async fn project_domain_add(
     Ok(Json(json!({ "domain": b.domain, "project": project, "attached": true })))
 }
 
-async fn domains_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+pub(crate) async fn domains_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Query(q): Query<LocalQ>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let pairs = c.projects.all_domains();
-    Json(json!(pairs
-        .into_iter()
-        .filter(|(p, _)| norm(&c.projects.team_of(p)) == t)
-        .map(|(p, d)| json!({ "project": p, "domain": d }))
-        .collect::<Vec<_>>()))
+    // Custom domains live in each project's node-local ProjectSettings (never
+    // gossiped), so a bare list shows ONLY locally-hosted projects' domains —
+    // a member's remotely-placed project's domains were invisible on the node
+    // that answered. Merge this node's domains with each peer hosting the
+    // tenant's projects (the same fan-out /v1/workflows uses). `?local=true`
+    // answers with local-only so a peer never re-fans (no loop).
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Value> = Vec::new();
+    for (p, d) in c.projects.all_domains() {
+        if norm(&c.projects.team_of(&p)) == t && seen.insert(format!("{p}\u{0}{d}")) {
+            out.push(json!({ "project": p, "domain": d }));
+        }
+    }
+    if !q.local.unwrap_or(false) {
+        for node in peer_nodes_for_tenant(&c, &t) {
+            if let Some(v) = fetch_from_host(&c, &node, "/v1/domains?local=true", &t).await {
+                if let Some(arr) = v.as_array() {
+                    for item in arr {
+                        let p = item.get("project").and_then(|x| x.as_str()).unwrap_or("");
+                        let d = item.get("domain").and_then(|x| x.as_str()).unwrap_or("");
+                        if seen.insert(format!("{p}\u{0}{d}")) {
+                            out.push(item.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Json(json!(out))
 }
 
 // ---- Deployment resources (functions + static assets, build artifacts) ----
@@ -3539,6 +3562,14 @@ struct CronToggle {
 }
 
 // ---- Workflows ----
+
+/// Query for endpoints that fan out to peers: `?local=true` answers with this
+/// node's local data only, so a proxied call never re-fans (loop guard).
+#[derive(Deserialize)]
+pub(crate) struct LocalQ {
+    #[serde(default)]
+    pub(crate) local: Option<bool>,
+}
 
 #[derive(Deserialize)]
 pub(crate) struct WfQuery {

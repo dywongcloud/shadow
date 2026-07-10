@@ -118,6 +118,18 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err(_) => Vec::new(),
             }
         }
+        // Tenant's LOCAL custom domains for the fleet-aggregation fan-out (domains
+        // live in node-local ProjectSettings; the coordinator merges each host's).
+        // Team rides as `?team=`; always local-only (the caller already fanned out).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/domains") => {
+            jb(crate::admin::domains_list(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Query(crate::admin::LocalQ { local: Some(true) }),
+            )
+            .await)
+        }
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
         // project on THIS node (or the project must be absent — idempotent).
