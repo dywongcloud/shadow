@@ -584,7 +584,13 @@ pub(crate) async fn deployment_resources(State(c): State<Arc<CloudState>>, heade
         }
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     };
-    if norm(&c.projects.team_of(&rec.project)) != t {
+    // Ownership judged from the deployment record's OWN tenant tag (authoritative
+    // and present — `rec` is a local record), NOT the node-local project row:
+    // `team_of` is UNTAGGED on a node whose ProjectStore row was GC'd/never synced
+    // (rows aren't gossiped), which used to hand a legit owner empty resources.
+    // Fall back to the project row only when the record's tag was lost.
+    let rec_owner = record_tenant(&rec.tenant);
+    if rec_owner != t && norm(&c.projects.team_of(&rec.project)) != t {
         return Json(json!({ "functions": [], "static_assets": [], "total_static": 0 }));
     }
     let functions: Vec<Value> = rec
@@ -1234,7 +1240,17 @@ pub(crate) async fn build_get(
     // Team-scoped — this route previously had no ownership check at all, so
     // any caller (even unauthenticated, since GET bypasses the JWT gate) who
     // knew/guessed a build id could read another tenant's full build log.
-    if norm(&c.projects.team_of(&b.project)) != norm(&t) {
+    // The project row is node-local (never gossiped) and Build carries no
+    // tenant tag, so `team_of` alone 404'd a member's OWN build log on any node
+    // whose row was GC'd/never synced. Fall back to the build's deployment
+    // record tenant tag (local gw record or gossiped peer copy) — the same
+    // authority `deployment_build`/`dep_list` trust.
+    let owns = norm(&c.projects.team_of(&b.project)) == norm(&t)
+        || b.deployment_id.as_deref().is_some_and(|did| {
+            c.gw.deployment_records().iter().any(|r| r.id == did && record_tenant(&r.tenant) == norm(&t))
+                || c.peer_deployments.read().values().flatten().any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(&t))
+        });
+    if !owns {
         return Err(StatusCode::NOT_FOUND);
     }
     Ok(Json(json!(b)))
@@ -5263,7 +5279,10 @@ fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notificati
 
     // 1b) Failed builds (git deploys that errored before going live).
     for b in c.builds.list() {
-        if norm(&c.projects.team_of(&b.project)) != team {
+        // Fleet-aware ownership (project rows are node-local): a failed-build
+        // alert would otherwise silently drop on any node whose project row is
+        // absent, hiding the failure from the owner.
+        if !project_owned_by(&c, &b.project, &team) {
             continue;
         }
         if b.state == fluid_core::DeployState::Error {
