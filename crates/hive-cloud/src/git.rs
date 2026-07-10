@@ -1820,9 +1820,48 @@ async fn build_via_fdi(
             }
             let mut m = function_manifest(project, start, runtime_override);
             m.route_policies = route_policies;
+            // after()/waitUntil runtime support for Node-runtime deployments: drop
+            // the platform shim into the build dir and inject it via NODE_OPTIONS
+            // so Next.js `after()` (which funnels into the platform waitUntil at
+            // globalThis[Symbol.for('@next/request-context')].get().waitUntil) keeps
+            // the instance warm for background work via the existing
+            // x-fluid-wait-until-ms keep-alive convention. Skipped for Bun (doesn't
+            // honor NODE_OPTIONS --require); harmless no-op if after() is never used.
+            if runtime_override != Some(hive_core::Runtime::Bun) {
+                install_after_shim(dir, &mut m).await;
+            }
             Ok(m)
         }
     }
+}
+
+/// The Node `--require` preload that provides `after()`/`waitUntil` support. Read
+/// at compile time from the crate's assets and written into each Node deployment.
+const AFTER_SHIM_JS: &str = include_str!("../assets/after-shim.cjs");
+const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
+
+/// Write the after()-support shim into the build dir and wire it into the first
+/// function's serve env (NODE_OPTIONS=--require + HIVE_AFTER_MAX_MS = maxDuration).
+/// A relative `--require ./<file>` path so it resolves against the function's CWD
+/// on every backend (the FC microVM relocates the workdir to /build).
+async fn install_after_shim(dir: &Path, m: &mut Manifest) {
+    if tokio::fs::write(dir.join(AFTER_SHIM_FILE), AFTER_SHIM_JS).await.is_err() {
+        return; // best-effort: a shim write failure must never fail the deploy
+    }
+    let Some(f) = m.functions.first_mut() else { return };
+    let max_ms = (f.max_duration_secs.max(1) as u64).saturating_mul(1000);
+    // Append to any NODE_OPTIONS the project already set, don't clobber it.
+    let require = format!("--require ./{AFTER_SHIM_FILE}");
+    f.env
+        .entry("NODE_OPTIONS".to_string())
+        .and_modify(|v| {
+            if !v.contains(AFTER_SHIM_FILE) {
+                v.push(' ');
+                v.push_str(&require);
+            }
+        })
+        .or_insert(require);
+    f.env.entry("HIVE_AFTER_MAX_MS".to_string()).or_insert_with(|| max_ms.to_string());
 }
 
 fn static_manifest(project: &str, static_dir: &str) -> Manifest {
