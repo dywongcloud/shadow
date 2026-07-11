@@ -9,6 +9,9 @@ history).
 - Relational mirror on GuardianDB for `ProjectStore`/`BillingStore`; hot-path
   `MetricsStore` deliberately excluded; `refresh()`-before-read requirement.
   Detail: `recall("relational-scope")` / `crates/hive-cloud/src/relational.rs`.
+- Admin SQL/tables view (`GET/POST /v1/admin/sql/*`) must stay read-only;
+  extend `relational::known_tables()` for any new relational table. Detail:
+  `recall("sql-readonly-guard")`.
 
 ## Mesh networking & anti-entropy
 
@@ -37,3 +40,7 @@ history).
 - Fleet has two glibc groups needing separate native builds (bkk/hk vs
   va/va2/va3/sj); always sha256-verify + `.old`-backup a binary before
   swapping. Detail: `recall("fleet-glibc-groups")`.
+- The dashboard's `/ops/*` proxy forwards every admin request to the CURRENT
+  control-plane leader, not the node running the dashboard process — verify
+  new admin endpoints through the real dashboard. Detail:
+  `recall("ops-proxy-leader-forward")`.

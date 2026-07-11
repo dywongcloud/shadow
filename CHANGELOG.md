@@ -28,3 +28,15 @@ project on every live node (not just future writes) and found two more real,
 already-exposed OpenAI API keys (`fatni`, `shoomoo`) beyond the original
 GitHub PAT — resealed all of them; a follow-up re-scan confirmed zero
 credential-shaped values remain stored as non-sensitive fleet-wide.
+
+## c2bbfce — Add caching + a read-only PostgreSQL/tables view to the admin Data Browser
+
+The Data Browser's collection/row/table reads are now client-cached for 15s
+(mutations still bust the cache immediately, unchanged). Adds a Documents |
+Tables (PostgreSQL) view toggle backed by the relational layer above: two
+new admin endpoints (`GET /v1/admin/sql/tables`, `POST /v1/admin/sql/query`)
+enforced SELECT-only server-side, live-verified end-to-end through the real
+dashboard including the guardrail actually being exercised via the UI's own
+query box. Along the way, confirmed the dashboard's `/ops` proxy forwards to
+the current control-plane leader regardless of which node runs the
+dashboard process — a new admin endpoint needs the leader deployed first.

@@ -488,6 +488,19 @@ token prefixes, PEM blocks, JWTs) in a value and forces `sensitive: true`
 regardless of the caller's flag, so a user forgetting to check "Sensitive"
 can't leak a real token in plaintext through the settings/gitops read paths.
 
+**Admin Data Browser — Tables (PostgreSQL) view.** Alongside the existing
+document-collection browser (`/admin/data`), a view toggle switches to a
+read-only view of the relational mirror above as real typed SQL tables:
+`GET /v1/admin/sql/tables` lists the known tables + columns, `POST
+/v1/admin/sql/query` runs a query (a picked table defaults to `SELECT *
+FROM <table> LIMIT 200`, or type your own). Enforced SELECT-only
+server-side — mutating keywords are rejected anywhere in the query (not
+just as the first token) and multi-statement input is rejected outright, so
+this can never become a second, less-guarded write path alongside the
+document browser's own PUT/POST/DELETE endpoints. The Data Browser's reads
+(both views) are also client-cached for 15s now — clicking between
+collections/tables no longer re-fetches every click.
+
 ## hived flags
 
 ```
