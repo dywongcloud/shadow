@@ -176,38 +176,7 @@ async fn authorized_mode(acl: &dyn AccessController, requester: PublicKey) -> Op
 /// Requests a peer's `DocTicket` for the store at `address`, over the [`TICKET_ALPN`].
 ///
 /// Returns `Ok(Some(ticket))` if granted, `Ok(None)` if denied/unavailable.
-/// Upper bound on one full request/response round trip (connect + stream +
-/// send + response). Neither `Endpoint::connect` nor the stream read below has
-/// any timeout of its own: dialing a `NodeId` that nothing is actually
-/// listening as under this ALPN (a stale/wrong peer entry — e.g. a mesh
-/// identity mistakenly fed in as if it were this protocol's identity) can
-/// hang indefinitely with no error. Live evidence: exactly this hung an
-/// hive-cloud caller's outer 30s init timeout, repeatedly, before the wrong
-/// identity source was fixed at the call site — this bounds the failure mode
-/// at the protocol layer too, so a single bad peer entry degrades to "this
-/// one candidate didn't answer in time, try the next" instead of a multi-
-/// second-to-indefinite stall per attempt.
-const REQUEST_TICKET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 pub async fn request_ticket(
-    endpoint: &Endpoint,
-    peer: NodeId,
-    address: &str,
-) -> Result<Option<String>> {
-    match tokio::time::timeout(
-        REQUEST_TICKET_TIMEOUT,
-        request_ticket_inner(endpoint, peer, address),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(GuardianError::Other(format!(
-            "ticket request to {peer} timed out after {REQUEST_TICKET_TIMEOUT:?}"
-        ))),
-    }
-}
-
-async fn request_ticket_inner(
     endpoint: &Endpoint,
     peer: NodeId,
     address: &str,

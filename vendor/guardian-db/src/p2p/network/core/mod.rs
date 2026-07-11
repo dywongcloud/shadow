@@ -150,6 +150,18 @@ enum StoreType {
 
 /// Optimized Iroh backend.
 ///
+/// Snapshot of one home-relay's connection status, as reported by
+/// [`IrohBackend::relay_status`] (C2). Derived from `Endpoint::home_relay_status`.
+#[derive(Debug, Clone)]
+pub struct RelayInfo {
+    /// URL of the home relay.
+    pub url: String,
+    /// Whether the endpoint is currently connected to this relay.
+    pub connected: bool,
+    /// Most recent connection error, if currently disconnected.
+    pub last_error: Option<String>,
+}
+
 /// High-performance Iroh backend with native optimizations:
 /// - Multi-level cache with intelligent compression
 /// - Connection pool with circuit breaking
@@ -196,7 +208,13 @@ pub struct IrohBackend {
     ticket_registry: crate::p2p::network::core::ticket_exchange::TicketRegistry,
     /// Peers we have already connected to (candidates for requesting tickets).
     known_peers: Arc<RwLock<std::collections::HashSet<NodeId>>>,
+    /// Per-peer latency sample history (bounded ring), for per-peer p95/p99 (C1).
+    /// Fed by `update_connection_latency`; independent of the EMA `avg_latency_ms`.
+    peer_latency_history: Arc<RwLock<HashMap<NodeId, std::collections::VecDeque<f64>>>>,
 }
+
+/// Max latency samples kept per peer for percentile estimation (C1).
+const PEER_LATENCY_HISTORY_CAP: usize = 128;
 
 /// Internal status of the Iroh node.
 #[derive(Debug, Clone)]
@@ -480,6 +498,7 @@ impl IrohBackend {
             ),
             ticket_registry: crate::p2p::network::core::ticket_exchange::new_registry(),
             known_peers: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            peer_latency_history: Arc::new(RwLock::new(HashMap::new())),
         };
         // Initialize the Iroh node asynchronously.
         backend.initialize_node().await?;
@@ -769,6 +788,55 @@ impl IrohBackend {
             return Err(GuardianError::Other("Endpoint not initialized".to_string()));
         }
         Ok(self.endpoint.clone())
+    }
+
+    /// Snapshot of the endpoint's home-relay connection status (C2).
+    ///
+    /// Returns one entry per home relay whose URL is known; empty when no relay is
+    /// configured or before one is selected. Wraps `Endpoint::home_relay_status`.
+    pub async fn relay_status(&self) -> Vec<RelayInfo> {
+        use iroh::Watcher;
+        let Ok(endpoint_arc) = self.get_endpoint().await else {
+            return Vec::new();
+        };
+        let endpoint_lock = endpoint_arc.read().await;
+        let Some(endpoint) = endpoint_lock.as_ref() else {
+            return Vec::new();
+        };
+        let mut watcher = endpoint.home_relay_status();
+        watcher
+            .get()
+            .into_iter()
+            .map(|s| RelayInfo {
+                url: s.url().to_string(),
+                connected: s.is_connected(),
+                last_error: s.last_error().map(|e| e.to_string()),
+            })
+            .collect()
+    }
+
+    /// Real connection type to `node_id` derived from its *active* transport
+    /// address (C1): `"relay"`, `"direct"` (IP), or `"unknown"`. `None` when the
+    /// peer is not known to the endpoint. Wraps `Endpoint::remote_info`.
+    pub async fn conn_type(&self, node_id: NodeId) -> Option<String> {
+        use iroh::endpoint::TransportAddrUsage;
+        let endpoint_arc = self.get_endpoint().await.ok()?;
+        let endpoint_lock = endpoint_arc.read().await;
+        let endpoint = endpoint_lock.as_ref()?;
+        let info = endpoint.remote_info(node_id).await?;
+        // Prefer the actively-used address; fall back to any known address.
+        let chosen = info
+            .addrs()
+            .find(|a| matches!(a.usage(), TransportAddrUsage::Active))
+            .or_else(|| info.addrs().next())?;
+        let kind = if chosen.addr().is_relay() {
+            "relay"
+        } else if chosen.addr().is_ip() {
+            "direct"
+        } else {
+            "unknown"
+        };
+        Some(kind.to_string())
     }
 
     // ─── Automatic DocTicket exchange (secure replication of iroh-docs stores) ─────────────
@@ -2036,6 +2104,10 @@ impl IrohBackend {
 
     /// Updates the latency of a connection in the pool.
     pub async fn update_connection_latency(&self, node_id: &NodeId, latency_ms: f64) -> Result<()> {
+        // Record the raw sample for per-peer percentiles (C1), independent of
+        // whether the peer is currently in the connection pool.
+        self.record_peer_latency_sample(node_id, latency_ms).await;
+
         let mut pool = self.connection_pool.write().await;
 
         if let Some(conn_info) = pool.get_mut(node_id) {
@@ -2059,6 +2131,52 @@ impl IrohBackend {
                 node_id.fmt_short()
             )))
         }
+    }
+
+    /// Appends a latency sample to a peer's bounded history ring (C1).
+    async fn record_peer_latency_sample(&self, node_id: &NodeId, latency_ms: f64) {
+        let mut hist = self.peer_latency_history.write().await;
+        let samples = hist.entry(*node_id).or_default();
+        samples.push_back(latency_ms);
+        while samples.len() > PEER_LATENCY_HISTORY_CAP {
+            samples.pop_front();
+        }
+    }
+
+    /// Per-peer p95/p99 latency (ms) from the peer's sample history (C1). Returns
+    /// `None` until at least a few samples exist, so callers don't show noise.
+    pub async fn peer_latency_percentiles(&self, node_id: &NodeId) -> Option<(f64, f64)> {
+        let hist = self.peer_latency_history.read().await;
+        let samples = hist.get(node_id)?;
+        if samples.len() < 4 {
+            return None;
+        }
+        let mut sorted: Vec<f64> = samples.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pick = |q: f64| {
+            let idx = ((sorted.len() as f64 * q) as usize).min(sorted.len() - 1);
+            sorted[idx]
+        };
+        Some((pick(0.95), pick(0.99)))
+    }
+
+    /// Peers we have learned about (via connection/ticket exchange) that are **not**
+    /// currently in the active connection pool (C3, honest version).
+    ///
+    /// Note: iroh 1.0 exposes no passive enumeration of *discovery-only* peers, so
+    /// this is the set of previously-known peers minus the live connections — an
+    /// observed view, not the full discovery table.
+    pub async fn discovered_not_connected(&self) -> Vec<NodeId> {
+        let connected: std::collections::HashSet<NodeId> = {
+            let pool = self.connection_pool.read().await;
+            pool.keys().copied().collect()
+        };
+        let known = self.known_peers.read().await;
+        known
+            .iter()
+            .filter(|p| !connected.contains(*p))
+            .copied()
+            .collect()
     }
 
     // === NODE INFO ===

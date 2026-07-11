@@ -38,12 +38,43 @@ use crate::persist::PlatformSnapshot;
 /// `GuardianDB` itself uses internally — seeding through it reaches the real
 /// connection the docs/blobs Willow sync dials from.
 struct Handle {
-    _db: GuardianDB,
+    db: GuardianDB,
     kv: Arc<dyn KeyValueStore<Error = GuardianError>>,
     client: IrohClient,
 }
 
 static HANDLE: OnceCell<Handle> = OnceCell::const_new();
+
+/// Name of the sole iroh-docs KV namespace this node currently opens (see
+/// `init_handle`). Extracted to a const so the head-CID-exchange RPC
+/// (`namespace_heads`) doesn't repeat the literal — kept open for when a node
+/// opens more than one store.
+const KV_NAMESPACE: &str = "hive-state";
+
+/// Convenience alias for the native relational/SQL database this handle backs
+/// (see [`crate::relational`]) — `guardian_db::sql::open_sql`'s return type.
+pub(crate) type SqlDb = Arc<guardian_db::sql::Database<guardian_db::sql::GuardianRelationalStorage>>;
+
+static SQL_HANDLE: OnceCell<SqlDb> = OnceCell::const_new();
+
+/// Lazily open (once) the native in-process relational/SQL database backed by
+/// this SAME live, relay-patched `GuardianDB` instance `handle()` uses — zero
+/// network hop, NOT the pgwire protocol (that layer is never enabled; see
+/// `crates/hive-cloud/Cargo.toml`'s guardian-db feature comment). Every node
+/// opens the identical named database ("hive"); guardian-db's own iroh-docs
+/// CRDT replication converges each node's local copy of every table within
+/// seconds of a write anywhere in the fleet.
+pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
+    SQL_HANDLE
+        .get_or_try_init(|| async {
+            let h = handle().await?;
+            guardian_db::sql::open_sql(&h.db, "hive")
+                .await
+                .map_err(|e| anyhow::anyhow!("guardian sql open: {e}"))
+        })
+        .await
+        .cloned()
+}
 
 /// Upper bound on the whole GuardianDB bring-up (iroh endpoint bind, keystore,
 /// docs/blobs spawn). Live evidence (2026-07-06 onward) showed init can wedge
@@ -138,12 +169,12 @@ async fn init_handle() -> anyhow::Result<Handle> {
         .map_err(|e| anyhow::anyhow!("guardian open: {e}"))?;
     tracing::info!("guardian init: GuardianDB open, opening 'hive-state' KV store");
     let kv = db
-        .key_value("hive-state", None)
+        .key_value(KV_NAMESPACE, None)
         .await
         .map_err(|e| anyhow::anyhow!("guardian kv open: {e}"))?;
 
     tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
-    Ok(Handle { _db: db, kv, client: seed_client })
+    Ok(Handle { db, kv, client: seed_client })
 }
 
 /// Register a peer's iroh address AND mark it known, against a specific
@@ -456,4 +487,43 @@ pub async fn keys() -> Vec<String> {
         Ok(h) => h.kv.all().into_keys().collect(),
         Err(_) => Vec::new(),
     }
+}
+
+/// design-head-cid-exchange-rpc's data source: per-namespace HEAD map for
+/// this node's local GuardianDB replica — a (key, content-hash, timestamp)
+/// triple for every live entry, WITHOUT ever reading a value's bytes (see
+/// `guardian_db::traits::KeyValueStore::entry_heads`, backed by iroh-docs'
+/// `Entry::content_hash()`/`timestamp()`). There is no single per-namespace
+/// root hash exposed by iroh-docs' public API, so a namespace's "head" is
+/// represented as the set of its per-key heads. Today there is exactly one
+/// namespace (`KV_NAMESPACE`); the map shape stays open for future stores.
+/// Served over the mesh at `GET /v1/guardian/heads` (see `admin::guardian_heads`
+/// + `gossip::dispatch`) so a peer can diff against its own without pulling
+/// any content.
+pub async fn namespace_heads() -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(h) = handle().await {
+        match h.kv.entry_heads().await {
+            Ok(heads) => {
+                out.insert(KV_NAMESPACE.to_string(), heads);
+            }
+            Err(e) => tracing::debug!(error = %e, "guardian namespace_heads: entry_heads failed"),
+        }
+    }
+    out
+}
+
+/// implement-reconciliation-trigger: trigger a REAL targeted iroh-docs
+/// range-reconciliation sync of THIS node's `KV_NAMESPACE` document against
+/// one specific peer — never a full-database refresh. `guardian_addr_json`
+/// MUST be that peer's GuardianDB-specific address (`NodeInfo.
+/// guardian_iroh_addr`), never its hive-p2p mesh address — see `seed_peer`'s
+/// doc comment for why that distinction is load-bearing. Returns the real
+/// entries pulled/pushed on success, or the failure reason on error (for
+/// implement-convergence-logging's warn-level path).
+pub async fn sync_with_peer(guardian_addr_json: &str) -> Result<guardian_db::traits::SyncOutcomeSummary, String> {
+    let h = handle().await.map_err(|e| e.to_string())?;
+    let addr: iroh::EndpointAddr =
+        serde_json::from_str(guardian_addr_json).map_err(|e| format!("malformed guardian addr: {e}"))?;
+    h.kv.sync_with_peer(addr).await.map_err(|e| e.to_string())
 }

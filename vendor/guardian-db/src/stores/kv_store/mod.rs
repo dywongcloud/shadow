@@ -9,7 +9,9 @@ use crate::log::lamport_clock::LamportClock;
 use crate::p2p::EventBus;
 use crate::p2p::network::core::docs::WillowDocs;
 use crate::stores::operation::Operation;
-use crate::traits::{KeyValueStore, NewStoreOptions, Store, StoreIndex, TracerWrapper};
+use crate::traits::{
+    EntryHead, KeyValueStore, NewStoreOptions, Store, StoreIndex, SyncOutcomeSummary, TracerWrapper,
+};
 use bytes::Bytes;
 use iroh_docs::{AuthorId, Capability, api::Doc, store::Query};
 use opentelemetry::trace::{TracerProvider, noop::NoopTracerProvider};
@@ -477,6 +479,73 @@ impl KeyValueStore for GuardianDBKeyValue {
         let ticket = self.docs.share_doc(&self.doc_handle, true).await?;
         Ok(ticket.to_string())
     }
+
+    fn namespace_id(&self) -> Option<String> {
+        Some(self.doc_handle.id().to_string())
+    }
+
+    /// Reuses the exact query `refresh_kv_index` already runs
+    /// (`Query::single_latest_per_key()`) but skips the `cat_bytes` content
+    /// fetch entirely — returns metadata only, so a peer can be asked "what
+    /// are your heads" without transferring a single value byte.
+    async fn entry_heads(&self) -> Result<Vec<EntryHead>> {
+        let entries = self
+            .docs
+            .get_many(&self.doc_handle, Query::single_latest_per_key().build())
+            .await?;
+        Ok(entries
+            .iter()
+            .filter(|e| e.content_len() != 0) // skip deletion markers
+            .map(|e| EntryHead {
+                key: String::from_utf8_lossy(e.key()).to_string(),
+                hash: e.content_hash().to_hex(),
+                timestamp: e.timestamp(),
+            })
+            .collect())
+    }
+
+    /// Real targeted reconciliation: `iroh_docs::api::Doc::start_sync` against
+    /// exactly this document and exactly this one peer (never a full-database
+    /// refresh). Subscribes BEFORE issuing `start_sync` so the matching
+    /// `SyncFinished` event for this round can't be missed, then waits
+    /// (bounded) to report the real entry counts. `spawn_live_index_sync`'s
+    /// own, separately-held subscription keeps `index` correct regardless of
+    /// whether THIS call observes the matching event in time — a timeout here
+    /// is therefore reported as success with unknown counts, not a failure:
+    /// the sync was genuinely triggered either way.
+    async fn sync_with_peer(&self, peer: iroh::EndpointAddr) -> Result<SyncOutcomeSummary> {
+        let peer_id = peer.id;
+        let mut stream = self.doc_handle.subscribe().await.ok();
+        self.doc_handle
+            .start_sync(vec![peer])
+            .await
+            .map_err(|e| GuardianError::Store(format!("start_sync: {e}")))?;
+        if let Some(s) = stream.as_mut() {
+            use futures::StreamExt;
+            use iroh_docs::engine::LiveEvent;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, s.next()).await {
+                    Ok(Some(Ok(LiveEvent::SyncFinished(ev)))) if ev.peer == peer_id => {
+                        return match ev.result {
+                            Ok(details) => Ok(SyncOutcomeSummary {
+                                entries_received: details.entries_received,
+                                entries_sent: details.entries_sent,
+                            }),
+                            Err(e) => Err(GuardianError::Store(format!("peer sync failed: {e}"))),
+                        };
+                    }
+                    Ok(Some(_)) => continue,
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        }
+        Ok(SyncOutcomeSummary::default())
+    }
 }
 
 impl GuardianDBKeyValue {
@@ -486,7 +555,7 @@ impl GuardianDBKeyValue {
     /// public key (no write secret); the write ticket carries the namespace secret. These are
     /// registered with the ticket exchange so each requester receives the capability matching
     /// its authenticated role.
-    async fn share_tickets(&self) -> Result<(String, String)> {
+    pub async fn share_tickets(&self) -> Result<(String, String)> {
         let read_ticket = self.docs.share_doc(&self.doc_handle, false).await?;
         let write_ticket = self.docs.share_doc(&self.doc_handle, true).await?;
         Ok((read_ticket.to_string(), write_ticket.to_string()))

@@ -807,7 +807,10 @@ async fn greek_config_stems_and_removes_stop_words() {
     let mut s = session().await;
     // "και" is a common Greek stop word; "αγάπη" (love) should be stemmed.
     let tv = scalar(&mut s, "SELECT to_tsvector('greek', 'αγάπη και ζωή')").await;
-    assert!(!tv.contains("'και'"), "Greek stop word 'και' should be removed");
+    assert!(
+        !tv.contains("'και'"),
+        "Greek stop word 'και' should be removed"
+    );
     assert!(!tv.is_empty(), "non-stop words should remain in tsvector");
 }
 
@@ -823,8 +826,15 @@ async fn lowercase_only_configs_are_accepted() {
     let mut s = session().await;
     // These configs have no Snowball stemmer but must be valid (no 42704).
     for cfg in &[
-        "armenian", "basque", "catalan", "hindi", "indonesian",
-        "irish", "lithuanian", "nepali", "yiddish",
+        "armenian",
+        "basque",
+        "catalan",
+        "hindi",
+        "indonesian",
+        "irish",
+        "lithuanian",
+        "nepali",
+        "yiddish",
     ] {
         let tv = scalar(
             &mut s,

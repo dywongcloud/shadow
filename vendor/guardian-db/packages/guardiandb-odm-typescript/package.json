@@ -1,5 +1,5 @@
 {
-  "name": "guardiandb-odm",
+  "name": "guardiandb-odm-typescript",
   "version": "0.16.0-odm.0",
   "description": "TypeScript ODM for GuardianDB document collections (Iroh-backed). For the PostgreSQL compatibility layer use guardiandb-postgres-typeorm instead.",
   "type": "module",

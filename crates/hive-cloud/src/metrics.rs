@@ -93,8 +93,10 @@ pub struct Bucket {
 
 impl Bucket {
     /// Accumulate `other` into `self` (used to merge across tenants for the global
-    /// operator aggregate). `t_ms` is preserved from `self`.
-    fn add(&mut self, other: &Bucket) {
+    /// operator aggregate, and across nodes for `metrics_get`'s fleet fan-out —
+    /// see admin.rs — since MetricsStore is confirmed node-local with no live
+    /// cross-node merge otherwise). `t_ms` is preserved from `self`.
+    pub(crate) fn add(&mut self, other: &Bucket) {
         self.requests += other.requests;
         self.errors += other.errors;
         self.client_err += other.client_err;

@@ -24,6 +24,12 @@ pub mod reactive_synchronizer;
 #[cfg(feature = "sql")]
 pub mod relational;
 pub mod rotation;
+/// Administration RPC: a loopback socket server fronting a live [`guardian::GuardianDB`]
+/// so tools (e.g. the TUI panel) attach over a socket instead of opening the storage
+/// directly, which the redb file lock forbids for a second process. Enabled by the
+/// `sentinel` feature. See `docs/ADMIN_RPC_PLAN.md`.
+#[cfg(feature = "sentinel")]
+pub mod sentinel;
 #[cfg(feature = "sql")]
 pub mod sql;
 pub mod stores;

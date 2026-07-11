@@ -12,7 +12,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - packages/guardiandb-odm/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   pull_request:
@@ -26,7 +26,7 @@ on:
       - tests/**
       - benches/**
       - guardian-db-derive/**
-      - packages/guardiandb-odm/**
+      - packages/guardiandb-odm-typescript/**
       - docs/ODM_BENCHMARKS.md
       - .github/workflows/odm-ci.yml
   workflow_dispatch:
@@ -60,7 +60,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
-  NODE_VERSION: '22'
+  NODE_VERSION: '24'
 
 jobs:
   rust-odm:
@@ -70,7 +70,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -128,7 +128,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -160,7 +160,7 @@ jobs:
           cargo test --features odm --test integration_replication -- --test-threads=1 2>&1 | tee target/ci-logs/integration-replication-attempt-2.log
 
       - name: Upload replication integration logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: rust-replication-integration-logs
@@ -176,23 +176,23 @@ jobs:
       fail-fast: false
       matrix:
         node:
-          - '20'
           - '22'
+          - '24'
 
     defaults:
       run:
-        working-directory: packages/guardiandb-odm
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.node }}
           cache: npm
-          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -228,12 +228,12 @@ jobs:
           cat benchmark-large-smoke-node-${{ matrix.node }}.json
 
       - name: Upload TypeScript smoke benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: typescript-smoke-benchmarks-node-${{ matrix.node }}
           path: |
-            packages/guardiandb-odm/benchmark-smoke-node-${{ matrix.node }}.json
-            packages/guardiandb-odm/benchmark-large-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-smoke-node-${{ matrix.node }}.json
+            packages/guardiandb-odm-typescript/benchmark-large-smoke-node-${{ matrix.node }}.json
           if-no-files-found: error
           retention-days: 14
 
@@ -246,7 +246,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -275,7 +275,7 @@ jobs:
         run: cargo test --features odm --test odm_benchmark_reliability explicit_large_document_limit_probe -- --ignored --test-threads=1
 
       - name: Upload Criterion reports
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: rust-criterion-odm-reports
@@ -292,18 +292,18 @@ jobs:
 
     defaults:
       run:
-        working-directory: packages/guardiandb-odm
+        working-directory: packages/guardiandb-odm-typescript
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
-          cache-dependency-path: packages/guardiandb-odm/package-lock.json
+          cache-dependency-path: packages/guardiandb-odm-typescript/package-lock.json
 
       - name: Install TypeScript SDK dependencies
         run: npm ci
@@ -335,12 +335,12 @@ jobs:
           cat benchmark-large-document.json
 
       - name: Upload TypeScript full benchmark artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         if: always()
         with:
           name: typescript-full-benchmarks
           path: |
-            packages/guardiandb-odm/benchmark-full.json
-            packages/guardiandb-odm/benchmark-large-document.json
+            packages/guardiandb-odm-typescript/benchmark-full.json
+            packages/guardiandb-odm-typescript/benchmark-large-document.json
           if-no-files-found: ignore
           retention-days: 14

@@ -4,10 +4,13 @@
 [![Discord](https://img.shields.io/discord/1410233136846995519?label=chat&logo=discord&logoColor=white&style=flat-square&color=7289DA)](https://discord.gg/Ezzk8PnGR5)
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.95.0+-orange.svg)
-![Version](https://img.shields.io/badge/version-0.17.1-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-0.18.0-brightgreen.svg)
 [![codecov](https://codecov.io/github/wmaslonek/guardian-db/branch/main/graph/badge.svg?token=AKOZE17VN8)](https://codecov.io/github/wmaslonek/guardian-db)
 
 ---
+
+<div align="center">
+  <a href="https://discord.gg/Ezzk8PnGR5"><img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/button-git.png" alt="Discord Button" width="275"/></a></div>
 
 **High-performance, local-first decentralized database built on Rust and Iroh**
 
@@ -22,16 +25,16 @@ It began as a Rust port of OrbitDB but is no longer "OrbitDB in Rust". The legac
 IPFS/CID/libp2p stack has been removed in favor of Iroh's QUIC transport, BLAKE3 hashing,
 and Willow range-based set reconciliation.
 
-## Why Iroh
+## Powered by Iroh
 
-- **Direct, encrypted connections** — Iroh's Magicsock handles NAT traversal, hole
+- **Direct, encrypted connections:** Iroh's Magicsock handles NAT traversal, hole
   punching, and roaming (Wi-Fi ⇄ 5G without dropping). No global DHT.
-- **QUIC transport** — one encrypted UDP socket multiplexes blobs (data), docs (state),
+- **QUIC transport:** one encrypted UDP socket multiplexes blobs (data), docs (state),
   and gossip (signals) per peer.
-- **Identity is the address** — each peer is an Ed25519 public key (`NodeId`, 32 bytes).
-- **Range-Based Set Reconciliation (Willow)** — peers transfer only the diff between them, not
+- **Identity is the address:** each peer is an Ed25519 public key (`NodeId`, 32 bytes).
+- **Range-Based Set Reconciliation (Willow):** peers transfer only the diff between them, not
   full record lists, syncing millions of records in milliseconds.
-- **Gossip for real-time signals** — iroh-gossip's epidemic broadcast trees fan out
+- **Gossip for real-time signals:** iroh-gossip's epidemic broadcast trees fan out
   ephemeral messages with low latency and redundancy.
 
 ### Coming from IPFS/OrbitDB
@@ -50,7 +53,7 @@ and Willow range-based set reconciliation.
 - **KeyValueStore / DocumentStore** run on **Iroh-Docs** (Last-Write-Wins CRDT), syncing via
   Willow range-based reconciliation.
 - **EventLogStore** keeps a causal DAG (ipfs-log lineage) for strict ordering and
-  auditability — but with no IPFS, no JSON, and 32-byte BLAKE3 links instead of CIDs.
+  auditability, but with no IPFS, no JSON, and 32-byte BLAKE3 links instead of CIDs.
 
 <details>
 <summary>Source layout</summary>
@@ -76,7 +79,7 @@ guardian-db/
 
 ```toml
 [dependencies]
-guardian-db = "0.17"
+guardian-db = "0.18"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -112,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ## Scaling
 
 A common question: *how does a local-first P2P database scale?* GuardianDB has no central
-server, so you don't scale a bottleneck — you add peers and tune how they connect and sync.
+server, so you don't scale a bottleneck, you add peers and tune how they connect and sync.
 
 **Reads & writes are local.** Each node answers queries from its own replica with no network
 round-trip, so read throughput scales linearly with the number of nodes. Writes are applied
@@ -123,11 +126,11 @@ reconciliation exchanges only what two peers are missing, so steady-state sync s
 even as total data grows. BLAKE3 + QUIC keep hashing and transport fast.
 
 **Discovery & connectivity** (in `ClientConfig`):
-- `enable_discovery_mdns` — find peers on the same LAN automatically.
-- `enable_discovery_n0` — global discovery via Pkarr/DNS (n0.computer), for peers across
+- `enable_discovery_mdns`: find peers on the same LAN automatically.
+- `enable_discovery_n0`: global discovery via Pkarr/DNS (n0.computer), for peers across
   the internet.
-- `known_peers` / `config.add_known_peer(node_id)` — bootstrap against specific nodes.
-- `db.connect_to_peer(node_id).await?` — force a direct connection and sync with one peer.
+- `known_peers` / `config.add_known_peer(node_id)`: bootstrap against specific nodes.
+- `db.connect_to_peer(node_id).await?`: force a direct connection and sync with one peer.
 
 Share a node's identity so others can reach it:
 
@@ -170,7 +173,7 @@ Enable the Rust ODM explicitly:
 
 ```toml
 [dependencies]
-guardian-db = { version = "0.17", features = ["odm"] }
+guardian-db = { version = " 0.18", features = ["odm"] }
 ```
 
 ### Rust model definitions
@@ -210,10 +213,10 @@ Supported derive attributes include `#[primary_key]`, `#[unique]`, `#[index]`, `
 
 ### JavaScript/TypeScript SDK shape
 
-The TypeScript ODM lives in its own package, [`guardiandb-odm`](packages/guardiandb-odm), and exposes the collection API requested in the ODM RFC. It targets regular GuardianDB (the document/collection store) — **not** the PostgreSQL compatibility layer; for SQL/TypeORM access via the `pgwire` server use [`guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm) instead. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
+The TypeScript ODM lives in its own package, [`guardiandb-odm-typescript`](packages/guardiandb-odm-typescript), and exposes the collection API requested in the ODM RFC. It targets regular GuardianDB (the document/collection store) — **not** the PostgreSQL compatibility layer; for SQL/TypeORM access via the `pgwire` server use [`guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm) instead. The included process-local transport is for SDK development and tests; production Node/WASM/mobile bindings should implement `GuardianTransport` against the Rust/Iroh backend.
 
 ```javascript
-import GuardianDB from "guardiandb-odm";
+import GuardianDB from "guardiandb-odm-typescript";
 import Iroh from "iroh";
 
 const iroh = await Iroh.create();
@@ -257,8 +260,8 @@ See [`docs/odm.md`](docs/odm.md) for the full design notes and caveats.
 ## PostgreSQL Compatibility (TypeORM, psql, node-postgres)
 
 GuardianDB now ships a **PostgreSQL-compatible relational layer** on top of its
-document model. Standard PostgreSQL clients — `psql`, node-postgres, **TypeORM**
-(`type: "postgres"`), DBeaver — connect over the PostgreSQL wire protocol and
+document model. Standard PostgreSQL clients, `psql`, node-postgres, **TypeORM**
+(`type: "postgres"`), DBeaver, connect over the PostgreSQL wire protocol and
 run ordinary SQL (DDL, DML, joins, aggregates, transactions, migrations), with
 no GuardianDB-specific client code.
 
@@ -287,7 +290,7 @@ await ds.initialize();   // schema sync, migrations, repositories, QueryBuilder,
 This lives inside the `guardian-db` crate as feature-gated modules:
 `relational` (types, catalog, storage trait), `sql`
 (parser/planner/executor, `information_schema`/`pg_catalog`), and `pgwire`
-(wire-protocol server). Enable the **`sql`** feature for the embedded engine —
+(wire-protocol server). Enable the **`sql`** feature for the embedded engine, 
 which maps relational storage onto a replicated GuardianDB document store,
 preserving the local-first / P2P model — or the **`pgwire`** feature (which
 implies `sql`) to also build the `guardian-pgwire` server binary.
@@ -296,6 +299,70 @@ implies `sql`) to also build the `guardian-pgwire` server binary.
 - Example TypeORM app: [`examples/postgres-typeorm`](examples/postgres-typeorm)
 - Native driver: [`packages/guardiandb-postgres-typeorm`](packages/guardiandb-postgres-typeorm)
 - Conformance tests: [`tests/postgres-compat`](tests/postgres-compat)
+
+## Introducing Guardian Sentinel TUI
+
+<div align="center">
+  <img src="docs/guardian-sentinel-logo.png" alt="Guardian Sentinel Logo" width="320"/>
+</div>
+
+GuardianDB is a library. Historically every interaction happened through Rust
+code. **Guardian Sentinel** is a terminal UI that turns the database into
+something an operator or developer can **inspect, manage, and monitor visually**,
+without writing code, and everything created through it **survives a restart**.
+
+It ships behind the `sentinel` feature (default builds are unaffected) and
+gives you nine screens: a **store dashboard**, **EventLog / KeyValue / Document
+inspectors**, an **Access Control manager**, a **P2P replication monitor**, a
+**network topology** map, a **keystore manager**, an **EventBus explorer**, and a
+**blob browser**, plus full write/management (create/close/drop stores, append
+and CRUD, share and import stores over P2P tickets) with contextual help (`?`),
+onboarding, and a client-side audit trail.
+
+### Two ways to run it
+
+**Embedded**: the panel opens a `data-dir` directly. Works only on a directory no
+other process is using (redb holds an exclusive per-process lock):
+
+```bash
+cargo run --features sentinel --bin guardian-sentinel -- --data-dir ./my_db
+# Empty data-dir? Press `n` to create your first store.
+```
+
+**Attached**: run the RPC server in the process that owns the storage, then point
+any number of panels at it over a socket, **without contending for the redb lock**
+(the same pattern the `pgwire` gateway uses for SQL):
+
+```bash
+# Owner process - the only one that touches storage
+cargo run --features sentinel --bin guardian-sentinel-server -- \
+  --addr 127.0.0.1:15433 \
+  --data-dir ./guardian_data \
+  --token "$GUARDIAN_ADMIN_TOKEN"     # optional; gates every action op
+
+# Panel - connects over RPC, holds no lock
+cargo run --features sentinel --bin guardian-sentinel -- \
+  --connect 127.0.0.1:15433 \
+  --token "$GUARDIAN_ADMIN_TOKEN"
+```
+
+The default RPC address is `127.0.0.1:15433`. Inspection is decoupled from storage
+through an `AdminSource` seam with two backends. `EmbeddedSource` (owns the
+data-dir) and `AdminClient` (socket), so the panel renders identically in either
+mode.
+
+### Keys to get started
+
+| Key | Action |
+|-----|--------|
+| `F1`–`F7` | Switch screens (Dashboard · Topology · Network · Access · Keystore · Blobs · Events) |
+| `n` | New store wizard (on the Dashboard) · new item on inspectors |
+| `Enter` / `Esc` | Open detail · go back |
+| `s` / `i` / `y` | Share store · import from ticket · show node identity |
+| `/` · `?` · `q` | Search · contextual help · quit |
+
+Private key material is **never** displayed; destructive actions require
+confirmation. Full guide: [`docs/SENTINEL_TUI.md`](docs/SENTINEL_TUI.md).
 
 ## Store Types
 
@@ -379,7 +446,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // CRUD operations - all operations are automatically replicated
     kv.put("app_name", "GuardianDB".as_bytes().to_vec()).await?;
-    kv.put("version", "0.17.0".as_bytes().to_vec()).await?;
+    kv.put("version", " 0.18.0".as_bytes().to_vec()).await?;
     kv.put("language", "Rust".as_bytes().to_vec()).await?;
 
     // Get values - queries the local CRDT index
@@ -449,7 +516,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "_id": "guardian-db",
         "name": "GuardianDB", 
         "type": "database",
-        "version": "0.17.0",
+        "version": " 0.18.0",
         "language": "Rust",
         "features": ["decentralized", "peer-to-peer", "CRDT", "Iroh"]
     });
@@ -654,7 +721,7 @@ cargo test --features odm --test odm_benchmark_reliability
 cargo bench --features odm --bench odm_benchmark
 
 # Check the TypeScript ODM SDK
-cd packages/guardiandb-odm
+cd packages/guardiandb-odm-typescript
 npm test
 cd ../..
 
@@ -662,7 +729,7 @@ cd ../..
 set GUARDIANDB_ODM_LARGE_DOC_MB 
 
 # Benchmark features with Typescript SSDK
-cd packages/guardiandb-odm
+cd packages/guardiandb-odm-typescript
 npm run bench -- --mode=runAll --docs=10000 --batch-size=1000 --queries=2500 --updates=2500
 npm run bench -- --mode=large --large-mb=17
 
@@ -691,10 +758,17 @@ decentralized systems, Iroh, and Rust. Join the
 follow updates on [Twitter](https://x.com/willsearch_) and
 [LinkedIn](https://www.linkedin.com/company/willsearch/).
 
-- **Issues** — bugs and feature requests: [GitHub Issues](https://github.com/wmaslonek/guardian-db/issues)
-- **Discussions** — Q&A and design: [GitHub Discussions](https://github.com/wmaslonek/guardian-db/discussions)
-- **Code** — see [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Issues**: bugs and feature requests: [GitHub Issues](https://github.com/wmaslonek/guardian-db/issues)
+- **Discussions**: Q&A and design: [GitHub Discussions](https://github.com/wmaslonek/guardian-db/discussions)
+- **Code**: see [CONTRIBUTING.md](CONTRIBUTING.md)
 
+</div>
+
+## Contributors
+
+<div align="left">
+  <img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/dylan.wong_.png" alt="Dylan Wong" title="Dylan Wong" width="65"/>
+  <img src="https://www.willsearch.com.br/wp-content/uploads/2026/07/william.oldenburg.png" alt="William Maslonek" title="William Maslonek" width="65"/>
 </div>
 
 ## Status
@@ -709,18 +783,12 @@ Opening a pull request is assumed to signal agreement with these terms.
 
 ## Acknowledgments
 
-- **[Iroh](https://github.com/n0-computer/iroh)** — QUIC-based P2P data synchronization.
-- **[ipfs-log-rs](https://github.com/eqlabs/ipfs-log-rs)** — CRDT log foundation, MIT
+- **[Iroh](https://github.com/n0-computer/iroh)**: QUIC-based P2P data synchronization.
+- **[ipfs-log-rs](https://github.com/eqlabs/ipfs-log-rs)**: CRDT log foundation, MIT
   © EQLabs. GuardianDB builds on it with significant enhancements for decentralized apps.
+- **[Ratatui](https://github.com/ratatui/ratatui)**: Rust library for building terminal
+  user interfaces, powering the Guardian Sentinel TUI.
 
 ---
 
 **GuardianDB** - A secure, performant, and fully decentralized peer-to-peer database for the modern Web.
-
-### SQL compatibility note 16
-
-Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.
-
-### SQL compatibility note 16
-
-Tracks PostgreSQL-compatible behavior for window functions, recursive CTEs, SQLSTATE-mapped validation, aggregate FILTER handling, and min/max type inference without changing executable code.

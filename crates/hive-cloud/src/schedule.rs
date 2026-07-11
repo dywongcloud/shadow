@@ -214,6 +214,7 @@ mod tests {
             peer_id: None,
             iroh_addr: None,
             guardian_iroh_addr: None,
+            relay_url: None,
             cp_epoch: 0,
             last_seen_ms: 0,
             is_self: false,

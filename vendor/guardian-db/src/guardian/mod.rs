@@ -973,6 +973,40 @@ impl KeyValueStore for KeyValueStoreWrapper {
             .share_ticket()
             .await
     }
+
+    fn namespace_id(&self) -> Option<String> {
+        self.store
+            .as_any()
+            .downcast_ref::<crate::stores::kv_store::GuardianDBKeyValue>()
+            .and_then(|kv| KeyValueStore::namespace_id(kv))
+    }
+
+    async fn entry_heads(&self) -> std::result::Result<Vec<crate::traits::EntryHead>, Self::Error> {
+        match self
+            .store
+            .as_any()
+            .downcast_ref::<crate::stores::kv_store::GuardianDBKeyValue>()
+        {
+            Some(kv) => kv.entry_heads().await,
+            None => Ok(Vec::new()),
+        }
+    }
+
+    async fn sync_with_peer(
+        &self,
+        peer: iroh::EndpointAddr,
+    ) -> std::result::Result<crate::traits::SyncOutcomeSummary, Self::Error> {
+        match self
+            .store
+            .as_any()
+            .downcast_ref::<crate::stores::kv_store::GuardianDBKeyValue>()
+        {
+            Some(kv) => kv.sync_with_peer(peer).await,
+            None => Err(GuardianError::Store(
+                "sync_with_peer unsupported for this store backend".to_string(),
+            )),
+        }
+    }
 }
 
 /// Wrapper that adapts a generic Store to DocumentStore.

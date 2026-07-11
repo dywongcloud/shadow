@@ -216,6 +216,12 @@ pub struct CloudState {
     /// peer, a NEW stream per request (no per-request handshake). Set when `iroh`
     /// binds; `None` = P2P disabled (HTTP mesh still routes). See [`hive_p2p::PeerPool`].
     pub mesh: RwLock<Option<Arc<hive_p2p::PeerPool>>>,
+    /// Live relay-set tracker for the bound `iroh` endpoint (dynamic-relay-list):
+    /// diffs [own relay_url + healthy peers' relay_url + the central backstop]
+    /// against what's actually applied via `Endpoint::insert_relay`/`remove_relay`
+    /// on a fixed interval — see `spawn_relay_sync_loop` in main.rs. Set when
+    /// `iroh` binds (alongside `mesh`); `None` = P2P disabled, nothing to sync.
+    pub relay_set: RwLock<Option<Arc<hive_p2p::RelaySet>>>,
     /// Single-owner placement leases for stateful CONTAINER deployments (fenced,
     /// consensus-free). See `lease.rs`.
     pub leases: crate::lease::LeaseStore,
@@ -537,6 +543,7 @@ impl CloudState {
             peer_deployments: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),
             mesh: RwLock::new(None),
+            relay_set: RwLock::new(None),
             leases: crate::lease::LeaseStore::new(),
             container_holders: RwLock::new(std::collections::HashMap::new()),
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),

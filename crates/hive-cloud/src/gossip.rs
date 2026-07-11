@@ -54,6 +54,28 @@ pub async fn probe(cloud: &Arc<CloudState>, node_id: &str, addr: &str, timeout: 
     }
 }
 
+/// Relay-selection-algorithm wiring: steer `addr_json`'s relay transport toward
+/// the best LIVE relay for the peer identified by iroh `node_id`, instead of
+/// trusting whatever relay was serialized into the cached hint at gossip time
+/// (which — for a peer only ever learned second/third-hand — may be stale or
+/// simply absent). Preference (see `hive_edge::select_relay_hint`): the target's
+/// OWN gossiped `relay_url` > the geographically nearest OTHER healthy peer's
+/// `relay_url` > the central `relay.shadw.cloud` backstop. Every caller of
+/// `request_to`/`fetch` below inherits this automatically (including
+/// `admin::fetch_from_host`, `acme.rs`, `db_replicate.rs`, `git.rs`'s mesh
+/// fanout — every one of them dials by `(node_id, addr_json)` through these two
+/// functions). Falls back to `addr_json` unchanged when `node_id` isn't found in
+/// the registry (e.g. a bootstrap seed never gossiped as a full `NodeInfo`).
+fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) -> String {
+    let nodes = cloud.registry.nodes();
+    let Some(target) = nodes.iter().find(|n| n.peer_id.as_deref() == Some(node_id)) else {
+        return addr_json.to_string();
+    };
+    let me = cloud.registry.me();
+    let hint = hive_edge::select_relay_hint(target, &nodes, &me);
+    hive_p2p::with_relay_hint(addr_json, Some(&hint))
+}
+
 /// Send an arbitrary gossip request to a node addressed DIRECTLY by (node_id, addr) —
 /// the dispatch primitive for deploy fanout over the mesh (a NAT'd coordinator has no
 /// HTTP admin path to FC nodes). Returns the response body, or None on timeout/error.
@@ -67,9 +89,10 @@ pub async fn request_to(
     timeout_secs: u64,
 ) -> Option<Vec<u8>> {
     let pool = cloud.mesh.read().clone()?;
+    let addr = relay_hinted_addr(cloud, node_id, addr);
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
-        pool.gossip_request(node_id, addr, method, path, body),
+        pool.gossip_request(node_id, &addr, method, path, body),
     )
     .await
     {
@@ -165,6 +188,11 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         }
         "/v1/fleet-deployments" => jb(crate::admin::fleet_deployments(State(cloud.clone())).await),
         "/v1/leases" => jb(crate::admin::leases_get(State(cloud.clone())).await),
+        // design-head-cid-exchange-rpc: per-namespace GuardianDB HEAD map (key,
+        // content-hash, timestamp — never value bytes) for the anti-entropy
+        // loop's peer-diff round. Same unauthenticated-read posture as
+        // /v1/serve-hosts and /v1/leases above.
+        "/v1/guardian/heads" => jb(crate::admin::guardian_heads(State(cloud.clone())).await),
         #[cfg(feature = "zkauth")]
         "/v1/zkauth/roster-export" => jb(crate::zkauth::roster_export().await),
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
@@ -391,6 +419,25 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             crate::admin::apply_mirrored_write(&cloud, p, body).await;
             jb(axum::Json(serde_json::json!({ "ok": true })))
         }
+        // Billing authority reads, proxied here by `admin::fetch_from_host` /
+        // `admin::proxy_billing_read` whenever the CALLING node isn't the billing
+        // authority (`billing_authority_node`) — this is the OTHER end of that
+        // proxy: without these three arms every `/v1/billing*` gossip call fell
+        // through to the catch-all `_ => Vec::new()` below, so `fetch_from_host`
+        // got back an empty body, failed to parse it as JSON, and the caller
+        // silently fell back to ITS OWN local (non-authoritative) billing state —
+        // on a perfectly healthy mesh connection, not just during a QUIC flap.
+        // Longest-prefix arms first so `/v1/billing/invoices` and
+        // `/v1/billing/ledger` don't get shadowed by the bare `/v1/billing` arm.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/invoices") => {
+            jb(crate::admin::billing_invoices(State(cloud.clone()), team_headers(p), team_claims(p)).await)
+        }
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/ledger") => {
+            jb(crate::admin::billing_ledger(State(cloud.clone()), team_headers(p), team_claims(p)).await)
+        }
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => {
+            jb(crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await)
+        }
         _ => Vec::new(),
     }
 }
@@ -577,6 +624,10 @@ pub async fn fetch(
         let target = cloud.peer_iroh.read().get(peer).cloned();
         let pool = cloud.mesh.read().clone();
         if let (Some((node_id, addr)), Some(pool)) = (target, pool) {
+            // Relay-selection-algorithm: steer toward the peer's own/nearest-peer's
+            // live relay_url instead of whatever relay `addr` was cached with — see
+            // `relay_hinted_addr`.
+            let addr = relay_hinted_addr(cloud, &node_id, &addr);
             // BOUND the iroh attempt: dialing a peer's STALE identity (e.g. after it
             // restarted with a new key) can hang on connect/relay-retry. Without this
             // cap, a dead cached addr would stall the whole gossip loop and the HTTP

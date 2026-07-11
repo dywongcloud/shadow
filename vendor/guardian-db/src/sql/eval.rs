@@ -13,6 +13,7 @@ use sqlparser::ast::{
     BinaryOperator, DateTimeField, Expr, FunctionArg, FunctionArgExpr, FunctionArguments,
     UnaryOperator, Value,
 };
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
@@ -548,8 +549,8 @@ impl Exec {
         if v.is_null() || lo.is_null() || hi.is_null() {
             return Ok(SqlValue::Null);
         }
-        let (v1, lo) = coerce_pair(v.clone(), lo);
-        let (v2, hi) = coerce_pair(v, hi);
+        let (v1, lo) = coerce_pair(&v, &lo);
+        let (v2, hi) = coerce_pair(&v, &hi);
         let ge = matches!(v1.compare(&lo), Some(Ordering::Greater | Ordering::Equal));
         let le = matches!(v2.compare(&hi), Some(Ordering::Less | Ordering::Equal));
         let within = ge && le;
@@ -575,7 +576,7 @@ impl Exec {
                 saw_null = true;
                 continue;
             }
-            let (a, b) = coerce_pair(v.clone(), iv);
+            let (a, b) = coerce_pair(&v, &iv);
             if a.sql_eq(&b) == Some(true) {
                 return Ok(SqlValue::Bool(!negated));
             }
@@ -606,7 +607,7 @@ impl Exec {
                 saw_null = true;
                 continue;
             }
-            let (a, b) = coerce_pair(v.clone(), candidate);
+            let (a, b) = coerce_pair(&v, &candidate);
             if a.sql_eq(&b) == Some(true) {
                 return Ok(SqlValue::Bool(!negated));
             }
@@ -662,7 +663,7 @@ impl Exec {
             let matched = match &operand_val {
                 Some(ov) => {
                     let cond = self.eval_inner(&when.condition, frames, aggs)?;
-                    let (a, b) = coerce_pair(ov.clone(), cond);
+                    let (a, b) = coerce_pair(ov, &cond);
                     a.sql_eq(&b) == Some(true)
                 }
                 None => self.eval_inner(&when.condition, frames, aggs)?.truthy() == Some(true),
@@ -877,7 +878,10 @@ fn string_of_value(v: &Value) -> Result<String> {
 
 /// Coerce a string literal against a typed counterpart so comparisons behave
 /// like PostgreSQL (`n > '9'` compares numerically, not lexically).
-fn coerce_pair(a: SqlValue, b: SqlValue) -> (SqlValue, SqlValue) {
+///
+/// Returns borrowed sides when the types already match (the common case),
+/// allocating an `Owned` value only when actual numeric coercion is required.
+fn coerce_pair<'a>(a: &'a SqlValue, b: &'a SqlValue) -> (Cow<'a, SqlValue>, Cow<'a, SqlValue>) {
     fn coerce_one(text_side: &SqlValue, typed: &SqlValue) -> Option<SqlValue> {
         let ty = typed.type_of();
         if matches!(ty, SqlType::Text | SqlType::Unknown) {
@@ -885,20 +889,20 @@ fn coerce_pair(a: SqlValue, b: SqlValue) -> (SqlValue, SqlValue) {
         }
         text_side.cast(&ty).ok()
     }
-    match (&a, &b) {
+    match (a, b) {
         (SqlValue::Text(_), other) if !matches!(other, SqlValue::Text(_) | SqlValue::Null) => {
-            if let Some(c) = coerce_one(&a, &b) {
-                return (c, b);
+            if let Some(c) = coerce_one(a, b) {
+                return (Cow::Owned(c), Cow::Borrowed(b));
             }
-            (a, b)
+            (Cow::Borrowed(a), Cow::Borrowed(b))
         }
         (other, SqlValue::Text(_)) if !matches!(other, SqlValue::Text(_) | SqlValue::Null) => {
-            if let Some(c) = coerce_one(&b, &a) {
-                return (a, c);
+            if let Some(c) = coerce_one(b, a) {
+                return (Cow::Borrowed(a), Cow::Owned(c));
             }
-            (a, b)
+            (Cow::Borrowed(a), Cow::Borrowed(b))
         }
-        _ => (a, b),
+        _ => (Cow::Borrowed(a), Cow::Borrowed(b)),
     }
 }
 
@@ -907,7 +911,7 @@ fn compare_op(a: &SqlValue, op: &BinaryOperator, b: &SqlValue) -> SqlValue {
     if a.is_null() || b.is_null() {
         return SqlValue::Null;
     }
-    let (a, b) = coerce_pair(a.clone(), b.clone());
+    let (a, b) = coerce_pair(a, b);
     match a.compare(&b) {
         None => SqlValue::Null,
         Some(ord) => {

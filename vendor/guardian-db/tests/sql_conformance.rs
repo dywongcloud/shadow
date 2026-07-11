@@ -743,7 +743,7 @@ async fn create_procedure_unsupported() {
 #[tokio::test]
 async fn create_trigger_supported_with_typed_exclusions() {
     // Triggers are implemented (see `tests/sql_triggers.rs` for the full
-    // behavioral suite); only the documented out-of-subset forms stay 0A000.
+    // behavioral suite), including CONSTRAINT, INSTEAD OF, and TRUNCATE variants.
     let mut s = session().await;
     ok(&mut s, "CREATE TABLE t (id INT)").await;
     ok(
@@ -763,13 +763,25 @@ async fn create_trigger_supported_with_typed_exclusions() {
     )
     .await;
     ok(&mut s, "DROP TRIGGER trg ON t").await;
-    for sql in [
+    ok(
+        &mut s,
         "CREATE CONSTRAINT TRIGGER trg AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
-        "CREATE TRIGGER trg INSTEAD OF INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()",
+    )
+    .await;
+    ok(&mut s, "DROP TRIGGER trg ON t").await;
+    ok(&mut s, "CREATE TABLE t2 (id INT)").await;
+    ok(&mut s, "CREATE VIEW v AS SELECT * FROM t2").await;
+    ok(
+        &mut s,
+        "CREATE TRIGGER trg INSTEAD OF INSERT ON v FOR EACH ROW EXECUTE FUNCTION f()",
+    )
+    .await;
+    ok(&mut s, "DROP TRIGGER trg ON v").await;
+    ok(
+        &mut s,
         "CREATE TRIGGER trg AFTER TRUNCATE ON t FOR EACH STATEMENT EXECUTE FUNCTION f()",
-    ] {
-        assert_eq!(err_code(&mut s, sql).await, "0A000", "for `{sql}`");
-    }
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -808,6 +820,11 @@ async fn full_text_search_subset_and_exclusions() {
     );
     ok(&mut s, "SELECT 'a'::tsvector").await;
     ok(&mut s, "SELECT 'a'::tsquery").await;
+    // ts_headline is now supported; test it works
+    assert_eq!(
+        rows_text(&mut s, "SELECT ts_headline('a cat sat', 'cat')").await,
+        vec![vec!["a <b>cat</b> sat".to_string()]]
+    );
     // Out-of-subset FTS constructs are *named*-unsupported: stable 0A000. It
     // must never be 42883/"does not exist" — these are PostgreSQL core
     // functions, and 42883 is also what triggers sidecar fallback-routing,
@@ -816,7 +833,6 @@ async fn full_text_search_subset_and_exclusions() {
         "SELECT phraseto_tsquery('the cat')",
         "SELECT websearch_to_tsquery('cat -dog')",
         "SELECT ts_rank_cd('a', 'b')",
-        "SELECT ts_headline('doc', 'query')",
         "SELECT setweight('a', 'A')",
         "SELECT ts_delete('a', 'b')",
         "SELECT tsvector_to_array('a')",
@@ -827,7 +843,7 @@ async fn full_text_search_subset_and_exclusions() {
     }
     // Unknown text search configurations are 42704, like PostgreSQL.
     assert_eq!(
-        err_code(&mut s, "SELECT to_tsvector('german', 'Haus')").await,
+        err_code(&mut s, "SELECT to_tsvector('unknown_config_xyz', 'test')").await,
         "42704"
     );
 }

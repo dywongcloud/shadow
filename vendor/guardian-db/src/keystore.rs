@@ -1,11 +1,14 @@
 use crate::guardian::error::{GuardianError, Result};
-use crate::log::identity_provider::Keystore as KeystoreInterface;
+use crate::log::identity_provider::{KeyMeta, Keystore as KeystoreInterface};
 use async_trait::async_trait;
 use iroh::SecretKey;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::sync::Arc;
 
 const KEYSTORE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keystore");
+/// Parallel table holding per-key lifecycle metadata JSON (D2). Kept separate
+/// from `KEYSTORE_TABLE` so `get`/`enumerate_keys` over secrets are untouched.
+const KEYMETA_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("keystore_meta");
 
 /// Keystore implementation that uses redb as the persistence backend
 /// and is compatible with the internal 'log' interface.
@@ -48,6 +51,10 @@ impl RedbKeystore {
                 let _ = write_txn
                     .open_table(KEYSTORE_TABLE)
                     .map_err(|e| GuardianError::Other(format!("Error creating table: {}", e)))?;
+                // Ensure the metadata table exists too (D2).
+                let _ = write_txn.open_table(KEYMETA_TABLE).map_err(|e| {
+                    GuardianError::Other(format!("Error creating meta table: {}", e))
+                })?;
             }
             write_txn
                 .commit()
@@ -129,6 +136,18 @@ impl KeystoreInterface for Arc<RedbKeystore> {
     async fn delete(&self, key: &str) -> Result<()> {
         (**self).delete(key).await
     }
+    fn enumerate_keys(&self) -> Result<Vec<String>> {
+        (**self).enumerate_keys()
+    }
+    fn public_key(&self, key_id: &str) -> Result<Option<String>> {
+        (**self).public_key(key_id)
+    }
+    fn generate_key(&self, key_id: &str) -> Result<String> {
+        (**self).generate_key(key_id)
+    }
+    fn key_meta(&self, key_id: &str) -> Result<Option<KeyMeta>> {
+        (**self).key_meta(key_id)
+    }
 }
 
 #[async_trait]
@@ -206,6 +225,119 @@ impl KeystoreInterface for RedbKeystore {
             .map_err(|e| GuardianError::Other(format!("Error committing removal: {}", e)))?;
         Ok(())
     }
+
+    fn enumerate_keys(&self) -> Result<Vec<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| GuardianError::Other(format!("Error opening keystore: {}", e)))?;
+        let table = match read_txn.open_table(KEYSTORE_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(Vec::new()), // table not created yet
+        };
+        let mut keys = Vec::new();
+        for item in table
+            .iter()
+            .map_err(|e| GuardianError::Other(format!("Error iterating keystore: {}", e)))?
+        {
+            let (k, _v) = item.map_err(|e| {
+                GuardianError::Other(format!("Error reading keystore entry: {}", e))
+            })?;
+            keys.push(k.value().to_string());
+        }
+        Ok(keys)
+    }
+
+    fn public_key(&self, key_id: &str) -> Result<Option<String>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| GuardianError::Other(format!("Error opening keystore: {}", e)))?;
+        let table = match read_txn.open_table(KEYSTORE_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        match table.get(key_id) {
+            Ok(Some(v)) => Ok(crate::log::identity_provider::derive_public(v.value())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(GuardianError::Other(format!(
+                "Error reading keystore: {}",
+                e
+            ))),
+        }
+    }
+
+    fn generate_key(&self, key_id: &str) -> Result<String> {
+        use zeroize::Zeroize;
+        let (mut bytes, public) = crate::log::identity_provider::new_secret_bytes();
+        // Do the fallible write in a closure so the transient secret is always
+        // wiped afterwards, on both the success and error paths.
+        let stored: Result<()> = (|| {
+            let write_txn = self
+                .db
+                .begin_write()
+                .map_err(|e| GuardianError::Other(format!("Error opening keystore: {}", e)))?;
+            {
+                let mut table = write_txn
+                    .open_table(KEYSTORE_TABLE)
+                    .map_err(|e| GuardianError::Other(format!("Error opening table: {}", e)))?;
+                table
+                    .insert(key_id, &bytes[..])
+                    .map_err(|e| GuardianError::Other(format!("Error inserting key: {}", e)))?;
+            }
+            {
+                // Record/refresh lifecycle metadata in the parallel table (D2),
+                // in the same transaction so secret + metadata stay consistent.
+                let mut meta_table = write_txn.open_table(KEYMETA_TABLE).map_err(|e| {
+                    GuardianError::Other(format!("Error opening meta table: {}", e))
+                })?;
+                let now = KeyMeta::now_secs();
+                let prior = meta_table
+                    .get(key_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| KeyMeta::from_json(v.value()));
+                let meta = match prior {
+                    Some(mut m) => {
+                        m.rotated_count = m.rotated_count.saturating_add(1);
+                        m.updated_at = now;
+                        m
+                    }
+                    None => KeyMeta {
+                        created_at: now,
+                        updated_at: now,
+                        kind: "ed25519".to_string(),
+                        rotated_count: 0,
+                    },
+                };
+                meta_table
+                    .insert(key_id, &meta.to_json()[..])
+                    .map_err(|e| GuardianError::Other(format!("Error inserting meta: {}", e)))?;
+            }
+            write_txn
+                .commit()
+                .map_err(|e| GuardianError::Other(format!("Error committing key: {}", e)))?;
+            Ok(())
+        })();
+        bytes.zeroize();
+        stored.map(|()| public)
+    }
+
+    fn key_meta(&self, key_id: &str) -> Result<Option<KeyMeta>> {
+        let read_txn = self
+            .db
+            .begin_read()
+            .map_err(|e| GuardianError::Other(format!("Error opening keystore: {}", e)))?;
+        let table = match read_txn.open_table(KEYMETA_TABLE) {
+            Ok(t) => t,
+            Err(_) => return Ok(None),
+        };
+        match table.get(key_id) {
+            Ok(Some(v)) => Ok(KeyMeta::from_json(v.value())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(GuardianError::Other(format!("Error reading meta: {}", e))),
+        }
+    }
 }
 
 /// Factory function to create keystores based on configuration.
@@ -247,6 +379,30 @@ mod tests {
         assert!(!keystore.has(key).await.unwrap());
     }
 
+    #[test]
+    fn test_generate_key_persists_across_reopen() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("admin_keystore");
+
+        // Generate a key, then drop the store (releases the redb lock).
+        let public = {
+            let ks = RedbKeystore::new(Some(path.clone())).unwrap();
+            let p = ks.generate_key("k1").unwrap();
+            assert!(!p.is_empty());
+            // The derived public matches what public_key reports.
+            assert_eq!(ks.public_key("k1").unwrap().as_deref(), Some(p.as_str()));
+            p
+        };
+
+        // Reopen the same path: the generated key must still be there.
+        let ks2 = RedbKeystore::new(Some(path)).unwrap();
+        assert_eq!(
+            ks2.public_key("k1").unwrap().as_deref(),
+            Some(public.as_str())
+        );
+        assert!(ks2.enumerate_keys().unwrap().iter().any(|k| k == "k1"));
+    }
+
     #[tokio::test]
     async fn test_keypair_storage() {
         let keystore = RedbKeystore::temporary().unwrap();
@@ -266,6 +422,35 @@ mod tests {
 
         // Compare public keys
         assert_eq!(original_secret.public(), retrieved_secret.public());
+    }
+
+    #[test]
+    fn test_key_meta_tracks_creation_and_rotation() {
+        let ks = RedbKeystore::temporary().unwrap();
+        // No metadata before the key exists.
+        assert!(ks.key_meta("k1").unwrap().is_none());
+
+        // First generation: rotated_count == 0, kind ed25519, timestamps set.
+        ks.generate_key("k1").unwrap();
+        let m1 = ks.key_meta("k1").unwrap().expect("meta after generate");
+        assert_eq!(m1.kind, "ed25519");
+        assert_eq!(m1.rotated_count, 0);
+        assert!(m1.created_at > 0);
+
+        // Regenerating the same id counts as a rotation and preserves created_at.
+        ks.generate_key("k1").unwrap();
+        let m2 = ks.key_meta("k1").unwrap().unwrap();
+        assert_eq!(m2.rotated_count, 1);
+        assert_eq!(m2.created_at, m1.created_at);
+
+        // The secret table stays a plain 32-byte secret (metadata is a sidecar).
+        assert!(ks.public_key("k1").unwrap().is_some());
+        assert!(
+            !ks.enumerate_keys()
+                .unwrap()
+                .iter()
+                .any(|k| k == "keystore_meta")
+        );
     }
 
     #[tokio::test]

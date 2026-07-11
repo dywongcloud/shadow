@@ -312,6 +312,7 @@ mod tests {
             peer_id: None,
             iroh_addr: None,
             guardian_iroh_addr: None,
+            relay_url: None,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

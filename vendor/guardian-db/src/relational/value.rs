@@ -454,23 +454,56 @@ impl SqlValue {
 
     /// Key string used for hash/btree index entries and primary-key derivation.
     pub fn index_key(&self) -> String {
+        let mut out = String::new();
+        self.write_index_key(&mut out);
+        out
+    }
+
+    /// Appends the index-key representation to `out`, avoiding a per-value
+    /// `String` allocation. Produces byte-identical output to [`index_key`],
+    /// which delegates here so the two can never diverge.
+    pub fn write_index_key(&self, out: &mut String) {
+        use std::fmt::Write as _;
         match self {
-            SqlValue::Null => "\u{0}null".to_string(),
-            SqlValue::Text(s) => format!("s:{s}"),
-            SqlValue::Citext(s) => format!("s:{}", s.to_lowercase()),
-            SqlValue::Bool(b) => format!("b:{b}"),
-            SqlValue::Uuid(u) => format!("u:{u}"),
+            SqlValue::Null => out.push_str("\u{0}null"),
+            SqlValue::Text(s) => {
+                out.push_str("s:");
+                out.push_str(s);
+            }
+            SqlValue::Citext(s) => {
+                out.push_str("s:");
+                out.push_str(&s.to_lowercase());
+            }
+            SqlValue::Bool(b) => {
+                out.push_str("b:");
+                out.push_str(if *b { "true" } else { "false" });
+            }
+            SqlValue::Uuid(u) => {
+                out.push_str("u:");
+                let _ = write!(out, "{u}");
+            }
             // Separate labels with NUL so byte order matches the label-wise
             // ltree ordering ('a.b' sorts before 'a-b', unlike raw text).
-            SqlValue::Ltree(p) => format!("l:{}", p.replace('.', "\u{0}")),
+            SqlValue::Ltree(p) => {
+                out.push_str("l:");
+                out.push_str(&p.replace('.', "\u{0}"));
+            }
             v if v.type_of().is_numeric() => {
                 // Normalise all numerics to a decimal string so 1 == 1.0 in the index.
+                out.push_str("n:");
                 match v.as_decimal() {
-                    Some(d) => format!("n:{}", d.normalize()),
-                    None => format!("n:{}", v.as_f64().unwrap_or(f64::NAN)),
+                    Some(d) => {
+                        let _ = write!(out, "{}", d.normalize());
+                    }
+                    None => {
+                        let _ = write!(out, "{}", v.as_f64().unwrap_or(f64::NAN));
+                    }
                 }
             }
-            other => format!("x:{}", other.to_text().unwrap_or_default()),
+            other => {
+                out.push_str("x:");
+                out.push_str(&other.to_text().unwrap_or_default());
+            }
         }
     }
 

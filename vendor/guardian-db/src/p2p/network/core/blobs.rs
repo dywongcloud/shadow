@@ -15,6 +15,17 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
+/// Detailed listing entry for a tagged blob (C4/C5): real byte size and whether
+/// the blob is fully stored locally (vs. a partial download).
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    pub hash: BlobHash,
+    /// Real byte size — the `Complete` size, a `Partial`'s known size, else 0.
+    pub size: u64,
+    /// True when the blob is fully stored; false for partial/missing.
+    pub complete: bool,
+}
+
 /// Client for operations with iroh-blobs.
 ///
 /// Supports local operations and P2P download of blobs from remote peers
@@ -267,10 +278,27 @@ impl BlobStore {
 
     /// Lists all tagged documents in the blob store.
     ///
-    /// Returns (hash, size) pairs for all documents.
+    /// Returns (hash, size) pairs for all documents. `size` is the real byte size,
+    /// resolved via `blobs().status()` (see [`BlobStore::list_documents_status`]).
     #[instrument(level = "debug", skip(self))]
     pub async fn list_documents(&self) -> Result<Vec<(BlobHash, u64)>> {
+        Ok(self
+            .list_documents_status()
+            .await?
+            .into_iter()
+            .map(|b| (b.hash, b.size))
+            .collect())
+    }
+
+    /// Lists all tagged documents with real size + completeness (C4/C5).
+    ///
+    /// The tag stream only yields hashes; the real byte size and whether the blob
+    /// is fully stored (vs. a partial download) come from `blobs().status(hash)`
+    /// (`iroh-blobs 0.103` `BlobStatus`). Costs one `status()` call per document.
+    #[instrument(level = "debug", skip(self))]
+    pub async fn list_documents_status(&self) -> Result<Vec<BlobInfo>> {
         use futures::stream::StreamExt;
+        use iroh_blobs::api::proto::BlobStatus;
 
         let store = self.store.read().await;
         let mut documents = Vec::new();
@@ -286,8 +314,21 @@ impl BlobStore {
             match tag_result {
                 Ok(tag_info) => {
                     let hash = tag_info.hash;
-                    // Return size 0 for now - the iroh-blobs API does not provide easy access to the size.
-                    documents.push((hash, 0));
+                    // Resolve real size + completeness from the store's blob status.
+                    let (size, complete) = match store.blobs().status(hash).await {
+                        Ok(BlobStatus::Complete { size }) => (size, true),
+                        Ok(BlobStatus::Partial { size }) => (size.unwrap_or(0), false),
+                        Ok(BlobStatus::NotFound) => (0, false),
+                        Err(e) => {
+                            warn!("status({}) failed: {}", hash, e);
+                            (0, false)
+                        }
+                    };
+                    documents.push(BlobInfo {
+                        hash,
+                        size,
+                        complete,
+                    });
                 }
                 Err(e) => {
                     warn!("Error processing tag during listing: {}", e);

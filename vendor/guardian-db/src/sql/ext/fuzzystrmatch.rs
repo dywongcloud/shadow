@@ -482,11 +482,9 @@ fn metaphone_raw(word: &[u8], max_phonemes: usize) -> String {
             }
         }
         // [GKP]N becomes N.
-        b'G' | b'K' | b'P' => {
-            if up(w + 1) == b'N' {
-                out.push(b'N');
-                w += 2;
-            }
+        b'G' | b'K' | b'P' if up(w + 1) == b'N' => {
+            out.push(b'N');
+            w += 2;
         }
         // WH becomes H, WR becomes R, W stays before a vowel.
         b'W' => {
@@ -527,10 +525,8 @@ fn metaphone_raw(word: &[u8], max_phonemes: usize) -> String {
         let after_next = if next != 0 { up(w + 2) } else { 0 };
         match c {
             // B unless in -MB.
-            b'B' => {
-                if prev != b'M' {
-                    out.push(b'B');
-                }
+            b'B' if prev != b'M' => {
+                out.push(b'B');
             }
             // 'sh' in -CIA- or -CH- (but K in CHR- / SCH-); S in C[IEY]
             // (dropped in SC[IEY]); else K.
@@ -589,16 +585,12 @@ fn metaphone_raw(word: &[u8], max_phonemes: usize) -> String {
                 }
             }
             // H before a vowel and not after C/G/P/S/T.
-            b'H' => {
-                if is_mvowel(next) && !affects_h(prev) {
-                    out.push(b'H');
-                }
+            b'H' if is_mvowel(next) && !affects_h(prev) => {
+                out.push(b'H');
             }
             // Dropped after C, else K.
-            b'K' => {
-                if prev != b'C' {
-                    out.push(b'K');
-                }
+            b'K' if prev != b'C' => {
+                out.push(b'K');
             }
             // F before H, else P.
             b'P' => {
@@ -636,10 +628,8 @@ fn metaphone_raw(word: &[u8], max_phonemes: usize) -> String {
             }
             b'V' => out.push(b'F'),
             // W before a vowel, else dropped.
-            b'W' => {
-                if is_mvowel(next) {
-                    out.push(b'W');
-                }
+            b'W' if is_mvowel(next) => {
+                out.push(b'W');
             }
             // KS.
             b'X' => {
@@ -649,10 +639,8 @@ fn metaphone_raw(word: &[u8], max_phonemes: usize) -> String {
                 }
             }
             // Y before a vowel.
-            b'Y' => {
-                if is_mvowel(next) {
-                    out.push(b'Y');
-                }
+            b'Y' if is_mvowel(next) => {
+                out.push(b'Y');
             }
             b'Z' => out.push(b'S'),
             // Passed through unchanged.

@@ -1312,7 +1312,10 @@ pub fn parse_thesaurus(s: &str) -> BTreeMap<String, Vec<String>> {
 /// The algorithm scans the sorted lexemes and looks for contiguous runs whose
 /// words (joined with a space) match a thesaurus phrase.  Matching runs are
 /// replaced by the canonical term(s) at the position of the first lexeme.
-pub fn apply_thesaurus(lexemes: &[TsLexeme], entries: &BTreeMap<String, Vec<String>>) -> Vec<TsLexeme> {
+pub fn apply_thesaurus(
+    lexemes: &[TsLexeme],
+    entries: &BTreeMap<String, Vec<String>>,
+) -> Vec<TsLexeme> {
     if entries.is_empty() {
         return lexemes.to_vec();
     }
@@ -1322,7 +1325,11 @@ pub fn apply_thesaurus(lexemes: &[TsLexeme], entries: &BTreeMap<String, Vec<Stri
     let mut insertions: Vec<(usize, Vec<TsLexeme>)> = Vec::new();
 
     // Check all subslices from longest to shortest to prefer longer matches.
-    let max_phrase_words = entries.keys().map(|p| p.split_whitespace().count()).max().unwrap_or(1);
+    let max_phrase_words = entries
+        .keys()
+        .map(|p| p.split_whitespace().count())
+        .max()
+        .unwrap_or(1);
     'outer: for start in 0..n {
         if skip[start] {
             continue;
@@ -1338,9 +1345,7 @@ pub fn apply_thesaurus(lexemes: &[TsLexeme], entries: &BTreeMap<String, Vec<Stri
                         positions: vec![pos],
                     })
                     .collect();
-                for i in start..start + len {
-                    skip[i] = true;
-                }
+                skip[start..start + len].fill(true);
                 insertions.push((start, replacement));
                 continue 'outer;
             }
@@ -1355,11 +1360,11 @@ pub fn apply_thesaurus(lexemes: &[TsLexeme], entries: &BTreeMap<String, Vec<Stri
     let mut ins_iter = insertions.into_iter().peekable();
     for (i, lex) in lexemes.iter().enumerate() {
         if skip[i] {
-            if let Some((start, _)) = ins_iter.peek() {
-                if *start == i {
-                    let (_, repl) = ins_iter.next().unwrap();
-                    result.extend(repl);
-                }
+            if let Some((start, _)) = ins_iter.peek()
+                && *start == i
+            {
+                let (_, repl) = ins_iter.next().unwrap();
+                result.extend(repl);
             }
         } else {
             result.push(lex.clone());

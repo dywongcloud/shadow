@@ -50,4 +50,4 @@ The current `DocumentStore::put_all` implementation writes documents individuall
 
 ## TypeScript transport
 
-The ODM package in `packages/guardiandb-odm` (npm: `guardiandb-odm`) exposes `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style CRUD. Native Node/WASM/mobile bindings implement `GuardianTransport`; a process-local reference transport is included for deterministic tests and SDK development. This ODM is for the GuardianDB document store, not the PostgreSQL compatibility layer (`packages/guardiandb-postgres-typeorm`).
+The ODM package in `packages/guardiandb-odm-typescript` (npm: `guardiandb-odm-typescript`) exposes `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style CRUD. Native Node/WASM/mobile bindings implement `GuardianTransport`; a process-local reference transport is included for deterministic tests and SDK development. This ODM is for the GuardianDB document store, not the PostgreSQL compatibility layer (`packages/guardiandb-postgres-typeorm`).

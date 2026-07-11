@@ -852,10 +852,15 @@ async fn sidecar_real_postgres() {
         None
     };
     let demote = |cmd: &mut std::process::Command| {
+        // `uid`/`gid` demotion is a Unix-only concept; on other platforms `run_as`
+        // is always `None` (no `id`/`postgres` user), so this is a no-op.
+        #[cfg(unix)]
         if let Some((uid, gid)) = run_as {
             use std::os::unix::process::CommandExt;
             cmd.uid(uid).gid(gid);
         }
+        #[cfg(not(unix))]
+        let _ = (cmd, &run_as);
     };
     let mut initdb = std::process::Command::new(bin.join("initdb"));
     initdb.args([

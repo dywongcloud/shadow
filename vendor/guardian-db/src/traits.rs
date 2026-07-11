@@ -10,7 +10,7 @@ use crate::p2p::EventBus;
 use crate::p2p::network::client::IrohClient;
 use crate::stores::operation::Operation;
 use futures::stream::Stream;
-use iroh::EndpointId as NodeId;
+use iroh::{EndpointAddr, EndpointId as NodeId};
 use iroh_blobs::Hash;
 use opentelemetry::global::{BoxedSpan, BoxedTracer};
 use opentelemetry::trace::{Tracer, noop::NoopTracer};
@@ -673,6 +673,34 @@ pub trait EventLogStore: Store {
     async fn list(&self, options: Option<StreamOptions>) -> Result<Vec<Operation>, Self::Error>;
 }
 
+/// Per-key HEAD metadata for anti-entropy comparison: a key's content hash and
+/// last-write timestamp, WITHOUT ever reading the value bytes. This is the
+/// cheap, content-addressed "does this key already match?" primitive — for an
+/// iroh-docs-backed store it comes straight from `Entry::content_hash()` /
+/// `Entry::timestamp()` (see `iroh_docs::api::Doc::get_many`), the same
+/// metadata `refresh_kv_index` already reads before it separately resolves the
+/// blob body. No single per-namespace root hash/CID is exposed by iroh-docs'
+/// public API (only an internal, actor-private range fingerprint), so a
+/// namespace's "head" is represented here as the set of its per-key heads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntryHead {
+    pub key: String,
+    /// Hex-encoded BLAKE3 content hash (`iroh_blobs::Hash::to_hex()`).
+    pub hash: String,
+    /// Entry timestamp (iroh-docs' internal microsecond clock).
+    pub timestamp: u64,
+}
+
+/// Outcome of a targeted [`KeyValueStore::sync_with_peer`] reconciliation
+/// round. Mirrors iroh-docs' own `engine::live::SyncDetails` field-for-field
+/// so callers outside this crate (e.g. hive-cloud) don't need to depend on
+/// iroh-docs types directly to read the result of a sync.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncOutcomeSummary {
+    pub entries_received: usize,
+    pub entries_sent: usize,
+}
+
 /// A store that behaves like a distributed key-value database.
 /// Inherits all functionality from the `Store` trait and adds operations
 /// specific to key-value pairs with CRDT semantics.
@@ -722,6 +750,31 @@ pub trait KeyValueStore: Store {
     /// iroh-docs namespace and replicate the data. The peer must open the store passing
     /// the ticket in [`CreateDBOptions::doc_ticket`]. Stores that do not use iroh-docs should return an error.
     async fn share_ticket(&self) -> Result<String, Self::Error>;
+
+    /// This store's underlying iroh-docs `NamespaceId` (hex-encoded), for
+    /// stores backed by one. Default `None` for stores that aren't
+    /// iroh-docs-backed (e.g. non-KV adapters going through the generic
+    /// oplog-scanning wrapper).
+    fn namespace_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Per-key HEAD metadata (content hash + timestamp) for every live entry
+    /// in this store, without fetching any value bytes — the anti-entropy
+    /// loop's cheap "compare before pulling" primitive. Default: empty
+    /// (only the iroh-docs-backed KV store implements this for real).
+    async fn entry_heads(&self) -> Result<Vec<EntryHead>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Triggers a REAL targeted range-reconciliation sync of this store's
+    /// single document/namespace against one specific peer (iroh-docs'
+    /// `Doc::start_sync`) — scoped to exactly this namespace, never a
+    /// full-database refresh. Default: a no-op success (stores that aren't
+    /// iroh-docs-backed have nothing to reconcile this way).
+    async fn sync_with_peer(&self, _peer: EndpointAddr) -> Result<SyncOutcomeSummary, Self::Error> {
+        Ok(SyncOutcomeSummary::default())
+    }
 }
 
 /// A simple struct for passing options to a DocumentStore's `get` method.

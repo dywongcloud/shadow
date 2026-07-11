@@ -34,6 +34,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/serve-hosts", get(serve_hosts))
         .route("/v1/resources", get(resources_get))
         .route("/v1/leases", get(leases_get))
+        .route("/v1/guardian/heads", get(guardian_heads))
         .route("/v1/cluster", get(cluster_status))
         .route("/v1/anycast", get(anycast_table))
         .route("/v1/ratelimit", get(ratelimit_get).put(ratelimit_put))
@@ -1358,6 +1359,18 @@ pub(crate) async fn leases_get(State(c): State<Arc<CloudState>>) -> Json<Value> 
     Json(json!(c.leases.list()))
 }
 
+/// design-head-cid-exchange-rpc: `{namespace: [{key, hash, timestamp}, ...]}`
+/// for every GuardianDB namespace this node's local replica currently holds —
+/// content-addressed HEAD metadata only, never value bytes. The anti-entropy
+/// loop (`spawn_anti_entropy_loop` in main.rs) fetches this from one random
+/// healthy peer each round and diffs it against its own local
+/// `guardian::namespace_heads()` to decide whether a real reconciliation sync
+/// is needed. Unauthenticated like `/v1/serve-hosts`/`/v1/leases` (mesh
+/// convergence machinery, not tenant data — no values are ever returned here).
+pub(crate) async fn guardian_heads(State(_c): State<Arc<CloudState>>) -> Json<Value> {
+    Json(json!(crate::guardian::namespace_heads().await))
+}
+
 /// REAL cluster resource accounting: this node's live CPU/mem/disk/network usage
 /// (sysinfo) plus cluster TOTALS = sum of every live node's capacity (gossiped via
 /// NodeInfo). Answers "available compute / storage / bandwidth across the mesh".
@@ -1904,7 +1917,9 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 15).await {
+        // See `fetch_from_host`: bumped from 15s to give the discovery fallback in
+        // `PeerPool::acquire` room to complete instead of being cut off here.
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await {
             return serde_json::from_slice(&b).ok();
         }
     }
@@ -2173,7 +2188,8 @@ pub(crate) async fn dispatch_project_delete(c: &Arc<CloudState>, node: &str, pro
         .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
     if let Some((id, addr)) = target {
         let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
-        if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 15).await.is_none() {
+        // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
+        if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await.is_none() {
             tracing::warn!(node, project, "project delete dispatch over iroh failed (peer will be retried on next delete)");
         }
     } else {
@@ -2385,7 +2401,19 @@ pub(crate) async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str,
     if let Some((id, addr)) = target {
         let sep = if path.contains('?') { '&' } else { '?' };
         let p = format!("{path}{sep}{}", mesh_team_qs(team));
-        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 10).await {
+        // 20s (not the old flat 10s): `acquire`'s cached-hint attempt can now fall
+        // back to a fresh-discovery dial (`PeerPool::dial_fresh`) when the hint is
+        // stale, which needs headroom beyond `connect_budget()` alone to actually
+        // complete instead of being cut off by this outer timeout.
+        //
+        // `addr` here is `n.iroh_addr` — a snapshot serialized at the HOST's own
+        // boot/last-gossip time, so its relay (if any) can go stale exactly like
+        // the direct addrs can. `request_to` re-hints the relay transport (this
+        // node's live-gossiped registry view of `id`'s own/nearest relay_url —
+        // see `gossip::relay_hinted_addr`) before dialing, so a call from e.g.
+        // fc-hongkong to fc-sanjose hints sj's own live relay_url rather than
+        // whatever was cached in `addr` at gossip time.
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20).await {
             return serde_json::from_slice(&b).ok();
         }
     }
@@ -2433,14 +2461,24 @@ async fn project_redeploy(
 // ---- GitOps ----
 
 /// All projects owned by a tenant plus their settings + git source — the data the
-/// dashboard serializes into the committed `openedge.yaml`.
+/// dashboard serializes into the committed `openedge.yaml`. FLEET-AWARE: iterating
+/// only the local `ProjectStore` snapshot (as this handler did before) misses any
+/// project this node never locally built/saw — `ProjectSettings` rows are
+/// confirmed node-local-only, never gossiped (unlike `dep_list`/`admin_overview`,
+/// which already merge `peer_deployments`). Union local settings with every
+/// project name a fleet-aggregated deployment carries for this tenant, so a
+/// project created (even with zero deployments yet) on ANOTHER node still
+/// appears here — the exact class of bug that hid team Simpfi's `drugs-wtf`
+/// project on 4 of 8 fleet nodes.
 async fn gitops_projects(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut out = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (project, settings) in c.projects.snapshot() {
         if norm(&settings.team) != t {
             continue;
         }
+        seen.insert(project.clone());
         let git = c.gw.git_for_project(&project);
         let prod = c.gw.list().into_iter().find(|d| d.project == project && d.production);
         // Enterprise deployment protection is part of the declarative config too —
@@ -2453,6 +2491,45 @@ async fn gitops_projects(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
             "production": prod,
             "root_dir": settings.build.root_dir,
             "protection": { "mode": prot.mode, "scope": prot.scope },
+        }));
+    }
+    // Fleet-visible fallback rows: a project this node has never locally seen a
+    // ProjectSettings row for, but that the tenant owns per a gossiped deployment
+    // record. Settings/git/protection are unavailable here (this node genuinely
+    // has none) — surfaced with defaults rather than silently omitted, so the
+    // project is at least visible/selectable instead of invisible.
+    for (_node, deps) in c.peer_deployments.read().iter() {
+        for d in deps {
+            if record_tenant(&d.tenant) != t || !seen.insert(d.project.clone()) {
+                continue;
+            }
+            out.push(json!({
+                "project": d.project,
+                "settings": crate::project_settings::ProjectSettings::default(),
+                "git": Value::Null,
+                "production": Value::Null,
+                "root_dir": "",
+                "protection": { "mode": "off", "scope": "preview" },
+            }));
+        }
+    }
+    // Second fallback tier: the fleet-replicated relational mirror (see
+    // relational.rs) — the DURABLE fix. Unlike peer_deployments (which can
+    // only know about a project that has at least one deployment somewhere),
+    // this catches a project that was CREATED but never successfully
+    // deployed anywhere in the fleet — `drugs-wtf`'s exact bug (zero
+    // deployments fleet-wide, live-witnessed).
+    for project in crate::relational::projects_for_team(&t).await {
+        if !seen.insert(project.clone()) {
+            continue;
+        }
+        out.push(json!({
+            "project": project,
+            "settings": crate::project_settings::ProjectSettings::default(),
+            "git": Value::Null,
+            "production": Value::Null,
+            "root_dir": "",
+            "protection": { "mode": "off", "scope": "preview" },
         }));
     }
     out.sort_by(|a, b| a["project"].as_str().unwrap_or("").cmp(b["project"].as_str().unwrap_or("")));
@@ -5145,8 +5222,66 @@ struct MetricsQ {
     /// falls back to "minute" (today's pre-existing behavior) via
     /// `Granularity::parse` — never a 400, this is a display parameter.
     gran: Option<String>,
+    /// Set by the fleet fan-out's own inner call (`metrics_get` -> peer) to
+    /// request ONLY this node's local view, with no further fan-out — stops
+    /// the recursion at one hop. Absent/false = the top-level call, which fans
+    /// out to every other healthy node (see `metrics_get`'s doc comment).
+    #[serde(default)]
+    local: Option<bool>,
 }
 
+/// Merge one peer's `/v1/metrics?local=true` JSON response into the running
+/// accumulators (series by `t_ms`, status/top-paths/projects by key). Silently
+/// no-ops on a malformed/unreachable peer response — a single unreachable node
+/// must not fail the whole tenant's usage view (matches `fleet_function_stats`'s
+/// best-effort fan-out).
+fn merge_peer_metrics(
+    v: &Value,
+    series: &mut Vec<crate::metrics::Bucket>,
+    status_distribution: &mut std::collections::HashMap<String, u64>,
+    top_paths: &mut std::collections::HashMap<String, u64>,
+    projects: &mut std::collections::HashMap<String, u64>,
+) {
+    if let Some(peer_series) = v.get("series").and_then(|s| serde_json::from_value::<Vec<crate::metrics::Bucket>>(s.clone()).ok()) {
+        let mut by_t: std::collections::HashMap<u64, usize> = series.iter().enumerate().map(|(i, b)| (b.t_ms, i)).collect();
+        for pb in peer_series {
+            if let Some(&i) = by_t.get(&pb.t_ms) {
+                series[i].add(&pb);
+            } else {
+                by_t.insert(pb.t_ms, series.len());
+                series.push(pb);
+            }
+        }
+        series.sort_by_key(|b| b.t_ms);
+    }
+    if let Some(peer_status) = v.get("status_distribution").and_then(|s| serde_json::from_value::<std::collections::HashMap<String, u64>>(s.clone()).ok()) {
+        for (k, n) in peer_status {
+            *status_distribution.entry(k).or_insert(0) += n;
+        }
+    }
+    for (dst, key) in [(&mut *top_paths, "top_paths"), (&mut *projects, "projects")] {
+        let (name_key, count_key) = if key == "top_paths" { ("path", "count") } else { ("project", "requests") };
+        if let Some(rows) = v.get(key).and_then(|s| s.as_array()) {
+            for row in rows {
+                if let (Some(name), Some(n)) = (row.get(name_key).and_then(|x| x.as_str()), row.get(count_key).and_then(|x| x.as_u64())) {
+                    *dst.entry(name.to_string()).or_insert(0) += n;
+                }
+            }
+        }
+    }
+}
+
+/// TENANT-SCOPED usage series + breakdowns for the Usage page. FLEET-AGGREGATE:
+/// `MetricsStore` is confirmed node-local with zero cross-node merge (never
+/// gossiped, and deliberately NOT adopted from a peer on restore — see
+/// `guardian::strip_node_local`'s "would double-count its traffic" comment,
+/// unlike billing which has a single elected metering owner). A tenant's
+/// traffic can land on ANY healthy node the routing mesh sends it to, so
+/// without fanning out, `/v1/metrics` answers depend entirely on which node
+/// happens to serve the dashboard's request — live-witnessed: the SAME tenant
+/// showed 0 requests on 7 of 8 fleet nodes and real traffic only on the 8th.
+/// `q.local=true` (set only on the inner fan-out call below) stops a peer from
+/// ALSO fanning out — single-hop only, no N-way amplification.
 async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<MetricsQ>) -> Json<Value> {
     let gran = crate::metrics::Granularity::parse(q.gran.as_deref());
     // Clamp to what this resolution's ring buffer actually retains (Minute:
@@ -5159,7 +5294,27 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
     // metrics through the separate operator-gated `admin_overview`.)
     let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
-    let series = c.metrics.series(gran, minutes, now_ms(), scope, project);
+    let mut series = c.metrics.series(gran, minutes, now_ms(), scope, project);
+    let mut status_distribution = c.metrics.status_distribution(scope);
+    let mut top_paths: std::collections::HashMap<String, u64> = c.metrics.top_paths(scope, 200).into_iter().collect();
+    let mut projects: std::collections::HashMap<String, u64> = c.metrics.project_totals(gran, minutes, now_ms(), scope).into_iter().collect();
+
+    if !q.local.unwrap_or(false) {
+        let self_name = c.node_name.clone();
+        for n in c.registry.nodes() {
+            if n.name == self_name || !n.healthy {
+                continue;
+            }
+            let mut path = format!("/v1/metrics?local=true&minutes={minutes}&gran={}", q.gran.as_deref().unwrap_or("minute"));
+            if let Some(p) = project {
+                path.push_str(&format!("&project={}", urlencode(p)));
+            }
+            if let Some(v) = fetch_from_host(&c, &n.name, &path, &t).await {
+                merge_peer_metrics(&v, &mut series, &mut status_distribution, &mut top_paths, &mut projects);
+            }
+        }
+    }
+
     let total_req: u64 = series.iter().map(|b| b.requests).sum();
     let total_err: u64 = series.iter().map(|b| b.errors + b.client_err).sum();
     let total_blocked: u64 = series.iter().map(|b| b.blocked).sum();
@@ -5167,6 +5322,11 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
     let miss: u64 = series.iter().map(|b| b.cache_miss).sum();
     let cache_ratio = if hits + miss == 0 { 0.0 } else { hits as f64 / (hits + miss) as f64 };
     let err_rate = if total_req == 0 { 0.0 } else { total_err as f64 / total_req as f64 };
+    let mut top_paths_v: Vec<(String, u64)> = top_paths.into_iter().collect();
+    top_paths_v.sort_by(|a, b| b.1.cmp(&a.1));
+    top_paths_v.truncate(10);
+    let mut projects_v: Vec<(String, u64)> = projects.into_iter().collect();
+    projects_v.sort_by(|a, b| b.1.cmp(&a.1));
     Json(json!({
         "series": series,
         "totals": {
@@ -5176,21 +5336,31 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
             "error_rate": err_rate,
             "cache_hit_ratio": cache_ratio,
         },
-        "status_distribution": c.metrics.status_distribution(scope),
-        "top_paths": c.metrics.top_paths(scope, 10).into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
-        "projects": c.metrics.project_totals(gran, minutes, now_ms(), scope).into_iter()
-            .map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
+        "status_distribution": status_distribution,
+        "top_paths": top_paths_v.into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
+        "projects": projects_v.into_iter().map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
     }))
 }
 
 // ============================ Owner / ops dashboard ============================
 
+#[derive(Deserialize, Default)]
+struct OverviewQ {
+    /// Set by the fleet fan-out's own inner call — see `metrics_get`'s doc
+    /// comment for the identical single-hop-fan-out rationale (`c.counters()`
+    /// and `c.metrics` are both confirmed node-local with no live cross-node
+    /// merge, same defect class).
+    #[serde(default)]
+    local: Option<bool>,
+}
+
 async fn admin_overview(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
+    q: Option<Query<OverviewQ>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    let (reqs, blocked) = c.counters();
+    let (mut reqs, mut blocked) = c.counters();
     let fstats = c.fluid.stats();
     let instances: usize = fstats.iter().map(|f| f.instances).sum();
     let nodes = c.registry.nodes();
@@ -5199,8 +5369,26 @@ async fn admin_overview(
     // Recent error rate from the metrics buckets (last 30m), GLOBAL across all
     // tenants — this is the operator ops console (owner-only), not tenant-facing.
     let series = c.metrics.series(crate::metrics::Granularity::Minute, 30, now_ms(), None, None);
-    let req30: u64 = series.iter().map(|b| b.requests).sum();
-    let err30: u64 = series.iter().map(|b| b.errors).sum();
+    let mut req30: u64 = series.iter().map(|b| b.requests).sum();
+    let mut err30: u64 = series.iter().map(|b| b.errors).sum();
+    // FLEET-AGGREGATE: `c.counters()`/`c.metrics` are node-local (same confirmed
+    // defect as `metrics_get` — see its doc comment). Without this, the ops
+    // console's headline request/blocked/error-rate tiles reflect only whichever
+    // node happens to serve the request, understating real fleet traffic by up
+    // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
+    if !q.map(|Query(q)| q.local.unwrap_or(false)).unwrap_or(false) {
+        let self_name = c.node_name.clone();
+        for n in &nodes {
+            if n.name == self_name || !n.healthy {
+                continue;
+            }
+            let Some(v) = fetch_from_host(&c, &n.name, "/v1/admin/overview?local=true", "").await else { continue };
+            reqs += v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0);
+            blocked += v.get("blocked").and_then(|x| x.as_u64()).unwrap_or(0);
+            req30 += v.get("req30").and_then(|x| x.as_u64()).unwrap_or(0);
+            err30 += v.get("err30").and_then(|x| x.as_u64()).unwrap_or(0);
+        }
+    }
     let err_rate = if req30 == 0 { 0.0 } else { err30 as f64 / req30 as f64 };
     // Fleet-aggregated counts (operator, all tenants): the ops overview runs on
     // ONE node while the placement scheduler hosts deployments on peers, so a
@@ -5232,6 +5420,11 @@ async fn admin_overview(
         "requests": reqs,
         "blocked": blocked,
         "error_rate_30m": err_rate,
+        // Raw 30m request/error counts (not just the ratio) so a fleet fan-out
+        // call can correctly weight-average across nodes rather than averaging
+        // already-averaged per-node ratios.
+        "req30": req30,
+        "err30": err30,
         "incidents_open": c.incidents.open_count(),
         "cluster": c.cluster.status(nodes.iter().map(|n| n.id.clone()).collect()),
         "webhooks": c.webhooks.list(None).len(),
@@ -5619,8 +5812,37 @@ async fn identity_sync(
 
 // ============================ Billing & compute credits ============================
 
-async fn billing_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+/// The single node currently metering usage into `BillingStore` (mirrors
+/// `spawn_billing_meter_loop`'s own election EXACTLY: the manual
+/// `HIVE_BILLING_COORDINATOR_NODE` pin if set, else the control-plane leader) —
+/// every OTHER node's local `BillingStore` is stale/empty for live reads (only
+/// ever bootstrapped from a peer snapshot at boot, never kept live-current).
+fn billing_authority_node(c: &Arc<CloudState>) -> String {
+    std::env::var("HIVE_BILLING_COORDINATOR_NODE")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| c.control_plane_leader())
+}
+
+/// Proxy a billing GET to the authority node when this node isn't it — fixes the
+/// confirmed bug where `/v1/billing` answers diverge by node (live-witnessed: 5
+/// distinct billing states, including a `plan` disagreement, across 8 nodes for
+/// the SAME tenant). Falls back to serving this node's own (possibly stale)
+/// local value if the proxy is unreachable, rather than erroring the page.
+async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
+    let authority = billing_authority_node(c);
+    if authority == c.node_name {
+        return None; // we ARE authoritative; caller serves its own local read
+    }
+    fetch_from_host(c, &authority, path, team).await
+}
+
+pub(crate) async fn billing_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some(v) = proxy_billing_read(&c, "/v1/billing", &t).await {
+        return Json(v);
+    }
     let acc = c.billing.account(&t);
     let plan = acc.plan.clone();
     // Live quota usage (business-locking gauges) + the metered rate card + this
@@ -5647,13 +5869,33 @@ async fn billing_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
 }
 
 /// Invoices for the tenant (finalized periods + current draft, newest first).
-async fn billing_invoices(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+/// Prefers the LOCAL fleet-replicated relational mirror (fastest — no network
+/// hop, and correct even if the billing leader is briefly unreachable),
+/// falling back to the HTTP proxy-to-leader, falling back to this node's own
+/// (possibly stale) local BillingStore.
+pub(crate) async fn billing_invoices(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some((_, _, Some(invoices_json))) = crate::relational::billing_snapshot(&t).await {
+        if let Ok(v) = serde_json::from_str::<Value>(&invoices_json) {
+            return Json(v);
+        }
+    }
+    if let Some(v) = proxy_billing_read(&c, "/v1/billing/invoices", &t).await {
+        return Json(v);
+    }
     Json(json!(c.billing.invoices(&t)))
 }
 
-async fn billing_ledger(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+pub(crate) async fn billing_ledger(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    if let Some((_, Some(ledger_json), _)) = crate::relational::billing_snapshot(&t).await {
+        if let Ok(v) = serde_json::from_str::<Value>(&ledger_json) {
+            return Json(v);
+        }
+    }
+    if let Some(v) = proxy_billing_read(&c, "/v1/billing/ledger", &t).await {
+        return Json(v);
+    }
     Json(json!(c.billing.ledger(&t)))
 }
 

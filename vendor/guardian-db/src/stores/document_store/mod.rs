@@ -949,6 +949,68 @@ impl GuardianDBDocumentStore {
         ))
     }
 
+    /// `&self` variant of [`put`](Self::put), for callers holding a shared reference
+    /// (e.g. the admin RPC over `Arc<dyn Store>`). The write path is interior-mutable
+    /// (iroh-docs `set_bytes` + the index's own locking), so no `&mut self` is needed.
+    #[instrument(level = "debug", skip(self, document))]
+    pub async fn put_impl(&self, document: Document) -> Result<Operation> {
+        self.ensure_writable()?;
+        let _entered = self.span.enter();
+
+        let key = (self.doc_opts.key_extractor)(&document)?;
+        let data = (self.doc_opts.marshal)(&document)?;
+
+        self.docs
+            .set_bytes(
+                &self.doc_handle,
+                self.author_id,
+                Bytes::from(key.clone().into_bytes()),
+                Bytes::from(data.clone()),
+            )
+            .await
+            .map_err(|e| {
+                GuardianError::Store(format!("Error writing key '{}' to iroh-docs: {}", key, e))
+            })?;
+
+        self.index.insert(key.clone(), data.clone());
+        Ok(Operation::new(Some(key), "PUT".to_string(), Some(data)))
+    }
+
+    /// `&self` variant of [`delete`](Self::delete). See [`put_impl`](Self::put_impl).
+    #[instrument(level = "debug", skip(self))]
+    pub async fn delete_impl(&self, document_id: &str) -> Result<Operation> {
+        self.ensure_writable()?;
+        let _entered = self.span.enter();
+
+        if self.index.get_value(document_id).is_none() {
+            return Err(GuardianError::NotFound(format!(
+                "No entry with key '{}' in the database",
+                document_id
+            )));
+        }
+
+        self.docs
+            .del(
+                &self.doc_handle,
+                self.author_id,
+                Bytes::from(document_id.as_bytes().to_vec()),
+            )
+            .await
+            .map_err(|e| {
+                GuardianError::Store(format!(
+                    "Error deleting key '{}' in iroh-docs: {}",
+                    document_id, e
+                ))
+            })?;
+
+        self.index.remove(document_id);
+        Ok(Operation::new(
+            Some(document_id.to_string()),
+            "DEL".to_string(),
+            None,
+        ))
+    }
+
     #[instrument(level = "debug", skip(self, documents))]
     pub async fn put_batch(&mut self, documents: Vec<Document>) -> Result<Vec<Operation>> {
         self.ensure_writable()?;

@@ -534,6 +534,13 @@ async fn blackhole_connect_times_out_and_is_marked_dead() {
     let _serial = net_serial();
     let _g1 = EnvGuard::set("HIVE_P2P_CONNECT_MS", "500");
     let _g2 = EnvGuard::set("HIVE_P2P_OPEN_MS", "500");
+    // `acquire`'s discovery-fallback retry (`dial_fresh`, relay-selection-algorithm)
+    // adds a SEPARATE budget on top of `HIVE_P2P_CONNECT_MS` for every connect
+    // timeout/error against the cached hint — bound it too, or this test's total
+    // wall time is (connect budget + the fallback's own 4s DEFAULT) × retry,
+    // blowing past the assertions below even though the peer is still correctly
+    // detected dead.
+    let _g3 = EnvGuard::set("HIVE_P2P_DISCOVERY_MS", "500");
     // Bind B but DO NOT serve/accept — held alive so its addr stays advertised.
     let ep_b = match hive_p2p::bind().await {
         Ok(e) => e,

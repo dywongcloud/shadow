@@ -37,6 +37,7 @@ mod microfrontends_api;
 mod notifications;
 mod persist;
 mod project_settings;
+mod relational;
 mod resources;
 mod resp;
 mod retry;
@@ -107,6 +108,13 @@ struct Args {
     /// Per-region burst concurrency limit (executions per 10s).
     #[arg(long, default_value_t = 1000)]
     burst_limit: usize,
+    /// Port for this node's OWN embedded iroh-relay server (HTTP relay + NAT
+    /// fallback for the mesh). Default 3341 — one above the standalone `iroh-relay`
+    /// binaries' :3340 on bkk/va/sj, so an embedded listener never collides with a
+    /// standalone one still running on the same host during the transition.
+    /// `HIVE_OWN_RELAY_PORT` overrides this at runtime.
+    #[arg(long, default_value_t = 3341)]
+    relay_port: u16,
 }
 
 #[tokio::main]
@@ -265,6 +273,60 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ip) = &public_ip {
         tracing::info!(%ip, ip6 = ?public_ip6, "node public IP (advertised to client DNS / Seer)");
     }
+
+    // Embedded iroh-relay server: every hived instance runs its OWN relay listener
+    // in-process (a real HTTP relay/NAT-traversal fallback for the mesh — see
+    // `iroh_relay::server`'s module docs: it's a genuine in-process server API,
+    // not just the CLI binary, via `Server::spawn`). This is additive alongside
+    // the standalone `iroh-relay` binaries already running on bkk/va/sj (:3340)
+    // during the transition — a different default port (3341) means an embedded
+    // listener never collides with a standalone one on the same host. Started
+    // PLAIN HTTP (no TLS/QUIC address-discovery yet): the CLI binary's
+    // self-signed-cert generation for that isn't exposed as a public library call
+    // in this iroh-relay version, so wiring it up is a deliberate, separate
+    // follow-up. Best-effort + fail-open: a bind failure here must NEVER block
+    // this node's own admin/gateway serving.
+    let relay_port: u16 = std::env::var("HIVE_OWN_RELAY_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(args.relay_port);
+    let relay_bind: SocketAddr =
+        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), relay_port);
+    let mut embedded_relay_cfg = iroh_relay::server::ServerConfig::default();
+    embedded_relay_cfg.relay = Some(iroh_relay::server::RelayConfig::new(relay_bind));
+    embedded_relay_cfg.quic = None;
+    embedded_relay_cfg.metrics_addr = None;
+    let relay_server = match tokio::time::timeout(
+        Duration::from_secs(5),
+        iroh_relay::server::Server::spawn(embedded_relay_cfg),
+    )
+    .await
+    {
+        Ok(Ok(server)) => {
+            tracing::info!(addr = ?server.http_addr(), "embedded iroh-relay server bound");
+            Some(server)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, port = relay_port, "embedded iroh-relay server failed to bind (continuing without it)");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(port = relay_port, "embedded iroh-relay server bind timed out (continuing without it)");
+            None
+        }
+    };
+    // Advertise our OWN relay only when we're actually listening AND have a
+    // routable public address to put in the URL — a NAT'd node can't usefully
+    // advertise a relay peers can't reach (same rule `public_ip`/`public_url`
+    // already follow). Kept alive for the whole process (`relay_server` isn't
+    // dropped until `main` returns, which — barring a fatal listener error below
+    // — is never, so the server outlives the boot function).
+    let own_relay_url: Option<String> =
+        relay_server.as_ref().and(public_ip.as_ref()).map(|ip| format!("http://{ip}:{relay_port}"));
+    if let Some(url) = &own_relay_url {
+        tracing::info!(%url, "this node's relay_url (advertised via gossip)");
+    }
+
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
@@ -279,6 +341,12 @@ async fn main() -> anyhow::Result<()> {
         // registry.set_self_guardian_addr() once guardian::my_iroh_addr()
         // resolves (best-effort, usually within the first couple of rounds).
         guardian_iroh_addr: None,
+        // Not set here either — mirrors `guardian_iroh_addr`: populated right
+        // after `registry` exists, via `registry.set_self_relay_url(..)` below,
+        // so `relay_url`'s own doc comment stays the single source of truth for
+        // when/why it's `None` (still filled in this same boot, just after the
+        // registry the setter needs is constructed).
+        relay_url: None,
         // Boot value; the gossip loop refreshes this every round from the
         // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,
@@ -297,6 +365,10 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name, "node host capacity");
     let registry = NodeRegistry::new(me);
+    // Populate this node's own relay_url now that `registry` exists (mirrors
+    // `set_self_guardian_addr`'s post-boot fill-in pattern) — it rides along in
+    // the very next `/v1/nodes/announce` gossip broadcast, no new RPC surface.
+    registry.set_self_relay_url(own_relay_url.clone());
 
     let cloud = CloudState::new(
         region.clone(),
@@ -384,6 +456,9 @@ async fn main() -> anyhow::Result<()> {
         // Pooled cross-node transport: reuse one QUIC connection per peer, a new
         // stream per request (built here, alongside the endpoint it dials with).
         *cloud.mesh.write() = Some(hive_p2p::PeerPool::new(ep.clone()));
+        // Live relay-set tracker (dynamic-hive-relay-urls-list): kept alongside
+        // `mesh`, synced on an interval by `spawn_relay_sync_loop` below.
+        *cloud.relay_set.write() = Some(hive_p2p::RelaySet::new(ep.clone()));
         let gateway_addr = args.listen.to_string();
         // #20 peer trust: enforce the allowlist only when HIVE_PEER_TRUST is set
         // (opt-in — default keeps the mesh open, no behavior change). When on, the
@@ -494,6 +569,26 @@ async fn main() -> anyhow::Result<()> {
     // comment for why this specific window matters.
     guardian::set_boot_seed_peers(crate::persist::load_peer_guardian_addr().into_values().collect());
     guardian::init_background();
+    // Fleet-consistent relational tables (project_teams, billing_*) — see
+    // relational.rs's module doc. Idempotent (CREATE TABLE IF NOT EXISTS);
+    // best-effort like every other GuardianDB-backed call, never blocks boot.
+    // Backfill existing projects (created before this migration shipped, so
+    // `set_project_team` never fired for them) — see backfill_projects's doc
+    // comment for why this is safe on every node but billing is deliberately
+    // excluded (self-heals via the metering loop instead).
+    {
+        let cloud = cloud.clone();
+        tokio::spawn(async move {
+            relational::init_schema().await;
+            let existing: Vec<(String, String, String)> = cloud
+                .projects
+                .snapshot()
+                .into_iter()
+                .map(|(project, s)| (project, s.team, s.build.root_dir))
+                .collect();
+            relational::backfill_projects(existing).await;
+        });
+    }
     // Restore-on-rollback guard: if the local snapshot regressed (older than the
     // GuardianDB replica — the failure that silently dropped shoomoo's env vars +
     // reset billing), adopt the replica. Web3 data-sovereignty: the replicated,
@@ -573,6 +668,19 @@ async fn main() -> anyhow::Result<()> {
     // peer (not just the ones we directly gossip), so cross-node requests reuse a
     // warm trunk instead of paying a cold dial/holepunch on the critical path.
     spawn_trunk_warmer(cloud.clone());
+
+    // Live relay-set refresh (dynamic-hive-relay-urls-list): keeps the bound iroh
+    // endpoint's relay map in sync with [own relay_url, every healthy peer's
+    // relay_url, the central relay.shadw.cloud backstop] as the registry changes,
+    // via live `insert_relay`/`remove_relay` (no rebind) — see `RelaySet`.
+    spawn_relay_sync_loop(cloud.clone());
+
+    // GuardianDB anti-entropy loop (implement-anti-entropy-loop): periodic
+    // Dynamo-style read-repair over the iroh-docs-backed replicated store —
+    // catches divergences the opportunistic live-sync path missed (this node
+    // offline/partitioned during a peer's write, ticket exchange never ran
+    // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
+    spawn_anti_entropy_loop(cloud.clone());
 
     // Billing meter loop: periodically converts measured fleet compute usage into
     // charges (usage → rate card → ledger → invoice). Runs whether Stripe is
@@ -1917,6 +2025,163 @@ fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
     });
 }
 
+/// Live relay-set refresh loop (dynamic-hive-relay-urls-list): keeps the bound
+/// `iroh` endpoint's relay map in sync with the DESIRED set —
+/// `[this node's own relay_url] + [every healthy peer's relay_url, from the live
+/// gossip-replicated NodeRegistry] + [the central relay.shadw.cloud backstop] +
+/// [HIVE_RELAY_URLS manual overrides — merged in, not replaced]` — via
+/// `Endpoint::insert_relay`/`remove_relay` (a genuine LIVE update on the
+/// already-bound endpoint; see `RelaySet`). Replaces the OLD bind-time-only
+/// `relay_map_from_env` as the ongoing source of truth for the mesh's relay set
+/// (that function still seeds/merges at bind time — kept, not removed).
+/// Config: `HIVE_RELAY_SYNC_INTERVAL` (s, default 30).
+fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_RELAY_SYNC_INTERVAL", 30));
+    // Manual overrides, read once at boot (same source `relay_map_from_env`
+    // reads at bind time) — merged into every refresh, not just the seed.
+    let manual: Vec<String> = std::env::var("HIVE_RELAY_URLS")
+        .ok()
+        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .unwrap_or_default();
+    tracing::info!(?interval, manual = manual.len(), "live relay-set refresh loop (dynamic relay list)");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            let set = match cloud.relay_set.read().clone() {
+                Some(s) => s,
+                None => continue, // iroh transport not bound (or not yet) — nothing to sync
+            };
+            let me = cloud.registry.me();
+            let mut desired: Vec<String> = Vec::new();
+            if let Some(u) = &me.relay_url {
+                desired.push(u.clone());
+            }
+            for n in cloud.registry.nodes() {
+                if n.is_self || !n.healthy {
+                    continue;
+                }
+                if let Some(u) = n.relay_url {
+                    desired.push(u);
+                }
+            }
+            desired.extend(manual.iter().cloned());
+            // Central backstop: always included, so a node with no peer/own relay
+            // known yet still has a working relay path.
+            desired.push(hive_edge::CENTRAL_RELAY_URL.to_string());
+            desired.sort();
+            desired.dedup();
+            let n = desired.len();
+            set.sync(desired).await;
+            tracing::debug!(relays = n, "live relay set synced");
+        }
+    });
+}
+
+/// GuardianDB anti-entropy loop (implement-anti-entropy-loop): each tick, picks
+/// ONE peer from the live, healthy `NodeRegistry` and asks it for its
+/// per-namespace GuardianDB HEAD map (`GET /v1/guardian/heads` —
+/// design-head-cid-exchange-rpc, key+content-hash+timestamp only, never value
+/// bytes), diffs it against this node's own local heads
+/// (`guardian::namespace_heads`), and for every namespace with a REAL
+/// divergence triggers a targeted `Doc::start_sync` reconciliation against
+/// exactly that peer (implement-reconciliation-trigger — never a
+/// full-database refresh). This is the Dynamo-style read-repair loop for the
+/// iroh-docs-backed replicated store: the periodic mechanism that catches
+/// entries a peer never picked up via the opportunistic live-sync path (e.g.
+/// this node was offline/partitioned when the peer wrote, or automatic
+/// DocTicket exchange never happened between this pair). Peer selection uses
+/// `now_ms()` modulo the healthy-peer count — good enough churn for eventual
+/// full-mesh coverage without a new RNG dependency; this is convergence
+/// machinery, not a security-sensitive selection. Config:
+/// `HIVE_ANTI_ENTROPY_INTERVAL_SECS` (s, default 60).
+fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_ANTI_ENTROPY_INTERVAL_SECS", 60));
+    tracing::info!(?interval, "guardian-db anti-entropy loop (head-CID exchange + targeted reconciliation)");
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        loop {
+            tick.tick().await;
+            anti_entropy_round(&cloud).await;
+        }
+    });
+}
+
+/// One anti-entropy round — see `spawn_anti_entropy_loop`. Split out so the
+/// loop body itself stays a plain tick-and-call, matching this file's other
+/// periodic loops (`spawn_trunk_warmer`, `spawn_relay_sync_loop`).
+async fn anti_entropy_round(cloud: &Arc<CloudState>) {
+    let candidates: Vec<NodeInfo> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some())
+        .collect();
+    if candidates.is_empty() {
+        return; // no reachable peer this round — nothing to compare against
+    }
+    let idx = (now_ms() as usize) % candidates.len();
+    let peer = &candidates[idx];
+    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
+
+    let remote_bytes =
+        match gossip::request_to(cloud, &peer_id, &peer_addr, hive_p2p::GOSSIP_GET, "/v1/guardian/heads", &[], 10).await
+        {
+            Some(b) => b,
+            None => {
+                tracing::warn!(peer = %peer.name, error = "no response from peer", "anti-entropy: heads RPC failed");
+                return;
+            }
+        };
+    let remote: std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> =
+        match serde_json::from_slice(&remote_bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(peer = %peer.name, error = %e, "anti-entropy: unparsable heads response");
+                return;
+            }
+        };
+    let local = guardian::namespace_heads().await;
+
+    for (ns, remote_heads) in &remote {
+        let local_by_key: std::collections::HashMap<&str, &str> = local
+            .get(ns)
+            .map(|v| v.iter().map(|h| (h.key.as_str(), h.hash.as_str())).collect())
+            .unwrap_or_default();
+        let diverged = remote_heads.iter().filter(|h| local_by_key.get(h.key.as_str()) != Some(&h.hash.as_str())).count();
+        if diverged == 0 {
+            tracing::debug!(namespace = %ns, peer = %peer.name, "anti-entropy: heads already match");
+            continue;
+        }
+        let Some(guardian_addr) = peer.guardian_iroh_addr.clone() else {
+            tracing::warn!(
+                namespace = %ns, peer = %peer.name, count = diverged,
+                error = "peer has no guardian_iroh_addr gossiped yet",
+                "anti-entropy: cannot reconcile — peer's GuardianDB address unknown"
+            );
+            continue;
+        };
+        match guardian::sync_with_peer(&guardian_addr).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    namespace = %ns,
+                    peer = %peer.name,
+                    count = diverged,
+                    entries_received = outcome.entries_received,
+                    entries_sent = outcome.entries_sent,
+                    "synced {diverged} missing entries from peer {}", peer.name
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    namespace = %ns, peer = %peer.name, count = diverged, error = %e,
+                    "anti-entropy: reconciliation sync failed"
+                );
+            }
+        }
+    }
+}
+
 /// Billing meter loop — the metering→billing pipeline. On a fixed interval it pulls
 /// the fleet-wide per-function usage stats (local + every peer over the mesh),
 /// aggregates them per tenant, and feeds the cumulative totals to the billing store,
@@ -1987,6 +2252,18 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             let mut charged_any = 0u64;
             for (tenant, tot) in totals {
                 charged_any += cloud.billing.meter_usage(&tenant, tot);
+                // Mirror into the fleet-replicated relational layer (see
+                // relational.rs's module doc) right after metering — ONLY this
+                // node (the elected billing authority) ever writes it, so
+                // every OTHER node's local replica converges to this SAME
+                // account state within seconds instead of staying empty/stale
+                // (the confirmed 5-way billing-divergence bug). Best-effort:
+                // the existing HTTP proxy-to-leader read remains correct and
+                // available regardless of this mirror's freshness.
+                let acc_json = serde_json::to_string(&cloud.billing.account(&tenant)).unwrap_or_default();
+                let ledger_json = serde_json::to_string(&cloud.billing.ledger(&tenant)).unwrap_or_default();
+                let invoices_json = serde_json::to_string(&cloud.billing.invoices(&tenant)).unwrap_or_default();
+                relational::upsert_billing(&tenant, &acc_json, &ledger_json, &invoices_json).await;
             }
             if charged_any > 0 {
                 tracing::debug!(cents = charged_any, "billing meter charged usage");

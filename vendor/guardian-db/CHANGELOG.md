@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-07-10
+
+### Added
+- **Guardian Sentinel. A terminal UI (TUI) for inspecting, managing, and monitoring GuardianDB**, behind the `sentinel` Cargo feature (default builds are unaffected). GuardianDB was a library operable only from Rust code; Sentinel turns it into a database a non-Rust operator can drive visually, and everything created through it survives a restart.
+  - **Admin RPC seam (`AdminSource`).** Inspection/management no longer touches the storage directly. A small JSON-lines RPC (mirroring the `pgwire` gateway model) exposes every operation through an `AdminSource` trait with two backends: `EmbeddedSource` (owns the `data-dir`) and `AdminClient` (socket). The `guardian-sentinel` panel consumes both uniformly — `--data-dir` (embedded) or `--connect <addr>` (attach to a live instance served by `guardian-sentinel-server` **without contending for the redb lock**). Loopback TCP by default; destructive/action ops are gated by a shared token (`--token`) per connection after an `auth` handshake.
+  - **Nine inspectors/monitors** (F1–F7 navigation): Store dashboard with metrics and filtering; EventLog inspector (entry list with cursor pagination, entry detail, live search/filter, CRDT heads with divergence, branch diff, and merge timeline); KeyValue inspector (list, value detail/edit, create/delete/search/export); Access Control manager (list, per-role detail, grant/revoke with role selector, creation wizard with manifest hash); P2P Replication monitor (peer list, peer detail with shared stores, real-time sync dashboard with sparkline, duration, in-flight syncs, and aggregate throughput, alerts/diagnostics); Network Topology (ASCII star graph with real connection type, per-edge latency with global and per-peer p95/p99, relay status, known-offline peers); Keystore manager (key list with active/rotated/type metadata, detail with public key, generate/rotate — never exposes the secret); EventBus explorer (live stream with follow/pause, type + search filters, per-type counts, events/s, 60s sparkline, top peers); and Blob browser (list with real size and partial/complete status, sort by hash/size, disk usage, detail + preview, add/export/delete).
+  - **Full write/management parity.** Create and persist stores through a wizard (`StoreRegistry`, a redb catalog in `<data-dir>/store_registry`, reopens every store with its `CreateDBOptions` on boot); close/drop stores; append to EventLogs and put/delete Documents (in addition to the existing KV CRUD); attach an ACL at creation; share a store as read/write `DocTicket`s and import a store from a ticket; and surface the node identity for P2P sharing.
+  - **Real network metrics** wrapped from iroh 1.0 / iroh-blobs 0.103: real connection type via `remote_info` (`net.topology`), relay status via `home_relay_status` (`net.relay`), global and per-peer latency percentiles (`node.latency`), aggregate throughput (`node.throughput`), real blob size and partial/complete state via `blobs().status` (`blobs.list`), and discovered-not-connected peers (`net.discovered`).
+  - **Usability layer for non-Rust operators:** contextual help (`?`) explaining each screen and the underlying concepts in plain language, action-oriented empty states, a 3-step onboarding quickstart on an empty data-dir, inline validation, destructive-action confirmations, and a client-side audit trail (`l`).
+  - **Admin RPC ops implemented (all with e2e tests):** `stores.list/create/close/drop/share/import`, `node.info/identity/latency/throughput`, `kv.entries/put/delete`, `eventlog.entries` (cursor-paginated)/`eventlog.heads`/`eventlog.append`, `docs.list/get/put/delete`, `peers.list/force_sync`, `blobs.list`/`blob.get/add/export/delete`, `events.subscribe` (streaming, structured fields), `keystore.list/detail/generate` (metadata + public key only), `acl.list/grant/revoke/create`, `net.topology/relay/discovered`, and `auth`.
+  - **Documentation:** `docs/SENTINEL_TUI.md`
+  - **Known architectural limitations** (documented, not bugs): network-partition detection and blob provider discovery are outside the iroh model; wall-clock-per-entry timestamps and runtime `replicate` edits require core changes; all ACL controller types currently behave as `SimpleAccessController` in the core.
+
+## [0.17.2] - 2026-07-06
+
+### Added
+- **Supabase compatibility layer** — Supabase client libraries (`supabase-js`,
+  PostgREST/GoTrue clients) talk to a GuardianDB node with no GuardianDB-specific
+  code, through a Kong-shaped HTTP gateway behind the `supabase` Cargo feature
+  (`supabase = ["sql", "dep:axum", "dep:tower", "dep:graphql-parser"]`); default
+  builds are unaffected. Served by the new `guardian-supabase` binary.
+  - **REST** (PostgREST-compatible): `SELECT`/`INSERT`/`UPDATE`/`DELETE` with
+    `select=`, filters, `order=`, `limit`/`offset`/`Range`, upsert via
+    `Prefer: resolution=…` + `on_conflict=`, `rpc/{fn}`, and PostgREST-shaped
+    errors carrying the real SQLSTATE.
+  - **Auth** (GoTrue-compatible): signup, password + refresh-token grants with
+    rotating refresh tokens, logout, `GET`/`PUT /user`, and `service_role`-gated
+    admin user management. HS256 JWTs implemented from scratch on the in-tree
+    `hmac`/`sha2`/`base64` (no `jsonwebtoken` dependency); bcrypt passwords.
+  - **Row-Level Security enforced end-to-end**: each request opens a session
+    bound to the effective Postgres role (bearer role ?? apikey role) with the
+    verified JWT claims injected as `request.jwt.claims`; policies use the
+    standard `auth.uid()`/`auth.role()`/`auth.jwt()` helpers, `service_role`
+    bypasses like Supabase's service key, and `WITH CHECK` violations surface as
+    `42501`/403.
+  - **Storage** (storage-api-compatible): bucket CRUD, raw-body upload/download
+    (with `x-upsert`), public + signed (HS256) URLs, move/copy/list/delete, per-
+    bucket size/mime limits — object bytes replicate through the same document
+    store as every other row.
+  - **postgres-meta** (`/pg-meta`, alias `/platform/pg-meta`): the catalog and
+    `pg_catalog` views Supabase Studio needs (schemas, tables, columns, indexes,
+    constraints, policies, views, types, roles, extensions) plus a `POST /query`
+    SQL-editor path, all `service_role`-gated.
+  - **Realtime**: a Phoenix-protocol websocket compatible with
+    `@supabase/realtime-js` v2 — `postgres_changes` (fed by the engine's local
+    commit hook, authorized per-subscriber against RLS) + `broadcast`, with a
+    typed error for every unsupported frame.
+  - **GraphQL** (`/graphql/v1`): a pg_graphql-compatible endpoint reflecting the
+    `public` schema per request (collections, relationships, filters/order,
+    mutations with `atMost`, keyset pagination, introspection), governed by RLS
+    exactly like REST.
+  - The remaining Kong service (**Edge Functions**) and out-of-subset features
+    return typed `501`/GraphQL errors — never a bare 404 and never fake success.
+  - **Documentation:** `docs/supabase-compat.md` (routes, RLS semantics, typed-
+    error taxonomy, Studio wiring, and deferred slices); in-process gateway,
+    storage/realtime, and pg_graphql integration test suites.
+
 ## [0.17.1] - 2026-06-29
 
 ### Added
@@ -64,7 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added local validation for required fields, nullability, field types, strict schemas, immutable primary keys, primary-key uniqueness, unique constraints, and secondary indexes.
   - Added `GuardianDB::init_collection`, `GuardianDB::list_collections`, and `GuardianDB::model_collection::<T>()` helpers under the ODM feature.
   - Added local transaction/consistency API scaffolding (`TransactionContext`, `ConsistencyLevel`) that explicitly rejects unsupported replicated transaction semantics until a distributed coordinator exists.
-- **TypeScript ODM SDK scaffold** in `packages/guardiandb-odm` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
+- **TypeScript ODM SDK scaffold** in `packages/guardiandb-odm-typescript` exposing `GuardianDB.init`, `GuardianDB.listDatabases`, `initCollection`, `listCollections`, and Mongoose-style collection CRUD through a `GuardianTransport` boundary.
   - Includes a process-local reference transport for deterministic SDK tests and future native Node/WASM/mobile bridge development.
 - **ODM documentation and tests**, including `docs/odm.md`, Rust ODM integration tests, and TypeScript SDK tests covering the issue #17 usage flow, uniqueness rollback, update operators, collection listing, and version-conflict behavior.
 

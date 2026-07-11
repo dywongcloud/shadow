@@ -42,6 +42,15 @@ pub struct NodeInfo {
     /// later gossip round once ready — never blocks boot).
     #[serde(default)]
     pub guardian_iroh_addr: Option<String>,
+    /// This node's OWN embedded iroh-relay server URL (e.g. `http://1.2.3.4:3341`),
+    /// so peers can dial it as a relay/NAT-traversal fallback instead of routing
+    /// through n0's public relay or a single central backstop. `None` until the
+    /// embedded relay listener has bound (best-effort, filled in post-boot — see
+    /// `NodeRegistry::set_self_relay_url`) or when the node has no reachable public
+    /// address to advertise (NAT'd, same rule as `public_ip`). `#[serde(default)]`
+    /// so older gossiped/persisted records without this field deserialize fine.
+    #[serde(default)]
+    pub relay_url: Option<String>,
     /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
     /// on every owner promotion/failover). Gossiped so the whole fleet converges
     /// on the highest epoch — the fencing token that lets a node reject admin
@@ -92,6 +101,57 @@ pub fn haversine_km(a: (f64, f64), b: (f64, f64)) -> f64 {
     let dlon = lon2 - lon1;
     let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * r * h.sqrt().asin()
+}
+
+/// Central relay backstop — a fixed, always-available relay every node can reach,
+/// used by [`select_relay_hint`] when no better (peer-owned or nearby-peer-owned)
+/// relay is known yet.
+pub const CENTRAL_RELAY_URL: &str = "https://relay.shadw.cloud";
+
+/// Pick the best relay URL to HINT when dialing `target`, given the full live
+/// registry snapshot (`nodes`, including `me`) — a pure, deterministic function so
+/// it's directly unit-testable with no I/O/network/registry-locking involved.
+///
+/// Preference order:
+///   1. `target`'s OWN `relay_url` (most direct — no extra hop through a third
+///      node's relay).
+///   2. The geographically closest OTHER peer's `relay_url` (simple squared lat/lon
+///      distance — good enough for "nearest", true haversine isn't needed here),
+///      excluding `target` and `me` themselves. When `target` (or a candidate) has
+///      no lat/lon, falls back to the first other peer with a `relay_url` (order is
+///      `nodes`' own order — deterministic, just not distance-ranked).
+///   3. [`CENTRAL_RELAY_URL`], the fixed backstop — always returned rather than
+///      `None`, so callers always have a usable hint.
+pub fn select_relay_hint(target: &NodeInfo, nodes: &[NodeInfo], me: &NodeInfo) -> String {
+    fn present(u: &Option<String>) -> Option<&str> {
+        u.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    }
+    if let Some(r) = present(&target.relay_url) {
+        return r.to_string();
+    }
+    let others = nodes.iter().filter(|n| n.id != target.id && n.id != me.id);
+    if let (Some(tlat), Some(tlon)) = (target.lat, target.lon) {
+        let mut best: Option<(f64, &str)> = None;
+        for n in others.clone() {
+            let Some(r) = present(&n.relay_url) else { continue };
+            let (Some(lat), Some(lon)) = (n.lat, n.lon) else { continue };
+            let d = (lat - tlat).powi(2) + (lon - tlon).powi(2);
+            if best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, r));
+            }
+        }
+        if let Some((_, r)) = best {
+            return r.to_string();
+        }
+    }
+    // No coordinates to rank by (either `target` or every candidate lacks
+    // lat/lon) — first other peer that has a relay_url, in registry order.
+    for n in others {
+        if let Some(r) = present(&n.relay_url) {
+            return r.to_string();
+        }
+    }
+    CENTRAL_RELAY_URL.to_string()
 }
 
 /// Classify a geographic coordinate into a continent name. Used to auto-assign a
@@ -163,6 +223,19 @@ impl NodeRegistry {
         let mut me = self.me.write();
         if me.guardian_iroh_addr != addr {
             me.guardian_iroh_addr = addr;
+        }
+    }
+
+    /// Update this node's own `relay_url` once the embedded iroh-relay listener
+    /// has bound (see `relay_url`'s own doc comment). Mirrors
+    /// `set_self_guardian_addr`: best-effort, idempotent, safe to call every
+    /// gossip round — a no-op write when unchanged, picked up by the very next
+    /// outgoing `/v1/nodes/announce` gossip broadcast since `nodes()`/`me()`
+    /// always read fresh. Never blocks boot.
+    pub fn set_self_relay_url(&self, url: Option<String>) {
+        let mut me = self.me.write();
+        if me.relay_url != url {
+            me.relay_url = url;
         }
     }
 
@@ -297,6 +370,7 @@ mod tests {
             peer_id: None,
             iroh_addr: None,
             guardian_iroh_addr: None,
+            relay_url: None,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

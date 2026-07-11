@@ -74,12 +74,24 @@ percent-encoding = "2"
 
 # Always-on: iroh-native, P2P-replicated durable store (iroh-docs + iroh-blobs).
 # Every platform snapshot is replicated here, in local/dev and production alike.
-guardian-db = { version = "0.17" }
+# `sql` enables guardian-db's native in-process Rust relational/query API
+# (guardian_db::sql::open_sql/Session -- zero network hop, NOT the pgwire
+# protocol) used for the fleet-consistent relational stores in relational.rs.
+guardian-db = { version = "0.18", features = ["sql"] }
 # Direct dependency (was transitive via guardian-db/hive-p2p only) so guardian.rs
 # can construct iroh::EndpointAddr to seed GuardianDB's known peers from the main
 # mesh's own gossip-derived roster. Same "1" range as hive-p2p — cargo unifies
 # both to one locked version (confirmed: single "iroh" entry in Cargo.lock).
 iroh = "1"
+# Embedded iroh-relay server (`iroh_relay::server::Server`): every hived instance
+# runs its OWN relay listener in-process (see main.rs's relay-listener boot step)
+# instead of depending solely on the standalone `iroh-relay` binaries deployed on
+# bkk/va/sj. Only a TRANSITIVE dep of `iroh` otherwise (its `server` module isn't
+# re-exported) — pinned to the exact version Cargo.lock already resolves `iroh` to,
+# so this doesn't introduce a second resolved version. `server` feature pulls in
+# the full in-process listener API (default features `metrics` + `tls-ring` stay
+# on too).
+iroh-relay = { version = "1.0.2", features = ["server"] }
 
 # Optional: production-grade Raft consensus (full log + state machine). The
 # always-on lightweight coordinator in cluster.rs is the default; `--features

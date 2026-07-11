@@ -224,7 +224,8 @@ pub fn on_write(
                 // dispatch reconstructs the storage write on the replica.
                 let sep = if rel_path.contains('?') { '&' } else { '?' };
                 let p = format!("{rel_path}{sep}mirror=1&{}", crate::admin::mesh_team_qs(&team));
-                crate::gossip::request_to(&cloud, id, addr, hive_p2p::GOSSIP_POST, &p, &body, 10).await.is_some()
+                // Bumped from 10s for fresh-discovery fallback headroom (see admin.rs::fetch_from_host).
+                crate::gossip::request_to(&cloud, id, addr, hive_p2p::GOSSIP_POST, &p, &body, 15).await.is_some()
             } else {
                 false
             };

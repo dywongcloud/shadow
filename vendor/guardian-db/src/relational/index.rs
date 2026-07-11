@@ -21,12 +21,12 @@ pub fn composite_key(values: &[SqlValue]) -> Option<String> {
     if values.iter().any(|v| v.is_null()) {
         return None;
     }
-    let mut out = String::new();
+    let mut out = String::with_capacity(values.len() * 16);
     for (i, v) in values.iter().enumerate() {
         if i > 0 {
             out.push(SEP);
         }
-        out.push_str(&v.index_key());
+        v.write_index_key(&mut out);
     }
     Some(out)
 }
@@ -34,7 +34,7 @@ pub fn composite_key(values: &[SqlValue]) -> Option<String> {
 /// A composite key that *includes* NULLs (used for ordered range scans where NULL
 /// ordering matters). NULLs sort last (PostgreSQL default for ASC).
 pub fn ordered_key(values: &[SqlValue]) -> String {
-    let mut out = String::new();
+    let mut out = String::with_capacity(values.len() * 16);
     for (i, v) in values.iter().enumerate() {
         if i > 0 {
             out.push(SEP);
@@ -42,7 +42,7 @@ pub fn ordered_key(values: &[SqlValue]) -> String {
         if v.is_null() {
             out.push('\u{10fffe}'); // sorts after any normal key component
         } else {
-            out.push_str(&v.index_key());
+            v.write_index_key(&mut out);
         }
     }
     out

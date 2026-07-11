@@ -23,7 +23,9 @@ pub use cdn::{CacheState, CdnCache, Lookup};
 pub use concurrency::{ConcurrencyLimiter, ConcurrencyStats, Plan};
 pub use cron::{CronJob, CronScheduler};
 pub use ratelimit::{RateLimiter, RateLimitStats};
-pub use region::{continent_of, haversine_km, NodeInfo, NodeRegistry};
+pub use region::{
+    continent_of, haversine_km, select_relay_hint, NodeInfo, NodeRegistry, CENTRAL_RELAY_URL,
+};
 pub use routing::{Redirect, Rewrite, RouteOutcome, Router};
 pub use runtime_cache::RuntimeCache;
 pub use waf::{RequestCtx, Verdict, Waf, WafAction, WafMatch, WafRule};

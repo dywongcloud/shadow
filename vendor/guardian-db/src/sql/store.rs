@@ -48,7 +48,9 @@ impl LoadedTable {
         let mut rows = BTreeMap::new();
         let mut versions = BTreeMap::new();
         for (_rid, doc) in docs {
-            if let Some((id, values, version)) = decode_row(&meta, &doc)? {
+            // `build` already owns the documents, so decode by move to skip a
+            // per-column `Json` clone.
+            if let Some((id, values, version)) = decode_row_owned(&meta, doc)? {
                 versions.insert(id.clone(), version);
                 rows.insert(id, values);
             }
@@ -73,20 +75,12 @@ impl LoadedTable {
         for idx in &mut self.indexes {
             idx.data.clear();
         }
-        // Collect keys first to avoid borrow conflicts.
-        let entries: Vec<(usize, String, String)> = self
-            .indexes
-            .iter()
-            .enumerate()
-            .flat_map(|(i, idx)| {
-                self.rows.iter().map(move |(rid, values)| {
-                    let key = ordered_key(&index_values(&idx.meta, values));
-                    (i, key, rid.clone())
-                })
-            })
-            .collect();
-        for (i, key, rid) in entries {
-            self.indexes[i].data.insert(key, rid);
+        // Single pass over rows: update all indexes per row, no intermediate Vec.
+        for (rid, values) in &self.rows {
+            for idx in self.indexes.iter_mut() {
+                let key = ordered_key(&index_values(&idx.meta, values));
+                idx.data.insert(key, rid.clone());
+            }
         }
     }
 
@@ -191,12 +185,14 @@ fn describe_key(columns: &[String], values: &[SqlValue]) -> String {
     format!("Key ({cols})=({}) already exists.", vals.join(", "))
 }
 
-/// Decode a stored document into `(row_id, values, version)`. Returns `None` for
-/// tombstoned rows.
-pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues, i64)>> {
-    let obj = doc
-        .as_object()
-        .ok_or_else(|| SqlError::Storage("row document is not an object".into()))?;
+/// Decode a stored document into `(row_id, values, version)` consuming the owned
+/// document. Column values are extracted with [`Map::remove`] so no per-column
+/// `Json` clone is required. Returns `None` for tombstoned rows.
+pub fn decode_row_owned(table: &Table, doc: Json) -> Result<Option<(String, RowValues, i64)>> {
+    let mut obj = match doc {
+        Json::Object(o) => o,
+        _ => return Err(SqlError::Storage("row document is not an object".into())),
+    };
     if obj.get(F_DELETED).and_then(Json::as_bool).unwrap_or(false) {
         return Ok(None);
     }
@@ -204,11 +200,11 @@ pub fn decode_row(table: &Table, doc: &Json) -> Result<Option<(String, RowValues
         .get(F_ID)
         .and_then(Json::as_str)
         .ok_or_else(|| SqlError::Storage("row document missing _id".into()))?
-        .to_string();
+        .to_owned();
     let version = obj.get(F_VERSION).and_then(Json::as_i64).unwrap_or(1);
     let mut values = BTreeMap::new();
     for col in &table.columns {
-        let raw = obj.get(&col.name).cloned().unwrap_or(Json::Null);
+        let raw = obj.remove(&col.name).unwrap_or(Json::Null);
         let value = SqlValue::decode_json(&raw, &col.ty)?;
         values.insert(col.name.clone(), value);
     }
@@ -224,8 +220,11 @@ pub fn encode_row(table: &Table, row_id: &str, values: &RowValues, version: i64)
     obj.insert(F_VERSION.into(), Json::from(version));
     obj.insert(F_DELETED.into(), Json::Bool(false));
     for col in &table.columns {
-        let v = values.get(&col.name).cloned().unwrap_or(SqlValue::Null);
-        obj.insert(col.name.clone(), v.encode_json());
+        // Encode directly from a reference — avoids a `SqlValue` clone per column.
+        let v = values
+            .get(&col.name)
+            .map_or(Json::Null, SqlValue::encode_json);
+        obj.insert(col.name.clone(), v);
     }
     Json::Object(obj)
 }

@@ -24,6 +24,46 @@ fn default_target() -> String {
     "production".into()
 }
 
+/// Does this value look like a real, live credential? Used to force
+/// `sensitive=true` even when the caller didn't ask for it — a user leaving the
+/// "Sensitive" checkbox unticked must never turn into a plaintext credential leak
+/// through the settings/gitops read paths. Deliberately precise prefix/shape
+/// matches (not generic entropy scoring) to avoid false-positive-masking a
+/// normal, non-secret config value.
+fn looks_like_secret(v: &str) -> bool {
+    let s = v.trim();
+    if s.is_empty() {
+        return false;
+    }
+    const PREFIXES: &[&str] = &[
+        // GitHub personal/app/OAuth/refresh tokens + fine-grained PATs.
+        "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+        // AWS access key IDs (both long-term and STS-issued).
+        "AKIA", "ASIA",
+        // Stripe secret/restricted keys (live and test).
+        "sk_live_", "sk_test_", "rk_live_", "rk_test_",
+        // npm publish tokens.
+        "npm_",
+        // Slack bot/user/app/config tokens.
+        "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-",
+        // Google API keys.
+        "AIza",
+        // Anthropic / OpenAI API keys.
+        "sk-ant-", "sk-proj-", "sk-",
+        // PEM-encoded private key blocks.
+        "-----BEGIN ",
+    ];
+    if PREFIXES.iter().any(|p| s.starts_with(p)) {
+        return true;
+    }
+    // JWTs: three base64url segments separated by dots, header segment starts
+    // with the near-universal `eyJ` (base64 of `{"`).
+    if s.starts_with("eyJ") && s.matches('.').count() == 2 {
+        return true;
+    }
+    false
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BuildConfig {
     pub framework: String,
@@ -193,6 +233,10 @@ impl ProjectStore {
     /// Forget a project's settings (used when a project is deleted).
     pub fn remove(&self, project: &str) {
         self.map.write().remove(project);
+        let project = project.to_string();
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move { crate::relational::remove_project(&project).await });
+        }
     }
 
     /// Settings only if the project was explicitly configured (None otherwise).
@@ -227,6 +271,15 @@ impl ProjectStore {
     /// written to disk / the replicated snapshot in plaintext.
     pub fn put_env(&self, project: &str, mut v: EnvVar) {
         v.updated_ms = now_ms();
+        // A value that LOOKS like a real credential is treated as sensitive
+        // regardless of what the caller sent — closes a real plaintext-leak class
+        // where a user forgets to check "Sensitive" and the token is then served
+        // back in full by every settings/gitops read (live-witnessed: a GitHub PAT
+        // stored non-sensitive on a real project). Never downgrades an explicit
+        // sensitive=true.
+        if !v.sensitive && looks_like_secret(&v.value) {
+            v.sensitive = true;
+        }
         let mut m = self.map.write();
         let s = m.entry(project.to_string()).or_default();
         // EDIT semantics: sensitive values are masked to "" in every read, so the
@@ -262,8 +315,20 @@ impl ProjectStore {
     }
 
     pub fn set_team(&self, project: &str, team: &str) {
-        let mut m = self.map.write();
-        m.entry(project.to_string()).or_default().team = team.to_string();
+        let root_dir = {
+            let mut m = self.map.write();
+            let s = m.entry(project.to_string()).or_default();
+            s.team = team.to_string();
+            s.build.root_dir.clone()
+        };
+        // Best-effort fleet-replicated mirror (see relational.rs's module doc):
+        // the durable fix for a project being invisible on any node lacking
+        // this LOCAL row — every node's own replica converges within seconds,
+        // regardless of which node actually owns this in-memory row.
+        let (project, team, root_dir) = (project.to_string(), team.to_string(), root_dir);
+        if let Ok(h) = tokio::runtime::Handle::try_current() {
+            h.spawn(async move { crate::relational::set_project_team(&project, &team, &root_dir).await });
+        }
     }
 
     /// Persist the monorepo subdirectory so redeploys keep building it.

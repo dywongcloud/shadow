@@ -314,6 +314,19 @@ fn env_ms(key: &str, default_ms: u64) -> Duration {
 fn connect_budget() -> Duration { env_ms("HIVE_P2P_CONNECT_MS", 5_000) }
 /// `open_bi` budget — pre-send. Cheap once the conn is live; a hang = half-dead trunk.
 fn open_budget() -> Duration { env_ms("HIVE_P2P_OPEN_MS", 2_000) }
+/// Discovery-fallback connect budget — used ONLY when a dial against the peer's
+/// cached hint (its direct addrs / relay_url, as last gossiped — see `acquire`)
+/// fails or times out. Deliberately a SEPARATE, smaller budget than
+/// `connect_budget`: this second attempt strips the hint down to a bare
+/// `EndpointId` so iroh's configured Discovery/AddressLookup (n0 pkarr/DNS, or
+/// `HIVE_DISCOVERY_DNS`) gets a genuine shot at resolving a FRESH address. Per
+/// iroh's own `connect()` semantics, a `RelayUrl` present in the hint — even a
+/// stale/unreachable one — marks the address set "resolved" and Discovery is
+/// NEVER consulted automatically, so without this fallback a stale cached hint
+/// (typical for a peer only ever learned second/third-hand via gossip, never
+/// dialed directly) can wedge every future dial to that peer forever once its
+/// cross-cloud QUIC path flaps.
+fn discovery_budget() -> Duration { env_ms("HIVE_P2P_DISCOVERY_MS", 4_000) }
 /// First-byte / response-headers budget — post-send. Generous: the cell may be cold.
 fn firstbyte_budget() -> Duration { env_ms("HIVE_P2P_FIRSTBYTE_MS", 15_000) }
 /// Body inter-chunk IDLE budget — post-send. Not a wall-clock cap; reset per chunk
@@ -544,20 +557,31 @@ impl PeerPool {
         // A holepunch that never completes would otherwise hang here forever and —
         // since edge.rs walks candidates sequentially — block the whole queue.
         let addr: EndpointAddr = serde_json::from_str(addr_json)?;
+        let id = addr.id;
         let budget = connect_budget();
         let conn = match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(e.into()),
+            Ok(Err(e)) => {
+                // Hard connect error against the CACHED hint. This hint is very often a
+                // stale, never-refreshed snapshot learned second/third-hand via gossip
+                // (see `addr_json` — built once at the peer's own boot, no refresh setter
+                // exists) rather than something this node ever dialed directly. Don't
+                // give up on the peer yet: fall back to fresh discovery below. Log it —
+                // previously this branch discarded the error with zero tracing, which is
+                // exactly how the hk↔sj mesh-flap went unnoticed in production.
+                self.evict(node_id).await;
+                tracing::warn!(node_id, err = %e, "p2p connect error using cached hint; retrying via fresh discovery");
+                self.dial_fresh(node_id, id).await?
+            }
             Err(_) => {
-                // Pre-send timeout: nothing was sent. Strongest "peer dead" signal.
+                // Pre-send timeout against the cached hint: nothing was sent. Rather than
+                // declaring the peer dead outright (the old behavior), give discovery a
+                // real shot — the hint's direct addrs/relay may simply be stale, not the
+                // peer itself.
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
-                self.evict(node_id).await; // no trunk yet, but keep the invariant
-                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p connect timeout");
-                return Err(anyhow::Error::new(DeadPeerTimeout {
-                    node_id: node_id.to_string(),
-                    phase: "connect",
-                    budget_ms: budget.as_millis() as u64,
-                }));
+                self.evict(node_id).await; // stale trunk (if any) is definitely dead
+                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p connect timeout using cached hint; retrying via fresh discovery");
+                self.dial_fresh(node_id, id).await?
             }
         };
 
@@ -570,6 +594,38 @@ impl PeerPool {
         self.opened.fetch_add(1, Ordering::Relaxed);
         tracing::info!(node_id, "trunk opened");
         Ok(conn)
+    }
+
+    /// Fallback dial using ONLY the peer's `EndpointId` — no cached direct addrs,
+    /// no cached relay_url. This forces iroh's configured Discovery/AddressLookup
+    /// (n0 pkarr/DNS, or the self-hosted `HIVE_DISCOVERY_DNS` resolver) to resolve
+    /// the peer's CURRENT address rather than reusing whatever stale hint `acquire`
+    /// already tried and failed on. Called from `acquire` only after the
+    /// cached-hint attempt has already failed/timed out — see `discovery_budget`
+    /// for why iroh would otherwise never consult Discovery on its own here.
+    async fn dial_fresh(&self, node_id: &str, id: iroh::EndpointId) -> Result<Connection> {
+        let budget = discovery_budget();
+        match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await {
+            Ok(Ok(c)) => {
+                tracing::info!(node_id, "p2p connect recovered via fresh discovery (cached hint was stale)");
+                Ok(c)
+            }
+            Ok(Err(e)) => {
+                self.evict(node_id).await;
+                tracing::warn!(node_id, err = %e, "p2p connect error via fresh discovery (giving up)");
+                Err(e.into())
+            }
+            Err(_) => {
+                self.timeouts.bump(node_id, PHASE_CONNECT).await;
+                self.evict(node_id).await;
+                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p discovery-fallback connect timeout (giving up)");
+                Err(anyhow::Error::new(DeadPeerTimeout {
+                    node_id: node_id.to_string(),
+                    phase: "connect",
+                    budget_ms: budget.as_millis() as u64,
+                }))
+            }
+        }
     }
 
     /// Drop the cached trunk for a peer so the next request re-dials.
@@ -1102,6 +1158,102 @@ fn relay_map_from_env() -> Option<iroh::RelayMap> {
         return None;
     }
     Some(iroh::RelayMap::from_iter(urls))
+}
+
+/// Return `addr_json` (a serialized `EndpointAddr`) with its relay transport
+/// STEERED toward `relay_url` when given — used to hint a specific, freshly
+/// gossiped relay (e.g. the target peer's own relay, or the nearest live peer's)
+/// instead of dialing on whatever relay happened to be serialized into the
+/// cached hint at gossip time (which may be stale or simply absent). Direct
+/// socket addrs already present in `addr_json` are left untouched — only the
+/// relay transport entry is replaced. `relay_url: None` returns `addr_json`
+/// unchanged. Fails open: an unparseable `addr_json`/`relay_url` returns the
+/// original string unchanged rather than erroring — a bad hint must never break
+/// an otherwise-workable dial. Pure (no I/O), so it's directly unit-testable.
+///
+/// NOTE: this only STEERS which relay a per-connection dial prefers (via the
+/// `EndpointAddr` passed to `connect()`); the relay itself must ALSO be a member
+/// of the local endpoint's own live `RelayMap` (see [`RelaySet`]) for the hint to
+/// have a real transport to route through — see this crate's module-level
+/// research notes on `insert_relay`/`remove_relay` for why the two compose
+/// rather than substitute for each other.
+pub fn with_relay_hint(addr_json: &str, relay_url: Option<&str>) -> String {
+    let Some(relay_url) = relay_url else { return addr_json.to_string() };
+    let Ok(mut addr) = serde_json::from_str::<EndpointAddr>(addr_json) else {
+        return addr_json.to_string();
+    };
+    let Ok(url) = relay_url.parse::<iroh::RelayUrl>() else {
+        return addr_json.to_string();
+    };
+    addr.addrs.retain(|a| !matches!(a, iroh::TransportAddr::Relay(_)));
+    addr.addrs.insert(iroh::TransportAddr::Relay(url));
+    serde_json::to_string(&addr).unwrap_or_else(|_| addr_json.to_string())
+}
+
+/// Tracks the relay URL set THIS PROCESS has applied to a bound [`Endpoint`] via
+/// [`Endpoint::insert_relay`]/[`Endpoint::remove_relay`], so a periodic refresh can
+/// diff a newly-desired set against what's actually live and apply only the
+/// delta. iroh's `Endpoint` exposes no live "read back the current `RelayMap`"
+/// getter, so the applied set must be tracked by the caller — this is that
+/// tracker. Scoped to ONLY the URLs this tracker itself has inserted: it never
+/// touches whatever relay(s) the endpoint was bound with (env override / preset
+/// default), so [`sync`](RelaySet::sync) composes safely on top of bind-time
+/// config instead of fighting it.
+///
+/// Backed by [`Endpoint::insert_relay`]/`remove_relay` — a genuine LIVE update on
+/// an already-bound, already-running endpoint (no rebind required); iroh's own
+/// `test_endpoint_online_add_relay` proves a relay inserted this way is usable
+/// within ~1s.
+pub struct RelaySet {
+    ep: Endpoint,
+    applied: Mutex<std::collections::HashSet<iroh::RelayUrl>>,
+}
+
+impl RelaySet {
+    /// Wrap a bound endpoint. The tracked "applied" set starts empty — this
+    /// tracker only ever manages URLs it itself inserts via [`sync`](Self::sync),
+    /// never the endpoint's bind-time relay config.
+    pub fn new(ep: Endpoint) -> Arc<RelaySet> {
+        Arc::new(RelaySet { ep, applied: Mutex::new(std::collections::HashSet::new()) })
+    }
+
+    /// The URLs currently applied by THIS tracker (for diagnostics/tests).
+    pub async fn applied(&self) -> Vec<String> {
+        self.applied.lock().await.iter().map(|u| u.to_string()).collect()
+    }
+
+    /// Reconcile the endpoint's live relay map to exactly `desired` (parsed from
+    /// strings; unparseable entries are skipped, never panic on a bad gossiped
+    /// URL): `insert_relay` every newly-desired URL, `remove_relay` every URL
+    /// this tracker previously applied but no longer desires. URLs already
+    /// applied AND still desired are left untouched (no redundant
+    /// insert/network chatter). No-op (and doesn't touch the map at all) once
+    /// the endpoint is closed — `insert_relay`/`remove_relay` themselves are
+    /// no-ops on a closed endpoint, so this simply mirrors that.
+    pub async fn sync(&self, desired: impl IntoIterator<Item = String>) {
+        let desired: std::collections::HashSet<iroh::RelayUrl> = desired
+            .into_iter()
+            .filter_map(|s| match s.parse::<iroh::RelayUrl>() {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    tracing::warn!(url = %s, error = %e, "invalid relay URL in live relay set; skipped");
+                    None
+                }
+            })
+            .collect();
+        let mut applied = self.applied.lock().await;
+        let to_add: Vec<iroh::RelayUrl> = desired.difference(&applied).cloned().collect();
+        let to_remove: Vec<iroh::RelayUrl> = applied.difference(&desired).cloned().collect();
+        for url in to_add {
+            let cfg = Arc::new(iroh::RelayConfig::from(url.clone()));
+            self.ep.insert_relay(url.clone(), cfg).await;
+            applied.insert(url);
+        }
+        for url in to_remove {
+            self.ep.remove_relay(&url).await;
+            applied.remove(&url);
+        }
+    }
 }
 
 /// Load a persistent iroh secret key from `path`, or generate + save one (0600).

@@ -497,7 +497,9 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         .collect();
     for (id, addr) in peers {
         let path = format!("/v1/tls/bundle?name={bundle}");
-        if let Some(bytes) = crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &path, &[], 10).await {
+        // Bumped from 10s: give `PeerPool::acquire`'s fresh-discovery fallback room
+        // to resolve a stale/flapped hint instead of being cut off by this timeout.
+        if let Some(bytes) = crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &path, &[], 15).await {
             if bytes.is_empty() {
                 continue;
             }
