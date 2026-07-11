@@ -164,7 +164,8 @@ const clerk = clerkMiddleware(async (auth, req) => {
 // exists) predates Clerk switching to the native `NextResponse.next({
 // request: { headers } })` form for this. On Vercel's edge network that
 // same-URL rewrite is a no-op signal handled in-process. Under plain
-// `next start` on this Next.js 14.2.35 build (also the final 14.2.x release),
+// `next start` on the Next.js 14.2.35 build this was confirmed against (the final
+// 14.2.x release; the dashboard now runs Next 16, guard retained defensively),
 // an explicit rewrite whose target equals the incoming request's own URL
 // makes the server re-dispatch the request over the network instead of
 // continuing in-process — and the re-dispatched request gets decorated
@@ -193,10 +194,11 @@ function neutralizeClerkSelfRewrite(req: Request, res: Response): Response {
 // When bypassing, skip Clerk's middleware (and its dev-browser handshake) too,
 // but still apply cache headers. Next 16 renamed the `middleware` convention to
 // `proxy` (Node runtime only) — this file was `middleware.ts`; the named `proxy`
-// export is the new contract. The `neutralizeClerkSelfRewrite` workaround is now
-// a harmless no-op under @clerk/nextjs v7 (which emits the native
-// `NextResponse.next({ request: { headers } })` form, not the same-URL rewrite),
-// kept as a belt-and-braces guard.
+// export is the new contract. `neutralizeClerkSelfRewrite` is retained as a
+// defensive guard: this build pins @clerk/nextjs ^6.39.x (v7 was rejected because
+// it removed the `SignedIn`/`SignedOut` components this dashboard relies on). The
+// guard only rewrites when the response's `x-middleware-rewrite` target equals the
+// request URL, so it stays inert unless that exact same-URL self-rewrite reappears.
 export const proxy = bypass
   ? (req: Request & { nextUrl: { pathname: string } }) => withCache(req, NextResponse.next())
   : async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
