@@ -74,5 +74,5 @@ ensure() { # <label> <admin-port>
   launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
 }
 
-ensure dev.shadw.node-a 8786
-ensure dev.shadw.node-b 8788
+ensure dev.shadw.fc-lax 8786
+ensure dev.shadw.fc-lax2 8788

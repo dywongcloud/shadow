@@ -44,3 +44,5 @@ history).
   control-plane leader, not the node running the dashboard process — verify
   new admin endpoints through the real dashboard. Detail:
   `recall("ops-proxy-leader-forward")`.
+
+@.gm/next-step.md
