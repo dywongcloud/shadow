@@ -249,6 +249,141 @@ pub(crate) async fn upsert_billing(tenant: &str, account_json: &str, ledger_json
     }
 }
 
+// ---------------------------------------------------------------------------
+// Admin "view as PostgreSQL" browser — read-only introspection + query
+// ---------------------------------------------------------------------------
+
+/// Column shape for `known_tables()` — plain data, not tied to `guardian_db`'s
+/// own `SqlType` so the admin JSON response stays simple/stable.
+pub(crate) struct SqlColumnInfo {
+    pub name: &'static str,
+    pub ty: &'static str,
+}
+
+pub(crate) struct SqlTableInfo {
+    pub name: &'static str,
+    pub columns: Vec<SqlColumnInfo>,
+}
+
+/// The exact tables `init_schema()` creates. Hand-maintained rather than a
+/// live `information_schema` introspection query — this module owns both the
+/// schema and this list, they're already the single source of truth for each
+/// other, and a fixed list can't be tricked into enumerating anything this
+/// module didn't itself create.
+pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
+    let col = |name: &'static str, ty: &'static str| SqlColumnInfo { name, ty };
+    vec![
+        SqlTableInfo {
+            name: "project_teams",
+            columns: vec![col("project", "text"), col("team", "text"), col("root_dir", "text"), col("updated_ms", "bigint")],
+        },
+        SqlTableInfo {
+            name: "billing_accounts",
+            columns: vec![col("tenant", "text"), col("account_json", "text"), col("updated_ms", "bigint")],
+        },
+        SqlTableInfo {
+            name: "billing_ledger_snapshot",
+            columns: vec![col("tenant", "text"), col("ledger_json", "text"), col("updated_ms", "bigint")],
+        },
+        SqlTableInfo {
+            name: "billing_invoices_snapshot",
+            columns: vec![col("tenant", "text"), col("invoices_json", "text"), col("updated_ms", "bigint")],
+        },
+    ]
+}
+
+/// SQL keywords that would mutate state or schema — rejected anywhere in a
+/// query submitted through the read-only admin browser, not just as the
+/// first token (defends against `SELECT 1; DROP TABLE x` multi-statement
+/// injection and Postgres data-modifying CTEs like
+/// `WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x`). Matched as a
+/// whole token (split on any non-alphanumeric byte) so an ordinary column or
+/// table name that merely CONTAINS one of these words as a substring (e.g. a
+/// hypothetical `updated_by` column) is never a false-positive rejection.
+const BLOCKED_SQL_KEYWORDS: &[&str] =
+    &["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE", "REPLACE", "MERGE", "CALL", "EXEC", "EXECUTE", "COPY", "VACUUM"];
+
+/// `Err(reason)` if `sql` contains anything beyond a single read-only
+/// statement. This is the ONLY gate between an admin's typed input and a live
+/// `Session::execute` against real fleet-replicated tables — deliberately
+/// conservative (reject-by-default on anything ambiguous) since a false
+/// rejection just shows an error, while a false acceptance is a real data-loss
+/// path.
+fn reject_unless_readonly(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("empty query".into());
+    }
+    let upper = trimmed.to_uppercase();
+    let first_token = upper.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|s| !s.is_empty()).unwrap_or("");
+    if first_token != "SELECT" && first_token != "WITH" {
+        return Err("only SELECT (or a read-only WITH ... SELECT) is allowed here".into());
+    }
+    for tok in upper.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        if BLOCKED_SQL_KEYWORDS.contains(&tok) {
+            return Err(format!("'{tok}' is not allowed in this read-only query"));
+        }
+    }
+    // A semicolon anywhere but trailing whitespace at the very end means a
+    // second statement is present — reject rather than guess which one runs.
+    let body = trimmed.trim_end_matches(';').trim_end();
+    if body.contains(';') {
+        return Err("only a single statement is allowed".into());
+    }
+    Ok(())
+}
+
+fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
+    match v {
+        SqlValue::Null => serde_json::Value::Null,
+        SqlValue::Bool(b) => serde_json::Value::Bool(*b),
+        SqlValue::Int2(n) => serde_json::json!(n),
+        SqlValue::Int4(n) => serde_json::json!(n),
+        SqlValue::Int8(n) => serde_json::json!(n),
+        SqlValue::Float4(n) => serde_json::json!(n),
+        SqlValue::Float8(n) => serde_json::json!(n),
+        SqlValue::Text(s) => serde_json::Value::String(s.clone()),
+        other => {
+            // Numeric/Uuid/Date/Time/Timestamp(tz)/Json/Array/Bytea/etc: none of
+            // this module's own tables use these types today; stringify via
+            // accessor helpers where available, else Debug — always something
+            // legible in the admin UI rather than a serialization error.
+            if let Some(s) = other.as_str() {
+                serde_json::Value::String(s.to_string())
+            } else if let Some(n) = other.as_f64() {
+                serde_json::json!(n)
+            } else if let Some(b) = other.as_bool() {
+                serde_json::Value::Bool(b)
+            } else {
+                serde_json::Value::String(format!("{other:?}"))
+            }
+        }
+    }
+}
+
+/// Run an admin-submitted, already-validated read-only query against the
+/// relational mirror and shape the result as `{fields: [name...], rows:
+/// [[value...]]}` for the admin "view as PostgreSQL" browser. Callers MUST
+/// have already passed `sql` through `reject_unless_readonly` — this function
+/// re-checks it anyway (cheap, and a missing call site must never become a
+/// live mutation path).
+pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, String> {
+    reject_unless_readonly(sql)?;
+    let db = crate::guardian::sql_db().await.map_err(|e| format!("relational store unavailable: {e}"))?;
+    let mut s = session(db).await;
+    let results = s.execute(sql).await.map_err(|e| format!("{e}"))?;
+    for r in &results {
+        if let ExecResult::Rows { fields, rows } = r {
+            let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
+            let json_rows: Vec<Vec<serde_json::Value>> = rows.iter().map(|row| row.iter().map(sql_value_to_json).collect()).collect();
+            return Ok(serde_json::json!({ "fields": field_names, "rows": json_rows }));
+        }
+    }
+    // A read-only statement that legitimately returns zero result sets (rare,
+    // but not itself evidence of anything unsafe having run) — an empty grid.
+    Ok(serde_json::json!({ "fields": Vec::<String>::new(), "rows": Vec::<Vec<serde_json::Value>>::new() }))
+}
+
 /// Fleet-replicated billing read: `(account_json, ledger_json, invoices_json)`
 /// from THIS node's own local replica. `None` for any field never written
 /// here yet (not yet replicated, or genuinely no billing history) — callers

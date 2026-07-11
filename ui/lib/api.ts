@@ -192,6 +192,13 @@ const PATH_TTL: Array<[RegExp, number]> = [
   [/^\/v1\/cluster$/, 5_000], // leadership/epoch — changes at gossip cadence, not per-second
   [/^\/v1\/nodes$/, 5_000], // mesh membership — same cadence
   [/^\/v1\/anycast$/, 5_000],
+  // Admin Data Browser (collections/rows/namespaces + the Postgres/table view) —
+  // an operator clicking between collections or re-opening the page doesn't need
+  // a fresh network round trip every couple seconds; any edit made FROM this page
+  // still invalidates immediately (opsSend clears the whole cache on every write).
+  [/^\/v1\/admin\/data(\/.*)?$/, 15_000],
+  [/^\/v1\/admin\/namespaces$/, 15_000],
+  [/^\/v1\/admin\/sql\//, 15_000],
 ];
 function pathTtl(path: string): number {
   for (const [re, ttl] of PATH_TTL) if (re.test(path)) return ttl;

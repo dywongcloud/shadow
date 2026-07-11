@@ -183,6 +183,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/admin/data/:collection", get(data_rows).post(data_create))
         .route("/v1/admin/data/:collection/:id", put(data_patch).delete(data_delete))
         .route("/v1/admin/namespaces", get(data_namespaces))
+        .route("/v1/admin/sql/tables", get(sql_tables))
+        .route("/v1/admin/sql/query", post(sql_query))
         .route("/v1/admin/guardian", get(guardian_status))
         .route("/v1/identity/sync", post(identity_sync))
         // ---- Billing & compute credits ----
@@ -6319,6 +6321,53 @@ async fn data_delete(
     c.audit.record(&t, "user", "delete", &collection, &id, "");
     crate::persist::persist(&c);
     Ok(Json(json!({ "deleted": id })))
+}
+
+// ============================ Data Browser: "view as PostgreSQL" ============================
+// An alternative, READ-ONLY view of the relational mirror built on guardian-db's
+// native SQL layer (crates/hive-cloud/src/relational.rs) — real typed tables
+// (project_teams, billing_*) instead of the document-collection JSON browsing
+// above. Deliberately a separate, narrower surface: no PUT/POST/DELETE here at
+// all (see relational::reject_unless_readonly) — mutations to this data still
+// only ever happen through the normal typed stores (ProjectStore/BillingStore),
+// never through this admin query box.
+
+/// List the known relational tables + their columns.
+async fn sql_tables(claims: Option<axum::Extension<crate::auth::Claims>>) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let tables: Vec<Value> = crate::relational::known_tables()
+        .into_iter()
+        .map(|t| json!({ "name": t.name, "columns": t.columns.into_iter().map(|c| json!({ "name": c.name, "type": c.ty })).collect::<Vec<_>>() }))
+        .collect();
+    Ok(Json(json!({ "tables": tables })))
+}
+
+#[derive(Deserialize)]
+struct SqlQueryBody {
+    sql: Option<String>,
+    table: Option<String>,
+}
+
+/// Run a read-only query against the relational mirror: either a caller-typed
+/// `sql` (SELECT/read-only WITH only — enforced in relational.rs, not just
+/// here), or a `table` name for the default `SELECT * FROM <table> LIMIT 200`
+/// the table-browser view uses. Exactly one of the two is expected.
+async fn sql_query(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(body): Json<SqlQueryBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let sql = match (body.sql.as_deref().map(str::trim), body.table.as_deref().map(str::trim)) {
+        (Some(s), _) if !s.is_empty() => s.to_string(),
+        (_, Some(t)) if !t.is_empty() => {
+            if !crate::relational::known_tables().iter().any(|k| k.name == t) {
+                return Err((StatusCode::BAD_REQUEST, format!("unknown table '{t}'")));
+            }
+            format!("SELECT * FROM {t} LIMIT 200")
+        }
+        _ => return Err((StatusCode::BAD_REQUEST, "provide 'sql' or 'table'".into())),
+    };
+    crate::relational::run_readonly_query(&sql).await.map(Json).map_err(|e| (StatusCode::BAD_REQUEST, e))
 }
 
 // ============================ Deployment preview / thumbnail ============================
