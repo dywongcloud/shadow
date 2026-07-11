@@ -20,3 +20,11 @@ converging a real fleet divergence.
 Found and fixed a live plaintext-secret leak (a real GitHub PAT served
 unmasked via project settings) with a credential-shape auto-detector, and
 cleaned up 3 abandoned duplicate Simpfi projects.
+
+## a29c4f1 — Docs + a one-time fleet-wide sweep for existing leaked secrets
+
+Ran the new credential-shape detector as a one-time backfill across every
+project on every live node (not just future writes) and found two more real,
+already-exposed OpenAI API keys (`fatni`, `shoomoo`) beyond the original
+GitHub PAT — resealed all of them; a follow-up re-scan confirmed zero
+credential-shaped values remain stored as non-sensitive fleet-wide.
