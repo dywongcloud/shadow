@@ -444,6 +444,50 @@ Background reading: Alex Ellis,
 ["How to run Firecracker without KVM on regular cloud VMs"](https://blog.alexellis.io/how-to-run-firecracker-without-kvm-on-regular-cloud-vms/),
 and the [PVM Firecracker fork](https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm).
 
+## Multi-node data & mesh networking
+
+Every `hived` instance runs a real, gossiped iroh-QUIC mesh (`hive-p2p`), plus an
+embedded [GuardianDB](https://github.com/wmaslonek/guardian-db) node (vendored at
+`vendor/guardian-db`, patched for self-hosted relays) for tenant/control-plane
+state — projects, teams, billing, domains.
+
+**Relational data (`crates/hive-cloud/src/relational.rs`).** Rare-write, needs-
+fleet-consistent-reads state (project→team ownership, billing account/ledger/
+invoices) is mirrored into GuardianDB's native SQL layer (`guardian_db::sql`,
+built on `iroh-docs` range-reconciliation) via a plain relational schema —
+writes dual-write best-effort alongside the existing in-memory store; reads
+prefer the relational mirror, falling back to local state. High-frequency
+per-request metrics are deliberately NOT put through this path — they're
+fanned out live on read instead (`GET /v1/metrics`, no `local=true`) since a
+replicated write-path for every request would be far too hot.
+
+**Per-node relay.** Every node embeds its own `iroh-relay` listener
+(`--relay-port`, default 3341; `HIVE_OWN_RELAY_PORT` env override) and
+gossips its URL as part of its `NodeInfo`. When dialing a peer, the relay
+actually used is chosen by `hive-edge`'s `select_relay_hint`: the target's
+own relay first, else the geographically-nearest peer's relay, else the
+central `relay.shadw.cloud` backstop — closing the class of bug where a
+node with no relay of its own (and a stale cached connect hint) could never
+reach a peer across a NAT/firewall boundary. This is additive to, not a
+replacement for, the standalone TLS+QUIC-capable `iroh-relay` processes a
+few nodes run today (the embedded listener is plain HTTP only for now).
+
+**Guardian-db anti-entropy.** Every node runs a periodic loop
+(`HIVE_ANTI_ENTROPY_INTERVAL_SECS`, default 60s): pick one random healthy
+peer, exchange per-key content-hash "heads" over `GET /v1/guardian/heads`,
+and for any namespace whose heads differ, trigger a targeted
+`iroh_docs::Doc::start_sync` reconciliation against that peer (not a full
+resync) — the CRDT equivalent of Dynamo-style read-repair. Convergence and
+divergence are both logged (`"synced N missing entries from peer X"` /
+`"heads already match"`) at `info`/`debug` level under the `hive_cloud`
+target.
+
+**Env-var secret detection.** `ProjectStore::put_env` auto-detects common
+credential shapes (GitHub/AWS/Stripe/npm/Slack/Google/Anthropic/OpenAI
+token prefixes, PEM blocks, JWTs) in a value and forces `sensitive: true`
+regardless of the caller's flag, so a user forgetting to check "Sensitive"
+can't leak a real token in plaintext through the settings/gitops read paths.
+
 ## hived flags
 
 ```
