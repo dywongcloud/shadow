@@ -76,7 +76,7 @@ ticks write nothing. Fleet-rolled and live-verified: billing_accounts
 4 → 23 rows, real teams/members/deployment rows replicated cross-node,
 existing tables and the SELECT-only guard unchanged.
 
-## (next) — Watchdog: persistent KeepAlive loop; launchd pended-spawn root cause
+## a2af203 — Watchdog: persistent KeepAlive loop; launchd pended-spawn root cause
 
 fc-lax2 crashed again (same upstream `noq` abort) and sat down because the
 watchdog LaunchAgent had never fired: launchd on this long-uptime gui domain
