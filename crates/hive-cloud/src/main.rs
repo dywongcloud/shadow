@@ -692,6 +692,10 @@ async fn main() -> anyhow::Result<()> {
     // `HIVE_BILLING_COORDINATOR_NODE` remains as an explicit manual PIN override.
     spawn_billing_meter_loop(cloud.clone());
 
+    // Relational mirror: teams/members/deployments + full billing backfill into
+    // the fleet-replicated SQL view (see spawn_relational_mirror_loop's doc).
+    spawn_relational_mirror_loop(cloud.clone());
+
     // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
     // World interface -- no external queue dependency).
     tokio::spawn(crate::world_queue::run_delivery_loop(cloud.clone(), cloud.world_queue.clone()));
@@ -2180,6 +2184,90 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
             }
         }
     }
+}
+
+/// Relational mirror loop — keeps the admin "view as PostgreSQL" browser's
+/// teams / team_members / deployments tables (and a FULL billing_accounts
+/// backfill) populated from live store snapshots. The metering loop's
+/// `upsert_billing` only fires for tenants with active usage THIS tick, so an
+/// account that exists but isn't currently metered would otherwise never
+/// appear in the mirror (the live-witnessed missing-billing-accounts gap:
+/// simpfi/thoth-division had project_teams rows but no billing_accounts row).
+///
+/// Write discipline, per section:
+/// - teams/members + billing backfill: control-plane-leader ONLY (the node
+///   where every admin mutation lands, so its stores are authoritative) —
+///   same single-writer rule as `upsert_billing`'s metering site. The billing
+///   manual pin (`HIVE_BILLING_COORDINATOR_NODE`) is honored for the billing
+///   section so both billing writers always sit on the same node.
+/// - deployments: EVERY node syncs only its OWN `gw.list()` rows (single
+///   writer per row by construction — see `relational::sync_deployments`).
+///
+/// A content hash per section skips ticks with no change, so a quiet fleet
+/// writes nothing (no CRDT doc churn — same debounce discipline as the
+/// guardian mesh/roster replication). Best-effort throughout: these tables
+/// feed ONLY the read-only admin browser, never control-plane logic.
+/// Config: `HIVE_RELATIONAL_MIRROR_SECS` (s, def 60).
+fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_RELATIONAL_MIRROR_SECS", 60));
+    tracing::info!(?interval, "relational mirror loop (teams/members/deployments + billing backfill → SQL view)");
+    tokio::spawn(async move {
+        let hash_of = |s: &str| {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut h);
+            h.finish()
+        };
+        let mut tick = tokio::time::interval(interval);
+        let (mut teams_hash, mut billing_hash, mut deps_hash) = (0u64, 0u64, 0u64);
+        let billing_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        loop {
+            tick.tick().await;
+            // Deployments: every node, own rows only.
+            let deps = cloud.gw.list();
+            if let Ok(json) = serde_json::to_string(&deps) {
+                let h = hash_of(&json);
+                if h != deps_hash {
+                    relational::sync_deployments(&cloud.node_name, &deps).await;
+                    deps_hash = h;
+                }
+            }
+            let isolated = cloud.mesh_health().isolated;
+            let cp_leader = cloud.control_plane_leader() == cloud.node_name && !isolated;
+            if cp_leader {
+                let teams = cloud.teams.list();
+                if let Ok(json) = serde_json::to_string(&teams) {
+                    let h = hash_of(&json);
+                    if h != teams_hash {
+                        relational::sync_teams(&teams).await;
+                        teams_hash = h;
+                    }
+                }
+            }
+            let billing_authority = match &billing_pin {
+                Some(pin) => pin == &cloud.node_name && !isolated,
+                None => cp_leader,
+            };
+            if billing_authority {
+                let (accounts, _) = cloud.billing.snapshot();
+                if let Ok(json) = serde_json::to_string(&accounts) {
+                    let h = hash_of(&json);
+                    if h != billing_hash {
+                        for acc in &accounts {
+                            let acc_json = serde_json::to_string(acc).unwrap_or_default();
+                            let ledger_json = serde_json::to_string(&cloud.billing.ledger(&acc.tenant)).unwrap_or_default();
+                            let invoices_json = serde_json::to_string(&cloud.billing.invoices(&acc.tenant)).unwrap_or_default();
+                            relational::upsert_billing(&acc.tenant, &acc_json, &ledger_json, &invoices_json).await;
+                        }
+                        billing_hash = h;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Billing meter loop — the metering→billing pipeline. On a fixed interval it pulls

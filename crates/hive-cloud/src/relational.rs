@@ -70,6 +70,37 @@ pub(crate) async fn init_schema() {
             invoices_json TEXT NOT NULL, \
             updated_ms BIGINT NOT NULL\
         )",
+        "CREATE TABLE IF NOT EXISTS teams (\
+            slug TEXT PRIMARY KEY, \
+            name TEXT NOT NULL, \
+            plan TEXT NOT NULL, \
+            member_count BIGINT NOT NULL, \
+            sso_enabled BIGINT NOT NULL, \
+            created_ms BIGINT NOT NULL, \
+            updated_ms BIGINT NOT NULL\
+        )",
+        "CREATE TABLE IF NOT EXISTS team_members (\
+            id TEXT PRIMARY KEY, \
+            team TEXT NOT NULL, \
+            email TEXT NOT NULL, \
+            name TEXT NOT NULL DEFAULT '', \
+            role TEXT NOT NULL, \
+            added_ms BIGINT NOT NULL, \
+            updated_ms BIGINT NOT NULL\
+        )",
+        "CREATE TABLE IF NOT EXISTS deployments (\
+            id TEXT PRIMARY KEY, \
+            project TEXT NOT NULL, \
+            team TEXT NOT NULL, \
+            node TEXT NOT NULL, \
+            alias TEXT NOT NULL DEFAULT '', \
+            kind TEXT NOT NULL DEFAULT '', \
+            target TEXT NOT NULL DEFAULT '', \
+            state TEXT NOT NULL DEFAULT '', \
+            production BIGINT NOT NULL, \
+            created_at_ms BIGINT NOT NULL, \
+            updated_ms BIGINT NOT NULL\
+        )",
     ] {
         if let Err(e) = session.execute(ddl).await {
             tracing::warn!(error = %e, ddl, "relational: schema bring-up statement failed");
@@ -250,6 +281,146 @@ pub(crate) async fn upsert_billing(tenant: &str, account_json: &str, ledger_json
 }
 
 // ---------------------------------------------------------------------------
+// Teams / members / deployments (populated by main.rs's relational mirror
+// loop — see spawn_relational_mirror_loop). VIEW-ONLY tables: nothing in the
+// control plane reads them back for logic; they exist solely so the admin
+// "view as PostgreSQL" browser shows real fleet data. Same best-effort,
+// never-blocks-the-real-mutation convention as everything else here.
+// ---------------------------------------------------------------------------
+
+/// Every value of the first column across all result sets (used to diff the
+/// mirror's current rows against a fresh snapshot for stale-row deletion).
+fn all_text_firsts(res: &[ExecResult]) -> Vec<String> {
+    let mut out = Vec::new();
+    for r in res {
+        if let ExecResult::Rows { rows, .. } = r {
+            for row in rows {
+                if let Some(SqlValue::Text(s)) = row.first() {
+                    out.push(s.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Full-snapshot sync of the `teams` + `team_members` tables. Caller gates on
+/// being the control-plane leader (the single node where every admin mutation
+/// lands, so its `TeamStore` is the authoritative copy) — same single-writer
+/// discipline as `upsert_billing`. Upserts every current team/member, then
+/// deletes rows whose team/member no longer exists in the snapshot.
+pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
+    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let now = hive_core::now_ms();
+    let mut s = session(db).await;
+    for t in teams {
+        let query = format!(
+            "INSERT INTO teams (slug, name, plan, member_count, sso_enabled, created_ms, updated_ms) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (slug) DO UPDATE SET name = excluded.name, plan = excluded.plan, \
+             member_count = excluded.member_count, sso_enabled = excluded.sso_enabled, \
+             created_ms = excluded.created_ms, updated_ms = excluded.updated_ms",
+            q(&t.slug),
+            q(&t.name),
+            q(&t.plan),
+            t.members.len(),
+            if t.sso_enabled { 1 } else { 0 },
+            t.created_ms,
+            now,
+        );
+        if let Err(e) = s.execute(&query).await {
+            tracing::debug!(team = %t.slug, error = %e, "relational: sync_teams upsert failed (non-fatal)");
+        }
+        for m in &t.members {
+            let id = format!("{}/{}", t.slug, m.email.to_lowercase());
+            let role = serde_json::to_string(&m.role).unwrap_or_default().trim_matches('"').to_string();
+            let mq = format!(
+                "INSERT INTO team_members (id, team, email, name, role, added_ms, updated_ms) \
+                 VALUES ({}, {}, {}, {}, {}, {}, {}) \
+                 ON CONFLICT (id) DO UPDATE SET name = excluded.name, role = excluded.role, \
+                 added_ms = excluded.added_ms, updated_ms = excluded.updated_ms",
+                q(&id),
+                q(&t.slug),
+                q(&m.email),
+                q(&m.name),
+                q(&role),
+                m.added_ms,
+                now,
+            );
+            if let Err(e) = s.execute(&mq).await {
+                tracing::debug!(member = %id, error = %e, "relational: sync_teams member upsert failed (non-fatal)");
+            }
+        }
+    }
+    // Remove teams/members that vanished from the snapshot (team deleted,
+    // member removed) so the mirror never shows ghosts forever.
+    let live_teams: std::collections::HashSet<String> = teams.iter().map(|t| t.slug.clone()).collect();
+    let live_members: std::collections::HashSet<String> =
+        teams.iter().flat_map(|t| t.members.iter().map(move |m| format!("{}/{}", t.slug, m.email.to_lowercase()))).collect();
+    if let Ok(res) = s.execute("SELECT slug FROM teams").await {
+        for slug in all_text_firsts(&res) {
+            if !live_teams.contains(&slug) {
+                let _ = s.execute(&format!("DELETE FROM teams WHERE slug = {}", q(&slug))).await;
+            }
+        }
+    }
+    if let Ok(res) = s.execute("SELECT id FROM team_members").await {
+        for id in all_text_firsts(&res) {
+            if !live_members.contains(&id) {
+                let _ = s.execute(&format!("DELETE FROM team_members WHERE id = {}", q(&id))).await;
+            }
+        }
+    }
+}
+
+/// Sync THIS node's own deployments into the `deployments` table. Every node
+/// writes ONLY rows whose `node` column is itself and deletes only its own
+/// stale rows — a single writer per row by construction, so a fleet-wide
+/// multi-node sync converges without conflicts (a relocated deployment's row
+/// moves to the new host on its next tick via the id-keyed upsert).
+pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentInfo]) {
+    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let now = hive_core::now_ms();
+    let mut s = session(db).await;
+    for d in deps {
+        let state = serde_json::to_string(&d.state).unwrap_or_default().trim_matches('"').to_string();
+        let team = if d.tenant.is_empty() { "personal" } else { d.tenant.as_str() };
+        let query = format!(
+            "INSERT INTO deployments (id, project, team, node, alias, kind, target, state, production, created_at_ms, updated_ms) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
+             ON CONFLICT (id) DO UPDATE SET project = excluded.project, team = excluded.team, \
+             node = excluded.node, alias = excluded.alias, kind = excluded.kind, target = excluded.target, \
+             state = excluded.state, production = excluded.production, \
+             created_at_ms = excluded.created_at_ms, updated_ms = excluded.updated_ms",
+            q(&d.id.to_string()),
+            q(&d.project),
+            q(team),
+            q(node),
+            q(&d.alias),
+            q(&d.kind),
+            q(&d.target),
+            q(&state),
+            if d.production { 1 } else { 0 },
+            d.created_at_ms,
+            now,
+        );
+        if let Err(e) = s.execute(&query).await {
+            tracing::debug!(deployment = %d.id, error = %e, "relational: sync_deployments upsert failed (non-fatal)");
+        }
+    }
+    // Delete only THIS node's rows for deployments it no longer hosts.
+    let live: std::collections::HashSet<String> = deps.iter().map(|d| d.id.to_string()).collect();
+    let sel = format!("SELECT id FROM deployments WHERE node = {}", q(node));
+    if let Ok(res) = s.execute(&sel).await {
+        for id in all_text_firsts(&res) {
+            if !live.contains(&id) {
+                let _ = s.execute(&format!("DELETE FROM deployments WHERE id = {}", q(&id))).await;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Admin "view as PostgreSQL" browser — read-only introspection + query
 // ---------------------------------------------------------------------------
 
@@ -288,6 +459,46 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
         SqlTableInfo {
             name: "billing_invoices_snapshot",
             columns: vec![col("tenant", "text"), col("invoices_json", "text"), col("updated_ms", "bigint")],
+        },
+        SqlTableInfo {
+            name: "teams",
+            columns: vec![
+                col("slug", "text"),
+                col("name", "text"),
+                col("plan", "text"),
+                col("member_count", "bigint"),
+                col("sso_enabled", "bigint"),
+                col("created_ms", "bigint"),
+                col("updated_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "team_members",
+            columns: vec![
+                col("id", "text"),
+                col("team", "text"),
+                col("email", "text"),
+                col("name", "text"),
+                col("role", "text"),
+                col("added_ms", "bigint"),
+                col("updated_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "deployments",
+            columns: vec![
+                col("id", "text"),
+                col("project", "text"),
+                col("team", "text"),
+                col("node", "text"),
+                col("alias", "text"),
+                col("kind", "text"),
+                col("target", "text"),
+                col("state", "text"),
+                col("production", "bigint"),
+                col("created_at_ms", "bigint"),
+                col("updated_ms", "bigint"),
+            ],
         },
     ]
 }
