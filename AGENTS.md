@@ -44,5 +44,9 @@ history).
   control-plane leader, not the node running the dashboard process — verify
   new admin endpoints through the real dashboard. Detail:
   `recall("ops-proxy-leader-forward")`.
+- `scripts/shadw-watchdog.sh`'s `ensure()` targets must track the current
+  local-Mac launchd job labels (`dev.shadw.fc-lax`/`dev.shadw.fc-lax2`), not
+  stale pre-rename ones — a mismatch makes the KeepAlive backstop silently
+  no-op. Detail: `recall("fc-lax2-watchdog-incident")`.
 
 @.gm/next-step.md

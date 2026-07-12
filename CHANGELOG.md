@@ -40,3 +40,13 @@ dashboard including the guardrail actually being exercised via the UI's own
 query box. Along the way, confirmed the dashboard's `/ops` proxy forwards to
 the current control-plane leader regardless of which node runs the
 dashboard process — a new admin endpoint needs the leader deployed first.
+
+## 41459ad — Fix stale launchd labels in shadw-watchdog.sh
+
+The KeepAlive-backstop watchdog (`dev.shadw.watchdog`) still targeted the
+pre-rename labels `dev.shadw.node-a`/`dev.shadw.node-b`, so every 30s tick
+silently no-op'd after the local nodes were renamed to
+`dev.shadw.fc-lax`/`dev.shadw.fc-lax2` — letting fc-lax2 sit crashed (a
+third-party `noq`/`noq-proto` panic-in-destructor abort) for 9h13m despite
+launchd `KeepAlive=true`. Updated the watchdog's targets to the current
+labels; verified live.
