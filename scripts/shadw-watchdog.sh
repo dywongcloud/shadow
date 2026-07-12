@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 # Watchdog for the shadw node daemons: ensures each installed node answers on its
-# admin /healthz; restarts ONLY a node that is genuinely down/wedged. Run
-# periodically by the dev.shadw.watchdog LaunchAgent (StartInterval). Backstops
-# launchd KeepAlive (which won't respawn reliably in some launchd domains).
+# admin /healthz; restarts ONLY a node that is genuinely down/wedged. Runs as a
+# PERSISTENT loop under the dev.shadw.watchdog LaunchAgent (KeepAlive daemon,
+# WATCHDOG_LOOP=1 in the plist) — NOT StartInterval, which was live-witnessed
+# silently never firing on this launchd domain (runs=0 across minutes even
+# after a fresh bootout+bootstrap, while fc-lax2 sat crashed). A KeepAlive'd
+# forever-loop only needs launchd to restart a dead process, which it does
+# reliably. Manual invocations (no WATCHDOG_LOOP) run a single pass and exit.
+# Backstops the node agents' own launchd KeepAlive (which won't respawn
+# reliably in some launchd domains either — same failure family).
 #
 # DO NOT FLAP THE BACKEND. A single slow /healthz — a GC pause, a busy keep-warm
 # tick, or a node still warming up right after a restart — must NEVER cause a
@@ -74,5 +80,17 @@ ensure() { # <label> <admin-port>
   launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
 }
 
-ensure dev.shadw.fc-lax 8786
-ensure dev.shadw.fc-lax2 8788
+run_checks() {
+  ensure dev.shadw.fc-lax 8786
+  ensure dev.shadw.fc-lax2 8788
+}
+
+if [ "${WATCHDOG_LOOP:-}" = "1" ]; then
+  echo "$(date '+%H:%M:%S') watchdog loop up (pid $$, every 30s)"
+  while true; do
+    run_checks
+    sleep 30
+  done
+else
+  run_checks
+fi

@@ -75,3 +75,16 @@ leader, own-deployments from every node, content-hash-debounced so quiet
 ticks write nothing. Fleet-rolled and live-verified: billing_accounts
 4 → 23 rows, real teams/members/deployment rows replicated cross-node,
 existing tables and the SELECT-only guard unchanged.
+
+## (next) — Watchdog: persistent KeepAlive loop; launchd pended-spawn root cause
+
+fc-lax2 crashed again (same upstream `noq` abort) and sat down because the
+watchdog LaunchAgent had never fired: launchd on this long-uptime gui domain
+reports `pended nondemand spawn = speculative` and indefinitely defers
+StartInterval/RunAtLoad spawns — only demand spawns (`kickstart`) run.
+Converted the watchdog to a persistent self-looping KeepAlive daemon
+(`WATCHDOG_LOOP=1`), re-bootstrapped, and adversarially verified: SIGABRT'd
+fc-lax2 and watched the watchdog restore it autonomously in under a minute.
+Separately, fc-virginia and fc-virginia-2 are userspace-frozen (ICMP alive,
+all service ports dead from every vantage incl. VPC-internal) and need a
+Tencent-console reboot — out of reach from this session.
