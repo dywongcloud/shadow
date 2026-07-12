@@ -50,3 +50,16 @@ silently no-op'd after the local nodes were renamed to
 third-party `noq`/`noq-proto` panic-in-destructor abort) for 9h13m despite
 launchd `KeepAlive=true`. Updated the watchdog's targets to the current
 labels; verified live.
+
+## 166ea99 — Fix stale fleet dashboard + a stale va binary; add scripts/deploy-ui-fleet.sh
+
+The Data Browser's Tables (PostgreSQL) view (c2bbfce) was invisible on the
+real https://shadw.cloud because that rollout updated only the backend
+binary, never the ui/ dashboard (systemd `hive-ui.service`) — every public
+node kept serving a pre-feature build. Separately, va was serving a stale
+`hive-cloud` binary that predated the SQL routes entirely (a prior rebuild
+was never swapped into its live path). Rebuilt+restarted the dashboard on
+all 6 public nodes and swapped in va's correct binary; live-verified via
+the compiled bundle, the backend routes, and a real browser hit against
+shadw.cloud. Adds `scripts/deploy-ui-fleet.sh` so this doesn't regress
+silently again.

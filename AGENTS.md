@@ -48,5 +48,9 @@ history).
   local-Mac launchd job labels (`dev.shadw.fc-lax`/`dev.shadw.fc-lax2`), not
   stale pre-rename ones — a mismatch makes the KeepAlive backstop silently
   no-op. Detail: `recall("fc-lax2-watchdog-incident")`.
+- The backend (`hive-cloud`, systemd `hive-node`) and the dashboard (`ui/`,
+  systemd `hive-ui`) are deployed independently — a backend-only fleet
+  rollout does NOT ship a `ui/` change. Use `scripts/deploy-ui-fleet.sh`
+  for any `ui/`-touching change. Detail: `recall("ui-deploy-gap-incident")`.
 
 @.gm/next-step.md
