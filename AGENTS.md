@@ -6,7 +6,8 @@ history).
 
 ## Data model
 
-- Relational mirror on GuardianDB for `ProjectStore`/`BillingStore`; hot-path
+- Relational mirror on GuardianDB: 7 tables (projects/billing + view-only
+  teams/members/deployments via `spawn_relational_mirror_loop`); hot-path
   `MetricsStore` deliberately excluded; `refresh()`-before-read requirement.
   Detail: `recall("relational-scope")` / `crates/hive-cloud/src/relational.rs`.
 - Admin SQL/tables view (`GET/POST /v1/admin/sql/*`) must stay read-only;

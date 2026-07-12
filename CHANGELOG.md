@@ -63,3 +63,15 @@ all 6 public nodes and swapped in va's correct binary; live-verified via
 the compiled bundle, the backend routes, and a real browser hit against
 shadw.cloud. Adds `scripts/deploy-ui-fleet.sh` so this doesn't regress
 silently again.
+
+## f6c9798 — Add teams/team_members/deployments to the admin SQL view + full billing backfill
+
+The SQL (PostgreSQL) view was missing whole surfaces: no teams, users
+(team_members), or deployments tables, and `billing_accounts` only held
+tenants actively metered on a tick (4 rows while 20+ tenants existed).
+Adds three view-only tables plus `spawn_relational_mirror_loop` — teams,
+members, and a FULL billing snapshot backfill sync from the control-plane
+leader, own-deployments from every node, content-hash-debounced so quiet
+ticks write nothing. Fleet-rolled and live-verified: billing_accounts
+4 → 23 rows, real teams/members/deployment rows replicated cross-node,
+existing tables and the SELECT-only guard unchanged.
