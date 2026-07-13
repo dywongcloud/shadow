@@ -26,30 +26,54 @@
       - tar
       - unzip
       - podman
-      - firewalld
       - policycoreutils-python-utils   # semanage, for podman/SELinux interplay
       - jq
     state: present
 
-- name: Ensure firewalld is running
+# The fleet's SOLE firewall is scripts/hive-lockdown.sh's own iptables/nft
+# chain (see that script's header) -- `firewalld` must be disabled+masked,
+# never enabled. It runs an independent netfilter layer whose restrictive
+# default zone (80/443/ssh only) silently blocks ports hive-lockdown.sh
+# explicitly allows for peers. Live-witnessed on fc-sanjose-2: a fresh
+# Rocky 10 image ships firewalld ACTIVE by default, which blocked the
+# relay/discovery ports from every other fleet node until disabled here --
+# the confirmed fleet convention (sj/bkk/va) is firewalld inactive+disabled.
+- name: Disable + mask firewalld (hive-lockdown.sh is the sole firewall)
   ansible.builtin.systemd:
     name: firewalld
-    state: started
-    enabled: true
+    state: stopped
+    enabled: false
+    masked: true
+  failed_when: false   # some images (e.g. bkk's TencentOS) never had it installed at all
 
-- name: Open 80/443 (public ingress) and podman/hive data dirs
-  ansible.posix.firewalld:
-    port: "{{ item }}"
-    permanent: true
-    immediate: true
-    state: enabled
-  loop:
-    - "80/tcp"
-    - "443/tcp"
-  # Deliberately NOT opening 8786 (admin) or 8787 (mesh/serve) publicly --
-  # the fleet's own hive-lockdown.sh convention keeps those loopback/tunnel-
-  # only. See roles/mesh_bootstrap for how nodes reach each other's admin
-  # ports without a public listener.
+- name: Install hive-lockdown.sh (canonical source, not hand-copied per node)
+  ansible.builtin.copy:
+    src: hive-lockdown.sh
+    dest: /usr/local/sbin/hive-lockdown.sh
+    mode: "0755"
+
+- name: Install hive-lockdown.service
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hive-lockdown.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Hive node public-port lockdown (block 8787/9090/etc from the internet)
+      After=network-online.target
+      Wants=network-online.target
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/local/sbin/hive-lockdown.sh
+      RemainAfterExit=yes
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Enable + run hive-lockdown now
+  ansible.builtin.systemd:
+    name: hive-lockdown
+    state: restarted
+    enabled: true
+    daemon_reload: true
 
 - name: Create hive data + run directories
   ansible.builtin.file:

@@ -26,6 +26,7 @@ DEFAULT_HOSTS=(
   43.152.247.70    # fc-bangkok
   43.166.206.175   # fc-virginia
   43.172.25.45     # fc-virginia-3
+  43.173.78.95     # fc-sanjose-2
 )
 HOSTS=("${@:-${DEFAULT_HOSTS[@]}}")
 

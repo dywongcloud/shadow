@@ -10,15 +10,19 @@
 
 - import_tasks: 30-host-kernel.yml
   tags: [host_kernel]
+  when: not (pvm_already_provisioned | default(false))
 
 - import_tasks: 40-guest-kernel.yml
   tags: [guest_kernel]
+  when: not (pvm_already_provisioned | default(false))
 
 - import_tasks: 50-rootfs.yml
   tags: [rootfs]
+  when: not (pvm_already_provisioned | default(false))
 
 - import_tasks: 60-boot.yml
   tags: [boot]
+  when: not (pvm_already_provisioned | default(false))
 
 - import_tasks: 70-smoke-test.yml
   tags: [smoke_test]

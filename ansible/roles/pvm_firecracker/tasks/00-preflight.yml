@@ -49,6 +49,32 @@
     msg: "Note: /dev/kvm already exists; this host may have real KVM and not need PVM."
   when: _preexisting_kvm.stat.exists
 
+- name: Read the currently running kernel release
+  ansible.builtin.command: uname -r
+  register: _running_kernel
+  changed_when: false
+
+# Idempotency guard: a re-run of this role on a host that ALREADY booted a
+# PVM-built kernel (running release ends in the host_localversion suffix,
+# e.g. "-pvm") must never re-attempt the host/guest kernel build. Doing so
+# is unsafe, not just wasteful: /boot/config-$(uname -r) at that point reads
+# back the ALREADY-PVM-PATCHED kernel's own config (self-referential), which
+# live-broke on fc-sanjose-2's idempotency test (pvm_para.h C90/u64 compile
+# errors during a re-configure) -- the correct config source (the plain
+# distro kernel's config) only exists BEFORE the first PVM boot. Once
+# `/dev/kvm` is confirmed present under an already-`-pvm` release, this node
+# is fully provisioned; 30/40/50/60 become no-ops.
+- name: Set pvm_already_provisioned fact
+  ansible.builtin.set_fact:
+    # Substring, not endswith: a dirty/untagged kernel tree build appends a
+    # trailing "+" (e.g. "6.12.33-pvm+"), which endswith("-pvm") would miss.
+    pvm_already_provisioned: "{{ _preexisting_kvm.stat.exists and host_localversion in _running_kernel.stdout }}"
+
+- name: Note PVM is already provisioned (skipping build/install/reboot)
+  ansible.builtin.debug:
+    msg: "Running kernel '{{ _running_kernel.stdout }}' already carries PVM and /dev/kvm is present -- skipping the host/guest kernel build entirely (safe re-run)."
+  when: pvm_already_provisioned
+
 - name: Ensure working directories exist
   ansible.builtin.file:
     path: "{{ item }}"
