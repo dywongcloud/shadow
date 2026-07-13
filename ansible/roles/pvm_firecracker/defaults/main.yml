@@ -7,15 +7,20 @@
 firecracker_repo: "https://github.com/DecOperations/firecracker-next"
 firecracker_version: "main"
 
-# PVM host + guest kernel source: a patch series on top of the SAME
-# virt-pvm/linux pvm-612 (Linux 6.12.33) base that converts PVM's hard
-# FSGSBASE/RDTSCP CPUID requirement into soft runtime fallbacks (MSR-based
-# GS-base switching, RDTSCP trap-and-emulate, guest FS-base hypercall
-# fallback) -- see tasks/00-preflight.yml and this role's README for what
-# that means for host eligibility. This repo's own branch is "main", not
-# upstream virt-pvm/linux's "pvm-612" naming.
-pvm_linux_repo: "https://github.com/dywongcloud/pvm-no-fsgsbase-rdtscp"
-pvm_linux_branch: "main"
+# PVM kernel = the virt-pvm/linux pvm-612 BASE (Linux 6.12.33 with PVM built
+# in) + a PATCH SERIES applied on top (the PVM-7.1 feature series and the
+# FSGSBASE/RDTSCP soft-fallback series -- MSR-based GS-base switching, RDTSCP
+# trap-and-emulate, guest FS-base hypercall fallback). The patch repo hosts
+# ONLY the patches (its `kernel/` dir is a GitHub-Pages browsing tree, NOT a
+# buildable source tree -- do not build from it). So: clone the base, clone the
+# patch repo, git-apply patches/*.patch to the base, then build. See
+# tasks/00-preflight.yml / this role's README for what the fallbacks mean for
+# host eligibility.
+pvm_base_repo: "https://github.com/virt-pvm/linux"
+pvm_base_branch: "pvm-612"
+pvm_patch_repo: "https://github.com/dywongcloud/pvm-no-fsgsbase-rdtscp"
+pvm_patch_branch: "main"
+pvm_patch_dir: "{{ build_root }}/pvm-patches"    # where the patch repo is cloned
 # The guest config is still the vanilla virt-pvm base config -- the fallback
 # patch series changes runtime capability gating, not guest Kconfig options.
 pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"

@@ -3,11 +3,13 @@
 # boots directly). Uses a SEPARATE clone so it doesn't clash with the in-tree
 # host-kernel build objects.
 
-- name: Clone PVM guest kernel source (separate tree)
+# Same base as the host kernel: virt-pvm/linux pvm-612 (a complete tree), a
+# SEPARATE clone so guest build objects don't clash with the host build.
+- name: Clone the PVM base kernel for the guest (separate tree)
   ansible.builtin.git:
-    repo: "{{ pvm_linux_repo }}"
+    repo: "{{ pvm_base_repo }}"
     dest: "{{ guest_kernel_src }}"
-    version: "{{ pvm_linux_branch }}"
+    version: "{{ pvm_base_branch }}"
     depth: 1
     single_branch: true
     force: false
@@ -18,30 +20,23 @@
     dest: "{{ build_root }}/pvm-guest.config"
     mode: "0644"
 
-# Same nested-layout resolution as the host kernel (see 30-host-kernel.yml):
-# the tree may live under a `kernel/` subdir, with PVM patches under `patches/`.
-- name: Locate the guest kernel Makefile (repo root or kernel/ subdir)
-  ansible.builtin.stat:
-    path: "{{ guest_kernel_src }}/kernel/Makefile"
-  register: _guest_nested_makefile
-
-- name: Set guest_kernel_tree fact (nested kernel/ if present, else repo root)
+- name: Set guest_kernel_tree fact
   ansible.builtin.set_fact:
-    guest_kernel_tree: "{{ guest_kernel_src ~ '/kernel' if _guest_nested_makefile.stat.exists else guest_kernel_src }}"
+    guest_kernel_tree: "{{ guest_kernel_src }}"
 
-- name: Apply PVM patches to the guest tree, if the repo ships any
+- name: Apply fsgsbase/rdtscp fallback patches to the guest tree (only if host masks either)
   ansible.builtin.shell:
     chdir: "{{ guest_kernel_tree }}"
     cmd: |
-      set -euo pipefail
+      set -uo pipefail
       shopt -s nullglob
-      for p in {{ guest_kernel_src }}/patches/*.patch; do
-        if git apply --check "$p" 2>/dev/null; then git apply "$p"; fi
+      for p in {{ pvm_patch_dir }}/patches/*.patch; do
+        git apply --3way "$p" 2>/dev/null || echo "skip: $(basename "$p")"
       done
       touch .hive_patches_applied
   args:
     creates: "{{ guest_kernel_tree }}/.hive_patches_applied"
-  when: _guest_nested_makefile.stat.exists
+  when: not (_has_fsgsbase | default(true)) or not (_has_rdtscp | default(true))
 
 - name: "Configure guest kernel (FC-ready virtio/ext4/serial built-in, PVM_GUEST=y)"
   ansible.builtin.shell:
