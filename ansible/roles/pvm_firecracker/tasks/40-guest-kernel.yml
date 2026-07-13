@@ -18,9 +18,34 @@
     dest: "{{ build_root }}/pvm-guest.config"
     mode: "0644"
 
+# Same nested-layout resolution as the host kernel (see 30-host-kernel.yml):
+# the tree may live under a `kernel/` subdir, with PVM patches under `patches/`.
+- name: Locate the guest kernel Makefile (repo root or kernel/ subdir)
+  ansible.builtin.stat:
+    path: "{{ guest_kernel_src }}/kernel/Makefile"
+  register: _guest_nested_makefile
+
+- name: Set guest_kernel_tree fact (nested kernel/ if present, else repo root)
+  ansible.builtin.set_fact:
+    guest_kernel_tree: "{{ guest_kernel_src ~ '/kernel' if _guest_nested_makefile.stat.exists else guest_kernel_src }}"
+
+- name: Apply PVM patches to the guest tree, if the repo ships any
+  ansible.builtin.shell:
+    chdir: "{{ guest_kernel_tree }}"
+    cmd: |
+      set -euo pipefail
+      shopt -s nullglob
+      for p in {{ guest_kernel_src }}/patches/*.patch; do
+        if git apply --check "$p" 2>/dev/null; then git apply "$p"; fi
+      done
+      touch .hive_patches_applied
+  args:
+    creates: "{{ guest_kernel_tree }}/.hive_patches_applied"
+  when: _guest_nested_makefile.stat.exists
+
 - name: "Configure guest kernel (FC-ready virtio/ext4/serial built-in, PVM_GUEST=y)"
   ansible.builtin.shell:
-    chdir: "{{ guest_kernel_src }}"
+    chdir: "{{ guest_kernel_tree }}"
     cmd: |
       set -euo pipefail
       cp {{ build_root }}/pvm-guest.config .config
@@ -32,17 +57,17 @@
       scripts/config --set-str  LOCALVERSION "{{ guest_localversion }}"
       make olddefconfig
   args:
-    creates: "{{ guest_kernel_src }}/.config"
+    creates: "{{ guest_kernel_tree }}/.config"
 
 - name: Build guest vmlinux (long-running)
   ansible.builtin.command:
     cmd: make -j{{ make_jobs }} vmlinux
-    chdir: "{{ guest_kernel_src }}"
-    creates: "{{ guest_kernel_src }}/vmlinux"
+    chdir: "{{ guest_kernel_tree }}"
+    creates: "{{ guest_kernel_tree }}/vmlinux"
   async: 3600
   poll: 30
 
 - name: Strip + install guest vmlinux
   ansible.builtin.command:
-    cmd: objcopy --strip-debug "{{ guest_kernel_src }}/vmlinux" "{{ pvm_dir }}/vmlinux-pvm"
+    cmd: objcopy --strip-debug "{{ guest_kernel_tree }}/vmlinux" "{{ pvm_dir }}/vmlinux-pvm"
     creates: "{{ pvm_dir }}/vmlinux-pvm"

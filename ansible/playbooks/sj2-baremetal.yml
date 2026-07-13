@@ -1,0 +1,17 @@
+---
+# sj2 bring-up, part 1: OS prerequisites + PVM kernel + firecracker-next +
+# podman + gVisor. The long pole (kernel compile + reboot). The hive-cloud
+# node config itself is cloned from sj's exact live setup by a follow-on
+# SSH step, so this playbook stops at the isolation backend.
+- name: sj2 prerequisites
+  hosts: sj2
+  become: true
+  gather_facts: true
+  roles:
+    - role: prerequisites
+
+- name: sj2 PVM Firecracker (kernel build + reboot + firecracker-next)
+  hosts: sj2
+  become: true
+  roles:
+    - role: pvm_firecracker

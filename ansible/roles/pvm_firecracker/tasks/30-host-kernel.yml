@@ -11,9 +11,44 @@
     single_branch: true
     force: false
 
+# The pvm_linux_repo restructured: the kernel tree now lives under a `kernel/`
+# subdirectory (with the PVM-7.1 feature series + fsgsbase/rdtscp vdso fallback
+# shipped as patches under `patches/` that must be applied to it), rather than
+# the repo root BEING the tree. Resolve the actual tree dir by finding the
+# top-level Makefile, so this works whether the repo is flat (old layout) or
+# nested (current layout).
+- name: Locate the kernel Makefile (repo root or kernel/ subdir)
+  ansible.builtin.stat:
+    path: "{{ host_kernel_src }}/kernel/Makefile"
+  register: _nested_makefile
+
+- name: Set host_kernel_tree fact (nested kernel/ if present, else repo root)
+  ansible.builtin.set_fact:
+    host_kernel_tree: "{{ host_kernel_src ~ '/kernel' if _nested_makefile.stat.exists else host_kernel_src }}"
+
+- name: Apply PVM patches (7.1 series + fsgsbase/rdtscp fallback), if the repo ships any
+  ansible.builtin.shell:
+    chdir: "{{ host_kernel_tree }}"
+    cmd: |
+      set -euo pipefail
+      shopt -s nullglob
+      applied=0
+      for p in {{ host_kernel_src }}/patches/*.patch; do
+        # Idempotent: only apply a patch that isn't already in the tree.
+        if git apply --check "$p" 2>/dev/null; then
+          git apply "$p"
+          applied=$((applied+1))
+        fi
+      done
+      echo "applied $applied patch(es)"
+      touch .hive_patches_applied
+  args:
+    creates: "{{ host_kernel_tree }}/.hive_patches_applied"
+  when: _nested_makefile.stat.exists
+
 - name: Configure host kernel (running config + PVM + build fixes)
   ansible.builtin.shell:
-    chdir: "{{ host_kernel_src }}"
+    chdir: "{{ host_kernel_tree }}"
     cmd: |
       set -euo pipefail
       cp /boot/config-$(uname -r) .config
@@ -31,19 +66,19 @@
       scripts/config --disable  UAPI_HEADER_TEST              # PVM's pvm_para.h fails the standalone test
       make olddefconfig
   args:
-    creates: "{{ host_kernel_src }}/.config"
+    creates: "{{ host_kernel_tree }}/.config"
 
 - name: Build host kernel (long-running)
   ansible.builtin.command:
     cmd: make -j{{ make_jobs }}
-    chdir: "{{ host_kernel_src }}"
-    creates: "{{ host_kernel_src }}/arch/x86/boot/bzImage"
+    chdir: "{{ host_kernel_tree }}"
+    creates: "{{ host_kernel_tree }}/arch/x86/boot/bzImage"
   async: 5400
   poll: 30
 
 - name: Read built kernel release string
   ansible.builtin.slurp:
-    src: "{{ host_kernel_src }}/include/config/kernel.release"
+    src: "{{ host_kernel_tree }}/include/config/kernel.release"
   register: _krelease
 
 - name: Set pvm_kernel_release fact (e.g. 6.12.33-pvm+)
@@ -52,7 +87,7 @@
 
 - name: Install modules + image (+ dracut initramfs + BLS entry)
   ansible.builtin.shell:
-    chdir: "{{ host_kernel_src }}"
+    chdir: "{{ host_kernel_tree }}"
     cmd: |
       set -e
       make -j{{ make_jobs }} modules_install
