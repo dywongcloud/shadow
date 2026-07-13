@@ -87,18 +87,66 @@ pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
 /// again from scratch instead of joining a wedged wait forever.
 const GUARDIAN_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Lazily open (once) the GuardianDB KV store, retrying on a previous failure.
+/// Minimum spacing between full init attempts after a failure. Every guardian
+/// caller (gossip puts, the anti-entropy loop, the relational mirror loop,
+/// admin SQL reads) retries `handle()` on its own cadence; without this gate
+/// a persistent failure had them collectively re-running `init_handle` —
+/// a FULL iroh endpoint bind + blobs/docs store bring-up — every few seconds.
+/// Live-witnessed on fc-virginia/fc-virginia-3: each failed attempt leaked
+/// the partially-built client (spawned actor tasks keep the Arc alive), and
+/// the retry storm grew hive-cloud to a 96.9GB anon-RSS OOM kill in ~8h,
+/// freezing two hosts into console-reboot territory.
+const INIT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Set once an init failure proves in-process retries can never succeed:
+/// redb's "Database already open. Cannot acquire lock." means a PREVIOUS
+/// leaked/timed-out attempt in THIS process still holds the file lock, so
+/// every further attempt is guaranteed to fail — and to leak another full
+/// iroh client doing so. Once latched, `handle()` fails fast with a message
+/// naming the only real recovery (restart the node process).
+static INIT_WEDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LAST_FAILED_INIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Lazily open (once) the GuardianDB KV store, retrying on a previous failure
+/// — but throttled (see `INIT_RETRY_BACKOFF`) and never after a wedge latch.
 async fn handle() -> anyhow::Result<&'static Handle> {
-    HANDLE
+    use std::sync::atomic::Ordering;
+    if let Some(h) = HANDLE.get() {
+        return Ok(h);
+    }
+    if INIT_WEDGED.load(Ordering::Relaxed) {
+        anyhow::bail!(
+            "guardian is wedged in this process (redb lock held by a leaked prior init attempt); restart hive-cloud to recover"
+        );
+    }
+    let last_failed = LAST_FAILED_INIT_MS.load(Ordering::Relaxed);
+    if last_failed != 0 {
+        let since = hive_core::now_ms().saturating_sub(last_failed);
+        if since < INIT_RETRY_BACKOFF.as_millis() as u64 {
+            anyhow::bail!("guardian init failed {since}ms ago; backing off before the next attempt");
+        }
+    }
+    let result = HANDLE
         .get_or_try_init(|| async {
             match tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()).await {
                 Ok(result) => result,
                 Err(_) => Err(anyhow::anyhow!(
-                    "guardian init timed out after {GUARDIAN_INIT_TIMEOUT:?} (iroh endpoint bind / keystore / docs bring-up never completed); will retry on next call"
+                    "guardian init timed out after {GUARDIAN_INIT_TIMEOUT:?} (iroh endpoint bind / keystore / docs bring-up never completed); will retry after backoff"
                 )),
             }
         })
-        .await
+        .await;
+    if let Err(e) = &result {
+        LAST_FAILED_INIT_MS.store(hive_core::now_ms(), Ordering::Relaxed);
+        if e.to_string().contains("Database already open") {
+            INIT_WEDGED.store(true, Ordering::Relaxed);
+            tracing::error!(
+                "guardian init hit redb 'Database already open' — a leaked prior attempt holds the lock; \
+                 latching wedged state (no further in-process retries; restart hive-cloud to recover)"
+            );
+        }
+    }
+    result
 }
 
 /// The actual GuardianDB bring-up, run under `handle()`'s timeout. Broken into
@@ -164,14 +212,26 @@ async fn init_handle() -> anyhow::Result<Handle> {
         backend: Some(client.backend().clone()),
         ..Default::default()
     };
-    let db = GuardianDB::new(client, Some(opts))
-        .await
-        .map_err(|e| anyhow::anyhow!("guardian open: {e}"))?;
+    // On ANY failure past this point the partially-built client MUST be shut
+    // down before returning Err: its iroh endpoint, blobs/docs stores and
+    // spawned actor tasks otherwise outlive the dropped handle (tasks hold
+    // the Arc), leaking the whole stack per retry — the exact mechanism
+    // behind the 96.9GB OOM freeze on the Virginia hosts.
+    let db = match GuardianDB::new(client, Some(opts)).await {
+        Ok(db) => db,
+        Err(e) => {
+            let _ = seed_client.shutdown().await;
+            return Err(anyhow::anyhow!("guardian open: {e}"));
+        }
+    };
     tracing::info!("guardian init: GuardianDB open, opening 'hive-state' KV store");
-    let kv = db
-        .key_value(KV_NAMESPACE, None)
-        .await
-        .map_err(|e| anyhow::anyhow!("guardian kv open: {e}"))?;
+    let kv = match db.key_value(KV_NAMESPACE, None).await {
+        Ok(kv) => kv,
+        Err(e) => {
+            let _ = seed_client.shutdown().await;
+            return Err(anyhow::anyhow!("guardian kv open: {e}"));
+        }
+    };
 
     tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
     Ok(Handle { db, kv, client: seed_client })
