@@ -2219,7 +2219,7 @@ pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, tea
 /// fan-out). Defaults to cascade when absent.
 #[derive(Deserialize, Default)]
 struct CascadeQ {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     cascade: Option<bool>,
 }
 
@@ -3130,7 +3130,7 @@ pub(crate) struct LimitQ {
     pub(crate) q: Option<String>,
     /// Internal: when set by a fleet-aggregation proxy, return ONLY this node's
     /// local events (no fan-out) — prevents proxy recursion.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
 }
 
@@ -3642,11 +3642,31 @@ struct CronToggle {
 
 // ---- Workflows ----
 
+/// Lenient `Option<bool>` query-param deserializer: axum's default (via
+/// `serde_urlencoded`) only accepts the literal strings `"true"`/`"false"`
+/// and 400s on anything else, but callers (the dashboard, `?summary=1`) send
+/// `"1"`/`"0"` — the same convention `gossip.rs`'s internal `wf_query`/
+/// `logs_query` already special-case (`v == "true" || v == "1"`) for the
+/// mesh-RPC path. This brings the public HTTP path up to that convention.
+fn de_lenient_bool<'de, D>(d: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<String>::deserialize(d)? {
+        None => Ok(None),
+        Some(s) => match s.as_str() {
+            "true" | "1" | "yes" => Ok(Some(true)),
+            "false" | "0" | "no" => Ok(Some(false)),
+            _ => Ok(None),
+        },
+    }
+}
+
 /// Query for endpoints that fan out to peers: `?local=true` answers with this
 /// node's local data only, so a proxied call never re-fans (loop guard).
 #[derive(Deserialize)]
 pub(crate) struct LocalQ {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
 }
 
@@ -3656,11 +3676,11 @@ pub(crate) struct WfQuery {
     pub(crate) project: Option<String>,
     /// Internal: when set by a fleet-aggregation proxy call, return ONLY this
     /// node's local workflows (no further fan-out) — prevents proxy recursion.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) local: Option<bool>,
     /// List-shape response: strip per-step `output` payloads (the runs TABLE
     /// renders none of them; full detail lives on `/v1/workflows/runs/:id`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) summary: Option<bool>,
 }
 
@@ -5228,7 +5248,7 @@ struct MetricsQ {
     /// request ONLY this node's local view, with no further fan-out — stops
     /// the recursion at one hop. Absent/false = the top-level call, which fans
     /// out to every other healthy node (see `metrics_get`'s doc comment).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 
@@ -5352,7 +5372,7 @@ struct OverviewQ {
     /// comment for the identical single-hop-fan-out rationale (`c.counters()`
     /// and `c.metrics` are both confirmed node-local with no live cross-node
     /// merge, same defect class).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_lenient_bool")]
     local: Option<bool>,
 }
 

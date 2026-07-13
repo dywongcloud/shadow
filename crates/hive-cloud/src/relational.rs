@@ -155,6 +155,28 @@ fn first_text(res: &[ExecResult]) -> Option<String> {
     None
 }
 
+/// (TEXT, BIGINT) row pairs — e.g. `SELECT slug, updated_ms FROM teams`.
+fn text_num_pairs(res: &[ExecResult]) -> Vec<(String, u64)> {
+    let mut out = Vec::new();
+    for r in res {
+        if let ExecResult::Rows { rows, .. } = r {
+            for row in rows {
+                if let Some(SqlValue::Text(a)) = row.first() {
+                    let n = match row.get(1) {
+                        Some(SqlValue::Int8(n)) => *n as u64,
+                        Some(SqlValue::Int4(n)) => *n as u64,
+                        Some(SqlValue::Int2(n)) => *n as u64,
+                        Some(SqlValue::Text(s)) => s.parse().unwrap_or(0),
+                        _ => 0,
+                    };
+                    out.push((a.clone(), n));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for r in res {
@@ -365,7 +387,14 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
             now,
         );
         if let Err(e) = exec(&mut s, &query).await {
-            tracing::debug!(team = %t.slug, error = %e, "relational: sync_teams upsert failed (non-fatal)");
+            // warn, not debug: a failed upsert here is permanently invisible
+            // otherwise (teams_hash still advances unconditionally in the
+            // main.rs caller, so a failure never retries until the team
+            // snapshot itself changes again) -- silently swallowing it at
+            // debug! (filtered out under the fleet's RUST_LOG=info default
+            // for this crate) previously let 3 of 5 real teams vanish from
+            // the SQL mirror with zero observable signal.
+            tracing::warn!(team = %t.slug, error = %e, "relational: sync_teams upsert failed (row will be missing from the mirror until the next team-data change)");
         }
         for m in &t.members {
             let id = format!("{}/{}", t.slug, m.email.to_lowercase());
@@ -384,25 +413,43 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
                 now,
             );
             if let Err(e) = exec(&mut s, &mq).await {
-                tracing::debug!(member = %id, error = %e, "relational: sync_teams member upsert failed (non-fatal)");
+                tracing::warn!(member = %id, error = %e, "relational: sync_teams member upsert failed (row will be missing from the mirror until the next team-data change)");
             }
         }
     }
     // Remove teams/members that vanished from the snapshot (team deleted,
     // member removed) so the mirror never shows ghosts forever.
+    //
+    // TOMBSTONE GUARD: only delete a row the authoritative leader has STOPPED
+    // asserting (its updated_ms no longer advances), never one merely missing
+    // from THIS node's local store. Every sync tick re-stamps every live
+    // team's updated_ms=now, so a row the real leader still owns is always
+    // fresh. Without this guard, a brief control-plane failover (pinned
+    // leader restarting -> next node in the owner chain takes over) let the
+    // stand-in leader's STALE local TeamStore drive this reconciliation and
+    // DELETE every team it had never heard of -- live-witnessed: the mirror
+    // lost 3 of 5 real teams fleet-wide during this session's rolling
+    // restarts (the follower stores held 2/4 of the 5 teams; team mutations
+    // only ever land on the pinned leader and followers never merge them).
+    let tombstone_ms = std::env::var("HIVE_RELATIONAL_TOMBSTONE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(600)
+        * 1000;
     let live_teams: std::collections::HashSet<String> = teams.iter().map(|t| t.slug.clone()).collect();
     let live_members: std::collections::HashSet<String> =
         teams.iter().flat_map(|t| t.members.iter().map(move |m| format!("{}/{}", t.slug, m.email.to_lowercase()))).collect();
-    if let Ok(res) = exec(&mut s, "SELECT slug FROM teams").await {
-        for slug in all_text_firsts(&res) {
-            if !live_teams.contains(&slug) {
+    let stale = |updated: u64| now.saturating_sub(updated) > tombstone_ms;
+    if let Ok(res) = exec(&mut s, "SELECT slug, updated_ms FROM teams").await {
+        for (slug, updated) in text_num_pairs(&res) {
+            if !live_teams.contains(&slug) && stale(updated) {
                 let _ = exec(&mut s, &format!("DELETE FROM teams WHERE slug = {}", q(&slug))).await;
             }
         }
     }
-    if let Ok(res) = exec(&mut s, "SELECT id FROM team_members").await {
-        for id in all_text_firsts(&res) {
-            if !live_members.contains(&id) {
+    if let Ok(res) = exec(&mut s, "SELECT id, updated_ms FROM team_members").await {
+        for (id, updated) in text_num_pairs(&res) {
+            if !live_members.contains(&id) && stale(updated) {
                 let _ = exec(&mut s, &format!("DELETE FROM team_members WHERE id = {}", q(&id))).await;
             }
         }

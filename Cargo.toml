@@ -22,6 +22,11 @@ members = [
     "crates/hive-wg",
     "crates/hive-zkauth",
 ]
+# vendor/guardian-db carries its own dev-dependencies and is consumed purely as
+# a path dependency (see crates/hive-cloud/Cargo.toml) -- excluding it lets its
+# own test suite run standalone (`cargo test --manifest-path vendor/guardian-db/Cargo.toml`)
+# instead of erroring on the nested-workspace conflict.
+exclude = ["vendor/guardian-db"]
 
 [workspace.package]
 version = "0.1.0"

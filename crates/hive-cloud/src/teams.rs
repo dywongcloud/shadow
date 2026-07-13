@@ -34,7 +34,7 @@ impl Role {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Member {
     pub email: String,
     pub role: Role,
@@ -44,7 +44,7 @@ pub struct Member {
     pub added_ms: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Team {
     /// URL-safe slug, e.g. "dylans-projects" — also the tenant identifier.
     pub slug: String,

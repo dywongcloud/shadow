@@ -68,6 +68,13 @@ impl DocumentStoreIndex {
         guard.insert(key, value);
     }
 
+    /// Atomically swap in a freshly-rebuilt index, replacing the old contents
+    /// wholesale (vs. many individual `insert` calls racing readers mid-rebuild).
+    pub fn replace_all(&self, new_index: HashMap<String, Vec<u8>>) {
+        let mut guard = self.index.write();
+        *guard = new_index;
+    }
+
     pub fn remove(&self, key: &str) {
         let mut guard = self.index.write();
         guard.remove(key);
@@ -101,8 +108,9 @@ async fn refresh_doc_index(
         .get_many(doc, Query::single_latest_per_key().build())
         .await?;
 
-    index.clear_all();
+    let mut new_index: HashMap<String, Vec<u8>> = HashMap::new();
     let mut count = 0;
+    let mut stale_served = 0;
 
     for entry in &entries {
         let key = String::from_utf8_lossy(entry.key()).to_string();
@@ -114,14 +122,40 @@ async fn refresh_doc_index(
         let hash_str = entry.content_hash().to_hex();
         match client.cat_bytes(&hash_str).await {
             Ok(value) => {
-                index.insert(key, value);
+                new_index.insert(key, value);
                 count += 1;
             }
             Err(e) => {
-                warn!("Failed to read content for key from iroh-docs: {:?}", e);
+                // The key->hash CRDT metadata synced fine (this entry is in
+                // `entries` at all), but fetching the content blob itself
+                // failed -- transient holder-unreachable/connection-race
+                // territory, not evidence the row doesn't exist. This used
+                // to unconditionally drop the key from the rebuilt index
+                // (every refresh fully `clear_all()`s first), so a single
+                // flaky `cat_bytes` silently zeroed out a row a PRIOR
+                // refresh had already fetched -- witnessed live as `SELECT
+                // COUNT` on a relational table intermittently returning 0
+                // on healthy, fully-synced fleet nodes. Fall back to
+                // whatever this key held before, so a transient fetch
+                // failure degrades to "serve last-known-good", not to
+                // "row vanished".
+                match index.get_value(&key) {
+                    Some(prev) => {
+                        new_index.insert(key, prev);
+                        stale_served += 1;
+                    }
+                    None => {
+                        warn!("Failed to read content for key from iroh-docs: {:?}", e);
+                    }
+                }
             }
         }
     }
+
+    if stale_served > 0 {
+        debug!(stale_served, "DocumentStore index: served last-known-good content for keys whose blob re-fetch failed this round");
+    }
+    index.replace_all(new_index);
 
     debug!(
         "DocumentStore index synchronized from iroh-docs: {} entries",

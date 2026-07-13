@@ -1,5 +1,40 @@
 # Changelog
 
+## (pending) — fc-sanjose-2 bring-up; fix workflows-page 400, teams-mirror corruption, and guardian-db index flakiness
+
+Brought up the fleet's 10th node, fc-sanjose-2 (43.173.78.95): PVM kernel
+built from `virt-pvm/linux@pvm-612` (the ansible `pvm_firecracker` role now
+clones that base and applies the fsgsbase/rdtscp fallback patches only on
+hosts that need them — the patch repo's own `kernel/` dir is a non-buildable
+browsing tree), firecracker-next, podman+gVisor, backend, dashboard, embedded
++ standalone relay, guardian replication, and a hardened lockdown (9090
+blocked publicly). `hive-lockdown.sh` is now git-tracked and deployed by the
+`prerequisites` role, which also disables+masks `firewalld` — a fresh Rocky
+10 image ships it active and its restrictive default zone silently blocked
+the relay/discovery ports underneath the hive rules. The PVM role gained a
+`pvm_already_provisioned` idempotency gate (a re-run on an already-PVM host
+used to self-referentially re-configure from the PVM kernel's own config and
+break the build).
+
+`GET /v1/workflows/runs?summary=1` returned 400 (the dashboard workflows page
+couldn't load runs): axum's `Query` bool deserialization only accepts literal
+`true`/`false`. All 7 `Option<bool>` query fields in `admin.rs` now use a
+lenient deserializer accepting `1`/`0` (matching the mesh-RPC path's existing
+convention); swept every crate — the class is confined to `admin.rs`.
+
+The relational teams mirror lost 3 of 5 real teams fleet-wide: the TeamStore
+itself diverges across nodes (mutations land only on the control-plane
+leader; followers never merged them), so a brief failover put a stale
+stand-in in charge of `sync_teams`, whose delete-reconciliation wiped every
+team it had never heard of. Followers now adopt the leader's TeamStore each
+mirror tick via a new `/v1/teams/snapshot` mesh arm, and the delete phase is
+tombstone-guarded (`updated_ms` staleness) so a live leader's rows can't be
+wiped. Separately, guardian-db's document-store index rebuild dropped rows
+whose content-blob fetch transiently failed (table counts flickered to 0 on
+healthy nodes) — it now falls back to the previously-fetched value. Every
+guardian SQL op is also bounded by a 10s timeout (a corrupted first-open used
+to hang reads forever with zero signal).
+
 ## 88fe215 — Fix multi-tenancy data-visibility/usage-consistency bugs; add relational layer on guardian-db 0.18; add per-node relay + guardian-db anti-entropy
 
 Team Simpfi's `drugs-wtf` project and fleet-wide billing/metrics were reported

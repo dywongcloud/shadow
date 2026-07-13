@@ -2246,6 +2246,46 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                         teams_hash = h;
                     }
                 }
+            } else if !isolated {
+                // Follower: adopt the leader's TeamStore wholesale. Team
+                // mutations only ever land on the leader (admin_ingress
+                // forward), so a follower's local store otherwise diverges
+                // forever from the moment it last held leadership --
+                // live-witnessed as sj=5 / bkk=4 / va=2 teams, which let a
+                // brief failover put a stale stand-in in charge of the teams
+                // mirror. Wholesale replace (not merge) is correct under the
+                // single-writer model: the leader IS the authority for all
+                // team data. Guarded on non-empty so an unreachable/booting
+                // leader can never wipe the local store.
+                let leader = cloud.control_plane_leader();
+                let peer = cloud
+                    .registry
+                    .nodes()
+                    .into_iter()
+                    .find(|n| n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some());
+                if let Some(peer) = peer {
+                    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
+                    if let Some(bytes) =
+                        gossip::request_to(&cloud, &peer_id, &peer_addr, hive_p2p::GOSSIP_GET, "/v1/teams/snapshot", &[], 10).await
+                    {
+                        match serde_json::from_slice::<std::collections::HashMap<String, crate::teams::Team>>(&bytes) {
+                            Ok(snapshot) if !snapshot.is_empty() => {
+                                let local = cloud.teams.snapshot();
+                                if local != snapshot {
+                                    tracing::info!(
+                                        leader = %leader,
+                                        local_teams = local.len(),
+                                        leader_teams = snapshot.len(),
+                                        "teams store: adopting the leader's snapshot (follower sync)"
+                                    );
+                                    cloud.teams.load(snapshot);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::debug!(leader = %leader, error = %e, "teams follower sync: unparsable snapshot"),
+                        }
+                    }
+                }
             }
             let billing_authority = match &billing_pin {
                 Some(pin) => pin == &cloud.node_name && !isolated,

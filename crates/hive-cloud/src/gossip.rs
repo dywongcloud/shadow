@@ -117,6 +117,18 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             Err(_) => Vec::new(),
         },
         "/v1/serve-hosts" => jb(crate::admin::serve_hosts(State(cloud.clone())).await),
+        // Full TeamStore snapshot for the leader->follower teams sync (see
+        // spawn_relational_mirror_loop's follower branch). Team mutations only
+        // ever land on the control-plane leader (admin_ingress forward), so a
+        // follower's local store otherwise diverges forever -- live-witnessed
+        // as sj=5 / bkk=4 / va=2 teams across nodes, which let a failover
+        // stand-in leader corrupt the relational teams mirror with its stale
+        // list. Mesh-authenticated peers only (same trust surface as every
+        // other arm here); team data carries no secrets beyond member emails,
+        // which already ride /v1/nodes-adjacent surfaces mesh-wide.
+        "/v1/teams/snapshot" if method == hive_p2p::GOSSIP_GET => {
+            serde_json::to_vec(&cloud.teams.snapshot()).unwrap_or_default()
+        }
         // TLS bundle distribution over the authenticated mesh (see acme.rs::
         // bundle_for_mesh — key decrypted in transit inside peer-authenticated
         // QUIC only; receiver re-encrypts with its own node key).
