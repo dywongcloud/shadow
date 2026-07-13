@@ -102,7 +102,7 @@ pub(crate) async fn init_schema() {
             updated_ms BIGINT NOT NULL\
         )",
     ] {
-        if let Err(e) = session.execute(ddl).await {
+        if let Err(e) = exec(&mut session, ddl).await {
             tracing::warn!(error = %e, ddl, "relational: schema bring-up statement failed");
         }
     }
@@ -183,10 +183,46 @@ fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
 /// (the actual iroh-docs replication runs continuously in the background
 /// regardless of this call).
 async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStorage> {
-    if let Err(e) = db.storage().refresh().await {
-        tracing::debug!(error = %e, "relational: index refresh failed (serving from the previous local index)");
+    match tokio::time::timeout(SQL_OP_TIMEOUT, db.storage().refresh()).await {
+        Ok(Err(e)) => tracing::debug!(error = %e, "relational: index refresh failed (serving from the previous local index)"),
+        Err(_) => tracing::warn!(
+            timeout_secs = SQL_OP_TIMEOUT.as_secs(),
+            "relational: index refresh timed out (serving from the previous local index) -- \
+             a fresh node's first refresh on a corrupted/interrupted namespace can hang \
+             indefinitely with no error at all; see run_readonly_query's own timeout for the \
+             matching guard on the query side"
+        ),
+        Ok(Ok(())) => {}
     }
     Session::new(db, "hive")
+}
+
+/// Bound on a single guardian-db SQL operation (index refresh or a query
+/// execute). Live-witnessed on a freshly-joined node (fc-sanjose-2): a
+/// corrupted/interrupted first-open of the "hive" relational namespace made
+/// `Session::execute`/`storage().refresh()` hang SILENTLY FOREVER -- near-zero
+/// CPU, connection established, no error, no log line -- while every other
+/// guardian-touching endpoint (KV reads, `/v1/nodes`) stayed instant. Unlike
+/// the KV path's `guardian::handle()` (which has its own `GUARDIAN_INIT_TIMEOUT`
+/// specifically because of this failure class), this SQL/relational path had
+/// no bound at all. A timeout turns an indefinite hang into a real, fast
+/// error a caller can log/retry/surface instead of an admin request (or a
+/// background loop iteration) that never returns.
+const SQL_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Execute one statement with `SQL_OP_TIMEOUT` bound, flattening the
+/// timeout and the inner guardian-db error into a single `Result<_, String>`
+/// so every existing call site (`?`, `if let Err`, `.ok()`) keeps working
+/// unchanged.
+async fn exec(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    sql: &str,
+) -> Result<Vec<ExecResult>, String> {
+    match tokio::time::timeout(SQL_OP_TIMEOUT, s.execute(sql)).await {
+        Ok(Ok(res)) => Ok(res),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err(format!("guardian sql execute timed out after {SQL_OP_TIMEOUT:?} (namespace likely wedged from an interrupted first-open; restart or reset this node's guardian data)")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +247,7 @@ pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str) 
         q(root_dir),
         hive_core::now_ms(),
     );
-    if let Err(e) = s.execute(&query).await {
+    if let Err(e) = exec(&mut s, &query).await {
         tracing::debug!(project, error = %e, "relational: set_project_team failed (non-fatal, fleet-fallback unavailable for this project until retried)");
     }
 }
@@ -221,7 +257,7 @@ pub(crate) async fn remove_project(project: &str) {
     let Ok(db) = crate::guardian::sql_db().await else { return };
     let mut s = session(db).await;
     let query = format!("DELETE FROM project_teams WHERE project = {}", q(project));
-    if let Err(e) = s.execute(&query).await {
+    if let Err(e) = exec(&mut s, &query).await {
         tracing::debug!(project, error = %e, "relational: remove_project failed (non-fatal)");
     }
 }
@@ -235,7 +271,7 @@ pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
     let Ok(db) = crate::guardian::sql_db().await else { return Vec::new() };
     let mut s = session(db).await;
     let query = format!("SELECT project, team FROM project_teams WHERE team = {}", q(team));
-    let Ok(res) = s.execute(&query).await else { return Vec::new() };
+    let Ok(res) = exec(&mut s, &query).await else { return Vec::new() };
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
 }
 
@@ -328,7 +364,7 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
             t.created_ms,
             now,
         );
-        if let Err(e) = s.execute(&query).await {
+        if let Err(e) = exec(&mut s, &query).await {
             tracing::debug!(team = %t.slug, error = %e, "relational: sync_teams upsert failed (non-fatal)");
         }
         for m in &t.members {
@@ -347,7 +383,7 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
                 m.added_ms,
                 now,
             );
-            if let Err(e) = s.execute(&mq).await {
+            if let Err(e) = exec(&mut s, &mq).await {
                 tracing::debug!(member = %id, error = %e, "relational: sync_teams member upsert failed (non-fatal)");
             }
         }
@@ -357,17 +393,17 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
     let live_teams: std::collections::HashSet<String> = teams.iter().map(|t| t.slug.clone()).collect();
     let live_members: std::collections::HashSet<String> =
         teams.iter().flat_map(|t| t.members.iter().map(move |m| format!("{}/{}", t.slug, m.email.to_lowercase()))).collect();
-    if let Ok(res) = s.execute("SELECT slug FROM teams").await {
+    if let Ok(res) = exec(&mut s, "SELECT slug FROM teams").await {
         for slug in all_text_firsts(&res) {
             if !live_teams.contains(&slug) {
-                let _ = s.execute(&format!("DELETE FROM teams WHERE slug = {}", q(&slug))).await;
+                let _ = exec(&mut s, &format!("DELETE FROM teams WHERE slug = {}", q(&slug))).await;
             }
         }
     }
-    if let Ok(res) = s.execute("SELECT id FROM team_members").await {
+    if let Ok(res) = exec(&mut s, "SELECT id FROM team_members").await {
         for id in all_text_firsts(&res) {
             if !live_members.contains(&id) {
-                let _ = s.execute(&format!("DELETE FROM team_members WHERE id = {}", q(&id))).await;
+                let _ = exec(&mut s, &format!("DELETE FROM team_members WHERE id = {}", q(&id))).await;
             }
         }
     }
@@ -404,17 +440,17 @@ pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentI
             d.created_at_ms,
             now,
         );
-        if let Err(e) = s.execute(&query).await {
+        if let Err(e) = exec(&mut s, &query).await {
             tracing::debug!(deployment = %d.id, error = %e, "relational: sync_deployments upsert failed (non-fatal)");
         }
     }
     // Delete only THIS node's rows for deployments it no longer hosts.
     let live: std::collections::HashSet<String> = deps.iter().map(|d| d.id.to_string()).collect();
     let sel = format!("SELECT id FROM deployments WHERE node = {}", q(node));
-    if let Ok(res) = s.execute(&sel).await {
+    if let Ok(res) = exec(&mut s, &sel).await {
         for id in all_text_firsts(&res) {
             if !live.contains(&id) {
-                let _ = s.execute(&format!("DELETE FROM deployments WHERE id = {}", q(&id))).await;
+                let _ = exec(&mut s, &format!("DELETE FROM deployments WHERE id = {}", q(&id))).await;
             }
         }
     }
@@ -582,7 +618,7 @@ pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, S
     reject_unless_readonly(sql)?;
     let db = crate::guardian::sql_db().await.map_err(|e| format!("relational store unavailable: {e}"))?;
     let mut s = session(db).await;
-    let results = s.execute(sql).await.map_err(|e| format!("{e}"))?;
+    let results = exec(&mut s, sql).await?;
     for r in &results {
         if let ExecResult::Rows { fields, rows } = r {
             let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
@@ -607,9 +643,9 @@ pub(crate) async fn billing_snapshot(tenant: &str) -> Option<(Option<String>, Op
     let acc_q = format!("SELECT account_json FROM billing_accounts WHERE tenant = {}", q(tenant));
     let ledger_q = format!("SELECT ledger_json FROM billing_ledger_snapshot WHERE tenant = {}", q(tenant));
     let inv_q = format!("SELECT invoices_json FROM billing_invoices_snapshot WHERE tenant = {}", q(tenant));
-    let account = s.execute(&acc_q).await.ok().and_then(|r| first_text(&r));
-    let ledger = s.execute(&ledger_q).await.ok().and_then(|r| first_text(&r));
-    let invoices = s.execute(&inv_q).await.ok().and_then(|r| first_text(&r));
+    let account = exec(&mut s, &acc_q).await.ok().and_then(|r| first_text(&r));
+    let ledger = exec(&mut s, &ledger_q).await.ok().and_then(|r| first_text(&r));
+    let invoices = exec(&mut s, &inv_q).await.ok().and_then(|r| first_text(&r));
     if account.is_none() && ledger.is_none() && invoices.is_none() {
         return None;
     }
