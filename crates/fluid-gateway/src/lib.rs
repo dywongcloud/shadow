@@ -50,6 +50,14 @@ pub struct Gateway {
     tunnels: tokio::sync::Mutex<HashMap<CellId, Arc<TunnelClient>>>,
     tunnels_opened: AtomicU64,
     tunnels_reused: AtomicU64,
+    /// Real User Monitoring samples from the `@vercel/speed-insights` beacon
+    /// (see `handle_public`'s `/_vercel/speed-insights/vitals` handling). Lives
+    /// here (not in hive-cloud's CloudState) because `Deployment.tenant` — the
+    /// only tenant attribution available at the point the beacon is received —
+    /// is resolved via `Gateway::select`, and `handle_public` has no CloudState
+    /// access at all (fluid-gateway is a lower-level crate hive-cloud embeds,
+    /// never the other way around).
+    rum: RumStore,
 }
 
 impl Gateway {
@@ -65,7 +73,35 @@ impl Gateway {
             tunnels: tokio::sync::Mutex::new(HashMap::new()),
             tunnels_opened: AtomicU64::new(0),
             tunnels_reused: AtomicU64::new(0),
+            rum: RumStore::new(),
         })
+    }
+
+    /// Record one `/_vercel/speed-insights/vitals` beacon payload
+    /// (`{"href":"...","vitals":{"FCP":...,"LCP":...,"CLS":...,"INP":...,"TTFB":...}}`)
+    /// under `tenant`. Malformed bodies are silently dropped (a beacon is
+    /// best-effort telemetry, never worth a request failure).
+    pub fn record_vitals(&self, tenant: &str, device: RumDevice, body: &[u8]) {
+        self.rum.record(tenant, device, body);
+    }
+
+    /// Real-User-Monitoring summary for `tenant` over the last `minutes`,
+    /// optionally narrowed to one device class — p75/p90/p95/p99 per vital,
+    /// a computed Real Experience Score, real top routes, and the true sample
+    /// count (so the dashboard can show an honest "collecting" state at 0
+    /// rather than the previous permanently-empty stub). LOCAL to this node
+    /// only — hive-cloud's `/v1/speed-insights` handler fans this out across
+    /// the fleet via `rum_raw` + `RumRaw::merge` before calling `summarize()`,
+    /// same reason `/v1/metrics` fans out (a tenant's visitors can land on
+    /// any node).
+    pub fn rum_summary(&self, tenant: &str, minutes: usize, device: Option<RumDevice>) -> RumSummary {
+        self.rum.summary(tenant, minutes, device, now_ms())
+    }
+
+    /// This node's local raw RUM data for `tenant` — the mergeable unit a
+    /// fleet-wide `/v1/speed-insights` fan-out combines via `RumRaw::merge`.
+    pub fn rum_raw(&self, tenant: &str, minutes: usize, device: Option<RumDevice>) -> RumRaw {
+        self.rum.raw(tenant, minutes, device, now_ms())
     }
 
     /// Get the live tunnel for an instance, opening one if needed. Creation is
@@ -607,6 +643,24 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     // their data here. Handle these before deployment routing so any deployed app
     // using the official packages works unchanged.
     if path.starts_with("/_vercel/") {
+        // The vitals beacon is the one `/_vercel/` path that needs tenant
+        // attribution (to store the sample under the right tenant) — resolve
+        // the deployment here (vercel_insights itself is a pure fn with no
+        // Gateway access) rather than plumbing Gateway through it for one path.
+        if parts.method == Method::POST && path == "/_vercel/speed-insights/vitals" {
+            if let Some(dep) = gw.select(host.as_deref()) {
+                let device = parts
+                    .headers
+                    .get(header::USER_AGENT)
+                    .and_then(|v| v.to_str().ok())
+                    .map(RumDevice::from_user_agent)
+                    .unwrap_or(RumDevice::Desktop);
+                if let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await {
+                    gw.record_vitals(&dep.tenant, device, &bytes);
+                }
+            }
+            return (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, "text/plain")], "ok").into_response();
+        }
         if let Some(resp) = vercel_insights(&parts.method, &path) {
             return resp;
         }
@@ -755,6 +809,301 @@ fn inject_headers(mut resp: Response, extra: &[(String, String)]) -> Response {
         }
     }
     resp
+}
+
+// ============================ Real User Monitoring ============================
+//
+// Storage + percentile/RES scoring for the `@vercel/speed-insights` beacon
+// (see `vercel_insights`'s SPEED_JS below for what it collects). Previously
+// the beacon fired and was received (202 Accepted) but the payload was
+// discarded entirely — the dashboard's Speed Insights page was hardcoded to
+// an empty "no RUM ingest yet" stub because there was, in fact, no ingest at
+// all. This closes that gap: real samples in, real percentiles + a real
+// score out.
+
+/// Coarse device class, sniffed server-side from the beacon POST's
+/// `User-Agent` header (the beacon itself sends no device field — adding one
+/// would mean shipping new client JS; a UA regex is a one-line, no-client-
+/// change alternative that's plenty accurate for the Desktop/Mobile toggle).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RumDevice {
+    Desktop,
+    Mobile,
+}
+
+impl RumDevice {
+    pub fn from_user_agent(ua: &str) -> RumDevice {
+        let ua = ua.to_ascii_lowercase();
+        if ua.contains("mobi") || ua.contains("android") || ua.contains("iphone") {
+            RumDevice::Mobile
+        } else {
+            RumDevice::Desktop
+        }
+    }
+}
+
+/// One beacon's worth of vitals (all optional — a real page load may not
+/// populate every observer, e.g. a page with zero layout shift never fires
+/// the CLS `PerformanceObserver` callback at all).
+#[derive(Clone, serde::Deserialize)]
+struct VitalsIn {
+    #[serde(default)]
+    href: String,
+    #[serde(default)]
+    vitals: VitalsPayload,
+}
+
+#[derive(Clone, Default, serde::Deserialize)]
+struct VitalsPayload {
+    #[serde(rename = "FCP")]
+    fcp: Option<f64>,
+    #[serde(rename = "LCP")]
+    lcp: Option<f64>,
+    #[serde(rename = "CLS")]
+    cls: Option<f64>,
+    #[serde(rename = "INP")]
+    inp: Option<f64>,
+    #[serde(rename = "TTFB")]
+    ttfb: Option<f64>,
+}
+
+#[derive(Clone)]
+struct VitalSample {
+    t_ms: u64,
+    route: String,
+    device: RumDevice,
+    v: VitalsPayload,
+}
+
+/// Bounded ring buffer per tenant (newest-N samples, not a time-bucketed
+/// rollup like `MetricsStore` — percentiles need the raw distribution, not a
+/// sum/count, and a capped buffer bounds memory without a separate eviction
+/// policy per resolution). Not persisted: RUM is a live-window UX signal
+/// (Vercel's own dashboard only ever shows a rolling window too), and a
+/// restart refilling within minutes of real traffic is an acceptable
+/// trade-off here — unlike the hour/day usage rollups, there's no billing or
+/// long-term-trend consumer relying on this surviving a restart.
+const RUM_CAP_PER_TENANT: usize = 5_000;
+
+#[derive(Default)]
+struct RumStore {
+    by_tenant: parking_lot::RwLock<HashMap<String, std::collections::VecDeque<VitalSample>>>,
+}
+
+impl RumStore {
+    fn new() -> RumStore {
+        RumStore::default()
+    }
+
+    fn record(&self, tenant: &str, device: RumDevice, body: &[u8]) {
+        let Ok(payload) = serde_json::from_slice::<VitalsIn>(body) else { return };
+        let route = path_of_href(&payload.href);
+        let mut map = self.by_tenant.write();
+        let dq = map.entry(tenant.to_string()).or_default();
+        dq.push_back(VitalSample { t_ms: now_ms(), route, device, v: payload.vitals });
+        while dq.len() > RUM_CAP_PER_TENANT {
+            dq.pop_front();
+        }
+    }
+
+    /// This node's LOCAL samples only, grouped by route — the mergeable unit
+    /// for a fleet-wide read. Percentiles can't be meaningfully averaged
+    /// across nodes (the average of two p75s is not the true p75 of the
+    /// combined population), so a fleet-wide caller merges these raw
+    /// per-route arrays (`RumRaw::merge`) and computes percentiles ONCE on
+    /// the combined, fully-sorted set — same "merge raw, compute once" shape
+    /// as `metrics.rs`'s `Bucket::add`, applied to a distribution instead of
+    /// a sum. Grouping by route (rather than one flat pool) is what lets the
+    /// dashboard's Poor/Needs Improvement/Great route buckets carry a REAL
+    /// per-route score instead of dumping every route into one bucket
+    /// regardless of its actual performance.
+    fn raw(&self, tenant: &str, minutes: usize, device: Option<RumDevice>, now_ms: u64) -> RumRaw {
+        let cutoff = now_ms.saturating_sub((minutes as u64) * 60_000);
+        let map = self.by_tenant.read();
+        let samples: Vec<&VitalSample> = map
+            .get(tenant)
+            .map(|dq| {
+                dq.iter()
+                    .filter(|s| s.t_ms >= cutoff && device.is_none_or(|d| s.device == d))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut by_route: HashMap<String, RouteRaw> = HashMap::new();
+        for s in &samples {
+            let r = by_route.entry(s.route.clone()).or_default();
+            if let Some(v) = s.v.fcp { r.fcp.push(v); }
+            if let Some(v) = s.v.lcp { r.lcp.push(v); }
+            if let Some(v) = s.v.cls { r.cls.push(v); }
+            if let Some(v) = s.v.inp { r.inp.push(v); }
+            if let Some(v) = s.v.ttfb { r.ttfb.push(v); }
+            r.count += 1;
+        }
+        for r in by_route.values_mut() {
+            r.sort();
+        }
+        RumRaw { by_route, sample_count: samples.len() }
+    }
+
+    fn summary(&self, tenant: &str, minutes: usize, device: Option<RumDevice>, now_ms: u64) -> RumSummary {
+        self.raw(tenant, minutes, device, now_ms).summarize()
+    }
+}
+
+/// One route's sorted-ascending vital-sample arrays + count — sorted so a
+/// merge across nodes is a cheap concatenate-then-resort, and so percentiles
+/// are computed once, on the final (possibly fleet-merged) set.
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
+pub struct RouteRaw {
+    pub fcp: Vec<f64>,
+    pub lcp: Vec<f64>,
+    pub cls: Vec<f64>,
+    pub inp: Vec<f64>,
+    pub ttfb: Vec<f64>,
+    pub count: u64,
+}
+
+impl RouteRaw {
+    fn sort(&mut self) {
+        for v in [&mut self.fcp, &mut self.lcp, &mut self.cls, &mut self.inp, &mut self.ttfb] {
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+    }
+    fn merge(&mut self, other: &RouteRaw) {
+        for (dst, src) in [
+            (&mut self.fcp, &other.fcp),
+            (&mut self.lcp, &other.lcp),
+            (&mut self.cls, &other.cls),
+            (&mut self.inp, &other.inp),
+            (&mut self.ttfb, &other.ttfb),
+        ] {
+            dst.extend_from_slice(src);
+            dst.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        }
+        self.count += other.count;
+    }
+    fn percentiles(&self, p: f64) -> VitalPercentiles {
+        let pct = |sorted: &[f64]| -> Option<f64> {
+            if sorted.is_empty() {
+                return None;
+            }
+            let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+            sorted.get(idx.min(sorted.len() - 1)).copied()
+        };
+        VitalPercentiles { fcp: pct(&self.fcp), lcp: pct(&self.lcp), cls: pct(&self.cls), inp: pct(&self.inp), ttfb: pct(&self.ttfb) }
+    }
+}
+
+/// Mergeable raw RUM data for one scope (a single node, or the fleet-wide
+/// merge of every node's local `raw()`), grouped by route.
+#[derive(Clone, Default, Serialize, serde::Deserialize)]
+pub struct RumRaw {
+    pub by_route: HashMap<String, RouteRaw>,
+    pub sample_count: usize,
+}
+
+/// Real Experience Score: each Core Web Vital scored 0-100 against
+/// Google/Vercel's published good/poor thresholds (linear between them),
+/// weighted LCP 25 / INP 25 / CLS 25 / FCP 15 / TTFB 10 — the commonly-
+/// published breakdown for Vercel's RES. `None` when none of the weighted
+/// vitals have data (honest "collecting"), never a fabricated score.
+fn res_score(p75: &VitalPercentiles) -> Option<u32> {
+    let score_of = |value: Option<f64>, good: f64, poor: f64| -> Option<f64> {
+        let v = value?;
+        // Every one of these 5 vitals is "lower is better".
+        let frac = ((poor - v) / (poor - good)).clamp(0.0, 1.0);
+        Some(frac * 100.0)
+    };
+    let weighted = [
+        (score_of(p75.lcp, 2500.0, 4000.0), 25.0),
+        (score_of(p75.inp, 200.0, 500.0), 25.0),
+        (score_of(p75.cls, 0.1, 0.25), 25.0),
+        (score_of(p75.fcp, 1800.0, 3000.0), 15.0),
+        (score_of(p75.ttfb, 800.0, 1800.0), 10.0),
+    ];
+    let (sum, weight): (f64, f64) = weighted.iter().filter_map(|(s, w)| s.map(|s| (s * w, *w))).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    if weight > 0.0 { Some((sum / weight).round() as u32) } else { None }
+}
+
+impl RumRaw {
+    /// Fold `other` (a peer's raw data) into `self`.
+    pub fn merge(&mut self, other: &RumRaw) {
+        for (route, r) in &other.by_route {
+            self.by_route.entry(route.clone()).or_default().merge(r);
+        }
+        self.sample_count += other.sample_count;
+    }
+
+    /// Compute the aggregate percentiles/RES (pooling every route together)
+    /// plus a per-route breakdown, from this (possibly fleet-merged) raw data.
+    pub fn summarize(&self) -> RumSummary {
+        let mut agg = RouteRaw::default();
+        for r in self.by_route.values() {
+            agg.merge(r);
+        }
+        let p75 = agg.percentiles(0.75);
+        let mut routes: Vec<RouteScore> = self
+            .by_route
+            .iter()
+            .map(|(route, r)| {
+                let p75 = r.percentiles(0.75);
+                RouteScore { route: route.clone(), count: r.count, res: res_score(&p75), p75 }
+            })
+            .collect();
+        routes.sort_by(|a, b| b.count.cmp(&a.count));
+        RumSummary {
+            sample_count: self.sample_count,
+            res: res_score(&p75),
+            p75,
+            p90: agg.percentiles(0.90),
+            p95: agg.percentiles(0.95),
+            p99: agg.percentiles(0.99),
+            routes,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Serialize)]
+pub struct VitalPercentiles {
+    pub fcp: Option<f64>,
+    pub lcp: Option<f64>,
+    pub cls: Option<f64>,
+    pub inp: Option<f64>,
+    pub ttfb: Option<f64>,
+}
+
+/// One route's own p75 + Real Experience Score — what actually justifies
+/// classifying a route into the dashboard's Poor/Needs Improvement/Great
+/// buckets (rather than every route landing in the same bucket regardless of
+/// its real performance, which a per-route-count-only breakdown would do).
+#[derive(Serialize)]
+pub struct RouteScore {
+    pub route: String,
+    pub count: u64,
+    pub res: Option<u32>,
+    pub p75: VitalPercentiles,
+}
+
+#[derive(Serialize)]
+pub struct RumSummary {
+    pub sample_count: usize,
+    /// Real Experience Score (0-100), `None` until at least one weighted
+    /// vital has a sample.
+    pub res: Option<u32>,
+    pub p75: VitalPercentiles,
+    pub p90: VitalPercentiles,
+    pub p95: VitalPercentiles,
+    pub p99: VitalPercentiles,
+    /// Per-route breakdown, sorted by sample count desc.
+    pub routes: Vec<RouteScore>,
+}
+
+/// Extract the path portion of a beacon's `href` (`https://host/a/b?q=1` ->
+/// `/a/b`) without pulling in a URL-parsing crate for one field.
+fn path_of_href(href: &str) -> String {
+    let after_scheme = href.split("://").nth(1).unwrap_or(href);
+    let path_and_after = after_scheme.splitn(2, '/').nth(1).map(|s| format!("/{s}")).unwrap_or_else(|| "/".to_string());
+    path_and_after.split(['?', '#']).next().unwrap_or("/").to_string()
 }
 
 /// Vercel Web Analytics + Speed Insights endpoints.

@@ -8,7 +8,7 @@ import { Calendar, ChevronDown, Coins, DollarSign, MoreHorizontal } from "lucide
 const BarChart = dynamic(() => import("@tremor/react").then((m) => m.BarChart), { ssr: false });
 const SparkAreaChart = dynamic(() => import("@tremor/react").then((m) => m.SparkAreaChart), { ssr: false });
 import { Card } from "@/components/ui";
-import { usePoll, type Overview, type FunctionStats, type BillingInfo, type Metrics } from "@/lib/api";
+import { usePoll, type FunctionStats, type BillingInfo, type Metrics } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 // A flat sparkline at the real current level — used for metrics we track as a
@@ -51,7 +51,6 @@ function bucketLabel(gran: Gran, t_ms: number) {
 }
 
 export default function UsagePage() {
-  const { data: ov } = usePoll<Overview>("/v1/overview", 3000);
   const { data: fns } = usePoll<FunctionStats[]>("/v1/functions", 3000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 5000);
   const [gran, setGran] = useState<Gran>("Daily");
@@ -64,15 +63,24 @@ export default function UsagePage() {
   // (crates/hive-cloud/src/metrics.rs) `gran` is currently set to.
   const { data: metrics } = usePoll<Metrics>(`/v1/metrics?minutes=${granMinutes}&gran=${apiGran}`, pollMs);
 
-  const requests = ov?.requests ?? 0;
-  const blocked = ov?.blocked ?? 0;
-  const cacheHits = ov?.cdn?.hits ?? 0;
+  // Sourced from /v1/metrics (tenant-scoped + fleet-fanned-out), NOT
+  // /v1/overview — that endpoint's non-operator response omits requests/
+  // blocked/cdn entirely (operator-only fields), so every non-owner team
+  // member previously saw these as permanently 0 here.
+  const requests = metrics?.totals?.requests ?? 0;
+  const blocked = metrics?.totals?.blocked ?? 0;
+  const cacheHits = (metrics?.series ?? []).reduce((a, b) => a + b.cache_hits, 0);
   const invocations = (fns ?? []).reduce((a, f) => a + f.requests, 0);
   // Active CPU pricing (Vercel Fluid convention): bill ACTIVE CPU time + provisioned
   // MEMORY GB-hrs, not idle instance wall-time. `active_cpu_ms` excludes I/O-idle
   // keep-warm time — that's where the headline savings come from.
   const activeCpuMs = (fns ?? []).reduce((a, f) => a + (f.active_cpu_ms ?? 0), 0);
   const memGbHrs = (fns ?? []).reduce((a, f) => a + (f.memory_gb_hrs ?? 0), 0);
+  // Real tenant-scoped instance count (now that /v1/functions is tenant-
+  // scoped, not operator-only — see fns above); previously sourced from
+  // /v1/overview's operator-only `instances` field, permanently 0 for anyone
+  // but the platform owner.
+  const instances = (fns ?? []).reduce((a, f) => a + f.instances, 0);
 
   // Charges are computed from the AUTHORITATIVE rate card the billing API returns
   // (crates/hive-cloud/src/billing.rs RATE_CARD) — never hardcoded multipliers.
@@ -90,7 +98,7 @@ export default function UsagePage() {
   const includedUsed = acc ? acc.used_cents / 100 : Math.min(includedTotal, edgeCharge + fnCharge + wafCharge);
   const onDemand = acc ? Math.max(0, -acc.balance_cents) / 100 : edgeCharge + fnCharge + wafCharge;
   const creditBalance = acc ? acc.balance_cents / 100 : 0;
-  const planName = (acc?.plan ?? (ov?.concurrency?.plan === "enterprise" ? "enterprise" : "hobby"));
+  const planName = acc?.plan ?? "hobby";
 
   // REAL per-tenant time-series from the metrics buckets (per-minute). Edge
   // requests, cache hits and blocked requests are tracked over time, so their
@@ -211,7 +219,7 @@ export default function UsagePage() {
           <Row color="bg-amber-500" name="Function Invocations" spark={fnS} usage={`${fmt(invocations)}`} charge={0} />
           <Row color="bg-purple-500" name="Active CPU" spark={flat(activeCpuMs, N)} usage={`${(activeCpuMs / 1000).toFixed(1)} s`} charge={cpuCharge} />
           <Row color="bg-teal-500" name="Provisioned Memory" spark={flat(Math.round(memGbHrs * 1000), N)} usage={`${memGbHrs.toFixed(3)} GB-hr`} charge={memCharge} />
-          <Row color="bg-cyan-500" name="Provisioned Instances" spark={flat((ov?.instances ?? 0) * 100, N)} usage={`${ov?.instances ?? 0}`} charge={0} />
+          <Row color="bg-cyan-500" name="Provisioned Instances" spark={flat(instances * 100, N)} usage={`${instances}`} charge={0} />
         </div>
       </Card>
     </div>

@@ -61,8 +61,16 @@ function WorkflowsInner() {
   // dashboard (fleet fan-out + per-project Upstash world reads per call). Poll
   // fast (3s) only while a run is actually in flight; 12s at rest. The
   // definitions list only changes on deploy — long TTL, slow poll.
+  // LAZY: only the "runs" sub-tab renders anything derived from this data (the
+  // Workflows/Hooks tabs only use `defs`, from the separate cheap poll below) —
+  // gate the recurring poll on `view === "runs"` so switching away from Runs
+  // stops paying for the most expensive read entirely instead of just not
+  // rendering its result. `usePoll`'s `active` still does one fetch on the
+  // transition (never stale-forever); the /v1/workflows/runs PATH_TTL entry
+  // caps that to at most one real network read per 3s even if the user flips
+  // tabs rapidly.
   const [anyRunning, setAnyRunning] = useState(false);
-  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs?summary=1", anyRunning ? 3000 : 12000);
+  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs?summary=1", anyRunning ? 3000 : 12000, view === "runs");
   const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
   useEffect(() => {
     setAnyRunning((runs ?? []).some((r) => r.status === "running" || r.status === "pending"));

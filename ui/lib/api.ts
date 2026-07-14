@@ -199,6 +199,23 @@ const PATH_TTL: Array<[RegExp, number]> = [
   [/^\/v1\/admin\/data(\/.*)?$/, 15_000],
   [/^\/v1\/admin\/namespaces$/, 15_000],
   [/^\/v1\/admin\/sql\//, 15_000],
+  // These previously fell back to the 2s GET_TTL_MS default, which is SHORTER
+  // than every one of these paths' own poll interval (usage.tsx: 3s-300s
+  // depending on Daily/Weekly/Monthly; observability.tsx: 5s; workflows.tsx:
+  // 3s-12s) — so the cache barely de-duped anything; almost every poll tick
+  // genuinely re-triggered the (often fleet-fan-out-backed) read. A short TTL
+  // here collapses redundant reads from multiple co-mounted components/tabs
+  // within the same window without masking any real staleness the page's own
+  // interval wouldn't already tolerate.
+  [/^\/v1\/metrics/, 3_000],
+  [/^\/v1\/overview$/, 3_000],
+  [/^\/v1\/functions$/, 3_000],
+  [/^\/v1\/databases$/, 3_000],
+  [/^\/v1\/integrations$/, 5_000],
+  // Workflow RUNS list only (bare or `?summary=1`/`?project=`) — never the
+  // single-run detail view (`/v1/workflows/runs/:id`), which a user actively
+  // watching a trace wants at full freshness.
+  [/^\/v1\/workflows\/runs(\?|$)/, 3_000],
 ];
 function pathTtl(path: string): number {
   for (const [re, ttl] of PATH_TTL) if (re.test(path)) return ttl;

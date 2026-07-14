@@ -170,13 +170,16 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             serde_json::to_vec(&cloud.databases.directory()).unwrap_or_default()
         }
         // Local per-function usage stats (each node meters its own compute) — the
-        // billing meter loop on the coordinator fans this out to sum fleet usage.
-        // Prefix match: `fetch_from_host` appends `?team=` so an exact arm misses.
+        // billing meter loop on the coordinator fans this out to sum fleet usage
+        // ACROSS EVERY TENANT (main.rs's billing-meter loop builds its own
+        // per-tenant totals from the unfiltered list via `FunctionStats.tenant`).
+        // Calls `c.fluid.stats()` directly rather than the dashboard-facing
+        // `admin::functions` handler, which is now tenant-scoped to a single
+        // caller (matching `databases_list`) — this internal fan-out needs the
+        // full, unfiltered per-node list instead. Prefix match: `fetch_from_host`
+        // appends `?team=` so an exact arm misses.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/functions") => {
-            match crate::admin::functions(State(cloud.clone()), mesh_operator_claims()).await {
-                Ok(j) => jb(j),
-                Err(_) => Vec::new(),
-            }
+            serde_json::to_vec(&cloud.fluid.stats()).unwrap_or_default()
         }
         // Tenant's LOCAL custom domains for the fleet-aggregation fan-out (domains
         // live in node-local ProjectSettings; the coordinator merges each host's).

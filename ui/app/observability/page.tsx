@@ -25,13 +25,6 @@ function fmtNum(n: number): string {
   if (n >= 1_000) return `${(n / 1_000).toFixed(n >= 10_000 ? 0 : 1)}K`;
   return `${n}`;
 }
-function fmtBytes(n: number): string {
-  if (n >= 1 << 30) return `${(n / (1 << 30)).toFixed(1)} GB`;
-  if (n >= 1 << 20) return `${(n / (1 << 20)).toFixed(0)} MB`;
-  if (n >= 1 << 10) return `${(n / (1 << 10)).toFixed(0)} KB`;
-  return `${n} B`;
-}
-
 export default function ObservabilityPage() {
   const [range, setRange] = useState(720);
   const [q, setQ] = useState("");
@@ -80,9 +73,16 @@ export default function ObservabilityPage() {
     Requests: b.requests,
     Errors: b.errors + b.client_err,
   }));
-  const xferSeries = series.map((b) => ({
+  // REAL cache hit/miss counts (metrics.rs's Bucket tracks these exactly —
+  // no fabrication). Replaces a previous "Fast Data Transfer" card that
+  // multiplied request count by a hardcoded ~4.3KB/request guess: this crate
+  // has no bytes-transferred instrumentation anywhere (Event/Bucket carry no
+  // such field), so that number was invented, not measured — matching the
+  // user-reported "inaccurate" observability data. Cache hit ratio is exact.
+  const cacheSeries = series.map((b) => ({
     t: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    Transfer: +(b.requests * 4300 / (1 << 20)).toFixed(3), // ~4.3KB/req → MB
+    Hits: b.cache_hits,
+    Misses: b.cache_miss,
   }));
   const mwSeries = series.map((b) => ({
     t: new Date(b.t_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
@@ -90,7 +90,7 @@ export default function ObservabilityPage() {
   }));
 
   const totalReq = data?.totals?.requests ?? 0;
-  const totalXferBytes = totalReq * 4300;
+  const cacheHitPct = (data?.totals?.cache_hit_ratio ?? 0) * 100;
   const totalMw = series.reduce((a, b) => a + b.blocked, 0);
 
   const projects = (data?.projects ?? []).filter((p) =>
@@ -128,8 +128,8 @@ export default function ObservabilityPage() {
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         <MetricCard title="Edge Requests" metric="Invocations" value={fmtNum(totalReq)} href="/observability"
           data={reqSeries} categories={["Requests", "Errors"]} colors={["blue", "amber"]} label={rangeLabel} />
-        <MetricCard title="Fast Data Transfer" metric="Total" value={fmtBytes(totalXferBytes)} href="/observability"
-          data={xferSeries} categories={["Transfer"]} colors={["blue"]} label={rangeLabel} />
+        <MetricCard title="Cache Hit Ratio" metric="Hits vs Misses" value={`${cacheHitPct.toFixed(1)}%`} href="/observability"
+          data={cacheSeries} categories={["Hits", "Misses"]} colors={["blue", "amber"]} label={rangeLabel} />
         <MetricCard title="Functions" metric="Invocations" value={fmtNum(totalReq)} href="/observability"
           data={reqSeries} categories={["Requests"]} colors={["blue"]} label={rangeLabel} />
         <MetricCard title="Middleware Invocations" metric="Invocations" value={fmtNum(totalMw)} href="/firewall"

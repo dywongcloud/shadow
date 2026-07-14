@@ -32,6 +32,7 @@ mod identity;
 mod incidents;
 mod integrations;
 mod metrics;
+mod resp_cache;
 mod microfrontends;
 mod microfrontends_api;
 mod notifications;
@@ -394,6 +395,20 @@ async fn main() -> anyhow::Result<()> {
     // Start the coalescing background persister: after this, persist() marks dirty
     // + wakes the writer instead of fsync-ing the whole state on the request thread.
     persist::spawn_persister(cloud.clone());
+    // Metrics hour/day rollups (metrics.rs's RollupSnapshot, the only durable slice
+    // of MetricsStore) are the sole exception to "persist() runs after every
+    // mutation": state.rs's record() — called on every single HTTP request — never
+    // calls persist(), so a tenant with real traffic but no OTHER admin mutation
+    // (deploy/db-create/team-edit etc.) since the last persist can lose its entire
+    // Weekly/Monthly usage history on an UNCLEAN shutdown (crash, OOM-kill, `kill
+    // -9` — the graceful SIGTERM flush below covers a clean `systemctl restart`,
+    // but not those). persist() is cheap to call even under heavy traffic (it only
+    // marks a dirty generation + wakes the coalescing background writer, which
+    // folds every mutation since its last drain into ONE capture+write) — a
+    // periodic safety-net call closes the gap, matching spawn_guardian_snapshot_
+    // loop's identical "periodic flush independent of mutation timing" fix for the
+    // same underlying bug class.
+    spawn_metrics_persist_loop(cloud.clone());
     // Graceful-shutdown flush: on SIGTERM/SIGINT (e.g. `systemctl restart`) write the
     // latest state synchronously so a restart loses nothing from the coalescing window.
     {
@@ -1537,6 +1552,18 @@ fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
             let snap = crate::persist::capture(&cloud);
             crate::guardian::replicate(&snap);
             tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// Periodic safety-net flush for metrics hour/day rollups — see the call site's
+/// comment in `main()` for the full bug this closes.
+fn spawn_metrics_persist_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_METRICS_PERSIST_SECS", 120));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            crate::persist::persist(&cloud);
         }
     });
 }

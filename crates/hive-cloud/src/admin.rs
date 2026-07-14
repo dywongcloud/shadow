@@ -10,6 +10,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine;
+use fluid_gateway::{RumDevice, RumRaw};
 use hive_core::{now_ms, BuildJob, JobState, ResourceSpec};
 use hive_edge::{
     bot::BotPolicy, routing::{Redirect, Rewrite}, waf::WafRule, CronJob, WorkflowDef,
@@ -177,6 +178,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/notifications/:id/archive", post(notification_archive))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
+        .route("/v1/speed-insights", get(speed_insights_get))
         // ---- Owner / ops dashboard ----
         .route("/v1/admin/overview", get(admin_overview))
         .route("/v1/admin/audit", get(admin_audit))
@@ -2378,15 +2380,9 @@ fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
 /// actually ran on the Firecracker nodes. Each `FunctionStats` carries its `tenant`.
 pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::FunctionStats> {
     let mut out: Vec<fluid_compute::FunctionStats> = c.fluid.stats();
-    let self_name = c.node_name.clone();
-    for n in c.registry.nodes() {
-        if n.name == self_name || !n.healthy {
-            continue;
-        }
-        if let Some(v) = fetch_from_host(c, &n.name, "/v1/functions", "").await {
-            if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
-                out.append(&mut stats);
-            }
+    for v in fan_out_peers(c, &all_healthy_peers(c), "", "/v1/functions").await {
+        if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
+            out.append(&mut stats);
         }
     }
     out
@@ -2444,6 +2440,44 @@ pub(crate) async fn fetch_from_host(c: &Arc<CloudState>, node: &str, path: &str,
         }
     }
     None
+}
+
+/// Fan out `path` (identical for every peer — only the target host varies) to
+/// every node in `peers` CONCURRENTLY, returning each reachable peer's parsed
+/// JSON response (unreachable/malformed peers are silently absent — never
+/// fail the whole read over one bad node).
+///
+/// Replaces the hand-rolled `for node in <peer list> { ...fetch_from_host
+/// (...).await... }` sequential loop that used to live in every one of these
+/// "merge every peer's view" handlers (metrics_get, wf_list, wf_runs,
+/// wf_summary, cron_list, fleet_function_stats, admin_overview). Each hop can
+/// carry up to `fetch_from_host`'s own 20s timeout, so N sequential hops could
+/// cost up to N×20s in the worst case (live-witnessed as the dashboard's
+/// slowest reads); `join_all` bounds the total added latency to the SLOWEST
+/// single hop instead of the sum of every hop — with a 10-node fleet this is
+/// up to a ~9x cut. Callers keep their own per-endpoint merge logic (it's
+/// cheap, in-memory, never the bottleneck) — only the network fan-out itself
+/// changes shape. `peers` is caller-supplied (not always "every healthy fleet
+/// node" — `peer_nodes_for_tenant` narrows to only nodes hosting the tenant's
+/// projects for the workflow endpoints).
+async fn fan_out_peers(c: &Arc<CloudState>, peers: &[String], team: &str, path: &str) -> Vec<Value> {
+    futures::future::join_all(peers.iter().map(|name| fetch_from_host(c, name, path, team)))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Every OTHER healthy node in the registry — the peer set for fan-outs that
+/// aren't tenant-scoped (metrics/cron/functions/overview see the whole fleet).
+fn all_healthy_peers(c: &Arc<CloudState>) -> Vec<String> {
+    let self_name = c.node_name.clone();
+    c.registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.name != self_name && n.healthy)
+        .map(|n| n.name)
+        .collect()
 }
 
 async fn project_redeploy(
@@ -3078,12 +3112,22 @@ async fn regions(
     Ok(Json(json!(c.registry.regions())))
 }
 
+/// TENANT-SCOPED function stats (Usage page's cost breakdown, the Functions
+/// list page, service-graph/deployment-canvas overlays). Previously gated
+/// behind `require_operator` — a hard 401/403 for every non-owner user, so
+/// all four dashboard consumers silently showed zero invocations/CPU/memory
+/// (and, on the Usage page, near-zero computed dollar charges) for the
+/// overwhelming majority of real users. No admin-only page ever depended on
+/// this endpoint's previous all-tenants shape — fixed the same way
+/// `databases_list` already scopes `/v1/databases`.
 pub async fn functions(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!(c.fluid.stats())))
+) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let list: Vec<_> = c.fluid.stats().into_iter().filter(|f| norm(&f.tenant) == t).collect();
+    Json(json!(list))
 }
 
 /// Tunnel reuse + #14 byte/backpressure metering for this node's gateway.
@@ -3605,18 +3649,12 @@ pub(crate) async fn cron_list(State(c): State<Arc<CloudState>>, headers: HeaderM
     // this can never double-fire or drop a follower-hosted deployment's cron.
     // `?local=true` (the internal fan-out marker) short-circuits the recursion.
     if !q.local.unwrap_or(false) {
-        let self_name = c.node_name.clone();
         // `seen` already holds this node's own (deduped) job ids from above.
-        for n in c.registry.nodes() {
-            if n.name == self_name || !n.healthy {
-                continue;
-            }
-            if let Some(v) = fetch_from_host(&c, &n.name, "/v1/cron?local=true", &t).await {
-                if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
-                    for j in peer_jobs {
-                        if seen.insert(j.id.clone()) {
-                            jobs.push(j);
-                        }
+        for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, "/v1/cron?local=true").await {
+            if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
+                for j in peer_jobs {
+                    if seen.insert(j.id.clone()) {
+                        jobs.push(j);
                     }
                 }
             }
@@ -3790,14 +3828,12 @@ pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap
             .iter()
             .map(|d| format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or("")))
             .collect();
-        for node in peer_nodes_for_tenant(&c, &team) {
-            if let Some(v) = fetch_from_host(&c, &node, "/v1/workflows?local=true", &team).await {
-                if let Some(arr) = v.as_array() {
-                    for d in arr {
-                        let key = format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or(""));
-                        if seen.insert(key) {
-                            defs.push(d.clone());
-                        }
+        for v in fan_out_peers(&c, &peer_nodes_for_tenant(&c, &team), &team, "/v1/workflows?local=true").await {
+            if let Some(arr) = v.as_array() {
+                for d in arr {
+                    let key = format!("{}\u{0}{}", d.get("project").and_then(|x| x.as_str()).unwrap_or(""), d.get("id").and_then(|x| x.as_str()).unwrap_or(""));
+                    if seen.insert(key) {
+                        defs.push(d.clone());
                     }
                 }
             }
@@ -3821,10 +3857,25 @@ async fn wf_define(
 
 pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Cache this endpoint's result for a couple seconds — it's "the most
+    // expensive read on the dashboard" per the comments below (fleet fan-out
+    // PLUS per-project Upstash world reads on every call), so collapsing
+    // concurrent/rapid requests from multiple tabs/team members matters more
+    // here than almost anywhere else. Never cache the inner `local=true` hop.
+    let is_top_level = !q.local.unwrap_or(false);
+    let cache_key = format!("wf_runs:{team}:{}:{}", q.project.as_deref().unwrap_or(""), q.summary.unwrap_or(false));
+    if is_top_level {
+        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(2)) {
+            return Json(v);
+        }
+    }
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() {
             if let Some(node) = host_node_for_project(&c, project) {
                 if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs?project={project}&local=true"), &team).await {
+                    if is_top_level {
+                        c.resp_cache.set(cache_key.clone(), v.clone());
+                    }
                     return Json(v);
                 }
             }
@@ -3859,10 +3910,13 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
             }
         };
         locals.retain(|p| crate::world::has_world(&c, p));
-        for proj in locals {
-            if let Some(wruns) = crate::world::list_runs(&c, &proj, 100).await {
-                runs.extend(wruns);
-            }
+        // Per-project Upstash world reads run CONCURRENTLY — a tenant with many
+        // projects previously paid one Upstash round-trip per project, one at a
+        // time (this function's own doc/comment history calls it "the most
+        // expensive read on the dashboard"). join_all bounds the added latency to
+        // the slowest single project's read instead of the sum of every project.
+        for wruns in futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100))).await.into_iter().flatten() {
+            runs.extend(wruns);
         }
     }
     let run_key = |r: &Value| -> Option<String> {
@@ -3870,14 +3924,13 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
     };
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
-        for node in peer_nodes_for_tenant(&c, &team) {
-            if let Some(v) = fetch_from_host(&c, &node, "/v1/workflows/runs?local=true", &team).await {
-                if let Some(arr) = v.as_array() {
-                    for r in arr {
-                        if let Some(id) = run_key(r) {
-                            if seen.insert(id) {
-                                runs.push(r.clone());
-                            }
+        let peers = peer_nodes_for_tenant(&c, &team);
+        for v in fan_out_peers(&c, &peers, &team, "/v1/workflows/runs?local=true").await {
+            if let Some(arr) = v.as_array() {
+                for r in arr {
+                    if let Some(id) = run_key(r) {
+                        if seen.insert(id) {
+                            runs.push(r.clone());
                         }
                     }
                 }
@@ -3900,7 +3953,11 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
             }
         }
     }
-    Json(json!(runs))
+    let result = json!(runs);
+    if is_top_level {
+        c.resp_cache.set(cache_key, result.clone());
+    }
+    Json(result)
 }
 
 /// One run with full step detail (for the trace timeline / Gantt). Resolves from
@@ -3927,14 +3984,14 @@ pub(crate) async fn wf_run_detail(
     }
     let found = |v: &Value| v.get("run").map(|r| !r.is_null()).unwrap_or(false);
     // 1) Explicit project (proxy to its host node over iroh if remote, else local).
+    // Candidate hosts queried CONCURRENTLY — a project hosted on the LAST
+    // candidate used to cost one sequential hop per candidate before this fix.
     if let Some(project) = q.project.as_deref() {
         if !q.local.unwrap_or(false) {
-            for node in host_nodes_for_project(&c, project) {
-                if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs/{id}?project={project}&local=true"), &team).await {
-                    if found(&v) {
-                        return Ok(Json(v));
-                    }
-                }
+            let hosts = host_nodes_for_project(&c, project);
+            let path = format!("/v1/workflows/runs/{id}?project={project}&local=true");
+            if let Some(v) = fan_out_peers(&c, &hosts, &team, &path).await.into_iter().find(|v| found(v)) {
+                return Ok(Json(v));
             }
         }
         if let Some(detail) = crate::world::run_detail(&c, project, &id).await {
@@ -3955,23 +4012,19 @@ pub(crate) async fn wf_run_detail(
         }
         s.into_iter().collect()
     };
-    for p in locals {
-        if crate::world::has_world(&c, &p) {
-            if let Some(detail) = crate::world::run_detail(&c, &p, &id).await {
-                if found(&detail) {
-                    return Ok(Json(detail));
-                }
-            }
-        }
+    let world_locals: Vec<String> = locals.into_iter().filter(|p| crate::world::has_world(&c, p)).collect();
+    // Concurrent per-project Upstash world reads (was one sequential hop per
+    // locally-hosted project — same "most expensive read" class as wf_runs).
+    let details = futures::future::join_all(world_locals.iter().map(|p| crate::world::run_detail(&c, p, &id))).await;
+    if let Some(detail) = details.into_iter().flatten().find(|d| found(d)) {
+        return Ok(Json(detail));
     }
-    // 3) Fleet: ask peers hosting this tenant's projects to resolve it (over iroh).
+    // 3) Fleet: ask peers hosting this tenant's projects to resolve it (over iroh), concurrently.
     if !q.local.unwrap_or(false) {
-        for node in peer_nodes_for_tenant(&c, &team) {
-            if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs/{id}?local=true"), &team).await {
-                if found(&v) {
-                    return Ok(Json(v));
-                }
-            }
+        let peers = peer_nodes_for_tenant(&c, &team);
+        let path = format!("/v1/workflows/runs/{id}?local=true");
+        if let Some(v) = fan_out_peers(&c, &peers, &team, &path).await.into_iter().find(|v| found(v)) {
+            return Ok(Json(v));
         }
     }
     Err(StatusCode::NOT_FOUND)
@@ -4000,20 +4053,19 @@ pub(crate) async fn wf_summary(State(c): State<Arc<CloudState>>, headers: Header
     // Merge peer rollups (the tenant's projects placed on other nodes). A project
     // lives on one host, so per-project rows don't overlap; sum defensively.
     if !q.local.unwrap_or(false) {
-      for node in peer_nodes_for_tenant(&c, &team) {
-        if let Some(v) = fetch_from_host(&c, &node, "/v1/workflows/summary?local=true", &team).await {
-            if let Some(arr) = v.as_array() {
-                for r in arr {
-                    let proj = r.get("project").and_then(|x| x.as_str()).unwrap_or("default").to_string();
-                    let e = agg.entry(proj).or_insert((0, 0, 0, 0));
-                    let g = |k: &str| r.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
-                    e.0 += g("created");
-                    e.1 += g("completed");
-                    e.2 += g("failed");
-                    e.3 += g("active");
-                }
-            }
-        }
+      let peers = peer_nodes_for_tenant(&c, &team);
+      for v in fan_out_peers(&c, &peers, &team, "/v1/workflows/summary?local=true").await {
+          if let Some(arr) = v.as_array() {
+              for r in arr {
+                  let proj = r.get("project").and_then(|x| x.as_str()).unwrap_or("default").to_string();
+                  let e = agg.entry(proj).or_insert((0, 0, 0, 0));
+                  let g = |k: &str| r.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+                  e.0 += g("created");
+                  e.1 += g("completed");
+                  e.2 += g("failed");
+                  e.3 += g("active");
+              }
+          }
       }
     }
     let rows: Vec<Value> = agg
@@ -4501,17 +4553,23 @@ async fn project_service_graph(State(c): State<Arc<CloudState>>, headers: Header
         return Ok(Json(json!(g)));
     }
     // Not hosted here — the graph (or the source to scan) lives on whichever node
-    // built the project. Fan out to every OTHER healthy peer and return the first
-    // that has it (each answers from its LOCAL store/scan + team-checks → no re-proxy
-    // loop, no cross-tenant leak). Registry is the reliable peer set (trunk-warmed).
+    // built the project. Fan out to every OTHER reachable peer CONCURRENTLY and
+    // return the first that has it (each answers from its LOCAL store/scan +
+    // team-checks → no re-proxy loop, no cross-tenant leak). Registry is the
+    // reliable peer set (trunk-warmed). Concurrent rather than the old
+    // first-match-wins sequential loop — a project hosted on the LAST-checked
+    // node used to cost N sequential hops; now it costs one concurrent round.
     let self_name = c.node_name.clone();
-    for n in c.registry.nodes() {
-        if n.name == self_name || n.iroh_addr.is_none() {
-            continue;
-        }
-        if let Some(v) = fetch_from_host(&c, &n.name, &format!("/v1/projects/{project}/service-graph"), &t).await {
-            return Ok(Json(v));
-        }
+    let peers: Vec<String> = c
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.name != self_name && n.iroh_addr.is_some())
+        .map(|n| n.name)
+        .collect();
+    let path = format!("/v1/projects/{project}/service-graph");
+    if let Some(v) = fan_out_peers(&c, &peers, &t, &path).await.into_iter().next() {
+        return Ok(Json(v));
     }
     Err(StatusCode::NOT_FOUND)
 }
@@ -5387,24 +5445,29 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
     // metrics through the separate operator-gated `admin_overview`.)
     let scope = Some(t.as_str());
     let project = q.project.as_deref().filter(|p| !p.is_empty());
+    // Cache the fleet-fan-out result (never the inner `local=true` hop) for a
+    // few seconds — collapses redundant fan-outs from multiple tabs/team
+    // members viewing the same tenant's metrics within the window into one
+    // real cross-node round.
+    let is_top_level = !q.local.unwrap_or(false);
+    let cache_key = format!("metrics:{t}:{minutes}:{}:{}", q.gran.as_deref().unwrap_or("minute"), project.unwrap_or(""));
+    if is_top_level {
+        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(3)) {
+            return Json(v);
+        }
+    }
     let mut series = c.metrics.series(gran, minutes, now_ms(), scope, project);
     let mut status_distribution = c.metrics.status_distribution(scope);
     let mut top_paths: std::collections::HashMap<String, u64> = c.metrics.top_paths(scope, 200).into_iter().collect();
     let mut projects: std::collections::HashMap<String, u64> = c.metrics.project_totals(gran, minutes, now_ms(), scope).into_iter().collect();
 
     if !q.local.unwrap_or(false) {
-        let self_name = c.node_name.clone();
-        for n in c.registry.nodes() {
-            if n.name == self_name || !n.healthy {
-                continue;
-            }
-            let mut path = format!("/v1/metrics?local=true&minutes={minutes}&gran={}", q.gran.as_deref().unwrap_or("minute"));
-            if let Some(p) = project {
-                path.push_str(&format!("&project={}", urlencode(p)));
-            }
-            if let Some(v) = fetch_from_host(&c, &n.name, &path, &t).await {
-                merge_peer_metrics(&v, &mut series, &mut status_distribution, &mut top_paths, &mut projects);
-            }
+        let mut path = format!("/v1/metrics?local=true&minutes={minutes}&gran={}", q.gran.as_deref().unwrap_or("minute"));
+        if let Some(p) = project {
+            path.push_str(&format!("&project={}", urlencode(p)));
+        }
+        for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, &path).await {
+            merge_peer_metrics(&v, &mut series, &mut status_distribution, &mut top_paths, &mut projects);
         }
     }
 
@@ -5420,7 +5483,7 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
     top_paths_v.truncate(10);
     let mut projects_v: Vec<(String, u64)> = projects.into_iter().collect();
     projects_v.sort_by(|a, b| b.1.cmp(&a.1));
-    Json(json!({
+    let result = json!({
         "series": series,
         "totals": {
             "requests": total_req,
@@ -5432,7 +5495,62 @@ async fn metrics_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claim
         "status_distribution": status_distribution,
         "top_paths": top_paths_v.into_iter().map(|(p, n)| json!({ "path": p, "count": n })).collect::<Vec<_>>(),
         "projects": projects_v.into_iter().map(|(p, n)| json!({ "project": p, "requests": n })).collect::<Vec<_>>(),
-    }))
+    });
+    if is_top_level {
+        c.resp_cache.set(cache_key, result.clone());
+    }
+    Json(result)
+}
+
+#[derive(Deserialize)]
+struct SpeedInsightsQ {
+    minutes: Option<usize>,
+    /// "desktop" | "mobile" — absent means both.
+    device: Option<String>,
+    /// Set by the fleet fan-out's own inner call — same single-hop rationale
+    /// as `metrics_get`'s `MetricsQ.local` (RUM samples are node-local: a
+    /// tenant's visitors can land on any node the routing mesh sends them to).
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    local: Option<bool>,
+}
+
+fn parse_device(s: Option<&str>) -> Option<RumDevice> {
+    match s {
+        Some("mobile") => Some(RumDevice::Mobile),
+        Some("desktop") => Some(RumDevice::Desktop),
+        _ => None,
+    }
+}
+
+/// Real User Monitoring summary for the Speed Insights page — p75/p90/p95/p99
+/// per Core Web Vital, a computed Real Experience Score, real top routes by
+/// beacon count, and the true sample count. See `fluid_gateway::RumStore` for
+/// where the underlying beacon data actually lives (this endpoint was
+/// entirely missing before — the beacon fired and was silently 202-accepted
+/// with no storage, and the dashboard's Speed Insights page was a hardcoded
+/// empty stub waiting for exactly this).
+async fn speed_insights_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Query(q): Query<SpeedInsightsQ>) -> Json<Value> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let minutes = q.minutes.unwrap_or(10_080); // default "Last 7 Days"
+    let device = parse_device(q.device.as_deref());
+    let mut raw = c.gw.rum_raw(&t, minutes, device);
+    if q.local.unwrap_or(false) {
+        return Json(json!(raw));
+    }
+    let cache_key = format!("speed-insights:{t}:{minutes}:{}", q.device.as_deref().unwrap_or(""));
+    if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(5)) {
+        return Json(v);
+    }
+    let dev_qs = q.device.as_deref().map(|d| format!("&device={d}")).unwrap_or_default();
+    let path = format!("/v1/speed-insights?local=true&minutes={minutes}{dev_qs}");
+    for v in fan_out_peers(&c, &all_healthy_peers(&c), &t, &path).await {
+        if let Ok(peer_raw) = serde_json::from_value::<RumRaw>(v) {
+            raw.merge(&peer_raw);
+        }
+    }
+    let result = json!(raw.summarize());
+    c.resp_cache.set(cache_key, result.clone());
+    Json(result)
 }
 
 // ============================ Owner / ops dashboard ============================
@@ -5470,12 +5588,7 @@ async fn admin_overview(
     // node happens to serve the request, understating real fleet traffic by up
     // to 8x. `local=true` on the fan-out call stops peer recursion (one hop).
     if !q.map(|Query(q)| q.local.unwrap_or(false)).unwrap_or(false) {
-        let self_name = c.node_name.clone();
-        for n in &nodes {
-            if n.name == self_name || !n.healthy {
-                continue;
-            }
-            let Some(v) = fetch_from_host(&c, &n.name, "/v1/admin/overview?local=true", "").await else { continue };
+        for v in fan_out_peers(&c, &all_healthy_peers(&c), "", "/v1/admin/overview?local=true").await {
             reqs += v.get("requests").and_then(|x| x.as_u64()).unwrap_or(0);
             blocked += v.get("blocked").and_then(|x| x.as_u64()).unwrap_or(0);
             req30 += v.get("req30").and_then(|x| x.as_u64()).unwrap_or(0);

@@ -231,6 +231,10 @@ pub struct CloudState {
     pub webhooks: Arc<crate::webhooks::WebhookStore>,
     pub databases: Arc<crate::databases::DatabaseStore>,
     pub metrics: crate::metrics::MetricsStore,
+    /// Short-TTL cache for expensive fleet-fan-out reads — see `resp_cache`'s
+    /// module doc for why this exists (client-side caching alone doesn't
+    /// de-dupe across tabs/users hitting the same tenant's expensive view).
+    pub resp_cache: crate::resp_cache::ResponseCache,
     pub incidents: crate::incidents::IncidentStore,
     pub securelinks: crate::securelink::SecureLinkStore,
     pub apikeys: crate::apikeys::ApiKeyStore,
@@ -549,6 +553,7 @@ impl CloudState {
             webhooks: Arc::new(crate::webhooks::WebhookStore::new()),
             databases: Arc::new(crate::databases::DatabaseStore::new()),
             metrics: crate::metrics::MetricsStore::new(),
+            resp_cache: crate::resp_cache::ResponseCache::new(),
             incidents: crate::incidents::IncidentStore::new(),
             securelinks: crate::securelink::SecureLinkStore::new(),
             apikeys: crate::apikeys::ApiKeyStore::new(),

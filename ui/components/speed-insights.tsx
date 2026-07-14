@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { ChevronDown, Calendar, CheckCircle2, AlertTriangle, XCircle, ChevronRight, ExternalLink, Maximize2 } from "lucide-react";
 import { Card } from "@/components/ui";
-import { usePoll, type Metrics } from "@/lib/api";
+import { usePoll } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const LineChart = dynamic(() => import("@tremor/react").then((m) => m.LineChart), { ssr: false });
@@ -21,18 +21,52 @@ interface Vital {
   rating: Rating;
 }
 
-// Core Web Vitals come from REAL User Monitoring (a client web-vitals beacon
-// reporting FCP/LCP/INP/CLS/TTFB per tenant). That backend isn't wired yet, so we
-// show NO fabricated values — an honest "collecting" empty state instead. When the
-// RUM ingest lands, this array is populated from the per-tenant p75 samples.
-const VITAL_LABELS: { key: string; label: string }[] = [
-  { key: "fcp", label: "First Contentful Paint" },
-  { key: "lcp", label: "Largest Contentful Paint" },
-  { key: "inp", label: "Interaction to Next Paint" },
-  { key: "cls", label: "Cumulative Layout Shift" },
-  { key: "ttfb", label: "Time to First Byte" },
+interface VitalPercentiles {
+  fcp: number | null;
+  lcp: number | null;
+  cls: number | null;
+  inp: number | null;
+  ttfb: number | null;
+}
+interface RouteScore {
+  route: string;
+  count: number;
+  res: number | null;
+  p75: VitalPercentiles;
+}
+interface RumSummary {
+  sample_count: number;
+  res: number | null;
+  p75: VitalPercentiles;
+  p90: VitalPercentiles;
+  p95: VitalPercentiles;
+  p99: VitalPercentiles;
+  routes: RouteScore[];
+}
+
+// Real User Monitoring, backed by GET /v1/speed-insights (the
+// @vercel/speed-insights beacon's FCP/LCP/CLS/INP/TTFB samples, stored +
+// percentiled server-side — see fluid-gateway's RumStore). Good/poor
+// thresholds mirror the server's own res_score() exactly, so the rail's
+// great/needs/poor classification and the RES gauge always agree.
+const VITAL_LABELS: { key: keyof VitalPercentiles; label: string; good: number; poor: number }[] = [
+  { key: "fcp", label: "First Contentful Paint", good: 1800, poor: 3000 },
+  { key: "lcp", label: "Largest Contentful Paint", good: 2500, poor: 4000 },
+  { key: "inp", label: "Interaction to Next Paint", good: 200, poor: 500 },
+  { key: "cls", label: "Cumulative Layout Shift", good: 0.1, poor: 0.25 },
+  { key: "ttfb", label: "Time to First Byte", good: 800, poor: 1800 },
 ];
-const VITALS: Vital[] = []; // no RUM data source yet — never fabricate values
+
+function ratingOf(value: number, good: number, poor: number): Rating {
+  if (value <= good) return "great";
+  if (value <= poor) return "needs";
+  return "poor";
+}
+
+function fmtVital(key: keyof VitalPercentiles, value: number): string {
+  if (key === "cls") return value.toFixed(2);
+  return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.round(value)} ms`;
+}
 
 const RATING_COLOR: Record<Rating, string> = {
   great: "#3fa45a",
@@ -42,29 +76,57 @@ const RATING_COLOR: Record<Rating, string> = {
 
 const PERCENTILES = ["P75", "P90", "P95", "P99"] as const;
 const RANGES = ["Last 24 Hours", "Last 7 Days", "Last 30 Days"] as const;
+const RANGE_MINUTES: Record<(typeof RANGES)[number], number> = {
+  "Last 24 Hours": 1_440,
+  "Last 7 Days": 10_080,
+  "Last 30 Days": 43_200,
+};
 
 export function SpeedInsights() {
-  const { data } = usePoll<Metrics>("/v1/metrics?minutes=720", 8000);
   const [device, setDevice] = useState<"Desktop" | "Mobile">("Desktop");
   const [pct, setPct] = useState<(typeof PERCENTILES)[number]>("P75");
   const [range, setRange] = useState<(typeof RANGES)[number]>("Last 7 Days");
   const [tab, setTab] = useState<"routes" | "paths">("routes");
-
-  // No RUM ingest yet → there is NO Real Experience Score, no per-vital p75, no
-  // geo breakdown. We show honest empty states rather than fabricated numbers.
-  // `res === null` renders as "collecting"; `rumDataPoints` is the real count (0
-  // until the beacon lands). The path list below IS real (top request paths), but
-  // it carries no RES score without RUM.
-  const res: number | null = null;
-  const rumDataPoints = 0;
-  const chart: { t: string; RES: number }[] = [];
-
-  // Real top request paths (tenant-scoped) — actual traffic, no fabricated score.
-  const routes = useMemo(
-    () => (data?.top_paths ?? []).map((p) => ({ route: p.path, points: p.count, res: null as number | null })),
-    [data],
+  const { data } = usePoll<RumSummary>(
+    `/v1/speed-insights?minutes=${RANGE_MINUTES[range]}&device=${device.toLowerCase()}`,
+    15_000,
   );
-  const hasRum = false; // flips true when the RUM ingest is wired
+
+  const res = data?.res ?? null;
+  const rumDataPoints = data?.sample_count ?? 0;
+  const hasRum = rumDataPoints > 0;
+  // No time-bucketed RUM history yet (only an aggregate over the selected
+  // range) — show the real current score as a single point rather than
+  // fabricating a trend line the backend doesn't actually have data for.
+  const chart: { t: string; RES: number }[] = res !== null ? [{ t: "now", RES: res }] : [];
+
+  const selectedPercentiles: VitalPercentiles | undefined = data
+    ? { P75: data.p75, P90: data.p90, P95: data.p95, P99: data.p99 }[pct]
+    : undefined;
+
+  const VITALS: Vital[] = useMemo(() => {
+    if (!selectedPercentiles) return [];
+    return VITAL_LABELS.flatMap(({ key, label, good, poor }) => {
+      const value = selectedPercentiles[key];
+      if (value === null || value === undefined) return [];
+      const rating = ratingOf(value, good, poor);
+      const pos = 1 - Math.min(1, Math.max(0, (value - good) / (poor - good)));
+      return [{ key, label, value: fmtVital(key, value), pos, rating }];
+    });
+  }, [selectedPercentiles]);
+
+  // Real per-route scores (each route's own p75 + RES, computed server-side
+  // the same way as the aggregate) — a route only ever lands in the bucket
+  // its OWN performance earns, never forced into "Great" just because it's
+  // the only bucket with data.
+  const routeBuckets = useMemo(() => {
+    const buckets: Record<Rating, { route: string; points: number; res: number | null }[]> = { great: [], needs: [], poor: [] };
+    for (const r of data?.routes ?? []) {
+      const rating: Rating = r.res === null ? "great" : r.res >= 90 ? "great" : r.res >= 50 ? "needs" : "poor";
+      buckets[rating].push({ route: r.route, points: r.count, res: r.res });
+    }
+    return buckets;
+  }, [data]);
 
   return (
     <div>
@@ -102,11 +164,11 @@ export function SpeedInsights() {
             label="Real Experience Score"
             value={<Gauge score={res} size={36} />}
           />
-          {(VITALS.length ? VITALS : VITAL_LABELS.map((l) => ({ ...l, value: "—", pos: 0, rating: "great" as Rating }))).map((v) => (
+          {(VITALS.length ? VITALS : VITAL_LABELS.map((l) => ({ key: l.key, label: l.label, value: "—", pos: 0, rating: "great" as Rating }))).map((v) => (
             <RailRow
               key={v.key}
               label={v.label}
-              value={<span className="text-base font-semibold tabular-nums text-muted">{v.value}</span>}
+              value={<span className={cn("text-base font-semibold tabular-nums", VITALS.length ? "" : "text-muted")}>{v.value}</span>}
             />
           ))}
         </Card>
@@ -120,14 +182,22 @@ export function SpeedInsights() {
                 <div className="text-xs text-secondary">{device}</div>
                 <h2 className="mb-3 text-xl font-semibold">Real Experience Score</h2>
                 <Gauge score={res} size={88} />
-                <div className="mt-3 flex items-center gap-1.5 text-sm font-medium text-muted">
-                  <AlertTriangle className="h-4 w-4" /> Collecting
-                </div>
-                <p className="mt-3 text-sm text-secondary">
-                  Core Web Vitals are measured from real visits via the RUM beacon. No real-user
-                  samples have been collected yet, so no score is shown — values populate here once
-                  the beacon reports FCP/LCP/INP/CLS/TTFB.
-                </p>
+                {hasRum ? (
+                  <p className="mt-3 text-sm text-secondary">
+                    Based on {rumDataPoints.toLocaleString()} real-user samples over {range.toLowerCase()}.
+                  </p>
+                ) : (
+                  <>
+                    <div className="mt-3 flex items-center gap-1.5 text-sm font-medium text-muted">
+                      <AlertTriangle className="h-4 w-4" /> Collecting
+                    </div>
+                    <p className="mt-3 text-sm text-secondary">
+                      Core Web Vitals are measured from real visits via the RUM beacon. No real-user
+                      samples have been collected yet, so no score is shown — values populate here once
+                      the beacon reports FCP/LCP/INP/CLS/TTFB.
+                    </p>
+                  </>
+                )}
               </div>
 
               {/* RES chart */}
@@ -190,13 +260,13 @@ export function SpeedInsights() {
                 ))}
               </div>
               <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-                <Bucket icon={<XCircle className="h-4 w-4 text-red-500" />} title="Poor" range="<50" items={[]} />
-                <Bucket icon={<AlertTriangle className="h-4 w-4 text-amber-500" />} title="Needs Improvement" range="50 - 90" items={[]} />
+                <Bucket icon={<XCircle className="h-4 w-4 text-red-500" />} title="Poor" range="<50" items={routeBuckets.poor} />
+                <Bucket icon={<AlertTriangle className="h-4 w-4 text-amber-500" />} title="Needs Improvement" range="50 - 90" items={routeBuckets.needs} />
                 <Bucket
                   icon={<CheckCircle2 className="h-4 w-4 text-green" />}
                   title="Great"
                   range=">90"
-                  items={routes}
+                  items={routeBuckets.great}
                   highlight
                 />
               </div>
