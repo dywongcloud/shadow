@@ -162,7 +162,19 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
             let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| capable(n)).collect();
             let mut pool = if eligibles.is_empty() { cands } else { eligibles };
             pool.sort_by_key(|n| load_of(&n.name));
-            let chosen = pool[0];
+            // Prefer the COORDINATOR itself when it's a valid candidate for this
+            // region: a local build has full log fidelity and zero cross-node
+            // dispatch/mirror dependency, whereas dispatching to a remote node
+            // (esp. an iroh-only one) hinges on the mesh round-trip both
+            // delivering the deploy AND streaming the build log back -- if that
+            // mirror stalls, the dashboard shows a build stuck at "dispatching"
+            // even though the deployment succeeded remotely. Pure load-sorting
+            // otherwise sends every deploy to whichever peer is idlest (a fresh
+            // node with 0 deployments always wins), which is exactly how a
+            // brand-new node became the sink for every build. Self only wins the
+            // region it's actually IN; other regions still pick the least-loaded
+            // node there.
+            let chosen = pool.iter().copied().find(|n| n.name == me).unwrap_or(pool[0]);
             if seen.insert(chosen.name.clone()) {
                 targets.push(target_of(chosen));
             }
@@ -194,7 +206,15 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| load_of(&a.name).cmp(&load_of(&b.name)))
     });
-    let chosen = elig[0];
+    // Prefer the coordinator itself when it's eligible: `self` is always the
+    // nearest node (distance 0 to its own geo), so this only overrides the
+    // load-tiebreak that otherwise ships every deploy to whichever same-region
+    // peer is idlest — which is how a fresh 0-deployment node became the sink
+    // for every build, then failed each one on the fragile cross-node dispatch/
+    // mirror path. A local build has full log fidelity and no mesh dependency.
+    // When `self` isn't eligible (e.g. a mock/LA coordinator), the nearest
+    // eligible remote still wins.
+    let chosen = elig.iter().copied().find(|n| n.name == me).unwrap_or(elig[0]);
     vec![target_of(chosen)]
 }
 

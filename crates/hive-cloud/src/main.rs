@@ -1655,8 +1655,33 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             }
             if let Some(pid) = peer_self_id {
                 cloud.registry.set_health(&pid, rtt, true);
-                if !peer.starts_with("seed:") {
+                // `node_admins` MUST hold only real HTTP(S) admin URLs — the
+                // deploy dispatcher (see git.rs / schedule.rs) treats any entry
+                // here as "reachable via HTTP" and does `http.post(format!(
+                // "{admin}/v1/git/deploy"))`. A peer reached over IROH has a
+                // 64-char-hex node-id (or a `seed:` key) as its gossip `peer`
+                // key, NOT a URL — storing that poisons node_admins so every
+                // deploy placed on that node fails with a reqwest "builder
+                // error" (unparseable URL) instead of falling back to the
+                // working iroh dispatch route. So: insert ONLY for http(s)
+                // peers, and REMOVE any stale entry when the same node is now
+                // only iroh-reachable (a node that lost its HTTP tunnel).
+                if peer.starts_with("http://") || peer.starts_with("https://") {
                     cloud.node_admins.write().insert(pid, peer.clone());
+                } else {
+                    // Iroh/seed key, not a URL. Clean a POISONED (non-http)
+                    // stored value, but never clobber a good HTTP admin URL the
+                    // same node may have registered via a different (http-
+                    // tunnel) gossip key this or a prior round — else the entry
+                    // would flap present/absent across rounds.
+                    let mut m = cloud.node_admins.write();
+                    let poisoned = m
+                        .get(&pid)
+                        .map(|a| !(a.starts_with("http://") || a.starts_with("https://")))
+                        .unwrap_or(false);
+                    if poisoned {
+                        m.remove(&pid);
+                    }
                 }
                 cloud.mark_gossip_ok();
             }
