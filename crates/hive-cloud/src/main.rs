@@ -1031,7 +1031,14 @@ async fn admin_ingress(
     if crate::auth::enforced() {
         let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
         let path = req.uri().path();
-        let open = path == "/healthz" || path == "/v1/token" || path == "/v1/git/webhook";
+        // Keep in sync with auth::require_auth's `open` list — the zkauth
+        // preview-unlock endpoints authenticate via a shared x-hive-internal
+        // secret (zkauth::internal_ok), never a platform JWT.
+        let open = path == "/healthz"
+            || path == "/v1/token"
+            || path == "/v1/git/webhook"
+            || path == "/v1/zkauth/register"
+            || path == "/v1/zkauth/preview-proof";
         if is_mutation && !open {
             let ok = crate::auth::extract_token(req.headers()).and_then(|t| crate::auth::verify(&t).ok()).is_some();
             if !ok {

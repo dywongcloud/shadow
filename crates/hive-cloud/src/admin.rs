@@ -105,6 +105,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/build", put(project_build_put))
         .route("/v1/projects/:project/functions", put(project_functions_put))
         .route("/v1/projects/:project/cron-enabled", put(project_cron_enabled_put))
+        .route("/v1/projects/:project/git-ci", put(project_git_ci_put))
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route("/v1/projects/:project/service-graph", get(project_service_graph))
@@ -459,6 +460,27 @@ async fn project_functions_put(
     // toggle silently never saved. The runtime `order_candidates` already honors
     // this flag; the setting should reflect what the operator selected.)
     c.projects.set_functions(&project, f);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// Records the outcome of the auto-CI install attempted right after a
+/// project's first git import (`/api/gitops/project-ci`). Called by the
+/// dashboard immediately after that fetch resolves — previously the result
+/// was discarded entirely (fire-and-forget), so a project imported without a
+/// completed GitHub OAuth connection silently got no webhook AND no Actions
+/// fallback installed, with no future push ever auto-deploying and no
+/// visible error anywhere. See [`crate::project_settings::GitCiStatus`].
+async fn project_git_ci_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(mut status): Json<crate::project_settings::GitCiStatus>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    status.checked_ms = hive_core::now_ms();
+    c.projects.set_git_ci(&project, status);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
@@ -2248,6 +2270,7 @@ fn git_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_cor
         .values()
         .flatten()
         .filter(|d| d.project == project)
+        .filter(|d| d.git.as_ref().is_some_and(|g| g.is_real_git()))
         .max_by_key(|d| d.created_at_ms)
         .and_then(|d| d.git.clone())
 }
@@ -2666,6 +2689,7 @@ async fn git_webhook(
         return Err((StatusCode::BAD_REQUEST, "missing repository".into()));
     }
     let want = crate::gitops::norm_repo(&repo_full);
+    tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, "git_webhook: received");
 
     // Deploy every project pointing at this repo for the pushed/PR branch. We do
     // NOT filter by branch: a push to a non-production branch (or a PR) is exactly
@@ -2711,6 +2735,18 @@ async fn git_webhook(
             "target": target.clone().unwrap_or_else(|| "auto".into()),
             "branch": branch,
         }));
+    }
+
+    if triggered.is_empty() {
+        // The single most common "preview build never starts" shape: a
+        // webhook/Actions-fallback delivery arrived and was accepted (no auth/
+        // signature error), but matched zero locally-known-or-fleet-gossiped
+        // projects for `want` — invisible before this line, since a 200 with
+        // `triggered: 0` looks identical to a genuine no-op from the GitHub
+        // delivery's own "Recent Deliveries" view.
+        tracing::warn!(repo = %want, event = %event, "git_webhook: no project matched this repo — build not started");
+    } else {
+        tracing::info!(repo = %want, event = %event, triggered = triggered.len(), "git_webhook: build(s) started");
     }
 
     Ok(Json(json!({

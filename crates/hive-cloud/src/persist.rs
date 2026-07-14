@@ -462,6 +462,25 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // Restore in chronological order so the newest becomes the default.
     deployments.sort_by_key(|d| d.created_at_ms);
     let n = deployments.len();
+    // Reconcile orphaned in-flight builds. A deployment/build persisted with
+    // state Queued/Building was mid-flight in an async task on the PREVIOUS
+    // process instance — that task died with the process, so on a fresh boot
+    // this state can never legitimately still be in progress. Left as-is, it
+    // stays "Building" forever (an infinite dashboard spinner with zero log
+    // activity, no error, no way to retry) — live-witnessed: a preview
+    // deployment orphaned by an unrelated node restart stayed stuck for 2+
+    // hours, which is indistinguishable from "the build never starts" to the
+    // user. Reconciling to Error on boot gives an actionable, retryable state
+    // instead of a silent hang.
+    let orphaned_count = deployments.iter().filter(|d| matches!(d.state, fluid_core::DeployState::Queued | fluid_core::DeployState::Building)).count();
+    for rec in &mut deployments {
+        if matches!(rec.state, fluid_core::DeployState::Queued | fluid_core::DeployState::Building) {
+            rec.state = fluid_core::DeployState::Error;
+        }
+    }
+    if orphaned_count > 0 {
+        tracing::warn!(count = orphaned_count, "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)");
+    }
     for rec in deployments {
         // Decide whether a persisted deployment can still serve after a restart:
         //   • container      → runs from a pre-built image; `root` irrelevant.
@@ -496,6 +515,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
     cloud.metrics.rollup_load(snap.metrics_rollup);
+    // BuildStore::load() already reconciles Queued/Building -> Error for its
+    // own per-build log records internally (git.rs) -- no duplicate needed
+    // here, only the DeployRecord-side gap above was missing.
     cloud.builds.load(snap.builds);
     cloud.incidents.load(snap.incidents);
     cloud.apikeys.load(snap.apikeys);

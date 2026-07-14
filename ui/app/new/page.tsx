@@ -162,19 +162,42 @@ export default function NewProjectPage() {
         creator: "you",
         env: env && Object.keys(env).length ? env : undefined,
       });
-      // Install a real GitHub webhook (push + pull_request) on the source repo so
-      // future pushes auto-deploy and PRs / non-prod branches get PREVIEW deploys
-      // (falls back to an Actions workflow; no-ops if GitHub isn't connected).
-      fetch("/api/gitops/project-ci", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ repo: repoUrl }),
-      }).catch(() => {});
       // Show the "Preparing Git Repository" clone animation, then transition to
       // the live build logs. The build is already running async on the node.
       const src = ownerRepo(repoUrl) + (root ? `/${root}` : "");
       const fallbackName = slug(template?.name || ownerRepo(repoUrl).split("/").pop() || "project");
       const dest = `${GIT_SCOPE}/${project || fallbackName}`;
+      // Install a real GitHub webhook (push + pull_request) on the source repo so
+      // future pushes auto-deploy and PRs / non-prod branches get PREVIEW deploys
+      // (falls back to an Actions workflow; no-ops if GitHub isn't connected).
+      // Previously fire-and-forget: a project imported without a completed GitHub
+      // OAuth connection silently got neither installed, so no future push ever
+      // auto-deployed, with zero visible error anywhere. Now the outcome is
+      // awaited and persisted so the dashboard can surface the gap + offer a
+      // retry — this call must not block navigation to the build logs, so it
+      // runs but is never awaited before the redirect below.
+      fetch("/api/gitops/project-ci", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: repoUrl }),
+      })
+        .then((r) => r.json())
+        .then((j: { ok?: boolean; skipped?: boolean; reason?: string; webhookInstalled?: boolean; workflowInstalled?: boolean }) =>
+          apiSend("PUT", `/v1/projects/${project || fallbackName}/git-ci`, {
+            webhook_installed: !!j.webhookInstalled,
+            workflow_installed: !!j.workflowInstalled,
+            skipped_reason: j.skipped ? j.reason || "unknown" : "",
+            checked_ms: 0,
+          }).catch(() => {}),
+        )
+        .catch(() =>
+          apiSend("PUT", `/v1/projects/${project || fallbackName}/git-ci`, {
+            webhook_installed: false,
+            workflow_installed: false,
+            skipped_reason: "request-failed",
+            checked_ms: 0,
+          }).catch(() => {}),
+        );
       // Persist the in-flight build so it shows as "Building" in the deployments
       // lists if the user navigates there before the build finishes.
       addPendingBuild({ id: res.build_id, project: project || fallbackName, team: currentTeam(), env: "production" });

@@ -112,6 +112,31 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
+        name: "projects",
+        // HashMap<String, ProjectSettings> → sorted BTreeMap for deterministic
+        // bytes, same shape as `teams`. Confirmed-real gap: `ProjectStore` is
+        // node-local like every other store this registry fixes, but was
+        // excluded from the first pass — a control-plane failover to a peer
+        // that never locally built a given project serves that project's
+        // settings/env/domains as empty defaults until it happens to receive a
+        // write for it.
+        snapshot: |c| {
+            let m: std::collections::BTreeMap<String, crate::project_settings::ProjectSettings> =
+                c.projects.snapshot().into_iter().collect();
+            enc(&m)
+        },
+        adopt: |c, b| {
+            let m: std::collections::BTreeMap<String, crate::project_settings::ProjectSettings> =
+                serde_json::from_slice(b).ok()?;
+            if m.is_empty() {
+                return None;
+            }
+            let n = m.len();
+            c.projects.load(m.into_iter().collect());
+            Some(n)
+        },
+    },
+    SyncedStore {
         name: "incidents",
         snapshot: |c| enc(&c.incidents.snapshot()),
         adopt: |c, b| {

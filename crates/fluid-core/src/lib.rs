@@ -961,6 +961,20 @@ pub struct GitSource {
     pub commit_message: String,
 }
 
+impl GitSource {
+    /// `repo_url` is a real git remote (github.com/... etc), not the synthetic
+    /// `upload://`/`image://` pseudo-URLs `run_build` also stamps into this same
+    /// field for zip/prebuilt-image deploys (so build metadata/webhook payloads
+    /// still have a source string). A caller resolving "the repo this project's
+    /// pushes should match" (e.g. GitHub webhook dispatch) must skip non-git
+    /// records — otherwise a zip/image redeploy becoming a project's NEWEST
+    /// deployment poisons that lookup, silently breaking future git-push
+    /// auto-deploys for the project's real, unrelated repo.
+    pub fn is_real_git(&self) -> bool {
+        !self.repo_url.starts_with("upload://") && !self.repo_url.starts_with("image://")
+    }
+}
+
 /// Lifecycle state of a deployment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -166,6 +166,31 @@ pub struct ProjectSettings {
     /// project-level Cron Jobs kill switch. Default true (on).
     #[serde(default = "default_true")]
     pub cron_enabled: bool,
+    /// Outcome of the auto-CI install attempted right after this project's
+    /// first git import (`/api/gitops/project-ci`): did a real GitHub webhook
+    /// or the Actions-workflow fallback actually get installed on the source
+    /// repo? Previously this result was fire-and-forget from the UI and
+    /// discarded entirely — a project imported without a completed GitHub
+    /// OAuth connection (the common "paste a public repo URL" flow) silently
+    /// got NEITHER installed, so no future push ever auto-deployed, with zero
+    /// visible error anywhere (not even a failed GitHub delivery, since no
+    /// webhook object was ever created). Persisting it here lets the
+    /// dashboard surface the gap and offer a retry.
+    #[serde(default)]
+    pub git_ci: Option<GitCiStatus>,
+}
+
+/// See [`ProjectSettings::git_ci`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct GitCiStatus {
+    pub webhook_installed: bool,
+    pub workflow_installed: bool,
+    /// Set only when neither installed — e.g. "github-not-connected",
+    /// "bad-repo", "composio-not-configured" (the exact `reason` values
+    /// `/api/gitops/project-ci` already returns).
+    #[serde(default)]
+    pub skipped_reason: String,
+    pub checked_ms: u64,
 }
 /// A project settings row with no explicit owner (never `set_team`'d, or
 /// reloaded from a snapshot/serde-default that lost the tag) is UNOWNED, never
@@ -193,6 +218,7 @@ impl Default for ProjectSettings {
             preview_protection: true,
             sandbox_allow_sudo: false,
             cron_enabled: true,
+            git_ci: None,
         }
     }
 }
@@ -264,6 +290,11 @@ impl ProjectStore {
     pub fn set_functions(&self, project: &str, f: FunctionSettings) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().functions = f;
+    }
+
+    pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().git_ci = Some(status);
     }
 
     /// Add or update an env var (by key+target). Sensitive values are sealed

@@ -306,12 +306,18 @@ impl Gateway {
         ids
     }
 
-    /// The git source of a project's newest deployment (for "redeploy").
+    /// The git source of a project's newest deployment (for "redeploy"), skipping
+    /// any deployment whose `git` is a synthetic `upload://`/`image://` pseudo-
+    /// source rather than a real git remote (see `GitSource::is_real_git`) — a
+    /// zip-upload or prebuilt-image "New Deployment" becoming the project's
+    /// newest record must not shadow its actual git repo for callers matching
+    /// future GitHub pushes.
     pub fn git_for_project(&self, project: &str) -> Option<fluid_core::GitSource> {
         let st = self.state.lock();
         st.deployments
             .values()
             .filter(|d| d.project == project)
+            .filter(|d| d.git.as_ref().is_some_and(|g| g.is_real_git()))
             .max_by_key(|d| d.created_at_ms)
             .and_then(|d| d.git.clone())
     }

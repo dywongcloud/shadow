@@ -1031,6 +1031,7 @@ fn dashboard_origin(cloud: &Arc<CloudState>, host: &str) -> Option<String> {
     derive_dashboard(
         host,
         &cloud.deploy_suffixes,
+        &cloud.apps_domain,
         std::env::var("HIVE_PUBLIC_DASHBOARD_URL").ok(),
         std::env::var("HIVE_DASHBOARD_URL").ok(),
     )
@@ -1043,6 +1044,7 @@ fn dashboard_origin(cloud: &Arc<CloudState>, host: &str) -> Option<String> {
 fn derive_dashboard(
     host: &str,
     suffixes: &[String],
+    apps_domain: &str,
     public_env: Option<String>,
     local_env: Option<String>,
 ) -> Option<String> {
@@ -1052,6 +1054,15 @@ fn derive_dashboard(
             .iter()
             .find(|s| s.as_str() != "localhost" && (h == **s || h.ends_with(&format!(".{s}"))))
             .cloned()
+            // `HIVE_DEPLOY_SUFFIXES` defaults to just `["localhost"]` (excluded
+            // above) and was never separately set fleet-wide for the real apps
+            // domain — silently making this whole redirect a permanent no-op for
+            // every *.{apps_domain} preview host, since `apps_domain` (correctly
+            // configured via HIVE_APPS_DOMAIN and already used by
+            // `state::host_matches_apps_domain` for ingress) was never consulted
+            // here. Fall back to it directly instead of depending on a second,
+            // redundant env var to duplicate the same value.
+            .or_else(|| crate::state::host_matches_apps_domain(&h, apps_domain).then(|| apps_domain.to_string()))
     } else {
         None
     };
@@ -1490,7 +1501,7 @@ mod tests {
         let local = Some("http://localhost:3002".to_string());
         // Public wildcard host → derived public dashboard (NOT localhost:3002).
         assert_eq!(
-            derive_dashboard("app.deployment.shadow.ngrok.pizza", &s, None, local.clone()),
+            derive_dashboard("app.deployment.shadow.ngrok.pizza", &s, "", None, local.clone()),
             Some("https://shadow.ngrok.pizza".to_string())
         );
         // Explicit override wins.
@@ -1498,6 +1509,7 @@ mod tests {
             derive_dashboard(
                 "app.deployment.shadow.ngrok.pizza:443",
                 &s,
+                "",
                 Some("https://dash.example.com/".to_string()),
                 local.clone()
             ),
@@ -1505,9 +1517,32 @@ mod tests {
         );
         // Local/loopback host → the local dashboard env (dev unchanged).
         assert_eq!(
-            derive_dashboard("app.localhost", &s, None, local.clone()),
+            derive_dashboard("app.localhost", &s, "", None, local.clone()),
             local
         );
+    }
+
+    #[test]
+    fn apps_domain_falls_back_when_deploy_suffixes_dont_match() {
+        // Live regression: HIVE_DEPLOY_SUFFIXES is unset fleet-wide (defaults to
+        // just ["localhost"], which is explicitly excluded from matching), so a
+        // real *.{apps_domain} preview host never matched `suffixes` at all —
+        // the preview-unlock redirect silently never fired for ANY team/project.
+        // `apps_domain` (HIVE_APPS_DOMAIN, already correctly configured and used
+        // for ingress) must be consulted as a fallback.
+        let s = vec!["localhost".to_string()]; // the real fleet default
+        let public = Some("https://shadw.cloud".to_string());
+        assert_eq!(
+            derive_dashboard("gm-verify-final-fe62ab2.shadw.app", &s, "shadw.app", public.clone(), None),
+            Some("https://shadw.cloud".to_string())
+        );
+        // Apex of the apps domain also matches.
+        assert_eq!(
+            derive_dashboard("shadw.app", &s, "shadw.app", public.clone(), None),
+            Some("https://shadw.cloud".to_string())
+        );
+        // A totally unrelated host matches neither suffixes nor apps_domain.
+        assert_eq!(derive_dashboard("evil.example.com", &s, "shadw.app", public, None), None);
     }
 
     fn route(node: &str, region: &str, lat: u64) -> PeerRoute {

@@ -134,8 +134,20 @@ pub async fn require_auth(mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
     // GitHub/Stripe webhooks can't present a platform JWT — they are
     // authenticated by their own HMAC signature inside the handler
-    // (GITHUB_WEBHOOK_SECRET / STRIPE_WEBHOOK_SECRET respectively).
-    let open = path == "/healthz" || path == "/v1/token" || path == "/v1/git/webhook" || path == "/v1/billing/webhook";
+    // (GITHUB_WEBHOOK_SECRET / STRIPE_WEBHOOK_SECRET respectively). The two
+    // zkauth endpoints are called server-to-server by the dashboard's
+    // preview-unlock route with ONLY a shared x-hive-internal secret (see
+    // zkauth::internal_ok) — never a platform JWT, since the whole point is
+    // authenticating a browser tab that has no session on this node at all.
+    // Without this exemption every preview-unlock attempt 401'd here before
+    // ever reaching zkauth's own (correct) internal-token check — live-
+    // witnessed as "missing or invalid bearer token" on both routes.
+    let open = path == "/healthz"
+        || path == "/v1/token"
+        || path == "/v1/git/webhook"
+        || path == "/v1/billing/webhook"
+        || path == "/v1/zkauth/register"
+        || path == "/v1/zkauth/preview-proof";
     if !is_mutation || open {
         return next.run(req).await;
     }
