@@ -200,6 +200,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
         .route("/v1/incidents", get(incidents_list).post(incident_open))
+        .route("/v1/incidents/:id", axum::routing::delete(incident_delete))
         .route("/v1/incidents/:id/updates", post(incident_update))
         // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,
         //      deployment protection, microfrontends, conformance) ----
@@ -3538,11 +3539,17 @@ async fn del_rewrite(
 
 // ---- Cron ----
 
-async fn cron_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+pub(crate) async fn cron_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Query(q): Query<LocalQ>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Tenant-scoped: only this team's jobs. Legacy jobs (no tenant recorded) are
     // attributed by their target project's owning team.
-    let jobs: Vec<CronJob> = c
+    // Dedup by id here too (`seen`): defends the merged view against a store
+    // that still holds pre-fix duplicate jobs (same id) until every node has
+    // restarted onto the deduping restore path — without it a node's own
+    // duplicates would show while a peer fanning them in would collapse them,
+    // leaving counts that never converge across the fleet.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut jobs: Vec<CronJob> = c
         .cron
         .list()
         .into_iter()
@@ -3550,7 +3557,35 @@ async fn cron_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims:
             let owner = if j.tenant.is_empty() { norm(&c.projects.team_of(&j.deployment)).to_string() } else { j.tenant.clone() };
             owner == t
         })
+        .filter(|j| seen.insert(j.id.clone()))
         .collect();
+    // FLEET FAN-OUT (read-only): cron jobs are node-local — a `vercel.json` cron
+    // is registered on the node that BUILT the deployment (git.rs), and a manual
+    // job on the control-plane leader; neither replicates. So a dashboard read
+    // that lands on any single node shows only that node's slice. Merge every
+    // healthy peer's local list (dedup by job id) so the operator sees the whole
+    // fleet's schedule. Deliberately a READ merge, NOT store replication +
+    // leader-only execution: each node keeps firing exactly its own jobs, so
+    // this can never double-fire or drop a follower-hosted deployment's cron.
+    // `?local=true` (the internal fan-out marker) short-circuits the recursion.
+    if !q.local.unwrap_or(false) {
+        let self_name = c.node_name.clone();
+        // `seen` already holds this node's own (deduped) job ids from above.
+        for n in c.registry.nodes() {
+            if n.name == self_name || !n.healthy {
+                continue;
+            }
+            if let Some(v) = fetch_from_host(&c, &n.name, "/v1/cron?local=true", &t).await {
+                if let Ok(peer_jobs) = serde_json::from_value::<Vec<CronJob>>(v) {
+                    for j in peer_jobs {
+                        if seen.insert(j.id.clone()) {
+                            jobs.push(j);
+                        }
+                    }
+                }
+            }
+        }
+    }
     Json(json!(jobs))
 }
 
@@ -5502,6 +5537,21 @@ async fn incident_update(
         crate::webhooks::dispatch(&c.webhooks, "*", "incident.resolved", json!({ "id": inc.id, "title": inc.title }));
     }
     Ok(Json(json!(inc)))
+}
+
+/// Permanently remove an incident (vs. resolving it, which keeps it in the
+/// history). The leader-authored delete propagates to every node via the
+/// store-sync follower loop's wholesale snapshot adoption.
+async fn incident_delete(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let inc = c.incidents.remove(&id).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
+    crate::persist::persist(&c);
+    crate::webhooks::dispatch(&c.webhooks, "*", "incident.deleted", json!({ "id": inc.id, "title": inc.title }));
+    Ok(Json(json!({ "ok": true, "deleted": inc.id })))
 }
 
 // ---- Notifications (inbox bell) ----

@@ -117,4 +117,25 @@ impl IdentityStore {
         *self.orgs.write() = orgs.into_iter().map(|o| (o.id.clone(), o)).collect();
         *self.users.write() = users.into_iter().map(|u| (u.id.clone(), u)).collect();
     }
+
+    /// Combined orgs+users snapshot for the fleet follower sync. The Clerk
+    /// webhook (`identity_sync`) only runs on the control-plane leader, so
+    /// without this a follower's org/user directory stays empty — breaking the
+    /// operator data view (and any cross-node membership check) on that node.
+    /// Sorted by id for deterministic wire bytes (the sync change-gate is a raw
+    /// byte compare).
+    pub fn snapshot(&self) -> IdentitySnapshot {
+        let mut orgs = self.orgs();
+        let mut users = self.users();
+        orgs.sort_by(|a, b| a.id.cmp(&b.id));
+        users.sort_by(|a, b| a.id.cmp(&b.id));
+        IdentitySnapshot { orgs, users }
+    }
+}
+
+/// Serializable combined snapshot of the identity directory.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct IdentitySnapshot {
+    pub orgs: Vec<OrgRecord>,
+    pub users: Vec<UserRecord>,
 }

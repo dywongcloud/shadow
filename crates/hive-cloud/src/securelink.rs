@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LinkRecord {
     pub id: String,
     /// Private backend this connector fronts, e.g. "db.internal:5432".
@@ -100,6 +100,18 @@ impl SecureLinkStore {
     /// All secure links across teams (ops data browser).
     pub fn all(&self) -> Vec<LinkRecord> {
         self.links.read().clone()
+    }
+
+    /// Snapshot for the fleet follower sync. Link records are pure metadata
+    /// (target/region/status/public_key/timestamps — no per-node secret; the
+    /// tunnel connector itself stays on its origin node), so replicating them
+    /// makes the ops link list fleet-consistent without moving any secret.
+    pub fn snapshot(&self) -> Vec<LinkRecord> {
+        self.links.read().clone()
+    }
+
+    pub fn load(&self, data: Vec<LinkRecord>) {
+        *self.links.write() = data;
     }
 
     pub fn list(&self, team: &str) -> Vec<LinkRecord> {

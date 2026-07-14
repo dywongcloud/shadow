@@ -22,14 +22,14 @@ pub enum IncidentStatus {
     Resolved,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IncidentUpdate {
     pub ts_ms: u64,
     pub status: IncidentStatus,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Incident {
     pub id: String,
     pub title: String,
@@ -114,6 +114,16 @@ impl IncidentStore {
         inc.updated_ms = now;
         inc.updates.push(IncidentUpdate { ts_ms: now, status: req.status, message: req.message });
         Some(inc.clone())
+    }
+
+    /// Remove an incident entirely (vs. `update` which only transitions its
+    /// status). Returns the removed incident if it existed. The fleet follower
+    /// sync adopts the leader's post-delete snapshot wholesale, so a delete on
+    /// the leader propagates to every node's list on the next tick.
+    pub fn remove(&self, id: &str) -> Option<Incident> {
+        let mut items = self.items.write();
+        let pos = items.iter().position(|i| i.id == id)?;
+        Some(items.remove(pos))
     }
 }
 

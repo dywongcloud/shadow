@@ -85,6 +85,19 @@ impl CronScheduler {
         self.jobs.read().clone()
     }
 
+    /// Wholesale-replace the job set, DEDUPED by id (first occurrence wins),
+    /// preserving each job's own schedule bookkeeping verbatim. Restore-from-
+    /// snapshot must use this rather than `add()` in a loop: `add()` pushes
+    /// unconditionally, so restoring a snapshot that already carried a job (and
+    /// every prior restart re-persisted it) duplicated it every boot — the live
+    /// bug that left `vc-shoomoo-0` present 3× on a node and fired it 3× per
+    /// schedule. Deduping here converges the store on the next restart.
+    pub fn replace_all(&self, jobs: Vec<CronJob>) {
+        let mut seen = std::collections::HashSet::new();
+        let deduped: Vec<CronJob> = jobs.into_iter().filter(|j| seen.insert(j.id.clone())).collect();
+        *self.jobs.write() = deduped;
+    }
+
     /// Look up a single job by id.
     pub fn get(&self, id: &str) -> Option<CronJob> {
         self.jobs.read().iter().find(|j| j.id == id).cloned()

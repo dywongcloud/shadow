@@ -105,4 +105,20 @@ impl AuditLog {
             .cloned()
             .collect()
     }
+
+    /// Snapshot (oldest→newest) for the fleet follower sync. Audit records are
+    /// written on the control-plane leader during every mutation (mutations
+    /// forward there via `admin_ingress`), so the leader's buffer is the
+    /// authoritative fleet-wide audit; a follower otherwise shows only its own
+    /// local events. Bounded by the buffer's own capacity (recent history is
+    /// all the operator audit view renders).
+    pub fn snapshot(&self) -> Vec<AuditEntry> {
+        self.entries.lock().iter().cloned().collect()
+    }
+
+    pub fn load(&self, data: Vec<AuditEntry>) {
+        let mut q = self.entries.lock();
+        q.clear();
+        q.extend(data);
+    }
 }

@@ -1,5 +1,36 @@
 # Changelog
 
+## (pending) — Fix admin incidents page; generic leader→follower store replication for the whole node-local divergence class
+
+The admin incidents page didn't load and "create didn't work": `IncidentStore`
+was node-local, so incidents created on the control-plane leader (where every
+mutation forwards) were invisible to reads that the dashboard's multi-A DNS
+landed on any other node. A fleet audit found this was a whole CLASS —
+~12 stores (apikeys, webhooks, databases, domains, integrations, gitops, docs,
+notifications, identity, enterprise, teams, incidents) took mutations only on
+the leader but served reads from the local store. Rather than hand-write a
+gossip arm + adoption block per store, added one generic mechanism
+(`store_sync::REGISTRY` + a `/v1/store-snapshot/<name>` gossip arm + a follower
+loop that adopts each store's snapshot when it changes). Serialization is
+canonicalized through `serde_json::Value` (sorted keys) so the byte-compare
+change-gate is stable even for HashMap-backed stores with nested maps — a first
+cut re-adopted databases/domains/gitops every tick until that landed.
+`apikeys` was the severest case: a key minted on the leader now verifies on
+every node instead of failing API auth on followers. Audit replication was
+live-verified adopting 659 entries onto a follower. Also added
+`DELETE /v1/incidents/:id` (was resolve-only). Secret-bearing stores ride the
+existing peer-trust-enforced signed mesh.
+
+Edge-enforcement config (WAF rules, redirects/rewrites, bot policy) replicates
+too, so every node enforces the leader's config. Cron is the exception — its
+jobs are split across nodes (manual jobs on the leader, `vercel.json` jobs on
+the building node), so `cron_list` fans out read-only and merges instead
+(execution stays per-node, never double-firing).
+
+`securelinks`/`audit` gained `snapshot()`/`load()`; `Team`/`Member`/`Incident`
+gained `PartialEq`; `vendor/guardian-db` is now a workspace-excluded path dep so
+its own test suite runs standalone.
+
 ## (pending) — fc-sanjose-2 bring-up; fix workflows-page 400, teams-mirror corruption, and guardian-db index flakiness
 
 Brought up the fleet's 10th node, fc-sanjose-2 (43.173.78.95): PVM kernel

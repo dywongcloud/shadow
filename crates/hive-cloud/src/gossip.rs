@@ -129,6 +129,31 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         "/v1/teams/snapshot" if method == hive_p2p::GOSSIP_GET => {
             serde_json::to_vec(&cloud.teams.snapshot()).unwrap_or_default()
         }
+        // Full IncidentStore snapshot for the same leader->follower sync
+        // (identical shape and rationale as /v1/teams/snapshot above): incident
+        // mutations only ever land on the control-plane leader via
+        // admin_ingress, so a follower's local store stays empty forever --
+        // live-witnessed as the admin incidents page showing nothing (and
+        // creates "not working") whenever the dashboard's multi-A DNS landed
+        // the read on any non-leader node while the 2 real incidents sat on
+        // the leader alone.
+        "/v1/incidents/snapshot" if method == hive_p2p::GOSSIP_GET => {
+            serde_json::to_vec(&cloud.incidents.snapshot()).unwrap_or_default()
+        }
+        // Generic leader->follower store snapshot: `GET /v1/store-snapshot/<name>`
+        // serves any store registered in `store_sync::REGISTRY` (teams,
+        // incidents, apikeys, webhooks, databases, domains, integrations,
+        // gitops, docs, notifications, identity, enterprise). Supersedes the
+        // two bespoke arms above (kept only as rolling-upgrade compat shims for
+        // followers still on the pre-registry build; remove once the fleet is
+        // uniform). See `crate::store_sync`.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/store-snapshot/") => {
+            let name = p["/v1/store-snapshot/".len()..]
+                .split(['?', '/'])
+                .next()
+                .unwrap_or("");
+            crate::store_sync::serve(cloud, name)
+        }
         // TLS bundle distribution over the authenticated mesh (see acme.rs::
         // bundle_for_mesh — key decrypted in transit inside peer-authenticated
         // QUIC only; receiver re-encrypts with its own node key).
@@ -330,6 +355,18 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // so this node returns only its own events (no re-fan-out → no loop).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
             jb(crate::admin::logs(State(cloud.clone()), team_headers(p), team_claims(p), logs_query(p)).await)
+        }
+        // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY
+        // its own jobs (local=true) for the requesting team. Same tenant-scoped
+        // shape as /v1/logs above.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/cron") => {
+            jb(crate::admin::cron_list(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Query(crate::admin::LocalQ { local: Some(true) }),
+            )
+            .await)
         }
         // Sandbox READS: every sandbox MUTATION forwards through admin_ingress to the
         // single current control-plane owner (no independent placement), so that node

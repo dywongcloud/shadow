@@ -481,9 +481,12 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     if !snap.waf_rules.is_empty() {
         cloud.waf.set_rules(snap.waf_rules);
     }
-    for j in snap.cron {
-        let _ = cloud.cron.add(j);
-    }
+    // replace_all (deduped by id), NOT add() in a loop: add() pushes
+    // unconditionally, so a snapshot that already carried a job — and every
+    // prior restart re-persisted it — duplicated that job on every boot,
+    // making the cron loop fire it N times per schedule (live-witnessed:
+    // vc-shoomoo-0 present 3× on a node). replace_all converges the store.
+    cloud.cron.replace_all(snap.cron);
     cloud.router.set_redirects(snap.redirects);
     cloud.router.set_rewrites(snap.rewrites);
     if !snap.teams.is_empty() {

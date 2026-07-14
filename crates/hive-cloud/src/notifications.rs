@@ -56,4 +56,30 @@ impl NotificationStore {
             r.insert(id.clone());
         }
     }
+
+    /// Read/archived state for the fleet follower sync. Notifications
+    /// themselves are recomputed live per node; only this read/archived
+    /// bookkeeping is stateful and leader-authored (mark-read/archive
+    /// mutations forward to the leader), so it must replicate or a follower
+    /// shows already-read items as unread. Sorted for deterministic wire bytes
+    /// (the sync's change-gate is a raw byte compare).
+    pub fn snapshot(&self) -> NotificationState {
+        let mut archived: Vec<String> = self.archived.read().iter().cloned().collect();
+        let mut read: Vec<String> = self.read.read().iter().cloned().collect();
+        archived.sort();
+        read.sort();
+        NotificationState { archived, read }
+    }
+
+    pub fn load(&self, s: NotificationState) {
+        *self.archived.write() = s.archived.into_iter().collect();
+        *self.read.write() = s.read.into_iter().collect();
+    }
+}
+
+/// Serializable snapshot of `NotificationStore`'s read/archived bookkeeping.
+#[derive(Clone, Serialize, serde::Deserialize)]
+pub struct NotificationState {
+    pub archived: Vec<String>,
+    pub read: Vec<String>,
 }
