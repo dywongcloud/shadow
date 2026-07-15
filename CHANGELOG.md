@@ -1,5 +1,20 @@
 # Changelog
 
+## (pending) — GitOps config sync is server-side only (delete in-browser git)
+
+GitOps config-repo mirroring used to fall back to an in-browser isomorphic-git
+path (`gitops-local` → `isogit` → `/api/git/cors-proxy`) whenever the server
+route skipped (GitHub not connected), and that browser path was unreliable. The
+server-side sync (`/api/gitops/sync` → Composio GitHub API), which is the path
+that worked, is now the sole mechanism: `triggerGitopsSync` no longer imports or
+runs any browser git — on a skipped sync it records a benign "not configured"
+status and the Set-up-GitOps onboarding is how a user connects GitHub. The entire
+client-side git subsystem is deleted (`ui/lib/gitops-local.ts`, `ui/lib/isogit.ts`,
+`ui/app/api/git/cors-proxy`, and the `isomorphic-git` + `@isomorphic-git/lightning-fs`
+dependencies), so the dashboard bundle ships zero browser-git code. Verified
+server-only across all fleet nodes (`/api/gitops/sync` 200, `/api/git/cors-proxy`
+404, zero isomorphic-git in every bundle).
+
 ## (pending) — Fix Redeploy 404 for zip-uploaded and image projects
 
 The Redeploy modal (and `shadw projects redeploy`) returned a bare
