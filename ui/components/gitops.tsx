@@ -12,7 +12,7 @@ interface Repo { name: string; full_name: string; default_branch: string; privat
 export interface GitopsSyncStatus {
   at: number; // epoch ms
   ok: boolean;
-  mode: "server" | "local";
+  mode: "server"; // server-side sync is the only path (no in-browser git)
   detail: string; // "pushed <sha>" | "unchanged" | error message
   repo?: string;
   commit?: string;
@@ -43,14 +43,15 @@ let syncInFlight = false;
 /**
  * Fire a GitOps config sync — fully autonomous and in the background.
  *
- * PRIMARY path: the SERVER-side sync route (`/api/gitops/sync`), which reads the
+ * SERVER-SIDE ONLY: posts to the sync route (`/api/gitops/sync`), which reads the
  * tenant's linked config repo, regenerates the artifact tree from live platform
  * state, and commits it via the GitHub API using the connected (Composio) token —
  * reliable, no browser git, no CORS proxy, works for every mutation made while
- * signed in. FALLBACK: when no repo is linked / GitHub isn't connected, the local
- * in-browser mirror (`gitops-local`, dynamically imported) keeps a versioned copy.
- * Every outcome (pushed / unchanged / error) is recorded to `hive_gitops_status`
- * so failures are VISIBLE in the UI instead of dying in the console.
+ * signed in. There is NO in-browser git fallback: when GitOps isn't set up (Composio
+ * not configured / GitHub not connected / no repo linked) the sync is a benign no-op
+ * and the "Set up GitOps" onboarding flow is how the user connects. Every outcome
+ * (pushed / unchanged / not-configured / error) is recorded to `hive_gitops_status`
+ * so state is VISIBLE in the UI instead of dying in the console.
  */
 export function triggerGitopsSync() {
   if (typeof window === "undefined" || syncInFlight) return;
@@ -73,15 +74,11 @@ export function triggerGitopsSync() {
         return;
       }
       if (d?.skipped) {
-        // Not linked / GitHub not connected → keep the local in-browser mirror.
-        const m = await import("@/lib/gitops-local");
-        const snap = await m.syncLocalGitops();
-        recordStatus({
-          at: Date.now(),
-          ok: !snap?.pushError,
-          mode: "local",
-          detail: snap?.pushError || (snap ? `local commit ${snap.commit}` : `local mirror (${d.reason})`),
-        });
+        // GitOps isn't set up yet (Composio not configured, GitHub not connected, or
+        // no config repo linked). This is a benign NOT-CONFIGURED state, not a sync
+        // failure — the "Set up GitOps" onboarding connects GitHub + links the repo.
+        // Record it (never a red error toast) and do NO in-browser git.
+        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `not configured (${String(d.reason || "not set up")})` });
         return;
       }
       // Server route reachable but the commit failed — surface it.
@@ -256,13 +253,9 @@ export function GitOps() {
         return;
       }
       localStorage.setItem("hive_gitops_linked", "1");
-      // Record the generated repo as the autonomous client-side push target, so
-      // every future change commits + pushes here in the background (no git page).
-      if (d.repo) {
-        localStorage.setItem("hive_gitops_remote", d.repo);
-        localStorage.setItem("hive_gitops_remote_branch", d.branch || "main");
-      }
-      // Kick an immediate background sync so the first post-setup change lands.
+      // The linked repo is persisted server-side (backend GitOpsLink); the server
+      // sync route reads it. Kick an immediate background sync so the first
+      // post-setup change lands.
       triggerGitopsSync();
       setResult({ repo: d.repo, created: !!d.created, files: Array.isArray(d.files) ? d.files.length : 0 });
       setDone(true);
@@ -290,8 +283,8 @@ export function GitOps() {
   useEffect(() => {
     const onStatus = () => {
       const s = readGitopsStatus();
-      // Only surface real push failures for a LINKED repo (local-mirror mode
-      // isn't an error state). Auto-clears on the next successful sync.
+      // Only surface real push failures for a LINKED repo (a benign not-configured
+      // sync records ok:true, so it never toasts). Auto-clears on the next success.
       setSyncErr(s && !s.ok && localStorage.getItem("hive_gitops_linked") === "1" ? s : null);
     };
     window.addEventListener("gitops-status", onStatus);

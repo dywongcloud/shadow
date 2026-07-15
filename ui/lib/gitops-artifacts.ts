@@ -1,10 +1,9 @@
 // Minimal, dependency-free YAML emitter + the OpenEdge org-config builder.
 //
-// PURE + isomorphic: no `server-only` guard, so it runs in BOTH the server-side
-// GitOps sync routes AND the client-side local provider (`gitops-local.ts`), which
-// materializes the same artifact tree into an in-browser git repo when no remote
-// config repo is linked. `gitops-yaml.ts` re-exports this under a server-only guard
-// for the existing server consumers — this file is the single source of truth.
+// PURE: builds the OpenEdge artifact tree for the SERVER-side GitOps sync routes
+// (`/api/gitops/sync` + `/api/gitops/init`, via `gitops-server.ts`). `gitops-yaml.ts`
+// re-exports this under a `server-only` guard for those consumers — this file is the
+// single source of truth for the committed artifact tree.
 //
 // Supports exactly what the config needs: nested maps, scalars, **simple YAML
 // lists** (arrays of scalars rendered as `- item`) and lists of maps. This keeps
