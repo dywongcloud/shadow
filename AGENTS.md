@@ -45,12 +45,11 @@ history).
   control-plane leader, not the node running the dashboard process — verify
   new admin endpoints through the real dashboard. Detail:
   `recall("ops-proxy-leader-forward")`.
-- `scripts/shadw-watchdog.sh` runs as a PERSISTENT KeepAlive loop
-  (`WATCHDOG_LOOP=1` in the plist), never StartInterval — this launchd domain
-  silently pends non-demand spawns; after any plist re-bootstrap, one manual
-  `launchctl kickstart` is required to demand-spawn it. Its `ensure()` targets
-  must track the current `dev.shadw.fc-lax*` labels. Detail:
-  `recall("launchd-pended-spawn-gotcha")` / `recall("fc-lax2-watchdog-incident")`.
+- `scripts/shadw-watchdog.sh` is a PERSISTENT KeepAlive loop (`WATCHDOG_LOOP=1`,
+  never StartInterval); needs one manual `launchctl kickstart` after any plist
+  re-bootstrap, and its `ensure()` targets track the current `dev.shadw.fc-lax*`
+  labels. Detail: `recall("launchd-pended-spawn-gotcha")` /
+  `recall("fc-lax2-watchdog-incident")`.
 - The backend (`hive-cloud`, systemd `hive-node`) and the dashboard (`ui/`,
   systemd `hive-ui`) are deployed independently — a backend-only fleet
   rollout does NOT ship a `ui/` change. Use `scripts/deploy-ui-fleet.sh`
