@@ -1,5 +1,20 @@
 # Changelog
 
+## (pending) — Deploy private GitHub repos (inject the connected-GitHub token)
+
+Deploying a private GitHub repo failed with `fatal: could not read Username for
+'https://github.com'` — the build's `git clone` ran anonymously and no layer ever
+attached a credential. Now the user's connected-GitHub token is plumbed to the
+clone: `GitDeployRequest` carries a `git_token` (fetched server-side by new
+`/api/git/deploy` + `/api/projects/[project]/redeploy` routes from the user's
+Composio GitHub connection, never exposed to the browser), and the backend injects
+it as an `x-access-token` clone URL (github.com-only), with the token scrubbed from
+clone stderr, an anonymous retry if a stale token is rejected (so public repos are
+never broken), actionable no-credential vs rejected-credential error messages, and
+the token cleared after the clone. A node-level `GITHUB_TOKEN` still works as a
+fallback (e.g. for webhook auto-deploys). Verified live on the fleet; public repos
+unaffected.
+
 ## (pending) — Usage page defaults to Monthly + lazy charts; fix flaky capacity test
 
 The dashboard Usage view now selects the **Monthly** granularity on first load
