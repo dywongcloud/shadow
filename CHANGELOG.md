@@ -1,5 +1,22 @@
 # Changelog
 
+## (pending) — Usage page defaults to Monthly + lazy charts; fix flaky capacity test
+
+The dashboard Usage view now selects the **Monthly** granularity on first load
+(was Daily). The page is split into a server shell (`page.tsx`, carrying an ISR
+`revalidate` config) and a client `usage-view.tsx`; the Tremor charts stay
+code-split via `next/dynamic` and now render loading skeletons so the deferred
+chunk never leaves a layout-shifting gap. (ISR note: the root layout's
+`force-dynamic` — required for auth-correct chrome — currently supersedes per-page
+static rendering app-wide, so `/usage` still renders dynamically; the ISR config
+is kept forward-compatible and, since the page carries no server data, caches
+nothing of value regardless.)
+
+Also fixes a flaky control-plane test (`capacity_is_released_after_builds`):
+capacity release is eventual-consistent and lagged the job's terminal transition,
+so the test's immediate `vcpus_used == 0` assert raced — now it waits for capacity
+to drain first (a real leak still fails, deterministically).
+
 ## (pending) — GitOps config sync is server-side only (delete in-browser git)
 
 GitOps config-repo mirroring used to fall back to an in-browser isomorphic-git
