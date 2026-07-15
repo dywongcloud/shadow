@@ -2277,6 +2277,54 @@ fn git_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_cor
         .and_then(|d| d.git.clone())
 }
 
+/// The newest deployment's SOURCE for `project`, fleet-aware and INCLUDING the
+/// non-real-git pseudo-sources (`upload://` zip, `image://` prebuilt image). Unlike
+/// `git_for_project_fleet` (which filters `is_real_git`, powering GitHub-webhook
+/// lookups), this powers REDEPLOY, which must reconstruct a build for zip- and
+/// image-based projects too — those return `None` from the git-only helper and were
+/// the exact cause of redeploy 404ing for every non-git project.
+fn source_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::GitSource> {
+    let mut best: Option<(u64, fluid_core::GitSource)> = None;
+    for r in c.gw.deployment_records() {
+        if r.project == project {
+            if let Some(g) = r.git {
+                if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+                    best = Some((r.created_at_ms, g));
+                }
+            }
+        }
+    }
+    for d in c.peer_deployments.read().values().flatten() {
+        if d.project == project {
+            if let Some(g) = d.git.clone() {
+                if best.as_ref().map_or(true, |(ts, _)| d.created_at_ms >= *ts) {
+                    best = Some((d.created_at_ms, g));
+                }
+            }
+        }
+    }
+    best.map(|(_, g)| g)
+}
+
+/// Build a placement `Target` addressing a specific node by NAME: self (both None),
+/// its HTTP admin URL when known, else its iroh mesh route. `None` when the node is
+/// unknown/unreachable. Used to pin a zip redeploy to the node holding the source.
+fn target_for_node(c: &Arc<CloudState>, node: &str) -> Option<crate::schedule::Target> {
+    if node == c.node_name {
+        return Some(crate::schedule::Target { node: node.to_string(), admin: None, iroh: None });
+    }
+    if let Some(a) = c.node_admins.read().get(node).cloned() {
+        return Some(crate::schedule::Target { node: node.to_string(), admin: Some(a), iroh: None });
+    }
+    let n = c.registry.nodes().into_iter().find(|n| n.name == node)?;
+    match (n.peer_id.clone(), n.iroh_addr.clone()) {
+        (Some(id), Some(addr)) => {
+            Some(crate::schedule::Target { node: node.to_string(), admin: None, iroh: Some((id, addr)) })
+        }
+        _ => None,
+    }
+}
+
 
 /// Peer node NAMES hosting `project` — addressed by node (not HTTP admin URL) so the
 /// caller can reach them over the iroh mesh via `fetch_from_host` (FC nodes have no
@@ -2480,40 +2528,108 @@ fn all_healthy_peers(c: &Arc<CloudState>) -> Vec<String> {
         .collect()
 }
 
-async fn project_redeploy(
-    State(c): State<Arc<CloudState>>,
-    headers: HeaderMap,
-    claims: Option<axum::Extension<crate::auth::Claims>>,
-    Path(project): Path<String>,
-    Json(body): Json<RedeployBody>,
-) -> Result<Json<Value>, StatusCode> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project).map_err(|(code, _)| code)?;
-    let git = git_for_project_fleet(&c, &project).ok_or(StatusCode::NOT_FOUND)?;
-    let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
-    // Environment chosen in the modal: "production" | "preview". When absent the
-    // branch decides (Vercel's classification).
-    let target = body
-        .target
-        .map(|t| t.trim().to_lowercase())
-        .filter(|t| t == "production" || t == "preview");
-    let req = fluid_core::GitDeployRequest {
-        repo_url: git.repo_url,
-        branch: Some(git.branch).filter(|b| !b.is_empty()),
-        project: Some(project),
+/// Assemble the deploy request for a redeploy from the resolved source. `no_fanout`
+/// pins a zip redeploy to the node holding the retained source (see below); git/image
+/// redeploys leave it false so the normal placement scheduler runs.
+fn redeploy_request(
+    project: &str,
+    src: &fluid_core::GitSource,
+    target: Option<String>,
+    use_cache: bool,
+    root_dir: Option<String>,
+    no_fanout: bool,
+) -> fluid_core::GitDeployRequest {
+    fluid_core::GitDeployRequest {
+        repo_url: src.repo_url.clone(),
+        branch: Some(src.branch.clone()).filter(|b| !b.is_empty()),
+        project: Some(project.to_string()),
         creator: Some("you".into()),
         production: true,
         target,
-        use_cache: body.use_cache,
+        use_cache,
         root_dir,
         env: None, // redeploy: existing project env is read from the store at build time
-        no_fanout: false, // dashboard redeploy is a coordinator deploy → schedule + fanout
+        no_fanout,
         build_config: None, // coordinator reads its own store; fanout fills these per-target
         function_settings: None,
         redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
         zip_b64: None,
         image_ref: None,
         image_port: None,
+    }
+}
+
+async fn project_redeploy(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(body): Json<RedeployBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+
+    // Environment chosen in the modal: "production" | "preview". When absent the
+    // branch decides (Vercel's classification).
+    let target = body
+        .target
+        .as_ref()
+        .map(|t| t.trim().to_lowercase())
+        .filter(|t| t == "production" || t == "preview");
+    let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+
+    // Resolve the newest deployment's SOURCE including the non-git pseudo-sources
+    // (`upload://` zip, `image://` image). The old handler used `git_for_project_fleet`
+    // which filters `is_real_git`, so it returned None — and thus 404 — for EVERY
+    // zip-uploaded or image-based project (the reported bug).
+    let Some(src) = source_for_project_fleet(&c, &project) else {
+        return Err((StatusCode::NOT_FOUND, format!("Project '{project}' has no deployment to redeploy yet.")));
     };
+
+    // Zip-uploaded project: there is no re-fetchable remote — rebuild from the RETAINED
+    // source, which lives on the node that built it. Build locally (no re-placement)
+    // when this node holds it, else dispatch the redeploy to the host node so it
+    // rebuilds from its own source. (Git/image sources are re-fetchable anywhere and
+    // fall through to the normal placement path below.)
+    if !src.is_real_git() && src.repo_url.starts_with("upload://") {
+        if crate::git::has_local_source(&project) {
+            let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true);
+            let build_id = crate::git::start_build(c.clone(), req);
+            return Ok(Json(json!({ "build_id": build_id })));
+        }
+        if let Some(host) = host_node_for_project(&c, &project) {
+            if host != c.node_name {
+                if let Some(t) = target_for_node(&c, &host) {
+                    let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true);
+                    let build_id = crate::git::redeploy_on_host(c.clone(), project.clone(), req, t);
+                    return Ok(Json(json!({ "build_id": build_id })));
+                }
+            }
+        }
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("The uploaded source for '{project}' is not available on a reachable node — re-upload the archive to redeploy."),
+        ));
+    }
+
+    // Prebuilt-image project: reconstruct the image ref and redeploy as an image.
+    if src.repo_url.starts_with("image://") {
+        let image_ref = src.repo_url.strip_prefix("image://").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let Some(image_ref) = image_ref else {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("The image reference for '{project}' is unavailable — redeploy from a new image."),
+            ));
+        };
+        let mut req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), false);
+        req.repo_url = String::new();
+        req.branch = None;
+        req.image_ref = Some(image_ref);
+        let build_id = crate::git::start_build(c.clone(), req);
+        return Ok(Json(json!({ "build_id": build_id })));
+    }
+
+    // Real git source: re-clone + rebuild through the normal placement/fanout path.
+    let req = redeploy_request(&project, &src, target, body.use_cache, root_dir, false);
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
 }

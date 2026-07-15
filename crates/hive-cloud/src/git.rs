@@ -319,6 +319,52 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     id
 }
 
+/// True when THIS node holds the retained source for `project` — a durable
+/// `<project>.src.zip` OR a prior build checkout — i.e. a zip redeploy can rebuild
+/// here without re-fetching from a peer.
+pub(crate) fn has_local_source(project: &str) -> bool {
+    deploy_root().join(format!("{project}.src.zip")).is_file() || newest_deploy_dir(project).is_some()
+}
+
+/// Redeploy a project whose retained source lives on a SPECIFIC host node (not this
+/// coordinator). Dispatch the rebuild to that node over the existing fanout transport
+/// (HTTP admin or iroh mesh); the target, receiving an `upload://` request with no
+/// archive, rebuilds from ITS OWN retained source. The remote build is mirrored into a
+/// local build record so the dashboard shows a single build. Returns the build id.
+pub(crate) fn redeploy_on_host(
+    cloud: Arc<CloudState>,
+    project: String,
+    req: GitDeployRequest,
+    host: crate::schedule::Target,
+) -> String {
+    let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
+    cloud.builds.insert(Build {
+        id: id.clone(),
+        project: project.clone(),
+        repo_url: req.repo_url.clone(),
+        branch: req.branch.clone().unwrap_or_default(),
+        commit: String::new(),
+        commit_message: String::new(),
+        state: DeployState::Building,
+        started_ms: now_ms(),
+        finished_ms: None,
+        deployment_id: None,
+        alias: None,
+        lines: Vec::new(),
+    });
+    let bid = id.clone();
+    tokio::spawn(async move {
+        cloud.builds.log(&bid, format!("Redeploy: dispatching to host node {}", host.node));
+        let ok = fanout_remote(&cloud, &bid, &req, &project, std::slice::from_ref(&host)).await;
+        cloud.builds.update(&bid, |b| {
+            b.state = if ok { DeployState::Ready } else { DeployState::Error };
+            b.finished_ms = Some(now_ms());
+        });
+        crate::persist::persist(&cloud);
+    });
+    id
+}
+
 async fn run_build(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -468,7 +514,49 @@ async fn run_build(
             .map_err(|e| anyhow::anyhow!("invalid upload encoding: {e}"))?;
         let files = extract_zip_into(&bytes, &dir).await?;
         log(format!("Extracted {files} file(s) in {}ms", now_ms().saturating_sub(t0)));
+        // Retain the ORIGINAL archive durably so a later Redeploy can rebuild this
+        // zip-uploaded project from source. Stored as a FILE beside the checkouts —
+        // `gc_build_dirs` only reaps directories, so this survives build-dir GC (and,
+        // on a persistent /tmp, node restarts); the redeploy path re-extracts it.
+        let retained = deploy_root().join(format!("{project}.src.zip"));
+        if let Err(e) = tokio::fs::write(&retained, &bytes).await {
+            log(format!("(note) could not retain source archive for future redeploys: {e}"));
+        }
         ("upload".to_string(), String::new(), format!("Uploaded {}", if name.is_empty() { "archive.zip".into() } else { name }))
+    } else if req.repo_url.starts_with("upload://") {
+        // REDEPLOY of a zip-uploaded project: no git remote to clone and the request
+        // carries no fresh archive. Rebuild from RETAINED source on THIS node — the
+        // durable `<project>.src.zip` if present (clean original), else a copy of the
+        // prior build's on-disk checkout. The redeploy handler pins the rebuild to the
+        // node that holds this source, so a missing source here is a real error.
+        let name = req.repo_url.trim_start_matches("upload://").to_string();
+        let retained = deploy_root().join(format!("{project}.src.zip"));
+        let t0 = now_ms();
+        if retained.is_file() {
+            log(format!(
+                "Redeploy: re-extracting retained source archive ({})",
+                if name.is_empty() { "archive.zip" } else { &name }
+            ));
+            let bytes = tokio::fs::read(&retained).await?;
+            let files = extract_zip_into(&bytes, &dir).await?;
+            log(format!("Extracted {files} file(s) in {}ms", now_ms().saturating_sub(t0)));
+        } else if let Some(src) = newest_deploy_dir(&project) {
+            log("Redeploy: reusing retained source from the prior build".to_string());
+            let (s, d) = (src.clone(), dir.clone());
+            tokio::task::spawn_blocking(move || copy_dir_into(&s, &d))
+                .await
+                .map_err(|e| anyhow::anyhow!("source copy task failed: {e}"))??;
+            log(format!("Prepared source in {}ms", now_ms().saturating_sub(t0)));
+        } else {
+            anyhow::bail!(
+                "no retained source found for this uploaded project — re-upload the archive to deploy again"
+            );
+        }
+        (
+            "upload".to_string(),
+            String::new(),
+            format!("Redeploy of {}", if name.is_empty() { "uploaded archive".into() } else { name }),
+        )
     } else {
         let short_repo = req.repo_url.trim_start_matches("https://").trim_end_matches(".git");
         log(format!(
@@ -2061,6 +2149,30 @@ async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
         let _ = tokio::fs::remove_dir_all(&inner).await;
     }
     Ok(dir_stats(dir).await.0)
+}
+
+/// Recursively copy the CONTENTS of `src` into `dst` (created if missing). Used by a
+/// zip-upload REDEPLOY that has no re-fetchable remote: it rebuilds from the retained
+/// on-disk checkout of the prior build. Symlinks are recreated best-effort; this is a
+/// local same-filesystem copy, so cost is bounded by the checkout size.
+fn copy_dir_into(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dir_into(&from, &to)?;
+        } else if ft.is_symlink() {
+            if let Ok(target) = std::fs::read_link(&from) {
+                let _ = std::os::unix::fs::symlink(target, &to);
+            }
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// (file count, total bytes) under `dir`, recursively — to report what the warm-up
