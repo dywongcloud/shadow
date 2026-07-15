@@ -183,28 +183,139 @@ export interface GhRepo {
   owner?: string;
 }
 
-/** Find or create a Composio-managed GitHub auth config; return its id. */
+/** OAuth scopes the platform needs: `repo` (private repo + org CONTENT), `read:org`
+ *  (enumerate the user's orgs so the org picker works + show what's reachable),
+ *  `workflow` (GitHub Actions writes for the GitOps CI workflow). */
+export const GITHUB_SCOPES = ["repo", "read:org", "workflow"] as const;
+
+/** Find or create a Composio-managed GitHub auth config; return its id.
+ *
+ *  Operator pin: `HIVE_GITHUB_AUTH_CONFIG_ID` overrides everything — set it to a
+ *  Composio auth-config (dashboard-configured, or `use_custom_auth` backed by your
+ *  own GitHub OAuth app) that is known to grant `read:org`, since Composio's managed
+ *  GitHub app may not honor a scope override and won't re-scope an existing config.
+ *  Otherwise reuse an existing config, else create one REQUESTING `GITHUB_SCOPES`. */
 async function githubAuthConfigId(): Promise<string> {
+  const pinned = process.env.HIVE_GITHUB_AUTH_CONFIG_ID?.trim();
+  if (pinned) return pinned;
   const list = await v3(`/auth_configs?toolkit_slug=${GITHUB_SLUG}`);
   const items: any[] = list?.items ?? [];
   if (items[0]?.id) return items[0].id;
   const created = await v3(`/auth_configs`, {
     method: "POST",
-    body: JSON.stringify({ toolkit: { slug: GITHUB_SLUG }, auth_config: { type: "use_composio_managed_auth" } }),
+    body: JSON.stringify({
+      toolkit: { slug: GITHUB_SLUG },
+      auth_config: { type: "use_composio_managed_auth", scopes: GITHUB_SCOPES },
+    }),
   });
   return created?.auth_config?.id || created?.id;
 }
 
-/** Whether this entity has an active GitHub connection. */
-export async function githubStatus(entity: string): Promise<{ connected: boolean; configured: boolean }> {
-  if (!composioConfigured()) return { connected: false, configured: false };
+/** Rich, HONEST view of a GitHub connection — beyond a bare connected bool. */
+export interface GithubConnectionDetail {
+  configured: boolean;
+  /** ACTIVE in Composio AND the token actually works (see `live`). */
+  connected: boolean;
+  entity: string;
+  login: string | null;
+  scopes: string[];
+  hasPrivateAccess: boolean; // `repo` — private repo + org content
+  hasOrgScope: boolean; // `read:org` — org enumeration
+  /** Composio says ACTIVE but the token is checked against GitHub — Composio keeps
+   *  ACTIVE after GitHub revokes a token, so this catches dead-but-ACTIVE connections. */
+  live: boolean;
+}
+
+/** Read the ACTIVE connected_account's granted scopes (a space/comma-separated
+ *  string on data.scope / state.val.scope). */
+function scopesFromAccount(active: any): string[] {
+  const raw =
+    active?.data?.scope || active?.state?.val?.scope || active?.connectionParams?.scope || "";
+  return String(raw)
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** The full, honest GitHub connection state for an entity. `connected` requires the
+ *  token to be BOTH ACTIVE in Composio AND live against GitHub (unmasks revoked-but-
+ *  ACTIVE tokens); `scopes`/`login` power the Integrations management UI. */
+export async function githubConnectionDetail(entity: string): Promise<GithubConnectionDetail> {
+  const base: GithubConnectionDetail = {
+    configured: composioConfigured(),
+    connected: false,
+    entity,
+    login: null,
+    scopes: [],
+    hasPrivateAccess: false,
+    hasOrgScope: false,
+    live: false,
+  };
+  if (!composioConfigured()) return base;
   try {
     const res = await v3(`/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${GITHUB_SLUG}`);
     const items: any[] = res?.items ?? [];
-    const connected = items.some((x) => (x.status || "").toUpperCase() === "ACTIVE");
-    return { connected, configured: true };
+    const active = items.find((x) => (x.status || "").toUpperCase() === "ACTIVE");
+    if (!active) return base;
+    const scopes = scopesFromAccount(active);
+    // Probe GitHub for real liveness — Composio reports ACTIVE for revoked tokens.
+    const user = await githubUser(entity).catch(() => null);
+    const live = !!user?.login;
+    if (!live) invalidateGithubToken(entity); // clear the 60s cache so a fresh token is picked up fast
+    return {
+      configured: true,
+      connected: live, // honest: ACTIVE + actually usable
+      entity,
+      login: user?.login ?? null,
+      scopes,
+      hasPrivateAccess: scopes.includes("repo"),
+      hasOrgScope: scopes.includes("read:org"),
+      live,
+    };
   } catch {
-    return { connected: false, configured: true };
+    return { ...base, configured: true };
+  }
+}
+
+/** Backwards-compatible slim status — now HONEST (connected = ACTIVE + live). */
+export async function githubStatus(entity: string): Promise<{ connected: boolean; configured: boolean }> {
+  const d = await githubConnectionDetail(entity);
+  return { connected: d.connected, configured: d.configured };
+}
+
+/** The organizations the connected user belongs to (needs `read:org`). Degrades to
+ *  [] when the scope is absent / unconfigured so the UI can fall back gracefully. */
+export async function githubOrgs(entity: string): Promise<{ login: string; name?: string }[]> {
+  if (!composioConfigured()) return [];
+  try {
+    const res = await ghExec(entity, "GITHUB_LIST_ORGANIZATIONS_FOR_THE_AUTHENTICATED_USER", { per_page: 100 });
+    const data = res?.data?.details ?? res?.data ?? res ?? [];
+    const arr: any[] = Array.isArray(data) ? data : data?.organizations ?? data?.items ?? [];
+    return arr.map((o: any) => ({ login: o.login, name: o.name || o.login })).filter((o) => o.login);
+  } catch (e) {
+    console.error("composio orgs failed", e);
+    return [];
+  }
+}
+
+/** Disconnect GitHub: DELETE every connected_account this entity has for the toolkit
+ *  (the list can return more than one), then drop the cached token. Returns how many
+ *  were removed. Reconnect = call this then `githubConnect` (re-consent grants new scopes). */
+export async function disconnectGithub(entity: string): Promise<{ ok: boolean; removed: number; error?: string }> {
+  if (!composioConfigured()) return { ok: false, removed: 0, error: "COMPOSIO_API_KEY not set" };
+  try {
+    const res = await v3(`/connected_accounts?user_ids=${encodeURIComponent(entity)}&toolkit_slugs=${GITHUB_SLUG}`);
+    const items: any[] = res?.items ?? [];
+    let removed = 0;
+    for (const it of items) {
+      if (!it?.id) continue;
+      await v3(`/connected_accounts/${encodeURIComponent(it.id)}`, { method: "DELETE" });
+      removed++;
+    }
+    invalidateGithubToken(entity);
+    return { ok: true, removed };
+  } catch (e: any) {
+    return { ok: false, removed: 0, error: e?.message || "disconnect failed" };
   }
 }
 
@@ -346,6 +457,17 @@ function looksLikeOrgRestriction(s: string): boolean {
   return /OAuth App access restrictions|restricting-access-to-your-organization|third-parties is limited/i.test(s || "");
 }
 
+/** The URL an org owner/member visits to approve/request this OAuth app for an org.
+ *  Prefers a concrete URL parsed from GitHub's 403 body (documentation_url or an
+ *  https://github.com/... link), falling back to the org's third-party-apps policy
+ *  page — never returns an empty/broken link. */
+function orgApproveUrl(org: string, errBody?: string): string {
+  const body = errBody || "";
+  const doc = body.match(/https:\/\/github\.com\/[^\s"')]+/i)?.[0];
+  if (doc && /orgs?\/|policies|settings|oauth/i.test(doc)) return doc;
+  return `https://github.com/orgs/${org}/policies/applications`;
+}
+
 /** A random, collision-proof name for the GitOps config repo. */
 export function randomConfigRepoName(): string {
   // 8 hex chars from crypto — never collides with a user's real source repo.
@@ -392,7 +514,7 @@ export async function createRepo(
         return {
           ok: false,
           restricted: true,
-          approve_url: `https://github.com/orgs/${org}/policies/applications`,
+          approve_url: orgApproveUrl(org, msg),
           error: `The "${org}" organization restricts third-party OAuth apps. An org owner must approve this app before a repo can be created there.`,
         };
       }
@@ -580,19 +702,37 @@ function mapRepos(arr: any[]): GhRepo[] {
 }
 
 /** List repositories for a specific ORGANIZATION (used when the GitOps scope is an
- *  org — the "use existing repo" picker must show the ORG's repos, not the user's). */
-export async function githubOrgRepos(entity: string, org: string): Promise<GhRepo[]> {
-  if (!composioConfigured() || !org) return [];
+ *  org — the "use existing repo" picker must show the ORG's repos, not the user's).
+ *  `type:'all'` so PRIVATE org repos are included. When the org restricts third-party
+ *  OAuth apps and hasn't approved this one, returns `{restricted, approve_url}` (with
+ *  a parsed/fallback approval link) instead of silently swallowing the 403 → []. */
+export async function githubOrgRepos(
+  entity: string,
+  org: string
+): Promise<{ repos: GhRepo[]; restricted?: boolean; approve_url?: string; error?: string }> {
+  if (!composioConfigured() || !org) return { repos: [] };
   try {
     const res = await ghExec(entity, "GITHUB_LIST_ORGANIZATION_REPOSITORIES", {
-      org, per_page: 100, sort: "updated",
+      org, per_page: 100, sort: "updated", type: "all",
     });
+    const d = deep(res);
+    if (res?.successful === false || d?.errors) {
+      const msg = d?.message || res?.error || JSON.stringify(d?.errors || {});
+      if (looksLikeOrgRestriction(msg)) {
+        return { repos: [], restricted: true, approve_url: orgApproveUrl(org, msg), error: msg };
+      }
+      return { repos: [], error: msg };
+    }
     const data = res?.data?.details ?? res?.data ?? res ?? [];
     const arr: any[] = Array.isArray(data) ? data : data?.repositories ?? data?.items ?? [];
-    return mapRepos(arr);
-  } catch (e) {
+    return { repos: mapRepos(arr) };
+  } catch (e: any) {
+    const msg = e?.message || "org repos failed";
+    if (looksLikeOrgRestriction(msg)) {
+      return { repos: [], restricted: true, approve_url: orgApproveUrl(org, msg), error: msg };
+    }
     console.error("composio org repos failed", e);
-    return [];
+    return { repos: [], error: msg };
   }
 }
 

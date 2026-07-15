@@ -24,9 +24,16 @@ export async function POST(req: NextRequest) {
   const entity = await resolveEntity();
   const res = await createRepo(entity, { name, org, isPrivate, autoInit: false });
   if (!res.ok) {
+    // Thread org-approval restriction (restricted + approve_url) so the UI can show
+    // a direct "approve this app for the organization" link, not raw GitHub JSON.
     return NextResponse.json(
-      { error: res.error || "Failed to create repository", conflict: !!res.conflict },
-      { status: res.conflict ? 409 : 500 }
+      {
+        error: res.error || "Failed to create repository",
+        conflict: !!res.conflict,
+        restricted: !!res.restricted,
+        approve_url: res.approve_url,
+      },
+      { status: res.conflict ? 409 : res.restricted ? 403 : 500 }
     );
   }
   const fullName = res.full_name || "";

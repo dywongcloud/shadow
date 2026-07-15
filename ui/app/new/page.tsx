@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound } from "lucide-react";
+import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, ExternalLink, ChevronDown, Plus, X, KeyRound, AlertTriangle, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -24,6 +24,17 @@ interface GhRepo {
   clone_url: string;
   default_branch: string;
   private: boolean;
+}
+
+/** Enriched GitHub status (subset of githubConnectionDetail) used to decide the
+ *  import panel state + whether to prompt reconnect / org-approval. */
+interface GhDetail {
+  configured: boolean;
+  connected: boolean;
+  scopes?: string[];
+  hasPrivateAccess?: boolean;
+  hasOrgScope?: boolean;
+  live?: boolean;
 }
 
 interface Template {
@@ -107,8 +118,11 @@ export default function NewProjectPage() {
   const [urlEnvRows, setUrlEnvRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
   const [name, setName] = useState("");
   const [port, setPort] = useState("");
-  const [gh, setGh] = useState<{ configured: boolean; connected: boolean }>({ configured: false, connected: false });
+  const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
+  // A reconnect / org-approval prompt shown above the repo list: a dead-but-ACTIVE
+  // token, a connection lacking read:org, or an org restricting the OAuth app.
+  const [ghCta, setGhCta] = useState<{ text: string; approveUrl?: string } | null>(null);
   const [repoQ, setRepoQ] = useState("");
   const [selected, setSelected] = useState<Template | null>(null);
   const [tplPage, setTplPage] = useState(0);
@@ -121,13 +135,51 @@ export default function NewProjectPage() {
   const shownTemplates = TEMPLATES.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
 
   useEffect(() => {
-    cachedJson<{ configured: boolean; connected: boolean }>("/api/github/status", 30_000).then((s) => {
-      setGh({ configured: !!s.configured, connected: !!s.connected });
-      if (s.connected) {
-        // Repos cached for 5 min so re-opening "New Project" is instant.
-        cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000).then((d) => setRepos(d.repos || [])).catch(() => {});
+    cachedJson<GhDetail>("/api/github/status", 30_000).then(async (s) => {
+      setGh({ ...s, configured: !!s.configured, connected: !!s.connected });
+      // Dead-but-ACTIVE token (ACTIVE in Composio but revoked on GitHub): scopes are
+      // known yet the connection isn't live → prompt a reconnect, not a false green.
+      if (s.configured && !s.connected && (s.scopes?.length ?? 0) > 0) {
+        setGhCta({ text: "Your GitHub authorization is no longer valid. Reconnect to import your repositories." });
+        return;
       }
+      if (!s.connected) return;
+      // Personal repos (cached 5 min so re-opening "New Project" is instant).
+      const personal = await cachedJson<{ repos: GhRepo[] }>("/api/github/repos", 5 * 60_000)
+        .then((d) => d.repos || [])
+        .catch(() => [] as GhRepo[]);
+      const merged: GhRepo[] = [...personal];
+      const seen = new Set(personal.map((r) => r.full_name));
+      // Only merge org repos when we can enumerate them (read:org). Absent scope is
+      // NOT nagged here — private-repo import already works; org access is offered in
+      // Integrations / the GitOps modal instead (non-disruptive per edge policy).
+      if (s.hasOrgScope) {
+        const orgs = await cachedJson<{ orgs: { login: string }[] }>("/api/github/orgs", 5 * 60_000)
+          .then((d) => d.orgs || [])
+          .catch(() => [] as { login: string }[]);
+        const results = await Promise.all(
+          orgs.slice(0, 8).map((o) =>
+            fetch(`/api/github/repos?org=${encodeURIComponent(o.login)}`)
+              .then((r) => r.json())
+              .catch(() => ({ repos: [] as GhRepo[] })),
+          ),
+        );
+        let restrictedCta: { text: string; approveUrl?: string } | null = null;
+        for (const res of results) {
+          // Surface the FIRST restricting org's approval link (only an org actually
+          // blocking the app warrants a CTA — a live, working connection stays quiet).
+          if (res?.restricted && res?.approve_url && !restrictedCta) {
+            restrictedCta = { text: "An organization restricts OpenEdge. Approve the app to import its repositories.", approveUrl: res.approve_url };
+          }
+          for (const r of (res?.repos as GhRepo[]) || []) {
+            if (r?.full_name && !seen.has(r.full_name)) { seen.add(r.full_name); merged.push(r); }
+          }
+        }
+        if (restrictedCta) setGhCta(restrictedCta);
+      }
+      setRepos(merged);
     }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Build the env map for the quick git-URL deploy from its editor rows.
@@ -269,10 +321,17 @@ export default function NewProjectPage() {
   }
 
   async function connectGithub() {
-    const r = await fetch("/api/github/connect", { method: "POST" });
+    const r = await fetch("/api/github/connect", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ returnTo: "/new" }) });
     const d = await r.json();
     if (d.redirectUrl) window.location.href = d.redirectUrl;
     else setError(d.error || "Could not start GitHub connection");
+  }
+
+  // Drop the current connection then re-run OAuth so re-consent grants the current
+  // scopes (fixes a dead token, or grants read:org for organization repos).
+  async function reconnectGithub() {
+    await fetch("/api/github/disconnect", { method: "POST" }).catch(() => {});
+    await connectGithub();
   }
 
   const filteredRepos = repos.filter((r) => r.full_name.toLowerCase().includes(repoQ.toLowerCase()));
@@ -371,6 +430,22 @@ export default function NewProjectPage() {
           <Card className="p-4">
             {gh.connected ? (
               <>
+                {/* Non-blocking org/reconnect prompt (personal + known-org repos still work). */}
+                {ghCta ? (
+                  <div className="mb-3 flex flex-col gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                    <span className="flex items-start gap-1.5"><AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" /> {ghCta.text}</span>
+                    <div className="flex flex-wrap items-center gap-3">
+                      {ghCta.approveUrl ? (
+                        <a href={ghCta.approveUrl} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:text-fg">
+                          Approve the app <ExternalLink className="h-3 w-3" />
+                        </a>
+                      ) : null}
+                      <button onClick={reconnectGithub} className="inline-flex items-center gap-1 font-medium underline underline-offset-2 hover:text-fg">
+                        <RefreshCw className="h-3 w-3" /> Reconnect / grant access
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
                 <div className="relative mb-3">
                   <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
                   <Input placeholder="Search…" value={repoQ} onChange={(e) => setRepoQ(e.target.value)} className="pl-9" />
@@ -394,15 +469,18 @@ export default function NewProjectPage() {
             ) : (
               <div className="flex flex-col items-center gap-3 py-8 text-center">
                 <Github className="h-8 w-8" />
-                <div className="font-medium">Connect GitHub</div>
+                <div className="font-medium">{ghCta ? "Reconnect GitHub" : "Connect GitHub"}</div>
                 <p className="max-w-xs text-sm text-secondary">
-                  {gh.configured
-                    ? "Authorize GitHub to import and deploy your repositories."
-                    : "Set COMPOSIO_API_KEY to enable multi-tenant GitHub OAuth. You can still deploy any public repo by URL above."}
+                  {!gh.configured
+                    ? "Set COMPOSIO_API_KEY to enable multi-tenant GitHub OAuth. You can still deploy any public repo by URL above."
+                    : ghCta
+                    ? ghCta.text
+                    : "Authorize GitHub to import and deploy your repositories."}
                 </p>
                 {gh.configured && (
-                  <Button onClick={connectGithub}>
-                    <Github className="h-4 w-4" /> Connect GitHub
+                  <Button onClick={ghCta ? reconnectGithub : connectGithub}>
+                    {ghCta ? <RefreshCw className="h-4 w-4" /> : <Github className="h-4 w-4" />}
+                    {ghCta ? "Reconnect GitHub" : "Connect GitHub"}
                   </Button>
                 )}
               </div>

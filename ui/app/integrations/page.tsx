@@ -1,10 +1,24 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { Github, Search, Plus, Database, Box, Lock, CreditCard, Loader2, Check, AlertTriangle, RefreshCw, Building2, GitBranch } from "lucide-react";
 import { Card, Button, Input, Badge, PageHeader, Triangle } from "@/components/ui";
-import { cachedJson } from "@/lib/cache";
+import { cachedJson, invalidate } from "@/lib/cache";
 import { currentTeam } from "@/lib/api";
+
+/** Enriched, HONEST GitHub connection detail (matches githubConnectionDetail). */
+interface GhDetail {
+  configured: boolean;
+  connected: boolean; // ACTIVE in Composio AND the token actually works
+  entity?: string | null;
+  login?: string | null;
+  scopes?: string[];
+  hasPrivateAccess?: boolean; // `repo`
+  hasOrgScope?: boolean; // `read:org`
+  live?: boolean;
+}
+interface GhOrg { login: string; name?: string }
 
 function Logo({ kind }: { kind: string }) {
   // White tile behind every icon (glyphs forced dark so they read on white in dark mode).
@@ -93,7 +107,27 @@ function MarketplaceArtCard({ count }: { count: number }) {
 }
 
 export default function IntegrationsPage() {
-  const [gh, setGh] = useState<{ configured: boolean; connected: boolean }>({ configured: false, connected: false });
+  const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
+  const [ghOrgs, setGhOrgs] = useState<GhOrg[]>([]);
+
+  // Refetch the enriched GitHub status + accessible orgs, bypassing the short
+  // client cache (called after connect/disconnect/reconnect so the card is fresh).
+  const refreshGh = useCallback(async () => {
+    invalidate("/api/github/status");
+    invalidate("/api/github/orgs");
+    try {
+      const s = await cachedJson<GhDetail>("/api/github/status", 30_000);
+      setGh({ ...s, configured: !!s.configured, connected: !!s.connected });
+      if (s.connected && s.hasOrgScope) {
+        const o = await cachedJson<{ orgs: GhOrg[] }>("/api/github/orgs", 60_000);
+        setGhOrgs(Array.isArray(o.orgs) ? o.orgs : []);
+      } else {
+        setGhOrgs([]);
+      }
+    } catch {
+      /* leave last-known state */
+    }
+  }, []);
 
   // Marketplace catalog (loaded inline).
   const [toolkits, setToolkits] = useState<Toolkit[]>([]);
@@ -114,6 +148,14 @@ export default function IntegrationsPage() {
     params.delete("connected");
     const qs = params.toString();
     window.history.replaceState({}, "", window.location.pathname + (qs ? `?${qs}` : ""));
+    // GitHub is a Git integration, not a resource toolkit — it's managed by the
+    // GitHub card (status/scopes/orgs), never credential-linked into deployments.
+    // Just refresh the card so a completed OAuth reflects immediately.
+    if (slug === "github") {
+      setLinkMsg({ tone: "ok", text: "GitHub connected." });
+      refreshGh();
+      return;
+    }
     setLinkMsg({ tone: "ok", text: `Linking ${slug} resources…` });
     (async () => {
       try {
@@ -138,14 +180,12 @@ export default function IntegrationsPage() {
         setLinkMsg({ tone: "warn", text: `Connected ${slug}, but linking resources failed.` });
       }
     })();
-  }, []);
+  }, [refreshGh]);
 
   useEffect(() => {
-    // GitHub status: short cache (reflects connection state).
-    cachedJson<{ configured: boolean; connected: boolean }>("/api/github/status", 30_000)
-      .then((s) => setGh({ configured: !!s.configured, connected: !!s.connected }))
-      .catch(() => {});
-  }, []);
+    // Enriched GitHub status + accessible orgs (short cache; reflects connection state).
+    refreshGh();
+  }, [refreshGh]);
 
   useEffect(() => {
     let cancelled = false;
@@ -181,12 +221,6 @@ export default function IntegrationsPage() {
   // Reset to page 0 whenever the search changes.
   useEffect(() => { setPage(0); }, [q]);
 
-  async function connectGithub() {
-    const r = await fetch("/api/github/connect", { method: "POST" });
-    const d = await r.json();
-    if (d.redirectUrl) window.location.href = d.redirectUrl;
-  }
-
   async function connectToolkit(slug: string) {
     setConnecting(slug);
     setError(null);
@@ -202,8 +236,9 @@ export default function IntegrationsPage() {
     }
   }
 
-  const connected = [
-    { kind: "github", name: "GitHub", desc: "Deploy projects automatically with Git integration", active: gh.connected },
+  // The managed hive-cloud data services (always active). GitHub is rendered by the
+  // dedicated <GithubCard/> which carries full connection/scope/org management.
+  const otherConnected = [
     { kind: "postgres", name: "OpenEdge Postgres", desc: "Serverless SQL database built for the edge", active: true },
     { kind: "kv", name: "OpenEdge KV", desc: "Durable Redis database for caching", active: true },
   ];
@@ -229,14 +264,15 @@ export default function IntegrationsPage() {
 
       <h2 className="mb-3 text-base font-semibold">Connected</h2>
       <div className="mb-10 grid grid-cols-1 gap-4 md:grid-cols-3">
-        {connected.map((i) => (
+        <GithubCard gh={gh} orgs={ghOrgs} onRefresh={refreshGh} />
+        {otherConnected.map((i) => (
           <Card key={i.name} className="p-5">
             <div className="mb-3 flex items-start justify-between">
               <div className="flex items-center gap-3">
                 <Logo kind={i.kind} />
                 <div>
                   <div className="font-semibold">{i.name}</div>
-                  <div className="text-xs text-muted">{i.kind === "github" ? (gh.connected ? "connected" : "not connected") : "hive-cloud"}</div>
+                  <div className="text-xs text-muted">hive-cloud</div>
                 </div>
               </div>
               <Badge tone={i.active ? "green" : "default"}>
@@ -245,11 +281,7 @@ export default function IntegrationsPage() {
             </div>
             <p className="mb-4 text-sm text-secondary">{i.desc}</p>
             <div className="flex items-center gap-3">
-              {i.kind === "github" && !gh.connected && gh.configured ? (
-                <Button onClick={connectGithub}>Connect</Button>
-              ) : (
-                <Button variant="outline">Configure</Button>
-              )}
+              <Button variant="outline">Configure</Button>
               <button className="text-sm text-secondary hover:text-fg">Disconnect</button>
             </div>
           </Card>
@@ -302,6 +334,179 @@ export default function IntegrationsPage() {
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * The GitHub connection management card — the literal ask: view what's granted,
+ * reconnect/adjust scopes, request org approval, disconnect+reconnect.
+ *
+ * Renders the HONEST connection state (ACTIVE *and* live), the granted scopes as
+ * badges (private-repo access via `repo`, org enumeration via `read:org`), the
+ * accessible organizations, and wires the previously-dead Disconnect / Configure
+ * buttons to real actions. A dead-but-ACTIVE token surfaces a red "reconnect
+ * needed" banner instead of a false green.
+ */
+function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRefresh: () => void }) {
+  const [busy, setBusy] = useState<null | "connect" | "reconnect" | "disconnect">(null);
+  const scopes = gh.scopes ?? [];
+  // A revoked-but-ACTIVE connection: Composio still lists an account (so scopes are
+  // known) but the token no longer works against GitHub (live=false) → reconnect.
+  const needsReconnect = gh.configured && !gh.connected && scopes.length > 0;
+
+  async function connect(kind: "connect" | "reconnect") {
+    setBusy(kind);
+    try {
+      // Reconnect = disconnect the stale/limited connection first, so re-consent binds
+      // a fresh account with the current scopes (incl. read:org) rather than reusing
+      // the old grant. Plain connect just runs OAuth.
+      if (kind === "reconnect") await fetch("/api/github/disconnect", { method: "POST" }).catch(() => {});
+      const r = await fetch("/api/github/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ returnTo: "/integrations" }),
+      });
+      const d = await r.json();
+      if (d.redirectUrl) { window.location.href = d.redirectUrl; return; }
+      setBusy(null);
+    } catch {
+      setBusy(null);
+    }
+  }
+
+  async function disconnect() {
+    if (!window.confirm("Disconnect GitHub? This removes the authorization from OpenEdge. You can reconnect anytime.")) return;
+    setBusy("disconnect");
+    try {
+      await fetch("/api/github/disconnect", { method: "POST" });
+    } finally {
+      setBusy(null);
+      onRefresh();
+    }
+  }
+
+  const active = gh.connected;
+  const subtitle = !gh.configured
+    ? "not configured"
+    : active
+    ? gh.login
+      ? `@${gh.login}`
+      : "connected"
+    : needsReconnect
+    ? "reconnect needed"
+    : "not connected";
+
+  return (
+    <Card className="p-5">
+      <div className="mb-3 flex items-start justify-between">
+        <div className="flex items-center gap-3">
+          <Logo kind="github" />
+          <div>
+            <div className="font-semibold">GitHub</div>
+            <div className="text-xs text-muted">{subtitle}</div>
+          </div>
+        </div>
+        <Badge tone={active ? "green" : needsReconnect ? "red" : "default"}>
+          {active ? <><Check className="h-3 w-3" /> Active</> : needsReconnect ? "Reconnect" : "Inactive"}
+        </Badge>
+      </div>
+
+      {/* Not configured: no OAuth path — point at the PAT / public-URL fallback. */}
+      {!gh.configured ? (
+        <>
+          <p className="mb-4 text-sm text-secondary">
+            GitHub OAuth needs <code className="rounded bg-subtle px-1 py-0.5 text-xs">COMPOSIO_API_KEY</code>. You
+            can still deploy any public repo by URL, or use a personal access token on the Git page.
+          </p>
+          <div className="flex items-center gap-3">
+            <Link href="/new"><Button variant="outline">Deploy by URL</Button></Link>
+          </div>
+        </>
+      ) : (
+        <>
+          <p className="mb-3 text-sm text-secondary">Deploy projects automatically with Git integration.</p>
+
+          {/* Reconnect-needed banner for a dead-but-ACTIVE token. */}
+          {needsReconnect ? (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>Your GitHub authorization is no longer valid (the token was revoked or expired). Reconnect to restore access.</span>
+            </div>
+          ) : null}
+
+          {/* Granted scopes → capability badges (only when live). */}
+          {active ? (
+            <div className="mb-3 flex flex-wrap gap-1.5">
+              <Badge tone={gh.hasPrivateAccess ? "green" : "default"}>
+                {gh.hasPrivateAccess ? <><Check className="h-3 w-3" /> Private access</> : "Public only"}
+              </Badge>
+              <Badge tone={gh.hasOrgScope ? "green" : "default"}>
+                <Building2 className="h-3 w-3" /> {gh.hasOrgScope ? "Org access" : "No org access"}
+              </Badge>
+            </div>
+          ) : null}
+
+          {/* Accessible organizations (needs read:org). */}
+          {active && gh.hasOrgScope && orgs.length > 0 ? (
+            <div className="mb-3 text-xs text-secondary">
+              <span className="text-muted">Organizations: </span>
+              {orgs.slice(0, 6).map((o) => o.login).join(", ")}
+              {orgs.length > 6 ? ` +${orgs.length - 6} more` : ""}
+            </div>
+          ) : null}
+
+          {/* Missing org scope → a NON-disruptive prompt (private content still works). */}
+          {active && !gh.hasOrgScope ? (
+            <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>Listing your organizations needs the <code>read:org</code> scope. Private-repo access already works — reconnect only if you want to pick org repos.</span>
+            </div>
+          ) : null}
+
+          <div className="flex flex-wrap items-center gap-3">
+            {active ? (
+              <>
+                <Button variant="outline" onClick={() => window.dispatchEvent(new Event("hive-open-gitops"))}>
+                  <GitBranch className="h-3.5 w-3.5" /> Set up GitOps
+                </Button>
+                <button
+                  onClick={() => connect("reconnect")}
+                  disabled={!!busy}
+                  className="inline-flex items-center gap-1.5 text-sm text-secondary hover:text-fg disabled:opacity-50"
+                >
+                  {busy === "reconnect" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  Reconnect / adjust access
+                </button>
+                <button
+                  onClick={disconnect}
+                  disabled={!!busy}
+                  className="inline-flex items-center gap-1.5 text-sm text-secondary hover:text-red-500 disabled:opacity-50"
+                >
+                  {busy === "disconnect" ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+                  Disconnect
+                </button>
+              </>
+            ) : (
+              <>
+                <Button onClick={() => connect(needsReconnect ? "reconnect" : "connect")} disabled={!!busy}>
+                  {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Github className="h-4 w-4" />}
+                  {needsReconnect ? "Reconnect GitHub" : "Connect"}
+                </Button>
+                {needsReconnect ? (
+                  <button
+                    onClick={disconnect}
+                    disabled={!!busy}
+                    className="text-sm text-secondary hover:text-red-500 disabled:opacity-50"
+                  >
+                    Disconnect
+                  </button>
+                ) : null}
+              </>
+            )}
+          </div>
+        </>
+      )}
+    </Card>
   );
 }
 

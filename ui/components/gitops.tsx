@@ -5,8 +5,18 @@ import { usePathname } from "next/navigation";
 import { Github, GitBranch, Check, Loader2, X, ArrowRight, ExternalLink } from "lucide-react";
 import { currentTeam } from "@/lib/api";
 
-interface GhStatus { configured: boolean; connected: boolean; entity?: string | null }
+interface GhStatus {
+  configured: boolean;
+  connected: boolean;
+  entity?: string | null;
+  login?: string | null;
+  scopes?: string[];
+  hasPrivateAccess?: boolean;
+  hasOrgScope?: boolean;
+  live?: boolean;
+}
 interface Repo { name: string; full_name: string; default_branch: string; private: boolean; owner?: string }
+interface GhOrg { login: string; name?: string }
 
 /** Last GitOps sync outcome, persisted for the UI (mirror card, error banner). */
 export interface GitopsSyncStatus {
@@ -112,6 +122,10 @@ export function GitOps() {
   const [mode, setMode] = useState<"create" | "existing">("create");
   const [repo, setRepo] = useState("");
   const [orgLogin, setOrgLogin] = useState("");
+  // Accessible organizations (needs read:org) → the org dropdown that replaces the
+  // old free-text login. Empty when the scope is absent; a manual-entry fallback
+  // still lets a member type a known org login (repo listing works with `repo`).
+  const [orgs, setOrgs] = useState<GhOrg[]>([]);
   const [isPrivate, setIsPrivate] = useState(true);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
@@ -138,6 +152,43 @@ export function GitOps() {
   const finishOnboarding = useCallback(() => {
     localStorage.setItem("hive_onboarded", "1");
     setStep("hidden");
+  }, []);
+
+  // Load the accessible orgs for the dropdown once the repo step is open and GitHub
+  // is connected. Degrades to [] (→ manual-entry fallback) when read:org is absent.
+  useEffect(() => {
+    if (step !== "repo" || !status.connected) return;
+    let cancelled = false;
+    fetch("/api/github/orgs")
+      .then((r) => r.json())
+      .then((d) => { if (!cancelled) setOrgs(Array.isArray(d.orgs) ? d.orgs : []); })
+      .catch(() => { if (!cancelled) setOrgs([]); });
+    return () => { cancelled = true; };
+  }, [step, status.connected]);
+
+  // Allow the Integrations "Set up GitOps" button (or anything) to RE-OPEN this
+  // setup modal on demand — bypassing the hive_onboarded / hive_gitops_linked
+  // localStorage gate that otherwise prevents it from ever reappearing.
+  useEffect(() => {
+    const open = () => {
+      setDone(false);
+      setError("");
+      setApproveUrl("");
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4000);
+      fetch("/api/github/status", { signal: ctrl.signal })
+        .then((r) => r.json())
+        .then((s: GhStatus) => {
+          setStatus(s);
+          if (s.connected) { setStep("repo"); loadRepos(); }
+          else setStep("intro");
+        })
+        .catch(() => setStep("intro"))
+        .finally(() => clearTimeout(timer));
+    };
+    window.addEventListener("hive-open-gitops", open);
+    return () => window.removeEventListener("hive-open-gitops", open);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Decide whether to show the modal, and at which step.
@@ -189,11 +240,21 @@ export function GitOps() {
 
   async function loadRepos(org?: string) {
     setLoadingRepos(true);
+    // Clear a stale approval link; a fresh restricted response re-sets it below.
+    setApproveUrl("");
     try {
       // Org scope → list the ORG's repos, not the personal account's.
       const q = org && org.trim() ? `?org=${encodeURIComponent(org.trim())}` : "";
       const r = await fetch(`/api/github/repos${q}`);
       const d = await r.json();
+      // The org restricts third-party OAuth apps → GitHub returns no repos; surface
+      // the parsed approval link + a re-check path instead of an empty dropdown.
+      if (d.restricted) {
+        setRepos([]);
+        setRepo("");
+        if (d.approve_url) setApproveUrl(d.approve_url);
+        return;
+      }
       const list: Repo[] = Array.isArray(d.repos) ? d.repos : [];
       setRepos(list);
       setRepo(list[0] ? list[0].full_name : "");
@@ -217,6 +278,25 @@ export function GitOps() {
         window.location.href = d.redirectUrl;
         return;
       }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Re-run OAuth after dropping the current connection, so re-consent grants the
+  // current scopes (e.g. read:org). Used by the "grant organization access" prompt
+  // when the org dropdown is empty because read:org was never granted.
+  async function reconnectGithub() {
+    setBusy(true);
+    try {
+      await fetch("/api/github/disconnect", { method: "POST" }).catch(() => {});
+      const r = await fetch("/api/github/connect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ returnTo: window.location.pathname }),
+      });
+      const d = await r.json();
+      if (d.redirectUrl) { window.location.href = d.redirectUrl; return; }
     } finally {
       setBusy(false);
     }
@@ -400,12 +480,43 @@ export function GitOps() {
                 </div>
 
                 {scope === "org" ? (
-                  <input
-                    value={orgLogin}
-                    onChange={(e) => setOrgLogin(e.target.value)}
-                    placeholder="github-org-login"
-                    className="mt-2 w-full rounded-md border border-border bg-bg px-3 py-2 text-sm outline-none focus:border-fg"
-                  />
+                  orgs.length > 0 ? (
+                    // Dropdown of the orgs the connection can actually see (read:org).
+                    <select
+                      value={orgLogin}
+                      onChange={(e) => setOrgLogin(e.target.value)}
+                      className="mt-2 w-full rounded-md border border-border bg-bg px-3 py-2 text-sm outline-none focus:border-fg"
+                    >
+                      <option value="">Select an organization…</option>
+                      {orgs.map((o) => (
+                        <option key={o.login} value={o.login}>{o.login}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    // No enumerable orgs (read:org absent) → prompt to grant org access,
+                    // but keep a manual-entry fallback (repo listing works with `repo`).
+                    <div className="mt-2 space-y-2">
+                      <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+                        We can&apos;t list your organizations — that needs the{" "}
+                        <span className="font-mono">read:org</span> scope.{" "}
+                        <button
+                          type="button"
+                          onClick={reconnectGithub}
+                          disabled={busy}
+                          className="font-medium underline underline-offset-2 hover:text-fg disabled:opacity-50"
+                        >
+                          Reconnect to grant organization access
+                        </button>
+                        , or type a known org login below.
+                      </div>
+                      <input
+                        value={orgLogin}
+                        onChange={(e) => setOrgLogin(e.target.value)}
+                        placeholder="github-org-login"
+                        className="w-full rounded-md border border-border bg-bg px-3 py-2 text-sm outline-none focus:border-fg"
+                      />
+                    </div>
+                  )
                 ) : null}
 
                 {/* Create vs use-existing */}
@@ -454,14 +565,31 @@ export function GitOps() {
 
                 {error ? <p className="mt-3 text-xs text-red-500">{error}</p> : null}
                 {approveUrl ? (
-                  <a
-                    href={approveUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-link hover:underline"
-                  >
-                    Approve this app for the organization <ExternalLink className="h-3 w-3" />
-                  </a>
+                  <div className="mt-2 flex flex-col gap-1.5">
+                    <p className="text-xs text-secondary">
+                      This organization restricts third-party OAuth apps. An org owner must approve
+                      OpenEdge (members can request it), then re-check access.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <a
+                        href={approveUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 text-xs font-medium text-link hover:underline"
+                      >
+                        Approve this app for the organization <ExternalLink className="h-3 w-3" />
+                      </a>
+                      <button
+                        type="button"
+                        onClick={() => loadRepos(scope === "org" ? orgLogin.trim() : "")}
+                        disabled={loadingRepos}
+                        className="inline-flex items-center gap-1 text-xs text-secondary hover:text-fg disabled:opacity-50"
+                      >
+                        {loadingRepos ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+                        Re-check access
+                      </button>
+                    </div>
+                  </div>
                 ) : null}
 
                 <div className="mt-5 flex items-center justify-between gap-2">
