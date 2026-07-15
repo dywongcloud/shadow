@@ -1,5 +1,43 @@
 # Changelog
 
+## (pending) — GitHub connection management (scopes, orgs, reconnect, disconnect)
+
+Users who connected GitHub for a private org or repo had no way to see what the
+connection actually granted, re-authorize with adjusted scopes, request
+organization approval, or disconnect and reconnect — and the platform made two
+silent mistakes: it swallowed GitHub's org OAuth-app-restriction `403`s (a
+restricted org's repo list just came back empty), and it treated
+revoked-but-still-`ACTIVE` Composio connections as connected, showing a false
+green. The Integrations page's GitHub "Configure" and "Disconnect" buttons were
+dead no-ops.
+
+The connection is now honest and fully manageable. `githubConnectionDetail`
+reports `connected` only when the token is BOTH active in Composio AND live
+against GitHub (a `GITHUB_GET_THE_AUTHENTICATED_USER` probe unmasks dead-`ACTIVE`
+tokens and drops the cached token), and surfaces the granted scope names, the
+account login, and whether private-repo (`repo`) and org-enumeration (`read:org`)
+access are present — never a token value. New helpers and routes: `githubOrgs` +
+`GET /api/github/orgs` (the user's orgs, degrading to `[]` without `read:org`);
+`disconnectGithub` + `POST /api/github/disconnect` (deletes every connected
+account for the user, so a later reconnect binds fresh); reconnect = disconnect
+then re-run OAuth; `githubOrgRepos` now requests `type:all` and returns
+`{repos, restricted, approve_url}` on an org OAuth-app restriction, via a shared
+`orgApproveUrl` that parses GitHub's 403 body and falls back to the org's
+third-party-apps policy page (never an empty link), also used by repo creation;
+and `githubAuthConfigId` honors a `HIVE_GITHUB_AUTH_CONFIG_ID` pin, otherwise
+requesting `[repo, read:org, workflow]`. The Integrations page gains a real
+GitHub card (login, scope badges, accessible orgs, a red reconnect-needed banner
+when the token is dead, and wired Disconnect / Reconnect-adjust-access /
+Set-up-GitOps buttons); the GitOps modal swaps the free-text org field for a
+dropdown with an approve link and a Re-check-access button and can be re-opened
+on demand; and New Project merges organization repos into the import list.
+Because Composio's managed GitHub app does not grant `read:org`, org
+*enumeration* degrades gracefully and only prompts a (non-disruptive) reconnect
+when a user actually needs it — private-repo access, which already works via
+`repo`, is never interrupted. Verified live on all 7 fleet nodes: enriched
+status serves, a dead-`ACTIVE` entity reports `live:false`, `/api/github/orgs`
+and `/api/github/disconnect` are registered, and no response carries a token.
+
 ## (pending) — Deploy private GitHub repos (inject the connected-GitHub token)
 
 Deploying a private GitHub repo failed with `fatal: could not read Username for
