@@ -564,32 +564,91 @@ async fn run_build(
             if branch.is_empty() { "main" } else { &branch }
         ));
         let t0 = now_ms();
-        let mut cmd = Command::new("git");
-        // Never let git fall back to an interactive credential prompt: this process
-        // has no controlling terminal (a daemon/service), so an inaccessible repo
-        // (private, mistyped, or deleted) makes git try to open /dev/tty and crash
-        // with a cryptic "No such device or address" instead of failing cleanly.
-        cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
-        cmd.arg("clone").arg("--depth").arg("1");
-        if !branch.is_empty() {
-            cmd.arg("--branch").arg(&branch);
+        // Credential for a PRIVATE repo: the deploy request's `git_token` (attached
+        // server-side by the dashboard from the user's connected GitHub), else a
+        // node-level `GITHUB_TOKEN`. It is injected ONLY into a local clone URL as
+        // `x-access-token` basic auth — `req.repo_url` stays tokenless everywhere it
+        // is logged/persisted, and the token is scrubbed out of any clone stderr.
+        let git_token: Option<String> = req
+            .git_token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()));
+        let tokenized_url = git_token.as_ref().and_then(|t| {
+            req.repo_url
+                .strip_prefix("https://github.com/")
+                .map(|rest| format!("https://x-access-token:{t}@github.com/{rest}"))
+        });
+
+        // Run `git clone <url>` into `dir`; returns (success, token-scrubbed stderr).
+        // Never let git open an interactive credential prompt (GIT_TERMINAL_PROMPT=0 /
+        // GIT_ASKPASS): this daemon has no controlling terminal, so a rejected/absent
+        // credential must fail cleanly instead of crashing on /dev/tty.
+        let run_clone = |clone_url: String| {
+            let (dir, branch, token) = (dir.clone(), branch.clone(), git_token.clone());
+            async move {
+                let mut cmd = Command::new("git");
+                cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                cmd.arg("clone").arg("--depth").arg("1");
+                if !branch.is_empty() {
+                    cmd.arg("--branch").arg(&branch);
+                }
+                cmd.arg(&clone_url).arg(&dir);
+                match cmd.output().await {
+                    Ok(out) => {
+                        let mut stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                        if let Some(t) = &token {
+                            stderr = stderr.replace(t.as_str(), "***");
+                        }
+                        (out.status.success(), stderr)
+                    }
+                    Err(e) => (false, format!("{e}")),
+                }
+            }
+        };
+        let auth_failed = |s: &str| {
+            s.contains("could not read Username")
+                || s.contains("Authentication failed")
+                || s.contains("terminal prompts disabled")
+                || s.contains("invalid username or password")
+        };
+
+        let first_url = tokenized_url.clone().unwrap_or_else(|| req.repo_url.clone());
+        let used_token = tokenized_url.is_some();
+        let (mut ok, mut stderr) = run_clone(first_url).await;
+        // A stored token that is expired / lacks access must never break a repo that
+        // would clone fine anonymously (public repos, token rotation): retry once
+        // without the credential before surfacing an error.
+        if !ok && used_token && auth_failed(&stderr) {
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            log("Retrying clone without the stored GitHub credential…".into());
+            let (ok2, stderr2) = run_clone(req.repo_url.clone()).await;
+            ok = ok2;
+            stderr = stderr2;
         }
-        cmd.arg(&req.repo_url).arg(&dir);
-        let out = cmd.output().await?;
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         anyhow::ensure!(
-            out.status.success(),
+            ok,
             "{}",
-            if stderr.contains("could not read Username") || stderr.contains("Authentication failed") || stderr.contains("terminal prompts disabled") {
-                format!(
-                    "git clone failed: this repository is private or inaccessible over anonymous HTTPS. \
-                     Only public repositories can be deployed from a pasted URL today — for a private repo, \
-                     connect GitHub and deploy from your repository list instead. ({stderr})"
-                )
+            if auth_failed(&stderr) {
+                if used_token {
+                    format!(
+                        "git clone failed: GitHub rejected the stored credential — it may be expired \
+                         or lack access to this repository. Reconnect GitHub and redeploy. ({stderr})"
+                    )
+                } else {
+                    format!(
+                        "git clone failed: this repository is private or inaccessible over anonymous \
+                         HTTPS. Connect GitHub on the Integrations page (or set GITHUB_TOKEN on the node) \
+                         and redeploy — private repositories need a credential. ({stderr})"
+                    )
+                }
             } else {
                 format!("git clone failed: {stderr}")
             }
         );
+        // The token has done its job; drop it so no build/deploy record, gossip frame,
+        // or displayed field constructed from `req` beyond this point can retain it.
+        req.git_token = None;
         log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
         let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
         // Full SHA for GitHub commit-status reporting (the statuses API needs it).

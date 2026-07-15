@@ -303,6 +303,33 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
   return r.json();
 }
 
+/**
+ * POST a deploy through a same-origin Next server route (`/api/git/deploy` or
+ * `/api/projects/:project/redeploy`) instead of straight to the backend. The
+ * server route attaches the signed-in user's connected-GitHub token so the build
+ * node can clone a PRIVATE repo, then forwards to the backend. Mirrors `apiSend`'s
+ * error surfacing (throws the backend's message) + cache-invalidation + GitOps
+ * reflection. The team rides both the body and the `x-hive-team` header.
+ */
+export async function apiDeployViaServerRoute<T>(routePath: string, body: Record<string, unknown>): Promise<T> {
+  const r = await fetchWithTimeout(
+    routePath,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...teamHeaders() },
+      body: JSON.stringify({ ...body, team: currentTeam() }),
+    },
+    60_000,
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error(detail?.trim() ? detail.trim() : `POST ${routePath} -> ${r.status}`);
+  }
+  invalidateApiCache();
+  if (typeof window !== "undefined") window.dispatchEvent(new Event("gitops-sync"));
+  return r.json();
+}
+
 /** Poll an endpoint on an interval. Returns {data, error, refresh, loading}.
  *  `active` (default true) gates the recurring interval — pass `false` to poll
  *  once (plus on team-change) and skip the background repeat, for data that's

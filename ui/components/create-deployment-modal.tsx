@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { Github, GitBranch, Loader2, Plus, Trash2, ChevronDown } from "lucide-react";
 import { Button, Input } from "@/components/ui";
-import { apiSend, currentTeam } from "@/lib/api";
+import { apiDeployViaServerRoute, currentTeam } from "@/lib/api";
 import { toast } from "@/components/toast";
 import { addPendingBuild } from "@/lib/pending-builds";
 
@@ -84,7 +84,9 @@ export function CreateDeploymentModal({
       const repo_url = isUrl ? source.trim() : repoUrl;
       const ref = isUrl ? branch : source.trim();
       const env = buildEnv();
-      const r = await apiSend<{ build_id: string }>("POST", "/v1/git/deploy", {
+      // Via the server route so a PRIVATE github repo gets the user's GitHub token
+      // attached server-side (never in the browser) for the clone.
+      const r = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url,
         branch: ref || undefined,
         project,

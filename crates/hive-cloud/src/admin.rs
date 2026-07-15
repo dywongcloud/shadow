@@ -1220,6 +1220,7 @@ pub(crate) async fn deploy_zip(
         zip_b64: Some(zip_b64),
         image_ref: None,
         image_port: None,
+        git_token: None, // zip upload has no git clone
     };
     start_named_deploy(&c, &t, req).await
 }
@@ -1276,6 +1277,7 @@ pub(crate) async fn deploy_image(
         zip_b64: None,
         image_ref: Some(image),
         image_port: body.port,
+        git_token: None, // prebuilt image deploy has no git clone
     };
     start_named_deploy(&c, &t, req).await
 }
@@ -2257,6 +2259,10 @@ struct RedeployBody {
     target: Option<String>,
     #[serde(default = "default_true_b")]
     use_cache: bool,
+    /// GitHub token for a private-repo redeploy, attached server-side by the
+    /// dashboard's /api/projects/:project/redeploy route (never sent by the browser).
+    #[serde(default)]
+    git_token: Option<String>,
 }
 
 /// Redeploy a project's newest git source (create a fresh deployment).
@@ -2538,6 +2544,7 @@ fn redeploy_request(
     use_cache: bool,
     root_dir: Option<String>,
     no_fanout: bool,
+    git_token: Option<String>,
 ) -> fluid_core::GitDeployRequest {
     fluid_core::GitDeployRequest {
         repo_url: src.repo_url.clone(),
@@ -2556,6 +2563,7 @@ fn redeploy_request(
         zip_b64: None,
         image_ref: None,
         image_port: None,
+        git_token,
     }
 }
 
@@ -2592,14 +2600,14 @@ async fn project_redeploy(
     // fall through to the normal placement path below.)
     if !src.is_real_git() && src.repo_url.starts_with("upload://") {
         if crate::git::has_local_source(&project) {
-            let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true);
+            let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone());
             let build_id = crate::git::start_build(c.clone(), req);
             return Ok(Json(json!({ "build_id": build_id })));
         }
         if let Some(host) = host_node_for_project(&c, &project) {
             if host != c.node_name {
                 if let Some(t) = target_for_node(&c, &host) {
-                    let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true);
+                    let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone());
                     let build_id = crate::git::redeploy_on_host(c.clone(), project.clone(), req, t);
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
@@ -2620,7 +2628,7 @@ async fn project_redeploy(
                 format!("The image reference for '{project}' is unavailable — redeploy from a new image."),
             ));
         };
-        let mut req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), false);
+        let mut req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), false, body.git_token.clone());
         req.repo_url = String::new();
         req.branch = None;
         req.image_ref = Some(image_ref);
@@ -2629,7 +2637,7 @@ async fn project_redeploy(
     }
 
     // Real git source: re-clone + rebuild through the normal placement/fanout path.
-    let req = redeploy_request(&project, &src, target, body.use_cache, root_dir, false);
+    let req = redeploy_request(&project, &src, target, body.use_cache, root_dir, false, body.git_token.clone());
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
 }
@@ -2875,6 +2883,7 @@ async fn git_webhook(
             zip_b64: None,
             image_ref: None,
             image_port: None,
+            git_token: None, // webhook auto-deploy: falls back to node GITHUB_TOKEN for private repos
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));

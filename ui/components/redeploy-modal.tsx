@@ -14,7 +14,7 @@ import {
   Check,
 } from "lucide-react";
 import { Button } from "@/components/ui";
-import { apiSend, currentTeam, type Deployment } from "@/lib/api";
+import { apiDeployViaServerRoute, currentTeam, type Deployment } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentHost } from "@/lib/deploy-url";
 import { toast } from "@/components/toast";
@@ -63,10 +63,12 @@ export function RedeployModal({
     setBusy(true);
     setError("");
     try {
-      const r = await apiSend<{ build_id: string }>("POST", `/v1/projects/${encodeURIComponent(deployment.project)}/redeploy`, {
-        target: env,
-        use_cache: useCache,
-      });
+      // Via the server route so a redeploy of a PRIVATE github repo gets the user's
+      // GitHub token attached server-side (never in the browser) for the clone.
+      const r = await apiDeployViaServerRoute<{ build_id: string }>(
+        `/api/projects/${encodeURIComponent(deployment.project)}/redeploy`,
+        { target: env, use_cache: useCache },
+      );
       // Persist the in-flight build so its "Building" row survives navigation/reload.
       addPendingBuild({ id: r.build_id, project: deployment.project, team: currentTeam(), env });
       toast("New Deployment Created");

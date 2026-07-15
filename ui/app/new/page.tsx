@@ -6,7 +6,7 @@ import { ArrowLeft, Github, Search, Loader2, GitBranch, FolderGit2, Lock, Extern
 import Link from "next/link";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
-import { apiSend, currentTeam, switchTeam } from "@/lib/api";
+import { apiSend, apiDeployViaServerRoute, currentTeam, switchTeam } from "@/lib/api";
 import { addPendingBuild } from "@/lib/pending-builds";
 import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
@@ -154,7 +154,9 @@ export default function NewProjectPage() {
     setDeploying(true);
     setError("");
     try {
-      const res = await apiSend<{ build_id: string }>("POST", "/v1/git/deploy", {
+      // Via the server route so a PRIVATE github repo gets the user's GitHub token
+      // attached server-side (never in the browser) for the clone.
+      const res = await apiDeployViaServerRoute<{ build_id: string }>("/api/git/deploy", {
         repo_url: repoUrl,
         branch,
         project,

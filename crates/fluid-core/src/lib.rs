@@ -1132,6 +1132,14 @@ pub struct GitDeployRequest {
     /// is auto-detected from the image's `ExposedPorts` (falling back to 8080).
     #[serde(default)]
     pub image_port: Option<u16>,
+    /// GitHub access token for cloning a PRIVATE repo. Injected on the build node as
+    /// `https://x-access-token:<token>@github.com/...` basic auth for the `git clone`
+    /// only — never written into `repo_url`, never logged (clone stderr is scrubbed),
+    /// and cleared (`take()`) right after the clone so no persisted/gossiped/displayed
+    /// record retains it. Rides placement/fanout like `zip_b64`; `skip_serializing_if`
+    /// omits it entirely when absent (public repos / no connection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_token: Option<String>,
 }
 fn default_prod() -> bool {
     true
