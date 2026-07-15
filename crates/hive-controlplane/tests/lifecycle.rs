@@ -56,6 +56,31 @@ async fn wait_terminal(hive: &Hive, id: &JobId) -> JobState {
     panic!("job {id} did not reach a terminal state");
 }
 
+/// Wait until every box has fully released its capacity (vcpus + cells back to 0).
+/// Capacity release is eventual-consistent: it lags a job's terminal-state
+/// transition by a scheduler tick, so a snapshot taken the instant `wait_terminal`
+/// returns can still see not-yet-released vcpus. Poll (same bound as
+/// `wait_terminal`) until it drains rather than asserting on that racy snapshot —
+/// a genuine leak still fails, but deterministically (the bounded panic), not
+/// flakily. Returns once drained.
+async fn wait_capacity_drained(hive: &Hive) {
+    for _ in 0..400 {
+        let status = hive.cluster_status();
+        if status.boxes.iter().all(|b| b.vcpus_used == 0 && b.cells == 0) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let status = hive.cluster_status();
+    let leaked: Vec<_> = status
+        .boxes
+        .iter()
+        .filter(|b| b.vcpus_used != 0 || b.cells != 0)
+        .map(|b| format!("{}(vcpus_used={}, cells={})", b.id, b.vcpus_used, b.cells))
+        .collect();
+    panic!("box capacity did not fully release: {}", leaked.join(", "));
+}
+
 #[tokio::test]
 async fn cold_build_succeeds() {
     let hive = test_hive(BTreeMap::new(), 20);
@@ -162,7 +187,10 @@ async fn capacity_is_released_after_builds() {
     for id in &ids {
         assert_eq!(wait_terminal(&hive, id).await, JobState::Succeeded);
     }
-    // After everything drains, all box capacity should be free again.
+    // Capacity release lags the terminal transition by a scheduler tick — wait for
+    // it to drain rather than asserting on a racy immediate snapshot (the old
+    // source of this test's "leaked vcpus" flakiness).
+    wait_capacity_drained(&hive).await;
     let status = hive.cluster_status();
     for b in status.boxes {
         assert_eq!(b.vcpus_used, 0, "box {} leaked vcpus", b.id);
