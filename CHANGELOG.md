@@ -1,5 +1,26 @@
 # Changelog
 
+## (pending) — Fix Redeploy 404 for zip-uploaded and image projects
+
+The Redeploy modal (and `shadw projects redeploy`) returned a bare
+`POST /v1/projects/<p>/redeploy -> 404` for any project deployed from a ZIP
+upload or a prebuilt image. `project_redeploy` resolved the source through
+`git_for_project_fleet`, which filters `GitSource::is_real_git()` and so
+returns `None` for the synthetic `upload://`/`image://` pseudo-URLs those
+deploys stamp into `repo_url` — a git-only redeploy that never worked for the
+non-git half of the platform. Now it resolves the newest source unfiltered
+(`source_for_project_fleet`) and rebuilds by kind: git re-clones; images
+reconstruct their `image_ref`; zip projects rebuild from RETAINED source —
+a durable `<project>.src.zip` kept at upload time (GC-safe, since the build-dir
+reaper skips non-directory files), falling back to a copy of the prior build's
+on-disk checkout. Because placement stickiness is container-lease-only, a zip
+redeploy pins to the node holding the source (local `no_fanout` build, else the
+redeploy forwards to the host node over the existing fanout transport). Genuine
+failures now return a descriptive 4xx body instead of an empty 404. Verified
+live end-to-end on the fleet (the reported `rfc-blog-page` redeploy: 404 → 200,
+built to Ready, still serving). Also removed a stray root-level `test.js`
+integration harness.
+
 ## (pending) — Fix admin incidents page; generic leader→follower store replication for the whole node-local divergence class
 
 The admin incidents page didn't load and "create didn't work": `IncidentStore`
