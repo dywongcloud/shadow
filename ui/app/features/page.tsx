@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import {
   GitBranch,
@@ -18,6 +19,32 @@ import {
   ArrowRight,
   Check,
 } from "lucide-react";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Features — shadw",
+  description:
+    "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
+  alternates: { canonical: "/features" },
+  openGraph: {
+    title: "Features — shadw",
+    description:
+      "Explore shadw's platform: Git deploys, immutable builds, instant rollback, preview URLs, custom domains & DNS, secrets, serverless functions, containers, edge functions, durable data, cron & workflows, observability, and ZK anonymous previews over a peer-to-peer mesh.",
+    url: "/features",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Features — shadw",
+    description:
+      "Git deploys, immutable builds, instant rollback, previews, custom domains, secrets, serverless functions, containers, edge, durable data, cron, and observability over a peer-to-peer mesh.",
+  },
+};
+
 
 const FEATURES = [
   {

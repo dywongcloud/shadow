@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { createPortal } from "react-dom";
 import { Twitter, Github, Linkedin, Dribbble, Menu, X } from "lucide-react";
+import Image from "next/image";
 
 const ELECTROLIZE_FONT = "var(--font-electrolize), ui-sans-serif, system-ui, sans-serif";
 
@@ -55,11 +56,11 @@ const FOOTER_COLS: { title: string; links: { label: string; href: string }[] }[]
   },
 ];
 
-/* eslint-disable @next/next/no-img-element */
 function Logo({ className = "h-7" }: { className?: string }) {
   // Wordmark is 1826×407 (≈ 4.49:1). Sized by height so it always fits the nav row
-  // and scales responsively; `w-auto` preserves the aspect ratio.
-  return <img src="/shadw-logo-wordmark.png" alt="shadw" className={`${className} w-auto select-none`} />;
+  // and scales responsively; `w-auto` preserves the aspect ratio. `priority` because
+  // it is the above-the-fold brand LCP on every marketing page.
+  return <Image src="/shadw-logo-wordmark.png" alt="shadw" width={1826} height={407} priority className={`${className} w-auto select-none`} />;
 }
 
 export function MarketingShell({ children }: { children: React.ReactNode }) {

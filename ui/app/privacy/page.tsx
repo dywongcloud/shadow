@@ -1,4 +1,31 @@
+import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection } from "@/components/marketing-shell";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Privacy Policy — shadw",
+  description:
+    "shadw's privacy policy: what the hosted dashboard and managed services collect, how your self-hosted application data and encrypted secrets stay on nodes you operate, our use of first-party cookies, and how to export or delete your data.",
+  alternates: { canonical: "/privacy" },
+  openGraph: {
+    title: "Privacy Policy — shadw",
+    description:
+      "shadw's privacy policy: what the hosted dashboard and managed services collect, how your self-hosted application data and encrypted secrets stay on nodes you operate, our use of first-party cookies, and how to export or delete your data.",
+    url: "/privacy",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Privacy Policy — shadw",
+    description:
+      "shadw's privacy policy: what the hosted dashboard collects, how your self-hosted data and encrypted secrets stay on your own nodes, and how to export or delete your data.",
+  },
+};
+
 
 const SECTIONS: { h: string; p: string }[] = [
   { h: "Overview", p: "shadw is a self-hosted, peer-to-peer cloud. When you self-host, your application data, deployments, and durable storage live on nodes you operate — not ours. This policy describes what the hosted dashboard and managed services collect." },

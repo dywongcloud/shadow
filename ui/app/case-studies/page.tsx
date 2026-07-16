@@ -1,6 +1,33 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { ArrowRight } from "lucide-react";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Case Studies — shadw",
+  description:
+    "How real teams cut costs and ship faster on shadw's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
+  alternates: { canonical: "/case-studies" },
+  openGraph: {
+    title: "Case Studies — shadw",
+    description:
+      "How real teams cut costs and ship faster on shadw's self-hosted, peer-to-peer cloud — cheaper AI inference, hundreds of per-client preview deploys, full data-residency compliance, and nine-second rollbacks under peak traffic.",
+    url: "/case-studies",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Case Studies — shadw",
+    description:
+      "How real teams cut costs and ship faster on shadw's peer-to-peer cloud — cheaper AI inference, per-client preview deploys, data-residency compliance, and instant rollbacks.",
+  },
+};
+
 
 const HEADLINE_METRICS = [
   { value: "40%", label: "lower infrastructure cost on average" },

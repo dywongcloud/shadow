@@ -1,6 +1,33 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { ArrowRight } from "lucide-react";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Blog — shadw",
+  description:
+    "Product news and engineering deep-dives from the shadw team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
+  alternates: { canonical: "/blog" },
+  openGraph: {
+    title: "Blog — shadw",
+    description:
+      "Product news and engineering deep-dives from the shadw team — the Vercel-style deploy pipeline, GuardianDB durability, zero-knowledge preview access, Fluid compute, instant rollback, and building a control plane with no central server.",
+    url: "/blog",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Blog — shadw",
+    description:
+      "Product news and engineering deep-dives from the shadw team on the peer-to-peer cloud: the deploy pipeline, GuardianDB, ZK previews, Fluid compute, and instant rollback.",
+  },
+};
+
 
 const FEATURED = {
   title: "Introducing the Vercel-style deploy pipeline",

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useTheme } from "next-themes";
+import Image from "next/image";
 
 /** Vercel-style globe-outline empty state. Shows the dark globe in dark mode and
  *  the light globe in light mode. The SVG is a half-globe wireframe anchored to
@@ -21,8 +22,7 @@ export function GlobeEmptyState({ title, desc }: { title: string; desc?: string 
         </div>
       )}
       <div className="pointer-events-none mt-6 flex justify-center">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={src} alt="" className="w-full select-none opacity-90" />
+        <Image src={src} alt="" width={688} height={256} unoptimized className="h-auto w-full select-none opacity-90" />
       </div>
     </div>
   );

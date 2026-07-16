@@ -1,6 +1,33 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
 import { Check } from "lucide-react";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Pricing — shadw",
+  description:
+    "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+  alternates: { canonical: "/pricing" },
+  openGraph: {
+    title: "Pricing — shadw",
+    description:
+      "shadw pricing plans: start free on Hobby, ship to production on Pro at $20/month, or self-host across your own global mesh on Enterprise. Compare tiers and read answers to common pricing questions.",
+    url: "/pricing",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Pricing — shadw",
+    description:
+      "shadw pricing: start free on Hobby, ship to production on Pro at $20/month, or self-host on Enterprise. Compare tiers and read pricing FAQs.",
+  },
+};
+
 
 type Tier = {
   name: string;

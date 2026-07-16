@@ -6,6 +6,7 @@ import { ArrowRight } from "lucide-react";
 import { MarqueeBanner } from "@/components/marquee-banner";
 import { MarketingShell } from "@/components/marketing-shell";
 import { GlobeWireframe } from "@/components/globe-wireframe";
+import Image from "next/image";
 
 /* ------------------------------------------------------------------ *
  * shadw — public landing page. Renders inside the shared MarketingShell
@@ -111,9 +112,12 @@ function IntroLoader() {
         }}
       >
         <GlowRing style={{ position: "absolute", inset: 0 }} />
-        <img
+        <Image
           src="/shadw-logo-dark.png"
           alt="shadw"
+          width={274}
+          height={91}
+          priority
           style={{
             position: "relative",
             zIndex: 1,
@@ -127,7 +131,6 @@ function IntroLoader() {
   );
 }
 
-/* eslint-disable @next/next/no-img-element */
 export function Landing() {
   return (
     <MarketingShell>
@@ -221,10 +224,13 @@ export function Landing() {
             <div className="flex justify-center pb-2 pt-1">
               <span className="h-1.5 w-1.5 rounded-full bg-white/25" />
             </div>
-            <img
+            <Image
               src="/shadw-device.png"
               alt="shadw Command Center"
-              className="w-full rounded-xl border border-white/5"
+              width={1562}
+              height={1078}
+              sizes="(max-width: 1024px) 100vw, 1024px"
+              className="h-auto w-full rounded-xl border border-white/5"
             />
           </div>
         </div>

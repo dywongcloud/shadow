@@ -2,6 +2,7 @@
 
 import { Suspense, useEffect, useState, use } from "react";
 import Link from "next/link";
+import Image from "next/image";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Github,
@@ -458,11 +459,12 @@ function DeploymentPreview({ project, prod }: { project: string; prod: Deploymen
   if (pv.kind === "image" && pv.url && !imgError) {
     return (
       <a href={deploymentUrl(prod?.alias, prod?.region_code)} target="_blank" rel="noreferrer" className={`${box} block bg-bg group`}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
+        <Image
           src={`/cloud${pv.url}`}
           alt={`${project} preview`}
-          className="h-full w-full object-cover object-top transition-transform group-hover:scale-[1.02]"
+          fill
+          sizes="(max-width: 640px) 100vw, 400px"
+          className="object-cover object-top transition-transform group-hover:scale-[1.02]"
           onError={() => setImgError(true)}
         />
         <span className="absolute bottom-2 left-2 rounded-md border border-border bg-card/90 px-2 py-0.5 text-[11px] text-secondary backdrop-blur">

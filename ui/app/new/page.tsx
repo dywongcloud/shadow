@@ -12,6 +12,7 @@ import { TeamSelect } from "@/components/team-picker";
 import { cachedJson } from "@/lib/cache";
 import { cn } from "@/lib/utils";
 import { PreparingDeployment } from "@/components/clone-animation";
+import Image from "next/image";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -93,8 +94,7 @@ function Monogram({ t, className = "h-10 w-10" }: { t: Template; className?: str
   if (t.icon) {
     return (
       <span className={`flex ${className} shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-white`}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={t.icon} alt={t.name} className="h-3/4 w-3/4 object-contain" />
+        <Image src={t.icon} alt={t.name} width={30} height={30} unoptimized className="h-3/4 w-3/4 object-contain" />
       </span>
     );
   }

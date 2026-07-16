@@ -1,4 +1,5 @@
 import * as React from "react";
+import Image from "next/image";
 
 // Providers we have real logo PNGs for (in /public/providers).
 const PNG = new Set([
@@ -23,8 +24,7 @@ export function BrandIcon({ id, name, color }: { id: string; name: string; color
   if (PNG.has(id)) {
     return (
       <span className="flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white/5">
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={`/providers/${id}.png`} alt={name} className="h-7 w-7 object-contain" />
+        <Image src={`/providers/${id}.png`} alt={name} width={28} height={28} className="h-7 w-7 object-contain" />
       </span>
     );
   }

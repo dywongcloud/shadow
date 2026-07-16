@@ -32,7 +32,7 @@ export default function AccountPage() {
           <div className="flex justify-end">
             <WithIdentity>{(id) => id.imageUrl
               // eslint-disable-next-line @next/next/no-img-element
-              ? <img src={id.imageUrl} alt="" className="h-16 w-16 rounded-full object-cover" />
+              ? <img src={id.imageUrl} alt="" loading="lazy" decoding="async" width={64} height={64} className="h-16 w-16 rounded-full object-cover" />
               : <div className="flex h-16 w-16 items-center justify-center rounded-full bg-[#0761d1] text-xl font-semibold text-white">{id.initial}</div>}</WithIdentity>
           </div>
         </SettingCard>

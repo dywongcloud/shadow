@@ -1,5 +1,44 @@
 # Changelog
 
+## (pending) — Responsive lazy-loading, ISR, Speed Insights, image optimization & LLM SEO
+
+The dashboard shipped none of the Vercel-style performance/discovery practices in
+a way that was actually present on mobile: the root layout was `force-dynamic`, so
+**every** route rendered dynamically (zero ISR, even the public marketing/docs
+pages), most routes had no loading skeleton, images were raw `<img>` (no
+responsive/modern-format optimization), the Speed Insights view had no in-app
+collector, and there were no SEO artifacts for search or AI crawlers. This applies
+all of them across the board, responsively.
+
+- **ISR**: the root `force-dynamic` is removed. It was only ever needed for the
+  home route's landing↔dashboard flip, which (like all auth chrome) is
+  client-side — no page reads server auth (`auth()`/`cookies()`/`headers()`), so
+  it was safe to lift. The home route keeps `force-dynamic` via a thin server
+  shell (`page.tsx` → `home-client.tsx`) so Clerk SSR still avoids the flash;
+  every public marketing + docs page is now `force-static` + `revalidate: 3600`
+  (real ISR, `○`/`◐` in the build), and the per-user dashboard pages render a fast
+  static shell that fetches data client-side.
+- **Lazy loading**: a responsive `loading.tsx` skeleton (`PageSkeleton`) now
+  covers every route (66 added), so navigation shows an instant, layout-stable
+  placeholder on mobile; the heaviest client components (React-Flow graphs, Tremor
+  charts, the command bar) stay `next/dynamic`-split.
+- **Image Optimization**: all 25 raw `<img>` became `next/image` (responsive
+  `srcset`/`sizes`, AVIF/WebP via `next.config` `images`, lazy by default,
+  `priority` only on the two LCP logos) — arbitrary external-host avatars/logos
+  stay hardened lazy `<img>`. Cumulative Layout Shift measured 0.
+- **Speed Insights**: a self-contained Core Web Vitals beacon (`VitalsBeacon`) in
+  the root layout collects FCP/LCP/CLS/INP/TTFB on every device and posts to the
+  vitals sink, so the Observability → Speed Insights view reflects the dashboard's
+  own real-user performance.
+- **SEO for LLMs / AI search**: added `robots.ts` (welcomes GPTBot, PerplexityBot,
+  ClaudeBot, Google-Extended, …), `sitemap.ts`, `llms.txt`, schema.org JSON-LD
+  (Organization/WebSite/SoftwareApplication), a dynamic OpenGraph image, and
+  unique per-page `metadata` (title/description/OG/canonical) with one `<h1>` per
+  public page.
+- **Responsive**: an explicit `width=device-width, initial-scale=1,
+  viewport-fit=cover` viewport (zoom left enabled for accessibility). Verified no
+  horizontal overflow at 375 / 768 / 1280 px.
+
 ## (pending) — GitHub connection management (scopes, orgs, reconnect, disconnect)
 
 Users who connected GitHub for a private org or repo had no way to see what the

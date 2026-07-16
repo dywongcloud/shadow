@@ -1,6 +1,33 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { CodeBlock } from "@/components/code-block";
 import { API_BASE, API_CATEGORIES, endpointHref, totalEndpoints } from "@/lib/api-catalog";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "REST API Reference — shadw Docs",
+  description:
+    "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+  alternates: { canonical: "/docs/api-reference" },
+  openGraph: {
+    title: "REST API Reference — shadw Docs",
+    description:
+      "Reference for the shadw REST API: authenticate with team-bound API keys or short-lived JWTs, scope requests to a team, handle rate limits and HTTP error codes, and browse every endpoint for deploys, projects, domains, and mesh nodes.",
+    url: "/docs/api-reference",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "REST API Reference — shadw Docs",
+    description:
+      "Reference for the shadw REST API: authenticate with API keys or JWTs, handle rate limits and error codes, and browse every endpoint for deploys, projects, domains, and nodes.",
+  },
+};
+
 
 /* The API Reference overview ("Using the REST API") — intro + API basics +
  * Authentication + team scoping + rate limits + errors + the Endpoints grid, with

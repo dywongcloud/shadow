@@ -1,4 +1,5 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import {
   MarketingShell,
   MarketingHero,
@@ -17,6 +18,32 @@ import {
   Hammer,
   Radar,
 } from "lucide-react";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Product — shadw",
+  description:
+    "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+  alternates: { canonical: "/product" },
+  openGraph: {
+    title: "Product — shadw",
+    description:
+      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data (GuardianDB) over an Iroh QUIC mesh, with Vercel-style Git deploys, immutable builds, and instant rollbacks.",
+    url: "/product",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Product — shadw",
+    description:
+      "shadw is a self-hosted, peer-to-peer cloud: serverless functions, containers, edge functions, and durable data over an Iroh QUIC mesh, with Vercel-style Git deploys and instant rollbacks.",
+  },
+};
+
 
 const CAPABILITIES = [
   {

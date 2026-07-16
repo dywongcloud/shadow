@@ -1,6 +1,33 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { Mail, MessageSquare, Building2 } from "lucide-react";
 import { MarketingShell, MarketingHero, MarketingSection, GlowCard } from "@/components/marketing-shell";
+
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Contact — shadw",
+  description:
+    "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
+  alternates: { canonical: "/contact" },
+  openGraph: {
+    title: "Contact — shadw",
+    description:
+      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise by email, or send us a message and we'll typically reply within one business day.",
+    url: "/contact",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Contact — shadw",
+    description:
+      "Get in touch with shadw about self-hosting, pricing, or migrating your cloud. Reach sales, support, or enterprise, or send us a message.",
+  },
+};
+
 
 export default function ContactPage() {
   return (

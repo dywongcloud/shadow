@@ -1,3 +1,5 @@
+import Image from "next/image";
+
 /* ------------------------------------------------------------------ *
  * The P2P network flowchart graphic with a glowing code-sample card
  * layered on top (z-index above the image). The base image shows the mesh
@@ -62,12 +64,14 @@ export function NetworkCode() {
   return (
     <div className="relative mx-auto w-full max-w-6xl px-4">
       {/* Base layer: the P2P network flowchart nodes image. */}
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
+      <Image
         src="/network-nodes.png"
         alt=""
         aria-hidden="true"
-        className="pointer-events-none w-full select-none"
+        width={2059}
+        height={764}
+        sizes="(max-width: 1152px) 100vw, 1152px"
+        className="pointer-events-none h-auto w-full select-none"
       />
 
       {/* Overlay layer (above the image): a glowing code-art card, shifted down so

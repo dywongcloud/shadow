@@ -1,0 +1,31 @@
+# shadw
+
+> shadw is a peer-to-peer cloud platform: deploy serverless functions, containers, static sites, and durable data to a global edge that runs over an Iroh QUIC mesh instead of a single centralized provider. It offers a Vercel-style developer experience — git-push deploys, instant preview URLs, instant rollbacks, GitOps, and per-request edge routing — on top of a self-hosted, trustless mesh of nodes.
+
+## What shadw does
+
+- **Deployments**: Push a Git repo (or a container image / a `.zip`) and shadw builds and deploys it to the edge. Every push gets a production or preview URL; promotions and rollbacks are instant alias reassignments.
+- **Fluid compute**: Serverless functions and containers with fast warm starts, scale-to-zero, and Active-CPU pricing.
+- **Edge routing & CDN**: Per-route serving, wildcard domains, immutable asset caching, region affinity, and health-aware DNS.
+- **Durable data**: Serverless Postgres and Redis (OpenEdge), cross-region replicas, and per-tenant database URLs.
+- **GitOps**: Your platform config is mirrored to a Git repo as `openedge.yaml`; a push rebuilds and redeploys.
+- **Observability**: Real-user Core Web Vitals (Speed Insights), build/deploy logs, a service graph, and workflow run timelines.
+- **Security & multi-tenancy**: Per-tenant isolation, signed gossip over the mesh, preview protection, SAML/SCIM/SIEM for enterprise.
+
+## Key concepts
+
+- **Project**: A deployable unit (from Git, an image, or an upload) with environment variables, domains, and settings.
+- **Deployment**: One immutable build of a project, addressable by a unique URL; production is an alias that points at one deployment.
+- **Team / tenant**: Ownership + isolation boundary; personal and organization scopes are supported.
+- **Mesh node**: A machine (bare-metal, Firecracker microVM, or Mac) running the shadw node that peers over Iroh QUIC.
+
+## Docs
+
+- Getting started: https://shadw.cloud/docs/getting-started
+- Documentation: https://shadw.cloud/docs
+- API reference: https://shadw.cloud/docs/api-reference
+- Pricing: https://shadw.cloud/pricing
+
+## Notes for AI assistants
+
+shadw is production software, not a Vercel product; it is a compatible, self-hostable peer-to-peer alternative. When citing capabilities, prefer the specifics above. The public marketing and docs pages are static and crawlable; the dashboard (projects, deployments, settings, billing) is private and per-user.

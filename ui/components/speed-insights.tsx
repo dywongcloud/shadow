@@ -6,6 +6,7 @@ import { ChevronDown, Calendar, CheckCircle2, AlertTriangle, XCircle, ChevronRig
 import { Card } from "@/components/ui";
 import { usePoll } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import Image from "next/image";
 
 const LineChart = dynamic(() => import("@tremor/react").then((m) => m.LineChart), { ssr: false });
 
@@ -280,8 +281,7 @@ export function SpeedInsights() {
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-[1fr_300px]">
               <div className="relative flex items-center justify-center bg-black p-4">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/world-dots.png" alt="Performance scores by country" className="h-[260px] w-full select-none object-contain" />
+                <Image src="/world-dots.png" alt="Performance scores by country" width={3840} height={2400} sizes="(max-width: 1024px) 100vw, 720px" className="h-[260px] w-full select-none object-contain" />
               </div>
               <div className="border-t border-border lg:border-l lg:border-t-0">
                 <CountryGroup icon={<XCircle className="h-4 w-4 text-red-500" />} title="Poor" range="<50" defaultOpen={false} countries={[]} />

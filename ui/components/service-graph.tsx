@@ -8,6 +8,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import Link from "next/link";
+import Image from "next/image";
 import { useTheme } from "next-themes";
 import {
   Shield, Globe, Boxes, Database as DbIcon, Terminal, ScrollText, Settings2,
@@ -123,8 +124,7 @@ function ResourceNode({ data }: { data: any }) {
   return (
     <div className="flex w-[220px] items-center gap-2 rounded-xl border border-border bg-card px-3 py-2.5 shadow-card">
       {data.img ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <span className="flex h-7 w-7 items-center justify-center overflow-hidden rounded-md bg-white/5"><img src={data.img} alt="" className="h-5 w-5 object-contain" /></span>
+        <span className="flex h-7 w-7 items-center justify-center overflow-hidden rounded-md bg-white/5"><Image src={data.img} alt="" width={20} height={20} className="h-5 w-5 object-contain" /></span>
       ) : data.tunnel ? (
         <Lock className="h-4 w-4 text-muted" />
       ) : (

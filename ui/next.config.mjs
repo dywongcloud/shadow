@@ -31,6 +31,21 @@ const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: false,
 
+  // Image Optimization (Vercel-parity): next/image serves responsive, correctly
+  // sized, modern-format images with lazy loading by default. AVIF/WebP first;
+  // the default device/image size ladder covers phones→desktops. remotePatterns
+  // allowlists the known external hosts the UI renders (GitHub avatars); truly
+  // arbitrary provider-logo URLs stay a plain lazy <img> (see the components).
+  images: {
+    formats: ["image/avif", "image/webp"],
+    deviceSizes: [360, 640, 750, 828, 1080, 1200, 1920, 2048],
+    imageSizes: [16, 24, 32, 48, 64, 96, 128, 256, 384],
+    remotePatterns: [
+      { protocol: "https", hostname: "avatars.githubusercontent.com" },
+      { protocol: "https", hostname: "**.githubusercontent.com" },
+    ],
+  },
+
   // instrumentation.ts is a stable convention in Next 16 — the experimental
   // `instrumentationHook` flag was removed (it now errors as an unknown key).
 

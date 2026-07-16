@@ -1,10 +1,32 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { ArrowRight } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-export const metadata = {
-  title: "Getting started — shadw Docs",
-  description: "Deploy your first app on shadw, the peer-to-peer cloud.",
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+
+export const metadata: Metadata = {
+  title: "Getting Started — shadw Docs",
+  description:
+    "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+  alternates: { canonical: "/docs/getting-started" },
+  openGraph: {
+    title: "Getting Started — shadw Docs",
+    description:
+      "Deploy your first app on shadw. This guide covers the quickstart, Git and Dockerfile builds, environment variables and secrets, GitOps, regions over the Iroh QUIC mesh, custom domains and TLS, the CLI, and self-hosting your own nodes.",
+    url: "/docs/getting-started",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Getting Started — shadw Docs",
+    description:
+      "Deploy your first app on shadw: quickstart, Git and Dockerfile builds, environment & secrets, GitOps, regions over the Iroh QUIC mesh, custom domains, the CLI, and self-hosting.",
+  },
 };
 
 function Section({ id, title, eyebrow, children }: { id: string; title: string; eyebrow?: string; children: React.ReactNode }) {

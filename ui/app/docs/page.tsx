@@ -1,10 +1,31 @@
 import Link from "next/link";
+import type { Metadata } from "next";
 import { ArrowRight, Boxes, GitBranch, Zap, Globe2, KeyRound, Code2 } from "lucide-react";
 import { CodeBlock } from "@/components/code-block";
 
-export const metadata = {
-  title: "Docs — shadw",
-  description: "Deploy anything to shadw, the peer-to-peer cloud.",
+// Perf: prerender this public page (see root layout note).
+export const dynamic = "force-static";
+export const revalidate = 3600;
+
+export const metadata: Metadata = {
+  title: "Documentation — shadw",
+  description:
+    "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
+  alternates: { canonical: "/docs" },
+  openGraph: {
+    title: "Documentation — shadw",
+    description:
+      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines. Push from Git and serve from anywhere, with guides for environment & secrets, GitOps, regions, and the REST API.",
+    url: "/docs",
+    type: "website",
+    siteName: "shadw",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Documentation — shadw",
+    description:
+      "shadw documentation: deploy serverless functions, containers, and static sites to a peer-to-peer cloud of your own machines, with guides for GitOps, regions, and the REST API.",
+  },
 };
 
 const HERO_TABS = [

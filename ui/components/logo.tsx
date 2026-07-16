@@ -1,4 +1,4 @@
-/* eslint-disable @next/next/no-img-element */
+import Image from "next/image";
 
 // The official shadw wordmark — theme-aware. The black logo shows on light
 // backgrounds, the white logo on dark ones, toggled purely with CSS (`dark:`)
@@ -7,8 +7,8 @@
 export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
   return (
     <span className="inline-flex items-center" aria-label="shadw">
-      <img src="/shadw-logo-light.png" alt="shadw" className={`${className} block dark:hidden`} />
-      <img src="/shadw-logo-dark.png" alt="shadw" className={`${className} hidden dark:block`} />
+      <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={`${className} block dark:hidden`} />
+      <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={`${className} hidden dark:block`} />
     </span>
   );
 }
@@ -27,8 +27,8 @@ export function VercelMark({ className = "h-5 w-auto" }: { className?: string })
 // Forced-color variants for surfaces that are always one theme (e.g. the
 // always-dark landing page uses <LogoWhite/>).
 export function LogoWhite({ className = "h-6 w-auto" }: { className?: string }) {
-  return <img src="/shadw-logo-dark.png" alt="shadw" className={className} />;
+  return <Image src="/shadw-logo-dark.png" alt="shadw" width={274} height={91} className={className} />;
 }
 export function LogoBlack({ className = "h-6 w-auto" }: { className?: string }) {
-  return <img src="/shadw-logo-light.png" alt="shadw" className={className} />;
+  return <Image src="/shadw-logo-light.png" alt="shadw" width={274} height={91} className={className} />;
 }

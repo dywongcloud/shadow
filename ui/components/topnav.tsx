@@ -488,7 +488,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       <button onClick={() => setOpen((o) => !o)} className="flex items-center gap-2 rounded-md px-1.5 py-1 hover:bg-subtle">
         {labelImg ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={labelImg} alt="" className={cn("h-6 w-6 object-cover", isPersonal ? "rounded-full" : "rounded-md")} />
+          <img src={labelImg} alt="" loading="lazy" decoding="async" width={24} height={24} className={cn("h-6 w-6 object-cover", isPersonal ? "rounded-full" : "rounded-md")} />
         ) : (
           <span className={cn("flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold text-white", isPersonal ? "bg-[#0761d1]" : "bg-fg text-bg")}>
             {(label?.[0] || "?").toUpperCase()}
@@ -523,7 +523,7 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
                 icon={
                   m.organization.imageUrl ? (
                     // eslint-disable-next-line @next/next/no-img-element
-                    <img src={m.organization.imageUrl} alt="" className="h-4 w-4 rounded object-cover" />
+                    <img src={m.organization.imageUrl} alt="" loading="lazy" decoding="async" width={16} height={16} className="h-4 w-4 rounded object-cover" />
                   ) : (
                     <span className="flex h-4 w-4 items-center justify-center rounded bg-fg text-[9px] font-bold text-bg">{m.organization.name.slice(0, 1).toUpperCase()}</span>
                   )
@@ -605,7 +605,7 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
       >
         {!current && identity.imageUrl ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img src={identity.imageUrl} alt="" className="h-6 w-6 rounded-full object-cover" />
+          <img src={identity.imageUrl} alt="" loading="lazy" decoding="async" width={24} height={24} className="h-6 w-6 rounded-full object-cover" />
         ) : (
           <span className={cn(
             "flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-semibold text-white",

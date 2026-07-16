@@ -3,6 +3,7 @@
 import { Check, ExternalLink, FolderGit2, GitBranch } from "lucide-react";
 import { Card } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import Image from "next/image";
 
 // Structural shape of a New Project template (matches app/new/page.tsx's Template
 // so the page can pass its `selected` template straight through).
@@ -21,10 +22,8 @@ export interface CloneTemplate {
 function GitHubMark({ className }: { className: string }) {
   return (
     <>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/github-mark.png" alt="GitHub" className={`${className} object-contain dark:hidden`} />
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/github-mark-white.png" alt="GitHub" className={`${className} hidden object-contain dark:block`} />
+      <Image src="/github-mark.png" alt="GitHub" width={28} height={28} className={`${className} object-contain dark:hidden`} />
+      <Image src="/github-mark-white.png" alt="GitHub" width={28} height={28} className={`${className} hidden object-contain dark:block`} />
     </>
   );
 }
@@ -33,10 +32,8 @@ function GitHubMark({ className }: { className: string }) {
 function GitHubInline() {
   return (
     <>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/github-mark.png" alt="" className="inline h-3.5 w-3.5 object-contain align-[-2px] dark:hidden" />
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img src="/github-mark-white.png" alt="" className="hidden h-3.5 w-3.5 object-contain align-[-2px] dark:inline" />
+      <Image src="/github-mark.png" alt="" width={14} height={14} className="inline h-3.5 w-3.5 object-contain align-[-2px] dark:hidden" />
+      <Image src="/github-mark-white.png" alt="" width={14} height={14} className="hidden h-3.5 w-3.5 object-contain align-[-2px] dark:inline" />
     </>
   );
 }
@@ -45,8 +42,7 @@ function Monogram({ t, className = "h-10 w-10" }: { t: CloneTemplate; className?
   if (t.icon) {
     return (
       <span className={`flex ${className} shrink-0 items-center justify-center overflow-hidden rounded-lg border border-border bg-white`}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src={t.icon} alt={t.name} className="h-3/4 w-3/4 object-contain" />
+        <Image src={t.icon} alt={t.name} width={30} height={30} unoptimized className="h-3/4 w-3/4 object-contain" />
       </span>
     );
   }

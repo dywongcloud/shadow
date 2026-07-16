@@ -10,6 +10,7 @@ import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/compone
 import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
 import { apiSend, usePoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
+import Image from "next/image";
 
 const KIND_ICON: Record<DbKind, React.ReactNode> = {
   postgres: <DbIcon className="h-5 w-5" />,
@@ -210,7 +211,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                     {native.map((n) => (
                       <Row key={n.kind}
                         icon={nativePng(n.kind)
-                          ? <span className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg bg-white/5">{/* eslint-disable-next-line @next/next/no-img-element */}<img src={nativePng(n.kind)!} alt={n.name} className="h-7 w-7 object-contain" /></span>
+                          ? <span className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-lg bg-white/5"><Image src={nativePng(n.kind)!} alt={n.name} width={28} height={28} className="h-7 w-7 object-contain" /></span>
                           : n.kind === "blob"
                           ? <span className="flex h-9 w-9 items-center justify-center"><BlobIcon /></span>
                           : <span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary">{KIND_ICON[n.kind]}</span>}
