@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { composioConfigured, githubConnect, resolveEntity } from "@/lib/composio";
-import { authorizeUrl, githubAppConfigured, makeState, stateCookieName } from "@/lib/github-app";
+import { authorizeUrl, currentUserId, githubAppConfigured, makeState, stateCookieName } from "@/lib/github-app";
 import { publicOrigin } from "@/lib/origin";
 
 export const dynamic = "force-dynamic";
@@ -16,7 +16,9 @@ export async function POST(req: NextRequest) {
   // No scopes param — capabilities come from the App's permissions + where it's
   // installed. The signed state carries returnTo; the nonce cookie binds it (CSRF).
   if (githubAppConfigured()) {
-    const { state, nonce } = makeState(returnTo);
+    // Bind the connection to the signed-in Clerk user (shared-browser safety):
+    // the uid rides the SIGNED state through the OAuth dance into the cookie.
+    const { state, nonce } = makeState(returnTo, await currentUserId());
     const res = NextResponse.json({ redirectUrl: authorizeUrl(state), provider: "github-app" });
     res.cookies.set(stateCookieName(), nonce, {
       httpOnly: true,

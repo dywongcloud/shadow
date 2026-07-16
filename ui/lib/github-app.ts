@@ -1,5 +1,19 @@
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } from "crypto";
+import { auth } from "@clerk/nextjs/server";
 import { cookies } from "next/headers";
+
+const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || !!process.env.CLERK_SECRET_KEY;
+
+/** Current Clerk user id, or null (signed-out / local no-auth mode / non-request ctx). */
+export async function currentUserId(): Promise<string | null> {
+  if (!clerkEnabled) return null;
+  try {
+    const { userId } = await auth();
+    return userId || null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * First-party GitHub App OAuth (user-to-server) — the platform's OWN GitHub App
@@ -87,6 +101,17 @@ export interface GhAppTokenBundle {
   login?: string;
   /** cached app slug (from /user/installations) for the install CTA */
   slug?: string;
+  /** Clerk userId the connection belongs to — a shared-browser/sign-out safety:
+   *  a different signed-in user (or a signed-out request) never sees or can
+   *  disconnect another user's connection. Absent in local no-Clerk mode. */
+  uid?: string;
+}
+
+/** True when the bundle belongs to the CURRENT Clerk user (or Clerk is off). */
+async function bundleAuthorized(b: GhAppTokenBundle): Promise<boolean> {
+  if (!clerkEnabled) return true;
+  if (!b.uid) return false; // Clerk on but unbound bundle (pre-binding/foreign) — refuse
+  return (await currentUserId()) === b.uid;
 }
 
 // ---------------------------------------------------------------------------
@@ -98,13 +123,18 @@ function sign(data: string): string {
   return createHmac("sha256", key()).update(data).digest("base64url");
 }
 
-export function makeState(returnTo: string): { state: string; nonce: string } {
+export function makeState(returnTo: string, uid?: string | null): { state: string; nonce: string } {
   const nonce = randomBytes(16).toString("base64url");
-  const body = Buffer.from(JSON.stringify({ n: nonce, r: returnTo, t: Date.now() })).toString("base64url");
+  const body = Buffer.from(
+    JSON.stringify({ n: nonce, r: returnTo, t: Date.now(), ...(uid ? { u: uid } : {}) })
+  ).toString("base64url");
   return { state: `${body}.${sign(body)}`, nonce };
 }
 
-export function verifyState(state: string, cookieNonce: string | undefined): { ok: boolean; returnTo: string } {
+export function verifyState(
+  state: string,
+  cookieNonce: string | undefined
+): { ok: boolean; returnTo: string; uid?: string } {
   try {
     const [body, mac] = state.split(".");
     if (!body || !mac || sign(body) !== mac) return { ok: false, returnTo: "/" };
@@ -112,7 +142,7 @@ export function verifyState(state: string, cookieNonce: string | undefined): { o
     if (!cookieNonce || j.n !== cookieNonce) return { ok: false, returnTo: "/" };
     if (typeof j.t !== "number" || Date.now() - j.t > STATE_TTL_MS) return { ok: false, returnTo: "/" };
     const returnTo = typeof j.r === "string" && j.r.startsWith("/") ? j.r : "/";
-    return { ok: true, returnTo };
+    return { ok: true, returnTo, uid: typeof j.u === "string" ? j.u : undefined };
   } catch {
     return { ok: false, returnTo: "/" };
   }
@@ -166,6 +196,7 @@ function bundleFrom(t: TokenResponse, prev?: GhAppTokenBundle): GhAppTokenBundle
     rexp: t.refresh_token_expires_in ? now + t.refresh_token_expires_in * 1000 : prev?.rexp,
     login: prev?.login,
     slug: prev?.slug,
+    uid: prev?.uid,
   };
 }
 
@@ -202,10 +233,14 @@ export async function clearTokenCookie(): Promise<void> {
   (await cookies()).set(GH_APP_COOKIE, "", { ...COOKIE_OPTS, maxAge: 0 });
 }
 
-/** Read the current bundle (no refresh). */
+/** Read the current bundle (no refresh) — ONLY if it belongs to the current
+ *  Clerk user (shared-browser / sign-out safety). Foreign/unbound bundles read
+ *  as disconnected rather than exposing another user's connection. */
 export async function readTokenBundle(): Promise<GhAppTokenBundle | null> {
   const c = (await cookies()).get(GH_APP_COOKIE)?.value;
-  return c ? openToken(c) : null;
+  const b = c ? openToken(c) : null;
+  if (!b) return null;
+  return (await bundleAuthorized(b)) ? b : null;
 }
 
 /**

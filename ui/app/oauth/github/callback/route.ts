@@ -63,6 +63,9 @@ export async function GET(req: NextRequest) {
     return back(v.returnTo, { github_error: "GitHub token exchange failed — please try again." });
   }
 
+  // Bind the connection to the Clerk user who initiated the connect (carried in
+  // the SIGNED state) — a different signed-in user on this browser won't see it.
+  if (v.uid) bundle.uid = v.uid;
   await setTokenCookie(bundle);
   const sep = v.returnTo.includes("?") ? "&" : "?";
   const res = NextResponse.redirect(new URL(`${v.returnTo}${sep}connected=github`, origin));
