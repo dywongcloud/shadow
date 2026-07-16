@@ -68,7 +68,9 @@ export function ActivityFeed() {
               <div key={i} className="flex items-start gap-3 border-b border-border py-3 last:border-0">
                 <Triangle className="mt-0.5 h-7 w-7 shrink-0" />
                 <div className="min-w-0 flex-1">
-                  <div className="text-sm">
+                  {/* break-words so a long request path/URL wraps instead of forcing
+                      horizontal overflow on mobile. */}
+                  <div className="text-sm break-words">
                     <span className="font-medium">node-{e.region}</span>{" "}
                     <span className="text-secondary">{describe(e)}</span>
                   </div>

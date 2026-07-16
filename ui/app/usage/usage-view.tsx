@@ -182,9 +182,9 @@ export default function UsageView() {
 
       {/* Consumption breakdown */}
       <Card>
-        <div className="mb-4 flex items-center justify-between">
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
           <h2 className="text-lg font-semibold">Consumption Breakdown</h2>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3 sm:gap-4">
             <div className="flex rounded-lg border border-border p-0.5 text-sm">
               {(["Daily", "Weekly", "Monthly"] as const).map((g) => (
                 <button
@@ -253,14 +253,15 @@ function GroupHeader({ name }: { name: string }) {
 function Row({ color, name, spark, usage, charge }: { color: string; name: string; spark: number[]; usage: string; charge: number }) {
   const data = spark.map((v, i) => ({ i, v }));
   return (
-    <div className="grid grid-cols-[1fr_auto_auto] items-center gap-4 border-b border-border py-3">
-      <span className="flex items-center gap-2.5 text-sm">
-        <span className={cn("h-2.5 w-2.5 rounded-full", color)} />
-        {name}
+    <div className="grid grid-cols-[1fr_auto_auto] items-center gap-2 border-b border-border py-3 sm:gap-4">
+      <span className="flex min-w-0 items-center gap-2.5 text-sm">
+        <span className={cn("h-2.5 w-2.5 shrink-0 rounded-full", color)} />
+        <span className="truncate">{name}</span>
       </span>
       <span className="flex items-center justify-end gap-3">
-        <SparkAreaChart data={data} index="i" categories={["v"]} colors={["slate"]} className="h-7 w-28" />
-        <span className="w-28 text-right text-sm tabular-nums text-secondary">{usage}</span>
+        {/* Decorative sparkline — hidden on phones to keep the row within the viewport. */}
+        <SparkAreaChart data={data} index="i" categories={["v"]} colors={["slate"]} className="hidden h-7 w-28 sm:block" />
+        <span className="w-20 text-right text-sm tabular-nums text-secondary sm:w-28">{usage}</span>
       </span>
       <span className="w-16 text-right text-sm tabular-nums">${charge.toFixed(2)}</span>
     </div>
