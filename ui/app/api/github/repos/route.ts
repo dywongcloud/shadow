@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { githubRepos, githubOrgRepos, resolveEntity } from "@/lib/composio";
+import { githubRepos, githubOrgRepos, resolveEntity } from "@/lib/github";
 
 export const dynamic = "force-dynamic";
 

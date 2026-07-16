@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { composioConfigured, githubStatus, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/composio";
+import { githubConfigured, githubStatus, commitFile, setRepoVariable, createRepoWebhook, resolveEntity } from "@/lib/github";
 import { deployWorkflowContent } from "@/lib/gitops-yaml";
 
 export const dynamic = "force-dynamic";
@@ -23,7 +23,7 @@ function parseRepo(input: string): { owner: string; repo: string } | null {
  * Body: { repo: string }  // clone URL or "owner/repo"
  */
 export async function POST(req: NextRequest) {
-  if (!composioConfigured()) return NextResponse.json({ skipped: true, reason: "composio-not-configured" });
+  if (!githubConfigured()) return NextResponse.json({ skipped: true, reason: "github-not-configured" });
   const body = await req.json().catch(() => ({} as any));
   const parsed = parseRepo(String(body?.repo || ""));
   if (!parsed) return NextResponse.json({ skipped: true, reason: "bad-repo" });

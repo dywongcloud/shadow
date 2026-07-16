@@ -17,6 +17,11 @@ interface GhDetail {
   hasPrivateAccess?: boolean; // `repo`
   hasOrgScope?: boolean; // `read:org`
   live?: boolean;
+  /** Which auth path serves this connection: the first-party GitHub App (org-level
+   *  permissions) or the legacy Composio-managed OAuth app. */
+  provider?: "github-app" | "composio";
+  /** Where to install/configure the App on orgs (github-app provider only). */
+  installUrl?: string;
 }
 interface GhOrg { login: string; name?: string }
 
@@ -455,11 +460,32 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
             </div>
           ) : null}
 
-          {/* Missing org scope → a NON-disruptive prompt (private content still works). */}
+          {/* Missing org access → a NON-disruptive prompt (private content still works).
+              github-app: org access = INSTALL the App on the org (no scopes involved).
+              composio: org enumeration needs the read:org scope via reconnect. */}
           {active && !gh.hasOrgScope ? (
             <div className="mb-3 flex items-start gap-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span>Listing your organizations needs the <code>read:org</code> scope. Private-repo access already works — reconnect only if you want to pick org repos.</span>
+              {gh.provider === "github-app" ? (
+                <span>
+                  To use an organization&apos;s repositories,{" "}
+                  <a href={gh.installUrl || "https://github.com/settings/installations"} target="_blank" rel="noreferrer" className="font-medium underline underline-offset-2 hover:text-fg">
+                    install the GitHub App on that organization
+                  </a>
+                  . Personal private repos already work.
+                </span>
+              ) : (
+                <span>Listing your organizations needs the <code>read:org</code> scope. Private-repo access already works — reconnect only if you want to pick org repos.</span>
+              )}
+            </div>
+          ) : null}
+
+          {/* App provider: always offer the install/configure surface (adding more orgs). */}
+          {active && gh.provider === "github-app" && gh.hasOrgScope ? (
+            <div className="mb-3 text-xs text-secondary">
+              <a href={gh.installUrl || "https://github.com/settings/installations"} target="_blank" rel="noreferrer" className="underline underline-offset-2 hover:text-fg">
+                Install / configure the GitHub App on more organizations
+              </a>
             </div>
           ) : null}
 

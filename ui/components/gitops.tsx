@@ -497,15 +497,15 @@ export function GitOps() {
                     // but keep a manual-entry fallback (repo listing works with `repo`).
                     <div className="mt-2 space-y-2">
                       <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
-                        We can&apos;t list your organizations — that needs the{" "}
-                        <span className="font-mono">read:org</span> scope.{" "}
+                        We can&apos;t list your organizations — install the GitHub App on the
+                        organization (Integrations → GitHub), or{" "}
                         <button
                           type="button"
                           onClick={reconnectGithub}
                           disabled={busy}
                           className="font-medium underline underline-offset-2 hover:text-fg disabled:opacity-50"
                         >
-                          Reconnect to grant organization access
+                          reconnect to grant organization access
                         </button>
                         , or type a known org login below.
                       </div>

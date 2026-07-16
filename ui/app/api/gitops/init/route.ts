@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { composioConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/composio";
+import { githubConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
 import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
@@ -20,8 +20,8 @@ export const dynamic = "force-dynamic";
  * }
  */
 export async function POST(req: NextRequest) {
-  if (!composioConfigured()) {
-    return NextResponse.json({ ok: false, error: "Composio not configured (COMPOSIO_API_KEY)." }, { status: 400 });
+  if (!githubConfigured()) {
+    return NextResponse.json({ ok: false, error: "GitHub is not configured." }, { status: 400 });
   }
   const body = await req.json().catch(() => ({} as any));
   const team = body?.team || req.headers.get("x-hive-team") || "personal";

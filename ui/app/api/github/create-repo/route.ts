@@ -1,16 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
-import { composioConfigured, createRepo, resolveEntity } from "@/lib/composio";
+import { createRepo, githubConfigured, resolveEntity } from "@/lib/github";
 
 export const dynamic = "force-dynamic";
 
-// Create a GitHub repository using THIS user's Composio GitHub connection, so the
-// in-browser Git page can make a repo without a pasted PAT. The repo is created
-// EMPTY (autoInit:false) so the page's own first local commit is the initial push
-// (no non-fast-forward against an auto-generated base commit).
+// Create a GitHub repository using THIS user's GitHub connection (first-party
+// GitHub App preferred, Composio fallback), so the in-browser Git page can make a
+// repo without a pasted PAT. The repo is created EMPTY (autoInit:false) so the
+// page's own first local commit is the initial push (no non-fast-forward against
+// an auto-generated base commit).
 export async function POST(req: NextRequest) {
-  if (!composioConfigured()) {
+  if (!githubConfigured()) {
     return NextResponse.json(
-      { error: "Composio not configured. Set COMPOSIO_API_KEY or use a GitHub PAT." },
+      { error: "GitHub is not configured on this deployment. Connect GitHub or use a PAT." },
       { status: 400 }
     );
   }

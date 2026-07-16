@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { composioConfigured, disconnectGithub, resolveEntity } from "@/lib/composio";
+import { disconnectGithub, githubConfigured, resolveEntity } from "@/lib/github";
 
 export const dynamic = "force-dynamic";
 
@@ -10,8 +10,8 @@ export const dynamic = "force-dynamic";
  * and is the first half of "reconnect / adjust access" (disconnect → re-run OAuth).
  */
 export async function POST() {
-  if (!composioConfigured()) {
-    return NextResponse.json({ ok: false, error: "GitHub isn't configured (COMPOSIO_API_KEY unset)." }, { status: 400 });
+  if (!githubConfigured()) {
+    return NextResponse.json({ ok: false, error: "GitHub isn't configured on this deployment." }, { status: 400 });
   }
   const entity = await resolveEntity();
   const res = await disconnectGithub(entity);

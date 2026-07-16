@@ -18,6 +18,11 @@ const isPublic = createRouteMatcher([
   "/sw.js", // service worker
   "/sign-in(.*)",
   "/sign-up(.*)",
+  // First-party GitHub App OAuth callback — GitHub redirects the browser here.
+  // Must not require a Clerk session (the flow is CSRF-protected by its own
+  // HMAC-signed state + nonce cookie); the token lands in an httpOnly cookie
+  // bound to this browser either way.
+  "/oauth/github/callback",
   "/cloud(.*)", // dashboard <-> platform API proxy (api.shadw.cloud)
   // NOTE: "/ops(.*)" (the ops-console API proxy) is deliberately NOT public —
   // see isAdminRoute below. It fronts the same privileged admin backend the

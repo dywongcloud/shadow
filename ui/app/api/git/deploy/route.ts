@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { resolveEntity, githubAccessToken } from "@/lib/composio";
+import { resolveEntity, githubAccessToken } from "@/lib/github";
 import { backend } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";

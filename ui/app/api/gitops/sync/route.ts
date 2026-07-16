@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { composioConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/composio";
+import { githubConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/github";
 import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
@@ -13,7 +13,7 @@ export const dynamic = "force-dynamic";
  * region / tier change reflects in the committed config automatically.
  */
 export async function POST(req: NextRequest) {
-  if (!composioConfigured()) return NextResponse.json({ skipped: true, reason: "composio-not-configured" });
+  if (!githubConfigured()) return NextResponse.json({ skipped: true, reason: "github-not-configured" });
   const team = (await req.json().catch(() => ({})))?.team || req.headers.get("x-hive-team") || "personal";
   const entity = await resolveEntity();
   const status = await githubStatus(entity);

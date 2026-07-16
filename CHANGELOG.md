@@ -1,5 +1,32 @@
 # Changelog
 
+## (pending) — First-party GitHub App OAuth (private repos & orgs for projects/deployments)
+
+Private organization repos still couldn't be used for projects and deployments:
+the Composio-managed OAuth app can't grant org access (no `read:org`, and orgs
+with OAuth-app restrictions had to approve a third-party app). The platform now
+has its OWN GitHub App (org-level permissions) wired end-to-end. `POST
+/api/github/connect` returns the first-party
+`github.com/login/oauth/authorize` URL (HMAC-signed state, CSRF-bound to a nonce
+cookie); GitHub redirects to the registered `/oauth/github/callback`, which
+exchanges the code and seals the user token into an AES-256-GCM-encrypted
+httpOnly cookie — the token is never stored server-side, never readable by the
+browser, and auto-refreshes (expiring-token Apps) or is cleared on refresh
+failure so status stays honest. A new `lib/github` facade fronts every GitHub
+operation (repos, orgs, org repos, repo creation, webhooks, Actions variables,
+GitOps commits, and the deploy/redeploy clone token) preferring the App token
+with direct GitHub REST calls, and falling back to the existing Composio
+connection unchanged — existing users are unaffected, and with neither
+configured everything degrades exactly as before. Org access is now an App
+*installation*: the Integrations GitHub card links "install the GitHub App on
+the organization" (from the user's installation `app_slug`), and an
+org-not-installed 403 threads the org's installations-settings URL through the
+existing restricted/approve UI. Disconnect revokes the grant on GitHub and
+clears the cookie. Witnessed live: credential validity, all callback error
+paths, cookie crypto roundtrip + tamper rejection, expired-token refresh
+failure clearing, Composio fallback, and the secret appearing in zero tracked
+files.
+
 ## (pending) — Responsive lazy-loading, ISR, Speed Insights, image optimization & LLM SEO
 
 The dashboard shipped none of the Vercel-style performance/discovery practices in

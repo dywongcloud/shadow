@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { githubConnectionDetail, resolveEntity } from "@/lib/composio";
+import { githubConnectionDetail, resolveEntity } from "@/lib/github";
 
 export const dynamic = "force-dynamic";
 
