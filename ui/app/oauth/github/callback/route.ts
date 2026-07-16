@@ -6,6 +6,7 @@ import {
   stateCookieName,
   verifyState,
 } from "@/lib/github-app";
+import { publicOrigin } from "@/lib/origin";
 
 export const dynamic = "force-dynamic";
 
@@ -22,8 +23,11 @@ export const dynamic = "force-dynamic";
  */
 export async function GET(req: NextRequest) {
   const url = req.nextUrl;
+  // Behind the gateway proxy the request's own origin is the INTERNAL
+  // localhost:3002 — redirects must target the PUBLIC host the user is on.
+  const origin = publicOrigin(req);
   const back = (path: string, params: Record<string, string>) => {
-    const u = new URL(path, url.origin);
+    const u = new URL(path, origin);
     for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
     const res = NextResponse.redirect(u);
     // One-shot state cookie is consumed either way.
@@ -61,7 +65,7 @@ export async function GET(req: NextRequest) {
 
   await setTokenCookie(bundle);
   const sep = v.returnTo.includes("?") ? "&" : "?";
-  const res = NextResponse.redirect(new URL(`${v.returnTo}${sep}connected=github`, url.origin));
+  const res = NextResponse.redirect(new URL(`${v.returnTo}${sep}connected=github`, origin));
   res.cookies.set(stateCookieName(), "", { httpOnly: true, path: "/", maxAge: 0 });
   return res;
 }
