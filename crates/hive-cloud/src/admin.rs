@@ -199,6 +199,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/confirm", post(billing_confirm))
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/billing/webhook", post(billing_webhook))
+        .route("/v1/admin/billing/grant", post(billing_grant))
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -6492,6 +6493,59 @@ async fn billing_charge(State(c): State<Arc<CloudState>>, headers: HeaderMap, cl
         }
         Err(e) => Err((StatusCode::PAYMENT_REQUIRED, e)),
     }
+}
+
+#[derive(Deserialize)]
+struct BillingGrantReq {
+    tenant: String,
+    /// Prepaid credit cents to add (0 = no credit change).
+    #[serde(default)]
+    credit_cents: u64,
+    /// New plan id to switch to ("" = no plan change).
+    #[serde(default)]
+    plan: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// Operator-only: comp an account with prepaid credits and/or switch its plan
+/// directly, bypassing Stripe entirely — a support/goodwill grant (refunds,
+/// promotions, platform-owner self-testing). Distinct from the self-service
+/// `/v1/billing/charge` path (which only ever acts on the CALLER's own tenant,
+/// no operator gate needed since it can't touch anyone else's account): this
+/// targets an explicit `tenant` chosen by the caller, so it is hard-gated to
+/// `require_operator` the same way every other platform-wide admin mutation is.
+async fn billing_grant(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(req): Json<BillingGrantReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let t = req.tenant.trim();
+    if t.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "tenant is required".into()));
+    }
+    // plan_spec() falls back to Hobby (PLANS[0]) for an unrecognized id rather
+    // than erroring, so an unknown id must be caught here by comparing the
+    // resolved spec's own id back against what was asked for.
+    if !req.plan.is_empty() && crate::billing::plan_spec(&req.plan).id != req.plan {
+        return Err((StatusCode::BAD_REQUEST, format!("unknown plan '{}'", req.plan)));
+    }
+    let note = if req.note.is_empty() { "Operator grant".to_string() } else { req.note.clone() };
+    if !req.plan.is_empty() {
+        c.billing.set_plan(t, &req.plan);
+    }
+    let acc = if req.credit_cents > 0 { c.billing.add_credits(t, req.credit_cents, &note) } else { c.billing.account(t) };
+    c.audit.record(
+        t,
+        "operator",
+        "billing-grant",
+        "billing",
+        "grant",
+        &format!("plan={} credit_cents={} note={}", req.plan, req.credit_cents, note),
+    );
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "ok": true, "account": acc })))
 }
 
 // ============================ Ops data browser ============================
