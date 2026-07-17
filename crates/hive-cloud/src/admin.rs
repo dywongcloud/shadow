@@ -1289,7 +1289,29 @@ pub(crate) async fn build_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let b = c.builds.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let b = match c.builds.get(&id) {
+        Some(b) => b,
+        None => {
+            // Not built here — a deploy mutation (POST /v1/git/deploy) is always
+            // leader-forwarded (admin_ingress), so a fresh build this node never
+            // ran locally almost always lives on the CURRENT control-plane leader
+            // instead. Reads are NOT leader-forwarded ("best-effort local" —
+            // admin_ingress's own comment), so without this fallback a dashboard
+            // poll landing on a non-leader node 404'd forever: the deploy
+            // genuinely succeeded (on the leader), but its status could never be
+            // read back from whichever node the browser happened to hit — the
+            // exact "Deployment started 0s ago…, 0 lines, Waiting for logs…"
+            // stuck-forever bug. Mirrors deployment_build's identical fallback
+            // (see its comment) for the sibling /v1/deployments/:id/build route.
+            if !c.is_control_plane_leader() {
+                let leader = c.control_plane_leader();
+                if let Some(v) = fetch_from_host(&c, &leader, &format!("/v1/builds/{id}"), &t).await {
+                    return Ok(Json(v));
+                }
+            }
+            return Err(StatusCode::NOT_FOUND);
+        }
+    };
     // Team-scoped — this route previously had no ownership check at all, so
     // any caller (even unauthenticated, since GET bypasses the JWT gate) who
     // knew/guessed a build id could read another tenant's full build log.

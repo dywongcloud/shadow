@@ -1,5 +1,23 @@
 # Changelog
 
+## (pending) — Fix build status stuck at "0 lines, Waiting for logs…" forever
+
+A fresh deployment's progress page (`/deploy/[id]`) could get stuck showing
+"Deployment started 0s ago…" with 0 log lines forever, even though the build
+had genuinely started (and often finished) on the backend. Root cause: a
+deploy mutation (`POST /v1/git/deploy`) is always forwarded to the current
+control-plane leader by `admin_ingress`, so a fresh build frequently lives
+only on the leader's in-memory `BuildStore` — but status *reads*
+(`GET /v1/builds/:id`) are served best-effort local and are never forwarded.
+A dashboard poll landing on a different (non-leader) fleet node than the one
+that ran the build had no way to find it, and 404'd on every single poll
+forever. `build_get` now mirrors the fallback its sibling `deployment_build`
+already had: on a local miss, if this node isn't the control-plane leader, it
+proxies the read to the leader via `fetch_from_host` before giving up with a
+genuine 404. Witnessed: reproduced the exact stuck state live (a build
+present on one fleet node, invisible via `GET` from a peer node), confirmed
+the fix compiles clean and the genuinely-unknown-id case is unaffected.
+
 ## (pending) — Fix "missing or invalid bearer token" on private-repo deploys
 
 Deploying (or redeploying) a repo through the dashboard failed with
