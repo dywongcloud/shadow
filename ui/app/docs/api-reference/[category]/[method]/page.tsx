@@ -15,7 +15,6 @@ import {
 export const revalidate = 3600;
 export const dynamicParams = true;
 
-
 // Statically generate a page for every endpoint in the catalog.
 export function generateStaticParams() {
   return API_CATEGORIES.flatMap((c) => c.endpoints.map((e) => ({ category: c.slug, method: e.slug })));

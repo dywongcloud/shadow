@@ -444,10 +444,15 @@ export async function opsGet<T>(path: string, opts?: { fresh?: boolean }): Promi
 
 /** usePoll against the ops console host (`/ops` → admin.shadw.cloud). Identical
  *  semantics to [`usePoll`]; use it for the operator `/admin` pages. */
-export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true) {
-  const [data, setData] = useState<T | null>(null);
+export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true, initial: T | null = null) {
+  // `initial` seeds the first paint from a server component's prefetch (see
+  // lib/ops-data.ts's fetchOpsServer) so admin pages render real data
+  // immediately instead of a blank/skeleton state while the first client poll
+  // is in flight. The poll still fires normally on mount to pick up anything
+  // that changed between the server fetch and hydration.
+  const [data, setData] = useState<T | null>(initial);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(initial === null);
 
   const load = useCallback(async (fresh: boolean) => {
     // See usePoll's identical guard: discard a response that settles after the
