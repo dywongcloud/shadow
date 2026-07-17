@@ -11,7 +11,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { VercelMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
 import { WithIdentity, type Identity } from "@/components/identity";
-import { usePoll, switchTeam, type Team } from "@/lib/api";
+import { usePoll, switchTeam, mintSessionToken, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
@@ -433,14 +433,28 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       }),
     })
       .then((r) => r.json())
-      .then((d) => {
+      .then(async (d) => {
         // The backend authoritatively marks the platform owner (owner_email). The
         // owner keeps the legacy "personal" namespace; everyone else stays isolated
         // under `u_<uid>`. Refresh pollers so personal data loads under the right one.
         const prev = localStorage.getItem("hive_is_owner");
         const now = d?.is_owner ? "1" : "0";
         localStorage.setItem("hive_is_owner", now);
-        if (prev !== now) window.dispatchEvent(new Event("hive-team-changed"));
+        if (prev === now) return;
+        // hive_is_owner flips which tenant currentTeam() resolves to (personal vs
+        // u_<uid>) — the FIRST time this resolves (a brand-new session), the
+        // hive_jwt cookie was already minted moments earlier under the OLD guess
+        // (u_<uid>, since hive_is_owner wasn't known yet — see the sibling
+        // hive_uid effect's switchTeam(PERSONAL) call above). The backend derives
+        // the tenant SOLELY from that cookie's claim, never from client-side
+        // belief, so a raw dispatch here told pollers to re-fetch while they kept
+        // authenticating as the WRONG (but validly empty) u_<uid> tenant — a
+        // successful 200 for the wrong namespace, never a 401 that would trigger
+        // the auth-retry remint, so it silently never self-corrected without a
+        // reload. Re-mint for the NOW-correct tenant before telling anyone to
+        // re-fetch, mirroring switchTeam's own discipline.
+        await mintSessionToken();
+        window.dispatchEvent(new Event("hive-team-changed"));
       })
       .catch(() => {
         if (syncedKey.current === key) syncedKey.current = ""; // allow a retry on failure

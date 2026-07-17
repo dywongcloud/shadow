@@ -351,6 +351,17 @@ export function usePoll<T>(path: string, intervalMs = 3000, active = true) {
     // correct view with the previous tenant's data (the leak: a stale
     // in-flight "test" org response clobbering the just-loaded "personal" list).
     const team = currentTeam();
+    // Identity hasn't resolved yet (Clerk still loading / hive_uid not synced
+    // into localStorage). Firing anyway would go out with no session cookie --
+    // GETs bypass the backend's require_auth, so it still succeeds (200) but
+    // scoped to whatever anonymous/default tenant the backend falls back to,
+    // typically genuinely empty. That's a real (not-loading) empty response, so
+    // it renders as a false "no projects yet" empty state on first load instead
+    // of the loading skeleton -- exactly the leak __pending__ exists to avoid,
+    // but only if callers actually skip the fetch instead of just tagging it.
+    // Stay loading; the next interval tick or the hive-team-changed dispatch
+    // (fired once identity resolves) retries.
+    if (team === "__pending__") return;
     try {
       const d = await apiGet<T>(path, fresh ? { fresh: true } : undefined);
       if (currentTeam() !== team) return; // stale response for a tenant we've since left — discard
@@ -443,6 +454,9 @@ export function useOpsPoll<T>(path: string, intervalMs = 3000, active = true) {
     // active tenant has since changed, so a slow prior-tenant request can never
     // clobber the correctly-loaded new tenant's state.
     const team = currentTeam();
+    // See usePoll's identical guard: skip firing while identity hasn't
+    // resolved yet, so a false-empty unauthenticated response never lands.
+    if (team === "__pending__") return;
     try {
       const d = await opsGet<T>(path, fresh ? { fresh: true } : undefined);
       if (currentTeam() !== team) return;

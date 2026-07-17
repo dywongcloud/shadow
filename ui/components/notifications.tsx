@@ -17,7 +17,20 @@ export function NotificationBell() {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    setPushDismissed(typeof window !== "undefined" && localStorage.getItem("oe_push_dismissed") === "1");
+    if (typeof window === "undefined") return;
+    // window.Notification.permission (granted/denied/default) is the browser's
+    // OWN persisted record of whether push is already enabled -- it survives
+    // across sessions on its own, independent of our localStorage flag. Treat
+    // it as authoritative: once the user has actually granted (or denied) the
+    // OS-level permission, never show the "Enable push" banner again, even if
+    // oe_push_dismissed itself got cleared (e.g. by topnav.tsx's account-switch
+    // reset). Previously oe_push_dismissed was the ONLY signal, so any path
+    // that cleared it (intentional or not) resurrected the banner and made the
+    // user re-click "Enable" despite already having granted permission --
+    // requestPermission() on an already-decided permission just re-resolves
+    // instantly with no OS prompt, so this read as "it keeps prompting me."
+    const alreadyDecided = "Notification" in window && window.Notification.permission !== "default";
+    setPushDismissed(alreadyDecided || localStorage.getItem("oe_push_dismissed") === "1");
   }, []);
   useEffect(() => {
     const f = (e: MouseEvent) => {

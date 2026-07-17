@@ -5862,11 +5862,40 @@ fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notificati
     let team = norm(team).to_string();
     let mut out: Vec<Notification> = Vec::new();
 
+    // Newest event timestamp per project, across BOTH deployments and builds --
+    // a failed deploy/build notification is only live while it's still the most
+    // recent thing that happened to its project. Without this, a failure from
+    // weeks ago kept notifying forever even after the project redeployed
+    // successfully since (the "old stale notifs" bug: build_notifications had no
+    // time window and no superseded-by-a-later-event check at all, so every
+    // Error-state deployment/build that ever existed showed up indefinitely
+    // unless the user explicitly archived it).
+    let mut newest_per_project: HashMap<String, u64> = HashMap::new();
+    for d in c.gw.list() {
+        if record_tenant(&d.tenant) != team {
+            continue;
+        }
+        let e = newest_per_project.entry(d.project.clone()).or_insert(0);
+        *e = (*e).max(d.created_at_ms);
+    }
+    for b in c.builds.list() {
+        if !project_owned_by(&c, &b.project, &team) {
+            continue;
+        }
+        let e = newest_per_project.entry(b.project.clone()).or_insert(0);
+        *e = (*e).max(b.started_ms);
+    }
+
     // 1) Failed deployments.
     for d in c.gw.list() {
         // Authoritative record tag (present on the local record), not the
         // node-local project row which is UNTAGGED on a non-hosting node.
         if record_tenant(&d.tenant) != team {
+            continue;
+        }
+        // Superseded by a later deployment or build for the same project (e.g.
+        // a subsequent successful redeploy) -- the failure is moot, stop notifying.
+        if newest_per_project.get(&d.project).is_some_and(|&t| t > d.created_at_ms) {
             continue;
         }
         if d.state == fluid_core::DeployState::Error {
@@ -5891,6 +5920,9 @@ fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notificati
         // alert would otherwise silently drop on any node whose project row is
         // absent, hiding the failure from the owner.
         if !project_owned_by(&c, &b.project, &team) {
+            continue;
+        }
+        if newest_per_project.get(&b.project).is_some_and(|&t| t > b.started_ms) {
             continue;
         }
         if b.state == fluid_core::DeployState::Error {
