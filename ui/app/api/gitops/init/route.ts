@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, createRepo, commitFiles, randomConfigRepoName, setRepoVariable, resolveEntity } from "@/lib/github";
-import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
+import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
 
@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
   await backend("/v1/gitops", team, {
     method: "PUT",
     body: JSON.stringify({ repo: fullName, branch, path, scope }),
-  });
+  }, authTokenFrom(req));
 
   // 3) Scaffold + push the full artifact tree as one commit.
   const { files, hash, projectCount } = await buildOrgArtifacts(team, path);
@@ -92,7 +92,7 @@ export async function POST(req: NextRequest) {
   await backend("/v1/gitops/synced", team, {
     method: "POST",
     body: JSON.stringify({ commit: result.commit || "", hash }),
-  }).catch(() => {});
+  }, authTokenFrom(req)).catch(() => {});
 
   // Auto-set the Actions variable so the committed workflow can reach the node.
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");

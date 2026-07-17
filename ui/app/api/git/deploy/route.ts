@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
-import { backend } from "@/lib/gitops-server";
+import { authTokenFrom, backend } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
 
@@ -32,7 +32,17 @@ export async function POST(req: NextRequest) {
     ]);
     if (token) body.git_token = token;
   }
-  const r = await backend("/v1/git/deploy", team, { method: "POST", body: JSON.stringify(body) });
+  // Forward the signed-in user's platform JWT so the backend's require_auth
+  // accepts the deploy (a POST mutation) — without it, private-repo deploys
+  // 401'd with "missing or invalid bearer token" even though the git_token for
+  // the clone was attached. Platform auth (hive_jwt) and clone auth (git_token)
+  // are two separate credentials; both are needed and never reach the browser.
+  const r = await backend(
+    "/v1/git/deploy",
+    team,
+    { method: "POST", body: JSON.stringify(body) },
+    authTokenFrom(req),
+  );
   const text = await r.text();
   return new NextResponse(text, {
     status: r.status,

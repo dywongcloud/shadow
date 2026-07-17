@@ -4,13 +4,43 @@ import { buildArtifacts } from "@/lib/gitops-yaml";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
 
-/** Call the backend admin API scoped to a tenant. */
-export async function backend(path: string, team: string, init?: RequestInit) {
+/**
+ * Call the backend admin API scoped to a tenant.
+ *
+ * `authToken` (the signed-in user's platform JWT) is forwarded as
+ * `Authorization: Bearer …` so MUTATIONS pass the backend's `require_auth`
+ * (when `HIVE_JWT_SECRET` is set). A Next server route that POSTs to the backend
+ * on the user's behalf (deploy, redeploy, GitOps writes) MUST pass it — unlike
+ * the `/cloud` rewrite proxy, a server→backend `fetch()` does not carry the
+ * browser's `hive_jwt` cookie automatically, so omitting it 401s with
+ * "missing or invalid bearer token". Reads (no token) stay unauthenticated, and
+ * the backend derives the tenant from the JWT claim (not the spoofable
+ * `x-hive-team` header), so forwarding the user's token scopes writes correctly.
+ */
+export async function backend(path: string, team: string, init?: RequestInit, authToken?: string | null) {
   return fetch(`${ADMIN}${path}`, {
     ...init,
-    headers: { "content-type": "application/json", "x-hive-team": team, ...(init?.headers || {}) },
+    headers: {
+      "content-type": "application/json",
+      "x-hive-team": team,
+      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+      ...(init?.headers || {}),
+    },
     cache: "no-store",
   });
+}
+
+/** Extract the caller's platform JWT from a Next request (httpOnly `hive_jwt`
+ *  cookie, or an incoming `Authorization: Bearer`) to forward to the backend. */
+export function authTokenFrom(req: {
+  cookies?: { get(name: string): { value: string } | undefined };
+  headers: { get(name: string): string | null };
+}): string | null {
+  const cookie = req.cookies?.get?.("hive_jwt")?.value;
+  if (cookie) return cookie;
+  const bearer = req.headers.get("authorization");
+  if (bearer && /^Bearer\s+/i.test(bearer)) return bearer.replace(/^Bearer\s+/i, "").trim() || null;
+  return null;
 }
 
 /**

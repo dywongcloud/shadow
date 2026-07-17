@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { githubConfigured, githubStatus, commitFiles, resolveEntity } from "@/lib/github";
-import { backend, buildOrgArtifacts } from "@/lib/gitops-server";
+import { authTokenFrom, backend, buildOrgArtifacts } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
 
@@ -43,7 +43,7 @@ export async function POST(req: NextRequest) {
   await backend("/v1/gitops/synced", team, {
     method: "POST",
     body: JSON.stringify({ commit: result.commit || "", hash }),
-  }).catch(() => {});
+  }, authTokenFrom(req)).catch(() => {});
 
   return NextResponse.json({
     ok: true, repo: link.repo, branch, commit: result.commit, files: files.length, projects: projectCount,

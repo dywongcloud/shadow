@@ -1,5 +1,22 @@
 # Changelog
 
+## (pending) — Fix "missing or invalid bearer token" on private-repo deploys
+
+Deploying (or redeploying) a repo through the dashboard failed with
+`missing or invalid bearer token`. The deploy is POSTed to a same-origin Next
+server route (`/api/git/deploy`) — not straight to the backend — so the route can
+attach the user's GitHub clone token server-side. But the shared `backend()`
+helper forwarded only `x-hive-team`, never the user's platform JWT: unlike the
+`/cloud` rewrite proxy, a server→backend `fetch()` doesn't carry the browser's
+`hive_jwt` cookie, so the backend's `require_auth` rejected the POST. `backend()`
+now forwards the caller's platform token (via `authTokenFrom(req)`, which reads
+the httpOnly `hive_jwt` cookie or an incoming `Authorization: Bearer`), and every
+server-route mutation that goes through it — deploy, redeploy, and the GitOps
+init/sync/integrations-link writes (the same latent class bug) — passes it
+through. The GitHub *clone* token (`git_token`) is a separate credential and is
+untouched; both are server-side only. Witnessed: the deploy that returned 401
+now returns a `build_id`, and the no-token path is unchanged.
+
 ## (pending) — First-party GitHub App OAuth (private repos & orgs for projects/deployments)
 
 Private organization repos still couldn't be used for projects and deployments:

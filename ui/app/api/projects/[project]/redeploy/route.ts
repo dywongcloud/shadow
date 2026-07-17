@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, githubAccessToken } from "@/lib/github";
-import { backend } from "@/lib/gitops-server";
+import { authTokenFrom, backend } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
 
@@ -30,10 +30,14 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ project: s
     new Promise<null>((resolve) => setTimeout(() => resolve(null), 8000)),
   ]);
   if (token) body.git_token = token;
-  const r = await backend(`/v1/projects/${encodeURIComponent(project)}/redeploy`, team, {
-    method: "POST",
-    body: JSON.stringify(body),
-  });
+  // Forward the user's platform JWT (see /api/git/deploy) so the redeploy
+  // mutation passes the backend's require_auth.
+  const r = await backend(
+    `/v1/projects/${encodeURIComponent(project)}/redeploy`,
+    team,
+    { method: "POST", body: JSON.stringify(body) },
+    authTokenFrom(req),
+  );
   const text = await r.text();
   return new NextResponse(text, {
     status: r.status,

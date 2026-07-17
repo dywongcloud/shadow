@@ -9,7 +9,7 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { resolveEntity, toolkitStatus, connectionCredentials, composioConfigured } from "@/lib/composio";
-import { backend } from "@/lib/gitops-server";
+import { authTokenFrom, backend } from "@/lib/gitops-server";
 
 export const dynamic = "force-dynamic";
 
@@ -64,7 +64,7 @@ export async function POST(req: NextRequest) {
     await backend("/v1/integrations", team, {
       method: "POST",
       body: JSON.stringify({ provider: slug, name, kind: cred?.kind || "oauth", entity, credentials: {}, env: {} }),
-    }).catch(() => {});
+    }, authTokenFrom(req)).catch(() => {});
     return NextResponse.json({ ok: true, provider: slug, env: [], injected: 0, note: "connected; no extractable credentials" });
   }
 
@@ -74,7 +74,7 @@ export async function POST(req: NextRequest) {
   const regRes = await backend("/v1/integrations", team, {
     method: "POST",
     body: JSON.stringify({ provider: slug, name, kind: cred.kind, entity, credentials: cred.credentials, env }),
-  });
+  }, authTokenFrom(req));
   if (!regRes.ok) {
     return NextResponse.json({ ok: false, error: `register failed (${regRes.status})` }, { status: 502 });
   }
@@ -91,7 +91,7 @@ export async function POST(req: NextRequest) {
         const r = await backend(`/v1/projects/${encodeURIComponent(p.project)}/env`, team, {
           method: "POST",
           body: JSON.stringify({ key, value, target: "production", sensitive: true }),
-        });
+        }, authTokenFrom(req));
         if (r.ok) injected++;
       }
     }
