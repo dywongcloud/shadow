@@ -17,6 +17,14 @@ through. The GitHub *clone* token (`git_token`) is a separate credential and is
 untouched; both are server-side only. Witnessed: the deploy that returned 401
 now returns a `build_id`, and the no-token path is unchanged.
 
+The same audit found the marketplace toolkit-index cache (`/api/composio/toolkits`)
+silently failing its `guardian-db` write for the same reason (operator-gated
+admin-data endpoint, no token) — so under enforcement it never persisted and
+re-fetched Composio's full 1,000+ catalog on every Integrations load. It now
+mints a short-lived `_global` operator token (server-side, via the internal
+token + owner email) for the read and write, so the index caches (witnessed:
+consecutive loads now serve `source: guardian-db`).
+
 ## (pending) — First-party GitHub App OAuth (private repos & orgs for projects/deployments)
 
 Private organization repos still couldn't be used for projects and deployments:
