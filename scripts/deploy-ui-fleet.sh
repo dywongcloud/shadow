@@ -13,12 +13,23 @@
 # ansible/playbooks/platform-only.yml serial:1 discipline for backend
 # rollouts, so the dashboard is never down fleet-wide during a bad build.
 #
-# Usage: scripts/deploy-ui-fleet.sh [host ...]   (defaults to the 6 public nodes)
+# Usage: scripts/deploy-ui-fleet.sh [host ...]   (defaults to the 7 fleet nodes)
 set -euo pipefail
 
 PEM="${HIVE_FLEET_PEM:-$HOME/Documents/billing.pem}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# SOURCE OF TRUTH: ansible/inventory/hosts.ini ([platform:children] -> the
+# fc_kvm + fc_pvm groups, ansible_host= values). This array is a hand-copied
+# mirror of those same 7 IPs, NOT auto-derived from the ini file, because the
+# order below (fc-sanjose/control-plane-leader first, then the rest) is a
+# deliberate rollout-safety curation that does not match hosts.ini's
+# group/file order -- parsing it back out would silently reorder deploys.
+# If a fleet node is added/removed/re-IP'd in hosts.ini, update this array in
+# the same change, or this script will deploy to a stale host list. Re-check
+# for drift with:
+#   diff <(grep -oE 'ansible_host=[0-9.]+' ansible/inventory/hosts.ini | cut -d= -f2 | sort) \
+#        <(awk '/^DEFAULT_HOSTS=\(/{f=1;next} /^\)/{f=0} f{print $1}' scripts/deploy-ui-fleet.sh | sort)
 DEFAULT_HOSTS=(
   170.106.158.151  # fc-sanjose (control-plane leader)
   170.106.40.67    # fc-virginia-2

@@ -200,6 +200,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/billing/charge", post(billing_charge))
         .route("/v1/billing/webhook", post(billing_webhook))
         .route("/v1/admin/billing/grant", post(billing_grant))
+        .route("/v1/admin/billing/backfill", post(billing_backfill_run))
         // ---- Deployment preview / thumbnail ----
         .route("/v1/projects/:project/preview", get(project_preview))
         .route("/v1/projects/:project/thumbnail", get(project_thumbnail))
@@ -1153,6 +1154,12 @@ pub(crate) async fn start_named_deploy(
         c.projects.set_root_dir(&project, root);
     }
     crate::persist::persist(c);
+    // Keep the git-webhook reverse index in sync with this project's connected
+    // repo — covers git-import at project creation AND any future explicit
+    // connect/reconnect that routes through this shared deploy entry (a no-op
+    // for zip/image sources, which can never receive a GitHub webhook anyway).
+    // See `gitops::GitRepoIndex::set_project_repo`.
+    c.git_index.set_project_repo(&project, &req.repo_url);
     // Start the build asynchronously; the dashboard streams logs via /v1/builds/:id.
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id, "project": project })))
@@ -1207,6 +1214,8 @@ pub(crate) async fn deploy_zip(
     let req = fluid_core::GitDeployRequest {
         repo_url: format!("upload://{filename}"),
         branch: None,
+        commit: None, // zip upload: no git history, nothing to pin to
+        head_repo_url: None, // zip upload has no git clone, let alone a fork
         project: meta.project,
         creator: Some("you".into()),
         production: meta.production.unwrap_or(true),
@@ -1264,6 +1273,8 @@ pub(crate) async fn deploy_image(
         // source is `image_ref` (no clone happens).
         repo_url: format!("image://{image}"),
         branch: None,
+        commit: None, // prebuilt image deploy: no git clone, nothing to pin to
+        head_repo_url: None, // prebuilt image deploy has no git clone, let alone a fork
         project: body.project,
         creator: Some("you".into()),
         production: body.production.unwrap_or(true),
@@ -2177,6 +2188,7 @@ async fn project_delete(
     record_event(&c, &project, "delete", &format!("deleted project {project} ({} deployment(s))", ids.len()));
     purge_project_resources(&c, &project, &t, ids.len()).await;
     c.projects.remove(&project);
+    c.git_index.remove_project(&project);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, &project, "project.removed", json!({ "project": project, "deployments": ids.len() }));
 
@@ -2261,6 +2273,7 @@ pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, tea
     let team = if team.trim().is_empty() { norm(&c.projects.team_of(project)).to_string() } else { team.to_string() };
     purge_project_resources(c, project, &team, ids.len()).await;
     c.projects.remove(project);
+    c.git_index.remove_project(project);
     crate::persist::persist(c);
     ids.len()
 }
@@ -2292,7 +2305,7 @@ struct RedeployBody {
 /// Find the latest git source for a project — from this node's gateway, OR (when
 /// the placement scheduler put the project on a peer) from the gossiped fleet
 /// deployments. Lets redeploy work even when the project is hosted remotely.
-fn git_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::GitSource> {
+pub(crate) fn git_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::GitSource> {
     if let Some(g) = c.gw.git_for_project(project) {
         return Some(g);
     }
@@ -2572,6 +2585,13 @@ fn redeploy_request(
     fluid_core::GitDeployRequest {
         repo_url: src.repo_url.clone(),
         branch: Some(src.branch.clone()).filter(|b| !b.is_empty()),
+        // Manual redeploy has no specific webhook-notified commit — build
+        // whatever the branch currently points to, same as before this field
+        // existed.
+        commit: None,
+        // A redeploy always clones the project's own configured repo — there is
+        // no webhook PR payload here to have identified a fork in the first place.
+        head_repo_url: None,
         project: Some(project.to_string()),
         creator: Some("you".into()),
         production: true,
@@ -2803,22 +2823,45 @@ async fn gitops_synced(
 /// pushed commit — repos become deployable workflows (taubyte-style GitOps CI).
 ///
 /// Auth: this route is in the `open` allowlist (GitHub can't present a platform
-/// JWT). When `GITHUB_WEBHOOK_SECRET` is set the HMAC-SHA256 signature is verified;
-/// with no secret configured it accepts unsigned deliveries (dev-open default).
+/// JWT). When `GITHUB_WEBHOOK_SECRET` is set the HMAC-SHA256 signature is
+/// verified. When it is unset, the safe default is to REJECT the delivery
+/// (401) rather than silently accepting anything unsigned — that permissive
+/// behavior must now be deliberately opted into via
+/// `GITHUB_WEBHOOK_ALLOW_UNSIGNED=1`, intended for local/dev convenience only
+/// (never set it in production once the secret is fleet-provisioned).
 async fn git_webhook(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     // Verify the GitHub signature when a secret is configured.
-    if let Ok(secret) = std::env::var("GITHUB_WEBHOOK_SECRET") {
-        if !secret.is_empty() {
+    match std::env::var("GITHUB_WEBHOOK_SECRET") {
+        Ok(secret) if !secret.is_empty() => {
             let sig = headers
                 .get("x-hub-signature-256")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("");
             if !verify_github_sig(secret.as_bytes(), &body, sig) {
                 return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
+            }
+        }
+        _ => {
+            // No secret configured: reject unsigned deliveries by default (safe
+            // default). Accepting them requires an explicit opt-in, never an
+            // implicit fallback of "secret happens to be unset".
+            let allow_unsigned = std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !allow_unsigned {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    "GITHUB_WEBHOOK_SECRET is not configured on this node, so webhook \
+                     signatures cannot be verified. Set GITHUB_WEBHOOK_SECRET to the \
+                     secret configured on the GitHub webhook, or set \
+                     GITHUB_WEBHOOK_ALLOW_UNSIGNED=1 to explicitly accept unsigned \
+                     deliveries (local/dev convenience only — do not set in production)."
+                        .into(),
+                ));
             }
         }
     }
@@ -2838,7 +2881,10 @@ async fn git_webhook(
     let repo_full = payload["repository"]["full_name"].as_str().unwrap_or("").to_string();
     let mut target: Option<String> = None;
     let mut pr_number: Option<u64> = None;
-    let (branch, commit) = match event.as_str() {
+    // `head_repo_url`: Some only for a PR opened FROM A FORK — its clone URL, used
+    // to override the clone SOURCE further down (never the project-matching repo,
+    // which always stays `repo_full`/the base repo — see `want` below).
+    let (branch, commit, head_repo_url) = match event.as_str() {
         "pull_request" => {
             let action = payload["action"].as_str().unwrap_or("");
             // A closed PR has nothing to (re)build. A merge fires a separate push
@@ -2851,7 +2897,31 @@ async fn git_webhook(
             pr_number = payload["number"].as_u64().or_else(|| payload["pull_request"]["number"].as_u64());
             let head_ref = payload["pull_request"]["head"]["ref"].as_str().unwrap_or("").to_string();
             let sha = payload["pull_request"]["head"]["sha"].as_str().unwrap_or("").to_string();
-            (head_ref, sha)
+            // `head.repo` is the repo the PR branch actually lives on — null/absent
+            // for a same-repo PR (GitHub omits it in that case for some payload
+            // shapes) as well as for a PR opened from a since-deleted/inaccessible
+            // fork (nothing left to clone; falls through to the base-repo clone,
+            // which will then fail downstream with a clear git error, same as
+            // today). Only when it's PRESENT and differs from the base repo is
+            // this a genuine fork PR whose branch/commit live somewhere the base
+            // repo's remote has never heard of.
+            let head_repo_full = payload["pull_request"]["head"]["repo"]["full_name"].as_str().map(str::to_string);
+            let is_fork = match head_repo_full.as_deref() {
+                Some(h) => crate::gitops::norm_repo(h) != crate::gitops::norm_repo(&repo_full),
+                None => false,
+            };
+            let head_repo_url = if is_fork {
+                // Prefer GitHub's own clone_url when present; fall back to
+                // constructing it from full_name (covers hand-built test payloads
+                // and any delivery shape that omits clone_url).
+                payload["pull_request"]["head"]["repo"]["clone_url"]
+                    .as_str()
+                    .map(str::to_string)
+                    .or_else(|| head_repo_full.as_deref().map(|f| format!("https://github.com/{f}.git")))
+            } else {
+                None
+            };
+            (head_ref, sha, head_repo_url)
         }
         "ping" => return Ok(Json(json!({ "pong": true }))),
         _ => {
@@ -2862,22 +2932,70 @@ async fn git_webhook(
             let r = payload["ref"].as_str().unwrap_or("");
             let branch = r.rsplit('/').next().unwrap_or("").to_string();
             let sha = payload["after"].as_str().unwrap_or("").to_string();
-            (branch, sha)
+            (branch, sha, None)
         }
     };
 
     if repo_full.is_empty() {
         return Err((StatusCode::BAD_REQUEST, "missing repository".into()));
     }
+    // PROJECT MATCHING always uses the BASE repo's full_name — a fork-originated
+    // PR still belongs to the base project; only the clone SOURCE (below) forks.
     let want = crate::gitops::norm_repo(&repo_full);
-    tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, "git_webhook: received");
+    tracing::info!(event = %event, repo = %repo_full, branch = %branch, commit = %commit, pr = ?pr_number, fork = ?head_repo_url, "git_webhook: received");
+
+    // Private-repo credential for every deploy this delivery triggers below,
+    // resolved ONCE (every triggered project shares the same `repo_full`).
+    // FIRST CHOICE: a GitHub App installation access token, minted server-side
+    // with no user session required (see `github_app_auth`) — this is what
+    // lets a repo that was only ever connected via a user's interactive
+    // GitHub App session (no node-wide GITHUB_TOKEN configured) still
+    // auto-deploy on push. `None` here (App not configured, App not
+    // installed on this repo, or a mint failure) is NOT fatal: `git.rs`'s
+    // clone path transparently falls back to the node-wide GITHUB_TOKEN env
+    // var exactly as it did before this existed.
+    let webhook_git_token: Option<String> = if crate::github_app_auth::configured() {
+        match repo_full.split_once('/') {
+            Some((owner, repo)) => match crate::github_app_auth::installation_token_for_repo(owner, repo).await {
+                Ok(Some(tok)) => Some(tok),
+                Ok(None) => {
+                    tracing::info!(repo = %want, "git_webhook: GitHub App not installed on this repo — falling back to node GITHUB_TOKEN");
+                    None
+                }
+                Err(e) => {
+                    // Never log `e`'s source token/key content — the error
+                    // variants in `github_app_auth` never carry credential
+                    // material, only status codes / parse failures.
+                    tracing::warn!(repo = %want, error = %e, "git_webhook: GitHub App installation-token mint failed — falling back to node GITHUB_TOKEN");
+                    None
+                }
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    // Candidate projects for this repo: O(1) via the reverse index
+    // (`gitops::GitRepoIndex`) in the normal case, instead of an O(projects)
+    // fleet-wide scan on every single webhook delivery. An index that has NEVER
+    // been populated at all (fresh boot before the first rebuild, or a bug) is
+    // NOT the same as "this repo genuinely has zero projects" — that specific
+    // case falls back to the original full scan defensively (not the normal
+    // path). See `GitRepoIndex`'s doc comment for what keeps it in sync.
+    let candidates: Vec<String> = if !c.git_index.is_empty() {
+        c.git_index.projects_for(&want)
+    } else {
+        tracing::warn!("git_webhook: reverse index is empty/uninitialized — falling back to a full project scan");
+        c.projects.snapshot().into_keys().collect()
+    };
 
     // Deploy every project pointing at this repo for the pushed/PR branch. We do
     // NOT filter by branch: a push to a non-production branch (or a PR) is exactly
     // how preview deployments are created — the branch decides production vs
     // preview at build time (or `target` forces a preview for PRs).
     let mut triggered = Vec::new();
-    for (project, _settings) in c.projects.snapshot() {
+    for project in candidates {
         // Fleet-aware git lookup: a project placed on a peer node (the common case —
         // most projects run on Firecracker nodes, not this coordinator) has no LOCAL
         // gateway git source, so `gw.git_for_project` returns None and the webhook
@@ -2892,6 +3010,15 @@ async fn git_webhook(
         let req = fluid_core::GitDeployRequest {
             repo_url: git.repo_url.clone(),
             branch: Some(deploy_branch).filter(|b| !b.is_empty()),
+            // Pin to the EXACT commit GitHub notified us about — without this the
+            // clone just builds "whatever the branch currently points to", which
+            // races a rapid double-push into building the wrong commit.
+            commit: Some(commit.clone()).filter(|s| !s.is_empty()),
+            // Fork-originated PR: clone/fetch from the FORK's repo, not the base
+            // repo `git.repo_url` — the fork's branch (and, without SHA-fetch
+            // support, its commits) don't exist on the base repo's remote at all.
+            // None for same-repo PRs and every push — clones `git.repo_url` as before.
+            head_repo_url: head_repo_url.clone(),
             project: Some(project.clone()),
             creator: Some("github".into()),
             production: true, // legacy field; classification uses `target`/branch
@@ -2906,7 +3033,9 @@ async fn git_webhook(
             zip_b64: None,
             image_ref: None,
             image_port: None,
-            git_token: None, // webhook auto-deploy: falls back to node GITHUB_TOKEN for private repos
+            // webhook auto-deploy: GitHub App installation token (first choice,
+            // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
+            git_token: webhook_git_token.clone(),
         };
         let build_id = crate::git::start_build(c.clone(), req);
         let ev = c.event(&c.region, "DEPLOY", &format!("{project}.localhost"), "/", 200, "gitops", &format!("github {} {} @ {}", event, want, &commit.chars().take(7).collect::<String>()));
@@ -6277,8 +6406,20 @@ pub(crate) async fn billing_get(State(c): State<Arc<CloudState>>, headers: Heade
 pub(crate) async fn billing_invoices(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if let Some((_, _, Some(invoices_json))) = crate::relational::billing_snapshot(&t).await {
-        if let Ok(v) = serde_json::from_str::<Value>(&invoices_json) {
-            return Json(v);
+        if let Ok(Value::Array(mut arr)) = serde_json::from_str::<Value>(&invoices_json) {
+            // The mirror only ever holds FINALIZED invoices (drafts are never
+            // persisted — see `relational::upsert_billing`'s doc comment).
+            // Append the current in-progress period's draft here so this
+            // fast local-mirror path matches the fallback below
+            // (`BillingStore::invoices` always includes the draft), then
+            // re-sort newest-first the same way `invoices()` does.
+            arr.push(json!(c.billing.current_invoice(&t)));
+            arr.sort_by(|a, b| {
+                let pa = a.get("period_start_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let pb = b.get("period_start_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                pb.cmp(&pa)
+            });
+            return Json(Value::Array(arr));
         }
     }
     if let Some(v) = proxy_billing_read(&c, "/v1/billing/invoices", &t).await {
@@ -6546,6 +6687,40 @@ async fn billing_grant(
     );
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true, "account": acc })))
+}
+
+#[derive(Deserialize, Default)]
+struct BillingBackfillReq {
+    /// Re-process tenants already marked migrated in `billing_backfill_state`
+    /// instead of skipping them (default: skip — safe to re-POST after a
+    /// partial run without re-touching tenants that already verified clean).
+    #[serde(default)]
+    force: bool,
+}
+
+/// ADMIN-ONLY, ONE-SHOT (idempotent) billing schema backfill: normalize the
+/// pre-migration JSON-blob billing rows (`billing_accounts.account_json` /
+/// `billing_ledger_snapshot.ledger_json` / `billing_invoices_snapshot.invoices_json`)
+/// into the new normalized per-row tables (`billing_accounts`'s new scalar
+/// columns, `billing_ledger`, `billing_invoices` + `billing_invoice_lines`).
+/// See `relational::backfill_billing_normalize`'s doc comment for the full
+/// write/verify contract and the critical `billing_accounts` table-name-
+/// collision finding it exists to handle.
+///
+/// NOT wired to run automatically anywhere — must be explicitly POSTed by a
+/// platform operator, and even then only after the separate production-data
+/// approval gate this migration's rollout plan calls for (this endpoint
+/// performs REAL writes against REAL billing data the moment it's called; it
+/// does not itself ask for confirmation — that gate lives outside this code).
+async fn billing_backfill_run(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(body): Json<BillingBackfillReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    crate::relational::backfill_billing_normalize(body.force)
+        .await
+        .map(Json)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))
 }
 
 // ============================ Ops data browser ============================

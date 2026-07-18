@@ -475,6 +475,18 @@ impl BillingStore {
         v
     }
 
+    /// Finalized (`status == "paid"`) invoices for a tenant, exactly as
+    /// stored — WITHOUT the current in-progress period's draft (unlike
+    /// `invoices()`, which appends it for the read API). `self.invoices`
+    /// only ever holds invoices `account()`'s period-rollover pushed via
+    /// `build_invoice(.., "paid")`, so this is already finalized-only by
+    /// construction; used by the relational mirror (`relational::upsert_billing`),
+    /// which must NEVER persist a draft (transient/computed, not a stored fact).
+    pub fn finalized_invoices(&self, tenant: &str) -> Vec<Invoice> {
+        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        self.invoices.read().get(tenant).cloned().unwrap_or_default()
+    }
+
     fn ledger_push(&self, tenant: &str, kind: &str, amount: i64, balance_after: i64, note: &str) -> LedgerEntry {
         let e = LedgerEntry {
             id: format!("led_{}", &Uuid::new_v4().simple().to_string()[..12]),
@@ -572,6 +584,15 @@ impl BillingStore {
         let mut v: Vec<LedgerEntry> = self.ledger.read().iter().filter(|e| e.tenant == tenant).cloned().collect();
         v.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
         v
+    }
+
+    /// Checkouts currently open (not yet confirmed — `confirm_checkout`
+    /// removes a checkout from the live map once applied) for a tenant. Used
+    /// by the relational mirror to persist a tenant's in-flight checkout
+    /// state (`billing_checkouts`, previously not mirrored at all).
+    pub fn checkouts_for_tenant(&self, tenant: &str) -> Vec<Checkout> {
+        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        self.checkouts.read().values().filter(|c| c.tenant == tenant).cloned().collect()
     }
 
     pub fn open_checkout(&self, tenant: &str, kind: &str, plan: &str, amount_cents: u64) -> Checkout {

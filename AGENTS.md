@@ -6,9 +6,16 @@ history).
 
 ## Data model
 
-- Relational mirror on GuardianDB: 7 tables (projects/billing + view-only
-  teams/members/deployments via `spawn_relational_mirror_loop`); hot-path
+- Relational mirror on GuardianDB: 11 tables (projects/billing + view-only
+  teams/members/deployments via `spawn_relational_mirror_loop`); billing is
+  normalized real per-row tables (`billing_accounts`, `billing_ledger`,
+  `billing_invoices` + `billing_invoice_lines`, `billing_checkouts`), not
+  JSON blobs — `billing_ledger_snapshot`/`billing_invoices_snapshot` remain
+  in the DDL deprecated-pending-removal (no longer written); hot-path
   `MetricsStore` deliberately excluded; `refresh()`-before-read requirement.
+  `relational::upsert_billing` wraps a tenant's whole write (account + every
+  ledger/invoice/invoice-line/checkout row) in one `BEGIN; ...; COMMIT;`
+  transaction — never split back into separate autocommit statements.
   Detail: `recall("relational-scope")` / `crates/hive-cloud/src/relational.rs`.
 - Admin SQL/tables view (`GET/POST /v1/admin/sql/*`) must stay read-only;
   extend `relational::known_tables()` for any new relational table. Detail:

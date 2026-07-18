@@ -92,7 +92,11 @@ Never commit real secrets. `inventory/hosts.ini`, `inventory/group_vars/
 vault.yml`, and `.vault_pass` are all gitignored -- only the `.example`
 templates ship in git. Secrets referenced in role templates
 (`vault_hive_jwt_secret`, `vault_hive_internal_token`,
-`vault_vercel_api_token`, `vault_vercel_team_id`, `vault_stripe_secret_key`)
+`vault_vercel_api_token`, `vault_vercel_team_id`, `vault_stripe_secret_key`,
+`vault_composio_api_key`, `vault_github_app_client_id`,
+`vault_github_app_client_secret`, `vault_github_app_redirect_uri`,
+`vault_hive_github_auth_config_id`, `vault_github_webhook_secret`,
+`vault_github_token`, `vault_hive_secret_key`)
 resolve from the encrypted `vault.yml`.
 
 ## Roles

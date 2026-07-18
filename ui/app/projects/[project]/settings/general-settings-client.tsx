@@ -3,7 +3,7 @@
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { Button, Input, SettingCard, Badge } from "@/components/ui";
-import { apiGet, type Deployment } from "@/lib/api";
+import { apiGet, type Deployment, type ProjectSettings } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
@@ -17,7 +17,7 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
     apiGet<Deployment[]>("/deployments")
       .then((all) => setDep(all.find((d) => d.project === project) ?? null))
       .catch(() => {});
-    apiGet<{ production_branch?: string }>(`/v1/projects/${encodeURIComponent(project)}/settings`)
+    apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`)
       .then((s) => setProdBranch(s?.production_branch || ""))
       .catch(() => {});
   }, [project]);
@@ -39,7 +39,11 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
           <Row label="Production URL" value={dep ? <a className="text-link hover:underline" href={deploymentUrl(dep.alias, dep.region_code)} target="_blank" rel="noreferrer">{deploymentHost(dep.alias, dep.region_code)}</a> : "—"} />
           <Row
             label="Git"
-            value={dep?.git ? <span className="font-mono text-xs">{dep.git.repo_url} @ {dep.git.branch}</span> : <Badge>Not connected</Badge>}
+            value={
+              <Link href={`/projects/${encodeURIComponent(project)}/settings/git`} className="hover:underline">
+                {dep?.git ? <span className="font-mono text-xs">{dep.git.repo_url} @ {dep.git.branch}</span> : <Badge>Not connected — connect →</Badge>}
+              </Link>
+            }
           />
           <Row
             label="Production Branch"
@@ -50,6 +54,7 @@ export function GeneralSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
       </SettingCard>
 
       <div className="flex flex-wrap gap-2 text-sm">
+        <Link href={`/projects/${encodeURIComponent(project)}/settings/git`}><Button variant="outline">Git →</Button></Link>
         <Link href={`/projects/${encodeURIComponent(project)}/settings/environment-variables`}><Button variant="outline">Environment Variables →</Button></Link>
         <Link href={`/projects/${encodeURIComponent(project)}/settings/functions`}><Button variant="outline">Functions →</Button></Link>
         <Link href={`/projects/${encodeURIComponent(project)}/settings/build`}><Button variant="outline">Build & Development →</Button></Link>

@@ -14,3 +14,27 @@ vault_stripe_secret_key: ""                   # optional -- only if billing is e
 # Clerk auth disabled (dev/self-host without Clerk).
 vault_clerk_publishable_key: ""               # NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 vault_clerk_secret_key: ""                    # CLERK_SECRET_KEY
+
+# GitHub App + Composio integration (hive_ui role: dashboard git-connect
+# flow; hive_platform role: webhook verification + private-clone fallback).
+# All global, same value on every node (see AGENTS.md /
+# recall("fleet-creds-enumerate-required-vars")). Omit all to run with
+# git-import/webhook features disabled (manual git-URL import still works).
+vault_composio_api_key: ""                    # COMPOSIO_API_KEY -- Composio API key, GitHub OAuth connection flow
+vault_github_app_client_id: ""                # GITHUB_APP_CLIENT_ID
+vault_github_app_client_secret: ""            # GITHUB_APP_CLIENT_SECRET -- also derives the session-cookie encryption key; must match across every node
+vault_github_app_redirect_uri: ""             # GITHUB_APP_REDIRECT_URI
+vault_hive_github_auth_config_id: ""          # HIVE_GITHUB_AUTH_CONFIG_ID
+vault_github_webhook_secret: ""               # GITHUB_WEBHOOK_SECRET -- signs (hive_ui) / verifies (hive_platform) GitHub webhook signatures; must match fleet-wide
+vault_github_token: ""                        # GITHUB_TOKEN -- node-wide fallback for cloning private repos on webhook-triggered builds
+# GitHub App server-to-server auth (hive_platform role) -- lets a webhook-triggered
+# build (no user session, see GITHUB_TOKEN above) mint its OWN short-lived
+# per-repo installation token instead of depending on a shared node-wide PAT,
+# for any repo the App is installed on. DIFFERENT credential pair from
+# vault_github_app_client_id/secret above (those are the App's OAuth
+# client id/secret for the interactive user-to-server flow; these are the
+# App's identity for JWT-signed app-to-server auth). Both optional -- omit
+# either to keep using the GITHUB_TOKEN-only fallback.
+vault_github_app_id: ""                       # GITHUB_APP_ID -- the App's numeric ID (App settings page)
+vault_github_app_private_key: ""              # GITHUB_APP_PRIVATE_KEY -- PEM from the App's "generate a private key"; paste with literal \n in place of newlines
+vault_hive_secret_key: ""                     # HIVE_SECRET_KEY -- encrypts per-project env-var secrets at rest; must match across the whole fleet

@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 
 const sections = [
   { slug: "", label: "General" },
+  { slug: "git", label: "Git" },
   { slug: "environment-variables", label: "Environment Variables" },
   { slug: "functions", label: "Functions" },
   { slug: "build", label: "Build & Development" },

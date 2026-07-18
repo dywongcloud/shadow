@@ -1063,6 +1063,28 @@ pub struct GitDeployRequest {
     pub repo_url: String,
     #[serde(default)]
     pub branch: Option<String>,
+    /// Exact commit SHA to build, when known (parsed from a GitHub webhook
+    /// payload's `after` for a push, or `pull_request.head.sha` for a PR). When
+    /// Some, the clone pins to this EXACT commit instead of the branch tip —
+    /// closes a race where a rapid double-push could otherwise silently build a
+    /// newer commit than the one GitHub actually notified about. None (manual
+    /// deploys, redeploys, the "New Project" import flow) has no specific commit
+    /// to pin to and falls back to a plain branch-tip clone.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// When a webhook-triggered PR build's HEAD commit lives on a FORK (not the
+    /// base repo `repo_url` points at), this is the fork's clone URL — the PR's
+    /// branch (and, for an older host without SHA-fetch support, the commit
+    /// itself) only exists on the fork's remote, so cloning/fetching against
+    /// `repo_url` would find nothing. When Some, the clone/fetch step in
+    /// `run_build` sources from THIS url instead of `repo_url`. `repo_url` itself
+    /// is left untouched everywhere else — project ownership/matching, the
+    /// displayed `Build.repo_url`, and commit-status reporting all stay on the
+    /// BASE repo, since a fork PR still belongs to the base project. None for
+    /// same-repo PRs, pushes, and every non-webhook deploy (manual import,
+    /// redeploy, "New Project").
+    #[serde(default)]
+    pub head_repo_url: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
     #[serde(default)]

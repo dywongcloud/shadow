@@ -717,6 +717,22 @@ export interface ProjectSettings {
   team?: string;
   preview_protection?: boolean;
   cron_enabled?: boolean;
+  /** The Git branch whose deployments are production; "" until the project's
+   *  first git deploy classifies it (or it has no git source at all). */
+  production_branch?: string;
+  /** Outcome of the auto-CI install attempted right after this project's first
+   *  git import — absent for a project with no git source yet. */
+  git_ci?: GitCiStatus;
+}
+
+/** See `ProjectSettings.git_ci`. Mirrors `hive-cloud::project_settings::GitCiStatus`. */
+export interface GitCiStatus {
+  webhook_installed: boolean;
+  workflow_installed: boolean;
+  /** Set only when neither installed — e.g. "github-not-connected", "bad-repo",
+   *  "github-not-configured", "request-failed", "unknown". */
+  skipped_reason: string;
+  checked_ms: number;
 }
 
 export interface RegionEntry {

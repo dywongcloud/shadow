@@ -558,24 +558,42 @@ async fn run_build(
             format!("Redeploy of {}", if name.is_empty() { "uploaded archive".into() } else { name }),
         )
     } else {
-        let short_repo = req.repo_url.trim_start_matches("https://").trim_end_matches(".git");
+        // A PR opened from a FORK has its branch/commit only on the fork's own
+        // remote — the base repo (`req.repo_url`) never has it. `git_webhook` sets
+        // `head_repo_url` for exactly that case; every other deploy path (push,
+        // manual import, redeploy, non-fork PR) leaves it None and clones
+        // `req.repo_url` as before. Project ownership/matching and every displayed
+        // field (`Build.repo_url`, commit-status reporting below) stay on the BASE
+        // repo — only the actual clone/fetch source changes here.
+        let clone_source_url = req.head_repo_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| req.repo_url.clone());
+        let short_repo = clone_source_url.trim_start_matches("https://").trim_end_matches(".git");
+        let pinned_commit = req.commit.clone().filter(|s| !s.is_empty());
         log(format!(
-            "Cloning {short_repo} (Branch: {}, Commit: HEAD)",
-            if branch.is_empty() { "main" } else { &branch }
+            "Cloning {short_repo} (Branch: {}, Commit: {})",
+            if branch.is_empty() { "main" } else { &branch },
+            pinned_commit.as_deref().map(|s| s.chars().take(7).collect::<String>()).unwrap_or_else(|| "HEAD".into())
         ));
         let t0 = now_ms();
-        // Credential for a PRIVATE repo: the deploy request's `git_token` (attached
-        // server-side by the dashboard from the user's connected GitHub), else a
-        // node-level `GITHUB_TOKEN`. It is injected ONLY into a local clone URL as
+        // Credential for a PRIVATE repo: the deploy request's `git_token` — either
+        // attached server-side by the dashboard from the user's connected GitHub
+        // (interactive deploys), or a freshly minted GitHub App installation
+        // token attached by `admin::git_webhook` (webhook-triggered deploys have
+        // no user session, see `github_app_auth`) — else a node-level
+        // `GITHUB_TOKEN`. It is injected ONLY into a local clone URL as
         // `x-access-token` basic auth — `req.repo_url` stays tokenless everywhere it
         // is logged/persisted, and the token is scrubbed out of any clone stderr.
+        // Applied to `clone_source_url` (the fork, when this is a fork PR): the same
+        // installation/token resolution as the base repo is reused verbatim (no new
+        // auth flow) — it may not grant access to an arbitrary fork, but a public
+        // fork still clones fine anonymously, and a rejected token falls back to the
+        // anonymous retry below exactly as it does for the base repo today.
         let git_token: Option<String> = req
             .git_token
             .clone()
             .filter(|t| !t.is_empty())
             .or_else(|| std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty()));
         let tokenized_url = git_token.as_ref().and_then(|t| {
-            req.repo_url
+            clone_source_url
                 .strip_prefix("https://github.com/")
                 .map(|rest| format!("https://x-access-token:{t}@github.com/{rest}"))
         });
@@ -584,25 +602,137 @@ async fn run_build(
         // Never let git open an interactive credential prompt (GIT_TERMINAL_PROMPT=0 /
         // GIT_ASKPASS): this daemon has no controlling terminal, so a rejected/absent
         // credential must fail cleanly instead of crashing on /dev/tty.
+        //
+        // When `req.commit` names an exact SHA (a webhook-triggered deploy), a plain
+        // `--depth 1 --branch` clone is not enough — under a rapid double-push the
+        // branch tip may already have moved past the commit GitHub notified us
+        // about, and a shallow branch clone simply does not contain that older
+        // commit. Pin to it instead: `git init` + `git fetch --depth 1 <sha>` fetches
+        // exactly that commit directly (GitHub, and any PAT/GitHub-App authenticated
+        // host, serve an arbitrary reachable SHA on request — this is the same trick
+        // GitHub Actions' own checkout action uses), then `checkout FETCH_HEAD` pins
+        // to it, staying just as cheap as the branch-tip shallow clone in the common
+        // case. If the remote rejects a direct SHA fetch (older/self-hosted git
+        // servers without `uploadpack.allowReachableSHA1InWant`), fall back to a full
+        // (unshallowed) clone of the branch followed by `checkout <sha>`, which is
+        // guaranteed to contain the commit as long as it is reachable from that
+        // branch. When `req.commit` is None (manual deploy, redeploy, import — no
+        // specific commit to pin to), behavior is EXACTLY the prior shallow
+        // branch-tip clone.
         let run_clone = |clone_url: String| {
-            let (dir, branch, token) = (dir.clone(), branch.clone(), git_token.clone());
+            let (dir, branch, token, commit) =
+                (dir.clone(), branch.clone(), git_token.clone(), pinned_commit.clone());
             async move {
-                let mut cmd = Command::new("git");
-                cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
-                cmd.arg("clone").arg("--depth").arg("1");
-                if !branch.is_empty() {
-                    cmd.arg("--branch").arg(&branch);
-                }
-                cmd.arg(&clone_url).arg(&dir);
-                match cmd.output().await {
-                    Ok(out) => {
-                        let mut stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                        if let Some(t) = &token {
-                            stderr = stderr.replace(t.as_str(), "***");
-                        }
-                        (out.status.success(), stderr)
+                let scrub = |raw: &[u8]| {
+                    let mut s = String::from_utf8_lossy(raw).trim().to_string();
+                    if let Some(t) = &token {
+                        s = s.replace(t.as_str(), "***");
                     }
-                    Err(e) => (false, format!("{e}")),
+                    s
+                };
+                if let Some(sha) = commit {
+                    // Fast path: fetch the exact commit directly into a fresh repo.
+                    if tokio::fs::create_dir_all(&dir).await.is_ok() {
+                        let mut init = Command::new("git");
+                        init.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                        init.arg("init").arg("-q").arg(&dir);
+                        let init_ok = init.output().await.map(|o| o.status.success()).unwrap_or(false);
+                        if init_ok {
+                            let mut remote = Command::new("git");
+                            remote.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                            remote.arg("-C").arg(&dir).arg("remote").arg("add").arg("origin").arg(&clone_url);
+                            let _ = remote.output().await;
+
+                            let mut fetch = Command::new("git");
+                            fetch.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                            fetch
+                                .arg("-C")
+                                .arg(&dir)
+                                .arg("fetch")
+                                .arg("--depth")
+                                .arg("1")
+                                .arg("origin")
+                                .arg(&sha);
+                            match fetch.output().await {
+                                Ok(out) if out.status.success() => {
+                                    let mut checkout = Command::new("git");
+                                    checkout
+                                        .env("GIT_TERMINAL_PROMPT", "0")
+                                        .env("GIT_ASKPASS", "/bin/echo")
+                                        .arg("-C")
+                                        .arg(&dir)
+                                        .arg("checkout")
+                                        .arg("-q")
+                                        .arg("FETCH_HEAD");
+                                    match checkout.output().await {
+                                        Ok(cout) if cout.status.success() => {
+                                            return (true, scrub(&cout.stderr));
+                                        }
+                                        Ok(cout) => {
+                                            tracing::debug!(
+                                                stderr = %scrub(&cout.stderr),
+                                                "checkout FETCH_HEAD failed after SHA fetch, falling back to full clone + checkout"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(error = %e, "checkout FETCH_HEAD failed after SHA fetch, falling back to full clone + checkout");
+                                        }
+                                    }
+                                }
+                                Ok(out) => {
+                                    tracing::debug!(
+                                        stderr = %scrub(&out.stderr),
+                                        "git fetch by SHA failed, falling back to full clone + checkout"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::debug!(error = %e, "git fetch by SHA failed, falling back to full clone + checkout");
+                                }
+                            }
+                        }
+                    }
+                    // Fallback: full (unshallowed) clone of the branch, then pin via checkout.
+                    let _ = tokio::fs::remove_dir_all(&dir).await;
+                    let mut cmd = Command::new("git");
+                    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                    cmd.arg("clone");
+                    if !branch.is_empty() {
+                        cmd.arg("--branch").arg(&branch);
+                    }
+                    cmd.arg(&clone_url).arg(&dir);
+                    match cmd.output().await {
+                        Ok(out) if out.status.success() => {
+                            let mut checkout = Command::new("git");
+                            checkout
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .env("GIT_ASKPASS", "/bin/echo")
+                                .arg("-C")
+                                .arg(&dir)
+                                .arg("checkout")
+                                .arg("-q")
+                                .arg(&sha);
+                            match checkout.output().await {
+                                Ok(cout) => (cout.status.success(), scrub(&cout.stderr)),
+                                Err(e) => (false, format!("{e}")),
+                            }
+                        }
+                        Ok(out) => (false, scrub(&out.stderr)),
+                        Err(e) => (false, format!("{e}")),
+                    }
+                } else {
+                    // No specific commit to pin to: exactly the prior behavior — a
+                    // shallow clone of the branch tip.
+                    let mut cmd = Command::new("git");
+                    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                    cmd.arg("clone").arg("--depth").arg("1");
+                    if !branch.is_empty() {
+                        cmd.arg("--branch").arg(&branch);
+                    }
+                    cmd.arg(&clone_url).arg(&dir);
+                    match cmd.output().await {
+                        Ok(out) => (out.status.success(), scrub(&out.stderr)),
+                        Err(e) => (false, format!("{e}")),
+                    }
                 }
             }
         };
@@ -611,9 +741,13 @@ async fn run_build(
                 || s.contains("Authentication failed")
                 || s.contains("terminal prompts disabled")
                 || s.contains("invalid username or password")
+                // GitHub returns this (not a generic 401) when a token lacks access to a
+                // repo — including private repos, which is exactly the fork-PR case where
+                // the surrounding retry-anonymously fallback must still trigger.
+                || s.contains("Repository not found")
         };
 
-        let first_url = tokenized_url.clone().unwrap_or_else(|| req.repo_url.clone());
+        let first_url = tokenized_url.clone().unwrap_or_else(|| clone_source_url.clone());
         let used_token = tokenized_url.is_some();
         let (mut ok, mut stderr) = run_clone(first_url).await;
         // A stored token that is expired / lacks access must never break a repo that
@@ -622,7 +756,7 @@ async fn run_build(
         if !ok && used_token && auth_failed(&stderr) {
             let _ = tokio::fs::remove_dir_all(&dir).await;
             log("Retrying clone without the stored GitHub credential…".into());
-            let (ok2, stderr2) = run_clone(req.repo_url.clone()).await;
+            let (ok2, stderr2) = run_clone(clone_source_url.clone()).await;
             ok = ok2;
             stderr = stderr2;
         }

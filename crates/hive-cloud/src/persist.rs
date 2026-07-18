@@ -497,6 +497,21 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         }
     }
     cloud.projects.load(snap.projects);
+    // Warm the git-webhook reverse index (`gitops::GitRepoIndex`) from what's
+    // already known locally at this point: every deployment this node hosts was
+    // just restored into `cloud.gw` above, so `git_for_project_fleet`'s local
+    // half is fully populated even though gossiped `peer_deployments` is still
+    // empty this early in boot. Projects hosted only on peers self-heal into the
+    // index as gossip arrives (see `main.rs`'s anti-entropy loop); `git_webhook`
+    // also falls back to a full scan defensively for the window before this
+    // call returns.
+    cloud.git_index.rebuild(
+        cloud
+            .projects
+            .snapshot()
+            .into_keys()
+            .filter_map(|p| crate::admin::git_for_project_fleet(cloud, &p).map(|g| (p, g.repo_url))),
+    );
     if !snap.waf_rules.is_empty() {
         cloud.waf.set_rules(snap.waf_rules);
     }

@@ -23,6 +23,7 @@ mod edge;
 mod enterprise;
 mod enterprise_api;
 mod git;
+mod github_app_auth;
 mod gossip;
 mod discovery;
 mod gitops;
@@ -1940,6 +1941,36 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                 let prev = cloud.peer_deployments.read().clone();
                 crate::state::merge_deployments_ttl(&prev, fleet, &alive)
             };
+            // Keep the git-webhook reverse index (`gitops::GitRepoIndex`, see
+            // `admin::git_webhook`) in sync with freshly-gossiped fleet
+            // deployments: a project first deployed via a DIFFERENT node than the
+            // one that later receives a GitHub webhook delivery (the
+            // `webhook.<platform_domain>` DNS root round-robins across every
+            // gateway node) would otherwise sit unindexed on this node until its
+            // own next deploy. Bounded to the projects visible in THIS round's
+            // peer data (not a project rescan), and skips any project this node
+            // already has a LOCAL real-git record for — matching
+            // `admin::git_for_project_fleet`'s local-wins precedence exactly.
+            {
+                let mut newest_by_project: HashMap<&str, &fluid_core::DeploymentInfo> = HashMap::new();
+                for d in merged_deps.values().flatten() {
+                    if !d.git.as_ref().is_some_and(|g| g.is_real_git()) {
+                        continue;
+                    }
+                    newest_by_project
+                        .entry(d.project.as_str())
+                        .and_modify(|cur| if d.created_at_ms > cur.created_at_ms { *cur = d })
+                        .or_insert(d);
+                }
+                for (project, d) in newest_by_project {
+                    if cloud.gw.git_for_project(project).is_some() {
+                        continue; // local record wins, unconditionally
+                    }
+                    if let Some(g) = &d.git {
+                        cloud.git_index.set_project_repo(project, &g.repo_url);
+                    }
+                }
+            }
             *cloud.peer_deployments.write() = merged_deps;
             *cloud.container_holders.write() = holders;
             // Roster hygiene: bound unbounded growth over a long uptime. Keep every
@@ -2358,14 +2389,36 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
             };
             if billing_authority {
                 let (accounts, _) = cloud.billing.snapshot();
-                if let Ok(json) = serde_json::to_string(&accounts) {
+                // Per-tenant (ledger, invoices, checkouts) fetched ONCE up
+                // front and reused for both the dirty-check hash below and
+                // (if dirty) the actual upsert loop.
+                //
+                // DIRTY-CHECK MUST COVER MORE THAN JUST ACCOUNTS: previously
+                // `h` hashed `accounts` alone, so a checkout/ledger-entry/
+                // invoice landing with no accompanying account-field change
+                // never flipped `billing_hash` and the whole billing mirror
+                // section stayed gated shut — live-witnessed: a checkout
+                // opened against an otherwise-unchanged account stayed absent
+                // from `billing_checkouts` for multiple ticks, only appearing
+                // once an unrelated account field happened to change on the
+                // same tick. Hashing the full per-tenant (account, ledger,
+                // invoices, checkouts) tuple set closes that gap: ANY
+                // billing-related change on ANY tenant flips the hash and
+                // triggers a re-sync on the next tick.
+                let per_tenant: Vec<_> = accounts
+                    .iter()
+                    .map(|acc| {
+                        let ledger = cloud.billing.ledger(&acc.tenant);
+                        let invoices = cloud.billing.finalized_invoices(&acc.tenant);
+                        let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
+                        (acc, ledger, invoices, checkouts)
+                    })
+                    .collect();
+                if let Ok(json) = serde_json::to_string(&per_tenant) {
                     let h = hash_of(&json);
                     if h != billing_hash {
-                        for acc in &accounts {
-                            let acc_json = serde_json::to_string(acc).unwrap_or_default();
-                            let ledger_json = serde_json::to_string(&cloud.billing.ledger(&acc.tenant)).unwrap_or_default();
-                            let invoices_json = serde_json::to_string(&cloud.billing.invoices(&acc.tenant)).unwrap_or_default();
-                            relational::upsert_billing(&acc.tenant, &acc_json, &ledger_json, &invoices_json).await;
+                        for (acc, ledger, invoices, checkouts) in &per_tenant {
+                            relational::upsert_billing(acc, ledger, invoices, checkouts).await;
                         }
                         billing_hash = h;
                     }
@@ -2453,10 +2506,11 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                 // (the confirmed 5-way billing-divergence bug). Best-effort:
                 // the existing HTTP proxy-to-leader read remains correct and
                 // available regardless of this mirror's freshness.
-                let acc_json = serde_json::to_string(&cloud.billing.account(&tenant)).unwrap_or_default();
-                let ledger_json = serde_json::to_string(&cloud.billing.ledger(&tenant)).unwrap_or_default();
-                let invoices_json = serde_json::to_string(&cloud.billing.invoices(&tenant)).unwrap_or_default();
-                relational::upsert_billing(&tenant, &acc_json, &ledger_json, &invoices_json).await;
+                let acc = cloud.billing.account(&tenant);
+                let ledger = cloud.billing.ledger(&tenant);
+                let invoices = cloud.billing.finalized_invoices(&tenant);
+                let checkouts = cloud.billing.checkouts_for_tenant(&tenant);
+                relational::upsert_billing(&acc, &ledger, &invoices, &checkouts).await;
             }
             if charged_any > 0 {
                 tracing::debug!(cents = charged_any, "billing meter charged usage");

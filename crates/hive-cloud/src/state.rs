@@ -178,6 +178,10 @@ pub struct CloudState {
     pub cluster: Arc<crate::cluster::Cluster>,
     pub teams: crate::teams::TeamStore,
     pub gitops: crate::gitops::GitOpsStore,
+    /// Reverse index (repo -> connected project names) accelerating
+    /// `admin::git_webhook`'s per-delivery project match to O(1). See
+    /// `gitops::GitRepoIndex` for what keeps it in sync.
+    pub git_index: crate::gitops::GitRepoIndex,
     /// Mesh peer admin URLs (for P2P build-cache pulls).
     pub peers: RwLock<Vec<String>>,
     /// node name -> that node's admin URL (learned via gossip). Lets the placement
@@ -529,6 +533,7 @@ impl CloudState {
             cluster,
             teams,
             gitops: crate::gitops::GitOpsStore::new(),
+            git_index: crate::gitops::GitRepoIndex::new(),
             peers: RwLock::new(Vec::new()),
             node_admins: RwLock::new(std::collections::HashMap::new()),
             trusted_peer_ids: {
