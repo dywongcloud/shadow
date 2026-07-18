@@ -105,9 +105,20 @@ export interface OrgConfigInput {
     /** Enterprise deployment protection (mode/scope only — never the password). */
     protection?: { mode?: string; scope?: string } | null;
   }>;
+  /** Raw database records (e.g. straight off `GET /v1/databases`) — may carry
+   *  a `connection` map of credentials. Only databaseNode()'s explicit
+   *  allowlist (name/kind/region/mode) below ever reaches the emitted YAML. */
+  databases?: Array<{
+    name: string;
+    kind?: string;
+    region?: string;
+    mode?: string;
+    [k: string]: any;
+  }>;
 }
 
 type ProjectInput = OrgConfigInput["projects"][number];
+type DatabaseInput = OrgConfigInput["databases"] extends Array<infer D> | undefined ? D : never;
 
 /** The declarative spec for a single project (shared by org + per-project files). */
 export function projectNode(p: ProjectInput): { [k: string]: Y } {
@@ -147,6 +158,23 @@ export function projectNode(p: ProjectInput): { [k: string]: Y } {
 }
 
 /**
+ * The declarative spec for a single database (shared by the org file). Explicit
+ * field allowlist — NEVER spreads the raw record — so `connection` (the
+ * credentials/connection-string map returned by `GET /v1/databases`) and any
+ * other credential-shaped field can never reach the committed YAML, matching
+ * the no-secrets-in-git discipline `projectNode()` above already follows for
+ * project env values.
+ */
+export function databaseNode(d: DatabaseInput): { [k: string]: Y } {
+  return {
+    name: d.name,
+    kind: d.kind || "unknown",
+    region: d.region || "",
+    mode: d.mode || "live",
+  };
+}
+
+/**
  * Build the declarative OpenEdge config. Mirrors the live platform objects:
  * the org/team meta plus a `projects:` array (a simple YAML list). Env values are
  * intentionally NOT serialized (only their keys + which targets) so secrets never
@@ -165,6 +193,8 @@ export function buildOrgConfig(input: OrgConfigInput): Y {
     },
     // Always present — an empty/minimal meta state is valid when no projects exist.
     projects: (input.projects || []).map(projectNode),
+    // Declarative shape only (name/kind/region/mode) — see databaseNode().
+    databases: (input.databases || []).map(databaseNode),
   };
 }
 

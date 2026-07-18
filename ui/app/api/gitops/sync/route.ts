@@ -37,15 +37,31 @@ export async function POST(req: NextRequest) {
     owner, repo, branch,
     message: `chore(openedge): sync ${projectCount} project(s) — ${files.length} artifact(s)`,
     files,
+    // A project deleted since the last sync must stop appearing in the repo,
+    // not just stop appearing in `files` — see commitFiles' doc comment.
+    managedPrefixes: ["projects/"],
   });
   if (!result.ok) return NextResponse.json({ ok: false, error: result.error }, { status: 502 });
 
-  await backend("/v1/gitops/synced", team, {
-    method: "POST",
-    body: JSON.stringify({ commit: result.commit || "", hash }),
-  }, authTokenFrom(req)).catch(() => {});
+  // commitFiles()'s catch-all per-file fallback has no batch-tree-delete equivalent,
+  // so when it ran AND this sync had (or may have had) pending tombstone deletions,
+  // the repo may still hold stale managed files even though the content commit
+  // succeeded. In that case do NOT persist last_hash — `hash` is derived purely from
+  // DESIRED file content, so persisting it here would make the next sync recompute
+  // the identical hash and short-circuit as `{unchanged:true}` above, masking the
+  // skipped deletion forever (until an unrelated content change happens to bump the
+  // hash). Skipping the persist instead guarantees the next sync attempt retries the
+  // atomic path — and its deletion reconciliation — rather than silently short-
+  // circuiting.
+  if (!result.deletionsSkipped) {
+    await backend("/v1/gitops/synced", team, {
+      method: "POST",
+      body: JSON.stringify({ commit: result.commit || "", hash }),
+    }, authTokenFrom(req)).catch(() => {});
+  }
 
   return NextResponse.json({
     ok: true, repo: link.repo, branch, commit: result.commit, files: files.length, projects: projectCount,
+    ...(result.deletionsSkipped ? { deletionsSkipped: true } : {}),
   });
 }

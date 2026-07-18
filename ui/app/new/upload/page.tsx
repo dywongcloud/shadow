@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft, Upload, Loader2, FileArchive, X, ChevronDown, Plus, KeyRound } from "lucide-react";
 import { Card, Button, Input } from "@/components/ui";
-import { currentTeam, switchTeam } from "@/lib/api";
+import { currentTeam, switchTeam, invalidateApiCache } from "@/lib/api";
 import { TeamSelect } from "@/components/team-picker";
 import { cn } from "@/lib/utils";
 
@@ -95,6 +95,14 @@ export default function UploadProjectPage() {
       });
       if (!res.ok) throw new Error((await res.text().catch(() => "")) || `Upload failed (${res.status})`);
       const { build_id } = (await res.json()) as { build_id: string };
+      // This zip upload is a raw multipart fetch (can't go through apiSend, which
+      // only handles JSON bodies) but it creates a brand-new project + deployment —
+      // the same mutation class as a git-URL deploy or registry-image deploy, both
+      // of which trigger an immediate gitops sync via apiSend/apiDeployViaServerRoute.
+      // Fire the equivalent manual calls here so this path isn't a silent gitops-sync
+      // bypass (previously only the 45s background interval would ever pick it up).
+      invalidateApiCache();
+      if (typeof window !== "undefined") window.dispatchEvent(new Event("gitops-sync"));
       router.push(`/deploy/${build_id}`);
     } catch (err) {
       setError(String(err));

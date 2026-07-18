@@ -83,16 +83,31 @@ export async function POST(req: NextRequest) {
       ? `feat(openedge): initialize GitOps config (${files.length} artifacts)`
       : `chore(openedge): sync GitOps config (${files.length} artifacts)`,
     files,
+    // A project deleted since the last sync must stop appearing in the repo,
+    // not just stop appearing in `files` — see commitFiles' doc comment.
+    managedPrefixes: ["projects/"],
   });
   if (!result.ok) {
     // The repo is still linked; report so the UI can show the error + retry sync.
     return NextResponse.json({ ok: false, repo: fullName, created, error: result.error }, { status: 502 });
   }
 
-  await backend("/v1/gitops/synced", team, {
-    method: "POST",
-    body: JSON.stringify({ commit: result.commit || "", hash }),
-  }, authTokenFrom(req)).catch(() => {});
+  // commitFiles()'s catch-all per-file fallback has no batch-tree-delete equivalent,
+  // so when it ran AND this first-link scaffold had (or may have had) pending
+  // tombstone deletions (e.g. re-linking a repo that already has stale projects/
+  // artifacts from a prior link/session), the repo may still hold stale managed
+  // files even though the content commit succeeded. In that case do NOT persist
+  // last_hash — `hash` is derived purely from DESIRED file content, so persisting
+  // it here would make the next sync recompute the identical hash and short-
+  // circuit as unchanged, masking the skipped deletion forever. Skipping the
+  // persist instead guarantees the next sync attempt retries the atomic path —
+  // and its deletion reconciliation — rather than silently short-circuiting.
+  if (!result.deletionsSkipped) {
+    await backend("/v1/gitops/synced", team, {
+      method: "POST",
+      body: JSON.stringify({ commit: result.commit || "", hash }),
+    }, authTokenFrom(req)).catch(() => {});
+  }
 
   // Auto-set the Actions variable so the committed workflow can reach the node.
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
@@ -112,5 +127,6 @@ export async function POST(req: NextRequest) {
     files: files.map((f) => f.path),
     projects: projectCount,
     variableSet,
+    ...(result.deletionsSkipped ? { deletionsSkipped: true } : {}),
   });
 }

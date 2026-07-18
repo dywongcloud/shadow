@@ -122,7 +122,17 @@ export async function commitFile(
 
 export async function commitFiles(
   entity: string,
-  opts: { owner: string; repo: string; branch?: string; message: string; files: { path: string; content: string }[] }
+  opts: {
+    owner: string;
+    repo: string;
+    branch?: string;
+    message: string;
+    files: { path: string; content: string }[];
+    /** Forwarded to both providers' deletion reconciliation — see
+     *  composio.commitFiles' doc comment (rest.ghCommitFiles mirrors the same
+     *  logic on the GitHub-App REST path). */
+    managedPrefixes?: string[];
+  }
 ): Promise<CommitResult> {
   const token = await getGithubAppToken();
   if (token) return rest.ghCommitFiles(token, opts);

@@ -49,7 +49,7 @@ export function authTokenFrom(req: {
  * stamps) so callers can skip a redundant commit when nothing changed.
  */
 export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml") {
-  const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes] = await Promise.all([
+  const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes, dbRes] = await Promise.all([
     backend("/v1/gitops/projects", team),
     backend(`/v1/teams/${encodeURIComponent(team)}`, team),
     backend("/v1/overview", team),
@@ -59,6 +59,10 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     backend("/v1/enterprise/saml", team),
     backend("/v1/enterprise/scim", team),
     backend("/v1/enterprise/microfrontends", team),
+    // Same tenant-scoped endpoint the Storage dashboard page polls
+    // (ui/app/storage/page.tsx: usePoll<Database[]>("/v1/databases", …)) —
+    // reused here rather than a bespoke gitops-only route.
+    backend("/v1/databases", team),
   ]);
   const projects = projRes.ok ? await projRes.json() : [];
   const teamInfo = teamRes.ok ? await teamRes.json() : null;
@@ -69,6 +73,7 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
   const saml = samlRes.ok ? await samlRes.json().catch(() => null) : null;
   const scim = scimRes.ok ? await scimRes.json().catch(() => null) : null;
   const mfe = mfeRes.ok ? (await mfeRes.json().catch(() => null))?.groups : null;
+  const databases = dbRes.ok ? await dbRes.json().catch(() => null) : null;
 
   const files = buildArtifacts({
     org: {
@@ -80,6 +85,10 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     region: ov?.region,
     rootPath,
     projects: Array.isArray(projects) ? projects : [],
+    // Raw records pass through — declarative-shape extraction (name/kind/region/
+    // mode only, never `connection`/credentials) happens in buildArtifacts's
+    // databaseNode(), mirroring how projectNode() shapes `projects` above.
+    databases: Array.isArray(databases) ? databases : [],
     platform: {
       routing: routing ? { redirects: routing.redirects || [], rewrites: routing.rewrites || [] } : undefined,
       enterprise: {

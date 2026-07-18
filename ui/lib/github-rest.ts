@@ -429,14 +429,46 @@ export async function ghCommitFile(
  * commit → update ref. Falls back to per-file Contents-API commits if any
  * Git Data step fails, so artifacts always land — mirrors
  * composio.commitFiles exactly, including its safety rule.
+ *
+ * Deletion reconciliation: `base_tree` overlays the given `tree` entries onto
+ * the existing tree ADDITIVELY — any base_tree path this call doesn't mention
+ * survives untouched. That means a per-resource file the caller stops emitting
+ * (e.g. a deleted project's `projects/<slug>.yaml`) would otherwise be
+ * orphaned in the repo forever. When `managedPrefixes` is given, this lists
+ * the base tree (`GET .../git/trees/{sha}?recursive=1`), finds paths under
+ * those prefixes that are no longer in `files`, and tombstones them
+ * (`sha: null`) in the same tree write — scoped so files outside the managed
+ * namespace are never touched. Best-effort: a failed or truncated listing
+ * just skips reconciliation for this sync (a delayed-by-one-cycle deletion is
+ * fine; a destructive/incorrect one is not). Mirrors composio.commitFiles'
+ * identical logic.
  */
 export async function ghCommitFiles(
   token: string,
-  opts: { owner: string; repo: string; branch?: string; message: string; files: { path: string; content: string }[] }
+  opts: {
+    owner: string;
+    repo: string;
+    branch?: string;
+    message: string;
+    files: { path: string; content: string }[];
+    /** Path prefixes (e.g. `["projects/"]`) this sync fully owns. A base-tree
+     *  path under one of these prefixes that is absent from `files` this time
+     *  is treated as stale and removed. Omit/empty to skip deletion
+     *  reconciliation (pure additive behavior, the prior default). */
+    managedPrefixes?: string[];
+  }
 ): Promise<CommitResult> {
   const { owner, repo, message, files } = opts;
   const branch = opts.branch || "main";
+  const managedPrefixes = opts.managedPrefixes || [];
   const repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  // Declared outside the try so the catch-all fallback below (which has no
+  // batch-tree-delete equivalent) can tell whether tombstone deletions were
+  // computed — or never got the chance to be computed — for this sync, and report
+  // `deletionsSkipped` accordingly instead of silently dropping them. Mirrors
+  // composio.commitFiles' identical hoisting.
+  let deletions: { path: string; sha: null }[] = [];
+  let deletionReconciliationAttempted = false;
   try {
     // 1) base ref + tree (absent on a brand-new empty repo)
     let baseSha: string | null = null;
@@ -455,17 +487,63 @@ export async function ghCommitFiles(
       if (!baseTree) throw new Error("base tree unresolved on non-empty repo — refusing destructive tree write");
     }
 
-    // 2) blobs
-    const tree: any[] = [];
-    for (const f of files) {
-      const blob = await gh(token, `${repoPath}/git/blobs`, {
-        method: "POST",
-        body: JSON.stringify({ content: f.content, encoding: "utf-8" }),
-      });
-      const sha = ok(blob.status) ? blob.json?.sha : null;
-      if (!sha) throw new Error(msgOf(blob.json, "blob create returned no sha"));
-      tree.push({ path: f.path, mode: "100644", type: "blob", sha });
+    // 1b) deletion reconciliation — see doc comment above. `gh()` never
+    // throws, so a failed/truncated listing just leaves `deletions` empty
+    // (additive-only for this sync) rather than aborting the commit.
+    if (baseTree && managedPrefixes.length) {
+      const listing = await gh(token, `${repoPath}/git/trees/${baseTree}?recursive=1`);
+      if (!ok(listing.status)) {
+        console.warn(
+          "github-rest ghCommitFiles: base tree listing failed — skipping deletion reconciliation this sync",
+          msgOf(listing.json, `HTTP ${listing.status}`)
+        );
+      } else if (listing.json?.truncated) {
+        console.warn("github-rest ghCommitFiles: base tree listing truncated (large repo) — skipping deletion reconciliation this sync");
+      } else {
+        const existingPaths: any[] = Array.isArray(listing.json?.tree) ? listing.json.tree : [];
+        const desired = new Set(files.map((f) => f.path));
+        for (const entry of existingPaths) {
+          const p = entry?.path;
+          if (typeof p !== "string" || entry?.type !== "blob") continue;
+          if (!managedPrefixes.some((prefix) => p.startsWith(prefix))) continue;
+          if (desired.has(p)) continue;
+          deletions.push({ path: p, sha: null });
+        }
+        deletions.sort((a, b) => a.path.localeCompare(b.path));
+      }
     }
+    // Reached regardless of whether reconciliation ran, was skipped as
+    // inapplicable (no managedPrefixes/baseTree), or failed internally above —
+    // in every case `deletions` now holds its final, known value for this sync.
+    deletionReconciliationAttempted = true;
+
+    // 2) blobs — bounded-concurrency pool (not unbounded Promise.all: a burst
+    // of fully-concurrent requests can trip GitHub's secondary rate limit).
+    // Results are written into an index-keyed array so the final tree
+    // preserves `files` order regardless of completion order — mirrors
+    // composio.commitFiles' identical pool.
+    const BLOB_CONCURRENCY = 6;
+    const blobShas: string[] = new Array(files.length);
+    let nextIndex = 0;
+    const createBlobs = async () => {
+      for (;;) {
+        const i = nextIndex++;
+        if (i >= files.length) return;
+        const f = files[i];
+        const blob = await gh(token, `${repoPath}/git/blobs`, {
+          method: "POST",
+          body: JSON.stringify({ content: f.content, encoding: "utf-8" }),
+        });
+        const sha = ok(blob.status) ? blob.json?.sha : null;
+        if (!sha) throw new Error(msgOf(blob.json, "blob create returned no sha"));
+        blobShas[i] = sha;
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BLOB_CONCURRENCY, files.length) }, () => createBlobs())
+    );
+    const tree: any[] = files.map((f, i) => ({ path: f.path, mode: "100644", type: "blob", sha: blobShas[i] }));
+    tree.push(...deletions);
 
     // 3) tree (base_tree keeps every file we're not touching)
     const t = await gh(token, `${repoPath}/git/trees`, {
@@ -497,6 +575,13 @@ export async function ghCommitFiles(
     return { ok: true, commit: commitSha };
   } catch (e: any) {
     console.error("github-rest ghCommitFiles atomic path failed, falling back to per-file", e?.message);
+    // The fallback below only ever creates/updates files one at a time via the
+    // Contents API — there is no batch-tree-delete equivalent, so any tombstone
+    // `deletions` computed above (or that the throw pre-empted before they could be
+    // computed at all) are NOT applied here. Surface that to the caller so it can
+    // avoid treating this sync as fully reconciled — see `deletionsSkipped` doc.
+    const deletionsSkipped =
+      managedPrefixes.length > 0 && (!deletionReconciliationAttempted || deletions.length > 0);
     // Fallback: commit each file individually via the Contents API.
     let last = "";
     for (const f of files) {
@@ -504,7 +589,7 @@ export async function ghCommitFiles(
       if (!r.ok) return { ok: false, error: r.error };
       last = r.commit || last;
     }
-    return { ok: true, commit: last };
+    return { ok: true, commit: last, ...(deletionsSkipped ? { deletionsSkipped: true } : {}) };
   }
 }
 

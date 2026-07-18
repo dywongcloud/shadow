@@ -48,7 +48,81 @@ function recordStatus(s: GitopsSyncStatus) {
   console.log(`%cgitops%c ${s.mode} sync ${s.ok ? "ok" : "FAILED"} — ${s.detail}`, "background:#8957e5;color:#fff;padding:1px 5px;border-radius:3px;font-weight:600", color);
 }
 
-let syncInFlight = false;
+// In-flight / pending-rerun state, keyed by team — a sync for team A must never
+// block or coalesce with a trigger for team B (each gets its own trailing-edge
+// coalescing below).
+const syncInFlight = new Map<string, boolean>();
+const syncPending = new Map<string, boolean>();
+
+// Retryable-failure backoff schedule (ms before attempt 2, 3, 4). Only network
+// errors and HTTP 5xx responses consume a retry; see runGitopsSync().
+const RETRY_DELAYS_MS = [2000, 4000, 8000];
+
+function wait(ms: number) {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/** One team's sync attempt, with bounded retry on transient (network / 5xx) failure. */
+async function runGitopsSync(team: string) {
+  for (let attempt = 0; ; attempt++) {
+    let r: Response;
+    let d: any;
+    try {
+      r = await fetch("/api/gitops/sync", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ team }),
+      });
+      d = await r.json().catch(() => ({}) as any);
+    } catch (e) {
+      // Thrown network error (offline, DNS, connection reset, ...) — retryable.
+      if (attempt < RETRY_DELAYS_MS.length) {
+        await wait(RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      recordStatus({ at: Date.now(), ok: false, mode: "server", detail: e instanceof Error ? e.message : String(e) });
+      return;
+    }
+
+    if (d?.ok) {
+      // deletionsSkipped: the sync itself succeeded (still ok:true) but the
+      // fallback commit path couldn't apply its tombstone deletions this round —
+      // a stale file is left in the repo pending the next retry. Surface that
+      // distinctly so it isn't indistinguishable from a fully clean push.
+      recordStatus({
+        at: Date.now(),
+        ok: true,
+        mode: "server",
+        detail: `pushed ${String(d.commit || "").slice(0, 8)} (${d.files} artifacts${d.deletionsSkipped ? ", cleanup retrying" : ""})`,
+        repo: d.repo,
+        commit: d.commit,
+      });
+      return;
+    }
+    if (d?.unchanged) {
+      recordStatus({ at: Date.now(), ok: true, mode: "server", detail: "unchanged", repo: d.repo });
+      return;
+    }
+    if (d?.skipped) {
+      // GitOps isn't set up yet (Composio not configured, GitHub not connected, or
+      // no config repo linked). This is a benign NOT-CONFIGURED state, not a sync
+      // failure — the "Set up GitOps" onboarding connects GitHub + links the repo.
+      // Record it (never a red error toast) and do NO in-browser git. Never retried.
+      recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `not configured (${String(d.reason || "not set up")})` });
+      return;
+    }
+
+    // Server route reachable but the commit failed. Only a 5xx is transient enough
+    // to retry — a 4xx (bad request, auth, not found, ...) won't succeed on replay.
+    const retryable = r.status >= 500 && r.status < 600;
+    if (retryable && attempt < RETRY_DELAYS_MS.length) {
+      await wait(RETRY_DELAYS_MS[attempt]);
+      continue;
+    }
+    recordStatus({ at: Date.now(), ok: false, mode: "server", detail: String(d?.error || `sync failed (HTTP ${r.status})`) });
+    return;
+  }
+}
 
 /**
  * Fire a GitOps config sync — fully autonomous and in the background.
@@ -62,41 +136,33 @@ let syncInFlight = false;
  * and the "Set up GitOps" onboarding flow is how the user connects. Every outcome
  * (pushed / unchanged / not-configured / error) is recorded to `hive_gitops_status`
  * so state is VISIBLE in the UI instead of dying in the console.
+ *
+ * Concurrency, per team (`currentTeam()`): a trigger that arrives while that team's
+ * sync is already in flight is coalesced — not dropped — by setting a pending flag;
+ * when the in-flight run finishes, a pending flag fires exactly one trailing re-run
+ * (never a loop), so every coalesced trigger during the run is captured by that
+ * single follow-up. A team's in-flight/pending state never blocks another team's.
  */
-export function triggerGitopsSync() {
-  if (typeof window === "undefined" || syncInFlight) return;
-  syncInFlight = true;
+export function triggerGitopsSync(team: string = currentTeam()) {
+  if (typeof window === "undefined") return;
+  if (syncInFlight.get(team)) {
+    syncPending.set(team, true);
+    return;
+  }
+  syncInFlight.set(team, true);
   (async () => {
     try {
-      const team = currentTeam();
-      const r = await fetch("/api/gitops/sync", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ team }),
-      });
-      const d = await r.json().catch(() => ({}) as any);
-      if (d?.ok) {
-        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `pushed ${String(d.commit || "").slice(0, 8)} (${d.files} artifacts)`, repo: d.repo, commit: d.commit });
-        return;
-      }
-      if (d?.unchanged) {
-        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: "unchanged", repo: d.repo });
-        return;
-      }
-      if (d?.skipped) {
-        // GitOps isn't set up yet (Composio not configured, GitHub not connected, or
-        // no config repo linked). This is a benign NOT-CONFIGURED state, not a sync
-        // failure — the "Set up GitOps" onboarding connects GitHub + links the repo.
-        // Record it (never a red error toast) and do NO in-browser git.
-        recordStatus({ at: Date.now(), ok: true, mode: "server", detail: `not configured (${String(d.reason || "not set up")})` });
-        return;
-      }
-      // Server route reachable but the commit failed — surface it.
-      recordStatus({ at: Date.now(), ok: false, mode: "server", detail: String(d?.error || `sync failed (HTTP ${r.status})`) });
-    } catch (e) {
-      recordStatus({ at: Date.now(), ok: false, mode: "server", detail: e instanceof Error ? e.message : String(e) });
+      await runGitopsSync(team);
     } finally {
-      syncInFlight = false;
+      syncInFlight.delete(team);
+      if (syncPending.get(team)) {
+        syncPending.delete(team);
+        // Trailing re-run must target the SAME team whose pending flag we just
+        // cleared, never a fresh currentTeam() read — the active team may have
+        // changed while this run was in flight, and re-deriving here would
+        // silently drop this team's queued change and sync the wrong team.
+        triggerGitopsSync(team);
+      }
     }
   })();
 }
