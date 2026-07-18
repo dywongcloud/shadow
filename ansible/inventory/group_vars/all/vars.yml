@@ -2,7 +2,8 @@
 # Fleet-wide defaults for every hive-cloud node. Override per-host in
 # hosts.ini (hive_name/hive_region) or per-group in group_vars/fc_kvm.yml /
 # group_vars/fc_pvm.yml. Secrets referenced here (vault_*) live in
-# group_vars/vault.yml, which is ansible-vault encrypted and gitignored --
+# group_vars/all/vault.yml (this file's own directory), which is
+# ansible-vault encrypted and gitignored --
 # see roles/README's Secrets section. This file documents every var this
 # repo's own fleet actually runs with; it is not the full set the codebase
 # recognizes (grep crates/hive-cloud/src/*.rs for `std::env::var("HIVE_` for

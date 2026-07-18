@@ -27,16 +27,17 @@ cp inventory/hosts.ini.example inventory/hosts.ini
 # (fc_kvm = has real /dev/kvm, fc_pvm = doesn't -- see roles/pvm_firecracker
 # for how to tell which one a given cloud VM is)
 
-cp inventory/group_vars/vault.yml.example inventory/group_vars/vault.yml
+mkdir -p inventory/group_vars/all
+cp inventory/group_vars/vault.yml.example inventory/group_vars/all/vault.yml
 # edit vault.yml: real HIVE_JWT_SECRET / HIVE_INTERNAL_TOKEN / VERCEL_API_TOKEN
-ansible-vault encrypt inventory/group_vars/vault.yml
+ansible-vault encrypt inventory/group_vars/all/vault.yml
 
 echo 'your-vault-password' > .vault_pass   # gitignored; ansible.cfg points at this
 chmod 600 .vault_pass
 ```
 
-Every HIVE_* value with a sane default lives in `inventory/group_vars/all.yml`
--- override per-group (`group_vars/fc_kvm.yml` / `group_vars/fc_pvm.yml`) or
+Every HIVE_* value with a sane default lives in
+`inventory/group_vars/all/vars.yml` -- override per-group (`group_vars/fc_kvm.yml` / `group_vars/fc_pvm.yml`) or
 per-host (`hosts.ini` inline vars) as needed. This file documents the vars
 this fleet actually runs with; it is not exhaustive -- grep
 `crates/hive-cloud/src/*.rs` for `std::env::var("HIVE_` for the full set the
@@ -89,8 +90,15 @@ THIRD node's view of the newcomer, not just the newcomer's own report).
 ## Secrets
 
 Never commit real secrets. `inventory/hosts.ini`, `inventory/group_vars/
-vault.yml`, and `.vault_pass` are all gitignored -- only the `.example`
-templates ship in git. Secrets referenced in role templates
+all/vault.yml`, and `.vault_pass` are all gitignored -- only the `.example`
+templates ship in git. `vault.yml` lives inside `group_vars/all/` (not as a
+flat `group_vars/all.yml`-style file) because ansible's group_vars loader
+does NOT merge a flat `group_vars/<group>.yml` with a same-named
+`group_vars/<group>/` directory -- whichever form is present for a given
+group name, the OTHER form for that same name is silently ignored entirely.
+`inventory/group_vars/all/vars.yml` (plaintext defaults) and
+`inventory/group_vars/all/vault.yml` (encrypted secrets) both live inside
+the `all/` directory specifically so both actually load. Secrets referenced in role templates
 (`vault_hive_jwt_secret`, `vault_hive_internal_token`,
 `vault_vercel_api_token`, `vault_vercel_team_id`, `vault_stripe_secret_key`,
 `vault_composio_api_key`, `vault_github_app_client_id`,

@@ -5,7 +5,7 @@ target/
 # Ansible: real inventory/secrets are operator-local, never committed --
 # only the .example templates ship in the repo.
 ansible/inventory/hosts.ini
-ansible/inventory/group_vars/vault.yml
+ansible/inventory/group_vars/all/vault.yml
 ansible/.vault_pass
 **/.env.local
 **/.env.local.*.bak
