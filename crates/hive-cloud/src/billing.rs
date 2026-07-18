@@ -372,7 +372,18 @@ impl BillingStore {
         // FINALIZE the closing period's invoice before resetting the counters.
         let now = now_ms();
         let rolled = if now >= acc.period_end_ms {
-            let closing = build_invoice(acc, self.usage_cost_cents_for(tenant), "paid");
+            // MUST use usage_cost_cents_since (ledger-only, no `self.accounts`
+            // touch) here, never usage_cost_cents_for -- `m` (accounts' write
+            // guard) is still held at this point, and usage_cost_cents_for
+            // internally does `self.accounts.read()`, which deadlocks against
+            // parking_lot::RwLock's non-reentrant write-then-read-same-thread
+            // pattern. Live-witnessed in production: this branch only fires
+            // once a tenant's monthly period actually elapses, so it went
+            // unhit for a long time -- reproduced as a real hang on the
+            // control-plane leader once account() started being called more
+            // frequently (relational mirror loop, one call per tenant per
+            // tick) raised the odds of landing on a tenant mid-rollover.
+            let closing = build_invoice(acc, self.usage_cost_cents_since(tenant, acc.period_start_ms), "paid");
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
@@ -391,13 +402,25 @@ impl BillingStore {
         out
     }
 
-    /// Sum of usage (non-plan) charges recorded THIS period, in cents.
+    /// Sum of usage (non-plan) charges recorded THIS period, in cents. Looks up
+    /// the tenant's period_start_ms itself via `self.accounts.read()` -- ONLY
+    /// safe to call when the caller does NOT already hold a lock (read or
+    /// write) on `self.accounts` on this thread/task. `account()`'s rollover
+    /// path holds `self.accounts`'s write lock across this computation and
+    /// must use `usage_cost_cents_since` instead (see its call site).
     fn usage_cost_cents_for(&self, tenant: &str) -> i64 {
         let acc_start = self.accounts.read().get(tenant).map(|a| a.period_start_ms).unwrap_or(0);
+        self.usage_cost_cents_since(tenant, acc_start)
+    }
+
+    /// Sum of usage (non-plan) charges recorded since `period_start_ms`, in
+    /// cents. Touches only `self.ledger`, never `self.accounts` -- safe to
+    /// call while the caller already holds `self.accounts`'s write lock.
+    fn usage_cost_cents_since(&self, tenant: &str, period_start_ms: u64) -> i64 {
         self.ledger
             .read()
             .iter()
-            .filter(|e| e.tenant == tenant && e.kind == "usage" && e.ts_ms >= acc_start)
+            .filter(|e| e.tenant == tenant && e.kind == "usage" && e.ts_ms >= period_start_ms)
             .map(|e| -e.amount_cents) // usage entries are negative amounts
             .sum()
     }
