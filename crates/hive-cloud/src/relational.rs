@@ -109,24 +109,6 @@ pub(crate) async fn init_schema() {
             stripe_session_id TEXT NOT NULL DEFAULT '', \
             created_ms BIGINT NOT NULL\
         )"),
-        // DEPRECATED-PENDING-REMOVAL: superseded by `billing_ledger` (real
-        // columns, per-row upserts, ACID-wrapped with the rest of the
-        // per-tenant write). No longer written by `upsert_billing`; DDL kept
-        // present only so an in-flight cutover has a grace window before a
-        // later phase drops it.
-        ("billing_ledger_snapshot", "CREATE TABLE IF NOT EXISTS billing_ledger_snapshot (\
-            tenant TEXT PRIMARY KEY, \
-            ledger_json TEXT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )"),
-        // DEPRECATED-PENDING-REMOVAL: superseded by `billing_invoices` +
-        // `billing_invoice_lines`. No longer written by `upsert_billing`;
-        // DDL kept present only for the same cutover grace window.
-        ("billing_invoices_snapshot", "CREATE TABLE IF NOT EXISTS billing_invoices_snapshot (\
-            tenant TEXT PRIMARY KEY, \
-            invoices_json TEXT NOT NULL, \
-            updated_ms BIGINT NOT NULL\
-        )"),
         ("teams", "CREATE TABLE IF NOT EXISTS teams (\
             slug TEXT PRIMARY KEY, \
             name TEXT NOT NULL, \
@@ -160,6 +142,23 @@ pub(crate) async fn init_schema() {
         )"),
     ] {
         ensure_table_exists(&mut session, table, ddl).await;
+    }
+    // REMOVAL (not just deprecation): `billing_ledger_snapshot` /
+    // `billing_invoices_snapshot` were the old per-tenant single-JSON-blob
+    // tables, fully superseded by the real per-row `billing_ledger` /
+    // `billing_invoices` + `billing_invoice_lines` tables above -- nothing
+    // in the codebase writes OR reads them anymore on the live path (the
+    // admin `billing_ledger`/`billing_invoices` handlers were migrated to
+    // the new tables; see `admin.rs`). `DROP TABLE IF EXISTS` is idempotent
+    // -- a genuine no-op on a node that already dropped these on a prior
+    // boot, and a real drop on any node still carrying the legacy table
+    // from before this change. Run unconditionally on every boot, same as
+    // the DDL loop above, so this converges fleet-wide without a manual
+    // operator step per node.
+    for table in ["billing_ledger_snapshot", "billing_invoices_snapshot"] {
+        if let Err(e) = exec(&mut session, &format!("DROP TABLE IF EXISTS {table}")).await {
+            tracing::warn!(table, error = %e, "relational: drop of deprecated snapshot table failed (non-fatal, will retry next boot)");
+        }
     }
     // `CREATE TABLE IF NOT EXISTS billing_accounts` above is a genuine no-op
     // against the OLD 3-column shape every real production node already has
@@ -668,10 +667,11 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
 /// differently-named replacement. The other four tables this same migration
 /// introduced do NOT have this problem: `billing_ledger`/`billing_invoices`/
 /// `billing_invoice_lines`/`billing_checkouts` are all genuinely new,
-/// non-colliding table names (`billing_ledger`/`billing_invoices` sit next
-/// to their untouched, still-present `billing_ledger_snapshot`/
-/// `billing_invoices_snapshot` originals; `billing_invoice_lines`/
-/// `billing_checkouts` are net-new with no pre-migration table at all) — a
+/// non-colliding table names (`billing_ledger`/`billing_invoices` sat next
+/// to their old `billing_ledger_snapshot`/`billing_invoices_snapshot`
+/// JSON-blob originals, now dropped by `init_schema`'s `DROP TABLE IF
+/// EXISTS` cleanup; `billing_invoice_lines`/`billing_checkouts` are net-new
+/// with no pre-migration table at all) — a
 /// plain `CREATE TABLE IF NOT EXISTS` is sufficient for all four and none of
 /// them need this ALTER-based treatment. `billing_accounts` is the ONLY
 /// name collision in this migration. `CREATE TABLE IF NOT EXISTS` is a
@@ -1341,18 +1341,6 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("stripe_session_id", "text"),
                 col("created_ms", "bigint"),
             ],
-        },
-        // DEPRECATED-PENDING-REMOVAL (see init_schema): no longer written by
-        // upsert_billing, kept only so the admin SQL browser can still see
-        // (increasingly stale) rows written before this migration until a
-        // later phase drops these tables.
-        SqlTableInfo {
-            name: "billing_ledger_snapshot",
-            columns: vec![col("tenant", "text"), col("ledger_json", "text"), col("updated_ms", "bigint")],
-        },
-        SqlTableInfo {
-            name: "billing_invoices_snapshot",
-            columns: vec![col("tenant", "text"), col("invoices_json", "text"), col("updated_ms", "bigint")],
         },
         // Audit trail + idempotency marker for `backfill_billing_normalize`
         // (the one-time old-JSON-blob-to-normalized-rows migration) — one row
