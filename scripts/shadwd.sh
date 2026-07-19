@@ -131,9 +131,10 @@ write_watchdog_plist() {
   <key>EnvironmentVariables</key><dict>
     <key>HOME</key><string>$HOME</string>
     <key>PATH</key><string>$PATHVAL</string>
+    <key>WATCHDOG_LOOP</key><string>1</string>
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>StartInterval</key><integer>30</integer>
+  <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>$LOGS/watchdog.log</string>
   <key>StandardErrorPath</key><string>$LOGS/watchdog.log</string>
 </dict></plist>
