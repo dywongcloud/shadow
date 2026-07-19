@@ -127,6 +127,13 @@ export default function NewProjectPage() {
   const [protocol, setProtocol] = useState("");
   const [memory, setMemory] = useState("");
   const [cpus, setCpus] = useState("");
+  // Extra ports beyond the primary (image source only) — a service that needs
+  // more than one raw port (e.g. a game server's play + query/RCON ports).
+  // Sent as the full `ports` list (primary + extras) only when at least one
+  // extra row is filled in; otherwise the request stays exactly as it was
+  // (plain port/protocol), matching the backend's replace-only-when-non-empty
+  // semantics for ImageDeployReq.ports.
+  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>([]);
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   // A reconnect / org-approval prompt shown above the repo list: a dead-but-ACTIVE
@@ -311,6 +318,17 @@ export default function NewProjectPage() {
     const env = urlEnv();
     const p = parseInt(port, 10);
     try {
+      const filledExtras = extraPorts.filter((r) => r.port.trim());
+      const ports = filledExtras.length
+        ? [
+            { container_port: p, protocol: protocol || "http", label: undefined },
+            ...filledExtras.map((r) => ({
+              container_port: parseInt(r.port, 10),
+              protocol: r.protocol || "tcp",
+              label: r.label.trim() || undefined,
+            })),
+          ].filter((s) => Number.isFinite(s.container_port) && s.container_port > 0)
+        : undefined;
       const res = await apiSend<{ build_id: string; project: string }>("POST", "/v1/deploy/image", {
         image: ref,
         creator: "you",
@@ -319,6 +337,7 @@ export default function NewProjectPage() {
         protocol: protocol || undefined,
         memory: memory.trim() || undefined,
         cpus: cpus.trim() || undefined,
+        ports,
         env: Object.keys(env).length ? env : undefined,
       });
       const guessed = slug(ref.split("/").pop()?.split(":")[0] || "app");
@@ -438,6 +457,35 @@ export default function NewProjectPage() {
                 string expects.
               </p>
             ) : null}
+            {/* Extra ports beyond the primary — a service that needs more than
+                one (e.g. a game server's play + query/RCON ports). */}
+            {extraPorts.map((row, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input className="w-32 text-xs" placeholder="Extra port"
+                  value={row.port}
+                  onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, port: e.target.value.replace(/[^0-9]/g, "") } : r)))} />
+                <select
+                  value={row.protocol}
+                  onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, protocol: e.target.value } : r)))}
+                  className="rounded-md border border-border bg-card px-2 py-1.5 text-xs"
+                >
+                  <option value="tcp">Raw TCP</option>
+                  <option value="udp">Raw UDP</option>
+                  <option value="grpc">gRPC</option>
+                  <option value="http">HTTP</option>
+                </select>
+                <Input className="flex-1 text-xs" placeholder="Label (optional, e.g. rcon)"
+                  value={row.label}
+                  onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, label: e.target.value } : r)))} />
+                <button type="button" className="text-muted hover:text-fg"
+                  onClick={() => setExtraPorts((c) => c.filter((_, j) => j !== i))}>
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+            <Button variant="outline" onClick={() => setExtraPorts((c) => [...c, { port: "", protocol: "tcp", label: "" }])}>
+              <Plus className="h-3.5 w-3.5" /> Add another port
+            </Button>
             {urlEnvRows.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
                 <Input className="flex-1 font-mono text-xs" placeholder="KEY" value={row.k}

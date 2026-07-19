@@ -914,6 +914,7 @@ async fn run_build(
         req.image_memory.as_deref(),
         req.image_cpus.as_deref(),
         req.image_pids.unwrap_or(0),
+        req.image_ports.clone(),
     )
     .await
     {
@@ -1753,6 +1754,7 @@ async fn produce_manifest(
     image_memory: Option<&str>,
     image_cpus: Option<&str>,
     image_pids: u32,
+    image_ports: Option<Vec<fluid_core::PortSpec>>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
@@ -1764,7 +1766,7 @@ async fn produce_manifest(
         // repo/fluid.json of its own to read.
         let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
         let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
-        return image_container_manifest(cloud, bid, project, image, image_port, image_protocol, mem_mib, cpus, image_pids).await;
+        return image_container_manifest(cloud, bid, project, image, image_port, image_protocol, mem_mib, cpus, image_pids, image_ports).await;
     }
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
@@ -3600,6 +3602,7 @@ async fn image_container_manifest(
     memory_mib: u32,
     cpus: f64,
     pids: u32,
+    ports_override: Option<Vec<PortSpec>>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let path = podman_path_env();
@@ -3645,7 +3648,32 @@ async fn image_container_manifest(
         if port_override.is_some() || protocol_override.is_some() { " (configured)" } else { " (from image ExposedPorts)" },
         container_volume_path(),
     ));
-    Ok(container_manifest(project, image, port, protocol.as_str(), memory_mib, cpus, pids))
+    let mut manifest = container_manifest(project, image, port, protocol.as_str(), memory_mib, cpus, pids);
+    // A full multi-port declaration REPLACES the single-port ports list built
+    // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
+    // above already reflect it, since callers pass the primary as `port`/
+    // `protocol_override` too). Only raw-protocol specs get a public
+    // allocation (`raw_ports::allocate_raw_ports_coordinated`); an http/https
+    // secondary entry here just documents an extra exposed port with no
+    // public ingress, same as a compose service's un-exposed ports.
+    if let Some(ports) = ports_override.filter(|p| !p.is_empty()) {
+        log(format!(
+            "Declared {} additional port(s): {}.",
+            ports.len().saturating_sub(1),
+            ports.iter().map(|p| format!("{}/{}", p.container_port, p.protocol)).collect::<Vec<_>>().join(", ")
+        ));
+        if let Some(f) = manifest.functions.first_mut() {
+            // Keep `protocol` (drives needs_raw_proxy()/routing for the whole
+            // function) in sync with the declared PRIMARY entry, in case a
+            // caller's primary protocol here disagrees with the single
+            // `protocol_override`/detected value used above.
+            if let Some(primary) = ports.first() {
+                f.protocol = primary.protocol;
+            }
+            f.ports = ports;
+        }
+    }
+    Ok(manifest)
 }
 
 /// Auto-detect a container's listening port + protocol from the image's

@@ -1519,6 +1519,19 @@ pub struct GitDeployRequest {
     /// default. Clamped fleet-wide.
     #[serde(default)]
     pub image_pids: Option<u32>,
+    /// Full multi-port declaration for an `image_ref` deploy — when non-empty,
+    /// this REPLACES the single `image_port`/`image_protocol` resolution
+    /// entirely (the first entry is the primary/listen port, used the same way
+    /// `image_port` would be); when empty/absent, the single-port path is
+    /// unchanged. Lets a service that needs more than one raw port declared
+    /// (e.g. a game server's play + query ports) describe all of them in one
+    /// deploy, the same way a compose service's `x-shadw-expose` already can.
+    /// NOTE: only the PRIMARY (first) port is forwardable through the mesh
+    /// splice today (`mesh_raw::resolve`'s existing, separately-tracked
+    /// `spec_idx != 0` limitation) — a secondary port here gets a real public
+    /// allocation but cross-node forwarding to it isn't wired yet.
+    #[serde(default)]
+    pub image_ports: Option<Vec<PortSpec>>,
     /// GitHub access token for cloning a PRIVATE repo. Injected on the build node as
     /// `https://x-access-token:<token>@github.com/...` basic auth for the `git clone`
     /// only — never written into `repo_url`, never logged (clone stderr is scrubbed),

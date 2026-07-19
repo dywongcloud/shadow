@@ -1235,6 +1235,7 @@ pub(crate) async fn deploy_zip(
         image_memory: None, // zip upload has no image_ref, so no container override to carry
         image_cpus: None,
         image_pids: None,
+        image_ports: None,
         git_token: None, // zip upload has no git clone
     };
     start_named_deploy(&c, &t, req).await
@@ -1277,6 +1278,10 @@ pub(crate) struct ImageDeployReq {
     /// fleet-wide.
     #[serde(default)]
     pids: Option<u32>,
+    /// Full multi-port override — see `fluid_core::GitDeployRequest::image_ports`'s
+    /// doc for the replace-not-merge semantics and the mesh-forwarding caveat.
+    #[serde(default)]
+    ports: Option<Vec<fluid_core::PortSpec>>,
     #[serde(default)]
     env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -1327,6 +1332,7 @@ pub(crate) async fn deploy_image(
         image_memory: body.memory,
         image_cpus: body.cpus,
         image_pids: body.pids,
+        image_ports: body.ports,
         git_token: None, // prebuilt image deploy has no git clone
     };
     start_named_deploy(&c, &t, req).await
@@ -2733,6 +2739,12 @@ fn redeploy_request(
         image_memory: None,
         image_cpus: None,
         image_pids: None,
+        // A multi-port declaration isn't restored from history on redeploy
+        // (only the single primary image_port_spec is) — a genuinely narrower,
+        // separately-tracked residual of this restore path, not a regression:
+        // the single-port restore this field sits beside has the exact same
+        // shape it always did.
+        image_ports: None,
         git_token,
     }
 }
@@ -3168,6 +3180,7 @@ async fn git_webhook(
             image_memory: None, // git push deploy has no image_ref, so no container override to carry
             image_cpus: None,
             image_pids: None,
+            image_ports: None,
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
