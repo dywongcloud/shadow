@@ -11,6 +11,7 @@ import { Button, Card, Badge } from "@/components/ui";
 import { BuildLogs } from "@/components/build-logs";
 import { ProjectWorkflows } from "@/components/workflows";
 import { RedeployModal } from "@/components/redeploy-modal";
+import { RawPortConnections } from "@/components/raw-port-connections";
 import { apiSend, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
@@ -203,6 +204,13 @@ function DeploymentDetail({ id }: { id: string }) {
               )}
             </div>
 
+            {dep?.raw_ports && dep.raw_ports.length > 0 && (
+              <div className="col-span-2">
+                <MetaLabel>Connection</MetaLabel>
+                <RawPortConnections deployment={dep} alias={self} />
+              </div>
+            )}
+
             <div className="col-span-2">
               <MetaLabel>Source</MetaLabel>
               {git ? (
@@ -335,3 +343,4 @@ function Meta({ label, icon, children }: { label: string; icon?: React.ReactNode
     </div>
   );
 }
+

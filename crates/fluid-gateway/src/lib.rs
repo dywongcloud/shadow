@@ -18,7 +18,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use fluid_compute::{func_key, Fluid, FunctionStats};
+use fluid_compute::{func_key, Fluid, FunctionStats, Lease};
 use fluid_core::{Deployment, DeploymentId, DeploymentInfo, DeployRequest, Manifest, RouteTarget};
 use fluid_tunnel::TunnelClient;
 use hive_backend::connect_endpoint;
@@ -437,6 +437,24 @@ impl Gateway {
 
     /// Pick the deployment for a request: `<project>.<host>` subdomain, else the
     /// most recent deployment.
+    /// Resolve the function a request `path` routes to for the deployment
+    /// served by `host` — the SAME resolution `handle_public`/`proxy_function`
+    /// use for an ordinary request — and lease its instance. Exposed
+    /// (`select` and the lease pool are otherwise private to this crate) for
+    /// hive-cloud's edge layer to splice a raw WebSocket-upgrade connection
+    /// directly into a LOCALLY-hosted instance, instead of replaying the
+    /// upgrade back through this same node's own public router over the mesh
+    /// (which would needlessly self-dial and re-evaluate routing a second
+    /// time). Returns `None` for no matching deployment, a Static route (no
+    /// function to upgrade to), or a lease failure (cold-start/capacity) —
+    /// the caller falls back to its normal mesh path on a miss.
+    pub async fn lease_for_path(&self, host: Option<&str>, path: &str) -> Option<Lease> {
+        let dep = self.select(host)?;
+        let RouteTarget::Function(name) = dep.manifest.resolve(path) else { return None };
+        let key = func_key(dep.id.as_str(), &name);
+        self.fluid.lease(&key).await.ok()
+    }
+
     fn select(&self, host: Option<&str>) -> Option<Deployment> {
         let st = self.state.lock();
         if let Some(h) = host {
@@ -1880,6 +1898,10 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
             serverless_functions: d.manifest.functions.iter().filter(|f| f.runtime != "edge").count(),
         },
         tenant: d.tenant.clone(),
+        // Stamped public raw-port bindings, so the fleet-deployments gossip
+        // carries the `public_port` → deployment mapping to every edge node
+        // (the generic raw proxy's routing table).
+        raw_ports: d.manifest.raw_port_bindings(),
     }
 }
 

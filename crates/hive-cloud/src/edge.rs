@@ -443,12 +443,27 @@ async fn edge_pipeline_inner(
                 fwd_headers.push((k.clone(), v.clone()));
             }
 
-            // WebSocket (#2): a raw cross-node byte splice over the iroh trunk —
-            // open_raw is failover-safe (the client upgrade is only consumed once the
-            // owner side is ready), so we can try each candidate's trunk in turn.
+            // WebSocket (#2): prefer a genuinely LOCAL splice when the best
+            // candidate IS this node — `local_ws_proxy` resolves + leases
+            // directly, no mesh hop at all, which also sidesteps a self-dial
+            // through our own trunk back into this same pipeline that a
+            // uniform `ws_proxy`-for-every-candidate loop would otherwise
+            // attempt. Any OTHER candidate still gets the raw cross-node byte
+            // splice over the iroh trunk (`open_raw` is failover-safe — the
+            // client upgrade is only consumed once an owner side is ready —
+            // so trying each remaining candidate's trunk in turn is safe).
             if is_ws_upgrade {
+                let host_opt = if host.is_empty() { None } else { Some(host.as_str()) };
+                if cands.iter().any(|c| c.node_id == cloud.node_name) {
+                    if let Ok(resp) = local_ws_proxy(&mut req, &cloud, host_opt, &path, &method, &path_q, &fwd_headers).await {
+                        let mut ev = cloud.event(&region, &method, &host, &path, resp.status().as_u16(), "local-ws", &cloud.node_name);
+                        ev.request_id = rid.clone();
+                        cloud.record(ev);
+                        return resp;
+                    }
+                }
                 if let Some(pool) = &mesh {
-                    for cand in &cands {
+                    for cand in cands.iter().filter(|c| c.node_id != cloud.node_name) {
                         if let Some(addr_json) = node_iroh.get(&cand.node_id) {
                             if let Ok(resp) =
                                 ws_proxy(&mut req, pool, &cloud.registry, &cand.node_id, addr_json, &method, &path_q, &fwd_headers).await
@@ -1386,17 +1401,28 @@ fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::stat
     raw
 }
 
-/// Cross-node WebSocket proxy (#2): open a RAW byte stream to the owner over its
-/// iroh trunk, replay the upgrade request (so the owner's local target performs
-/// the handshake), relay the owner's response head (e.g. `101`) back to the
-/// client, then splice raw bytes both ways (client ↔ iroh ↔ owner) — HTTP framing
-/// bypassed. `open_raw` runs BEFORE the client upgrade is consumed, so a failed
-/// candidate can be retried on the next one.
+/// Cross-node WebSocket proxy (#2), used for every candidate OTHER than this
+/// node itself (see [`local_ws_proxy`] for the local case): open a RAW byte
+/// stream to the owner over its iroh trunk, replay the upgrade request (so
+/// the owner's local target performs the handshake), relay the owner's
+/// response head (e.g. `101`) back to the client, then splice raw bytes both
+/// ways (client ↔ iroh ↔ owner) — HTTP framing bypassed. `open_raw` runs
+/// BEFORE the client upgrade is consumed, so a failed candidate can be
+/// retried on the next one.
 ///
-/// NOTE: the owner splices to its own gateway address; a full end-to-end upgrade
-/// to a deployed *function* additionally needs the owner's LOCAL serving path to
-/// upgrade (it's request/response today) — TODO. The cross-NODE transport here is
-/// complete and exercised by the `hive-p2p` raw-splice test.
+/// The owner splices to its own gateway address (re-entering THIS SAME
+/// pipeline as a fresh HTTP connection) — which is exactly why the caller
+/// (`edge_pipeline`) never dials this function against `cloud.node_name`
+/// itself: that would re-evaluate `is_ws_upgrade` a second time on the same
+/// request. `local_ws_proxy` closes that gap end-to-end for the local case:
+/// a per-CONNECTION raw escape on the instance's own tunnel listener
+/// (`fluid_tunnel::TunnelServer::serve_maybe_raw`, magic-byte-gated) plus a
+/// direct lease + splice from THIS layer, no gateway re-entry at all.
+///
+/// Generic raw TCP/UDP (no HTTP upgrade to replay) does NOT go through this
+/// function: the raw-port proxy / UDP relay use `PeerPool::open_raw_to_port`,
+/// whose handshake names the target deployment/port explicitly (owner side:
+/// `mesh_raw::resolver`).
 async fn ws_proxy(
     req: &mut Request,
     pool: &hive_p2p::PeerPool,
@@ -1439,6 +1465,75 @@ async fn ws_proxy(
     // Commit: take over the client connection and splice it to the iroh stream.
     let on_upg = hyper::upgrade::on(&mut *req);
     tokio::spawn(async move {
+        if let Ok(upgraded) = on_upg.await {
+            let mut client = hyper_util::rt::TokioIo::new(upgraded);
+            if !leftover.is_empty() {
+                let _ = client.write_all(&leftover).await;
+            }
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut raw).await;
+        }
+    });
+    Ok(resp)
+}
+
+/// LOCAL counterpart to [`ws_proxy`]: when the winning candidate for a
+/// WebSocket upgrade is THIS node, splice directly into the instance's
+/// tunnel listener instead of dialing out over the iroh mesh to ourselves —
+/// avoiding a pointless (and, depending on whether a self-dial resolves at
+/// all, potentially wedged) mesh round-trip back through this same node's
+/// own public router. Resolves the target function the SAME way an ordinary
+/// request would (`Gateway::lease_for_path`), opens a fresh connection to
+/// the leased instance's tunnel listener prefixed with
+/// [`fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC`] (switches that ONE
+/// connection on the instance's listener to a raw splice — see
+/// `TunnelServer::serve_maybe_raw`), replays the upgrade request exactly as
+/// `ws_proxy` does for the mesh case, then splices. The lease rides as the
+/// spliced task's guard so inflight accounting covers the whole WS session.
+async fn local_ws_proxy(
+    req: &mut Request,
+    cloud: &Arc<CloudState>,
+    host: Option<&str>,
+    path: &str,
+    method: &str,
+    path_q: &str,
+    fwd_headers: &[(String, String)],
+) -> Result<Response, ()> {
+    let lease = cloud.gw.lease_for_path(host, path).await.ok_or(())?;
+    let addr = match &lease.endpoint {
+        hive_backend::CellEndpoint::Tcp(a) => a.clone(),
+        // A vsock (microVM) endpoint has no TCP address to dial directly —
+        // not a served shape for this local fast path; the caller falls back
+        // to the mesh path (which itself would refuse the same way raw
+        // targets do — see `mesh_raw::resolve`).
+        hive_backend::CellEndpoint::Vsock { .. } => return Err(()),
+    };
+    let mut raw = tokio::net::TcpStream::connect(&addr).await.map_err(|_| ())?;
+    raw.write_all(&[fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC]).await.map_err(|_| ())?;
+    let mut head = format!("{method} {path_q} HTTP/1.1\r\n");
+    for (k, v) in fwd_headers {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    if raw.write_all(head.as_bytes()).await.is_err() {
+        return Err(());
+    }
+    let _ = raw.flush().await;
+    let (status, resp_headers, leftover) = read_http_head(&mut raw).await?;
+    let mut builder = Response::builder().status(status);
+    for (k, v) in &resp_headers {
+        if let (Ok(name), Ok(val)) =
+            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
+        {
+            builder = builder.header(name, val);
+        }
+    }
+    let resp = builder.body(Body::empty()).map_err(|_| ())?;
+    let on_upg = hyper::upgrade::on(&mut *req);
+    tokio::spawn(async move {
+        // Held for the whole spliced session — the lease's inflight
+        // accounting must cover a WS connection's full lifetime, not just
+        // the initial handshake.
+        let _guard = lease;
         if let Ok(upgraded) = on_upg.await {
             let mut client = hyper_util::rt::TokioIo::new(upgraded);
             if !leftover.is_empty() {

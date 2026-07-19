@@ -673,6 +673,21 @@ export interface Deployment {
   region?: string;
   /** Public ingress code for the region (iad/sin/sfo/lax); "" when unmapped. */
   region_code?: string;
+  /** Stamped public raw TCP/UDP/gRPC port bindings (empty for HTTP-only
+   *  deployments) — a raw-protocol service (Postgres, Minecraft, …) has no
+   *  Host header to route on, so each gets its OWN public port here instead
+   *  of the shared 80/443 gateway. See `ui/lib/deploy-url.ts`'s
+   *  `rawPortAddress` for the ready-to-copy `host:port` connection string. */
+  raw_ports?: RawPortBinding[];
+}
+
+export interface RawPortBinding {
+  public_port: number;
+  function: string;
+  container_port: number;
+  /** "http" | "https" | "ws" | "wss" | "grpc" | "json-rpc" | "tcp" | "udp" */
+  protocol: string;
+  label?: string;
 }
 
 export interface DeploymentFeatures {

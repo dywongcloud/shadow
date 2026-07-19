@@ -28,6 +28,7 @@ mod gossip;
 mod discovery;
 mod gitops;
 mod lease;
+mod mesh_raw;
 mod guardian;
 mod identity;
 mod incidents;
@@ -39,7 +40,10 @@ mod microfrontends_api;
 mod notifications;
 mod persist;
 mod project_settings;
+mod raw_ports;
+mod raw_proxy;
 mod relational;
+mod udp_relay;
 mod resources;
 mod resp;
 mod retry;
@@ -544,8 +548,12 @@ async fn main() -> anyhow::Result<()> {
                 });
                 h
             });
-        tokio::spawn(hive_p2p::serve_tunnels_with_join(ep, gateway_addr, 256, trust, Some(gossip_handler), join_handler));
-        tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join surface on)");
+        // Generic raw TCP/UDP mesh forwarding (owner-node accept side): resolve
+        // inbound `STREAM_RAW_TARGET` handshakes to this node's local container
+        // legs — the cross-node hop behind the raw-port proxy / UDP relay.
+        let raw_resolver = crate::mesh_raw::resolver(cloud.clone());
+        tokio::spawn(hive_p2p::serve_tunnels_full(ep, gateway_addr, 256, trust, Some(gossip_handler), join_handler, Some(raw_resolver)));
+        tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }
 
     // Initial owner resolution (single-node: this node is owner) + seed the
@@ -806,6 +814,22 @@ async fn main() -> anyhow::Result<()> {
     // is enabled (HIVE_DB_DOMAIN set); the wildcard `*.{db_domain}` cert comes from
     // the same ACME-managed SNI resolver. High ports (>1024) — no capability needed.
     db_gateway::spawn(cloud.clone());
+
+    // Generic raw-TCP ingress (the db_gateway pattern generalized to ALLOCATED
+    // ports): one public listener per raw-protocol deployment's stamped
+    // public_port (`raw_ports`), on every node — local connections splice into
+    // the leased instance, remote ones ride the iroh mesh's raw-target streams
+    // to the owner. Reconciles listeners against local + gossiped allocations.
+    raw_proxy::spawn(cloud.clone());
+
+    // UDP relay — the DATAGRAM half of the raw-port space (Minecraft Bedrock
+    // 19132/udp, any UDP service). Its own mechanism, NOT the TCP splice:
+    // NAT-style per-client session table on each allocated public UDP port,
+    // forwarding to the container's published `/udp` loopback port locally or
+    // over `[u32 len]`-framed raw-target mesh streams to the owner node, with
+    // idle-timeout session eviction. Shares raw_proxy's allocations + mesh
+    // primitive; see `udp_relay.rs`.
+    udp_relay::spawn(cloud.clone());
 
     // Real-DNS ingress listeners (ngrok retirement): a public HTTPS listener with
     // the hot-swappable SNI resolver (wildcard apps cert + api cert; ACME-managed)

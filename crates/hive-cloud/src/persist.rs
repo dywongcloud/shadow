@@ -493,6 +493,12 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         let is_container = rec.manifest.functions.iter().any(|f| f.runtime == "container");
         let fc_image_backed = cloud.gw.backend_name() == "firecracker" && rec.manifest.image.is_some();
         if is_container || fc_image_backed || std::path::Path::new(&rec.root).exists() {
+            // Re-adopt any PUBLIC raw-port stamps this record carries into the
+            // allocator registry (self-heal for a lost raw_ports.json): the
+            // record and the registry are two durable copies of the same
+            // claim, and a restored service must keep its port claimed so a
+            // parallel deploy can't be handed it.
+            crate::raw_ports::adopt_record(&rec);
             cloud.gw.restore(rec);
         }
     }

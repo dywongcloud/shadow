@@ -61,11 +61,16 @@ fn load_map(cloud: &Arc<CloudState>) -> HashMap<String, usize> {
 /// holder is honored only while healthy + reachable and (for region-pinned
 /// projects) inside an allowed region; otherwise this falls through to the
 /// normal placement policy unchanged.
+///
+/// `stateful` (see [`place`]'s doc for the full hazard) is threaded through to
+/// the fallback `place` call so a fresh (no-lease-yet) stateful deployment is
+/// ALSO protected, not just redeploys of an already-leased one.
 pub fn place_for_project(
     cloud: &Arc<CloudState>,
     project: &str,
     regions: &[String],
     is_container: bool,
+    stateful: bool,
 ) -> Vec<Target> {
     if let Some(holder) = cloud.leases.owner_of(project) {
         let nodes = cloud.registry.nodes();
@@ -92,14 +97,33 @@ pub fn place_for_project(
             }
         }
     }
-    place(cloud, regions, is_container)
+    place(cloud, regions, is_container, stateful)
 }
 
 /// Choose placement targets. See module docs for the policy. `is_container` routes
 /// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
 /// mock/podman backend) — Firecracker nodes can't run them, so placing a container
 /// there fails every cold start with "no capacity / No such file or directory".
-pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) -> Vec<Target> {
+///
+/// `stateful` is the multi-region-fanout safety guard: a container deployment gets
+/// an automatic, durable, PER-NODE persistent volume (`container_volume_cfg` in
+/// `git.rs`) — a fresh, independent volume on every node it's placed on, with NO
+/// data-sync or leader-election between them. For a stateless function that's fine
+/// (every replica is interchangeable). For a stateful single-writer service (a
+/// Postgres database, a Minecraft world save — anything whose
+/// `FunctionConfig::needs_raw_proxy()` is true, or that is otherwise a container
+/// per the existing single-owner lease model in `lease.rs`) it is NOT: fanning out
+/// to multiple regions would silently create independent, diverging volumes the
+/// moment more than one region is selected — e.g. two Minecraft world saves
+/// silently forking apart, or two Postgres instances both accepting independent
+/// writes with no replication between them (a split-brain). When `stateful` is
+/// true, the explicit-region branch below is constrained to a single region (with
+/// a clear warning logged) instead of fanning out one target per region — matching
+/// this module's existing convention of degrading a placement request to a safe
+/// default with a logged explanation rather than hard-failing the deploy (see the
+/// module doc's "if nothing is eligible/reachable" fallback, and
+/// `place_for_project`'s lease-holder stickiness, for the same pattern).
+pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool, stateful: bool) -> Vec<Target> {
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
@@ -146,10 +170,31 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool) ->
         .collect();
 
     if !regions.is_empty() {
+        // One target per selected region — EXCEPT for a stateful/single-writer
+        // deployment, which is forced to a single region (see this fn's doc for the
+        // diverging-replica hazard this closes). Silently constrain + log rather
+        // than reject the deploy outright: consistent with every other placement
+        // fallback in this module (never hard-fail on a placement/region choice).
+        let regions: &[String] = if stateful && regions.len() > 1 {
+            tracing::warn!(
+                requested_regions = ?regions,
+                constrained_to = %regions[0],
+                "placement: stateful/single-writer deployment requested multi-region fanout \
+                 across {} regions; no data-sync or leader-election exists between fanout \
+                 replicas, so this would silently create independent, diverging volumes per \
+                 region (e.g. split-brain Postgres, forked Minecraft world saves). \
+                 Constraining to a single region ({}) instead of fanning out.",
+                regions.len(),
+                regions[0],
+            );
+            &regions[..1]
+        } else {
+            &regions[..]
+        };
         // One target per selected region.
         let mut targets: Vec<Target> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for region in &regions {
+        for region in regions {
             let cands: Vec<&NodeInfo> = nodes
                 .iter()
                 .filter(|n| n.healthy && n.region.eq_ignore_ascii_case(region) && reachable(n))

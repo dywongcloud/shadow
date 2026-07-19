@@ -226,6 +226,18 @@ impl Runtime {
     }
 }
 
+/// One UDP port publish for a CONTAINER function: the port the app listens on
+/// INSIDE its container and the loopback host port podman publishes it on
+/// (`-p 127.0.0.1:<host_port>:<container_port>/udp`). Host ports are chosen by
+/// fluid-compute's `cold_start` (which also records the mapping on the instance
+/// registry so hive-cloud's UDP relay can resolve the local datagram leg); they
+/// ride here so the backends emit the matching `-p …/udp` publish flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdpPublish {
+    pub container_port: u16,
+    pub host_port: u16,
+}
+
 /// How to launch a long-lived function server inside a cell (Fluid compute).
 /// The process MUST listen on `$PORT` (Vercel/Heroku convention).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -245,6 +257,17 @@ pub struct FunctionLaunch {
     /// 0 = use the node's generous default. Ignored for microVM/process functions.
     #[serde(default)]
     pub memory_mib: u32,
+    /// CPU quota for a CONTAINER function's cgroup (podman `--cpus`), e.g. 4.0.
+    /// 0.0 = use the node's generous default. Clamped fleet-wide in
+    /// `ContainerLimits::for_container`. Ignored for microVM/process functions
+    /// (distinct from a microVM's vCPU count, sized elsewhere).
+    #[serde(default)]
+    pub cpus: f64,
+    /// Max-PIDs ceiling for a CONTAINER function's cgroup (podman `--pids-limit`)
+    /// — a fork-bomb guard. 0 = use the node's default. Clamped fleet-wide.
+    /// Ignored for microVM/process functions.
+    #[serde(default)]
+    pub pids: u32,
     /// The resolved runtime — the SINGLE explicit signal every backend/guest
     /// agent uses to decide bytecode-cache behavior, replacing ad hoc argv
     /// re-sniffing. Always set explicitly by the constructor (fluid-compute's
@@ -252,6 +275,23 @@ pub struct FunctionLaunch {
     /// hypothetical older/foreign message, never relied on as real inference.
     #[serde(default)]
     pub runtime: Runtime,
+    /// The function speaks a NON-HTTP application protocol
+    /// (`fluid_core::FunctionConfig::needs_raw_proxy()`: gRPC / raw TCP / UDP —
+    /// e.g. Postgres wire, Minecraft). The backend fronting the function must
+    /// serve its local tunnel hop as a RAW byte splice
+    /// (`fluid_tunnel::TunnelServer::serve_raw`) instead of the HTTP-framed
+    /// `serve` path, whose request-line writing + chunked decoding would
+    /// corrupt non-HTTP bytes. Set explicitly by fluid-compute's `cold_start`;
+    /// `false` (the default, and the wire-compat default for older messages)
+    /// keeps the existing HTTP-framed path byte-identical.
+    #[serde(default)]
+    pub raw_proxy: bool,
+    /// UDP ports a CONTAINER function publishes on loopback (see [`UdpPublish`]).
+    /// Empty for every non-container function and for container functions that
+    /// declare no UDP port specs; `#[serde(default)]` keeps older/foreign
+    /// messages wire-compatible. Ignored by the microVM/process paths.
+    #[serde(default)]
+    pub udp_ports: Vec<UdpPublish>,
 }
 
 fn default_max_conc() -> u32 {
@@ -399,7 +439,11 @@ mod runtime_tests {
             port: 3000,
             max_concurrency: 10,
             memory_mib: 0,
+            cpus: 0.0,
+            pids: 0,
             runtime: Runtime::Bun,
+            raw_proxy: false,
+            udp_ports: Vec::new(),
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(json.contains("\"runtime\":\"bun\""));

@@ -62,6 +62,35 @@ const STREAM_GOSSIP_SIGNED: u8 = 0x03;
 /// mode an untrusted connection may use when a trust set is enforced; every
 /// other mode on an untrusted connection is dropped per-stream.
 const STREAM_JOIN: u8 = 0x04;
+/// RAW proxy to a NAMED local target (generic TCP/UDP mesh forwarding): unlike
+/// [`STREAM_RAW`] — whose accept side is hard-wired to splice into the owner's
+/// local HTTP gateway, which is why the WebSocket path must replay an HTTP
+/// upgrade request over it — this mode opens with an explicit machine-readable
+/// handshake naming WHICH deployment/function/container-port the opener wants,
+/// so protocols with no HTTP request to replay (Postgres wire, Minecraft, DNS,
+/// game UDP, …) can cross the mesh. Framing:
+///   opener → owner:  `[u32 len][RawTarget JSON]` (see [`RawTarget`]), then payload
+///   owner  → opener: `[1B status]` ([`RAW_TARGET_OK`] / error codes), then payload
+/// The status byte is written BEFORE any spliced bytes, so the opener can fail
+/// over to another candidate node without having consumed any client bytes
+/// (same failover-safety property `edge::ws_proxy` relies on).
+/// Payload after an OK status:
+///   * `proto: tcp`  — an opaque byte splice both ways (copy_bidirectional).
+///   * `proto: udp`  — length-prefixed datagrams `[u32 len][bytes]` both ways,
+///     one frame per datagram (boundaries preserved), each ≤ [`RAW_MAX_DATAGRAM`].
+/// MIXED-FLEET NOTE: an old receiver misparses this mode byte as a tunnel
+/// session (the dispatcher's `_` arm) rather than rejecting it outright. This
+/// is made SAFE (not just avoided-by-convention) by [`RAW_TARGET_MAGIC`]: the
+/// admission response the real handler writes is unmistakable, so a stream
+/// that lands on an old peer either times out (no unsolicited write arrives
+/// within the firstbyte budget) or gets a magic-mismatch — either way
+/// `open_raw_to_port` returns `Err` and the caller fails over to its next
+/// candidate, never a garbage splice. Compatible peers are still preferred
+/// where a capability signal is available (nearer/healthier candidates are
+/// tried first), but correctness no longer depends on the caller having
+/// perfect knowledge of every peer's version — unlike the coordination-only
+/// staged-rollout rule [`STREAM_GOSSIP_SIGNED`] still relies on.
+const STREAM_RAW_TARGET: u8 = 0x05;
 const GOSSIP_METHOD_GET: u8 = 0;
 const GOSSIP_METHOD_POST: u8 = 1;
 /// Domain separator for gossip signatures (versioned; bump on format change).
@@ -89,6 +118,91 @@ pub type GossipHandler = Arc<
 /// current node roster so the joiner learns the whole mesh in one round trip.
 pub type JoinHandler = Arc<
     dyn Fn(String, Vec<u8>, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Transport a [`RawTarget`] speaks. Kebab-case wire strings ("tcp"/"udp") so
+/// the handshake JSON matches `fluid_core::ServiceProtocol`'s serde convention
+/// (this crate deliberately does not depend on fluid-core; the mapping is done
+/// by the resolver in hive-cloud).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RawProto {
+    Tcp,
+    Udp,
+}
+
+/// The opening handshake of a [`STREAM_RAW_TARGET`] stream: which local service
+/// the opener wants the owner node to splice it into. `deployment` may be empty
+/// — the owner then resolves the project's CURRENT serving deployment locally
+/// (fresher than anything the edge could pin across a redeploy); when set it
+/// pins an exact deployment id.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct RawTarget {
+    pub project: String,
+    pub function: String,
+    #[serde(default)]
+    pub deployment: String,
+    /// The CONTAINER port of the target service (what the app listens on inside
+    /// its container) — the stable identity of the port across nodes/redeploys.
+    /// Never a host/public port: those are node-local allocations the opener
+    /// cannot know.
+    pub port: u16,
+    pub proto: RawProto,
+}
+
+/// Fixed 4-byte preamble the owner writes BEFORE every [`STREAM_RAW_TARGET`]
+/// admission status byte (`[magic][status]`, 5 bytes total). Exists so the
+/// opener can tell a REAL raw-target response apart from an old,
+/// un-upgraded peer's dispatcher misrouting the `0x05` mode byte to its
+/// default tunnel-session arm (`fluid_tunnel::TunnelServer::serve`) — that
+/// path can unsolicitedly write a Metrics frame whose wire encoding is
+/// `[u64 stream_id=0 big-endian][kind][len][payload]`, i.e. its first byte
+/// is `0x00`, which used to be read as a bare [`RAW_TARGET_OK`] and get a
+/// live client spliced into tunnel-codec garbage instead of a clean
+/// failover. Any realistic tunnel `stream_id` (a small counter) also has a
+/// `0x00` leading byte in big-endian form, so a magic with a NON-ZERO first
+/// byte defeats both the specific Metrics-frame collision and the general
+/// class of it. This makes the admission self-certifying: even a stream
+/// dialed against a peer with NO version/capability check at all fails
+/// closed (bad magic ⇒ the opener bails and its caller fails over) rather
+/// than needing the caller to have first verified peer compatibility.
+pub const RAW_TARGET_MAGIC: [u8; 4] = [0xF1, 0x5C, 0x9E, 0xA2];
+/// Status byte the owner writes on a [`STREAM_RAW_TARGET`] stream before any
+/// payload: the target resolved and the local leg is connected — splice begins.
+/// Always preceded on the wire by [`RAW_TARGET_MAGIC`].
+pub const RAW_TARGET_OK: u8 = 0;
+/// No local target for the handshake (unknown project/function/port, protocol
+/// not locally forwardable yet, or a malformed handshake). The opener should
+/// fail over to its next candidate node.
+pub const RAW_TARGET_NOT_FOUND: u8 = 1;
+/// The target resolved but the owner could not connect its local leg.
+pub const RAW_TARGET_CONNECT_FAILED: u8 = 2;
+
+/// Largest UDP payload one [`STREAM_RAW_TARGET`] datagram frame may carry —
+/// the maximum UDP-over-IPv4 payload; anything larger could never have arrived
+/// as a single datagram, so a bigger length prefix is a framing error.
+pub const RAW_MAX_DATAGRAM: usize = 65_507;
+
+/// What a [`RawTargetResolver`] hands back for an admitted target: the LOCAL
+/// address of the leg to splice into, plus an opaque guard held for the
+/// lifetime of the splice (e.g. a fluid-compute `Lease`, so instance inflight
+/// accounting stays correct and the instance isn't idled out mid-connection).
+pub struct RawTargetConn {
+    /// `host:port` on the owner node — TCP-connected for `proto: tcp`, the
+    /// datagram destination for `proto: udp`.
+    pub addr: String,
+    /// Dropped when the splice ends.
+    pub guard: Option<Box<dyn std::any::Any + Send>>,
+}
+
+/// Resolves one [`RawTarget`] to its local leg on THIS node, or `None` when the
+/// target isn't served here ([`RAW_TARGET_NOT_FOUND`] goes back to the opener).
+/// Provided by hive-cloud, which owns the deployment→container mapping this
+/// transport crate deliberately knows nothing about.
+pub type RawTargetResolver = Arc<
+    dyn Fn(RawTarget) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RawTargetConn>> + Send>>
         + Send
         + Sync,
 >;
@@ -244,13 +358,43 @@ async fn read_u32<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<usize> {
 }
 
 async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>> {
+    read_frame_max(r, GOSSIP_MAX_FRAME).await
+}
+
+/// Read one `[u32 len][bytes]` frame with an explicit size cap — the shared
+/// primitive behind gossip/join frames (16 MiB cap) and raw-target datagram
+/// frames ([`RAW_MAX_DATAGRAM`] cap).
+async fn read_frame_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> std::io::Result<Vec<u8>> {
     let n = read_u32(r).await?;
-    if n > GOSSIP_MAX_FRAME {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "gossip frame too large"));
+    if n > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
     }
     let mut v = vec![0u8; n];
     r.read_exact(&mut v).await?;
     Ok(v)
+}
+
+/// Read one datagram frame off a raw-target UDP mesh stream: `Ok(Some(bytes))`
+/// per datagram, `Ok(None)` on a clean end-of-stream. Exported so the edge-side
+/// UDP relay speaks byte-identical framing to the owner-side pump in this crate.
+pub async fn read_raw_datagram<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+    match read_frame_max(r, RAW_MAX_DATAGRAM).await {
+        Ok(d) => Ok(Some(d)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Write one datagram frame (`[u32 len][bytes]`, boundary-preserving) onto a
+/// raw-target UDP mesh stream. Oversized payloads are a framing error — they
+/// could never have arrived as one datagram.
+pub async fn write_raw_datagram<W: AsyncWrite + Unpin>(w: &mut W, datagram: &[u8]) -> std::io::Result<()> {
+    if datagram.len() > RAW_MAX_DATAGRAM {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "datagram too large"));
+    }
+    w.write_all(&(datagram.len() as u32).to_be_bytes()).await?;
+    w.write_all(datagram).await?;
+    w.flush().await
 }
 
 /// Serialize this endpoint's dialable address (direct socket addrs + relay url) to
@@ -814,6 +958,110 @@ impl PeerPool {
         }
     }
 
+    /// Open a RAW byte stream to a NAMED service on a peer — the mesh-forward
+    /// primitive for generic (non-HTTP) TCP/UDP proxying. Unlike [`open_raw`],
+    /// whose owner side splices into the owner's local HTTP gateway (so the
+    /// caller must speak HTTP at it — the WebSocket upgrade-replay case), this
+    /// sends a [`RawTarget`] handshake naming the deployment/function/container
+    /// port to splice into, and waits for the owner's 1-byte admission status
+    /// BEFORE returning — so a caller that hasn't yet consumed any client bytes
+    /// can fail over to the next candidate node on any error (the same
+    /// failover-safety `ws_proxy` gets from `open_raw` running pre-upgrade).
+    ///
+    /// On success the returned stream is the spliced connection:
+    /// * `proto: tcp` — opaque bytes both ways (`copy_bidirectional` it).
+    /// * `proto: udp` — one `[u32 len][bytes]` frame per datagram both ways
+    ///   (use [`read_raw_datagram`]/[`write_raw_datagram`]).
+    ///
+    /// Pre-send phases (connect / `open_bi`) retry once, exactly as
+    /// [`open_raw`]; once the handshake is on the wire a timeout/refusal is
+    /// returned (bounded by the firstbyte budget) for the caller's candidate
+    /// failover to decide.
+    pub async fn open_raw_to_port(
+        &self,
+        node_id: &str,
+        addr_json: &str,
+        target: &RawTarget,
+    ) -> Result<P2pStream> {
+        let hs = serde_json::to_vec(target)?;
+        let mut attempt = 0u8;
+        loop {
+            attempt += 1;
+            let conn = match self.acquire(node_id, addr_json).await {
+                Ok(c) => c,
+                Err(e) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e);
+                }
+            };
+            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(pair)) => pair,
+                Ok(Err(e)) => {
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_OPEN).await;
+                    self.evict(node_id).await;
+                    if attempt < 2 {
+                        continue;
+                    }
+                    return Err(self.dead_peer(node_id, "open", open_budget()));
+                }
+            };
+            send.write_all(&[STREAM_RAW_TARGET]).await?;
+            send.write_all(&(hs.len() as u32).to_be_bytes()).await?;
+            send.write_all(&hs).await?;
+            send.flush().await?;
+            // POST-SEND: await the owner's admission response, bounded by the
+            // firstbyte budget (the owner may cold-start the target instance).
+            // `[4B magic][1B status]`, not a bare status byte — see
+            // `RAW_TARGET_MAGIC`'s doc for why: an un-upgraded peer's
+            // dispatcher misrouting this stream to its default tunnel-session
+            // handler can unsolicitedly write a frame whose first byte(s)
+            // coincidentally equal a bare `RAW_TARGET_OK`; the magic makes a
+            // real admission unmistakable so a misroute fails closed here
+            // (bad/absent magic ⇒ Err, caller fails over) instead of splicing
+            // the client into codec garbage.
+            let mut resp = [0u8; 5];
+            match tokio::time::timeout(firstbyte_budget(), recv.read_exact(&mut resp)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
+                    return Err(anyhow::Error::new(PostSendTimeout {
+                        node_id: node_id.to_string(),
+                        phase: "firstbyte",
+                        budget_ms: firstbyte_budget().as_millis() as u64,
+                    }));
+                }
+            }
+            if resp[..4] != RAW_TARGET_MAGIC {
+                anyhow::bail!(
+                    "peer {node_id} sent a non-raw-target response (magic mismatch — likely an un-upgraded peer misrouting this stream to its tunnel handler); treating as refused"
+                );
+            }
+            match resp[4] {
+                RAW_TARGET_OK => return Ok(tokio::io::join(recv, send)),
+                RAW_TARGET_NOT_FOUND => anyhow::bail!(
+                    "peer {node_id} has no local target for {}/{} port {} ({:?})",
+                    target.project, target.function, target.port, target.proto
+                ),
+                RAW_TARGET_CONNECT_FAILED => anyhow::bail!(
+                    "peer {node_id} could not connect its local leg for {}/{} port {}",
+                    target.project, target.function, target.port
+                ),
+                other => anyhow::bail!("peer {node_id} sent unknown raw-target status {other}"),
+            }
+        }
+    }
+
     /// Control-plane gossip over the mesh (#unify): tunnel an HTTP-shaped request to
     /// the peer's local admin over a NEW bi stream on the reused trunk, and return
     /// the response body bytes. `method` is [`GOSSIP_GET`]/[`GOSSIP_POST`]. Re-dials
@@ -1337,11 +1585,30 @@ pub async fn serve_tunnels_with_join(
     gossip: Option<GossipHandler>,
     join: Option<JoinHandler>,
 ) {
+    serve_tunnels_full(ep, local_http, max_concurrency, trust, gossip, join, None).await
+}
+
+/// [`serve_tunnels_with_join`] plus the generic raw-target surface: when a
+/// [`RawTargetResolver`] is provided, [`STREAM_RAW_TARGET`] streams are served
+/// (parse the [`RawTarget`] handshake, resolve it to a local leg, splice — see
+/// [`serve_raw_target`]); without one they are answered [`RAW_TARGET_NOT_FOUND`]
+/// so an opener fails over instead of hanging. Trust semantics are identical to
+/// every other non-JOIN mode: an untrusted peer's raw-target streams are dropped.
+pub async fn serve_tunnels_full(
+    ep: Endpoint,
+    local_http: String,
+    max_concurrency: u32,
+    trust: Option<TrustSet>,
+    gossip: Option<GossipHandler>,
+    join: Option<JoinHandler>,
+    raw_resolver: Option<RawTargetResolver>,
+) {
     while let Some(incoming) = ep.accept().await {
         let local = local_http.clone();
         let trust = trust.clone();
         let gossip = gossip.clone();
         let join = join.clone();
+        let raw_resolver = raw_resolver.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(c) => c,
@@ -1369,6 +1636,7 @@ pub async fn serve_tunnels_with_join(
                 let local = local.clone();
                 let gossip = gossip.clone();
                 let join = join.clone();
+                let raw_resolver = raw_resolver.clone();
                 let rid = remote_id.clone();
                 let trust = trust.clone();
                 tokio::spawn(async move {
@@ -1397,6 +1665,7 @@ pub async fn serve_tunnels_with_join(
                             }
                         }
                         STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
+                        STREAM_RAW_TARGET => serve_raw_target(recv, send, raw_resolver).await,
                         _ => {
                             fluid_tunnel::TunnelServer::serve(
                                 tokio::io::join(recv, send),
@@ -1568,6 +1837,137 @@ async fn raw_splice(mut stream: P2pStream, local_http: &str) {
         }
     };
     let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+}
+
+/// Server side of a [`STREAM_RAW_TARGET`] stream (the owner-node accept handler
+/// for generic raw TCP/UDP mesh forwarding): read the [`RawTarget`] handshake,
+/// resolve it to a local leg via the caller-provided [`RawTargetResolver`]
+/// (hive-cloud owns the deployment→container-port mapping), answer the 1-byte
+/// admission status, then move payload:
+/// * `tcp` — `copy_bidirectional` between the mesh stream and a fresh TCP
+///   connection to the resolved local address.
+/// * `udp` — pump length-prefixed datagram frames ↔ a connected local UDP
+///   socket, preserving datagram boundaries. Session lifetime is owned by the
+///   OPENER (the edge relay closes the mesh stream to end it) — mirroring how a
+///   raw TCP splice lives until either side closes.
+///
+/// Every refusal (bad handshake, no resolver, unresolvable target, connect
+/// failure) is an explicit status byte, never a silent close, so the opener can
+/// fail over to another candidate node without a timeout.
+async fn serve_raw_target<R, W>(mut recv: R, mut send: W, resolver: Option<RawTargetResolver>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let refuse = |mut send: W, code: u8| async move {
+        let mut buf = [0u8; 5];
+        buf[..4].copy_from_slice(&RAW_TARGET_MAGIC);
+        buf[4] = code;
+        let _ = send.write_all(&buf).await;
+        let _ = send.flush().await;
+    };
+    // Handshake frame: a target descriptor is tiny — cap well under the gossip
+    // frame limit so a hostile length prefix can't balloon the read. A
+    // malformed/unreadable handshake still gets an explicit refusal (not a
+    // bare close) so the opener fails fast instead of burning its firstbyte
+    // budget waiting on a peer that already gave up.
+    let raw = match read_frame_max(&mut recv, 4096).await {
+        Ok(b) => b,
+        Err(_) => {
+            refuse(send, RAW_TARGET_NOT_FOUND).await;
+            return;
+        }
+    };
+    let Ok(target) = serde_json::from_slice::<RawTarget>(&raw) else {
+        refuse(send, RAW_TARGET_NOT_FOUND).await;
+        return;
+    };
+    let Some(resolver) = resolver else {
+        refuse(send, RAW_TARGET_NOT_FOUND).await;
+        return;
+    };
+    let Some(conn) = resolver(target.clone()).await else {
+        tracing::debug!(project = %target.project, function = %target.function, port = target.port, proto = ?target.proto, "raw target: no local leg resolved");
+        refuse(send, RAW_TARGET_NOT_FOUND).await;
+        return;
+    };
+    // Held for the whole splice — e.g. the fluid-compute lease keeping the
+    // instance's inflight accounting correct for this live connection.
+    let _guard = conn.guard;
+    match target.proto {
+        RawProto::Tcp => {
+            let mut tcp = match tokio::net::TcpStream::connect(&conn.addr).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!(local = %conn.addr, error = %e, "raw target: local TCP connect failed");
+                    refuse(send, RAW_TARGET_CONNECT_FAILED).await;
+                    return;
+                }
+            };
+            let mut ok = [0u8; 5];
+            ok[..4].copy_from_slice(&RAW_TARGET_MAGIC);
+            ok[4] = RAW_TARGET_OK;
+            if send.write_all(&ok).await.is_err() || send.flush().await.is_err() {
+                return;
+            }
+            let mut stream = tokio::io::join(recv, send);
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+        }
+        RawProto::Udp => {
+            // A connected loopback socket: send() targets the container's
+            // published local UDP port; recv() only accepts its replies.
+            let sock = match tokio::net::UdpSocket::bind("127.0.0.1:0").await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "raw target: local UDP bind failed");
+                    refuse(send, RAW_TARGET_CONNECT_FAILED).await;
+                    return;
+                }
+            };
+            if let Err(e) = sock.connect(&conn.addr).await {
+                tracing::debug!(local = %conn.addr, error = %e, "raw target: local UDP connect failed");
+                refuse(send, RAW_TARGET_CONNECT_FAILED).await;
+                return;
+            }
+            let mut ok = [0u8; 5];
+            ok[..4].copy_from_slice(&RAW_TARGET_MAGIC);
+            ok[4] = RAW_TARGET_OK;
+            if send.write_all(&ok).await.is_err() || send.flush().await.is_err() {
+                return;
+            }
+            let sock = Arc::new(sock);
+            // Inbound (mesh → container) in its own task: `read_raw_datagram`
+            // is not cancellation-safe mid-frame, so it must never sit in a
+            // select arm. Ends on stream EOF/error — the opener closing the
+            // mesh stream IS the end-of-session signal.
+            let inbound_sock = sock.clone();
+            let mut inbound = tokio::spawn(async move {
+                while let Ok(Some(d)) = read_raw_datagram(&mut recv).await {
+                    if inbound_sock.send(&d).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            // Outbound (container → mesh) here; `UdpSocket::recv` is
+            // cancel-safe, so selecting it against the inbound task's exit is
+            // sound. Either side ending tears the whole session down.
+            let mut buf = vec![0u8; RAW_MAX_DATAGRAM];
+            loop {
+                tokio::select! {
+                    _ = &mut inbound => break,
+                    r = sock.recv(&mut buf) => match r {
+                        Ok(n) => {
+                            if write_raw_datagram(&mut send, &buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    },
+                }
+            }
+            inbound.abort();
+        }
+    }
 }
 
 /// Assert at compile time that a `P2pStream` satisfies the tunnel transport bound.

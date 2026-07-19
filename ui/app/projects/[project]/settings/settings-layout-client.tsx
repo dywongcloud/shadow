@@ -11,6 +11,7 @@ const sections = [
   { slug: "git", label: "Git" },
   { slug: "environment-variables", label: "Environment Variables" },
   { slug: "functions", label: "Functions" },
+  { slug: "network", label: "Network" },
   { slug: "build", label: "Build & Development" },
   { slug: "routing", label: "Routing" },
   { slug: "cron", label: "Cron Jobs" },

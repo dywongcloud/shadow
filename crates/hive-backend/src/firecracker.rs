@@ -755,17 +755,29 @@ impl CellBackend for FirecrackerBackend {
             if let Some(rt) = &runtime {
                 tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
             }
+            // Primary port from `start_cmd` (TCP, drives readiness + the tunnel),
+            // plus one `/udp` publish per `FunctionLaunch::udp_ports` entry —
+            // the loopback datagram legs the UDP relay forwards to (host ports
+            // chosen upstream by fluid-compute's `cold_start`, which records
+            // them on the instance registry for the relay's resolution).
+            let mut ports = vec![crate::ContainerPort::tcp(internal, func.port)];
+            ports.extend(func.udp_ports.iter().map(|u| crate::ContainerPort {
+                container_port: u.container_port,
+                host_port: u.host_port,
+                protocol: crate::ContainerProtocol::Udp,
+            }));
             let (name, endpoint, task) = crate::podman_run_container(
                 &cell.id,
                 &image,
-                internal,
-                func.port,
+                &ports,
                 &func.env,
                 func.max_concurrency,
                 Self::PODMAN_PATH,
                 runtime.as_deref(),
                 net_json,
-                &crate::ContainerLimits::for_container(func.memory_mib),
+                &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids),
+                // Non-HTTP protocol (gRPC/TCP/UDP): raw byte-splice tunnel mode.
+                func.raw_proxy,
             )
             .await?;
             self.containers.lock().await.insert(cell.id.clone(), name);

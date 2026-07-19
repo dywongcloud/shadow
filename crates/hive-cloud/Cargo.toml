@@ -16,6 +16,7 @@ fluid-core = { workspace = true }
 fluid-build = { workspace = true }
 fluid-compute = { workspace = true }
 fluid-gateway = { workspace = true }
+fluid-tunnel = { workspace = true }
 hive-edge = { workspace = true }
 hive-wg = { workspace = true }
 hive-p2p = { workspace = true }

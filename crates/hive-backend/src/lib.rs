@@ -266,6 +266,39 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
     }
 }
 
+/// Transport protocol for one published container port. Podman's `-p` publishes
+/// TCP by default; UDP needs an explicit `/udp` suffix appended to the internal
+/// port (see [`podman_run_container`]'s `-p` emission). Mirrors the tcp/udp
+/// split of `fluid_core::ServiceProtocol` at the level this crate needs —
+/// hive-backend does not depend on fluid-core, so this is a minimal local
+/// counterpart rather than a shared/re-exported type.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ContainerProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// One port a container publishes: the port the app listens on INSIDE the
+/// container, the host port it's reachable on, and the transport it speaks.
+/// A deployment may publish several (e.g. a game server's game/rcon/query
+/// ports) — see [`ContainerSpec::ports`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContainerPort {
+    pub container_port: u16,
+    pub host_port: u16,
+    pub protocol: ContainerProtocol,
+}
+
+impl ContainerPort {
+    /// Build a single TCP port — the overwhelmingly common case (a plain HTTP
+    /// container) — and the bridge for callers that still carry one bare
+    /// container/host port pair instead of a full list.
+    pub fn tcp(container_port: u16, host_port: u16) -> ContainerPort {
+        ContainerPort { container_port, host_port, protocol: ContainerProtocol::Tcp }
+    }
+}
+
 /// A container (podman) cell: instead of a microVM / host process, the backend
 /// runs this OCI image directly via podman on the HOST. Set when the deployment's
 /// function is `runtime == "container"`. Lets Firecracker nodes run containers on
@@ -274,8 +307,13 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
 pub struct ContainerSpec {
     /// OCI image to `podman run` (from the function's `__container__` start_cmd).
     pub image: String,
-    /// Port the container listens on inside (host port is allocated + mapped).
-    pub port: u16,
+    /// Every port this container publishes. The first entry is the PRIMARY
+    /// port — the one health-checked for readiness and fronted by the
+    /// multiplexed tunnel server ([`podman_run_container`]); every entry
+    /// (primary and additional) gets its own `-p` publish. Non-empty by
+    /// construction for a real deploy; the overwhelmingly common shape is
+    /// exactly one TCP entry (see [`ContainerPort::tcp`]).
+    pub ports: Vec<ContainerPort>,
 }
 
 /// Per-container resource ceilings applied to `podman run` so one tenant's
@@ -315,14 +353,16 @@ impl Default for ContainerLimits {
 
 impl ContainerLimits {
     /// Limits for a specific container function: honor the deployment's requested
-    /// memory (`memory_mib`, from fluid.json `container.memory` / project settings)
-    /// when set (>0), else the generous, env-tunable default. CPU/PID from default.
-    /// The requested value is CLAMPED to a fleet-wide maximum — without this, a
-    /// tenant's own `fluid.json` (`{"container":{"memory":"999999m"}}`) could
-    /// remove the ceiling entirely (H1's whole point was that ONE tenant's
-    /// container must never be able to exhaust host RAM and starve every other
-    /// co-located tenant on a shared node).
-    pub fn for_container(memory_mib: u32) -> Self {
+    /// memory (`memory_mib`, from fluid.json `container.memory` / project settings),
+    /// CPU quota (`cpus`, fluid.json `container.cpus`), and max-PIDs (`pids`,
+    /// fluid.json `container.pids`) when set (memory/pids >0, cpus >0.0), else the
+    /// generous, env-tunable default for that dimension. EACH requested value is
+    /// CLAMPED to its own fleet-wide maximum — without this, a tenant's own
+    /// `fluid.json` (`{"container":{"memory":"999999m","cpus":"999","pids":999999}}`)
+    /// could remove the ceiling entirely (H1's whole point was that ONE tenant's
+    /// container must never be able to exhaust host RAM/CPU/the process table and
+    /// starve every other co-located tenant on a shared node).
+    pub fn for_container(memory_mib: u32, cpus: f64, pids: u32) -> Self {
         let mut l = Self::default();
         if memory_mib > 0 {
             let max = std::env::var("HIVE_CONTAINER_MEMORY_MAX_MIB")
@@ -331,6 +371,22 @@ impl ContainerLimits {
                 .filter(|v| *v > 0)
                 .unwrap_or(16_384); // 16 GiB — generous for a real monolith, still a real ceiling
             l.memory = Some(format!("{}m", memory_mib.min(max)));
+        }
+        if cpus > 0.0 {
+            let max = std::env::var("HIVE_CONTAINER_CPUS_MAX")
+                .ok()
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(8.0); // 4x the "2.0" default — generous, still a real ceiling
+            l.cpus = Some(format!("{}", cpus.min(max)));
+        }
+        if pids > 0 {
+            let max = std::env::var("HIVE_CONTAINER_PIDS_MAX")
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(4096); // 4x the 1024 default — generous, still a real ceiling
+            l.pids = Some(pids.min(max));
         }
         l
     }
@@ -423,8 +479,14 @@ fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
 pub(crate) async fn podman_run_container(
     cell_id: &CellId,
     image: &str,
-    internal_port: u16,
-    host_port: u16,
+    // Every port to publish. `ports[0]` is the PRIMARY port: it drives the
+    // `PORT` env var, the readiness probe, and the tunnel this fn fronts the
+    // container with. Every entry (including non-primary ones) gets its own
+    // `-p` publish below. Must be non-empty — a container with no published
+    // port can never be reached. The single-TCP-port case (`&[ContainerPort::
+    // tcp(internal, host)]`) reproduces this fn's pre-multi-port behavior
+    // exactly.
+    ports: &[ContainerPort],
     env: &std::collections::BTreeMap<String, String>,
     max_concurrency: u32,
     path_env: &str,
@@ -442,8 +504,17 @@ pub(crate) async fn podman_run_container(
     // Per-container resource ceilings (memory/cpus/pids) applied as `podman run`
     // flags so a single tenant can't DoS the shared host. See [`ContainerLimits`].
     limits: &ContainerLimits,
+    // The service speaks a NON-HTTP protocol (`FunctionLaunch::raw_proxy`, from
+    // `FunctionConfig::needs_raw_proxy()`: gRPC / raw TCP / UDP). The tunnel
+    // fronting the container then serves each accepted connection as a RAW
+    // bidirectional byte splice to the container's published loopback port —
+    // zero HTTP framing — instead of the HTTP-framed multiplexed path, which
+    // would corrupt e.g. Postgres or Minecraft wire bytes by HTTP-parsing them.
+    raw_proxy: bool,
 ) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
     use tokio::process::Command;
+    anyhow::ensure!(!ports.is_empty(), "podman_run_container: at least one port must be published");
+    let primary = ports[0];
     let name = format!("hive-{}", cell_id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
 
     let net = net_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
@@ -535,7 +606,7 @@ pub(crate) async fn podman_run_container(
     // directly; it's reached solely via the gateway/ngrok for the deployment.
     let mut base: Vec<String> = vec![
         "-d".into(), "--name".into(), name.clone(),
-        "-e".into(), format!("PORT={internal_port}"),
+        "-e".into(), format!("PORT={}", primary.container_port),
     ];
     for (k, v) in env {
         base.push("-e".into());
@@ -569,8 +640,17 @@ pub(crate) async fn podman_run_container(
     // Resource ceilings + privilege drop — DoS / escalation defense-in-depth.
     // These are `run` OPTIONS, so they must precede the image name below.
     base.extend(crate::container_cli::resource_flags(apple, limits));
-    base.push("-p".into());
-    base.push(format!("127.0.0.1:{host_port}:{internal_port}"));
+    // One `-p` per published port; UDP gets podman's literal `/udp` suffix on
+    // the internal port, TCP (the default, and today's only case) gets none —
+    // byte-identical to the pre-multi-port single `-p` for a one-TCP-port spec.
+    for p in ports {
+        base.push("-p".into());
+        let suffix = match p.protocol {
+            ContainerProtocol::Udp => "/udp",
+            ContainerProtocol::Tcp => "",
+        };
+        base.push(format!("127.0.0.1:{}:{}{suffix}", p.host_port, p.container_port));
+    }
     base.push(image.to_string());
 
     // Attempt 1: with the requested sandbox runtime (e.g. gVisor `runsc`) if any —
@@ -741,7 +821,7 @@ pub(crate) async fn podman_run_container(
     // container that is still RUNNING — we hand back the endpoint and let it finish
     // booting (early requests 502 until the port opens, then it serves). We only
     // bail if the container has actually EXITED (a real crash).
-    let func_addr = format!("127.0.0.1:{host_port}");
+    let func_addr = format!("127.0.0.1:{}", primary.host_port);
     let ready_secs = std::env::var("HIVE_CONTAINER_READY_SECS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -779,7 +859,34 @@ pub(crate) async fn podman_run_container(
                 Ok((conn, _)) => {
                     let local = func_addr.clone();
                     tokio::spawn(async move {
-                        fluid_tunnel::TunnelServer::serve(conn, local, max_conc).await;
+                        // Clean per-protocol branch: a non-HTTP service (gRPC /
+                        // raw TCP — Postgres, Minecraft, …) gets a genuine raw
+                        // byte splice to the container's loopback port; an
+                        // HTTP-family service keeps the existing HTTP-framed
+                        // multiplexed tunnel path, byte-identical.
+                        //
+                        // UDP EXTENSION POINT: this listener (and serve_raw's
+                        // copy_bidirectional) is TCP-only. A UDP service's
+                        // datagrams cannot ride this hop — the UDP relay
+                        // (separate mechanism) must forward datagrams directly
+                        // to the container's published loopback UDP port
+                        // (`127.0.0.1:<host_port>`, published above with the
+                        // `-p …/udp` suffix), bypassing this TCP tunnel
+                        // entirely. Plug that relay in HERE, beside the accept
+                        // loop, when it lands.
+                        if raw_proxy {
+                            fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
+                        } else {
+                            // `serve_maybe_raw`, not bare `serve`: an
+                            // HTTP-protocol function (this branch) still
+                            // needs its normal framed path for ordinary
+                            // requests, but a WebSocket-upgrade connection
+                            // (`edge.rs`'s local splice, opened directly to
+                            // this SAME listener) needs one connection
+                            // switched to a raw byte splice — see
+                            // `TunnelServer::serve_maybe_raw`'s doc.
+                            fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                        }
                     });
                 }
                 Err(_) => break,
@@ -935,13 +1042,30 @@ mod container_limits_tests {
     #[test]
     fn for_container_honors_requested_memory_else_default() {
         // A deployment's requested memory (memory_mib) overrides the default…
-        let flags = ContainerLimits::for_container(8192).podman_run_flags();
+        let flags = ContainerLimits::for_container(8192, 0.0, 0).podman_run_flags();
         let m = idx(&flags, "--memory").expect("--memory present");
         assert_eq!(flags[m + 1], "8192m", "explicit memory_mib wins");
         // …and 0 falls back to the generous default (never the old 512m).
-        let d = ContainerLimits::for_container(0).podman_run_flags();
+        let d = ContainerLimits::for_container(0, 0.0, 0).podman_run_flags();
         let dm = idx(&d, "--memory").expect("--memory present");
         assert_ne!(d[dm + 1], "512m", "0 must not resurrect the OOM-killing 512m");
+    }
+
+    #[test]
+    fn for_container_honors_requested_cpus_and_pids_else_default() {
+        // A deployment's requested cpus/pids (fluid.json `container.cpus`/`pids`)
+        // override the defaults…
+        let flags = ContainerLimits::for_container(0, 4.0, 512).podman_run_flags();
+        let c = idx(&flags, "--cpus").expect("--cpus present");
+        assert_eq!(flags[c + 1], "4", "explicit cpus wins");
+        let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
+        assert_eq!(flags[p + 1], "512", "explicit pids wins");
+        // …and 0.0/0 fall back to the fleet-wide env-tunable defaults.
+        let d = ContainerLimits::for_container(0, 0.0, 0).podman_run_flags();
+        let dc = idx(&d, "--cpus").expect("--cpus present");
+        assert_eq!(d[dc + 1], "2.0", "0.0 must fall back to the default cpus quota");
+        let dp = idx(&d, "--pids-limit").expect("--pids-limit present");
+        assert_eq!(d[dp + 1], "1024", "0 must fall back to the default pids limit");
     }
 
     #[test]
@@ -953,16 +1077,38 @@ mod container_limits_tests {
         // defeating the entire H1 hardening pass ("one tenant's container
         // cannot exhaust host RAM ... a DoS against every other tenant on a
         // shared host").
-        let flags = ContainerLimits::for_container(999_999).podman_run_flags();
+        let flags = ContainerLimits::for_container(999_999, 0.0, 0).podman_run_flags();
         let m = idx(&flags, "--memory").expect("--memory present");
         assert_eq!(flags[m + 1], "16384m", "an excessive request must be clamped to the fleet-wide maximum");
 
         // A reasonable, legitimate request under the max is honored exactly
         // (already covered above for 8192, re-asserted here as a boundary
         // check right at the default max).
-        let flags = ContainerLimits::for_container(16_384).podman_run_flags();
+        let flags = ContainerLimits::for_container(16_384, 0.0, 0).podman_run_flags();
         let m = idx(&flags, "--memory").expect("--memory present");
         assert_eq!(flags[m + 1], "16384m", "a request exactly at the max must pass through unchanged");
+    }
+
+    #[test]
+    fn for_container_clamps_an_excessive_requested_cpus_and_pids() {
+        // Same class of regression as the memory test above, for the two
+        // dimensions added alongside it: an unclamped `fluid.json`
+        // (`{"container":{"cpus":"999","pids":999999}}`) must never be able to
+        // remove the CPU-quota / process-table ceiling entirely — the whole
+        // point of H1 hardening applies identically to every dimension a
+        // tenant can request, not just memory.
+        let flags = ContainerLimits::for_container(0, 999.0, 999_999).podman_run_flags();
+        let c = idx(&flags, "--cpus").expect("--cpus present");
+        assert_eq!(flags[c + 1], "8", "an excessive cpus request must be clamped to the fleet-wide maximum");
+        let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
+        assert_eq!(flags[p + 1], "4096", "an excessive pids request must be clamped to the fleet-wide maximum");
+
+        // A reasonable, legitimate request exactly at the max is honored exactly.
+        let flags = ContainerLimits::for_container(0, 8.0, 4096).podman_run_flags();
+        let c = idx(&flags, "--cpus").expect("--cpus present");
+        assert_eq!(flags[c + 1], "8", "a cpus request exactly at the max must pass through unchanged");
+        let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
+        assert_eq!(flags[p + 1], "4096", "a pids request exactly at the max must pass through unchanged");
     }
 
     #[test]
@@ -1010,14 +1156,14 @@ mod apple_container_live_tests {
         let result = podman_run_container(
             &cell_id,
             "docker.io/library/nginx:alpine",
-            80,
-            host_port,
+            &[ContainerPort::tcp(80, host_port)],
             &env,
             10,
             path_env,
             None, // no sandbox runtime — irrelevant on macOS (see module doc)
             None, // single container, no compose network
             &limits,
+            false, // HTTP-family service — the framed tunnel path
         )
         .await;
 

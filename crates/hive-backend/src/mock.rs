@@ -266,6 +266,16 @@ impl CellBackend for MockBackend {
                 }
             }
             let port = func.port;
+            // Primary port (TCP, drives readiness + the tunnel) plus one `/udp`
+            // publish per `FunctionLaunch::udp_ports` entry — the loopback
+            // datagram legs the UDP relay forwards to. Mirrors
+            // `podman_run_container`'s emission for macOS dev parity.
+            let mut ports = vec![crate::ContainerPort::tcp(internal.parse().unwrap_or(8080), port)];
+            ports.extend(func.udp_ports.iter().map(|u| crate::ContainerPort {
+                container_port: u.container_port,
+                host_port: u.host_port,
+                protocol: crate::ContainerProtocol::Udp,
+            }));
             let mut args: Vec<String> = vec![
                 "run".into(), "-d".into(), "--name".into(), name.clone(),
                 "-e".into(), format!("PORT={internal}"),
@@ -308,9 +318,20 @@ impl CellBackend for MockBackend {
             // Resource ceilings + privilege drop (DoS / escalation defense) — `run`
             // OPTIONS, so they precede the image name. Honors the deployment's
             // requested memory (else the generous env-tunable default).
-            args.extend(crate::container_cli::resource_flags(apple, &crate::ContainerLimits::for_container(func.memory_mib)));
-            args.push("-p".into());
-            args.push(format!("127.0.0.1:{port}:{internal}"));
+            args.extend(crate::container_cli::resource_flags(apple, &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids)));
+            // One `-p` per published port; UDP gets podman's literal `/udp`
+            // suffix on the internal port, TCP (the default, and today's only
+            // case) gets none — byte-identical to the pre-multi-port single
+            // `-p` for a one-TCP-port spec. Mirrors `podman_run_container`'s
+            // emission (see lib.rs) for macOS dev parity.
+            for p in &ports {
+                args.push("-p".into());
+                let suffix = match p.protocol {
+                    crate::ContainerProtocol::Udp => "/udp",
+                    crate::ContainerProtocol::Tcp => "",
+                };
+                args.push(format!("127.0.0.1:{}:{}{suffix}", p.host_port, p.container_port));
+            }
             args.push(image.clone());
             let status = Command::new(bin)
                 .args(&args)
@@ -333,7 +354,14 @@ impl CellBackend for MockBackend {
                 self.containers.lock().await.remove(&cell.id);
                 return Err(e);
             }
-            // Front the container with the multiplexed tunnel server.
+            // Front the container with the tunnel server. Non-HTTP services
+            // (`func.raw_proxy`: gRPC / raw TCP — Postgres, Minecraft, …) get a
+            // genuine raw byte splice to the container's published loopback
+            // port; HTTP-family services keep the existing HTTP-framed
+            // multiplexed path unchanged. (UDP needs a separate datagram relay
+            // targeting the published `/udp` loopback port directly — see the
+            // extension-point note in `podman_run_container`.)
+            let raw_proxy = func.raw_proxy;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let tunnel_addr = listener.local_addr()?.to_string();
             let max_conc = func.max_concurrency.max(1);
@@ -342,7 +370,17 @@ impl CellBackend for MockBackend {
                     match listener.accept().await {
                         Ok((conn, _)) => {
                             let local = func_addr.clone();
-                            tokio::spawn(async move { fluid_tunnel::TunnelServer::serve(conn, local, max_conc).await; });
+                            tokio::spawn(async move {
+                                if raw_proxy {
+                                    fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
+                                } else {
+                                    // serve_maybe_raw: lets edge.rs's local WS splice open a
+                                    // raw connection to this same listener (magic-byte-gated,
+                                    // see TunnelServer::serve_maybe_raw), byte-identical for
+                                    // every ordinary framed request.
+                                    fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                                }
+                            });
                         }
                         Err(_) => break,
                     }
@@ -409,7 +447,10 @@ impl CellBackend for MockBackend {
 
         // Front the function with a multiplexed tunnel server (the mock
         // equivalent of the in-VM cell agent). The gateway connects ONE tunnel
-        // here and multiplexes all requests over it.
+        // here and multiplexes all requests over it. A non-HTTP process
+        // function (`func.raw_proxy`) is spliced raw instead — same
+        // per-protocol branch as the container paths.
+        let raw_proxy = func.raw_proxy;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let tunnel_addr = listener.local_addr()?.to_string();
         let max_conc = func.max_concurrency.max(1);
@@ -420,7 +461,14 @@ impl CellBackend for MockBackend {
                     Ok((conn, _)) => {
                         let local = func_addr_for_task.clone();
                         tokio::spawn(async move {
-                            fluid_tunnel::TunnelServer::serve(conn, local, max_conc).await;
+                            if raw_proxy {
+                                fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
+                            } else {
+                                // serve_maybe_raw: lets edge.rs's local WS splice open a raw
+                                // connection to this same listener (magic-byte-gated), byte-
+                                // identical for every ordinary framed request.
+                                fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                            }
                         });
                     }
                     Err(_) => break,

@@ -38,6 +38,13 @@ struct Instance {
     cell_id: CellId,
     handle: hive_backend::CellHandle,
     endpoint: CellEndpoint,
+    /// Loopback UDP publishes of this instance's container (container_port →
+    /// host_port), chosen at cold start. This is the "instance registry" surface
+    /// hive-cloud's UDP relay resolves the LOCAL datagram leg from (via
+    /// [`Lease::udp_host_port`]) — datagrams cannot ride the TCP tunnel
+    /// `endpoint`, so they go straight at `127.0.0.1:<host_port>`. Empty for
+    /// non-container functions and containers with no declared UDP specs.
+    udp_ports: Vec<hive_core::UdpPublish>,
     inflight: u32,
     started_at_ms: u64,
     last_active_ms: u64,
@@ -621,18 +628,51 @@ impl Fluid {
             let reg = self.registry.lock();
             let pool = reg.get(key).ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
             let port = free_port()?;
+            // CONTAINER functions publish every declared UDP port spec on its own
+            // loopback host port (`-p 127.0.0.1:<host>:<container>/udp`) so the
+            // UDP relay has a local datagram leg — datagrams cannot ride the TCP
+            // tunnel. Host ports are probed as real UDP binds; a failed probe
+            // skips that spec LOUDLY (the app's other ports still serve) rather
+            // than failing the whole cold start over an auxiliary publish.
+            let udp_ports: Vec<hive_core::UdpPublish> =
+                if pool.cfg.start_cmd.first().map(String::as_str) == Some("__container__") {
+                    let mut seen = std::collections::BTreeSet::new();
+                    pool.cfg
+                        .ports
+                        .iter()
+                        .filter(|s| s.protocol == fluid_core::ServiceProtocol::Udp && seen.insert(s.container_port))
+                        .filter_map(|s| match free_udp_port() {
+                            Ok(hp) => Some(hive_core::UdpPublish { container_port: s.container_port, host_port: hp }),
+                            Err(e) => {
+                                warn!(func = %key, container_port = s.container_port, error = %e, "no free loopback UDP host port; skipping this UDP publish");
+                                None
+                            }
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let launch = FunctionLaunch {
                 start_cmd: pool.cfg.start_cmd.clone(),
                 env: pool.cfg.env.clone(),
                 workdir: Some(pool.workdir.clone()),
                 port,
                 max_concurrency: pool.cfg.max_concurrency,
-                // Carry the container memory ceiling to the backend's podman path.
+                // Carry the container memory/cpus/pids ceilings to the backend's
+                // podman path (cpus/pids ignored for microVM/process functions).
                 memory_mib: pool.cfg.memory_mib,
+                cpus: pool.cfg.cpus,
+                pids: pool.cfg.pids,
                 // The single resolved runtime signal for this launch — explicit
                 // config wins, else inferred from argv. Every backend/guest agent
                 // reads THIS instead of re-sniffing start_cmd independently.
                 runtime: hive_core::Runtime::resolve(&pool.cfg.runtime, &pool.cfg.start_cmd),
+                // Non-HTTP protocol (gRPC/TCP/UDP): the backend must front this
+                // function's local tunnel hop with a RAW byte splice, never the
+                // HTTP-framed tunnel path (which would corrupt e.g. Postgres /
+                // Minecraft wire bytes by HTTP-parsing them).
+                raw_proxy: pool.cfg.needs_raw_proxy(),
+                udp_ports,
             };
             (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
         };
@@ -643,7 +683,24 @@ impl Fluid {
         let container = if launch.start_cmd.first().map(String::as_str) == Some("__container__") {
             Some(hive_backend::ContainerSpec {
                 image: launch.start_cmd.get(1).cloned().unwrap_or_default(),
-                port: launch.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080),
+                // Single TCP entry (the common shape): container port from
+                // start_cmd[2], host port = the launch's assigned free port —
+                // same (container, host) pairing the backends build from
+                // `func.start_cmd`/`func.port` in their podman paths.
+                ports: {
+                    let mut ports = vec![hive_backend::ContainerPort::tcp(
+                        launch.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080),
+                        launch.port,
+                    )];
+                    // Declared UDP specs publish alongside the primary TCP port
+                    // (same mapping the backends emit from `launch.udp_ports`).
+                    ports.extend(launch.udp_ports.iter().map(|u| hive_backend::ContainerPort {
+                        container_port: u.container_port,
+                        host_port: u.host_port,
+                        protocol: hive_backend::ContainerProtocol::Udp,
+                    }));
+                    ports
+                },
             })
         } else {
             None
@@ -692,6 +749,7 @@ impl Fluid {
                     cell_id: cell_id.clone(),
                     handle: handle.clone(),
                     endpoint: endpoint.clone(),
+                    udp_ports: launch.udp_ports.clone(),
                     inflight: 1, // this lease
                     started_at_ms: now_ms(),
                     last_active_ms: now_ms(),
@@ -1002,6 +1060,24 @@ impl Lease {
     pub fn cell_id(&self) -> &CellId {
         &self.cell_id
     }
+
+    /// The loopback host port THIS lease's instance publishes `container_port`
+    /// over UDP on (`127.0.0.1:<host_port>`, podman `-p …/udp`) — the local
+    /// datagram leg the UDP relay sends to while holding the lease (so inflight
+    /// accounting keeps the instance alive for the session). `None` when the
+    /// instance publishes no such UDP port (non-container function, or the spec
+    /// wasn't declared/published).
+    pub fn udp_host_port(&self, container_port: u16) -> Option<u16> {
+        let reg = self.fluid.registry.lock();
+        reg.get(&self.key)?
+            .instances
+            .iter()
+            .find(|i| i.cell_id == self.cell_id)?
+            .udp_ports
+            .iter()
+            .find(|u| u.container_port == container_port)
+            .map(|u| u.host_port)
+    }
 }
 
 impl Drop for Lease {
@@ -1026,6 +1102,15 @@ async fn probe(endpoint: &CellEndpoint) -> bool {
 fn free_port() -> anyhow::Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(l.local_addr()?.port())
+}
+
+/// Grab a free UDP port by binding a UDP socket to :0 — a port free for TCP is
+/// not necessarily free for UDP, so UDP publishes get their own probe. (Same
+/// probe-then-release TOCTOU window as [`free_port`]; podman's own bind fails
+/// loudly in the rare race and keep-warm relaunches.)
+fn free_udp_port() -> anyhow::Result<u16> {
+    let s = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    Ok(s.local_addr()?.port())
 }
 
 #[cfg(test)]
@@ -1109,6 +1194,7 @@ mod tests {
                 endpoint: None,
             },
             endpoint: CellEndpoint::Tcp("127.0.0.1:1".into()),
+            udp_ports: Vec::new(),
             inflight: 0,
             started_at_ms: now_ms(),
             last_active_ms: now_ms(),
@@ -1193,6 +1279,7 @@ mod tests {
                 root: std::path::PathBuf::from("/tmp"), endpoint: None,
             },
             endpoint: CellEndpoint::Tcp("127.0.0.1:1".into()),
+            udp_ports: Vec::new(),
             inflight, started_at_ms: now_ms(), last_active_ms: now_ms(), draining,
             requests_served: 0,
         });

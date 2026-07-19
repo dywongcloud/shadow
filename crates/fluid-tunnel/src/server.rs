@@ -1,5 +1,24 @@
 //! Instance-side tunnel: demux requests, proxy to the local function over HTTP
 //! concurrently, push in-band metrics, and nack when at capacity.
+//!
+//! Two serving modes, chosen per-function by the backend that fronts it:
+//! * [`TunnelServer::serve`] — the HTTP-framed multiplexed path (the default).
+//! * [`TunnelServer::serve_raw`] — a plain bidirectional byte splice for
+//!   non-HTTP protocols (`needs_raw_proxy()`), with no framing whatsoever.
+//!
+//! A THIRD mode exists for an HTTP-protocol function that ALSO needs an
+//! occasional raw escape on ONE connection — a WebSocket upgrade, which
+//! cannot ride the multiplexed frame format (it needs the whole connection,
+//! unframed, for the life of the upgraded session):
+//! * [`TunnelServer::serve_maybe_raw`] — peeks the connection's first byte
+//!   (non-consuming, `TcpStream::peek`); [`RAW_UPGRADE_MAGIC`] switches this
+//!   ONE connection to [`serve_raw`], anything else (every real HTTP request
+//!   line starts with an uppercase ASCII method letter) is byte-identical
+//!   `serve`. The accept loop that fronts an HTTP-protocol function uses this
+//!   instead of bare `serve` so a caller that knows to send the magic byte
+//!   first (`fluid_gateway`'s local WS splice) can open a raw connection to
+//!   the SAME listener ordinary framed traffic uses, with zero effect on
+//!   every other connection.
 
 use crate::codec::{read_frame, Frame, FrameKind};
 use crate::{Metrics, ReqMeta, RespMeta};
@@ -140,6 +159,71 @@ impl TunnelServer {
         }
         drop(out_tx);
         let _ = writer.await;
+    }
+
+    /// Serve one accepted connection in RAW byte-splice mode: connect a fresh
+    /// TCP stream to `local_addr` (the function/container's published loopback
+    /// port) and copy bytes bidirectionally until either side closes — ZERO
+    /// HTTP framing, parsing, or tunnel-frame codec. This is the serving mode
+    /// for non-HTTP application protocols (`FunctionConfig::needs_raw_proxy()`:
+    /// gRPC / raw TCP wire protocols like Postgres or Minecraft), whose bytes
+    /// the HTTP-framed [`TunnelServer::serve`] path would corrupt by writing an
+    /// HTTP request line at them and chunk-decoding their responses. Same
+    /// proven splice pattern as hive-cloud's `db_gateway` and `edge::ws_proxy`.
+    ///
+    /// TCP-ONLY by design: `copy_bidirectional` is a byte-stream concept and
+    /// does not apply to UDP datagrams. A UDP service's local hop needs a
+    /// separate datagram relay (host UDP socket <-> the container's published
+    /// loopback UDP port, preserving datagram boundaries) — that relay plugs in
+    /// beside this function at the accept-loop branch in hive-backend's podman
+    /// path, NOT here.
+    pub async fn serve_raw<S>(stream: S, local_addr: String)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let mut backend = match TcpStream::connect(&local_addr).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(local = %local_addr, error = %e, "raw splice: local connect failed");
+                return;
+            }
+        };
+        let mut stream = stream;
+        let _ = tokio::io::copy_bidirectional(&mut stream, &mut backend).await;
+    }
+
+    /// First byte a caller writes to switch ONE connection on an
+    /// HTTP-protocol function's listener (normally exclusively `serve`, the
+    /// framed multiplexed path) to a raw splice for that connection alone —
+    /// see [`serve_maybe_raw`](Self::serve_maybe_raw). Chosen outside the
+    /// ASCII range: every real HTTP request line starts with an uppercase
+    /// method letter (`G`/`P`/`H`/…, all < `0x80`), so this can never
+    /// collide with genuine framed traffic.
+    pub const RAW_UPGRADE_MAGIC: u8 = 0xFE;
+
+    /// Peek-and-dispatch entry point for an HTTP-protocol function's
+    /// listener: a plain byte-stream splice for the ONE connection whose
+    /// first byte is [`RAW_UPGRADE_MAGIC`] (magic consumed, never spliced),
+    /// [`serve`](Self::serve) unchanged for every other connection (the
+    /// peek does not consume anything a real request needs). Used by the
+    /// accept loop in place of bare `serve` so a caller that knows the magic
+    /// (`fluid_gateway`'s local WebSocket-upgrade splice) can open a raw
+    /// connection to the SAME listener ordinary framed traffic uses.
+    pub async fn serve_maybe_raw(stream: TcpStream, local_addr: String, max_concurrency: u32) {
+        let mut peek = [0u8; 1];
+        let is_raw = matches!(stream.peek(&mut peek).await, Ok(1) if peek[0] == Self::RAW_UPGRADE_MAGIC);
+        if !is_raw {
+            Self::serve(stream, local_addr, max_concurrency).await;
+            return;
+        }
+        let mut stream = stream;
+        let mut discard = [0u8; 1];
+        // The peek above only inspected the byte; actually consume it here
+        // (a real read, not another peek) so it never leaks into the splice.
+        if stream.read_exact(&mut discard).await.is_err() {
+            return;
+        }
+        Self::serve_raw(stream, local_addr).await;
     }
 }
 

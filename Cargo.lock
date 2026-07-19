@@ -1799,6 +1799,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 
@@ -2468,6 +2469,7 @@ dependencies = [
  "fluid-compute",
  "fluid-core",
  "fluid-gateway",
+ "fluid-tunnel",
  "futures",
  "guardian-db",
  "hive-backend",
@@ -2562,6 +2564,7 @@ dependencies = [
  "bytes",
  "fluid-tunnel",
  "iroh",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

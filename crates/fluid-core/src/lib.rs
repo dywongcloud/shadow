@@ -45,6 +45,222 @@ impl std::fmt::Debug for DeploymentId {
     }
 }
 
+/// Application protocol a service speaks, driving ingress/routing decisions
+/// (Railway-style, configurable per service). Wire representation is the
+/// existing lowercase strings already persisted in deployment records
+/// ("http", "https", "ws", "wss", "grpc", "json-rpc", "tcp", "udp") — this
+/// enum is a drop-in typed replacement for the old bare `String` field, not a
+/// new format. An absent field or a legacy empty string both deserialize to
+/// [`ServiceProtocol::Http`] (backward-compatible with older manifests).
+///
+/// Strict-vs-lenient split (load-bearing — do not collapse the two):
+/// - `FromStr` is STRICT: an unrecognized string is an [`InvalidProtocol`]
+///   error. Deploy-input boundaries (fluid.json ingestion via
+///   [`Manifest::from_json`], compose port suffixes, admin API fields) use it
+///   to reject malformed fresh input with a clear error.
+/// - serde `Deserialize` is LENIENT: an unrecognized string coerces to
+///   [`ServiceProtocol::Http`] with a `tracing::warn!`, NEVER an error. The
+///   pre-enum field was an unvalidated bare `String`, so arbitrary strings
+///   ("h2c", "HTTP", typos) can already sit inside persisted `state.json`
+///   snapshots and gossip-replicated snapshots — and those loaders treat any
+///   deserialize failure as "no state" (`unwrap_or_default()` /
+///   skip-and-continue), so a hard error here would silently WIPE a node's
+///   entire persisted platform state on restart. Loading stored state must
+///   never fail on this field.
+///
+/// HTTP-family protocols (`Http`, `Https`, `Ws`, `Wss`, `JsonRpc`) ride the
+/// normal L7 path. Connection-oriented ones (`Grpc`, `Tcp`, `Udp`) are
+/// spliced as a raw connection cross-node — see [`FunctionConfig::needs_raw_proxy`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ServiceProtocol {
+    Http,
+    Https,
+    Ws,
+    Wss,
+    Grpc,
+    JsonRpc,
+    Tcp,
+    Udp,
+}
+
+impl ServiceProtocol {
+    /// Whether a service speaking this protocol is spliced as a RAW connection
+    /// (vs the buffered/streamed HTTP tunnel) when proxied — gRPC (HTTP/2
+    /// trailers) and raw TCP/UDP. The single source of truth behind
+    /// [`FunctionConfig::needs_raw_proxy`] AND the per-[`PortSpec`]
+    /// public-port-allocation decision (each raw-protocol spec gets its own
+    /// allocated public port; HTTP-family specs ride 80/443 Host routing).
+    /// `json-rpc` stays HTTP-framed (it's HTTP-transported despite the name).
+    pub fn needs_raw_proxy(self) -> bool {
+        matches!(self, ServiceProtocol::Grpc | ServiceProtocol::Tcp | ServiceProtocol::Udp)
+    }
+
+    /// The lowercase wire string for this protocol — the inverse of
+    /// [`ServiceProtocol`]'s `FromStr` impl and the same value serde emits.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceProtocol::Http => "http",
+            ServiceProtocol::Https => "https",
+            ServiceProtocol::Ws => "ws",
+            ServiceProtocol::Wss => "wss",
+            ServiceProtocol::Grpc => "grpc",
+            ServiceProtocol::JsonRpc => "json-rpc",
+            ServiceProtocol::Tcp => "tcp",
+            ServiceProtocol::Udp => "udp",
+        }
+    }
+}
+
+impl Default for ServiceProtocol {
+    /// Matches the pre-enum default ("http", via the old empty-string convention).
+    fn default() -> Self {
+        ServiceProtocol::Http
+    }
+}
+
+impl std::fmt::Display for ServiceProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Error returned when parsing a protocol string that isn't one of the known
+/// values (`http`/`https`/`ws`/`wss`/`grpc`/`json-rpc`/`tcp`/`udp`, or empty).
+/// Carries the invalid input so the caller can surface a clear, actionable
+/// deploy-time error instead of silently defaulting to HTTP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidProtocol(pub String);
+
+impl std::fmt::Display for InvalidProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "unknown protocol {:?} — expected one of: http, https, ws, wss, grpc, json-rpc, tcp, udp",
+            self.0
+        )
+    }
+}
+impl std::error::Error for InvalidProtocol {}
+
+impl std::str::FromStr for ServiceProtocol {
+    type Err = InvalidProtocol;
+
+    /// Strict parse for raw (non-JSON) input — e.g. a compose port suffix, a
+    /// CLI/UI field, a query string — so callers reject malformed protocol
+    /// strings at the point of entry rather than falling through to a silent
+    /// HTTP default. Mirrors the `#[serde(alias = "")]` convention: empty
+    /// string is treated as "http" for backward compatibility.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "" | "http" => Ok(ServiceProtocol::Http),
+            "https" => Ok(ServiceProtocol::Https),
+            "ws" => Ok(ServiceProtocol::Ws),
+            "wss" => Ok(ServiceProtocol::Wss),
+            "grpc" => Ok(ServiceProtocol::Grpc),
+            "json-rpc" => Ok(ServiceProtocol::JsonRpc),
+            "tcp" => Ok(ServiceProtocol::Tcp),
+            "udp" => Ok(ServiceProtocol::Udp),
+            other => Err(InvalidProtocol(other.to_string())),
+        }
+    }
+}
+
+/// LENIENT deserialization — see the strict-vs-lenient split on
+/// [`ServiceProtocol`]. This impl backs every serde path that reads
+/// already-stored state (persisted `state.json` snapshots, gossip-replicated
+/// snapshots, guardian restores) where a hard error would be amplified into
+/// silent total state loss by `unwrap_or_default()`-style loaders. Unknown
+/// strings coerce to `Http` with a warning; deploy-time rejection of unknown
+/// values lives at the input boundaries via the strict `FromStr`.
+impl<'de> Deserialize<'de> for ServiceProtocol {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct ProtocolVisitor;
+        impl serde::de::Visitor<'_> for ProtocolVisitor {
+            type Value = ServiceProtocol;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a protocol string (http, https, ws, wss, grpc, json-rpc, tcp, udp)")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<ServiceProtocol, E> {
+                Ok(v.parse::<ServiceProtocol>().unwrap_or_else(|_| {
+                    tracing::warn!(
+                        protocol = %v,
+                        "unrecognized service protocol in stored/replicated state; defaulting to http"
+                    );
+                    ServiceProtocol::Http
+                }))
+            }
+        }
+        deserializer.deserialize_str(ProtocolVisitor)
+    }
+}
+
+/// One published port + protocol on a service. A single deployment MAY expose
+/// more than one (Docker-Compose/Railway-style multi-port), e.g. a Minecraft
+/// server (`itzg/minecraft-server`) publishing game (25565/tcp), rcon
+/// (25575/tcp), and query (25565/udp) simultaneously. `label` is a free-form,
+/// purely informational identifier surfaced to the user (e.g. "game", "rcon",
+/// "query") — never matched against by routing.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortSpec {
+    pub container_port: u16,
+    #[serde(default)]
+    pub protocol: ServiceProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The PUBLIC port allocated for this spec when its protocol needs raw
+    /// (non-HTTP) ingress — what an external client actually connects to
+    /// (HTTP-family specs ride the shared 80/443 gateway and stay `None`).
+    /// Stamped at deploy time by the platform's raw-port allocator
+    /// (hive-cloud's `raw_ports` module), never user-supplied; the allocation
+    /// is keyed by (project, function, container_port, protocol) so it is
+    /// STABLE across redeploys — a new deployment of the same service is
+    /// re-stamped with the same public port. `None` also for records written
+    /// before the allocator existed (re-allocated on their next deploy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_port: Option<u16>,
+}
+
+impl PortSpec {
+    /// Build a single-port list entry — the compatibility bridge for callers
+    /// that still carry exactly one bare `u16` port (`ImageDeployReq`,
+    /// `ContainerSpec`, and other single-port representations elsewhere in
+    /// the codebase not rewritten in this pass). No `label`: there is no
+    /// multi-port distinction to make with only one port.
+    pub fn single(container_port: u16, protocol: ServiceProtocol) -> PortSpec {
+        PortSpec { container_port, protocol, label: None, public_port: None }
+    }
+
+    /// Same bridge for an `Option<u16>` legacy port field: `None` normalizes
+    /// to an empty port list (nothing declared), `Some(port)` to a
+    /// single-element list via [`PortSpec::single`].
+    pub fn from_legacy_port(port: Option<u16>, protocol: ServiceProtocol) -> Vec<PortSpec> {
+        port.map(|p| vec![PortSpec::single(p, protocol)]).unwrap_or_default()
+    }
+}
+
+/// One ALLOCATED public raw-ingress binding on a deployment: a [`PortSpec`]
+/// whose `public_port` has been stamped by the platform's raw-port allocator,
+/// flattened together with the owning function's name. This is the shape the
+/// generic raw proxy routes on — `public_port` → which function/container port
+/// to splice to, over which protocol — and it rides [`DeploymentInfo`] so the
+/// mapping is visible FLEET-WIDE via the existing deployment gossip (any edge
+/// node must know which public ports exist and who serves them, exactly like
+/// HTTP hosts ride `peer_routes`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawPortBinding {
+    pub public_port: u16,
+    /// Owning function (the [`FunctionConfig`] whose spec was stamped).
+    pub function: String,
+    pub container_port: u16,
+    pub protocol: ServiceProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
 /// A serverless function within a deployment. The server process must listen on
 /// `$PORT` and speak HTTP/1.1.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,6 +278,23 @@ pub struct FunctionConfig {
     pub vcpus: u32,
     #[serde(default = "default_memory")]
     pub memory_mib: u32,
+    /// Per-deployment CPU quota override for a CONTAINER function (podman
+    /// `--cpus`), e.g. 4.0 — from fluid.json `container.cpus` /
+    /// `ImageDeployReq.cpus`. 0.0 = the node's generous env-tunable default
+    /// (`ContainerLimits::default`). Clamped to a fleet-wide ceiling in
+    /// `ContainerLimits::for_container` (`HIVE_CONTAINER_CPUS_MAX`) so one
+    /// tenant's own request can never remove the ceiling entirely. Distinct
+    /// from `vcpus` above (microVM sizing); ignored for microVM/process
+    /// functions.
+    #[serde(default)]
+    pub cpus: f64,
+    /// Per-deployment max-PIDs override for a CONTAINER function's cgroup
+    /// (podman `--pids-limit`) — a fork-bomb guard — from fluid.json
+    /// `container.pids` / `ImageDeployReq.pids`. 0 = the node's default.
+    /// Clamped to a fleet-wide ceiling (`HIVE_CONTAINER_PIDS_MAX`). Ignored
+    /// for microVM/process functions.
+    #[serde(default)]
+    pub pids: u32,
     /// Fluid in-function concurrency: max simultaneous requests per instance.
     #[serde(default = "default_max_concurrency")]
     pub max_concurrency: u32,
@@ -89,26 +322,41 @@ pub struct FunctionConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclude_files: Option<String>,
     /// Application protocol this service speaks, for ingress/routing decisions
-    /// (Railway-style, configurable per service). One of: "http" (default), "https",
-    /// "ws"/"wss", "grpc", "json-rpc", "tcp", "udp". HTTP-family protocols ride the
-    /// normal L7 path; connection-oriented ones ("grpc", "tcp") are spliced as a raw
-    /// connection cross-node so framing (h2 trailers / arbitrary bytes) is preserved.
-    /// Empty string is treated as "http" (backward-compatible with older manifests).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub protocol: String,
+    /// (Railway-style, configurable per service). See [`ServiceProtocol`] for
+    /// the full semantics (wire strings, HTTP-family vs raw-proxied, the
+    /// empty-string/absent-field backward-compat default, and the
+    /// strict-FromStr-vs-lenient-serde split: malformed values are rejected
+    /// at the deploy-input boundary, but stored state always loads).
+    #[serde(default, skip_serializing_if = "is_default_protocol")]
+    pub protocol: ServiceProtocol,
+    /// Forward-looking multi-port representation: every port this service
+    /// publishes, each with its own protocol and an optional label (e.g.
+    /// "game"/"rcon"/"query" for a Minecraft-style multi-port service). Empty
+    /// by default — no call site populates this yet; single-port callers keep
+    /// using their own bare port field and bridge to this shape via
+    /// [`PortSpec::single`]/[`PortSpec::from_legacy_port`] when they migrate.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ports: Vec<PortSpec>,
+}
+
+fn is_default_protocol(p: &ServiceProtocol) -> bool {
+    *p == ServiceProtocol::Http
 }
 
 impl FunctionConfig {
-    /// The effective protocol, normalizing empty/legacy to "http".
+    /// The effective protocol as a wire string, e.g. for logging/headers.
+    /// Callers needing the typed value should use `self.protocol` directly.
     pub fn protocol_or_http(&self) -> &str {
-        if self.protocol.is_empty() { "http" } else { self.protocol.as_str() }
+        self.protocol.as_str()
     }
 
     /// Whether this service needs a RAW connection splice (vs the buffered/streamed
-    /// HTTP tunnel) when proxied cross-node — gRPC (HTTP/2 trailers) and raw TCP.
-    /// These are spliced byte-for-byte like a WebSocket so framing survives the mesh.
+    /// HTTP tunnel) when proxied cross-node — gRPC (HTTP/2 trailers) and raw
+    /// TCP/UDP. These are spliced byte-for-byte like a WebSocket so framing
+    /// survives the mesh; `json-rpc` stays HTTP-framed (it's HTTP-transported
+    /// despite the name), matching the existing grpc/json-rpc distinction.
     pub fn needs_raw_proxy(&self) -> bool {
-        matches!(self.protocol_or_http(), "grpc" | "tcp")
+        self.protocol.needs_raw_proxy()
     }
 }
 
@@ -144,6 +392,8 @@ impl Default for FunctionConfig {
             env: BTreeMap::new(),
             vcpus: default_vcpus(),
             memory_mib: default_memory(),
+            cpus: 0.0,
+            pids: 0,
             max_concurrency: default_max_concurrency(),
             min_instances: 0,
             max_instances: default_max_instances(),
@@ -152,7 +402,8 @@ impl Default for FunctionConfig {
             regions: Vec::new(),
             include_files: None,
             exclude_files: None,
-            protocol: String::new(),
+            protocol: ServiceProtocol::default(),
+            ports: Vec::new(),
         }
     }
 }
@@ -744,13 +995,81 @@ pub struct Manifest {
     pub origin_function: Option<String>,
 }
 
+/// Strict deploy-time protocol validation for raw `fluid.json` text: walk
+/// every `functions[*].protocol` and `functions[*].ports[*].protocol` string
+/// in the RAW JSON and reject unrecognized values via the strict
+/// `ServiceProtocol::FromStr`. Must run on the raw text (not the deserialized
+/// [`Manifest`]) because the lenient serde impl has already coerced unknowns
+/// to `http` by the time the typed value exists. Non-string values are left
+/// for serde to reject with its own type error.
+fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
+    use serde::de::Error as _;
+    let raw: serde_json::Value = serde_json::from_str(s)?;
+    let Some(functions) = raw.get("functions").and_then(|f| f.as_array()) else {
+        return Ok(());
+    };
+    for f in functions {
+        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("<unnamed>");
+        let mut check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
+            if let Some(p) = v.as_str() {
+                p.parse::<ServiceProtocol>()
+                    .map_err(|e| serde_json::Error::custom(format!("function {name:?}{ctx}: {e}")))?;
+            }
+            Ok(())
+        };
+        if let Some(p) = f.get("protocol") {
+            check(p, "")?;
+        }
+        if let Some(ports) = f.get("ports").and_then(|p| p.as_array()) {
+            for (i, port) in ports.iter().enumerate() {
+                if let Some(p) = port.get("protocol") {
+                    check(p, &format!(" ports[{i}]"))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Manifest {
+    /// Parse a fresh, user-authored `fluid.json`. This is a DEPLOY-INPUT
+    /// boundary, so unknown protocol strings are a hard, clearly-worded error
+    /// here — checked against the RAW strings via the strict
+    /// `ServiceProtocol::FromStr` BEFORE the lenient serde impl coerces them
+    /// to `http` (see the strict-vs-lenient split on [`ServiceProtocol`]).
+    /// Persisted-state loaders must NOT go through this function; they
+    /// deserialize [`Manifest`] directly and get the lenient behavior.
     pub fn from_json(s: &str) -> Result<Manifest, serde_json::Error> {
+        validate_protocols_strict(s)?;
         serde_json::from_str(s)
     }
 
     pub fn function(&self, name: &str) -> Option<&FunctionConfig> {
         self.functions.iter().find(|f| f.name == name)
+    }
+
+    /// Every STAMPED raw-ingress binding in this manifest (specs whose
+    /// `public_port` the raw-port allocator filled in) — the flattened
+    /// `public_port` → function/container-port/protocol view the generic raw
+    /// proxy serves, also surfaced on [`DeploymentInfo`] so it gossips
+    /// fleet-wide. Only raw-protocol specs ever get stamped, so this is empty
+    /// for HTTP-only deployments.
+    pub fn raw_port_bindings(&self) -> Vec<RawPortBinding> {
+        let mut out = Vec::new();
+        for f in &self.functions {
+            for spec in &f.ports {
+                if let Some(pp) = spec.public_port {
+                    out.push(RawPortBinding {
+                        public_port: pp,
+                        function: f.name.clone(),
+                        container_port: spec.container_port,
+                        protocol: spec.protocol,
+                        label: spec.label.clone(),
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Resolve a request path to a route target using longest-prefix match.
@@ -1119,6 +1438,24 @@ pub struct GitDeployRequest {
     /// placement never recurses.
     #[serde(default)]
     pub no_fanout: bool,
+    /// Set by the coordinator on every per-target deploy of a MULTI-target
+    /// fanout EXCEPT the designated primary (the first placement target). A
+    /// `no_fanout` sub-build skips the coordinator's placement gates entirely,
+    /// so this flag is how the stateful/single-writer fanout guard reaches the
+    /// pure-remote fanout path: at initial placement a Dockerfile/compose
+    /// deploy's container-ness (and thus statefulness) is UNKNOWN, so the
+    /// coordinator may legitimately fan an unknown deploy out to several
+    /// regions — and only each target's own build discovers whether the result
+    /// is a stateful single-writer service (container volume / raw protocol).
+    /// A target that discovers it IS stateful while `fanout_secondary` is true
+    /// declines to host (see the guard in `git.rs::run_build`), collapsing the
+    /// deploy to the primary region instead of silently creating independent,
+    /// diverging per-region volumes (split-brain). False (the default) on
+    /// direct deploys, single-target dispatches, and the primary target —
+    /// stateless multi-region fanout is unaffected because the guard also
+    /// requires the post-build stateful signal.
+    #[serde(default)]
+    pub fanout_secondary: bool,
     /// Project BuildConfig (framework/install/build/output/root), forwarded by the
     /// coordinator on a fanout deploy so the target builds with the SAME settings
     /// the user configured — not just whatever it auto-detects. Opaque JSON to
@@ -1154,6 +1491,34 @@ pub struct GitDeployRequest {
     /// is auto-detected from the image's `ExposedPorts` (falling back to 8080).
     #[serde(default)]
     pub image_port: Option<u16>,
+    /// Optional explicit protocol for an `image_ref` deploy (Railway-style; see
+    /// [`ServiceProtocol`]), e.g. `Udp` for a UDP-only service (Minecraft Bedrock,
+    /// port 19132/udp — an image exposing no TCP port at all can't be auto-detected
+    /// as anything but this). `None` falls back to whatever `image_container_manifest`
+    /// (hive-cloud) detects from the image's `ExposedPorts` alongside `image_port`
+    /// (defaulting to `Http` when nothing is exposed either). Independent of
+    /// `image_port`: either may be set without the other — the resolution order lives
+    /// in `image_container_manifest`, not here.
+    #[serde(default)]
+    pub image_protocol: Option<ServiceProtocol>,
+    /// Memory ceiling override for an `image_ref` deploy's container, e.g. "4g",
+    /// "2048m", "512" — same string format/semantics as a Dockerfile-build
+    /// project's fluid.json `container.memory`. `None` = the node's generous
+    /// env-tunable default. Always clamped to a fleet-wide ceiling
+    /// (`ContainerLimits::for_container`) so a request can never remove the
+    /// ceiling entirely.
+    #[serde(default)]
+    pub image_memory: Option<String>,
+    /// CPU quota override for an `image_ref` deploy's container, e.g. "2.0",
+    /// "0.5" — same format as fluid.json `container.cpus`. `None` = the node's
+    /// default. Clamped fleet-wide.
+    #[serde(default)]
+    pub image_cpus: Option<String>,
+    /// Max-PIDs override for an `image_ref` deploy's container cgroup (fork-bomb
+    /// guard) — same as fluid.json `container.pids`. `None` = the node's
+    /// default. Clamped fleet-wide.
+    #[serde(default)]
+    pub image_pids: Option<u32>,
     /// GitHub access token for cloning a PRIVATE repo. Injected on the build node as
     /// `https://x-access-token:<token>@github.com/...` basic auth for the `git clone`
     /// only — never written into `repo_url`, never logged (clone stderr is scrubbed),
@@ -1208,6 +1573,15 @@ pub struct DeploymentInfo {
     /// Owning team/tenant slug (empty = "personal").
     #[serde(default)]
     pub tenant: String,
+    /// Allocated public raw-ingress bindings (TCP/UDP/gRPC public ports stamped
+    /// on this deployment's manifest by the raw-port allocator). Carried here —
+    /// unlike the rest of the manifest — because the generic raw proxy on EVERY
+    /// edge node needs the fleet-wide `public_port` → deployment mapping, and
+    /// `DeploymentInfo` is exactly what the `/v1/fleet-deployments` gossip
+    /// already replicates into each node's `peer_deployments`. Empty for
+    /// HTTP-only deployments and for peers running older binaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub raw_ports: Vec<RawPortBinding>,
 }
 fn default_ready() -> DeployState {
     DeployState::Ready
@@ -1325,22 +1699,69 @@ mod routing_tests {
         assert_eq!(f.protocol_or_http(), "http");
         assert!(!f.needs_raw_proxy());
         // json-rpc + ws ride the normal HTTP/L7 path (not raw).
-        f.protocol = "json-rpc".into();
+        f.protocol = ServiceProtocol::JsonRpc;
         assert!(!f.needs_raw_proxy());
-        f.protocol = "ws".into();
+        f.protocol = ServiceProtocol::Ws;
         assert!(!f.needs_raw_proxy());
-        // grpc + tcp are connection-spliced cross-node.
-        f.protocol = "grpc".into();
+        // grpc + tcp + udp are connection-spliced cross-node.
+        f.protocol = ServiceProtocol::Grpc;
         assert_eq!(f.protocol_or_http(), "grpc");
         assert!(f.needs_raw_proxy());
-        f.protocol = "tcp".into();
+        f.protocol = ServiceProtocol::Tcp;
         assert!(f.needs_raw_proxy());
-        // An empty protocol is skipped on the wire (backward-compatible manifests).
+        f.protocol = ServiceProtocol::Udp;
+        assert_eq!(f.protocol_or_http(), "udp");
+        assert!(f.needs_raw_proxy());
+        // A default (http) protocol is skipped on the wire (backward-compatible manifests).
         let j = serde_json::to_string(&FunctionConfig::default()).unwrap();
-        assert!(!j.contains("\"protocol\""), "empty protocol omitted from JSON");
+        assert!(!j.contains("\"protocol\""), "default protocol omitted from JSON");
         // And a manifest without `protocol` deserializes to the http default.
         let back: FunctionConfig = serde_json::from_str(&j).unwrap();
         assert_eq!(back.protocol_or_http(), "http");
+        // Legacy empty-string protocol (old manifests) still deserializes to http.
+        let legacy: FunctionConfig =
+            serde_json::from_str(r#"{"name":"f","start_cmd":[],"protocol":""}"#).unwrap();
+        assert_eq!(legacy.protocol, ServiceProtocol::Http);
+        // Every known wire string round-trips through serde.
+        for (variant, wire) in [
+            (ServiceProtocol::Http, "http"),
+            (ServiceProtocol::Https, "https"),
+            (ServiceProtocol::Ws, "ws"),
+            (ServiceProtocol::Wss, "wss"),
+            (ServiceProtocol::Grpc, "grpc"),
+            (ServiceProtocol::JsonRpc, "json-rpc"),
+            (ServiceProtocol::Tcp, "tcp"),
+            (ServiceProtocol::Udp, "udp"),
+        ] {
+            assert_eq!(variant.as_str(), wire);
+            assert_eq!(wire.parse::<ServiceProtocol>().unwrap(), variant);
+            let stored: FunctionConfig = serde_json::from_str(&format!(
+                r#"{{"name":"f","start_cmd":[],"protocol":"{wire}"}}"#
+            ))
+            .unwrap();
+            assert_eq!(stored.protocol, variant, "stored deployment protocol {wire:?} must round-trip");
+        }
+        // Strict-vs-lenient split: FromStr (the deploy-input boundary) rejects
+        // unknown strings; serde Deserialize (the stored-state path) NEVER
+        // fails on them — it coerces to http (see lenient_deserialize tests).
+        assert!("quic".parse::<ServiceProtocol>().is_err());
+        // PortSpec compatibility bridge from a legacy bare `Option<u16>` port.
+        assert_eq!(PortSpec::from_legacy_port(None, ServiceProtocol::Tcp), vec![]);
+        assert_eq!(
+            PortSpec::from_legacy_port(Some(25565), ServiceProtocol::Tcp),
+            vec![PortSpec::single(25565, ServiceProtocol::Tcp)]
+        );
+        // FunctionConfig.ports is empty by default and round-trips when set
+        // (e.g. a Minecraft-style multi-port service).
+        assert!(FunctionConfig::default().ports.is_empty());
+        f.ports = vec![
+            PortSpec { container_port: 25565, protocol: ServiceProtocol::Tcp, label: Some("game".into()), public_port: None },
+            PortSpec { container_port: 25575, protocol: ServiceProtocol::Tcp, label: Some("rcon".into()), public_port: None },
+            PortSpec { container_port: 25565, protocol: ServiceProtocol::Udp, label: Some("query".into()), public_port: None },
+        ];
+        let j2 = serde_json::to_string(&f).unwrap();
+        let back2: FunctionConfig = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2.ports, f.ports);
     }
 
     #[test]
@@ -1565,6 +1986,57 @@ mod routing_tests {
         ] {
             assert!(c.code().chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'));
         }
+    }
+
+    #[test]
+    fn stored_state_with_unknown_protocol_loads_leniently_as_http() {
+        // The data-loss landmine this guards: the pre-enum protocol field was
+        // an unvalidated bare String, so persisted snapshots / gossip payloads
+        // can contain arbitrary strings ("h2c", "HTTP", typos) — and both
+        // loaders (persist::load's unwrap_or_default, guardian's
+        // skip-on-parse-failure) turn a deserialize error into total silent
+        // state loss. Deserialize must therefore NEVER fail on this field.
+        let f: FunctionConfig =
+            serde_json::from_str(r#"{"name":"f","start_cmd":[],"protocol":"h2c"}"#)
+                .expect("unknown stored protocol must NOT fail deserialization");
+        assert_eq!(f.protocol, ServiceProtocol::Http);
+        // Same through the snapshot-shaped nesting (DeployRecord -> Manifest
+        // -> FunctionConfig, the exact chain inside PlatformSnapshot), plus a
+        // legacy-cased value and an unknown ports[].protocol.
+        let json = r#"{"id":"d1","project":"p","root":"/tmp","manifest":{"project":"p",
+            "functions":[{"name":"api","start_cmd":["node"],"protocol":"HTTP",
+                          "ports":[{"container_port":9,"protocol":"h2c"}]}]},
+            "created_at_ms":0,"creator":"you","git":null,"production":true}"#;
+        let rec: DeployRecord =
+            serde_json::from_str(json).expect("stored snapshot row must load despite bad protocol");
+        assert_eq!(rec.manifest.functions[0].protocol, ServiceProtocol::Http);
+        assert_eq!(rec.manifest.functions[0].ports[0].protocol, ServiceProtocol::Http);
+    }
+
+    #[test]
+    fn manifest_from_json_still_rejects_unknown_protocol_in_fresh_input() {
+        // Deploy-input boundary stays STRICT: from_json checks the raw
+        // strings before lenient serde can coerce them.
+        let err = Manifest::from_json(
+            r#"{"project":"p","functions":[{"name":"api","start_cmd":["node"],"protocol":"h2c"}]}"#,
+        )
+        .expect_err("unknown protocol in fresh fluid.json must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("h2c") && msg.contains("unknown protocol"), "clear error, got: {msg}");
+        // ports[].protocol is validated too.
+        assert!(Manifest::from_json(
+            r#"{"project":"p","functions":[{"name":"api","start_cmd":["node"],
+                "ports":[{"container_port":9,"protocol":"htp"}]}]}"#,
+        )
+        .is_err());
+        // Known values (and legacy empty string) still parse fine.
+        let ok = Manifest::from_json(
+            r#"{"project":"p","functions":[{"name":"api","start_cmd":["node"],"protocol":"grpc"},
+                                            {"name":"web","start_cmd":["node"],"protocol":""}]}"#,
+        )
+        .expect("valid manifest must parse");
+        assert_eq!(ok.functions[0].protocol, ServiceProtocol::Grpc);
+        assert_eq!(ok.functions[1].protocol, ServiceProtocol::Http);
     }
 
     #[test]

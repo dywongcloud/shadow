@@ -1224,12 +1224,17 @@ pub(crate) async fn deploy_zip(
         root_dir: None,
         env: meta.env,
         no_fanout: false, // coordinator deploy → schedule + fanout (ships the zip to the region node)
+        fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
         build_config: None,
         function_settings: None,
         redeploy: false,
         zip_b64: Some(zip_b64),
         image_ref: None,
         image_port: None,
+        image_protocol: None,
+        image_memory: None, // zip upload has no image_ref, so no container override to carry
+        image_cpus: None,
+        image_pids: None,
         git_token: None, // zip upload has no git clone
     };
     start_named_deploy(&c, &t, req).await
@@ -1241,9 +1246,37 @@ pub(crate) struct ImageDeployReq {
     image: String,
     #[serde(default)]
     project: Option<String>,
-    /// Explicit container port; auto-detected from the image when omitted.
+    /// Explicit container port; auto-detected from the image's `ExposedPorts` when
+    /// omitted (see `image_container_manifest` in `git.rs`).
     #[serde(default)]
     port: Option<u16>,
+    /// Explicit protocol override (Railway-style; see `fluid_core::ServiceProtocol`).
+    /// Independent of `port` — either may be given without the other. Needed for any
+    /// image whose auto-detected default (http) is wrong, and REQUIRED for a
+    /// UDP-only image (e.g. Minecraft Bedrock, port 19132/udp, no TCP port at all —
+    /// there is no TCP port for auto-detection to find, let alone default to http).
+    #[serde(default)]
+    protocol: Option<fluid_core::ServiceProtocol>,
+    /// Memory ceiling override for the container, e.g. "4g", "2048m", "512" —
+    /// same format/semantics as a Dockerfile-build project's fluid.json
+    /// `container.memory`. Omitted/None = the node's generous env-tunable
+    /// default. Always clamped to a fleet-wide ceiling
+    /// (`ContainerLimits::for_container`) so a request can never remove the
+    /// ceiling entirely — gives registry-image deploys (e.g.
+    /// `itzg/minecraft-server`) the same resource-override parity the
+    /// Dockerfile-build path already has via fluid.json.
+    #[serde(default)]
+    memory: Option<String>,
+    /// CPU quota override for the container, e.g. "2.0", "0.5" — same format as
+    /// fluid.json `container.cpus`. Omitted/None = the node's default. Clamped
+    /// fleet-wide.
+    #[serde(default)]
+    cpus: Option<String>,
+    /// Max-PIDs override for the container's cgroup (fork-bomb guard) — same as
+    /// fluid.json `container.pids`. Omitted/None = the node's default. Clamped
+    /// fleet-wide.
+    #[serde(default)]
+    pids: Option<u32>,
     #[serde(default)]
     env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -1283,12 +1316,17 @@ pub(crate) async fn deploy_image(
         root_dir: None,
         env: body.env,
         no_fanout: false, // coordinator deploy → schedule + fanout to a container node
+        fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
         build_config: None,
         function_settings: None,
         redeploy: body.redeploy.unwrap_or(false),
         zip_b64: None,
         image_ref: Some(image),
         image_port: body.port,
+        image_protocol: body.protocol,
+        image_memory: body.memory,
+        image_cpus: body.cpus,
+        image_pids: body.pids,
         git_token: None, // prebuilt image deploy has no git clone
     };
     start_named_deploy(&c, &t, req).await
@@ -1896,9 +1934,18 @@ async fn dep_create(
     // this route). A project's first deploy still claims the production alias inside
     // `deploy_full` even when `production=false`, so URLs resolve.
     let creator = req.creator.clone().unwrap_or_else(|| "you".into());
+    // Public raw-port allocation: same stable-keyed allocator the git build
+    // path uses (`raw_ports::allocate_raw_ports`) — a direct-API deployment
+    // declaring raw-protocol PortSpecs gets its public ports stamped before
+    // the record is registered/persisted. No-op for HTTP-only manifests.
+    let mut manifest = req.manifest;
+    let project = manifest.project.clone();
+    if let Err(e) = crate::raw_ports::allocate_raw_ports_coordinated(&c, &project, &mut manifest).await {
+        tracing::warn!(project = %project, error = %e, "raw public-port allocation failed for direct deploy (raw ingress unavailable)");
+    }
     let info = c.gw.deploy_full(
         req.root,
-        req.manifest,
+        manifest,
         creator,
         req.git,
         req.production,
@@ -2022,6 +2069,16 @@ async fn dep_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims
     let project = c.gw.remove(&id).await;
     if let Some(p) = &project {
         record_event(&c, p, "delete", &format!("deleted deployment {id}"));
+        // Release the project's PUBLIC raw ports only when this was its LAST
+        // local deployment — superseded records of the same project share the
+        // same stable per-project allocation, so releasing earlier would yank
+        // the port out from under a still-registered record.
+        if !c.gw.list().iter().any(|d| d.project == *p) {
+            let released = crate::raw_ports::release_raw_ports_coordinated(&c, p).await;
+            if !released.is_empty() {
+                tracing::info!(project = %p, ports = ?released, "released public raw port(s) — last deployment deleted");
+            }
+        }
     }
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id, "project": project })))
@@ -2068,6 +2125,15 @@ async fn purge_project_resources(c: &Arc<CloudState>, project: &str, team: &str,
     purge_project_podman_volumes(project).await;
     c.builds.remove_for_project(project);
     purge_project_source_dirs(project).await;
+
+    // Return the project's PUBLIC raw ports (TCP/UDP/gRPC ingress) to the
+    // allocator pool. Runs on every teardown path (direct delete + mesh
+    // cascade) so the durable claim in raw_ports.json never outlives the
+    // project it was allocated for.
+    let released = crate::raw_ports::release_raw_ports_coordinated(c, project).await;
+    if !released.is_empty() {
+        tracing::info!(project, ports = ?released, "released public raw port(s) on project delete");
+    }
 }
 
 /// Remove every volume named `hive-vol-<project>` or `hive-vol-<project>-<service>`
@@ -2348,6 +2414,50 @@ fn source_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_
     best.map(|(_, g)| g)
 }
 
+/// The port + protocol the newest deployment for `project` was actually running with
+/// (its `web` function's declared port, whatever `container_manifest` baked in at
+/// deploy time — an explicit override or the auto-detected value) — LOCAL only (this
+/// node's own `deployment_records`; a project placed entirely on a peer has no
+/// manifest available here, since `peer_deployments`'/`DeploymentInfo` carries no
+/// port info, only `GitSource` — same fleet-locality gap `source_for_project_fleet`
+/// itself only partially closes). Feeds `redeploy_request` so an image redeploy
+/// restores the ORIGINAL port/protocol instead of blindly re-running auto-detection
+/// (which silently drops a manual override, and can't even land on the right answer
+/// for a multi-port image). `None` when there's no prior deployment with a declared
+/// port (no deploy yet, non-container deployment, or the record lives only on a peer).
+fn image_port_spec_for_project_fleet(c: &Arc<CloudState>, project: &str) -> Option<fluid_core::PortSpec> {
+    fn spec_from(f: &fluid_core::FunctionConfig) -> Option<fluid_core::PortSpec> {
+        // Post-fix records carry the real spec directly.
+        if let Some(p) = f.ports.first() {
+            return Some(fluid_core::PortSpec::single(p.container_port, p.protocol));
+        }
+        // Back-compat: a record written before `FunctionConfig.ports` existed —
+        // recover the port from the `__container__` structured marker
+        // (start_cmd = ["__container__", image, port, run_cfg_json], see
+        // `container_manifest`/`image_container_manifest` in git.rs) with whatever
+        // protocol was baked in (pre-fix that was always `http`, so this only ever
+        // recovers a plain TCP/HTTP port — the only kind that could exist before
+        // this patch).
+        if f.runtime == "container" && f.start_cmd.first().map(String::as_str) == Some("__container__") {
+            let port: u16 = f.start_cmd.get(2)?.parse().ok()?;
+            return Some(fluid_core::PortSpec::single(port, f.protocol));
+        }
+        None
+    }
+    let mut best: Option<(u64, fluid_core::PortSpec)> = None;
+    for r in c.gw.deployment_records() {
+        if r.project != project {
+            continue;
+        }
+        let Some(f) = r.manifest.functions.first() else { continue };
+        let Some(spec) = spec_from(f) else { continue };
+        if best.as_ref().map_or(true, |(ts, _)| r.created_at_ms >= *ts) {
+            best = Some((r.created_at_ms, spec));
+        }
+    }
+    best.map(|(_, spec)| spec)
+}
+
 /// Build a placement `Target` addressing a specific node by NAME: self (both None),
 /// its HTTP admin URL when known, else its iroh mesh route. `None` when the node is
 /// unknown/unreachable. Used to pin a zip redeploy to the node holding the source.
@@ -2572,7 +2682,13 @@ fn all_healthy_peers(c: &Arc<CloudState>) -> Vec<String> {
 
 /// Assemble the deploy request for a redeploy from the resolved source. `no_fanout`
 /// pins a zip redeploy to the node holding the retained source (see below); git/image
-/// redeploys leave it false so the normal placement scheduler runs.
+/// redeploys leave it false so the normal placement scheduler runs. `image_port_spec`
+/// is the ORIGINAL port/protocol the project's newest deployment ran with (see
+/// `image_port_spec_for_project_fleet`) — restored onto `image_port`/`image_protocol`
+/// so an image redeploy doesn't silently discard an explicit override (or a
+/// UDP-only image's only possible port) and blindly re-detect from scratch every
+/// time. Harmless to set for a non-image (git/zip) redeploy: `image_ref` stays
+/// `None` there, so `produce_manifest` never even looks at these two fields.
 fn redeploy_request(
     project: &str,
     src: &fluid_core::GitSource,
@@ -2581,6 +2697,7 @@ fn redeploy_request(
     root_dir: Option<String>,
     no_fanout: bool,
     git_token: Option<String>,
+    image_port_spec: Option<fluid_core::PortSpec>,
 ) -> fluid_core::GitDeployRequest {
     fluid_core::GitDeployRequest {
         repo_url: src.repo_url.clone(),
@@ -2600,12 +2717,22 @@ fn redeploy_request(
         root_dir,
         env: None, // redeploy: existing project env is read from the store at build time
         no_fanout,
+        // A pinned zip redeploy (`no_fanout: true`) targets exactly ONE node (the
+        // retained-source holder) — never one-of-many — so it is never a secondary.
+        fanout_secondary: false,
         build_config: None, // coordinator reads its own store; fanout fills these per-target
         function_settings: None,
         redeploy: false, // goes straight to start_build (bypasses git_deploy naming)
         zip_b64: None,
         image_ref: None,
-        image_port: None,
+        image_port: image_port_spec.as_ref().map(|p| p.container_port),
+        image_protocol: image_port_spec.as_ref().map(|p| p.protocol),
+        // Resource overrides (unlike port/protocol above) aren't restored from
+        // the project's deployment history — a redeploy takes the node's
+        // default until the caller re-specifies one.
+        image_memory: None,
+        image_cpus: None,
+        image_pids: None,
         git_token,
     }
 }
@@ -2635,6 +2762,9 @@ async fn project_redeploy(
     let Some(src) = source_for_project_fleet(&c, &project) else {
         return Err((StatusCode::NOT_FOUND, format!("Project '{project}' has no deployment to redeploy yet.")));
     };
+    // Original port/protocol to restore on an image redeploy (see `redeploy_request`'s
+    // doc comment) — resolved once, reused across every branch below.
+    let image_spec = image_port_spec_for_project_fleet(&c, &project);
 
     // Zip-uploaded project: there is no re-fetchable remote — rebuild from the RETAINED
     // source, which lives on the node that built it. Build locally (no re-placement)
@@ -2643,14 +2773,14 @@ async fn project_redeploy(
     // fall through to the normal placement path below.)
     if !src.is_real_git() && src.repo_url.starts_with("upload://") {
         if crate::git::has_local_source(&project) {
-            let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone());
+            let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone(), image_spec.clone());
             let build_id = crate::git::start_build(c.clone(), req);
             return Ok(Json(json!({ "build_id": build_id })));
         }
         if let Some(host) = host_node_for_project(&c, &project) {
             if host != c.node_name {
                 if let Some(t) = target_for_node(&c, &host) {
-                    let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone());
+                    let req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), true, body.git_token.clone(), image_spec.clone());
                     let build_id = crate::git::redeploy_on_host(c.clone(), project.clone(), req, t);
                     return Ok(Json(json!({ "build_id": build_id })));
                 }
@@ -2671,7 +2801,7 @@ async fn project_redeploy(
                 format!("The image reference for '{project}' is unavailable — redeploy from a new image."),
             ));
         };
-        let mut req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), false, body.git_token.clone());
+        let mut req = redeploy_request(&project, &src, target.clone(), body.use_cache, root_dir.clone(), false, body.git_token.clone(), image_spec.clone());
         req.repo_url = String::new();
         req.branch = None;
         req.image_ref = Some(image_ref);
@@ -2680,7 +2810,7 @@ async fn project_redeploy(
     }
 
     // Real git source: re-clone + rebuild through the normal placement/fanout path.
-    let req = redeploy_request(&project, &src, target, body.use_cache, root_dir, false, body.git_token.clone());
+    let req = redeploy_request(&project, &src, target, body.use_cache, root_dir, false, body.git_token.clone(), image_spec);
     let build_id = crate::git::start_build(c.clone(), req);
     Ok(Json(json!({ "build_id": build_id })))
 }
@@ -3027,12 +3157,17 @@ async fn git_webhook(
             root_dir,
             env: None, // git push redeploy: env comes from the project store
             no_fanout: false, // gitops redeploy is a coordinator deploy → schedule + fanout
+            fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
             build_config: None,
             function_settings: None,
             redeploy: false, // webhook push → start_build directly (bypasses git_deploy naming)
             zip_b64: None,
             image_ref: None,
             image_port: None,
+            image_protocol: None,
+            image_memory: None, // git push deploy has no image_ref, so no container override to carry
+            image_cpus: None,
+            image_pids: None,
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),
@@ -6930,7 +7065,16 @@ async fn data_delete(
         return Ok(Json(json!({ "deleted": id })));
     }
     let ok = match collection.as_str() {
-        "deployments" => c.gw.remove(&id).await.is_some(),
+        "deployments" => match c.gw.remove(&id).await {
+            Some(p) => {
+                // Same last-deployment raw-port release as `dep_delete`.
+                if !c.gw.list().iter().any(|d| d.project == p) {
+                    let _ = crate::raw_ports::release_raw_ports_coordinated(&c, &p).await;
+                }
+                true
+            }
+            None => false,
+        },
         "databases" => {
             // Use the RECORD's own owning team (not the operator's `t`) so the
             // queue/vector namespace purge targets the correct tenant.

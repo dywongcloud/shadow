@@ -118,6 +118,15 @@ export default function NewProjectPage() {
   const [urlEnvRows, setUrlEnvRows] = useState<{ k: string; v: string }[]>([{ k: "", v: "" }]);
   const [name, setName] = useState("");
   const [port, setPort] = useState("");
+  // Protocol override + resource overrides (container-image source only) — the
+  // backend's ImageDeployReq accepts these as independent optional overrides;
+  // "" means "let the backend auto-detect / use its default". A raw-protocol
+  // image (Postgres, Minecraft, …) needs `protocol` set explicitly since
+  // auto-detection assumes HTTP, and a UDP-only image (e.g. Minecraft Bedrock,
+  // 19132/udp) has no TCP port for auto-detection to find at all.
+  const [protocol, setProtocol] = useState("");
+  const [memory, setMemory] = useState("");
+  const [cpus, setCpus] = useState("");
   const [gh, setGh] = useState<GhDetail>({ configured: false, connected: false });
   const [repos, setRepos] = useState<GhRepo[]>([]);
   // A reconnect / org-approval prompt shown above the repo list: a dead-but-ACTIVE
@@ -307,6 +316,9 @@ export default function NewProjectPage() {
         creator: "you",
         project: name.trim() ? slug(name) : undefined,
         port: Number.isFinite(p) && p > 0 ? p : undefined,
+        protocol: protocol || undefined,
+        memory: memory.trim() || undefined,
+        cpus: cpus.trim() || undefined,
         env: Object.keys(env).length ? env : undefined,
       });
       const guessed = slug(ref.split("/").pop()?.split(":")[0] || "app");
@@ -388,9 +400,44 @@ export default function NewProjectPage() {
             <div className="flex items-center gap-2">
               <Input className="flex-1 text-xs" placeholder="Project name (optional — derived from the source)"
                 value={name} onChange={(e) => setName(e.target.value)} />
-              <Input className="w-44 text-xs" placeholder="Container port (image only)"
-                value={port} onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))} />
             </div>
+            {/* Container port + protocol (image source only) — a raw-protocol
+                service (Postgres, Minecraft, …) has no Host header to route on
+                and gets its OWN public port instead of the shared HTTP
+                gateway; `protocol` also needs an explicit override for a
+                UDP-only image (e.g. Minecraft Bedrock, 19132/udp — there's no
+                TCP port for auto-detection to find). */}
+            <div className="flex items-center gap-2">
+              <Input className="w-32 text-xs" placeholder="Port (image only)"
+                value={port} onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))} />
+              <select
+                value={protocol}
+                onChange={(e) => setProtocol(e.target.value)}
+                title="Protocol (image only) — required for a raw TCP/UDP/gRPC service like a database or game server"
+                className="rounded-md border border-border bg-card px-2 py-1.5 text-xs"
+              >
+                <option value="">Auto-detect (HTTP)</option>
+                <option value="http">HTTP</option>
+                <option value="https">HTTPS</option>
+                <option value="ws">WebSocket</option>
+                <option value="wss">WebSocket (TLS)</option>
+                <option value="grpc">gRPC</option>
+                <option value="tcp">Raw TCP (databases, game servers)</option>
+                <option value="udp">Raw UDP (e.g. Minecraft Bedrock)</option>
+              </select>
+              <Input className="w-28 text-xs" placeholder="Memory (e.g. 4g)"
+                value={memory} onChange={(e) => setMemory(e.target.value)} />
+              <Input className="w-24 text-xs" placeholder="CPUs (e.g. 2.0)"
+                value={cpus} onChange={(e) => setCpus(e.target.value)} />
+            </div>
+            {protocol === "tcp" || protocol === "udp" ? (
+              <p className="text-xs text-muted">
+                A raw {protocol.toUpperCase()} service gets its own public port (shown on the deployment page once
+                built) — clients connect with a plain <span className="font-mono">host:port</span> address, the
+                same format a Minecraft client&apos;s &quot;Server Address&quot; field or a database connection
+                string expects.
+              </p>
+            ) : null}
             {urlEnvRows.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
                 <Input className="flex-1 font-mono text-xs" placeholder="KEY" value={row.k}

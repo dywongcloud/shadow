@@ -490,6 +490,50 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => {
             jb(crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await)
         }
+        // Fleet-global raw-port allocation coordination (closes the F1
+        // node-local-registry-vs-fleet-global-port-space race): the actual
+        // claim decision runs ONLY on the control-plane leader — a non-leader
+        // receiving this (stale routing, or a peer with an out-of-date view of
+        // who the leader is) refuses rather than racing its own local
+        // registry against the real leader's. See `raw_ports.rs` module doc
+        // and `allocate_raw_ports_coordinated`.
+        "/v1/raw-ports/allocate" if method == hive_p2p::GOSSIP_POST => {
+            if !cloud.is_control_plane_leader() {
+                return jb(axum::Json(serde_json::json!({ "error": "not the control-plane leader" })));
+            }
+            #[derive(serde::Deserialize)]
+            struct Req {
+                project: String,
+                manifest: fluid_core::Manifest,
+            }
+            match serde_json::from_slice::<Req>(body) {
+                Ok(req) => match crate::raw_ports::allocate_raw_ports_records(&req.project, &req.manifest) {
+                    Ok(allocs) => jb(axum::Json(serde_json::json!({ "allocs": allocs }))),
+                    Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+                },
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": format!("malformed request: {e}") }))),
+            }
+        }
+        // Mirror of the allocate arm above, for release — see
+        // `release_raw_ports_coordinated`'s doc for why release must also be
+        // leader-coordinated (a non-leader-only release would leak the claim
+        // in the leader's authoritative registry forever).
+        "/v1/raw-ports/release" if method == hive_p2p::GOSSIP_POST => {
+            if !cloud.is_control_plane_leader() {
+                return jb(axum::Json(serde_json::json!({ "error": "not the control-plane leader" })));
+            }
+            #[derive(serde::Deserialize)]
+            struct Req {
+                project: String,
+            }
+            match serde_json::from_slice::<Req>(body) {
+                Ok(req) => {
+                    let released = crate::raw_ports::release_raw_ports(&req.project);
+                    jb(axum::Json(serde_json::json!({ "released": released })))
+                }
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": format!("malformed request: {e}") }))),
+            }
+        }
         _ => Vec::new(),
     }
 }

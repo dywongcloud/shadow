@@ -12,7 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluid_core::{
-    DeployState, FunctionConfig, GitDeployRequest, GitSource, Manifest, Route, RouteTarget,
+    DeployState, FunctionConfig, GitDeployRequest, GitSource, Manifest, PortSpec, Route,
+    RouteTarget, ServiceProtocol,
 };
 use hive_core::now_ms;
 use parking_lot::Mutex;
@@ -355,7 +356,9 @@ pub(crate) fn redeploy_on_host(
     let bid = id.clone();
     tokio::spawn(async move {
         cloud.builds.log(&bid, format!("Redeploy: dispatching to host node {}", host.node));
-        let ok = fanout_remote(&cloud, &bid, &req, &project, std::slice::from_ref(&host)).await;
+        // Single pinned host = the deploy's one-and-only (primary) target — never
+        // a secondary replica of a multi-region fanout.
+        let ok = fanout_remote(&cloud, &bid, &req, &project, std::slice::from_ref(&host), true).await;
         cloud.builds.update(&bid, |b| {
             b.state = if ok { DeployState::Ready } else { DeployState::Error };
             b.finished_ms = Some(now_ms());
@@ -427,7 +430,23 @@ async fn run_build(
         // Lease-holder-sticky for redeploys: an existing container project's live
         // lease pins the redeploy to its current serving node (see
         // schedule::place_for_project); no lease / new project → normal policy.
-        let targets = crate::schedule::place_for_project(cloud, &project, &regions, req.image_ref.is_some());
+        //
+        // Stateful/single-writer fanout guard: a prebuilt-image deploy is a known
+        // container up front (per the comment above), and per the existing
+        // container-lease single-owner model (`lease.rs`) every container is
+        // treated as stateful for fanout-placement purposes — see
+        // `schedule::place`'s `stateful` doc for why an un-synced multi-region
+        // fanout would silently diverge a container's per-node volume. A
+        // Dockerfile/compose-detected container isn't known yet at this point
+        // (see comment above); once its manifest (and real protocol) exists it
+        // is covered post-build instead — by the multi-region-tail guard below
+        // when THIS node hosts the build, and by the `fanout_secondary`
+        // stateful-replica guard (each dispatched sub-build declines to host if
+        // it turns out stateful and non-primary) on the pure-remote fanout
+        // branch, which never reaches the tail here and whose `no_fanout`
+        // sub-builds skip both of this coordinator's gates.
+        let known_container = req.image_ref.is_some();
+        let targets = crate::schedule::place_for_project(cloud, &project, &regions, known_container, known_container);
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
@@ -458,7 +477,26 @@ async fn run_build(
             // then remove the project from any other node that still hosts it.
             let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             log(format!("Placement: region-aware scheduler → {}", names.join(", ")));
-            let ok = fanout_remote(cloud, bid, &req, &project, &remote).await;
+            // `primary_first: true` — on this branch NO local target was selected,
+            // so `remote` IS the entire placement in region order: remote[0] (the
+            // first requested region's node, matching the region `schedule::place`'s
+            // stateful guard would itself constrain to) is the designated primary;
+            // every other target is dispatched as a `fanout_secondary` replica.
+            // That flag is what closes the stateful-guard hole on this pure-remote
+            // path: a first-time Dockerfile/compose deploy's container-ness is
+            // UNKNOWN here (see `known_container` above), so this placement gate
+            // ran with stateful=false, and each dispatched sub-build carries
+            // `no_fanout: true` — skipping BOTH its own initial placement gate AND
+            // the post-build multi-region tail gate. Without the flag, a stateful
+            // service whose 2+ selected regions exclude the coordinator's own
+            // region would build independently in every region with the guard
+            // consulted nowhere (the exact split-brain it exists to prevent). With
+            // it, each secondary re-evaluates statefulness AFTER its own build and
+            // declines to host if stateful (see the fanout-replica guard in
+            // `run_build`), collapsing the deploy to the primary region only —
+            // while a STATELESS multi-region fanout proceeds on every target
+            // exactly as before.
+            let ok = fanout_remote(cloud, bid, &req, &project, &remote, true).await;
             // Atomic promotion (Vercel convention): only relocate — i.e. remove the
             // project from nodes that still host the PREVIOUS deployment — once the
             // new placement actually built & is serving. A FAILED build must never
@@ -861,7 +899,24 @@ async fn run_build(
     // deploy — Vercel still records the deployment/project — so on error we fall
     // back to a "build failed" page and keep going (build state ends as Error).
     let mut build_failed = false;
-    let mut manifest = match produce_manifest(cloud, bid, &dir, &build_dir, &project, &commit, first_deploy, req.use_cache, req.image_ref.as_deref(), req.image_port).await {
+    let mut manifest = match produce_manifest(
+        cloud,
+        bid,
+        &dir,
+        &build_dir,
+        &project,
+        &commit,
+        first_deploy,
+        req.use_cache,
+        req.image_ref.as_deref(),
+        req.image_port,
+        req.image_protocol,
+        req.image_memory.as_deref(),
+        req.image_cpus.as_deref(),
+        req.image_pids.unwrap_or(0),
+    )
+    .await
+    {
         Ok(m) => m,
         Err(e) => {
             build_failed = true;
@@ -1016,6 +1071,53 @@ async fn run_build(
     // just like the mock backend. So no re-home is needed: the container builds
     // (podman build, below) and serves on whichever node it was placed on.
     let is_container = manifest.functions.iter().any(|f| f.runtime == "container");
+    // Captured here (before `manifest` moves into `deploy_full` below) for the
+    // multi-region-fanout stateful guard in the "Multi-region tail" block further
+    // down. Either signal marks a single-writer service that must not be silently
+    // fanned out to independent, non-synchronized regional replicas: `is_container`
+    // (every container gets its own durable per-node volume — see
+    // `container_volume_cfg` — matching the existing single-owner lease model in
+    // `lease.rs`), or `FunctionConfig::needs_raw_proxy()` (gRPC/TCP/UDP — a
+    // Postgres or Minecraft-style stateful protocol even when NOT containerized).
+    let is_stateful = is_container || manifest.functions.iter().any(|f| f.needs_raw_proxy());
+
+    // ---- Stateful fanout-replica guard (the remote sub-build side) ---------
+    // The coordinator's two placement gates cannot cover the pure-remote fanout
+    // path for a first-time Dockerfile/compose deploy: container-ness (and thus
+    // statefulness) is unknowable before the build runs, so the initial gate ran
+    // with stateful=false, and this sub-build was dispatched with
+    // `no_fanout: true` — which skips both that gate and the post-build
+    // multi-region tail gate on THIS node. `fanout_secondary` is the
+    // coordinator's signal that this build is a NON-PRIMARY member of a
+    // multi-target fanout; now that the build has run, `is_stateful` is finally
+    // known, so this is the first (and only) point where "stateful replica in a
+    // multi-region fanout" is detectable at all on this path. Decline to host:
+    // every container gets a fresh, independent, per-node volume with no
+    // data-sync or leader election (see `schedule::place`'s `stateful` doc), so
+    // hosting here alongside the primary would silently fork state per region
+    // (split-brain Postgres, diverging game-world saves). Collapse to the
+    // primary region with a logged explanation instead of hard-failing — the
+    // same degrade-with-a-warning convention as `schedule::place`'s
+    // explicit-region stateful constraint (and the log line is mirrored into
+    // the coordinator's build record, so the user sees exactly why only one
+    // region hosts). Stateless multi-region fanout is untouched: `is_stateful`
+    // is false for it, so every secondary proceeds to host as before.
+    if is_stateful && req.fanout_secondary {
+        log(
+            "Stateful service detected (container volume / raw single-writer protocol) on a \
+             secondary fanout target: declining to host an independent regional replica — no \
+             data-sync or leader-election exists between fanout replicas, so hosting here would \
+             silently fork this service's state per region (split-brain). The deploy is served \
+             from the primary region only; to run this region instead, select it as the single \
+             region in Function Settings."
+                .into(),
+        );
+        cloud.builds.update(bid, |b| {
+            b.state = DeployState::Ready;
+            b.finished_ms = Some(now_ms());
+        });
+        return Ok(());
+    }
 
     // Build-time bytecode-cache warm-up: precompile the server's bytecode INTO
     // the artifact so a fresh microVM's first hit skips parse/compile. Dispatches
@@ -1059,6 +1161,28 @@ async fn run_build(
             }
             Err(e) => log(format!("WARN: could not deliver build to microVM ({e}); serving may fail.")),
         }
+    }
+
+    // ---- Public raw-port allocation (TCP/UDP/gRPC ingress) -----------------
+    // A raw-protocol service has no Host header to route on, so the shared
+    // 80/443 gateway can't reach it — allocate (or, on a redeploy, RE-USE: the
+    // claim is keyed by project/function/container-port/protocol, not by
+    // deployment id) one public port per declared raw PortSpec, and stamp it
+    // into the manifest BEFORE the record is registered/persisted so the
+    // allocation rides the deployment record fleet-wide. Placed after the
+    // stateful fanout-replica guard above so a declining secondary never
+    // claims ports it will not serve. Allocation failure (range exhausted /
+    // claim not persistable) degrades with a logged warning rather than
+    // failing the whole deploy — HTTP-family routes still work.
+    match crate::raw_ports::allocate_raw_ports_coordinated(cloud, &project, &mut manifest).await {
+        Ok(ports) if !ports.is_empty() => log(format!(
+            "Allocated public raw port(s): {} (stable across redeploys).",
+            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+        )),
+        Ok(_) => {}
+        Err(e) => log(format!(
+            "WARN: could not allocate public raw port(s): {e} — raw TCP/UDP ingress is unavailable for this deployment."
+        )),
     }
 
     // Capture vercel.json crons before the manifest is moved into the gateway —
@@ -1271,12 +1395,22 @@ async fn run_build(
     // the project from nodes that are no longer targets. Only on a clean build.
     if !req.no_fanout && !build_failed {
         let regions = cloud.projects.get(&project).functions.regions;
-        let targets = crate::schedule::place(cloud, &regions, false);
+        // `stateful = is_stateful` (captured above, before `manifest` moved into
+        // `deploy_full`): this is THE fanout hazard site — a container built and
+        // hosted here would otherwise be replicated to every other selected region
+        // with a brand-new, independent, non-synced volume. See
+        // `schedule::place`'s `stateful` doc.
+        let targets = crate::schedule::place(cloud, &regions, false, is_stateful);
         if targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none()) {
             let remote: Vec<crate::schedule::Target> =
                 targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();
             if !remote.is_empty() {
-                let _ = fanout_remote(cloud, bid, &req, &project, &remote).await;
+                // `primary_first: false` — THIS node hosted the build (it is the
+                // primary), so every remote here is an extra-region secondary.
+                // Defense-in-depth: for a stateful deploy `place` above already
+                // constrained the targets to one region, so remotes only exist
+                // for stateless deploys, where the secondary flag is inert.
+                let _ = fanout_remote(cloud, bid, &req, &project, &remote, false).await;
             }
             let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
             cleanup_non_targets(cloud, &project, &names).await;
@@ -1291,12 +1425,23 @@ async fn run_build(
 /// in a Ready state. Each dispatched deploy carries `no_fanout:true` so the
 /// target just builds + hosts (no recursion), the project's current env (so the
 /// target has it even on a redeploy), and the owning team header.
+///
+/// `primary_first`: whether `remote[0]` is the deploy's designated PRIMARY
+/// host (true on the pure-remote placement branch, where the target list IS
+/// the whole placement, and on a single-host pinned redeploy) or the primary
+/// already lives elsewhere (false on the multi-region tail, where THIS
+/// coordinator hosted the build and every remote is an extra region). Every
+/// non-primary target gets `fanout_secondary: true` stamped on its request —
+/// the signal `run_build`'s stateful fanout-replica guard needs, since a
+/// `no_fanout` sub-build skips both coordinator-side placement gates and
+/// otherwise has no way to know it is one of N>1 independent regions.
 async fn fanout_remote(
     cloud: &Arc<CloudState>,
     bid: &str,
     req: &GitDeployRequest,
     project: &str,
     remote: &[crate::schedule::Target],
+    primary_first: bool,
 ) -> bool {
     let log = |s: String| cloud.builds.log(bid, s);
     let team = cloud.projects.team_of(project);
@@ -1306,9 +1451,12 @@ async fn fanout_remote(
     let build_config = cloud.projects.get_if_set(project).map(|s| s.build).and_then(|b| serde_json::to_value(b).ok());
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
     let mut all_ok = true;
-    for t in remote {
+    for (idx, t) in remote.iter().enumerate() {
         let mut dreq = req.clone();
         dreq.no_fanout = true;
+        // Everyone but the designated primary is a secondary replica — see this
+        // fn's doc + the stateful fanout-replica guard in `run_build`.
+        dreq.fanout_secondary = !(primary_first && idx == 0);
         dreq.project = Some(project.to_string());
         dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
         dreq.build_config = build_config.clone();
@@ -1601,13 +1749,22 @@ async fn produce_manifest(
     use_cache: bool,
     image_ref: Option<&str>,
     image_port: Option<u16>,
+    image_protocol: Option<ServiceProtocol>,
+    image_memory: Option<&str>,
+    image_cpus: Option<&str>,
+    image_pids: u32,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
     // port, and run it as a container with an automatic persistent volume + env. No
     // Dockerfile build, no framework detection.
     if let Some(image) = image_ref {
-        return image_container_manifest(cloud, bid, project, image, image_port).await;
+        // Same override format/semantics as the Dockerfile-build path's fluid.json
+        // `container` block below — parsed here since an image deploy has no
+        // repo/fluid.json of its own to read.
+        let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
+        let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
+        return image_container_manifest(cloud, bid, project, image, image_port, image_protocol, mem_mib, cpus, image_pids).await;
     }
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
@@ -1632,10 +1789,13 @@ async fn produce_manifest(
             None => parse_expose(&dockerfile).await.unwrap_or(8080),
         };
         let protocol = ovr.protocol.unwrap_or_else(|| "http".to_string());
-        // Memory ceiling: an explicit fluid.json `container.memory`, else 0 =
-        // "use the node's generous default" (never the old 512m that OOM-killed
-        // real monolith containers). This is baked into the manifest.
+        // Memory/cpus/pids ceilings: an explicit fluid.json `container.memory`/
+        // `cpus`/`pids`, else 0/0.0 = "use the node's generous default" (never
+        // the old hardcoded 512m that OOM-killed real monolith containers).
+        // These are baked into the manifest.
         let mem_mib = ovr.memory.as_deref().map(parse_mem_mib).unwrap_or(0);
+        let cpus = ovr.cpus.as_deref().map(parse_cpus_quota).unwrap_or(0.0);
+        let pids = ovr.pids.unwrap_or(0);
         let t1 = now_ms();
         // Single-image build, no compose networking involved (unlike
         // `build_compose_manifest`, which stays on podman — see that
@@ -1673,7 +1833,7 @@ async fn produce_manifest(
         }
         anyhow::ensure!(out.status.success(), "{bin} build failed");
         log(format!("Image built: {image} ({}ms), port {exposed} ({protocol})", now_ms().saturating_sub(t1)));
-        Ok(container_manifest(project, &image, exposed, &protocol, mem_mib))
+        Ok(container_manifest(project, &image, exposed, &protocol, mem_mib, cpus, pids))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
@@ -3329,7 +3489,14 @@ pub(crate) fn project_net(project: &str) -> (String, String, String) {
     )
 }
 
-fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str, memory_mib: u32) -> Manifest {
+fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str, memory_mib: u32, cpus: f64, pids: u32) -> Manifest {
+    // `protocol` is a free-form string here (Railway-style `fluid.json` override for
+    // the Dockerfile-build path, or an already-resolved wire string from an image
+    // deploy) — parse it into the typed enum, falling back to the http default for
+    // anything unrecognized rather than rejecting the build outright (this synthesis
+    // step has never validated the string; `FunctionConfig`'s own JSON deserialize
+    // boundary is where a genuinely malformed value is rejected hard).
+    let proto: ServiceProtocol = protocol.parse().unwrap_or_default();
     Manifest {
         project: project.to_string(),
         static_dir: None,
@@ -3342,19 +3509,39 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str,
             start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string(), container_volume_cfg(project, None)],
             env: Default::default(),
             vcpus: 1,
-            // 0 = use the node's generous, env-tunable container-memory default
-            // (a real value here comes from fluid.json `container.memory`). NOT the
-            // old hardcoded 512m, which OOM-killed monolith containers.
+            // 0/0.0 = use the node's generous, env-tunable container defaults (a
+            // real value here comes from fluid.json `container.memory`/`cpus`/
+            // `pids` or an `ImageDeployReq`'s equivalents). NOT the old hardcoded
+            // 512m, which OOM-killed monolith containers.
             memory_mib,
+            cpus,
+            pids,
             max_concurrency: 20,
             min_instances: 1,
             max_instances: 5,
             idle_ttl_secs: 120,
             max_duration_secs: 300,
-            protocol: protocol.to_string(),
+            protocol: proto,
+            // Bridge the single port this function actually runs into the
+            // forward-looking multi-port list (see `PortSpec::from_legacy_port`'s
+            // doc comment — this call site is exactly the bridging it names) so a
+            // stored deployment record always carries a recoverable port+protocol,
+            // e.g. for `image_port_spec_for_project_fleet` on redeploy.
+            ports: PortSpec::from_legacy_port(Some(internal), proto),
             ..Default::default()
         }],
-        routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }],
+        // A raw-protocol (tcp/udp/grpc) deployment has no HTTP request to
+        // route — its gateway leg would tunnel-frame into what
+        // `FunctionLaunch::raw_proxy` now serves as a pure byte splice
+        // (garbage either way), and it's reached through its allocated raw
+        // public port instead (`raw_ports`/`raw_proxy`), never `/`. Skip
+        // creating the meaningless HTTP route rather than advertising an
+        // endpoint that was never really there.
+        routes: if proto.needs_raw_proxy() {
+            Vec::new()
+        } else {
+            vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }]
+        },
         ..Default::default()
     }
 }
@@ -3409,6 +3596,10 @@ async fn image_container_manifest(
     project: &str,
     image: &str,
     port_override: Option<u16>,
+    protocol_override: Option<ServiceProtocol>,
+    memory_mib: u32,
+    cpus: f64,
+    pids: u32,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let path = podman_path_env();
@@ -3432,22 +3623,35 @@ async fn image_container_manifest(
     }
     log(format!("Pulled {image} in {}ms", now_ms().saturating_sub(t0)));
 
-    // Port: explicit override wins; else read the image's ExposedPorts; else 8080.
-    let port = match port_override {
-        Some(p) => p,
-        None => detect_image_port(&path, image).await.unwrap_or(8080),
+    // Port + protocol: explicit values win outright. Otherwise auto-detect from the
+    // image's own `ExposedPorts` (falling back to 8080/http when nothing is exposed
+    // either) — `detect_image_port` now surfaces the actual detected protocol too,
+    // so a UDP-only image (e.g. Minecraft Bedrock, 19132/udp, no TCP port at all) no
+    // longer gets forced through the http default it can't actually speak. An
+    // explicit port WITHOUT an explicit protocol assumes http (the pre-existing
+    // behavior for an overridden port) rather than cross-referencing the detected
+    // port's protocol, which could belong to a DIFFERENT exposed port than the one
+    // the caller just asked for.
+    let (port, protocol) = match (port_override, protocol_override) {
+        (Some(p), Some(proto)) => (p, proto),
+        (Some(p), None) => (p, ServiceProtocol::Http),
+        (None, protocol_override) => match detect_image_port(&path, image).await {
+            Some(spec) => (spec.container_port, protocol_override.unwrap_or(spec.protocol)),
+            None => (8080, protocol_override.unwrap_or_default()),
+        },
     };
     log(format!(
-        "Container port {port}{}. Attaching persistent volume (≥1 GB) at {}.",
-        if port_override.is_some() { " (configured)" } else { " (from image ExposedPorts)" },
+        "Container port {port}/{protocol}{}. Attaching persistent volume (≥1 GB) at {}.",
+        if port_override.is_some() || protocol_override.is_some() { " (configured)" } else { " (from image ExposedPorts)" },
         container_volume_path(),
     ));
-    Ok(container_manifest(project, image, port, "http", 0))
+    Ok(container_manifest(project, image, port, protocol.as_str(), memory_mib, cpus, pids))
 }
 
-/// Auto-detect a container's listening port from the image's `Config.ExposedPorts`
-/// (`podman image inspect`). Returns the lowest exposed TCP port, or None.
-async fn detect_image_port(path_env: &str, image: &str) -> Option<u16> {
+/// Auto-detect a container's listening port + protocol from the image's
+/// `Config.ExposedPorts` (`podman image inspect`). See [`parse_exposed_ports`] for
+/// the selection order (prefers TCP, falls back to UDP-only images).
+async fn detect_image_port(path_env: &str, image: &str) -> Option<PortSpec> {
     let out = Command::new("podman")
         .args(["image", "inspect", image, "--format", "{{json .Config.ExposedPorts}}"])
         .env("PATH", path_env)
@@ -3461,24 +3665,33 @@ async fn detect_image_port(path_env: &str, image: &str) -> Option<u16> {
 }
 
 /// Parse `podman image inspect --format '{{json .Config.ExposedPorts}}'` output
-/// (e.g. `{"8080/tcp":{},"9090/tcp":{}}`) → the lowest exposed TCP port. `null` /
-/// empty / udp-only → None.
-fn parse_exposed_ports(json: &str) -> Option<u16> {
+/// (e.g. `{"8080/tcp":{},"9090/tcp":{}}`) → the lowest exposed TCP port (protocol
+/// `Http`, matching the pre-existing default for the common case). When the image
+/// exposes NO tcp port at all, falls back to the lowest exposed UDP port instead
+/// (protocol `Udp`) rather than discarding it — a UDP-only service (e.g. Minecraft
+/// Bedrock, `19132/udp`, no TCP port) is otherwise impossible to auto-detect at all.
+/// `null` / empty / unparseable → `None`.
+fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
     let v: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
     let obj = v.as_object()?;
-    // Keys look like "8080/tcp"; take the lowest tcp port number.
-    let mut ports: Vec<u16> = obj
-        .keys()
-        .filter_map(|k| {
-            let (num, proto) = k.split_once('/').unwrap_or((k.as_str(), "tcp"));
-            if proto.eq_ignore_ascii_case("udp") {
-                return None;
-            }
-            num.parse::<u16>().ok()
-        })
-        .collect();
-    ports.sort_unstable();
-    ports.first().copied()
+    // Keys look like "8080/tcp" / "19132/udp".
+    let mut tcp_ports: Vec<u16> = Vec::new();
+    let mut udp_ports: Vec<u16> = Vec::new();
+    for k in obj.keys() {
+        let (num, proto) = k.split_once('/').unwrap_or((k.as_str(), "tcp"));
+        let Ok(port) = num.parse::<u16>() else { continue };
+        if proto.eq_ignore_ascii_case("udp") {
+            udp_ports.push(port);
+        } else {
+            tcp_ports.push(port);
+        }
+    }
+    tcp_ports.sort_unstable();
+    if let Some(p) = tcp_ports.first() {
+        return Some(PortSpec::single(*p, ServiceProtocol::Http));
+    }
+    udp_ports.sort_unstable();
+    udp_ports.first().map(|p| PortSpec::single(*p, ServiceProtocol::Udp))
 }
 
 /// Build a MULTI-service container manifest from a docker-compose / compose.yaml.
@@ -3486,7 +3699,12 @@ fn parse_exposed_ports(json: &str) -> Option<u16> {
 /// podman network (encoded as `start_cmd[3]`, with the service name as the alias in
 /// `start_cmd[4]`) so they reach each other by name. `min_instances=1` keeps every
 /// service warm so internal ones (db/redis) actually run. The PRIMARY public service
-/// gets the `/` route; other services run on the shared network (internal).
+/// always gets the `/` route; every other service stays internal-only UNLESS it opts
+/// in via `x-shadw-expose` (`ParsedService::expose` — see `compose.rs`), in which case
+/// it gets its own `/<service-name>` route plus a raw TCP/UDP proxy target
+/// (`FunctionConfig::ports`). Every service's `FunctionConfig::protocol` reflects its
+/// parsed (or expose-overridden) `ParsedService::protocol` — no service silently
+/// defaults to `http` just because the compose port suffix went unparsed.
 async fn build_compose_manifest(
     cloud: &Arc<CloudState>,
     bid: &str,
@@ -3579,6 +3797,36 @@ async fn build_compose_manifest(
             "volpath": container_volume_path(),
         })
         .to_string();
+        let is_primary = Some(&svc.name) == primary.as_ref();
+        // The `x-shadw-expose` opt-in may override the protocol/port a NON-PRIMARY
+        // service is reached on externally; absent an override, both fall back to
+        // the service's own parsed values. This is the single source of truth for
+        // `FunctionConfig::protocol` (drives cross-node raw-vs-HTTP proxying for
+        // every service, not just exposed ones) — `start_cmd[2]` (the container's
+        // REAL internal listen port) is never affected by the override.
+        let resolved_protocol = svc.expose.protocol.unwrap_or(svc.protocol);
+        // The raw TCP splice (`mesh_raw::resolve`'s TCP branch) always connects
+        // to the leased instance's PUBLISHED endpoint, which is derived from
+        // `start_cmd[2]` (= `svc.port`, the container's real listen port) —
+        // never from the PortSpec's `container_port`. An `x-shadw-expose` port
+        // override that DIFFERS from `svc.port` would therefore silently
+        // allocate/advertise a public port keyed to a container_port the
+        // splice never actually dials, so a client connecting expecting that
+        // stated port to be the real one would land on `svc.port` instead
+        // with no error. Refuse to honor a differing override — fall back to
+        // `svc.port` (the address the splice really uses) and say so loudly,
+        // rather than letting the two silently diverge.
+        let resolved_expose_port = match svc.expose.port {
+            Some(p) if p != svc.port => {
+                log(format!(
+                    "WARN: service '{}' declares x-shadw-expose port {p}, but its raw TCP splice always targets the real listen port {} — using {} for the public allocation instead of the mismatched override.",
+                    svc.name, svc.port, svc.port
+                ));
+                svc.port
+            }
+            Some(p) => p,
+            None => svc.port,
+        };
         functions.push(FunctionConfig {
             name: svc.name.clone(),
             runtime: "container".into(),
@@ -3593,10 +3841,35 @@ async fn build_compose_manifest(
             max_instances: 3,
             idle_ttl_secs: 300,
             max_duration_secs: 300,
+            protocol: resolved_protocol,
+            // Only an explicit `x-shadw-expose` opt-in publishes a raw external proxy
+            // target for a NON-PRIMARY service — the primary is already reachable via
+            // its `/` route, and every unopted-in service stays internal-only
+            // (unchanged default behavior: a private DB sidecar never becomes public
+            // just because it declares `ports:`).
+            ports: if svc.expose.enabled {
+                vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         });
-        if Some(&svc.name) == primary.as_ref() {
+        if is_primary && !resolved_protocol.needs_raw_proxy() {
             routes.push(Route { pattern: "/".into(), target: RouteTarget::Function(svc.name.clone()) });
+        } else if is_primary {
+            log(format!(
+                "Primary service '{}' is a raw {} service — no HTTP '/' route created (reachable through its allocated raw public port instead).",
+                svc.name, resolved_protocol
+            ));
+        } else if svc.expose.enabled && !resolved_protocol.needs_raw_proxy() {
+            // Explicit opt-in external route for a secondary service (e.g. a
+            // standalone Postgres/Redis meant to be reachable from outside) —
+            // namespaced under its own service name so it never collides with the
+            // primary's `/`.
+            routes.push(Route {
+                pattern: format!("/{}", sanitize_tag(&svc.name)),
+                target: RouteTarget::Function(svc.name.clone()),
+            });
         }
     }
     log(format!(
@@ -3620,6 +3893,16 @@ struct ContainerOverride {
     /// Overrides the node's generous default; lets a heavy monolith request more.
     #[serde(default)]
     memory: Option<String>,
+    /// CPU quota for the container (podman `--cpus`), e.g. "4", "2.0", "0.5".
+    /// Overrides the node's generous default. Clamped to a fleet-wide ceiling in
+    /// `ContainerLimits::for_container` (`HIVE_CONTAINER_CPUS_MAX`).
+    #[serde(default)]
+    cpus: Option<String>,
+    /// Max-PIDs ceiling for the container's cgroup (podman `--pids-limit`) — a
+    /// fork-bomb guard. Overrides the node's default. Clamped to a fleet-wide
+    /// ceiling (`HIVE_CONTAINER_PIDS_MAX`).
+    #[serde(default)]
+    pids: Option<u32>,
 }
 
 /// Parse a human memory string ("4g", "2048m", "1.5g", "512") into MiB. Returns 0
@@ -3641,6 +3924,17 @@ fn parse_mem_mib(s: &str) -> u32 {
         (t.as_str(), 1.0) // bare number = MiB
     };
     num.trim().parse::<f64>().ok().map(|v| (v * mult).round() as u32).unwrap_or(0)
+}
+
+/// Parse a CPU quota string ("4", "2.0", "0.5") into a fractional vCPU count.
+/// Returns 0.0 (→ use the node's default) for empty/unparseable/non-positive
+/// input.
+fn parse_cpus_quota(s: &str) -> f64 {
+    let t = s.trim();
+    if t.is_empty() {
+        return 0.0;
+    }
+    t.parse::<f64>().ok().filter(|v| *v > 0.0).unwrap_or(0.0)
 }
 
 /// Parse the `container` override block from a repo's `fluid.json` text, if any.
@@ -3941,10 +4235,23 @@ mod tests {
     }
 
     #[test]
-    fn exposed_ports_picks_lowest_tcp() {
-        assert_eq!(parse_exposed_ports(r#"{"8080/tcp":{}}"#), Some(8080));
-        assert_eq!(parse_exposed_ports(r#"{"9090/tcp":{},"3000/tcp":{}}"#), Some(3000)); // lowest
-        assert_eq!(parse_exposed_ports(r#"{"53/udp":{}}"#), None); // udp ignored
+    fn exposed_ports_prefers_tcp_falls_back_to_udp() {
+        assert_eq!(parse_exposed_ports(r#"{"8080/tcp":{}}"#), Some(PortSpec::single(8080, ServiceProtocol::Http)));
+        // Lowest tcp wins when multiple are exposed.
+        assert_eq!(parse_exposed_ports(r#"{"9090/tcp":{},"3000/tcp":{}}"#), Some(PortSpec::single(3000, ServiceProtocol::Http)));
+        // A tcp port present alongside udp ones still wins (matches prior precedence).
+        assert_eq!(
+            parse_exposed_ports(r#"{"8080/tcp":{},"19132/udp":{}}"#),
+            Some(PortSpec::single(8080, ServiceProtocol::Http))
+        );
+        // UDP-only image (no tcp port at all, e.g. Minecraft Bedrock 19132/udp) is no
+        // longer discarded — the lowest udp port is surfaced with protocol=udp instead
+        // of forcing a blind fallback to the 8080/http default.
+        assert_eq!(parse_exposed_ports(r#"{"53/udp":{}}"#), Some(PortSpec::single(53, ServiceProtocol::Udp)));
+        assert_eq!(
+            parse_exposed_ports(r#"{"19133/udp":{},"19132/udp":{}}"#),
+            Some(PortSpec::single(19132, ServiceProtocol::Udp))
+        ); // lowest udp
         assert_eq!(parse_exposed_ports("null"), None);
         assert_eq!(parse_exposed_ports(""), None);
     }
@@ -3953,7 +4260,7 @@ mod tests {
     fn image_manifest_has_container_fn_and_volume() {
         // The prebuilt-image manifest runs the image as a container with a stable,
         // per-project persistent volume encoded in start_cmd[3].
-        let m = container_manifest("my-proj", "fruitbox12/simplifi:latest", 8080, "http", 0);
+        let m = container_manifest("my-proj", "fruitbox12/simplifi:latest", 8080, "http", 0, 0.0, 0);
         let f = &m.functions[0];
         assert_eq!(f.runtime, "container");
         assert_eq!(f.start_cmd[0], "__container__");
@@ -4162,7 +4469,7 @@ mod tests {
 
     #[test]
     fn container_manifest_carries_protocol() {
-        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0);
+        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0, 0.0, 0);
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].protocol_or_http(), "grpc");
         assert!(m.functions[0].needs_raw_proxy());
@@ -4171,6 +4478,8 @@ mod tests {
         let cfg: serde_json::Value = serde_json::from_str(&m.functions[0].start_cmd[3]).unwrap();
         assert_eq!(cfg["vol"], "hive-vol-proj");
         assert_eq!(m.functions[0].memory_mib, 0, "0 = use the node's generous default (not 512m)");
+        assert_eq!(m.functions[0].cpus, 0.0, "0.0 = use the node's generous default");
+        assert_eq!(m.functions[0].pids, 0, "0 = use the node's generous default");
     }
 
     #[test]
@@ -4184,8 +4493,28 @@ mod tests {
         assert_eq!(parse_mem_mib("512"), 512);
         assert_eq!(parse_mem_mib(""), 0);
         assert_eq!(parse_mem_mib("garbage"), 0);
-        let m = container_manifest("proj", "img:tag", 8080, "http", 4096);
+        let m = container_manifest("proj", "img:tag", 8080, "http", 4096, 0.0, 0);
         assert_eq!(m.functions[0].memory_mib, 4096);
+    }
+
+    #[test]
+    fn container_cpus_and_pids_override_parses_and_bakes_into_manifest() {
+        // fluid.json { container: { cpus: "4", pids: 2048 } } → baked onto the
+        // manifest verbatim (clamping happens later, at `ContainerLimits::
+        // for_container` consumption time — same split as memory above).
+        let o = parse_container_override(r#"{"container":{"cpus":"4","pids":2048}}"#);
+        assert_eq!(o.cpus.as_deref(), Some("4"));
+        assert_eq!(o.pids, Some(2048));
+        assert_eq!(parse_cpus_quota("4"), 4.0);
+        assert_eq!(parse_cpus_quota("2.0"), 2.0);
+        assert_eq!(parse_cpus_quota("0.5"), 0.5);
+        assert_eq!(parse_cpus_quota(""), 0.0);
+        assert_eq!(parse_cpus_quota("garbage"), 0.0);
+        assert_eq!(parse_cpus_quota("-1"), 0.0, "a non-positive quota must not sneak through as a real override");
+        assert_eq!(parse_cpus_quota("0"), 0.0, "zero must not sneak through as a real override");
+        let m = container_manifest("proj", "img:tag", 8080, "http", 0, 4.0, 2048);
+        assert_eq!(m.functions[0].cpus, 4.0);
+        assert_eq!(m.functions[0].pids, 2048);
     }
 
     #[tokio::test]

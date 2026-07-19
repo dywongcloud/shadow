@@ -93,6 +93,30 @@ export function deploymentUrl(alias: string | undefined | null, regionCode?: str
 /** Whether a public deployment domain (tunnel) is configured at build time. */
 export const hasPublicDeployDomain = !!DEPLOY_DOMAIN;
 
+/** The public host (no port) for a deployment on the CURRENT session — the
+ *  same domain resolution `deploymentHost`/`deploymentUrl` use, but without
+ *  the HTTP gateway's own `:8787` suffix, since a raw TCP/UDP/gRPC binding
+ *  listens on its OWN allocated port (`raw_ports[i].public_port`), never the
+ *  shared HTTP gateway port. */
+function rawPortHost(alias: string | undefined | null, regionCode?: string | null): string {
+  if (!alias) return "";
+  const domain = publicDeployDomain(regionCode);
+  return domain ? `${subOf(alias)}.${domain}` : `${subOf(alias)}.localhost`;
+}
+
+/**
+ * A ready-to-copy `host:port` connection address for one raw port binding
+ * (`Deployment.raw_ports[i]`) — the literal format every raw client accepts
+ * (psql's "host:port", redis-cli's `-h host -p port`, a Minecraft client's
+ * "Server Address" field). Every fleet node binds every allocated raw port,
+ * so this is reachable through the SAME domain/alias resolution HTTP
+ * deployment links already use — no separate DNS story needed.
+ */
+export function rawPortAddress(alias: string | undefined | null, publicPort: number, regionCode?: string | null): string {
+  const host = rawPortHost(alias, regionCode);
+  return host ? `${host}:${publicPort}` : "";
+}
+
 // ---- EXPERIMENT: anonymous preview access (NEXT_PUBLIC_ZKAUTH=1) ----
 
 /** Whether the anonymous-membership preview flow is enabled in the UI. */
