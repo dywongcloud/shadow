@@ -6,7 +6,7 @@ import { useEffect } from "react";
 // No-op in browsers without service-worker support.
 export function PwaRegister() {
   useEffect(() => {
-    if (typeof window === "undefined" || !("serviceWorker" in navigator)) return;
+    if (typeof window === "undefined" || !("serviceWorker" in navigator) || !navigator.serviceWorker) return;
 
     // If a SW already controls this page, a later controllerchange means an
     // UPDATED service worker took over (e.g. after a deploy) — reload ONCE so the

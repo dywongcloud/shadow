@@ -43,6 +43,7 @@ import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview 
 import { usePendingBuilds } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
+import { RawPortConnections } from "@/components/raw-port-connections";
 
 // The project sub-tabs now live in the TOP NAV (breadcrumb-tabs model, issue 3);
 // they drive this page via `?tab=`. The page reads that param REACTIVELY so a tab
@@ -218,6 +219,12 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                     {prod ? deploymentHost(prod.alias, prod.region_code) : "—"} <ExternalLink className="inline h-3 w-3" />
                   </a>
                 </div>
+                {prod && prod.raw_ports && prod.raw_ports.length > 0 && (
+                  <div>
+                    <div className="text-muted">Raw Connections</div>
+                    <RawPortConnections deployment={prod} />
+                  </div>
+                )}
                 <div className="flex gap-12">
                   <div>
                     <div className="text-muted">Status</div>

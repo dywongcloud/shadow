@@ -13,6 +13,7 @@ import {
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentHost } from "@/lib/deploy-url";
+import { RawPortsBadge } from "@/components/raw-port-connections";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { SignedIn, SignedOut } from "@clerk/nextjs";
 import { Landing } from "@/components/landing";
@@ -471,8 +472,11 @@ function ProjectCard({ p, onChange, isFav, onToggleFav }: { p: Deployment; onCha
             <Triangle />
             <div className="min-w-0">
               <div className="truncate font-semibold">{p.project}</div>
-              <div className={`truncate text-sm ${p.production ? "text-secondary" : "text-muted"}`}>
-                {p.production ? deploymentHost(p.alias) : "No Production Deployment"}
+              <div className="flex min-w-0 items-center gap-1.5">
+                <div className={`truncate text-sm ${p.production ? "text-secondary" : "text-muted"}`}>
+                  {p.production ? deploymentHost(p.alias) : "No Production Deployment"}
+                </div>
+                <RawPortsBadge deployment={p} />
               </div>
             </div>
           </div>
@@ -529,8 +533,11 @@ function ProjectRow({ p, onChange, isFav, onToggleFav }: { p: Deployment; onChan
         {/* Name + production domain (or "No Production Deployment"). */}
         <div className="min-w-0 shrink-0 basis-56 lg:basis-72">
           <div className="truncate font-semibold">{p.project}</div>
-          <div className={`truncate text-xs ${isProd ? "text-secondary" : "text-muted"}`}>
-            {isProd ? deploymentHost(p.alias) : "No Production Deployment"}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <div className={`truncate text-xs ${isProd ? "text-secondary" : "text-muted"}`}>
+              {isProd ? deploymentHost(p.alias) : "No Production Deployment"}
+            </div>
+            <RawPortsBadge deployment={p} />
           </div>
         </div>
         {/* Deploy info: commit message / connect-git / status (top) + date (bottom). */}

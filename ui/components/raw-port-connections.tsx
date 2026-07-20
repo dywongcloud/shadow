@@ -65,3 +65,26 @@ export function RawPortConnections({ deployment, alias }: { deployment: Deployme
     </div>
   );
 }
+
+/**
+ * Compact card/row treatment for tight real estate (project grid tiles, list
+ * rows): a terse `protocol:port` for a single raw binding, or `N raw ports`
+ * once there's more than one — the full copy-to-clipboard `host:port` address
+ * list stays in `RawPortConnections` above; this is its space-constrained
+ * sibling for a project card/tile. Renders nothing for an HTTP-only
+ * deployment, same null-safety as `RawPortConnections`.
+ */
+export function RawPortsBadge({ deployment }: { deployment: Deployment | null | undefined }) {
+  const bindings = deployment?.raw_ports;
+  if (!bindings || bindings.length === 0) return null;
+  const label = bindings.length === 1 ? `${bindings[0].protocol}:${bindings[0].public_port}` : `${bindings.length} raw ports`;
+  return (
+    <span
+      className="inline-flex shrink-0 items-center gap-1 rounded-md bg-subtle px-1.5 py-0.5 font-mono text-xs text-secondary"
+      title="Raw TCP/UDP connection exposed"
+    >
+      <Server className="h-3 w-3" />
+      {label}
+    </span>
+  );
+}
