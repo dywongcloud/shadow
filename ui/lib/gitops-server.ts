@@ -17,17 +17,31 @@ const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
  * the backend derives the tenant from the JWT claim (not the spoofable
  * `x-hive-team` header), so forwarding the user's token scopes writes correctly.
  */
+// Mirrors lib/api.ts's fetchWithTimeout: an unbounded server->backend fetch()
+// here (GitHub API calls in commitFiles() share the same failure shape) can
+// stall the whole /api/gitops/sync request indefinitely on a hung backend or
+// far region, which surfaces client-side as a raw "Failed to fetch" instead of
+// a clean, retryable HTTP error. 20s matches apiGet's own default timeout.
+const BACKEND_TIMEOUT_MS = 20_000;
+
 export async function backend(path: string, team: string, init?: RequestInit, authToken?: string | null) {
-  return fetch(`${ADMIN}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      "x-hive-team": team,
-      ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
-      ...(init?.headers || {}),
-    },
-    cache: "no-store",
-  });
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), BACKEND_TIMEOUT_MS);
+  try {
+    return await fetch(`${ADMIN}${path}`, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        "x-hive-team": team,
+        ...(authToken ? { authorization: `Bearer ${authToken}` } : {}),
+        ...(init?.headers || {}),
+      },
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 /** Extract the caller's platform JWT from a Next request (httpOnly `hive_jwt`
@@ -48,21 +62,21 @@ export function authTokenFrom(req: {
  * tree. Returns the files plus a content hash (ignoring the volatile generatedAt
  * stamps) so callers can skip a redundant commit when nothing changed.
  */
-export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml") {
+export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml", authToken?: string | null) {
   const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes, dbRes] = await Promise.all([
-    backend("/v1/gitops/projects", team),
-    backend(`/v1/teams/${encodeURIComponent(team)}`, team),
-    backend("/v1/overview", team),
-    backend("/v1/routing", team),
-    backend("/v1/enterprise/ip-blocks", team),
-    backend("/v1/enterprise/siem", team),
-    backend("/v1/enterprise/saml", team),
-    backend("/v1/enterprise/scim", team),
-    backend("/v1/enterprise/microfrontends", team),
+    backend("/v1/gitops/projects", team, undefined, authToken),
+    backend(`/v1/teams/${encodeURIComponent(team)}`, team, undefined, authToken),
+    backend("/v1/overview", team, undefined, authToken),
+    backend("/v1/routing", team, undefined, authToken),
+    backend("/v1/enterprise/ip-blocks", team, undefined, authToken),
+    backend("/v1/enterprise/siem", team, undefined, authToken),
+    backend("/v1/enterprise/saml", team, undefined, authToken),
+    backend("/v1/enterprise/scim", team, undefined, authToken),
+    backend("/v1/enterprise/microfrontends", team, undefined, authToken),
     // Same tenant-scoped endpoint the Storage dashboard page polls
     // (ui/app/storage/page.tsx: usePoll<Database[]>("/v1/databases", …)) —
     // reused here rather than a bespoke gitops-only route.
-    backend("/v1/databases", team),
+    backend("/v1/databases", team, undefined, authToken),
   ]);
   const projects = projRes.ok ? await projRes.json() : [];
   const teamInfo = teamRes.ok ? await teamRes.json() : null;

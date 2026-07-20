@@ -19,7 +19,8 @@ export async function POST(req: NextRequest) {
   const status = await githubStatus(entity);
   if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
 
-  const linkRes = await backend("/v1/gitops", team);
+  const authToken = authTokenFrom(req);
+  const linkRes = await backend("/v1/gitops", team, undefined, authToken);
   const link = linkRes.ok ? await linkRes.json() : null;
   if (!link?.repo || !link.repo.includes("/")) {
     return NextResponse.json({ skipped: true, reason: "no-config-repo" });
@@ -28,7 +29,7 @@ export async function POST(req: NextRequest) {
   const branch = link.branch || "main";
   const path = link.path || "openedge.yaml";
 
-  const { files, hash, projectCount } = await buildOrgArtifacts(team, path);
+  const { files, hash, projectCount } = await buildOrgArtifacts(team, path, authToken);
   if (hash === link.last_hash) {
     return NextResponse.json({ unchanged: true, repo: link.repo, files: files.length });
   }
@@ -57,7 +58,7 @@ export async function POST(req: NextRequest) {
     await backend("/v1/gitops/synced", team, {
       method: "POST",
       body: JSON.stringify({ commit: result.commit || "", hash }),
-    }, authTokenFrom(req)).catch(() => {});
+    }, authToken).catch(() => {});
   }
 
   return NextResponse.json({

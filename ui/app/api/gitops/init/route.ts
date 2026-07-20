@@ -70,13 +70,14 @@ export async function POST(req: NextRequest) {
   const path = "openedge.yaml";
 
   // 2) Link the repo to this tenant.
+  const authToken = authTokenFrom(req);
   await backend("/v1/gitops", team, {
     method: "PUT",
     body: JSON.stringify({ repo: fullName, branch, path, scope }),
-  }, authTokenFrom(req));
+  }, authToken);
 
   // 3) Scaffold + push the full artifact tree as one commit.
-  const { files, hash, projectCount } = await buildOrgArtifacts(team, path);
+  const { files, hash, projectCount } = await buildOrgArtifacts(team, path, authToken);
   const result = await commitFiles(entity, {
     owner, repo, branch,
     message: created
@@ -106,7 +107,7 @@ export async function POST(req: NextRequest) {
     await backend("/v1/gitops/synced", team, {
       method: "POST",
       body: JSON.stringify({ commit: result.commit || "", hash }),
-    }, authTokenFrom(req)).catch(() => {});
+    }, authToken).catch(() => {});
   }
 
   // Auto-set the Actions variable so the committed workflow can reach the node.

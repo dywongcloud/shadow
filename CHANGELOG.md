@@ -1,5 +1,34 @@
 # Changelog
 
+## (pending) — Fix GitOps sync silently reading the wrong tenant + unbounded hang
+
+Production GitOps sync intermittently showed "GitOps sync failed / Failed to
+fetch" with a Retry button, even for tenants with a genuinely linked repo. The
+prior "missing or invalid bearer token" fix (below) covered every *mutation*
+through `gitops-server.ts`'s shared `backend()` helper, but left its *reads*
+unauthenticated: `ui/app/api/gitops/sync/route.ts`'s own `/v1/gitops` link
+lookup and all 10 concurrent `backend()` calls inside `buildOrgArtifacts`
+(`/v1/teams/:team`, `/v1/gitops/projects`, `/v1/overview`, etc.) omitted the
+caller's platform JWT. Under JWT enforcement, `admin.rs`'s `tenant()` resolves
+any request with no claims to `ANON_TENANT` rather than the real caller — so
+the link lookup silently read the (empty) link for `"__anon__"` and returned
+`{skipped:true, reason:"no-config-repo"}` even when the tenant had GitOps
+linked, and the `/v1/teams/:team` read hit `require_team`'s 403. `backend()`
+now threads `authToken` through every read too, and `buildOrgArtifacts` takes
+an `authToken` parameter forwarded by both of its callers
+(`api/gitops/sync`, `api/gitops/init`) so every request in the chain resolves
+to the real tenant.
+
+Separately, `backend()` had no timeout: a single hung backend or GitHub API
+call anywhere in `buildOrgArtifacts`/`commitFiles` could stall the whole
+`/api/gitops/sync` request indefinitely, which is the shape of failure that
+eventually surfaces client-side as a raw "Failed to fetch" rather than a clean
+HTTP error. `backend()` now wraps its `fetch()` in an `AbortController` with a
+20s timeout, matching `lib/api.ts`'s `fetchWithTimeout` default, so a hang
+degrades to a retryable HTTP timeout that `gitops.tsx`'s existing retry/
+backoff logic already handles. Witnessed: `cargo check -p hive-cloud` and
+`npm run build` (ui/) both compile clean with these changes.
+
 ## (pending) — Fix build status stuck at "0 lines, Waiting for logs…" forever
 
 A fresh deployment's progress page (`/deploy/[id]`) could get stuck showing
