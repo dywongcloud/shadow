@@ -268,6 +268,31 @@ impl Gateway {
         st.deployments.get(&did).map(view_of)
     }
 
+    /// Mutate an existing deployment's manifest IN PLACE (same record id — no
+    /// new deployment, no rebuild) and sync every function's updated config
+    /// into the Fluid pool so FUTURE instance launches see it (running
+    /// instances keep their launch-time shape until recycled). The
+    /// settings-edit hook behind hive-cloud's `PUT /v1/projects/:project/network`
+    /// (exposing raw TCP/UDP ports without a redeploy). Pool sync goes through
+    /// [`Fluid::update_config`] — never `register`, which would replace the
+    /// whole pool and orphan its live instances. Lock order (state, then fluid
+    /// registry) matches `reconcile_keepwarm`. Returns the updated view, or
+    /// `None` for an unknown id.
+    pub fn update_manifest(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut fluid_core::Manifest),
+    ) -> Option<DeploymentInfo> {
+        let did = DeploymentId::from(id.to_string());
+        let mut st = self.state.lock();
+        let dep = st.deployments.get_mut(&did)?;
+        mutate(&mut dep.manifest);
+        for f in &dep.manifest.functions {
+            self.fluid.update_config(&func_key(did.as_str(), &f.name), f.clone());
+        }
+        Some(view_of(dep))
+    }
+
     /// Keep-warm reconciliation: only the PRODUCTION deployment of each project
     /// keeps its configured `min_instances` warm; every superseded (non-production)
     /// deployment is drained to zero. Without this, each redeploy left an old

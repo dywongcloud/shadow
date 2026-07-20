@@ -382,6 +382,25 @@ impl Fluid {
         }
     }
 
+    /// Replace an existing pool's function config IN PLACE, keeping its live
+    /// instances — the no-redeploy settings-edit hook (ports/protocol changes
+    /// from the dashboard's Network page, via `Gateway::update_manifest`).
+    /// [`Fluid::register`] is NOT usable for this: it replaces the whole
+    /// [`FunctionPool`] (fresh `instances: Vec::new()`), which would orphan
+    /// every running cell untracked. The new config applies to FUTURE instance
+    /// launches (e.g. `cold_start`'s per-launch UDP port publishes); instances
+    /// already running keep their launch-time shape until recycled.
+    /// Recomputes the runtime-aware safe-concurrency baseline the same way
+    /// `register` does. No-op if the pool isn't registered.
+    pub fn update_config(&self, key: &str, cfg: FunctionConfig) {
+        let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
+        let safe_concurrency = if rec < cfg.max_concurrency { Some(rec) } else { None };
+        if let Some(p) = self.registry.lock().get_mut(key) {
+            p.cfg = cfg;
+            p.safe_concurrency = safe_concurrency;
+        }
+    }
+
     /// Set a pool's keep-warm floor. Setting it to 0 lets the autoscaler drain the
     /// pool's idle instances to zero (scale-to-zero) — used to stop keeping
     /// superseded (non-production) deployments warm while still allowing a cold

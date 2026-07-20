@@ -105,6 +105,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/projects/:project/settings", get(project_settings_get))
         .route("/v1/projects/:project/build", put(project_build_put))
         .route("/v1/projects/:project/functions", put(project_functions_put))
+        .route("/v1/projects/:project/network", put(project_network_put))
         .route("/v1/projects/:project/cron-enabled", put(project_cron_enabled_put))
         .route("/v1/projects/:project/git-ci", put(project_git_ci_put))
         .route("/v1/projects/:project/env", post(project_env_put))
@@ -466,6 +467,136 @@ async fn project_functions_put(
     c.projects.set_functions(&project, f);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// One user-editable port row in `PUT /v1/projects/:project/network`.
+/// `protocol` arrives as its wire string and is parsed with the STRICT
+/// `FromStr` — this is a deploy-input boundary, so a malformed value must 400
+/// with a clear message, never silently coerce to http (the lenient serde
+/// impl is reserved for already-stored state).
+#[derive(Deserialize)]
+struct NetworkPortIn {
+    container_port: u16,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NetworkPutBody {
+    #[serde(default)]
+    ports: Vec<NetworkPortIn>,
+}
+
+/// Edit a project's exposed ports/protocol WITHOUT a redeploy — the write
+/// side of the settings Network page. Rewrites the PRIMARY function's (first
+/// entry — the shape every single-service deploy path produces) `ports` list
+/// on the project's production (else newest Ready) deployment record, syncs
+/// `FunctionConfig::protocol` to the first spec, stamps a public port for
+/// every raw (tcp/udp/grpc) spec via the leader-coordinated allocator
+/// (stable claim keys ⇒ an unchanged spec keeps its public port across
+/// edits, exactly like redeploys do), and persists the record in place
+/// (`Gateway::update_manifest` — same id, no rebuild). The raw proxy/UDP
+/// relay reconcile listeners from the record's stamped bindings within their
+/// ~5s loop, and the updated `DeploymentInfo.raw_ports` gossips fleet-wide
+/// with the deployment list. Claims are released only when the edit leaves
+/// the project with NO ports declared and NO stamped binding on any function
+/// — releasing while any binding survives would free live ports.
+///
+/// Records are node-local: a project placed on a peer node 404s here with a
+/// hosting-node hint (see PRD row `network-edit-crossnode-forward`).
+async fn project_network_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(b): Json<NetworkPutBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let mut specs: Vec<fluid_core::PortSpec> = Vec::with_capacity(b.ports.len());
+    for p in &b.ports {
+        if p.container_port == 0 {
+            return Err((StatusCode::BAD_REQUEST, "container_port must be 1-65535".into()));
+        }
+        let protocol: fluid_core::ServiceProtocol = p
+            .protocol
+            .parse()
+            .map_err(|e: fluid_core::InvalidProtocol| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        if specs.iter().any(|s| s.container_port == p.container_port && s.protocol == protocol) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("duplicate port spec {}/{}", p.container_port, protocol.as_str()),
+            ));
+        }
+        specs.push(fluid_core::PortSpec {
+            container_port: p.container_port,
+            protocol,
+            label: p.label.clone().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()),
+            public_port: None,
+        });
+    }
+    let recs = c.gw.deployment_records();
+    let rec = recs
+        .iter()
+        .filter(|r| r.project == project && r.production)
+        .max_by_key(|r| r.created_at_ms)
+        .or_else(|| {
+            recs.iter()
+                .filter(|r| r.project == project && r.state == fluid_core::DeployState::Ready)
+                .max_by_key(|r| r.created_at_ms)
+        });
+    let Some(rec) = rec else {
+        let hint = host_node_for_project(&c, &project)
+            .map(|n| format!(" (hosted on node '{n}' — edit ports from that node's admin)"))
+            .unwrap_or_default();
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("no deployment record for project '{project}' on this node{hint}"),
+        ));
+    };
+    if rec.manifest.functions.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("deployment '{}' has no functions to expose ports on", rec.id),
+        ));
+    }
+    let mut manifest = rec.manifest.clone();
+    {
+        let f = &mut manifest.functions[0];
+        f.ports = specs.clone();
+        f.protocol = specs.first().map(|s| s.protocol).unwrap_or_default();
+    }
+    if let Err(e) = crate::raw_ports::allocate_raw_ports_coordinated(&c, &project, &mut manifest).await {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, format!("raw public-port allocation failed: {e}")));
+    }
+    if b.ports.is_empty() && manifest.raw_port_bindings().is_empty() {
+        crate::raw_ports::release_raw_ports_coordinated(&c, &project).await;
+    }
+    let dep_id = rec.id.clone();
+    let bindings = manifest.raw_port_bindings();
+    let ports_out = manifest.functions[0].ports.clone();
+    if c.gw.update_manifest(&dep_id, move |m| *m = manifest).is_none() {
+        return Err((StatusCode::NOT_FOUND, format!("deployment '{dep_id}' vanished mid-update")));
+    }
+    crate::persist::persist(&c);
+    let detail = if bindings.is_empty() {
+        "cleared exposed ports".to_string()
+    } else {
+        bindings
+            .iter()
+            .map(|bd| format!("{} {}→{}", bd.protocol.as_str(), bd.public_port, bd.container_port))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let ev = c.event(&c.region, "PUT", &format!("{project}.localhost"), "/settings/network", 200, "network-edit", &detail);
+    c.record(ev);
+    Ok(Json(json!({
+        "project": project,
+        "deployment": dep_id,
+        "ports": ports_out,
+        "raw_ports": bindings,
+    })))
 }
 
 /// Records the outcome of the auto-CI install attempted right after a
