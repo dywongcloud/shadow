@@ -43,7 +43,7 @@ pub struct Incident {
     pub updates: Vec<IncidentUpdate>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct OpenReq {
     pub title: String,
     pub severity: Severity,
@@ -53,7 +53,7 @@ pub struct OpenReq {
     pub message: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UpdateReq {
     pub status: IncidentStatus,
     pub message: String,

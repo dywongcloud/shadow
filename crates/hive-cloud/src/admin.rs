@@ -6282,12 +6282,77 @@ async fn incidents_list(
     Ok(Json(json!(c.incidents.list())))
 }
 
+/// The incidents store is in the leader→follower store-sync REGISTRY: a
+/// follower-side write returns 200, persists locally, then gets silently
+/// CLOBBERED by the next sync cycle's wholesale snapshot adoption (live-hit
+/// 2026-07-21: an incident created on fc-lax vanished from fc-lax itself
+/// minutes later). Mutations therefore run ONLY on the leader — a non-leader
+/// node forwards the request there (carrying the caller's own bearer, so the
+/// leader re-verifies the same operator JWT against the fleet-shared secret)
+/// and returns the leader's response, or fails LOUDLY with 502. It must never
+/// fall back to the local write: accepting a write the sync loop will erase is
+/// strictly worse than refusing it.
+///
+/// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation
+/// tokens are stripped of `platform_admin` on verification (`gossip::
+/// team_claims` — a compromised trusted peer could otherwise forge operator
+/// authority fleet-wide; closing that needs per-node signing keys), so an
+/// operator-gated mutation cannot ride the mesh under the current threat
+/// model. In practice the dashboard's `/ops` proxy already talks to the
+/// leader directly, so this 502 only surfaces on direct API calls against a
+/// follower whose HTTP admin map lacks the leader — which previously LOST the
+/// write silently and now names the fix instead.
+async fn forward_incident_mutation_to_leader(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    path: &str,
+    body: &Value,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let leader = c.control_plane_leader();
+    let admin = c.node_admins.read().get(&leader).cloned();
+    let Some(admin) = admin else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("incident mutations must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"),
+        ));
+    };
+    let mut req = if body.is_null() {
+        c.http.delete(format!("{admin}{path}")).timeout(std::time::Duration::from_secs(15))
+    } else {
+        c.http.post(format!("{admin}{path}")).timeout(std::time::Duration::from_secs(15)).json(body)
+    };
+    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
+        req = req.header(axum::http::header::AUTHORIZATION, auth.clone());
+    }
+    match req.send().await {
+        Ok(r) if r.status().is_success() => {
+            let v = r.json::<Value>().await.map_err(|e| {
+                (StatusCode::BAD_GATEWAY, format!("leader '{leader}' returned an unreadable incident response: {e}"))
+            })?;
+            Ok(Json(v))
+        }
+        Ok(r) => {
+            let status = StatusCode::from_u16(r.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let detail = r.text().await.unwrap_or_default();
+            Err((status, if detail.is_empty() { format!("leader '{leader}' rejected the incident mutation") } else { detail }))
+        }
+        Err(e) => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("incident mutation forward to leader '{leader}' failed: {e}"),
+        )),
+    }
+}
+
 async fn incident_open(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<crate::incidents::OpenReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
+    if !c.is_control_plane_leader() {
+        return forward_incident_mutation_to_leader(&c, &headers, "/v1/incidents", &json!(req)).await;
+    }
     let inc = c.incidents.open(req);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, "*", "incident.opened", json!({ "id": inc.id, "title": inc.title, "severity": inc.severity }));
@@ -6296,11 +6361,15 @@ async fn incident_open(
 
 async fn incident_update(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
     Json(req): Json<crate::incidents::UpdateReq>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
+    if !c.is_control_plane_leader() {
+        return forward_incident_mutation_to_leader(&c, &headers, &format!("/v1/incidents/{id}/updates"), &json!(req)).await;
+    }
     let resolved = matches!(req.status, crate::incidents::IncidentStatus::Resolved);
     let inc = c.incidents.update(&id, req).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
@@ -6315,10 +6384,14 @@ async fn incident_update(
 /// store-sync follower loop's wholesale snapshot adoption.
 async fn incident_delete(
     State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
+    if !c.is_control_plane_leader() {
+        return forward_incident_mutation_to_leader(&c, &headers, &format!("/v1/incidents/{id}"), &Value::Null).await;
+    }
     let inc = c.incidents.remove(&id).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, "*", "incident.deleted", json!({ "id": inc.id, "title": inc.title }));
