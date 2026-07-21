@@ -44,8 +44,49 @@ mesh_ok() {
   esac
 }
 
+# Impostor check: the hive-cloud process LISTENING on the admin port must be the
+# one launched with this label's own --name. /healthz and /v1/mesh both pass when
+# a DIFFERENT hive-cloud instance squats the port (live-hit 2026-07-21: a reboot's
+# RunAtLoad race let the meshless dev `node-a` win fc-lax's 8786/8787; it answered
+# /healthz green and saw LAN peers, so neither existing check fired while the real
+# fc-lax crash-looped on bind for 22h and fleet build dispatch through LA failed).
+# argv is deterministic — no sustained-window needed. Prints the squatter pid and
+# returns 0 only when a WRONG-named hive-cloud holds the port; anything else
+# (correct owner, non-hive process, no listener) returns 1 and is left alone.
+imposter_pid() { # <expected-name> <admin-port>
+  local pid args
+  pid=$(lsof -nP -tiTCP:"$2" -sTCP:LISTEN 2>/dev/null | head -1)
+  [ -n "$pid" ] || return 1
+  args=$(ps -o command= -p "$pid" 2>/dev/null) || return 1
+  case "$args" in
+    *"--name $1 "*|*"--name $1") return 1 ;;
+    *hive-cloud*) echo "$pid"; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ensure() { # <label> <admin-port>
   launchctl print "$DOMAIN/$1" >/dev/null 2>&1 || return 0   # not installed → skip
+
+  # Evict a port squatter before any health interpretation: a wrong-named
+  # hive-cloud on this port means every probe below is interrogating the WRONG
+  # process. Bootout its own label if launchd owns it (stop + unload, so its
+  # KeepAlive cannot re-race), plain kill for an orphan, then kickstart the
+  # rightful label to claim the port immediately.
+  local name pid ilabel
+  name=${1#dev.shadw.}
+  if pid=$(imposter_pid "$name" "$2"); then
+    ilabel=$(launchctl list 2>/dev/null | awk -v p="$pid" '$1 == p {print $3}')
+    echo "$(date '+%H:%M:%S') $1 IMPOSTOR on :$2 (pid $pid label ${ilabel:-none} is not --name $name) — evicting and restarting $1"
+    if [ -n "$ilabel" ]; then
+      launchctl bootout "$DOMAIN/$ilabel" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    else
+      kill "$pid" 2>/dev/null || true
+    fi
+    sleep 2
+    launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
+    return 0
+  fi
 
   # Fast path: healthy right now → done (the overwhelmingly common case).
   if healthy "$2"; then

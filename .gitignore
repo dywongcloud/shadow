@@ -32,3 +32,7 @@ ansible/.vault_pass
 # Agent-tool worktree/session scratch (isolated-worktree subagents, local
 # settings) -- transient tooling state, never durable repo content.
 .claude/
+
+# agentplug-runner per-repo KV scratch (native spool host runtime state,
+# regenerated on daemon boot) -- transient tooling state, never repo content.
+.agentplug-kv/
