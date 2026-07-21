@@ -1,0 +1,3 @@
+{
+  "/oauth/github/callback/route": "app/oauth/github/callback/route.js"
+}

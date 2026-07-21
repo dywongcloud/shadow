@@ -262,6 +262,33 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err(_) => Vec::new(),
             }
         }
+        // Network-settings edit forward: the requesting node proxies a
+        // body-carrying `PUT /v1/projects/:project/network` mutation to the
+        // project's actual hosting node over the mesh (deployment records
+        // are node-local — see `admin::project_network_put`'s doc comment
+        // and `admin::put_to_host`). Body is the validated
+        // `NetworkPutBody` JSON; team rides via `?team=`/`?tok=` since the
+        // mesh transport carries no HTTP headers. The host runs it locally
+        // (it holds the record), so there's no re-proxy loop.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/projects/") && p.contains("/network") => {
+            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+            let parsed: crate::admin::NetworkPutBody = match serde_json::from_slice(body) {
+                Ok(v) => v,
+                Err(_) => return Vec::new(),
+            };
+            match crate::admin::project_network_put(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(project),
+                axum::Json(parsed),
+            )
+            .await
+            {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
         // Build status/log polling for the fanout mirror (coordinator streams the
         // target's build into its own record so the dashboard UX is unchanged).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/builds/") => {

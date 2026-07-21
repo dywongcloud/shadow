@@ -1,0 +1,3 @@
+module.exports=[34384,a=>{"use strict";var b=a.i(7997),c=a.i(7155);a.s(["default",0,function(){return(0,b.jsx)(c.PageSkeleton,{})}])},42388,a=>{a.n(a.i(34384))}];
+
+//# sourceMappingURL=app_projects_%5Bproject%5D_logs_loading_tsx_0s6-ktl._.js.map

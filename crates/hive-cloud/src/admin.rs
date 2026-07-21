@@ -475,7 +475,7 @@ async fn project_functions_put(
 /// with a clear message, never silently coerce to http (the lenient serde
 /// impl is reserved for already-stored state).
 #[derive(Deserialize)]
-struct NetworkPortIn {
+pub(crate) struct NetworkPortIn {
     container_port: u16,
     #[serde(default)]
     protocol: String,
@@ -484,7 +484,7 @@ struct NetworkPortIn {
 }
 
 #[derive(Deserialize)]
-struct NetworkPutBody {
+pub(crate) struct NetworkPutBody {
     #[serde(default)]
     ports: Vec<NetworkPortIn>,
 }
@@ -504,16 +504,19 @@ struct NetworkPutBody {
 /// the project with NO ports declared and NO stamped binding on any function
 /// — releasing while any binding survives would free live ports.
 ///
-/// Records are node-local: a project placed on a peer node 404s here with a
-/// hosting-node hint (see PRD row `network-edit-crossnode-forward`).
-async fn project_network_put(
+/// Records are node-local: a project placed on a peer node has no local
+/// record here, so the validated edit is FORWARDED (body and all) to that
+/// project's actual hosting node over HTTP admin or the iroh mesh — mirroring
+/// `dep_promote`'s host-node proxy for `/promote` — instead of 404ing (see
+/// `put_to_host` and the matching `/network` arm in `gossip::dispatch`).
+pub(crate) async fn project_network_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(project): Path<String>,
     Json(b): Json<NetworkPutBody>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let team = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let mut specs: Vec<fluid_core::PortSpec> = Vec::with_capacity(b.ports.len());
     for p in &b.ports {
         if p.container_port == 0 {
@@ -547,12 +550,30 @@ async fn project_network_put(
                 .max_by_key(|r| r.created_at_ms)
         });
     let Some(rec) = rec else {
-        let hint = host_node_for_project(&c, &project)
-            .map(|n| format!(" (hosted on node '{n}' — edit ports from that node's admin)"))
-            .unwrap_or_default();
+        // Not hosted locally — the placement scheduler put this project on a
+        // peer node. Forward the already-validated edit (body and all) to
+        // that node instead of 404ing; it holds the real deployment record,
+        // so there is no re-proxy loop (mirrors the delete-cascade /
+        // read-view proxy arms in `gossip::dispatch`).
+        if let Some(node) = host_node_for_project(&c, &project) {
+            let fwd_body = json!({
+                "ports": specs.iter().map(|s| json!({
+                    "container_port": s.container_port,
+                    "protocol": s.protocol.as_str(),
+                    "label": s.label,
+                })).collect::<Vec<_>>(),
+            });
+            if let Some(v) = put_to_host(&c, &node, &format!("/v1/projects/{project}/network"), &team, &fwd_body).await {
+                return Ok(Json(v));
+            }
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("project '{project}' is hosted on node '{node}' but the network-edit forward failed"),
+            ));
+        }
         return Err((
             StatusCode::NOT_FOUND,
-            format!("no deployment record for project '{project}' on this node{hint}"),
+            format!("no deployment record for project '{project}' on this node"),
         ));
     };
     if rec.manifest.functions.is_empty() {
@@ -2167,6 +2188,51 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
         // See `fetch_from_host`: bumped from 15s to give the discovery fallback in
         // `PeerPool::acquire` room to complete instead of being cut off here.
         if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await {
+            return serde_json::from_slice(&b).ok();
+        }
+    }
+    None
+}
+
+/// PUT (with a JSON body) to a host node by NAME: HTTP admin PUT if we know
+/// its URL — matching the real route's registered verb, since unlike
+/// `/promote` the `/network` route is only registered as `put(...)` and a
+/// `.post()` there would 405 — else over the iroh mesh (dispatched there as
+/// `GOSSIP_POST`; the mesh transport has no HTTP-verb distinction, only
+/// path/body — see the matching `/network` arm in `gossip::dispatch`). The
+/// body-carrying counterpart of `post_to_host`, used to forward
+/// `PUT /v1/projects/:project/network` to a project's actual hosting node
+/// when the record isn't local (see `project_network_put`).
+async fn put_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Ok(r) = c
+            .http
+            .put(format!("{admin}{path}"))
+            .header("x-hive-team", team)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(body)
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((id, addr)) = target {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
+        let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &body_bytes, 20).await {
             return serde_json::from_slice(&b).ok();
         }
     }

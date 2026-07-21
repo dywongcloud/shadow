@@ -1,0 +1,1035 @@
+{
+  "version": 3,
+  "pages404": true,
+  "appType": "app",
+  "caseSensitive": false,
+  "basePath": "",
+  "redirects": [
+    {
+      "source": "/:path+/",
+      "destination": "/:path+",
+      "internal": true,
+      "priority": true,
+      "statusCode": 308,
+      "regex": "^(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))/$"
+    },
+    {
+      "source": "/dashboard",
+      "destination": "/",
+      "statusCode": 308,
+      "regex": "^(?!/_next)/dashboard(?:/)?$"
+    },
+    {
+      "source": "/login",
+      "destination": "/sign-in",
+      "statusCode": 308,
+      "regex": "^(?!/_next)/login(?:/)?$"
+    },
+    {
+      "source": "/signup",
+      "destination": "/sign-up",
+      "statusCode": 308,
+      "regex": "^(?!/_next)/signup(?:/)?$"
+    },
+    {
+      "source": "/team",
+      "destination": "/teams",
+      "statusCode": 308,
+      "regex": "^(?!/_next)/team(?:/)?$"
+    },
+    {
+      "source": "/marketplace",
+      "destination": "/integrations",
+      "statusCode": 307,
+      "regex": "^(?!/_next)/marketplace(?:/)?$"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/:path*",
+      "headers": [
+        {
+          "key": "X-Content-Type-Options",
+          "value": "nosniff"
+        },
+        {
+          "key": "X-Frame-Options",
+          "value": "SAMEORIGIN"
+        },
+        {
+          "key": "Referrer-Policy",
+          "value": "strict-origin-when-cross-origin"
+        },
+        {
+          "key": "Permissions-Policy",
+          "value": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "default-src 'self'; script-src 'self' 'unsafe-inline' https://*.clerk.accounts.dev https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud; frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'; upgrade-insecure-requests"
+        },
+        {
+          "key": "Content-Security-Policy-Report-Only",
+          "value": "default-src 'self'; script-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; font-src 'self' data:; connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud; frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'"
+        },
+        {
+          "key": "Strict-Transport-Security",
+          "value": "max-age=63072000; includeSubDomains; preload"
+        }
+      ],
+      "regex": "^(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/_next/static/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ],
+      "regex": "^/_next/static(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/account/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/account(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/settings/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/settings(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/teams/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/teams(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/network/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/network(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/deployments/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/deployments(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/billing/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/billing(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/admin/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/admin(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/projects/:project/settings/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/projects(?:/([^/]+?))/settings(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/projects/:project",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, no-store, max-age=0, must-revalidate"
+        }
+      ],
+      "regex": "^/projects(?:/([^/]+?))(?:/)?$"
+    },
+    {
+      "source": "/",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/(?:/)?$"
+    },
+    {
+      "source": "/product/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/product(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/solutions/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/solutions(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/features/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/features(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/pricing/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/pricing(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/blog/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/blog(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/case-studies/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/case-studies(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/contact/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/contact(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/privacy/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/privacy(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/docs/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/docs(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/status/:path*",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
+        }
+      ],
+      "regex": "^/status(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+    },
+    {
+      "source": "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up)[^.]*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "private, max-age=60, stale-while-revalidate=300"
+        }
+      ],
+      "regex": "^(?:/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up)[^.]*))(?:/)?$"
+    }
+  ],
+  "onMatchHeaders": [],
+  "rewrites": {
+    "beforeFiles": [],
+    "afterFiles": [
+      {
+        "source": "/cloud/v1/zkauth/:path*",
+        "destination": "/api/blocked",
+        "regex": "^/cloud/v1/zkauth(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+      },
+      {
+        "source": "/cloud/:path*",
+        "destination": "https://api.shadw.cloud/:path*",
+        "regex": "^/cloud(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+      },
+      {
+        "source": "/ops/:path*",
+        "destination": "https://api.shadw.cloud/:path*",
+        "regex": "^/ops(?:/((?:[^/]+?)(?:/(?:[^/]+?))*))?(?:/)?$"
+      }
+    ],
+    "fallback": []
+  },
+  "dynamicRoutes": [
+    {
+      "page": "/api/projects/[project]/redeploy",
+      "regex": "^/api/projects/([^/]+?)/redeploy(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/api/projects/(?<nxtPproject>[^/]+?)/redeploy(?:/)?$"
+    },
+    {
+      "page": "/deploy/[id]",
+      "regex": "^/deploy/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/deploy/(?<nxtPid>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/deployments/[id]",
+      "regex": "^/deployments/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/deployments/(?<nxtPid>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/docs/api-reference/[category]/[method]",
+      "regex": "^/docs/api\\-reference/([^/]+?)/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPcategory": "nxtPcategory",
+        "nxtPmethod": "nxtPmethod"
+      },
+      "namedRegex": "^/docs/api\\-reference/(?<nxtPcategory>[^/]+?)/(?<nxtPmethod>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/domains/[domain]",
+      "regex": "^/domains/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPdomain": "nxtPdomain"
+      },
+      "namedRegex": "^/domains/(?<nxtPdomain>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]",
+      "regex": "^/projects/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/logs",
+      "regex": "^/projects/([^/]+?)/logs(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/logs(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/sandboxes",
+      "regex": "^/projects/([^/]+?)/sandboxes(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/sandboxes(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/sandboxes/[sandboxId]",
+      "regex": "^/projects/([^/]+?)/sandboxes/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject",
+        "nxtPsandboxId": "nxtPsandboxId"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/sandboxes/(?<nxtPsandboxId>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings",
+      "regex": "^/projects/([^/]+?)/settings(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/build",
+      "regex": "^/projects/([^/]+?)/settings/build(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/build(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/cron",
+      "regex": "^/projects/([^/]+?)/settings/cron(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/cron(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/environment-variables",
+      "regex": "^/projects/([^/]+?)/settings/environment\\-variables(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/environment\\-variables(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/functions",
+      "regex": "^/projects/([^/]+?)/settings/functions(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/functions(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/git",
+      "regex": "^/projects/([^/]+?)/settings/git(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/git(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/microfrontends",
+      "regex": "^/projects/([^/]+?)/settings/microfrontends(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/microfrontends(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/network",
+      "regex": "^/projects/([^/]+?)/settings/network(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/network(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/routing",
+      "regex": "^/projects/([^/]+?)/settings/routing(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/routing(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/secure-compute",
+      "regex": "^/projects/([^/]+?)/settings/secure\\-compute(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/secure\\-compute(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/team",
+      "regex": "^/projects/([^/]+?)/settings/team(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/team(?:/)?$"
+    },
+    {
+      "page": "/projects/[project]/settings/webhooks",
+      "regex": "^/projects/([^/]+?)/settings/webhooks(?:/)?$",
+      "routeKeys": {
+        "nxtPproject": "nxtPproject"
+      },
+      "namedRegex": "^/projects/(?<nxtPproject>[^/]+?)/settings/webhooks(?:/)?$"
+    },
+    {
+      "page": "/sign-in/[[...sign-in]]",
+      "regex": "^/sign\\-in(?:/(.+?))?(?:/)?$",
+      "routeKeys": {
+        "nxtPsignin": "nxtPsign-in"
+      },
+      "namedRegex": "^/sign\\-in(?:/(?<nxtPsignin>.+?))?(?:/)?$"
+    },
+    {
+      "page": "/sign-up/[[...sign-up]]",
+      "regex": "^/sign\\-up(?:/(.+?))?(?:/)?$",
+      "routeKeys": {
+        "nxtPsignup": "nxtPsign-up"
+      },
+      "namedRegex": "^/sign\\-up(?:/(?<nxtPsignup>.+?))?(?:/)?$"
+    },
+    {
+      "page": "/storage/[id]",
+      "regex": "^/storage/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/storage/(?<nxtPid>[^/]+?)(?:/)?$"
+    },
+    {
+      "page": "/workflows/runs/[id]",
+      "regex": "^/workflows/runs/([^/]+?)(?:/)?$",
+      "routeKeys": {
+        "nxtPid": "nxtPid"
+      },
+      "namedRegex": "^/workflows/runs/(?<nxtPid>[^/]+?)(?:/)?$"
+    }
+  ],
+  "staticRoutes": [
+    {
+      "page": "/",
+      "regex": "^/(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/(?:/)?$"
+    },
+    {
+      "page": "/_global-error",
+      "regex": "^/_global\\-error(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/_global\\-error(?:/)?$"
+    },
+    {
+      "page": "/_not-found",
+      "regex": "^/_not\\-found(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/_not\\-found(?:/)?$"
+    },
+    {
+      "page": "/account",
+      "regex": "^/account(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/account(?:/)?$"
+    },
+    {
+      "page": "/activity",
+      "regex": "^/activity(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/activity(?:/)?$"
+    },
+    {
+      "page": "/admin",
+      "regex": "^/admin(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin(?:/)?$"
+    },
+    {
+      "page": "/admin/audit",
+      "regex": "^/admin/audit(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/audit(?:/)?$"
+    },
+    {
+      "page": "/admin/data",
+      "regex": "^/admin/data(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/data(?:/)?$"
+    },
+    {
+      "page": "/admin/databases",
+      "regex": "^/admin/databases(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/databases(?:/)?$"
+    },
+    {
+      "page": "/admin/incidents",
+      "regex": "^/admin/incidents(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/incidents(?:/)?$"
+    },
+    {
+      "page": "/admin/nodes",
+      "regex": "^/admin/nodes(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/nodes(?:/)?$"
+    },
+    {
+      "page": "/admin/teams",
+      "regex": "^/admin/teams(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/admin/teams(?:/)?$"
+    },
+    {
+      "page": "/api/blocked",
+      "regex": "^/api/blocked(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/blocked(?:/)?$"
+    },
+    {
+      "page": "/api/composio/connect",
+      "regex": "^/api/composio/connect(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/composio/connect(?:/)?$"
+    },
+    {
+      "page": "/api/composio/toolkits",
+      "regex": "^/api/composio/toolkits(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/composio/toolkits(?:/)?$"
+    },
+    {
+      "page": "/api/git/deploy",
+      "regex": "^/api/git/deploy(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/git/deploy(?:/)?$"
+    },
+    {
+      "page": "/api/github/connect",
+      "regex": "^/api/github/connect(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/connect(?:/)?$"
+    },
+    {
+      "page": "/api/github/create-repo",
+      "regex": "^/api/github/create\\-repo(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/create\\-repo(?:/)?$"
+    },
+    {
+      "page": "/api/github/disconnect",
+      "regex": "^/api/github/disconnect(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/disconnect(?:/)?$"
+    },
+    {
+      "page": "/api/github/orgs",
+      "regex": "^/api/github/orgs(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/orgs(?:/)?$"
+    },
+    {
+      "page": "/api/github/repos",
+      "regex": "^/api/github/repos(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/repos(?:/)?$"
+    },
+    {
+      "page": "/api/github/status",
+      "regex": "^/api/github/status(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/github/status(?:/)?$"
+    },
+    {
+      "page": "/api/gitops/init",
+      "regex": "^/api/gitops/init(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/gitops/init(?:/)?$"
+    },
+    {
+      "page": "/api/gitops/project-ci",
+      "regex": "^/api/gitops/project\\-ci(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/gitops/project\\-ci(?:/)?$"
+    },
+    {
+      "page": "/api/gitops/sync",
+      "regex": "^/api/gitops/sync(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/gitops/sync(?:/)?$"
+    },
+    {
+      "page": "/api/integrations/link",
+      "regex": "^/api/integrations/link(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/integrations/link(?:/)?$"
+    },
+    {
+      "page": "/api/preview-unlock",
+      "regex": "^/api/preview\\-unlock(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/preview\\-unlock(?:/)?$"
+    },
+    {
+      "page": "/api/token",
+      "regex": "^/api/token(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/token(?:/)?$"
+    },
+    {
+      "page": "/api/zk-enroll",
+      "regex": "^/api/zk\\-enroll(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/api/zk\\-enroll(?:/)?$"
+    },
+    {
+      "page": "/apple-icon.png",
+      "regex": "^/apple\\-icon\\.png(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/apple\\-icon\\.png(?:/)?$"
+    },
+    {
+      "page": "/billing",
+      "regex": "^/billing(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/billing(?:/)?$"
+    },
+    {
+      "page": "/billing/checkout",
+      "regex": "^/billing/checkout(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/billing/checkout(?:/)?$"
+    },
+    {
+      "page": "/blog",
+      "regex": "^/blog(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/blog(?:/)?$"
+    },
+    {
+      "page": "/case-studies",
+      "regex": "^/case\\-studies(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/case\\-studies(?:/)?$"
+    },
+    {
+      "page": "/cdn",
+      "regex": "^/cdn(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cdn(?:/)?$"
+    },
+    {
+      "page": "/cdn/caches",
+      "regex": "^/cdn/caches(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cdn/caches(?:/)?$"
+    },
+    {
+      "page": "/cdn/redirects",
+      "regex": "^/cdn/redirects(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cdn/redirects(?:/)?$"
+    },
+    {
+      "page": "/cdn/routing",
+      "regex": "^/cdn/routing(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cdn/routing(?:/)?$"
+    },
+    {
+      "page": "/cdn/routing/new",
+      "regex": "^/cdn/routing/new(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cdn/routing/new(?:/)?$"
+    },
+    {
+      "page": "/contact",
+      "regex": "^/contact(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/contact(?:/)?$"
+    },
+    {
+      "page": "/cron",
+      "regex": "^/cron(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/cron(?:/)?$"
+    },
+    {
+      "page": "/deployments",
+      "regex": "^/deployments(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/deployments(?:/)?$"
+    },
+    {
+      "page": "/docs",
+      "regex": "^/docs(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/docs(?:/)?$"
+    },
+    {
+      "page": "/docs/api-reference",
+      "regex": "^/docs/api\\-reference(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/docs/api\\-reference(?:/)?$"
+    },
+    {
+      "page": "/docs/getting-started",
+      "regex": "^/docs/getting\\-started(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/docs/getting\\-started(?:/)?$"
+    },
+    {
+      "page": "/domains",
+      "regex": "^/domains(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/domains(?:/)?$"
+    },
+    {
+      "page": "/favicon.ico",
+      "regex": "^/favicon\\.ico(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/favicon\\.ico(?:/)?$"
+    },
+    {
+      "page": "/features",
+      "regex": "^/features(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/features(?:/)?$"
+    },
+    {
+      "page": "/firewall",
+      "regex": "^/firewall(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/firewall(?:/)?$"
+    },
+    {
+      "page": "/functions",
+      "regex": "^/functions(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/functions(?:/)?$"
+    },
+    {
+      "page": "/icon.png",
+      "regex": "^/icon\\.png(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/icon\\.png(?:/)?$"
+    },
+    {
+      "page": "/integrations",
+      "regex": "^/integrations(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/integrations(?:/)?$"
+    },
+    {
+      "page": "/logs",
+      "regex": "^/logs(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/logs(?:/)?$"
+    },
+    {
+      "page": "/manifest.webmanifest",
+      "regex": "^/manifest\\.webmanifest(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/manifest\\.webmanifest(?:/)?$"
+    },
+    {
+      "page": "/monitoring",
+      "regex": "^/monitoring(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/monitoring(?:/)?$"
+    },
+    {
+      "page": "/network",
+      "regex": "^/network(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/network(?:/)?$"
+    },
+    {
+      "page": "/new",
+      "regex": "^/new(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/new(?:/)?$"
+    },
+    {
+      "page": "/new/upload",
+      "regex": "^/new/upload(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/new/upload(?:/)?$"
+    },
+    {
+      "page": "/oauth/github/callback",
+      "regex": "^/oauth/github/callback(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/oauth/github/callback(?:/)?$"
+    },
+    {
+      "page": "/observability",
+      "regex": "^/observability(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/observability(?:/)?$"
+    },
+    {
+      "page": "/opengraph-image",
+      "regex": "^/opengraph\\-image(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/opengraph\\-image(?:/)?$"
+    },
+    {
+      "page": "/preview-unlock",
+      "regex": "^/preview\\-unlock(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/preview\\-unlock(?:/)?$"
+    },
+    {
+      "page": "/pricing",
+      "regex": "^/pricing(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/pricing(?:/)?$"
+    },
+    {
+      "page": "/privacy",
+      "regex": "^/privacy(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/privacy(?:/)?$"
+    },
+    {
+      "page": "/product",
+      "regex": "^/product(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/product(?:/)?$"
+    },
+    {
+      "page": "/projects",
+      "regex": "^/projects(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/projects(?:/)?$"
+    },
+    {
+      "page": "/regions",
+      "regex": "^/regions(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/regions(?:/)?$"
+    },
+    {
+      "page": "/robots.txt",
+      "regex": "^/robots\\.txt(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/robots\\.txt(?:/)?$"
+    },
+    {
+      "page": "/sandbox",
+      "regex": "^/sandbox(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/sandbox(?:/)?$"
+    },
+    {
+      "page": "/settings",
+      "regex": "^/settings(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/settings(?:/)?$"
+    },
+    {
+      "page": "/settings/api-keys",
+      "regex": "^/settings/api\\-keys(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/settings/api\\-keys(?:/)?$"
+    },
+    {
+      "page": "/settings/enterprise",
+      "regex": "^/settings/enterprise(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/settings/enterprise(?:/)?$"
+    },
+    {
+      "page": "/settings/notifications",
+      "regex": "^/settings/notifications(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/settings/notifications(?:/)?$"
+    },
+    {
+      "page": "/settings/webhooks",
+      "regex": "^/settings/webhooks(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/settings/webhooks(?:/)?$"
+    },
+    {
+      "page": "/sitemap.xml",
+      "regex": "^/sitemap\\.xml(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/sitemap\\.xml(?:/)?$"
+    },
+    {
+      "page": "/solutions",
+      "regex": "^/solutions(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/solutions(?:/)?$"
+    },
+    {
+      "page": "/status",
+      "regex": "^/status(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/status(?:/)?$"
+    },
+    {
+      "page": "/storage",
+      "regex": "^/storage(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/storage(?:/)?$"
+    },
+    {
+      "page": "/teams",
+      "regex": "^/teams(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/teams(?:/)?$"
+    },
+    {
+      "page": "/usage",
+      "regex": "^/usage(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/usage(?:/)?$"
+    },
+    {
+      "page": "/workflows",
+      "regex": "^/workflows(?:/)?$",
+      "routeKeys": {},
+      "namedRegex": "^/workflows(?:/)?$"
+    }
+  ],
+  "dataRoutes": [],
+  "rsc": {
+    "header": "rsc",
+    "varyHeader": "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch",
+    "prefetchHeader": "next-router-prefetch",
+    "didPostponeHeader": "x-nextjs-postponed",
+    "contentTypeHeader": "text/x-component",
+    "suffix": ".rsc",
+    "prefetchSegmentHeader": "next-router-segment-prefetch",
+    "prefetchSegmentSuffix": ".segment.rsc",
+    "prefetchSegmentDirSuffix": ".segments",
+    "clientParamParsing": false,
+    "dynamicRSCPrerender": false
+  },
+  "rewriteHeaders": {
+    "pathHeader": "x-nextjs-rewritten-path",
+    "queryHeader": "x-nextjs-rewritten-query"
+  }
+}

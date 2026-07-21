@@ -1,0 +1,16 @@
+{
+  "headers": {
+    "x-nextjs-stale-time": "300",
+    "x-nextjs-prerender": "1",
+    "x-next-cache-tags": "_N_T_/layout,_N_T_/billing/layout,_N_T_/billing/checkout/layout,_N_T_/billing/checkout/page,_N_T_/billing/checkout"
+  },
+  "segmentPaths": [
+    "/_tree",
+    "/_full",
+    "/billing/checkout/__PAGE__",
+    "/billing/checkout",
+    "/billing",
+    "/_index",
+    "/_head"
+  ]
+}

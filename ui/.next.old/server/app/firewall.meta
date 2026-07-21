@@ -1,0 +1,15 @@
+{
+  "headers": {
+    "x-nextjs-stale-time": "300",
+    "x-nextjs-prerender": "1",
+    "x-next-cache-tags": "_N_T_/layout,_N_T_/firewall/layout,_N_T_/firewall/page,_N_T_/firewall"
+  },
+  "segmentPaths": [
+    "/_tree",
+    "/_full",
+    "/firewall/__PAGE__",
+    "/firewall",
+    "/_index",
+    "/_head"
+  ]
+}

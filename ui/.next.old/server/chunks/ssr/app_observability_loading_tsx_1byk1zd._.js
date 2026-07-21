@@ -1,0 +1,3 @@
+module.exports=[71150,a=>{"use strict";var b=a.i(7997),c=a.i(42630);a.s(["default",0,function(){return(0,b.jsxs)("div",{children:[(0,b.jsxs)("div",{className:"mb-6 flex items-center justify-between",children:[(0,b.jsx)(c.Skeleton,{className:"h-6 w-40"}),(0,b.jsxs)("div",{className:"flex items-center gap-2",children:[(0,b.jsx)(c.Skeleton,{className:"h-8 w-28"}),(0,b.jsx)(c.Skeleton,{className:"h-8 w-32"})]})]}),(0,b.jsx)("div",{className:"grid grid-cols-1 gap-4 lg:grid-cols-2",children:Array.from({length:4}).map((a,d)=>(0,b.jsx)(c.SkeletonCard,{className:"h-48"},d))})]})}])},28276,a=>{a.n(a.i(71150))}];
+
+//# sourceMappingURL=app_observability_loading_tsx_1byk1zd._.js.map

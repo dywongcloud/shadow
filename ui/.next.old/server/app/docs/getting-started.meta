@@ -1,0 +1,16 @@
+{
+  "headers": {
+    "x-nextjs-stale-time": "300",
+    "x-nextjs-prerender": "1",
+    "x-next-cache-tags": "_N_T_/layout,_N_T_/docs/layout,_N_T_/docs/getting-started/layout,_N_T_/docs/getting-started/page,_N_T_/docs/getting-started"
+  },
+  "segmentPaths": [
+    "/_tree",
+    "/_full",
+    "/docs/getting-started/__PAGE__",
+    "/docs/getting-started",
+    "/docs",
+    "/_index",
+    "/_head"
+  ]
+}
