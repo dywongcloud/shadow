@@ -131,6 +131,10 @@ export async function switchTeam(slug: string): Promise<void> {
  *  when the old cookie is already rejected. Guarded to a single retry so a
  *  genuinely unauthorized call (not just an expired cookie) still fails fast. */
 async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  // Wait for the mount-time session mint to at least have been attempted before
+  // this request's FIRST try — see `ensureSessionMinted`'s doc comment below for
+  // the exact race this closes. No-op after the first resolution.
+  await ensureSessionMinted();
   const once = async () => {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -161,6 +165,42 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
 }
 let lastAutoMintAt = 0;
 const AUTO_MINT_COOLDOWN_MS = 30_000;
+
+/**
+ * Closes the mount-time race between `SessionToken`'s cookie mint and every
+ * OTHER component's own data-fetch mount effect (`usePoll`, `NotificationBell`,
+ * `PendingBuildsProvider`, …): both are independent sibling effects with no
+ * ordering guarantee, so a data fetch could fire before the mint landed. When
+ * the `hive_jwt` cookie has expired (1h TTL) but local identity is already
+ * cached from a prior session (a RETURNING user, not a first-ever sign-in),
+ * `currentTeam()` resolves synchronously and `usePoll`'s `__pending__` guard
+ * never engages — the fetch goes out with no valid cookie. The backend's GET
+ * path bypasses `require_auth`, so this returns a real 200 scoped to an
+ * anonymous/empty tenant instead of a 401/403 — which is the ONLY thing that
+ * triggers this file's existing auto-remint-and-retry below. The wrongly-scoped
+ * empty response then gets committed as genuine settled data, producing a false
+ * "Deploy your first project" empty state that no automatic poll tick ever
+ * corrects (each new poll is scoped as unluckily as the first, and nothing ever
+ * signals that the earlier 200 was wrong). Fix: every `/cloud`+`/ops` request
+ * awaits ONE shared, idempotent mint promise before firing — whichever caller
+ * (SessionToken's effect or a poll's own mount effect) reaches it FIRST kicks
+ * off the mint; every other caller (this turn or a future one, until it
+ * resolves) shares the same in-flight promise. Near-zero cost after the first
+ * resolution (an already-settled promise). Resets to `null` on a failed mint so
+ * a LATER caller (the next poll tick) can retry instead of wedging the gate shut
+ * forever on one bad attempt.
+ */
+let sessionMintPromise: Promise<void> | null = null;
+export function ensureSessionMinted(): Promise<void> {
+  if (typeof window === "undefined" || !CLERK_ON) return Promise.resolve();
+  if (!sessionMintPromise) {
+    sessionMintPromise = mintSessionToken().then(
+      (granted) => { if (granted === null) sessionMintPromise = null; },
+      () => { sessionMintPromise = null; },
+    );
+  }
+  return sessionMintPromise;
+}
 
 // Short-TTL, tenant-scoped GET cache + in-flight de-dup. The dashboard has no
 // client-side cache today: every click/poll/re-render that calls `apiGet` is a

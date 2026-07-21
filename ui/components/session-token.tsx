@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
-import { mintSessionToken } from "@/lib/api";
+import { mintSessionToken, ensureSessionMinted } from "@/lib/api";
 
 /**
  * Keeps a fresh httpOnly `hive_jwt` cookie (minted by `/api/token`) so the
@@ -12,11 +12,17 @@ import { mintSessionToken } from "@/lib/api";
  * synchronously inside `switchTeam()` BEFORE pollers re-fetch, so we don't also
  * re-mint on `hive-team-changed` here (that would double-fire + race). Dev-safe:
  * when the backend isn't enforcing, `/api/token` is a no-op.
+ *
+ * The INITIAL mount call routes through `ensureSessionMinted()` — the same
+ * shared, idempotent gate every `fetchWithTimeout` call awaits before its first
+ * request — so this effect and every OTHER component's own data-fetch mount
+ * effect (which may run first) are guaranteed to share the exact same in-flight
+ * mint rather than racing to fire two separate ones.
  */
 export function SessionToken() {
   useEffect(() => {
     let cancelled = false;
-    mintSessionToken();
+    void ensureSessionMinted();
     const id = setInterval(() => {
       if (!cancelled) mintSessionToken();
     }, 50 * 60_000);
