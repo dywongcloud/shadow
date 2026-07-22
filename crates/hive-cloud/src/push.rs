@@ -531,8 +531,36 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
     if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
         Ok(())
     } else {
-        Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("textbelt send failed").to_string())
+        let raw = v.get("error").and_then(|e| e.as_str()).unwrap_or("textbelt send failed");
+        Err(sanitize_textbelt_error(raw))
     }
+}
+
+/// Textbelt echoes the API key back inside some error messages — most notably
+/// the out-of-quota one: "Out of quota. Refill at
+/// https://textbelt.com/purchase?key=<THE FULL SECRET KEY>". This error is
+/// surfaced all the way to the browser (via push_test / push_sms_put), so it
+/// MUST be scrubbed of the key before it leaves the process. Redact the exact
+/// key value AND any residual `key=`/purchase-URL fragment, and map the known
+/// out-of-quota case to a clean message with no URL at all.
+fn sanitize_textbelt_error(raw: &str) -> String {
+    if raw.to_ascii_lowercase().contains("out of quota") {
+        return "SMS quota exhausted — refill your Textbelt account to send more.".into();
+    }
+    let mut s = raw.to_string();
+    if let Ok(key) = std::env::var("HIVE_TEXTBELT_KEY") {
+        if !key.is_empty() {
+            s = s.replace(&key, "***");
+            s = s.replace(&format!("{key}_test"), "***");
+        }
+    }
+    // Belt-and-braces: drop any lingering key= query fragment (and everything
+    // after it up to whitespace) even if the env value didn't textually match.
+    if let Some(i) = s.find("key=") {
+        let tail_end = s[i..].find(char::is_whitespace).map(|w| i + w).unwrap_or(s.len());
+        s.replace_range(i..tail_end, "key=***");
+    }
+    s
 }
 
 /// Remaining Textbelt quota, cached (short TTL) so a settings read never blocks
@@ -563,7 +591,10 @@ async fn sms_quota(c: &Arc<CloudState>) -> Option<i64> {
         .await
         .ok()?;
     let v: serde_json::Value = r.json().await.ok()?;
-    v.get("quotaRemaining").and_then(|q| q.as_i64())
+    // Clamp to >=0: Textbelt reports a negative quotaRemaining for an
+    // exhausted/invalid key, which read as a nonsensical "-1 SMS remaining" in
+    // the UI. 0 is the honest "none left" the settings page renders sensibly.
+    v.get("quotaRemaining").and_then(|q| q.as_i64()).map(|q| q.max(0))
 }
 
 /// Format one notification as an SMS body (single segment, 160 chars).

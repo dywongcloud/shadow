@@ -384,7 +384,7 @@ function PushSmsDelivery({
       <div className="mb-2 flex items-center justify-between border-b border-border pb-2">
         <span className="text-sm font-semibold">Push &amp; SMS delivery</span>
         {data?.sms_quota != null && (
-          <span className="text-xs text-muted">{data.sms_quota} SMS remaining</span>
+          <span className="text-xs text-muted">{data.sms_quota > 0 ? `${data.sms_quota} SMS remaining` : "SMS quota exhausted — refill Textbelt"}</span>
         )}
       </div>
 
@@ -519,21 +519,37 @@ function PushSmsDelivery({
           {testErr && <div className="mt-3 text-sm text-red-500">Test failed: {testErr}</div>}
           {test && (
             <div className="mt-3 space-y-1.5 text-sm">
-              <div className="flex items-center gap-2">
-                {test.web_push.failed === 0 && test.web_push.sent > 0 ? (
-                  <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-                ) : (
-                  <XCircle className="h-4 w-4 text-red-500" />
-                )}
-                <span className="text-secondary">
-                  Web push: {test.web_push.sent} sent
-                  {test.web_push.failed > 0 && `, ${test.web_push.failed} failed`}
-                  {test.web_push.sent === 0 && test.web_push.failed === 0 && " (no devices registered)"}
-                </span>
-              </div>
-              {test.web_push.errors.length > 0 && (
-                <div className="pl-6 text-xs text-red-500">{test.web_push.errors.join("; ")}</div>
-              )}
+              {(() => {
+                const wp = test.web_push;
+                const pruned = wp.pruned ?? 0;
+                // Sent something → success. Nothing sent but we pruned expired
+                // devices → informational (self-healed), not a failure. Nothing
+                // registered → neutral hint. A genuine error → failure.
+                const ok = wp.sent > 0;
+                const onlyPruned = wp.sent === 0 && wp.failed === 0 && pruned > 0;
+                return (
+                  <>
+                    <div className="flex items-center gap-2">
+                      {ok || onlyPruned ? (
+                        <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+                      ) : (
+                        <XCircle className={`h-4 w-4 ${wp.sent === 0 && wp.failed === 0 ? "text-muted" : "text-red-500"}`} />
+                      )}
+                      <span className="text-secondary">
+                        {wp.sent > 0 && `Web push: ${wp.sent} sent`}
+                        {wp.sent > 0 && wp.failed > 0 && `, ${wp.failed} failed`}
+                        {wp.sent === 0 && wp.failed > 0 && `Web push: ${wp.failed} failed`}
+                        {wp.sent === 0 && wp.failed === 0 && pruned === 0 && "Web push: no devices registered — enable push on this device above"}
+                        {onlyPruned && `Removed ${pruned} expired device${pruned === 1 ? "" : "s"} — enable push on this device to receive notifications`}
+                        {wp.sent > 0 && pruned > 0 && ` (removed ${pruned} expired)`}
+                      </span>
+                    </div>
+                    {wp.errors.length > 0 && (
+                      <div className="pl-6 text-xs text-red-500">{wp.errors.join("; ")}</div>
+                    )}
+                  </>
+                );
+              })()}
               <div className="flex items-center gap-2">
                 {!test.sms.attempted ? (
                   <XCircle className="h-4 w-4 text-muted" />

@@ -39,7 +39,7 @@ export interface PushSettings {
   sms_quota: number | null;
 }
 export interface PushTestResult {
-  web_push: { sent: number; failed: number; errors: string[] };
+  web_push: { sent: number; failed: number; errors: string[]; devices?: number; pruned?: number };
   sms: { attempted: boolean; ok: boolean; error?: string };
 }
 

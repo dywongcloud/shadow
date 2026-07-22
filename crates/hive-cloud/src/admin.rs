@@ -6705,13 +6705,32 @@ async fn push_test(
     let devices = c.push.devices_for(&user, &team);
     let mut sent = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut dead: Vec<String> = Vec::new();
     for d in &devices {
         match crate::push::send_web_push(&c, d, &payload).await {
             Ok(true) => sent += 1,
-            Ok(false) => errors.push(format!("{}: subscription expired (404/410)", d.label)),
+            // A 404/410 means the subscription is permanently gone (the browser
+            // profile closed / unsubscribed). Don't report it as a scary
+            // failure — prune it so the test self-heals and the next one is
+            // clean, exactly like the background dispatcher does.
+            Ok(false) => dead.push(d.endpoint.clone()),
             Err(e) => errors.push(format!("{}: {e}", d.label)),
         }
     }
+    // Prune the dead subscriptions durably: locally if we're the leader, else
+    // via the leader-forwarded DELETE (the PushStore is REGISTRY-synced, so a
+    // follower-local remove would be clobbered by the next sync).
+    for endpoint in &dead {
+        if c.is_control_plane_leader() {
+            c.push.remove_subscription(endpoint, None);
+        } else {
+            let _ = forward_mutation_to_leader(&c, &headers, reqwest::Method::DELETE, "/v1/push/subscribe", &json!({ "endpoint": endpoint })).await;
+        }
+    }
+    if !dead.is_empty() && c.is_control_plane_leader() {
+        crate::persist::persist(&c);
+    }
+    let pruned = dead.len();
 
     // SMS test only ever targets the caller's OWN verified+enabled number.
     let sms_result = match c.push.sms_for(&user, &team) {
@@ -6723,7 +6742,7 @@ async fn push_test(
     };
 
     Ok(Json(json!({
-        "web_push": { "sent": sent, "failed": errors.len(), "errors": errors, "devices": devices.len() },
+        "web_push": { "sent": sent, "failed": errors.len(), "errors": errors, "devices": devices.len(), "pruned": pruned },
         "sms": sms_result,
     })))
 }
