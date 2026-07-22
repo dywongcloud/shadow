@@ -19,9 +19,22 @@ import { timeAgo } from "@/lib/utils";
 const CHANNELS = [
   { key: "web", icon: <Bell className="h-4 w-4" />, title: "Web", desc: "Receive notifications in the OpenEdge dashboard." },
   { key: "email", icon: <AtSign className="h-4 w-4" />, title: "Email", desc: "" },
-  { key: "push", icon: <Smartphone className="h-4 w-4" />, title: "Push", desc: "Receive notifications on desktop or mobile." },
-  { key: "sms", icon: <Phone className="h-4 w-4" />, title: "SMS", desc: "No phone number." },
+  // push + sms descriptions/toggles are DERIVED from the real push backend at
+  // render time (see NotificationsPage) — not static — so this row always
+  // reflects the actual registered devices / verified number.
+  { key: "push", icon: <Smartphone className="h-4 w-4" />, title: "Push", desc: "" },
+  { key: "sms", icon: <Phone className="h-4 w-4" />, title: "SMS", desc: "" },
 ];
+
+/** Mask a phone number for display: keep the country prefix + last 4, dot the
+ *  rest (e.g. "+1··········4567") so the settings summary never prints the full
+ *  number in the always-visible channel list. */
+function maskPhone(p: string): string {
+  const digits = p.replace(/[^\d]/g, "");
+  if (digits.length < 5) return p;
+  const last4 = digits.slice(-4);
+  return `+${digits.slice(0, 1)}${"·".repeat(Math.max(3, digits.length - 5))}${last4}`;
+}
 
 const MATRIX: { group: string; rows: { label: string; cols: string[] }[]; cols: string[] }[] = [
   { group: "Anomaly Alerts", cols: ["Push", "Email", "Web"], rows: [{ label: "Default Alert Rule", cols: ["push", "email", "web"] }] },
@@ -48,6 +61,73 @@ export default function NotificationsPage() {
     localStorage.setItem("hive_notif", JSON.stringify({ chan: nextChan, grid: nextGrid }));
   }
   function setChannel(k: string, v: boolean) { const n = { ...chan, [k]: v }; setChan(n); persist(n, grid); }
+
+  // Real push/SMS state — SHARED by the Channels summary rows above and the
+  // detailed PushSmsDelivery section below (one poll, deduped by the api
+  // cache) so the two never contradict each other. This is the single source
+  // of truth for the push/sms channel rows (no more static "No phone number").
+  const { data: pushData, refresh: refreshPush } = usePoll<PushSettings>("/v1/push/settings", 15000);
+  const [ownEndpoint, setOwnEndpoint] = useState<string | null>(null);
+  useEffect(() => { currentPushSubscription().then((s) => setOwnEndpoint(s?.endpoint ?? null)); }, []);
+  const [chanBusy, setChanBusy] = useState<string | null>(null);
+  const [chanErr, setChanErr] = useState<string | null>(null);
+
+  const pushDevices = pushData?.devices ?? [];
+  const thisDeviceSubscribed = !!ownEndpoint && pushDevices.some((d) => d.endpoint === ownEndpoint);
+  const sms = pushData?.sms ?? null;
+  const pushSupportedHere = pushSupported();
+
+  // Channel summary text derived from real state.
+  function channelDesc(k: string): React.ReactNode {
+    if (k === "push") {
+      if (!pushSupportedHere) return "Not supported in this browser.";
+      if (pushDevices.length === 0) return "Receive notifications on desktop or mobile.";
+      return `${pushDevices.length} device${pushDevices.length === 1 ? "" : "s"} registered${thisDeviceSubscribed ? " · incl. this one" : ""}.`;
+    }
+    if (k === "sms") {
+      if (!sms) return "No phone number.";
+      if (!sms.verified) return `${maskPhone(sms.phone)} · pending verification`;
+      return `${maskPhone(sms.phone)} · verified`;
+    }
+    return "";
+  }
+
+  // Real toggle actions for the push/sms channel rows.
+  async function togglePushChannel(on: boolean) {
+    setChanBusy("push"); setChanErr(null);
+    try {
+      if (on) {
+        const sub = await subscribePush();
+        setOwnEndpoint(sub.endpoint);
+      } else {
+        // Turn OFF = unsubscribe THIS browser (the row the user is looking at).
+        const sub = await currentPushSubscription();
+        if (sub) { await apiSend("DELETE", "/v1/push/subscribe", { endpoint: sub.endpoint }).catch(() => {}); await sub.unsubscribe().catch(() => {}); setOwnEndpoint(null); }
+      }
+      refreshPush();
+    } catch (e) {
+      setChanErr(String(e instanceof Error ? e.message : e));
+    } finally { setChanBusy(null); }
+  }
+  async function toggleSmsChannel(on: boolean) {
+    // Only a VERIFIED number can be toggled here; unverified/none routes the
+    // user to the delivery section below to add + verify a number.
+    if (!sms?.verified) { setChanErr("Add and verify a phone number below to enable SMS."); return; }
+    setChanBusy("sms"); setChanErr(null);
+    try {
+      await apiSend("PUT", "/v1/push/sms", { phone: sms.phone, enabled: on });
+      refreshPush();
+    } catch (e) {
+      setChanErr(String(e instanceof Error ? e.message : e));
+    } finally { setChanBusy(null); }
+  }
+  const channelChecked = (k: string): boolean =>
+    k === "push" ? thisDeviceSubscribed : k === "sms" ? !!(sms?.verified && sms.enabled) : !!chan[k];
+  function onChannelToggle(k: string, v: boolean) {
+    if (k === "push") return void togglePushChannel(v);
+    if (k === "sms") return void toggleSmsChannel(v);
+    setChannel(k, v);
+  }
   function cell(rowKey: string, col: string) {
     const k = `${rowKey}.${col}`;
     return grid[k] ?? true; // default checked, like the screenshot
@@ -71,16 +151,30 @@ export default function NotificationsPage() {
               <div>
                 <div className="flex items-center gap-2 text-sm font-medium">
                   {c.title}
-                  {c.key === "push" && <Badge tone="amber">Subscribe Device</Badge>}
+                  {/* Live push badge: reflects THIS browser's real subscription. */}
+                  {c.key === "push" && (thisDeviceSubscribed
+                    ? <Badge tone="green">This device</Badge>
+                    : <Badge tone="amber">Subscribe device</Badge>)}
+                  {c.key === "sms" && sms && (sms.verified
+                    ? <Badge tone="green">Verified</Badge>
+                    : <Badge tone="amber">Unverified</Badge>)}
                 </div>
                 <div className="text-xs text-secondary">
-                  {c.key === "email" ? <WithIdentity>{(id) => <>{id.email || "your email"}</>}</WithIdentity> : c.desc}
+                  {c.key === "email"
+                    ? <WithIdentity>{(id) => <>{id.email || "your email"}</>}</WithIdentity>
+                    : (c.key === "push" || c.key === "sms") ? channelDesc(c.key) : c.desc}
                 </div>
               </div>
             </div>
-            <Switch checked={!!chan[c.key]} onChange={(v) => setChannel(c.key, v)} label={c.title} />
+            <Switch
+              checked={channelChecked(c.key)}
+              onChange={(v) => onChannelToggle(c.key, v)}
+              disabled={chanBusy === c.key || (c.key === "push" && !pushSupportedHere)}
+              label={c.title}
+            />
           </div>
         ))}
+        {chanErr && <div className="border-t border-border px-5 py-2 text-xs text-red-500">{chanErr}</div>}
         <div className="flex items-center justify-between border-t border-border px-5 py-4">
           <div className="flex items-center gap-3">
             <span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary"><BellOff className="h-4 w-4" /></span>
@@ -94,7 +188,7 @@ export default function NotificationsPage() {
       </Card>
 
       {/* Push & SMS delivery */}
-      <PushSmsDelivery />
+      <PushSmsDelivery data={pushData} refresh={refreshPush} ownEndpoint={ownEndpoint} setOwnEndpoint={setOwnEndpoint} />
 
       {/* Matrix */}
       <div className="mt-8 space-y-8">
@@ -141,14 +235,20 @@ const E164_RE = /^\+[1-9]\d{6,14}$/;
  *  backend, caller-scoped for the current tenant), SMS number config, and a
  *  real end-to-end test send. Enrollment reuses the exact `subscribePush`
  *  flow the notification bell's banner uses (lib/push). */
-function PushSmsDelivery() {
-  const { data, refresh, loading } = usePoll<PushSettings>("/v1/push/settings", 15000);
-
-  // This browser's own subscription endpoint — marks "this device" in the list.
-  const [ownEndpoint, setOwnEndpoint] = useState<string | null>(null);
-  useEffect(() => {
-    currentPushSubscription().then((s) => setOwnEndpoint(s?.endpoint ?? null));
-  }, []);
+function PushSmsDelivery({
+  data,
+  refresh,
+  ownEndpoint,
+  setOwnEndpoint,
+}: {
+  // Shared with the Channels summary rows above — one poll, one source of
+  // truth, so the two sections never contradict each other.
+  data: PushSettings | null;
+  refresh: () => void;
+  ownEndpoint: string | null;
+  setOwnEndpoint: (e: string | null) => void;
+}) {
+  const loading = data === null;
 
   const [err, setErr] = useState<string | null>(null);
   const [enabling, setEnabling] = useState(false);
