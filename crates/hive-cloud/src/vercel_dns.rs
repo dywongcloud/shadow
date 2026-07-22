@@ -303,6 +303,7 @@ pub struct ReconcilerStats {
     pub deletes: AtomicU64,
     pub api_errors: AtomicU64,
     pub empty_set_blocks: AtomicU64,
+    pub per_name_holds: AtomicU64,
     pub last_pass_ms: AtomicU64,
 }
 
@@ -312,6 +313,7 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     deletes: AtomicU64::new(0),
     api_errors: AtomicU64::new(0),
     empty_set_blocks: AtomicU64::new(0),
+    per_name_holds: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
 };
 
@@ -372,6 +374,42 @@ async fn reconcile_zone<A: DnsApi>(
     }
     let current = api.list(domain).await?;
     let (creates, deletes) = diff(&current, desired, managed_names);
+    // Per-name last-known-good: a degraded registry view can leave a managed
+    // name with ZERO desired addresses while env-sourced names (relay/
+    // discovery) keep the overall set non-empty — so the whole-set emptiness
+    // guard above never trips, and the diff would delete every record for the
+    // vanished name (live-observed 2026-07-22: a freshly-restarted node with a
+    // still-empty healthy-web view won the leader check and deleted all
+    // api/admin/webhook/apex/www records for the platform zone each cycle,
+    // publishing only relay/discovery and blackholing the domain behind
+    // Vercel's wildcard ALIAS while the real leader raced to re-create them).
+    // Never delete a name's address records while desiring NO addresses for it.
+    let empty_names: std::collections::HashSet<&str> = managed_names
+        .iter()
+        .copied()
+        .filter(|n| !desired.iter().any(|d| d.name == *n && (d.rtype == "A" || d.rtype == "AAAA")))
+        .collect();
+    let deletes: Vec<String> = if empty_names.is_empty() {
+        deletes
+    } else {
+        let by_id: HashMap<&str, &RecordView> = current.iter().map(|r| (r.id.as_str(), r)).collect();
+        let (held, kept): (Vec<String>, Vec<String>) = deletes.into_iter().partition(|id| {
+            by_id
+                .get(id.as_str())
+                .map(|r| (r.rtype == "A" || r.rtype == "AAAA") && empty_names.contains(r.name.as_str()))
+                .unwrap_or(false)
+        });
+        if !held.is_empty() {
+            STATS.per_name_holds.fetch_add(held.len() as u64, Ordering::Relaxed);
+            tracing::error!(
+                %domain,
+                held = held.len(),
+                names = ?empty_names,
+                "DNS reconciler: desired set has NO addresses for managed name(s) — holding their last-known-good records instead of deleting"
+            );
+        }
+        kept
+    };
     if creates.is_empty() && deletes.is_empty() {
         return Ok(()); // converged — write nothing
     }

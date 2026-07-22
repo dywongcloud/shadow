@@ -3818,6 +3818,7 @@ async fn relay_stats(
                     "deletes": crate::vercel_dns::STATS.deletes.load(std::sync::atomic::Ordering::Relaxed),
                     "api_errors": crate::vercel_dns::STATS.api_errors.load(std::sync::atomic::Ordering::Relaxed),
                     "empty_set_blocks": crate::vercel_dns::STATS.empty_set_blocks.load(std::sync::atomic::Ordering::Relaxed),
+                    "per_name_holds": crate::vercel_dns::STATS.per_name_holds.load(std::sync::atomic::Ordering::Relaxed),
                     "last_pass_ms": crate::vercel_dns::STATS.last_pass_ms.load(std::sync::atomic::Ordering::Relaxed),
                 },
                 // ACME/TLS state: which zones have an installed certificate.
