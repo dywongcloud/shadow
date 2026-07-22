@@ -773,13 +773,62 @@ export async function createRepoWebhook(
     });
     if (res?.successful !== false) return { ok: true };
     const msg = String(deep(res)?.message || res?.error || "");
-    // "Hook already exists on this repository" → already installed, treat as ok.
-    if (/already exists/i.test(msg)) return { ok: true };
+    // "Hook already exists on this repository" → GitHub never PATCHes an
+    // existing hook on create, so a hook first installed WITHOUT a secret (the
+    // deploy-skew bug) would stay unsigned forever and every delivery would
+    // 401 at the backend's signature check. Force-update the existing hook's
+    // config (secret + events) so re-running "reconnect" self-heals it.
+    if (/already exists/i.test(msg)) return await reconcileWebhookSecret(entity, owner, repo, url, secret);
     return { ok: false, error: msg || "create webhook failed" };
   } catch (e: any) {
     const msg = String(e?.message || "unknown error");
-    if (/already exists/i.test(msg)) return { ok: true };
+    if (/already exists/i.test(msg)) return await reconcileWebhookSecret(entity, owner, repo, url, secret);
     return { ok: false, error: `Composio: ${msg}` };
+  }
+}
+
+/** An existing hook for `url` must carry the current signing secret or the
+ *  backend rejects its deliveries (401 "bad signature"). Find the hook by its
+ *  config.url and PATCH the secret + events + active in. No secret to set → the
+ *  "already exists" outcome is still success (nothing to reconcile). */
+async function reconcileWebhookSecret(
+  entity: string,
+  owner: string,
+  repo: string,
+  url: string,
+  secret?: string
+): Promise<{ ok: boolean; error?: string }> {
+  if (!secret) return { ok: true };
+  try {
+    const list = await ghExec(entity, "GITHUB_LIST_REPOSITORY_WEBHOOKS", { owner, repo });
+    const hooks: any[] = (() => {
+      const d = deep(list);
+      if (Array.isArray(d)) return d;
+      if (Array.isArray(list?.data)) return list.data;
+      if (Array.isArray(d?.data)) return d.data;
+      return [];
+    })();
+    const norm = (u: string) => u.replace(/\/+$/, "");
+    const mine = hooks.find((h) => norm(String(h?.config?.url || "")) === norm(url));
+    if (!mine?.id) {
+      // Hook exists per GitHub but we can't locate it to patch — surface it so
+      // the caller (git-settings reconnect) shows a real error, not false ok.
+      return { ok: false, error: "existing webhook found but could not be located to update its secret" };
+    }
+    const upd = await ghExec(entity, "GITHUB_UPDATE_A_REPOSITORY_WEBHOOK", {
+      owner,
+      repo,
+      hook_id: mine.id,
+      active: true,
+      events: ["push", "pull_request"],
+      config: { url, content_type: "json", insecure_ssl: "0", secret },
+    });
+    if (upd?.successful === false) {
+      return { ok: false, error: String(deep(upd)?.message || upd?.error || "update webhook secret failed") };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    return { ok: false, error: `Composio: ${String(e?.message || "reconcile webhook failed")}` };
   }
 }
 
