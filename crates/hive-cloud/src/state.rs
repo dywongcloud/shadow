@@ -250,6 +250,9 @@ pub struct CloudState {
     pub billing: crate::billing::BillingStore,
     pub audit: crate::audit::AuditLog,
     pub notifications: crate::notifications::NotificationStore,
+    /// Web-push subscriptions + SMS targets + delivery watermarks (see
+    /// [`crate::push`]) — leader-synced, mutations leader-gated.
+    pub push: crate::push::PushStore,
     /// Enterprise feature suite (IP blocking, SIEM, SAML, SCIM, deployment
     /// protection, microfrontends, conformance). See [`crate::enterprise`].
     pub enterprise: Arc<crate::enterprise::EnterpriseStore>,
@@ -570,6 +573,7 @@ impl CloudState {
             billing: crate::billing::BillingStore::new(),
             audit: crate::audit::AuditLog::new(crate::persist::data_dir().join("audit.jsonl")),
             notifications: crate::notifications::NotificationStore::new(),
+            push: crate::push::PushStore::new(),
             enterprise: Arc::new(crate::enterprise::EnterpriseStore::new()),
             sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(region_for_sandboxes, firecracker)),
             owner_email,

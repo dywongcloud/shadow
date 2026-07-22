@@ -129,6 +129,18 @@ QUIC transport resolves the address via discovery/relay/holepunch underneath.
 A public IP is only ever needed for the client-facing DNS ingress (Plane A),
 never for mesh membership.
 
+## Optional env: SMS push notifications (Textbelt)
+
+`HIVE_TEXTBELT_KEY` — the Textbelt API key used by the notification dispatcher
+(runs on the control-plane leader only) to send SMS for error-severity
+notifications, and by `GET /v1/push/settings` to surface remaining quota. Set
+it in each node's environment (the value is a secret — keep it in the node's
+launchd/systemd env, NEVER in the repo). Web Push works without it; only the
+SMS delivery leg and the quota display need it. Absent → SMS sends return a
+clean "HIVE_TEXTBELT_KEY not configured" error and web push is unaffected. The
+per-node VAPID keypair for Web Push is generated automatically on first use and
+replicated fleet-wide via the store-sync registry (no manual key management).
+
 ## Adding a node — the whole procedure
 
 On the NEW node, set env vars and start `hive-cloud` — no `--peer` HTTP URL,

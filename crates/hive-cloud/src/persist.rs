@@ -68,6 +68,9 @@ pub struct PlatformSnapshot {
     pub builds: Vec<crate::git::Build>,
     #[serde(default)]
     pub incidents: Vec<crate::incidents::Incident>,
+    /// Web-push subscriptions / SMS targets / delivery watermarks / VAPID keys.
+    #[serde(default)]
+    pub push: crate::push::PushState,
     #[serde(default)]
     pub apikeys: Vec<crate::apikeys::ApiKey>,
     #[serde(default)]
@@ -331,6 +334,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         metrics_rollup: cloud.metrics.rollup_snapshot(),
         builds: cloud.builds.snapshot(),
         incidents: cloud.incidents.snapshot(),
+        push: cloud.push.snapshot(),
         apikeys: cloud.apikeys.snapshot(),
         integrations: cloud.integrations.snapshot(),
         svcgraphs: cloud.svcgraph.snapshot(),
@@ -541,6 +545,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // here, only the DeployRecord-side gap above was missing.
     cloud.builds.load(snap.builds);
     cloud.incidents.load(snap.incidents);
+    cloud.push.load(snap.push);
     cloud.apikeys.load(snap.apikeys);
     cloud.integrations.load(snap.integrations);
     cloud.svcgraph.load(snap.svcgraphs);

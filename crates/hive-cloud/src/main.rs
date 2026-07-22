@@ -38,6 +38,7 @@ mod resp_cache;
 mod microfrontends;
 mod microfrontends_api;
 mod notifications;
+mod push;
 mod persist;
 mod project_settings;
 mod raw_ports;
@@ -720,6 +721,10 @@ async fn main() -> anyhow::Result<()> {
     // Relational mirror: teams/members/deployments + full billing backfill into
     // the fleet-replicated SQL view (see spawn_relational_mirror_loop's doc).
     spawn_relational_mirror_loop(cloud.clone());
+
+    // Web-push + SMS delivery for the notification inbox — leader-only inside
+    // the loop, tenant-scoped by construction (see `push::spawn_push_dispatcher`).
+    crate::push::spawn_push_dispatcher(cloud.clone());
 
     // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
     // World interface -- no external queue dependency).

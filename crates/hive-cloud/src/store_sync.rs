@@ -150,6 +150,23 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
+        name: "push",
+        // PushState's Vecs are kept sorted by the store's own mutators and the
+        // watermark map is a BTreeMap, so `enc` alone is already deterministic.
+        snapshot: |c| enc(&c.push.snapshot()),
+        adopt: |c, b| {
+            let v: crate::push::PushState = serde_json::from_slice(b).ok()?;
+            // Decline an entirely-empty leader payload (fresh leader before its
+            // own first persist load) — never wipe a follower's adopted copy.
+            if v.subs.is_empty() && v.sms.is_empty() && v.vapid.public_b64.is_empty() {
+                return None;
+            }
+            let n = v.subs.len() + v.sms.len();
+            c.push.load(v);
+            Some(n)
+        },
+    },
+    SyncedStore {
         name: "apikeys",
         snapshot: |c| enc_sorted(c.apikeys.snapshot()),
         adopt: |c, b| {

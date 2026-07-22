@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Bell, Settings2, Archive, AlertTriangle, XCircle, Info, BellRing } from "lucide-react";
 import { apiSend, usePoll, type Notification, type NotificationFeed } from "@/lib/api";
+import { subscribePush } from "@/lib/push";
 import { timeAgo } from "@/lib/utils";
 
 type Tab = "inbox" | "archive" | "comments";
@@ -62,11 +63,24 @@ export function NotificationBell() {
     await apiSend("POST", "/v1/notifications/archive-all").catch(() => {});
     refresh();
   }
-  function enablePush() {
-    if (typeof window !== "undefined" && "Notification" in window) {
-      window.Notification.requestPermission().catch(() => {});
+  async function enablePush() {
+    // Full Web Push enrollment (permission → SW subscription → backend
+    // registration under the current tenant) — shared with the settings page
+    // via lib/push. Only a SUCCESSFUL registration dismisses the banner; a
+    // transient failure (VAPID fetch, subscribe, backend upsert) keeps it
+    // visible so the user can retry, while an explicit permission denial keeps
+    // the existing dismissed-forever behavior (the mount effect treats a
+    // decided Notification.permission as authoritative anyway).
+    try {
+      await subscribePush();
+      dismissPush();
+    } catch (e) {
+      if (typeof window !== "undefined" && "Notification" in window && window.Notification.permission === "denied") {
+        dismissPush();
+        return;
+      }
+      console.warn("push: enable failed —", e);
     }
-    dismissPush();
   }
   function dismissPush() {
     setPushDismissed(true);

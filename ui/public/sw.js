@@ -93,3 +93,50 @@ self.addEventListener("fetch", (event) => {
     );
   }
 });
+
+/* ---- Web Push ----
+ * Payload (JSON from the backend push pipeline):
+ *   {title, body, severity, category, project, url, id, ts_ms}
+ * `tag: id` dedupes re-delivery of the same notification (a re-pushed id
+ * replaces the shown notification instead of stacking a duplicate). */
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    // Non-JSON payload (should never happen from our pipeline) — show as-is.
+    payload = { body: event.data ? event.data.text() : "" };
+  }
+  const title = payload.title || "shadw";
+  event.waitUntil(
+    self.registration.showNotification(title, {
+      body: payload.body || "",
+      icon: "/icon.png", // app-router icon route (ui/app/icon.png)
+      tag: payload.id || undefined,
+      data: { url: payload.url || "/" },
+    })
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const url = (event.notification.data && event.notification.data.url) || "/";
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((wins) => {
+        // Prefer focusing an already-open dashboard tab (navigated to the
+        // notification's target) over spawning a new window every click.
+        for (const client of wins) {
+          if ("focus" in client) {
+            return client
+              .focus()
+              .then((focused) => ((focused || client).navigate ? (focused || client).navigate(url) : undefined))
+              .catch(() => self.clients.openWindow(url));
+          }
+        }
+        return self.clients.openWindow(url);
+      })
+      .catch(() => self.clients.openWindow(url))
+  );
+});

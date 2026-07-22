@@ -177,6 +177,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/notifications/read", post(notifications_read))
         .route("/v1/notifications/archive-all", post(notifications_archive_all))
         .route("/v1/notifications/:id/archive", post(notification_archive))
+        // ---- Push delivery (web push + SMS) ----
+        .route("/v1/push/vapid-key", get(push_vapid_key))
+        .route("/v1/push/subscribe", post(push_subscribe).delete(push_unsubscribe))
+        .route("/v1/push/settings", get(push_settings))
+        .route("/v1/push/sms", axum::routing::put(push_sms_put))
+        .route("/v1/push/sms/verify", post(push_sms_verify))
+        .route("/v1/push/test", post(push_test))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
         .route("/v1/speed-insights", get(speed_insights_get))
@@ -4915,6 +4922,17 @@ async fn team_remove_member(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner", "admin"])?;
     let t = c.teams.remove_member(&slug, &email).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    // Revoke the ex-member's push/SMS registrations for THIS team so they stop
+    // receiving its notifications immediately (rows capture the tenant at
+    // registration and the dispatcher would otherwise keep fanning to them
+    // forever — see push.rs). Resolve email -> Clerk user id via the identity
+    // mirror (push rows are keyed by user id, members by email).
+    if let Some(uid) = c.identity.users().into_iter().find(|u| u.email.eq_ignore_ascii_case(email.trim())).map(|u| u.id) {
+        let purged = c.push.purge_user_tenant(&uid, &norm(&slug));
+        if purged > 0 {
+            tracing::info!(team = %slug, user = %uid, purged, "revoked ex-member push/SMS registrations");
+        }
+    }
     crate::persist::persist(&c);
     Ok(Json(json!(t)))
 }
@@ -6282,16 +6300,16 @@ async fn incidents_list(
     Ok(Json(json!(c.incidents.list())))
 }
 
-/// The incidents store is in the leader→follower store-sync REGISTRY: a
-/// follower-side write returns 200, persists locally, then gets silently
-/// CLOBBERED by the next sync cycle's wholesale snapshot adoption (live-hit
-/// 2026-07-21: an incident created on fc-lax vanished from fc-lax itself
-/// minutes later). Mutations therefore run ONLY on the leader — a non-leader
-/// node forwards the request there (carrying the caller's own bearer, so the
-/// leader re-verifies the same operator JWT against the fleet-shared secret)
-/// and returns the leader's response, or fails LOUDLY with 502. It must never
-/// fall back to the local write: accepting a write the sync loop will erase is
-/// strictly worse than refusing it.
+/// Leader-forward for mutations of leader→follower REGISTRY-synced stores
+/// (incidents, push): a follower-side write returns 200, persists locally,
+/// then gets silently CLOBBERED by the next sync cycle's wholesale snapshot
+/// adoption (live-hit 2026-07-21: an incident created on fc-lax vanished from
+/// fc-lax itself minutes later). Mutations therefore run ONLY on the leader —
+/// a non-leader node forwards the request there (carrying the caller's own
+/// bearer, so the leader re-verifies the same JWT against the fleet-shared
+/// secret) and returns the leader's response, or fails LOUDLY with 502. It
+/// must never fall back to the local write: accepting a write the sync loop
+/// will erase is strictly worse than refusing it.
 ///
 /// Deliberately NO iroh-mesh fallback (unlike `put_to_host`): mesh delegation
 /// tokens are stripped of `platform_admin` on verification (`gossip::
@@ -6302,9 +6320,10 @@ async fn incidents_list(
 /// leader directly, so this 502 only surfaces on direct API calls against a
 /// follower whose HTTP admin map lacks the leader — which previously LOST the
 /// write silently and now names the fix instead.
-async fn forward_incident_mutation_to_leader(
+async fn forward_mutation_to_leader(
     c: &Arc<CloudState>,
     headers: &HeaderMap,
+    method: reqwest::Method,
     path: &str,
     body: &Value,
 ) -> Result<Json<Value>, (StatusCode, String)> {
@@ -6313,16 +6332,25 @@ async fn forward_incident_mutation_to_leader(
     let Some(admin) = admin else {
         return Err((
             StatusCode::BAD_GATEWAY,
-            format!("incident mutations must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"),
+            format!("this mutation must run on the control-plane leader '{leader}', whose admin URL this node does not know — retry via the leader"),
         ));
     };
-    let mut req = if body.is_null() {
-        c.http.delete(format!("{admin}{path}")).timeout(std::time::Duration::from_secs(15))
-    } else {
-        c.http.post(format!("{admin}{path}")).timeout(std::time::Duration::from_secs(15)).json(body)
-    };
-    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
-        req = req.header(axum::http::header::AUTHORIZATION, auth.clone());
+    let mut req = c.http.request(method, format!("{admin}{path}")).timeout(std::time::Duration::from_secs(15));
+    if !body.is_null() {
+        req = req.json(body);
+    }
+    // Forward EVERY credential/tenant-context header the leader re-derives auth
+    // and tenant from: Authorization (bearer), Cookie (the dashboard's hive_jwt
+    // is a cookie, not a bearer — dropping it 401'd cookie-auth mutations), and
+    // x-hive-team (the tenant selector `tenant()` reads in unenforced mode —
+    // dropping it silently mis-stored the row under "personal").
+    for h in [axum::http::header::AUTHORIZATION, axum::http::header::COOKIE] {
+        if let Some(v) = headers.get(&h) {
+            req = req.header(h, v.clone());
+        }
+    }
+    if let Some(v) = headers.get("x-hive-team") {
+        req = req.header("x-hive-team", v.clone());
     }
     match req.send().await {
         Ok(r) if r.status().is_success() => {
@@ -6351,7 +6379,7 @@ async fn incident_open(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     if !c.is_control_plane_leader() {
-        return forward_incident_mutation_to_leader(&c, &headers, "/v1/incidents", &json!(req)).await;
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::POST, "/v1/incidents", &json!(req)).await;
     }
     let inc = c.incidents.open(req);
     crate::persist::persist(&c);
@@ -6368,7 +6396,7 @@ async fn incident_update(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     if !c.is_control_plane_leader() {
-        return forward_incident_mutation_to_leader(&c, &headers, &format!("/v1/incidents/{id}/updates"), &json!(req)).await;
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::POST, &format!("/v1/incidents/{id}/updates"), &json!(req)).await;
     }
     let resolved = matches!(req.status, crate::incidents::IncidentStatus::Resolved);
     let inc = c.incidents.update(&id, req).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
@@ -6390,12 +6418,314 @@ async fn incident_delete(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     if !c.is_control_plane_leader() {
-        return forward_incident_mutation_to_leader(&c, &headers, &format!("/v1/incidents/{id}"), &Value::Null).await;
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::DELETE, &format!("/v1/incidents/{id}"), &Value::Null).await;
     }
     let inc = c.incidents.remove(&id).ok_or((StatusCode::NOT_FOUND, "no such incident".into()))?;
     crate::persist::persist(&c);
     crate::webhooks::dispatch(&c.webhooks, "*", "incident.deleted", json!({ "id": inc.id, "title": inc.title }));
     Ok(Json(json!({ "ok": true, "deleted": inc.id })))
+}
+
+// ============================ Push delivery (web push + SMS) ============================
+
+/// Caller's user id from verified claims (`sub` = Clerk user id via the mint);
+/// "local" in unenforced dev mode. Push/SMS rows are keyed by this so
+/// `push_settings` can never return a teammate's devices or phone number.
+fn push_user_id(claims: Option<&crate::auth::Claims>) -> String {
+    claims.map(|cl| cl.sub.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| "local".into())
+}
+
+/// Public VAPID key for `pushManager.subscribe` — requires a signed-in session
+/// (the key itself is public by design; the gate just keeps the surface
+/// consistent with every other dashboard read).
+async fn push_vapid_key(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    // Generate ONLY on the leader (a follower minting its own key forks the
+    // fleet keypair, stranding every subscription made against the other key).
+    crate::push::ensure_vapid_on_leader(&c);
+    let keys = c.push.vapid();
+    if keys.public_b64.is_empty() {
+        // Follower before the leader's key has synced in — transient, retryable.
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "push keys initializing; retry shortly".into()));
+    }
+    Ok(Json(json!({ "key": keys.public_b64 })))
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PushSubscribeBody {
+    endpoint: String,
+    p256dh: String,
+    auth: String,
+    #[serde(default)]
+    label: String,
+}
+
+/// Register (or re-register) this browser's push subscription under the
+/// caller's VERIFIED tenant — the tenant comes from `tenant()` (JWT claim
+/// first, never a bare spoofable header under enforcement), which is the
+/// entire cross-tenant isolation story for delivery: the dispatcher only fans
+/// a tenant's notifications to rows stored under that exact tenant.
+async fn push_subscribe(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<PushSubscribeBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Validate BEFORE forwarding: endpoint host must be a recognized push
+    // service (stops our VAPID-signed server-side POST from being aimed at an
+    // arbitrary attacker URL) and the subscriber keys must be well-formed
+    // (garbage keys create rows that fail encryption on every tick forever).
+    if let Err(e) = crate::push::valid_subscription_input(&b.endpoint, &b.p256dh, &b.auth) {
+        return Err((StatusCode::BAD_REQUEST, e.into()));
+    }
+    if !c.is_control_plane_leader() {
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::POST, "/v1/push/subscribe", &json!(b)).await;
+    }
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+    match c.push.upsert_subscription(crate::push::PushSubscription {
+        endpoint: b.endpoint,
+        p256dh: b.p256dh,
+        auth: b.auth,
+        tenant: team,
+        user_id: user,
+        label: b.label.chars().take(64).collect(),
+        created_ms: hive_core::now_ms(),
+    }) {
+        crate::push::SubscribeResult::Ok => {
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "ok": true })))
+        }
+        crate::push::SubscribeResult::EndpointOwnedByOther => {
+            Err((StatusCode::CONFLICT, "this push endpoint is registered to a different account".into()))
+        }
+        crate::push::SubscribeResult::CapReached => {
+            Err((StatusCode::TOO_MANY_REQUESTS, "too many registered devices for this account; remove one first".into()))
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PushUnsubscribeBody {
+    endpoint: String,
+}
+
+async fn push_unsubscribe(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<PushUnsubscribeBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !c.is_control_plane_leader() {
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::DELETE, "/v1/push/subscribe", &json!(b)).await;
+    }
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+    let removed = c.push.remove_subscription(&b.endpoint, Some(&user));
+    if removed {
+        crate::persist::persist(&c);
+    }
+    Ok(Json(json!({ "ok": true, "removed": removed })))
+}
+
+/// The CALLER's own delivery config for the current tenant — never anyone
+/// else's (rows are filtered by the verified user id AND tenant).
+async fn push_settings(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+    let devices: Vec<Value> = c
+        .push
+        .devices_for(&user, &team)
+        .into_iter()
+        .map(|d| json!({ "endpoint": d.endpoint, "label": d.label, "created_ms": d.created_ms }))
+        .collect();
+    // `verified` gates delivery; `sms_quota` is served from a short-TTL cache so
+    // this read never blocks on a live Textbelt round trip.
+    let sms = c
+        .push
+        .sms_for(&user, &team)
+        .map(|s| json!({ "phone": s.phone, "enabled": s.enabled, "verified": s.verified }));
+    let quota = crate::push::sms_quota_cached(&c).await;
+    Ok(Json(json!({ "devices": devices, "sms": sms, "sms_quota": quota })))
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PushSmsBody {
+    phone: String,
+    enabled: bool,
+}
+
+/// Deterministic 6-digit code from cryptographic bytes (no PRNG dep needed).
+fn sms_verification_code() -> String {
+    use ring::rand::SecureRandom;
+    let mut b = [0u8; 4];
+    let _ = ring::rand::SystemRandom::new().fill(&mut b);
+    format!("{:06}", u32::from_be_bytes(b) % 1_000_000)
+}
+
+/// Set (or change) the SMS number. This does NOT enable delivery: it texts a
+/// verification code to the number and stores it PENDING. Delivery starts only
+/// after `push_sms_verify` confirms the code — so a caller can never point
+/// notifications at a phone number they don't control (anti-SMS-bombing).
+/// Toggling an already-verified number on/off skips re-verification.
+async fn push_sms_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<PushSmsBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let phone = b.phone.trim().to_string();
+    let digits_ok = phone.strip_prefix('+').is_some_and(|d| (8..=15).contains(&d.len()) && d.chars().all(|c| c.is_ascii_digit()));
+    if !digits_ok {
+        return Err((StatusCode::BAD_REQUEST, "phone must be E.164 (e.g. +15551234567)".into()));
+    }
+    if !c.is_control_plane_leader() {
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::PUT, "/v1/push/sms", &json!({ "phone": phone, "enabled": b.enabled })).await;
+    }
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+
+    // Fast path: toggling an already-verified, unchanged number needs no text.
+    if let Some(existing) = c.push.sms_for(&user, &team) {
+        if existing.verified && existing.phone == phone {
+            c.push.set_sms_enabled(&user, &team, b.enabled);
+            crate::persist::persist(&c);
+            return Ok(Json(json!({ "ok": true, "verified": true, "code_sent": false })));
+        }
+    }
+
+    let code = sms_verification_code();
+    let sent = c.push.set_sms_pending(&user, &team, &phone, &code, hive_core::now_ms());
+    if !sent {
+        // Within resend cooldown — do not spend another SMS.
+        crate::persist::persist(&c);
+        return Ok(Json(json!({ "ok": true, "verified": false, "code_sent": false, "note": "a code was already sent recently; check your messages or wait a minute" })));
+    }
+    let msg = format!("[shadw] Your verification code is {code}. Enter it to enable SMS notifications.");
+    match crate::push::send_sms(&c, &phone, &msg, false).await {
+        Ok(()) => {
+            crate::persist::persist(&c);
+            Ok(Json(json!({ "ok": true, "verified": false, "code_sent": true })))
+        }
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("could not send verification SMS: {e}"))),
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PushSmsVerifyBody {
+    code: String,
+}
+
+/// Confirm ownership of the pending SMS number by entering the texted code.
+async fn push_sms_verify(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<PushSmsVerifyBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if !c.is_control_plane_leader() {
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::POST, "/v1/push/sms/verify", &json!({ "code": b.code })).await;
+    }
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+    if c.push.verify_sms(&user, &team, b.code.trim(), hive_core::now_ms()) {
+        crate::persist::persist(&c);
+        Ok(Json(json!({ "ok": true, "verified": true })))
+    } else {
+        Err((StatusCode::BAD_REQUEST, "invalid or expired verification code".into()))
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct PushTestBody {
+    /// Route the SMS leg through Textbelt's `_test` key variant (validates the
+    /// whole request path without sending or consuming quota) — used by
+    /// automated verification; the settings-page button sends for real.
+    #[serde(default)]
+    sms_test: bool,
+}
+
+/// Per-user rate limit for the test endpoint: it triggers real FCM sends and
+/// (for a verified number) a real SMS, so a signed-in user must not be able to
+/// spam it. One test per user per 30s.
+static PUSH_TEST_LAST: std::sync::LazyLock<parking_lot::RwLock<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+const PUSH_TEST_COOLDOWN_MS: u64 = 30_000;
+
+/// Send a real test notification through the REAL delivery pipeline to the
+/// caller's own registered devices/SMS for the current tenant. Deliberately
+/// NOT leader-gated: it mutates nothing (no store writes), and running it on
+/// any node is exactly what makes dev/non-leader verification possible. Rate-
+/// limited per user; the SMS leg only ever reaches the caller's OWN verified
+/// number.
+async fn push_test(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    body: Option<Json<PushTestBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let user = push_user_id(claims.as_ref().map(|e| &e.0));
+    let opts = body.map(|Json(b)| b).unwrap_or_default();
+
+    // Rate-limit per (user, tenant) — cheap in-memory cooldown.
+    let rl_key = format!("{user}|{team}");
+    {
+        let now = hive_core::now_ms();
+        let mut g = PUSH_TEST_LAST.write();
+        if let Some(last) = g.get(&rl_key) {
+            if now.saturating_sub(*last) < PUSH_TEST_COOLDOWN_MS {
+                return Err((StatusCode::TOO_MANY_REQUESTS, "please wait a moment before sending another test".into()));
+            }
+        }
+        g.insert(rl_key, now);
+    }
+
+    let test_notif = crate::notifications::Notification {
+        id: format!("test-{}", hive_core::now_ms()),
+        severity: "info".into(),
+        category: "test".into(),
+        project: team.clone(),
+        environment: String::new(),
+        message: "Test notification — push delivery is working.".into(),
+        ts_ms: hive_core::now_ms(),
+        read: false,
+        archived: false,
+    };
+    let payload = crate::push::push_payload(&test_notif);
+
+    let devices = c.push.devices_for(&user, &team);
+    let mut sent = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for d in &devices {
+        match crate::push::send_web_push(&c, d, &payload).await {
+            Ok(true) => sent += 1,
+            Ok(false) => errors.push(format!("{}: subscription expired (404/410)", d.label)),
+            Err(e) => errors.push(format!("{}: {e}", d.label)),
+        }
+    }
+
+    // SMS test only ever targets the caller's OWN verified+enabled number.
+    let sms_result = match c.push.sms_for(&user, &team) {
+        Some(t) if t.enabled && t.verified => match crate::push::send_sms(&c, &t.phone, &crate::push::sms_body(&test_notif), opts.sms_test).await {
+            Ok(()) => json!({ "attempted": true, "ok": true, "test_mode": opts.sms_test }),
+            Err(e) => json!({ "attempted": true, "ok": false, "error": e }),
+        },
+        _ => json!({ "attempted": false, "ok": false }),
+    };
+
+    Ok(Json(json!({
+        "web_push": { "sent": sent, "failed": errors.len(), "errors": errors, "devices": devices.len() },
+        "sms": sms_result,
+    })))
 }
 
 // ---- Notifications (inbox bell) ----
@@ -6404,7 +6734,7 @@ async fn incident_delete(
 /// (failed deploys, 5xx error anomalies, blocked-traffic usage anomalies),
 /// applying the user's read/archived state. Archived items keep their `archived`
 /// flag so the client can render an Archive tab.
-fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notifications::Notification> {
+pub(crate) fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate::notifications::Notification> {
     use crate::notifications::Notification;
     use std::collections::HashMap;
     let team = norm(team).to_string();
