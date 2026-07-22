@@ -3180,36 +3180,48 @@ async fn git_webhook(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Verify the GitHub signature when a secret is configured.
-    match std::env::var("GITHUB_WEBHOOK_SECRET") {
-        Ok(secret) if !secret.is_empty() => {
-            let sig = headers
-                .get("x-hub-signature-256")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
-            if !verify_github_sig(secret.as_bytes(), &body, sig) {
-                return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
+    // Signature policy: a SIGNED delivery is always verified when a secret is
+    // configured (a bad/forged signature is rejected). An UNSIGNED delivery is
+    // accepted ONLY with the explicit `GITHUB_WEBHOOK_ALLOW_UNSIGNED` opt-in —
+    // this restores auto-deploy for hooks that were installed before the UI
+    // was provisioned with the signing secret (they carry no signature and
+    // would otherwise 401 forever), without dropping verification of the
+    // hooks that DO sign. Re-signing those legacy hooks (reconnect GitHub) lets
+    // this flag be removed again for strict-everywhere verification.
+    let secret = std::env::var("GITHUB_WEBHOOK_SECRET").ok().filter(|s| !s.is_empty());
+    let sig = headers
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let allow_unsigned = std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !sig.is_empty() {
+        // Signed: verify against the secret. A signed delivery with no secret
+        // configured can't be verified — accept only under the opt-in.
+        match &secret {
+            Some(s) => {
+                if !verify_github_sig(s.as_bytes(), &body, sig) {
+                    return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
+                }
+            }
+            None => {
+                if !allow_unsigned {
+                    return Err((StatusCode::UNAUTHORIZED, "signed delivery but GITHUB_WEBHOOK_SECRET is not configured".into()));
+                }
             }
         }
-        _ => {
-            // No secret configured: reject unsigned deliveries by default (safe
-            // default). Accepting them requires an explicit opt-in, never an
-            // implicit fallback of "secret happens to be unset".
-            let allow_unsigned = std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
-                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-            if !allow_unsigned {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    "GITHUB_WEBHOOK_SECRET is not configured on this node, so webhook \
-                     signatures cannot be verified. Set GITHUB_WEBHOOK_SECRET to the \
-                     secret configured on the GitHub webhook, or set \
-                     GITHUB_WEBHOOK_ALLOW_UNSIGNED=1 to explicitly accept unsigned \
-                     deliveries (local/dev convenience only — do not set in production)."
-                        .into(),
-                ));
-            }
-        }
+    } else if !allow_unsigned {
+        // Unsigned and not opted in → reject (the strict default).
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "unsigned webhook delivery rejected. The GitHub hook has no signing \
+             secret; reconnect GitHub to re-sign it, or set \
+             GITHUB_WEBHOOK_ALLOW_UNSIGNED=1 to accept unsigned deliveries."
+                .into(),
+        ));
+    } else {
+        tracing::warn!("accepting UNSIGNED webhook delivery (GITHUB_WEBHOOK_ALLOW_UNSIGNED=1) — re-sign this hook to restore signature verification");
     }
 
     let event = headers
