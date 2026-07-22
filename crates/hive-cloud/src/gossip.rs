@@ -377,6 +377,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/summary") => {
             jb(crate::admin::wf_summary(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
         }
+        // Workflow hooks list — must match before the generic `/v1/workflows` arm.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/hooks") => {
+            jb(crate::admin::wf_hooks(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+        }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows") => {
             jb(crate::admin::wf_list(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
         }
@@ -681,6 +685,7 @@ fn wf_query(path: &str) -> axum::extract::Query<crate::admin::WfQuery> {
         project: qparam(path, "project"),
         local: qparam(path, "local").map(|v| v == "true" || v == "1"),
         summary: qparam(path, "summary").map(|v| v == "true" || v == "1"),
+        run_id: qparam(path, "runId"),
     })
 }
 

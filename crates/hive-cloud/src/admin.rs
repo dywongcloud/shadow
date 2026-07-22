@@ -70,6 +70,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/cron/:id/run", post(cron_run))
         .route("/v1/workflows", get(wf_list).post(wf_define))
         .route("/v1/workflows/summary", get(wf_summary))
+        .route("/v1/workflows/hooks", get(wf_hooks))
         .route("/v1/workflows/runs", get(wf_runs))
         .route("/v1/workflows/runs/:id", get(wf_run_detail))
         .route("/v1/workflows/:id/run", post(wf_run))
@@ -4432,6 +4433,9 @@ pub(crate) struct WfQuery {
     /// renders none of them; full detail lives on `/v1/workflows/runs/:id`).
     #[serde(default, deserialize_with = "de_lenient_bool")]
     pub(crate) summary: Option<bool>,
+    /// Scope a run-scoped read (e.g. `/v1/workflows/hooks`) to a single run.
+    #[serde(default, rename = "runId")]
+    pub(crate) run_id: Option<String>,
 }
 
 /// Does this workflow's project belong to the requesting team? Fleet-aware —
@@ -4716,6 +4720,103 @@ pub(crate) async fn wf_summary(State(c): State<Arc<CloudState>>, headers: Header
         })
         .collect();
     Json(json!(rows))
+}
+
+/// List workflow HOOKS for the observability console's Hooks tab. Hooks live ONLY
+/// in the deployed app's WDK "world" store (there's no engine-side source the way
+/// runs have one), so this reads them from every project HOSTED on this node and
+/// fans out to the peers hosting this tenant's other projects — the same
+/// tenant-scoping / project-filtering / `?local=` fleet-merge shape as `wf_runs`.
+/// `?runId=` scopes the read to a single run.
+pub(crate) async fn wf_hooks(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    // Same short-TTL collapse as wf_runs (fleet fan-out + per-project Upstash world
+    // reads). Never cache the inner `local=true` hop.
+    let is_top_level = !q.local.unwrap_or(false);
+    let run_id = q.run_id.as_deref();
+    let cache_key = format!("wf_hooks:{team}:{}:{}", q.project.as_deref().unwrap_or(""), run_id.unwrap_or(""));
+    if is_top_level {
+        if let Some(v) = c.resp_cache.get(&cache_key, Duration::from_secs(2)) {
+            return Json(v);
+        }
+    }
+    let rid_q = run_id.map(|r| format!("&runId={r}")).unwrap_or_default();
+    // Cross-region project: proxy to the node that HOSTS it — its world env is
+    // decrypted there (same per-project `local=true` proxy path as wf_runs).
+    if let Some(project) = q.project.as_deref() {
+        if c.gw.git_for_project(project).is_none() {
+            if let Some(node) = host_node_for_project(&c, project) {
+                let path = format!("/v1/workflows/hooks?project={project}&local=true{rid_q}");
+                if let Some(v) = fetch_from_host(&c, &node, &path, &team).await {
+                    if is_top_level {
+                        c.resp_cache.set(cache_key.clone(), v.clone());
+                    }
+                    return Json(v);
+                }
+            }
+        }
+    }
+    // Hooks from the WDK world of each project hosted on THIS node (env_map decrypts
+    // locally); the coordinator gets remote ones via the proxy / fan-out paths.
+    let mut hooks: Vec<Value> = Vec::new();
+    {
+        let locals: Vec<String> = match q.project.as_deref() {
+            Some(p) if c.gw.git_for_project(p).is_some() => vec![p.to_string()],
+            Some(_) => vec![],
+            None => {
+                let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+                for d in c.gw.list() {
+                    // Authoritative deployment-record tag, not the node-local project row.
+                    if record_tenant(&d.tenant) == team {
+                        s.insert(d.project);
+                    }
+                }
+                s.into_iter().collect()
+            }
+        };
+        let world_locals: Vec<String> = locals.into_iter().filter(|p| crate::world::has_world(&c, p)).collect();
+        // Per-project Upstash world reads run CONCURRENTLY (same "most expensive
+        // read" class as wf_runs) — bound the added latency to the slowest project.
+        for whooks in futures::future::join_all(world_locals.iter().map(|p| crate::world::list_hooks(&c, p, run_id, 50))).await.into_iter().flatten() {
+            hooks.extend(whooks);
+        }
+    }
+    let hook_key = |h: &Value| -> Option<String> {
+        let hid = h.get("hookId").and_then(|x| x.as_str()).unwrap_or("");
+        let rid = h.get("runId").and_then(|x| x.as_str()).unwrap_or("");
+        if hid.is_empty() && rid.is_empty() {
+            None
+        } else {
+            Some(format!("{rid}\u{0}{hid}"))
+        }
+    };
+    if q.project.is_none() && !q.local.unwrap_or(false) {
+        let mut seen: std::collections::HashSet<String> = hooks.iter().filter_map(hook_key).collect();
+        let peers = peer_nodes_for_tenant(&c, &team);
+        let path = format!("/v1/workflows/hooks?local=true{rid_q}");
+        for v in fan_out_peers(&c, &peers, &team, &path).await {
+            if let Some(arr) = v.as_array() {
+                for h in arr {
+                    if let Some(k) = hook_key(h) {
+                        if seen.insert(k) {
+                            hooks.push(h.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Newest-first across the merged fleet view.
+    hooks.sort_by(|a, b| {
+        let am = a.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        let bm = b.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        bm.cmp(&am)
+    });
+    let result = json!(hooks);
+    if is_top_level {
+        c.resp_cache.set(cache_key, result.clone());
+    }
+    Json(result)
 }
 
 async fn wf_run(

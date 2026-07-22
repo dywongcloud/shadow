@@ -2,47 +2,21 @@
 
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
-import Link from "next/link";
-import dynamic from "next/dynamic";
-import { Search, ChevronDown, Calendar, Plus, Loader2, X } from "lucide-react";
-import { Button, Input, Triangle, PageHeader } from "@/components/ui";
-import { apiSend, usePoll, type WorkflowRun, type WorkflowDef } from "@/lib/api";
-import { StatusChips, RunsTable, normalizeRun } from "@/components/workflows";
+import { Plus, X } from "lucide-react";
+import { Button, Input, PageHeader } from "@/components/ui";
+import { apiSend, usePoll, type WorkflowDef, type WorkflowRun } from "@/lib/api";
+import { RunsList, WorkflowsList, HooksView, normalizeRun, type WdkView } from "@/components/workflows";
+import { normStatus } from "@/components/workflows/shared";
 
-// reactflow (the graph renderer) only mounts once a workflow definition is
-// opened — dynamic + ssr:false keeps its ~considerable bundle out of every
-// /workflows page load (the default "Runs" tab never touches it).
-const WorkflowDefGraph = dynamic(
-  () => import("@/components/workflow-graph").then((m) => m.WorkflowDefGraph),
-  {
-    ssr: false,
-    loading: () => (
-      <div className="flex h-[480px] items-center justify-center rounded-xl border border-border bg-bg">
-        <Loader2 className="h-5 w-5 animate-spin text-muted" />
-      </div>
-    ),
-  }
-);
-
-const RANGES: Record<string, number> = {
-  "Last 1 hour": 3600_000,
-  "Last 12 hours": 12 * 3600_000,
-  "Last 24 hours": 24 * 3600_000,
-  "Last 7 days": 7 * 24 * 3600_000,
-};
-
-function useNow(ms = 1000) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), ms);
-    return () => clearInterval(id);
-  }, [ms]);
-  return now;
-}
+// ---------------------------------------------------------------------------
+// The global workflow observability console — a faithful native port of the
+// Vercel @workflow/web Home view (Runs / Hooks / Workflows), aggregated across
+// every project, inside hive's chrome. Sub-views are driven by the TOP-NAV
+// breadcrumb sub-tabs (`?tab=`), not an in-page tab bar.
+// ---------------------------------------------------------------------------
 
 export default function WorkflowsPage() {
-  // useSearchParams (for the top-nav-driven `?tab=` view) must sit under a Suspense
-  // boundary in the app router.
+  // useSearchParams must sit under a Suspense boundary in the app router.
   return (
     <Suspense fallback={<div className="h-40" />}>
       <WorkflowsInner />
@@ -51,241 +25,45 @@ export default function WorkflowsPage() {
 }
 
 function WorkflowsInner() {
-  // The active view (Runs / Workflows / Hooks) is driven by the TOP-NAV sub-tabs
-  // (`?tab=`) — the breadcrumb-tabs model shared with the project/deployment pages —
-  // instead of an in-page tab bar. Defaults to "runs".
   const searchParams = useSearchParams();
   const tab = searchParams.get("tab");
   const view: WdkView = tab === "workflows" || tab === "hooks" ? tab : "runs";
+
   // ADAPTIVE polling: /v1/workflows/runs is the most expensive read on the
-  // dashboard (fleet fan-out + per-project Upstash world reads per call). Poll
-  // fast (3s) only while a run is actually in flight; 12s at rest. The
-  // definitions list only changes on deploy — long TTL, slow poll.
-  // LAZY: only the "runs" sub-tab renders anything derived from this data (the
-  // Workflows/Hooks tabs only use `defs`, from the separate cheap poll below) —
-  // gate the recurring poll on `view === "runs"` so switching away from Runs
-  // stops paying for the most expensive read entirely instead of just not
-  // rendering its result. `usePoll`'s `active` still does one fetch on the
-  // transition (never stale-forever); the /v1/workflows/runs PATH_TTL entry
-  // caps that to at most one real network read per 3s even if the user flips
-  // tabs rapidly.
+  // dashboard (fleet fan-out + per-project Upstash world reads). Poll fast (3s)
+  // only while a run is in flight; 12s at rest. Gate on the Runs view so the
+  // other tabs stop paying for it entirely.
   const [anyRunning, setAnyRunning] = useState(false);
-  const { data: rawRuns } = usePoll<WorkflowRun[]>("/v1/workflows/runs?summary=1", anyRunning ? 3000 : 12000, view === "runs");
+  const { data: rawRuns, loading: runsLoading } = usePoll<WorkflowRun[]>("/v1/workflows/runs?summary=1", anyRunning ? 3000 : 12000, view === "runs");
   const runs = useMemo(() => (rawRuns ?? []).map(normalizeRun), [rawRuns]);
   useEffect(() => {
-    setAnyRunning((runs ?? []).some((r) => r.status === "running" || r.status === "pending"));
+    setAnyRunning(runs.some((r) => normStatus(r.status) === "running" || normStatus(r.status) === "pending"));
   }, [runs]);
   const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 15000);
-  // The 1s wall-clock re-render only matters while a duration is ticking (a
-  // run in flight); 5s otherwise keeps "x min ago" fresh without re-rendering
-  // the whole page every second.
-  const now = useNow(anyRunning ? 1000 : 5000);
-  const [q, setQ] = useState("");
-  const [range, setRange] = useState("Last 12 hours");
-  const [env, setEnv] = useState("All Environments");
   const [creating, setCreating] = useState(false);
-
-  // Time window, then environment scope. (Workflow runs execute on the deployed
-  // app, so they default to "production"; the env filter narrows the same dataset.)
-  const windowed = useMemo(() => {
-    const cutoff = now - (RANGES[range] ?? RANGES["Last 12 hours"]);
-    return (runs ?? []).filter((r) => r.started_ms >= cutoff);
-  }, [runs, range, now]);
-
-  const envScoped = useMemo(() => {
-    if (env === "All Environments") return windowed;
-    const want = env.toLowerCase();
-    return windowed.filter((r) => (r.environment ?? "production") === want);
-  }, [windowed, env]);
-
-  // Per-project activity rollup derived from the REAL runs (created / completed /
-  // failed / active), so the table reflects live data + the env/time filters —
-  // this is what was previously empty (the summary endpoint ignored WDK world runs).
-  const summary = useMemo(() => {
-    const agg = new Map<string, { project: string; created: number; completed: number; failed: number; active: number }>();
-    for (const r of envScoped) {
-      const proj = r.project || "default";
-      const e = agg.get(proj) ?? { project: proj, created: 0, completed: 0, failed: 0, active: 0 };
-      e.created++;
-      if (r.status === "succeeded") e.completed++;
-      else if (r.status === "failed") e.failed++;
-      else if (r.status === "running" || r.status === "pending") e.active++;
-      agg.set(proj, e);
-    }
-    return [...agg.values()].sort((a, b) => b.created - a.created);
-  }, [envScoped]);
-
-  const filtered = useMemo(() => {
-    const needle = q.toLowerCase();
-    return envScoped.filter(
-      (r) =>
-        r.name.toLowerCase().includes(needle) ||
-        r.id.toLowerCase().includes(needle) ||
-        r.project.toLowerCase().includes(needle)
-    );
-  }, [envScoped, q]);
 
   return (
     <div className="pb-20">
-      {/* Header — consistent with every other page (PageHeader). */}
       <PageHeader
         title="Workflows"
-        desc="Compose multi-step pipelines across your deployments and run them on demand or on a schedule."
+        desc="Observe every workflow run, hook, and definition across your deployments."
         action={
-          <div className="flex items-center gap-2">
-            <Pill icon={<Calendar className="h-3.5 w-3.5" />} label={range} options={Object.keys(RANGES)} onSelect={setRange} />
-            <Button variant="outline" onClick={() => setCreating((v) => !v)}>
-              {creating ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />} {creating ? "Close" : "New Workflow"}
-            </Button>
-          </div>
+          <Button variant="outline" onClick={() => setCreating((v) => !v)}>
+            {creating ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />} {creating ? "Close" : "New Workflow"}
+          </Button>
         }
       />
 
       {creating && <WorkflowDefiner onDone={() => setCreating(false)} />}
 
-      {/* Sub-tabs (Runs / Workflows / Hooks) now live in the top nav's tab bar
-          (breadcrumb-tabs model) — driven by `?tab=`; no in-page tab bar here. */}
-
-      {view === "runs" && (
-        <>
-          <div className="mb-4"><StatusChips runs={envScoped} /></div>
-          <div className="mb-3 flex items-center gap-2">
-            <Pill label={env} options={["All Environments", "Production", "Preview"]} onSelect={setEnv} />
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted" />
-              <Input placeholder="Search workflows, runs, and projects…" value={q} onChange={(e) => setQ(e.target.value)} className="pl-9" />
-            </div>
-          </div>
-          <div className="mb-6 overflow-hidden rounded-xl border border-border bg-card">
-            <div className="grid grid-cols-[2fr_0.8fr_0.8fr_0.8fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-              <span>Project</span><span>Created</span><span>Completed</span><span>Failed</span><span></span>
-            </div>
-            {(summary ?? []).length === 0 ? (
-              <div className="px-4 py-10 text-center text-sm text-secondary">No workflow activity yet.</div>
-            ) : (
-              (summary ?? []).map((s) => (
-                <Link
-                  key={s.project}
-                  href={`/projects/${encodeURIComponent(s.project)}?tab=workflows`}
-                  className="grid grid-cols-[2fr_0.8fr_0.8fr_0.8fr_auto] items-center border-b border-border px-4 py-3 text-sm transition-colors last:border-0 hover:bg-subtle/50"
-                >
-                  <span className="flex items-center gap-2 font-medium"><Triangle className="h-5 w-5" /> {s.project}</span>
-                  <span className="tabular-nums">{s.created}</span>
-                  <span className="tabular-nums text-emerald-600 dark:text-emerald-400">{s.completed}</span>
-                  <span className="tabular-nums text-red-600 dark:text-red-400">{s.failed}</span>
-                  <ChevronDown className="h-4 w-4 -rotate-90 text-muted" />
-                </Link>
-              ))
-            )}
-          </div>
-          <div className="mb-2 text-sm font-medium">Recent runs</div>
-          <RunsTable runs={filtered} now={now} showProject />
-        </>
-      )}
-
-      {view === "workflows" && <WorkflowsView defs={defs ?? []} />}
+      {view === "runs" && <RunsList runs={rawRuns ? runs : null} loading={runsLoading && !rawRuns} showProject />}
+      {view === "workflows" && <WorkflowsList defs={defs ?? []} />}
       {view === "hooks" && <HooksView defs={defs ?? []} />}
     </div>
   );
 }
 
-type WdkView = "runs" | "workflows" | "hooks";
-
-/** The "Workflows" definitions view (enabled + visible, unlike WDK's default).
- *  Workflows ingested from a deployed app's Vercel WDK manifest carry a `graph`,
- *  which we render on the canvas (Vercel web-dashboard style) via "Diagram". */
-function WorkflowsView({ defs }: { defs: WorkflowDef[] }) {
-  const [openId, setOpenId] = useState<string | null>(null);
-  async function run(id: string) {
-    await apiSend("POST", `/v1/workflows/${encodeURIComponent(id)}/run`).catch(() => {});
-  }
-  const open = defs.find((d) => d.id === openId) || null;
-  return (
-    <div className="space-y-4">
-      <div className="overflow-hidden rounded-xl border border-border bg-card">
-        <div className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] border-b border-border px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
-          <span>Workflow</span><span>Project</span><span>Steps</span><span></span>
-        </div>
-        {defs.length === 0 ? (
-          <div className="px-4 py-12 text-center text-sm text-secondary">No workflows defined yet — deploy an app using the Vercel WDK, or use “New Workflow”.</div>
-        ) : (
-          defs.map((d) => {
-            const hasGraph = !!(d.graph && d.graph.nodes && d.graph.nodes.length);
-            return (
-              <div key={d.id} className="grid grid-cols-[1.4fr_1fr_1.4fr_auto] items-center gap-3 border-b border-border px-4 py-3 text-sm last:border-0">
-                <span className="truncate font-mono font-medium">{d.name}</span>
-                <span className="truncate text-secondary">{d.project || "default"}</span>
-                <span className="truncate font-mono text-xs text-muted">{d.steps.map((s) => s.name).join(" → ") || (hasGraph ? `${d.graph!.nodes.length} node(s)` : "—")}</span>
-                <div className="flex gap-2">
-                  {hasGraph && (
-                    <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => setOpenId(openId === d.id ? null : d.id)}>
-                      {openId === d.id ? "Hide" : "Diagram"}
-                    </Button>
-                  )}
-                  <Button variant="outline" className="px-2.5 py-1 text-xs" onClick={() => run(d.id)}>Run</Button>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-      {open && open.graph && (
-        <div>
-          <div className="mb-2 text-sm font-medium">{open.name} — workflow graph</div>
-          <WorkflowDefGraph def={open} />
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** The "Hooks" view — trigger endpoints for each workflow. */
-function HooksView({ defs }: { defs: WorkflowDef[] }) {
-  return (
-    <div className="space-y-3">
-      <p className="text-sm text-secondary">Trigger workflows from anything — POST to a hook URL to start a run.</p>
-      {defs.length === 0 ? (
-        <div className="rounded-xl border border-border bg-card px-4 py-12 text-center text-sm text-secondary">No hooks — define a workflow first.</div>
-      ) : (
-        defs.map((d) => (
-          <div key={d.id} className="rounded-xl border border-border bg-card p-4">
-            <div className="mb-1 font-mono text-sm font-medium">{d.name}</div>
-            <code className="block overflow-x-auto rounded-md border border-border bg-subtle/50 px-3 py-2 font-mono text-xs text-secondary">
-              POST /cloud/v1/workflows/{d.id}/run
-            </code>
-          </div>
-        ))
-      )}
-    </div>
-  );
-}
-
-/** Small dropdown pill used for env/time-range filters. */
-function Pill({ icon, label, options, onSelect }: { icon?: React.ReactNode; label: string; options: string[]; onSelect: (v: string) => void }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        onBlur={() => setTimeout(() => setOpen(false), 150)}
-        className="flex items-center gap-2 rounded-md border border-border-strong px-3 py-1.5 text-sm text-fg hover:bg-subtle"
-      >
-        {icon} {label} <ChevronDown className="h-3.5 w-3.5 text-muted" />
-      </button>
-      {open && (
-        <div className="absolute right-0 z-30 mt-1 w-44 overflow-hidden rounded-lg border border-border bg-card py-1 shadow-pop">
-          {options.map((o) => (
-            <button key={o} onMouseDown={() => { onSelect(o); setOpen(false); }} className="block w-full px-3 py-1.5 text-left text-sm hover:bg-subtle">
-              {o}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Define + immediately a workflow against a real project deployment. */
+/** Define + immediately run a workflow against a real project deployment. */
 function WorkflowDefiner({ onDone }: { onDone: () => void }) {
   const [name, setName] = useState("pipeline");
   const [project, setProject] = useState("");

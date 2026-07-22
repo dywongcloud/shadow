@@ -256,6 +256,9 @@ const PATH_TTL: Array<[RegExp, number]> = [
   // single-run detail view (`/v1/workflows/runs/:id`), which a user actively
   // watching a trace wants at full freshness.
   [/^\/v1\/workflows\/runs(\?|$)/, 3_000],
+  // Workflow HOOKS list — derived from world events; changes only as runs create
+  // hooks, so a short de-dupe TTL is plenty (the Hooks tab polls slowly).
+  [/^\/v1\/workflows\/hooks(\?|$)/, 8_000],
 ];
 function pathTtl(path: string): number {
   for (const [re, ttl] of PATH_TTL) if (re.test(path)) return ttl;
@@ -1081,6 +1084,10 @@ export interface WorkflowRun {
   finished_ms: number | null;
   /** Deployment environment the run executed on ("production" | "preview"). */
   environment?: string;
+  /** Native WDK fields carried alongside the internal shape (superset). */
+  createdAt?: number;
+  updatedAt?: number;
+  workflowName?: string;
 }
 export interface WorkflowSummaryRow {
   project: string;
@@ -1088,6 +1095,19 @@ export interface WorkflowSummaryRow {
   completed: number;
   failed: number;
   active: number;
+}
+/** A workflow hook (webhook / createHook trigger), derived from world events.
+ *  Mirrors the upstream console's Hooks table. */
+export interface WorkflowHook {
+  hookId: string;
+  runId: string;
+  project: string;
+  token?: string | null;
+  isWebhook?: boolean;
+  /** Number of times the hook has been received/invoked. */
+  invocations: number;
+  created_ms: number;
+  metadata?: unknown;
 }
 
 // ---- Domains / DNS ----

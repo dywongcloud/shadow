@@ -3,134 +3,39 @@
 import { Suspense, useEffect, useMemo, useState, use } from "react";
 import { useSearchParams, useRouter, usePathname } from "next/navigation";
 import Link from "next/link";
+import dynamic from "next/dynamic";
 import {
-  Copy, Check, ChevronRight, ChevronDown, Code2, Timer, X,
-  GitBranch, ArrowUpDown, ExternalLink,
+  Check, ChevronRight, ChevronDown, Code2, Timer, X,
+  GitBranch, ArrowUpDown, ExternalLink, Loader2, Waves,
 } from "lucide-react";
-import { apiGet } from "@/lib/api";
+import { apiGet, usePoll, type WorkflowDef } from "@/lib/api";
+import {
+  AbsTime, CopyableText, EmptyState, StatusBadge, fmtDuration, decodeBlob, parseName, pretty, statusMeta, toMs, normStatus,
+} from "@/components/workflows/shared";
 
 // ---------------------------------------------------------------------------
-// A Vercel-WDK-style run detail: Trace (Gantt) + Events, with a span side panel.
-// Data comes from the app's own WDK "world" store via /v1/workflows/runs/:id,
-// which returns { run, steps, events } in the native WDK shape (timestamps are
-// epoch SECONDS as floats; step/run input+output are devalue+base64 blobs).
+// Run detail — a faithful native port of the Vercel @workflow/web run view:
+// breadcrumb + LiveStatus header, upstream stat row (Status / Duration / Run ID
+// / Queued / Started / Completed), and the four tabs Trace | Events | Streams |
+// Graph. Data comes from the app's own WDK "world" store via
+// /v1/workflows/runs/:id → { run, steps, events } (native WDK shapes:
+// epoch-second floats; devalue+base64 input/output blobs).
 // ---------------------------------------------------------------------------
+
+const WorkflowDefGraph = dynamic(() => import("@/components/workflow-graph").then((m) => m.WorkflowDefGraph), {
+  ssr: false,
+  loading: () => (
+    <div className="flex h-[460px] items-center justify-center rounded-xl border border-border bg-bg">
+      <Loader2 className="h-5 w-5 animate-spin text-muted" />
+    </div>
+  ),
+});
 
 interface Detail {
   run?: Record<string, any> | null;
   steps?: Record<string, any>[];
   events?: Record<string, any>[];
   project?: string;
-}
-
-// epoch-seconds (float) | epoch-ms → ms. Returns null for missing/zero.
-function ms(t: unknown): number | null {
-  if (typeof t !== "number" || t <= 0) return null;
-  return t > 1e12 ? t : Math.round(t * 1000);
-}
-
-function fmtDur(d: number): string {
-  if (!isFinite(d) || d < 0) d = 0;
-  if (d < 1000) return `${Math.round(d)}ms`;
-  const s = d / 1000;
-  if (s < 60) return `${s.toFixed(2).replace(/\.?0+$/, "")}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s % 60);
-  if (m < 60) return `${m}m ${rem}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h ${m % 60}m`;
-}
-
-// "step//./app/steps/autopilotSteps//listProactiveTenantsStep" →
-//   { module: "./app/steps/autopilotSteps", name: "listProactiveTenantsStep" }
-function parseName(raw?: string): { module: string; name: string } {
-  if (!raw) return { module: "", name: "" };
-  const parts = raw.split("//").map((s) => s.trim()).filter(Boolean);
-  if (parts.length >= 3) return { module: parts[1], name: parts[parts.length - 1] };
-  if (parts.length === 2) return { module: parts[0], name: parts[1] };
-  return { module: "", name: parts[parts.length - 1] || raw };
-}
-
-// Minimal devalue `unflatten` — the WDK encodes step/run input+output as
-// base64("devl" + devalue.stringify(value)) (with encryption OFF). Decode for the
-// side panel / events so we show real values, not opaque blobs. Best-effort.
-function unflatten(parsed: any): any {
-  if (typeof parsed === "number") {
-    if (parsed === -1 || parsed === -2) return undefined;
-    if (parsed === -3) return NaN;
-    if (parsed === -4) return Infinity;
-    if (parsed === -5) return -Infinity;
-    if (parsed === -6) return -0;
-    throw new Error("bad");
-  }
-  if (!Array.isArray(parsed) || parsed.length === 0) throw new Error("bad");
-  const values = parsed;
-  const hydrated: any[] = new Array(values.length);
-  const seen = new Set<number>();
-  function hydrate(index: number): any {
-    if (index === -1 || index === -2) return undefined;
-    if (index === -3) return NaN;
-    if (index === -4) return Infinity;
-    if (index === -5) return -Infinity;
-    if (index === -6) return -0;
-    if (seen.has(index)) return hydrated[index];
-    seen.add(index);
-    const value = values[index];
-    if (!value || typeof value !== "object") {
-      hydrated[index] = value;
-    } else if (Array.isArray(value)) {
-      if (typeof value[0] === "string") {
-        const type = value[0];
-        if (type === "Date") hydrated[index] = new Date(value[1]).toISOString();
-        else if (type === "BigInt") hydrated[index] = String(value[1]);
-        else if (type === "null") {
-          const o: any = {};
-          hydrated[index] = o;
-          for (let i = 1; i < value.length; i += 2) o[value[i]] = hydrate(value[i + 1]);
-        } else if (type === "Set") {
-          const a: any[] = [];
-          hydrated[index] = a;
-          for (let i = 1; i < value.length; i++) a.push(hydrate(value[i]));
-        } else if (type === "Map") {
-          const o: any = {};
-          hydrated[index] = o;
-          for (let i = 1; i < value.length; i += 2) o[String(hydrate(value[i]))] = hydrate(value[i + 1]);
-        } else hydrated[index] = value;
-      } else {
-        const arr: any[] = new Array(value.length);
-        hydrated[index] = arr;
-        for (let i = 0; i < value.length; i++) arr[i] = value[i] === -2 ? undefined : hydrate(value[i]);
-      }
-    } else {
-      const obj: any = {};
-      hydrated[index] = obj;
-      for (const k in value) obj[k] = hydrate((value as any)[k]);
-    }
-    return hydrated[index];
-  }
-  return hydrate(0);
-}
-
-/** Decode a WDK input/output blob to a JS value (best-effort). */
-function decodeBlob(v: any): any {
-  if (v == null) return v;
-  if (typeof v !== "string") return v; // already decoded
-  try {
-    const s = typeof atob === "function" ? atob(v) : v;
-    if (s.startsWith("devl")) return unflatten(JSON.parse(s.slice(4)));
-    try { return JSON.parse(s); } catch { return s; }
-  } catch {
-    return v;
-  }
-}
-
-function pretty(v: any): string {
-  try {
-    return JSON.stringify(v, (_k, val) => (val === undefined ? "__undefined__" : val), 2)
-      .replace(/"__undefined__"/g, "undefined");
-  } catch {
-    return String(v);
-  }
 }
 
 interface Span {
@@ -146,19 +51,7 @@ interface Span {
   cid?: string;
 }
 
-const STATUS_META: Record<string, { label: string; dot: string; bar: string; text: string }> = {
-  succeeded: { label: "Completed", dot: "bg-emerald-500", bar: "bg-emerald-500/70 border-emerald-500", text: "text-emerald-600 dark:text-emerald-400" },
-  completed: { label: "Completed", dot: "bg-emerald-500", bar: "bg-emerald-500/70 border-emerald-500", text: "text-emerald-600 dark:text-emerald-400" },
-  running: { label: "Active", dot: "bg-amber-500", bar: "bg-amber-400/70 border-amber-500", text: "text-amber-600 dark:text-amber-400" },
-  failed: { label: "Failed", dot: "bg-red-500", bar: "bg-red-500/70 border-red-500", text: "text-red-600 dark:text-red-400" },
-  error: { label: "Failed", dot: "bg-red-500", bar: "bg-red-500/70 border-red-500", text: "text-red-600 dark:text-red-400" },
-  cancelled: { label: "Cancelled", dot: "bg-zinc-400", bar: "bg-zinc-400/60 border-zinc-400", text: "text-secondary" },
-  pending: { label: "Pending", dot: "bg-zinc-400", bar: "bg-zinc-300/60 border-zinc-400", text: "text-secondary" },
-  sleep: { label: "Sleep", dot: "bg-zinc-400", bar: "bg-zinc-300/70 border-zinc-400", text: "text-secondary" },
-};
-function meta(s: string) {
-  return STATUS_META[(s || "").toLowerCase()] || STATUS_META.pending;
-}
+type RunTab = "trace" | "events" | "streams" | "graph";
 
 export function Page({ paramsPromise }: { paramsPromise: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
@@ -174,7 +67,8 @@ function RunDetail({ id }: { id: string }) {
   const router = useRouter();
   const pathname = usePathname();
   const project = sp.get("project") || "";
-  const tab = (sp.get("tab") as "trace" | "events") === "events" ? "events" : "trace";
+  const tabParam = sp.get("tab") as RunTab | null;
+  const tab: RunTab = tabParam === "events" || tabParam === "streams" || tabParam === "graph" ? tabParam : "trace";
   const [d, setD] = useState<Detail | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -206,7 +100,15 @@ function RunDetail({ id }: { id: string }) {
     return () => clearInterval(iv);
   }, [isLive]);
 
-  const setTab = (t: "trace" | "events") => {
+  // Workflow definitions — for the Graph tab (match this run's def by id).
+  const { data: defs } = usePoll<WorkflowDef[]>("/v1/workflows", 20000, tab === "graph");
+  const def = useMemo(() => {
+    const wf = run?.workflowName || run?.def_id;
+    if (!wf || !defs) return null;
+    return defs.find((x) => x.id === wf) ?? defs.find((x) => parseName(x.id).name === parseName(wf).name) ?? null;
+  }, [defs, run]);
+
+  const setTab = (t: RunTab) => {
     const q = new URLSearchParams(sp.toString());
     q.set("tab", t);
     router.replace(`${pathname}?${q.toString()}`);
@@ -218,9 +120,9 @@ function RunDetail({ id }: { id: string }) {
   const spans = useMemo<Span[]>(() => {
     const out: Span[] = [];
     for (const s of steps) {
-      const start = ms(s.startedAt) ?? ms(s.createdAt);
+      const start = toMs(s.startedAt) ?? toMs(s.createdAt);
       if (start == null) continue;
-      const end = ms(s.completedAt) ?? (isLive ? now : start);
+      const end = toMs(s.completedAt) ?? (isLive ? now : start);
       const { module, name } = parseName(s.stepName);
       out.push({
         key: `step:${s.stepId}`, kind: "step", name, module, start, end,
@@ -230,24 +132,24 @@ function RunDetail({ id }: { id: string }) {
     }
     const waits = events
       .filter((e) => e.eventType === "wait_created" || e.eventType === "wait_completed")
-      .sort((a, b) => (ms(a.createdAt) ?? 0) - (ms(b.createdAt) ?? 0));
+      .sort((a, b) => (toMs(a.createdAt) ?? 0) - (toMs(b.createdAt) ?? 0));
     let pending: Record<string, any> | null = null;
     let wi = 0;
     for (const e of waits) {
       if (e.eventType === "wait_created") pending = e;
       else if (e.eventType === "wait_completed" && pending) {
-        const start = ms(pending.createdAt);
+        const start = toMs(pending.createdAt);
         if (start != null) {
-          const end = ms(e.createdAt) ?? ms(pending.eventData?.resumeAt) ?? start;
+          const end = toMs(e.createdAt) ?? toMs(pending.eventData?.resumeAt) ?? start;
           out.push({ key: `wait:${wi++}`, kind: "sleep", name: "sleep", module: "", start, end, status: "sleep", raw: { ...pending, completed: e }, cid: pending.eventId });
         }
         pending = null;
       }
     }
     if (pending) {
-      const start = ms(pending.createdAt);
+      const start = toMs(pending.createdAt);
       if (start != null) {
-        const end = ms(pending.eventData?.resumeAt) ?? (isLive ? now : start);
+        const end = toMs(pending.eventData?.resumeAt) ?? (isLive ? now : start);
         out.push({ key: `wait:${wi++}`, kind: "sleep", name: "sleep", module: "", start, end, status: "sleep", raw: pending, cid: pending.eventId });
       }
     }
@@ -255,8 +157,12 @@ function RunDetail({ id }: { id: string }) {
     return out;
   }, [steps, events, isLive, now]);
 
-  const rootStart = ms(run?.createdAt) ?? ms(run?.startedAt) ?? (spans[0]?.start ?? now);
-  const rootEnd = ms(run?.completedAt) ?? (isLive ? now : Math.max(rootStart, ...spans.map((s) => s.end)));
+  const queuedMs = toMs(run?.createdAt);
+  const startedMs = toMs(run?.startedAt);
+  const completedMs = toMs(run?.completedAt);
+  const expiredMs = toMs(run?.expiredAt);
+  const rootStart = queuedMs ?? startedMs ?? (spans[0]?.start ?? now);
+  const rootEnd = completedMs ?? (isLive ? now : Math.max(rootStart, ...spans.map((s) => s.end)));
   const rootSpan: Span | null = run
     ? { key: "root", kind: "root", ...parseName(run.workflowName), start: rootStart, end: rootEnd, status, raw: run, cid: run.runId }
     : null;
@@ -265,11 +171,13 @@ function RunDetail({ id }: { id: string }) {
   const t1 = Math.max(rootEnd, ...spans.map((s) => s.end), t0 + 1);
   const selected: Span | null = sel === "root" ? rootSpan : spans.find((s) => s.key === sel) || null;
   const wfName = parseName(run?.workflowName).name || id;
+  const runError = run?.error ? (typeof run.error === "string" ? run.error : run.error?.message || pretty(run.error)) : null;
 
   return (
     <div className="pb-10">
+      {/* Breadcrumb — Runs / <runId> (upstream), rooted at hive's /workflows. */}
       <div className="mb-4 flex items-center gap-2 text-sm text-secondary">
-        <Link href="/workflows" className="hover:text-fg">Workflows</Link>
+        <Link href="/workflows" className="hover:text-fg">Runs</Link>
         <span className="text-muted">/</span>
         <span className="font-mono text-fg">{id}</span>
       </div>
@@ -277,11 +185,7 @@ function RunDetail({ id }: { id: string }) {
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
           <h1 className="text-xl font-semibold tracking-tight">{wfName}</h1>
-          <CopyText text={id} className="font-mono text-sm text-secondary" />
-          <span className={`flex items-center gap-1.5 text-sm ${meta(status).text}`}>
-            <span className={`h-2 w-2 rounded-full ${meta(status).dot} ${isLive ? "animate-pulse" : ""}`} />
-            {isLive ? "Active" : meta(status).label}
-          </span>
+          <StatusBadge status={status} live={isLive} />
         </div>
         {project && (
           <Link href={`/projects/${encodeURIComponent(project)}?tab=workflows`} className="inline-flex items-center gap-1 text-sm text-link hover:underline">
@@ -290,16 +194,33 @@ function RunDetail({ id }: { id: string }) {
         )}
       </div>
 
-      <div className="mb-5 grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-5">
-        <Stat label="Created" value={run?.createdAt ? new Date(ms(run.createdAt)!).toLocaleTimeString() : "—"} />
-        <Stat label="Completed" value={run?.completedAt ? new Date(ms(run.completedAt)!).toLocaleTimeString() : "—"} />
-        <Stat label="Duration" value={run ? fmtDur(rootEnd - rootStart) : "—"} />
-        <Stat label="Steps" value={String(steps.length)} />
-        <Stat label="Spec" value={run?.specVersion != null ? String(run.specVersion) : "—"} />
+      {/* Stat row — upstream vocabulary: Status / Duration / Run ID / Queued /
+          Started / Completed (+ Expired when the world retains it), with hive's
+          Steps + Spec as secondary extras. */}
+      <div className="mb-5 grid grid-cols-2 gap-x-8 gap-y-3 sm:grid-cols-4 lg:grid-cols-8">
+        <Stat label="Status"><StatusBadge status={status} live={isLive} className="text-sm" /></Stat>
+        <Stat label="Duration"><span className="tabular-nums">{run ? fmtDuration(rootEnd - rootStart) : "—"}</span></Stat>
+        <Stat label="Run ID"><CopyableText text={id} className="max-w-full text-xs text-secondary" truncate /></Stat>
+        <Stat label="Queued"><AbsTime ms={queuedMs} /></Stat>
+        <Stat label="Started"><AbsTime ms={startedMs} /></Stat>
+        <Stat label="Completed"><AbsTime ms={completedMs} /></Stat>
+        {expiredMs ? (
+          <Stat label="Expired"><AbsTime ms={expiredMs} /></Stat>
+        ) : (
+          <Stat label="Steps"><span className="tabular-nums">{steps.length}</span></Stat>
+        )}
+        <Stat label="Spec"><span className="tabular-nums">{run?.specVersion != null ? String(run.specVersion) : "—"}</span></Stat>
       </div>
 
+      {runError && (
+        <div className="mb-4 overflow-x-auto rounded-lg border border-red-500/40 bg-red-500/5 px-4 py-3 font-mono text-xs text-red-600 dark:text-red-400">
+          {runError}
+        </div>
+      )}
+
+      {/* Tabs — Trace | Events | Streams | Graph (upstream parity). */}
       <div className="mb-4 flex items-center gap-1">
-        {(["trace", "events"] as const).map((t) => (
+        {(["trace", "events", "streams", "graph"] as const).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -312,14 +233,19 @@ function RunDetail({ id }: { id: string }) {
 
       {err && !d && <div className="rounded-lg border border-border bg-card px-4 py-10 text-center text-sm text-secondary">Couldn’t load this run: {err}</div>}
 
-      {tab === "trace" ? (
+      {tab === "trace" && (
         <TraceView rootSpan={rootSpan} spans={spans} t0={t0} t1={t1} selectedKey={sel} onSelect={setSel} selected={selected} events={events} />
-      ) : (
-        <EventsView events={events} steps={steps} runId={id} />
       )}
+      {tab === "events" && <EventsView events={events} steps={steps} runId={id} />}
+      {tab === "streams" && <StreamsView run={run} steps={steps} events={events} />}
+      {tab === "graph" && <GraphView def={def} loading={defs === undefined} steps={steps} />}
     </div>
   );
 }
+
+/* ------------------------------------------------------------------------- */
+/* Trace (gantt) + span side panel                                            */
+/* ------------------------------------------------------------------------- */
 
 function TraceView({
   rootSpan, spans, t0, t1, selectedKey, onSelect, selected, events,
@@ -331,10 +257,12 @@ function TraceView({
   const total = Math.max(1, t1 - t0);
   const ticks = useMemo(() => Array.from({ length: 6 }, (_, i) => t0 + (total * i) / 5), [t0, total]);
 
+  const barMeta = (s: Span) => (s.kind === "sleep" ? { bar: "bg-zinc-300/70 border-zinc-400" } : statusMeta(s.status));
+
   const Row = ({ s, depth }: { s: Span; depth: number }) => {
     const leftPct = ((s.start - t0) / total) * 100;
     const widthPct = Math.max(0.6, ((s.end - s.start) / total) * 100);
-    const m = meta(s.status);
+    const m = barMeta(s);
     const active = selectedKey === s.key;
     const Icon = s.kind === "sleep" ? Timer : s.kind === "root" ? GitBranch : Code2;
     return (
@@ -346,13 +274,13 @@ function TraceView({
           <Icon className={`h-3.5 w-3.5 shrink-0 ${s.kind === "sleep" ? "text-muted" : "text-secondary"}`} />
           <span className={`truncate ${s.kind === "root" ? "font-semibold" : "font-mono text-xs"}`}>{s.name}</span>
           {s.attempt && s.attempt > 1 ? <span className="shrink-0 rounded bg-amber-500/15 px-1 text-[10px] text-amber-600">×{s.attempt}</span> : null}
-          <span className="ml-auto shrink-0 pl-2 tabular-nums text-xs text-muted">{fmtDur(s.end - s.start)}</span>
+          <span className="ml-auto shrink-0 pl-2 tabular-nums text-xs text-muted">{fmtDuration(s.end - s.start)}</span>
         </span>
         <span className="relative h-9 border-l border-border">
           <span
             className={`absolute top-1/2 h-3 -translate-y-1/2 rounded-sm border ${m.bar}`}
             style={{ left: `${leftPct}%`, width: `${widthPct}%`, minWidth: 2 }}
-            title={`${s.name} · ${fmtDur(s.end - s.start)}`}
+            title={`${s.name} · ${fmtDuration(s.end - s.start)}`}
           />
         </span>
       </button>
@@ -367,7 +295,7 @@ function TraceView({
           <span className="relative h-7 border-l border-border">
             {ticks.map((t, i) => (
               <span key={i} className="absolute top-1/2 -translate-y-1/2 -translate-x-1/2 tabular-nums" style={{ left: `${(i / (ticks.length - 1)) * 100}%` }}>
-                {fmtDur(t - t0)}
+                {fmtDuration(t - t0)}
               </span>
             ))}
           </span>
@@ -375,7 +303,7 @@ function TraceView({
         {rootSpan && <Row s={rootSpan} depth={0} />}
         {spans.map((s) => <Row key={s.key} s={s} depth={1} />)}
         {spans.length === 0 && !rootSpan && (
-          <div className="px-4 py-12 text-center text-sm text-secondary">No spans recorded for this run.</div>
+          <EmptyState title="No spans recorded for this run." />
         )}
       </div>
 
@@ -406,6 +334,7 @@ function SidePanel({ span, onClose, events }: { span: Span; onClose: () => void;
         <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-4 w-4" /></button>
       </div>
       <div className="max-h-[70vh] overflow-auto px-4 py-3 text-sm">
+        {span.kind !== "sleep" && <Field label="Status"><StatusBadge status={span.status} className="text-xs" /></Field>}
         {span.module && <Field label="Module" mono>{span.module}</Field>}
         {span.kind === "step" && <Field label="Step ID" mono copy>{raw.stepId}</Field>}
         {span.kind === "step" && <Field label="Attempts">{String(raw.attempt ?? 1)}</Field>}
@@ -414,7 +343,7 @@ function SidePanel({ span, onClose, events }: { span: Span; onClose: () => void;
         {span.kind !== "sleep" && <Field label="Started">{tsStr(raw.startedAt)}</Field>}
         <Field label="Completed">{span.kind === "sleep" ? tsStr(raw.completed?.createdAt) : tsStr(raw.completedAt)}</Field>
         {span.kind === "sleep" && <Field label="Resume At">{tsStr(raw.eventData?.resumeAt)}</Field>}
-        {raw.error ? <Field label="Error" mono>{String(raw.error)}</Field> : null}
+        {raw.error ? <Field label="Error" mono>{typeof raw.error === "string" ? raw.error : raw.error?.message || pretty(raw.error)}</Field> : null}
 
         {span.kind !== "sleep" && (
           <>
@@ -433,6 +362,10 @@ function SidePanel({ span, onClose, events }: { span: Span; onClose: () => void;
   );
 }
 
+/* ------------------------------------------------------------------------- */
+/* Events                                                                     */
+/* ------------------------------------------------------------------------- */
+
 function EventsView({ events, steps, runId }: { events: Record<string, any>[]; steps: Record<string, any>[]; runId: string }) {
   const [asc, setAsc] = useState(true);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -448,7 +381,7 @@ function EventsView({ events, steps, runId }: { events: Record<string, any>[]; s
   }, [events]);
 
   const rows = useMemo(() => {
-    const r = [...events].sort((a, b) => (ms(a.createdAt) ?? 0) - (ms(b.createdAt) ?? 0));
+    const r = [...events].sort((a, b) => (toMs(a.createdAt) ?? 0) - (toMs(b.createdAt) ?? 0));
     return asc ? r : r.reverse();
   }, [events, asc]);
 
@@ -475,7 +408,7 @@ function EventsView({ events, steps, runId }: { events: Record<string, any>[]; s
         <span>Time</span><span>Event Type</span><span>Name</span><span>Correlation ID</span><span>Event ID</span>
       </div>
       {rows.length === 0 ? (
-        <div className="px-4 py-12 text-center text-sm text-secondary">No events.</div>
+        <EmptyState title="No events." />
       ) : rows.map((e, i) => {
         const k = e.eventId || String(i);
         const isOpen = open.has(k);
@@ -503,6 +436,103 @@ function EventsView({ events, steps, runId }: { events: Record<string, any>[]; s
   );
 }
 
+/* ------------------------------------------------------------------------- */
+/* Streams                                                                    */
+/* ------------------------------------------------------------------------- */
+
+/** The world-redis adapter keeps no dedicated stream store, so surface any
+ *  stream REFERENCES found in the run/step/event payloads (ids like `strm_…`
+ *  or offloaded-ref markers), and otherwise state that honestly. */
+function StreamsView({ run, steps, events }: { run: Record<string, any> | null; steps: Record<string, any>[]; events: Record<string, any>[] }) {
+  const streamIds = useMemo(() => {
+    const found = new Set<string>();
+    const scan = (v: any, depth: number) => {
+      if (depth > 6 || v == null) return;
+      if (typeof v === "string") {
+        if (/^(strm|stream)_[\w-]+$/.test(v)) found.add(v);
+        else if (/^(s3rf:|kvrf:)/.test(v)) found.add(v);
+        return;
+      }
+      if (Array.isArray(v)) { for (const x of v) scan(x, depth + 1); return; }
+      if (typeof v === "object") {
+        for (const [k, x] of Object.entries(v)) {
+          if ((k === "streamId" || k === "stream_id") && typeof x === "string") found.add(x);
+          else scan(x, depth + 1);
+        }
+      }
+    };
+    if (run) { scan(decodeBlob(run.input), 0); scan(decodeBlob(run.output), 0); }
+    for (const s of steps) { scan(decodeBlob(s.input), 0); scan(decodeBlob(s.output), 0); }
+    for (const e of events) scan(decodeEventData(e.eventData), 0);
+    return [...found];
+  }, [run, steps, events]);
+
+  if (streamIds.length === 0) {
+    return (
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <EmptyState
+          title="No streams for this run"
+          hint="Streams appear when a workflow writes streamed output. This app's world store doesn't retain stream chunks."
+          icon={<Waves className="h-6 w-6" />}
+        />
+      </div>
+    );
+  }
+  return (
+    <div className="overflow-hidden rounded-xl border border-border bg-card">
+      <div className="grid grid-cols-[1fr] border-b border-border bg-subtle/30 px-4 py-2.5 text-xs font-medium uppercase tracking-wide text-muted">
+        <span>Stream ID</span>
+      </div>
+      {streamIds.map((sid) => (
+        <div key={sid} className="flex items-center justify-between border-b border-border px-4 py-3 text-sm last:border-0">
+          <CopyableText text={sid} className="text-xs text-secondary" truncate />
+          <span className="text-xs text-muted">content not retained by this world store</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------------- */
+/* Graph                                                                      */
+/* ------------------------------------------------------------------------- */
+
+function GraphView({ def, loading, steps }: { def: WorkflowDef | null; loading?: boolean; steps: Record<string, any>[] }) {
+  // Execution overlay: map step label → status so the def graph reflects this run.
+  const overlay = useMemo(() => {
+    const m: Record<string, string> = {};
+    for (const s of steps) {
+      const nm = parseName(s.stepName).name;
+      if (nm) m[nm] = normStatus(String(s.status || (s.completedAt ? "completed" : "running")));
+    }
+    return m;
+  }, [steps]);
+
+  if (loading && !def) {
+    return (
+      <div className="flex h-[460px] items-center justify-center rounded-xl border border-border bg-bg">
+        <Loader2 className="h-5 w-5 animate-spin text-muted" />
+      </div>
+    );
+  }
+  if (!def || !def.graph || !def.graph.nodes?.length) {
+    return (
+      <div className="overflow-hidden rounded-xl border border-border bg-card">
+        <EmptyState
+          title="No graph for this workflow"
+          hint="The workflow's manifest carries no declared graph — deploy with the Vercel WDK to publish one."
+          icon={<GitBranch className="h-6 w-6" />}
+        />
+      </div>
+    );
+  }
+  return <WorkflowDefGraph def={def} overlay={overlay} />;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Small helpers                                                              */
+/* ------------------------------------------------------------------------- */
+
 function decodeEventData(data: any): any {
   if (!data || typeof data !== "object") return data;
   const out: any = Array.isArray(data) ? [...data] : { ...data };
@@ -521,20 +551,20 @@ function eventDot(t?: string): string {
 }
 
 function tsStr(t: unknown): string {
-  const m = ms(t);
+  const m = toMs(t);
   return m ? new Date(m).toLocaleString() : "—";
 }
 function timeStr(t: unknown): string {
-  const m = ms(t);
+  const m = toMs(t);
   if (!m) return "—";
   const dt = new Date(m);
   return `${dt.toLocaleTimeString([], { hour12: false })}.${String(dt.getMilliseconds()).padStart(3, "0")}`;
 }
-function Stat({ label, value }: { label: string; value: string }) {
+function Stat({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div>
+    <div className="min-w-0">
       <div className="text-xs text-muted">{label}</div>
-      <div className="text-sm tabular-nums">{value}</div>
+      <div className="min-w-0 truncate text-sm">{children}</div>
     </div>
   );
 }
@@ -542,7 +572,7 @@ function Field({ label, children, mono, copy }: { label: string; children: React
   return (
     <div className="mb-2 grid grid-cols-[100px_1fr] items-start gap-2">
       <span className="text-xs text-muted">{label}</span>
-      {copy ? <CopyText text={String(children)} className={`break-all ${mono ? "font-mono text-xs" : ""}`} />
+      {copy ? <CopyableText text={String(children)} className={`break-all ${mono ? "text-xs" : ""}`} mono={mono} />
         : <span className={`break-all ${mono ? "font-mono text-xs" : ""}`}>{children}</span>}
     </div>
   );
@@ -578,18 +608,5 @@ function EventLine({ ev }: { ev: Record<string, any> }) {
       </button>
       {open && <div className="border-t border-border p-1.5"><Json v={decodeEventData(ev.eventData)} /></div>}
     </div>
-  );
-}
-function CopyText({ text, className }: { text: string; className?: string }) {
-  const [done, setDone] = useState(false);
-  return (
-    <button
-      onClick={() => { navigator.clipboard?.writeText(text); setDone(true); setTimeout(() => setDone(false), 1200); }}
-      className={`inline-flex items-center gap-1 hover:text-fg ${className || ""}`}
-      title="Copy"
-    >
-      <span className="truncate">{text}</span>
-      {done ? <Check className="h-3 w-3 shrink-0 text-emerald-500" /> : <Copy className="h-3 w-3 shrink-0 text-muted" />}
-    </button>
   );
 }

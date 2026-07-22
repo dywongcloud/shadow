@@ -211,3 +211,117 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
     }
     Some(json!({ "run": run, "steps": steps, "events": events, "project": project }))
 }
+
+/// List workflow "hooks" for a project (newest first), each tagged with `project`.
+///
+/// A hook is a `hook_created` event; its live invocation count is the number of
+/// `hook_received` events in the SAME run whose `correlationId` matches the hook.
+/// When `run_id` is Some we scan only that run's events; otherwise we scan the
+/// most recent `limit` runs (capped to bound the per-run event fan-out). Reads use
+/// the same LIST-index + HASH-payload pattern as [`run_detail`]. Returns None when
+/// no world is configured; Some(empty) when a world exists but has no hooks.
+pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&str>, limit: usize) -> Option<Vec<Value>> {
+    let (url, token, p) = world_config(cloud, project)?;
+    // Which runs to scan: the explicit one, else the most recent `limit` (bounded
+    // to ~50 so a project with thousands of runs can't trigger a huge fan-out).
+    let run_ids: Vec<String> = if let Some(rid) = run_id {
+        vec![rid.to_string()]
+    } else {
+        let cap = limit.clamp(1, 50);
+        let hi = cap.saturating_sub(1).to_string();
+        let ids = cmd(cloud, &url, &token, &["ZRANGE", &format!("{p}:runs"), "0", &hi, "REV"]).await?;
+        ids.as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+    };
+    let mut out: Vec<Value> = Vec::new();
+    for rid in run_ids {
+        // Events for this run (append-ordered LIST + HASH of payloads) — mirror `run_detail`.
+        let ev_ids = cmd(cloud, &url, &token, &["LRANGE", &format!("{p}:events:{rid}"), "0", "-1"]).await;
+        let ev_ids: Vec<String> = ev_ids
+            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+            .unwrap_or_default();
+        if ev_ids.is_empty() {
+            continue;
+        }
+        let mut hargs = vec!["HMGET".to_string(), format!("{p}:eventdata:{rid}")];
+        hargs.extend(ev_ids.iter().cloned());
+        let hargs_ref: Vec<&str> = hargs.iter().map(|s| s.as_str()).collect();
+        let mut events: Vec<Value> = Vec::new();
+        if let Some(arr) = cmd(cloud, &url, &token, &hargs_ref).await.and_then(|v| v.as_array().cloned()) {
+            for b in arr {
+                if let Some(ev) = decode_blob(&b) {
+                    events.push(ev);
+                }
+            }
+        }
+        if events.is_empty() {
+            continue;
+        }
+        let etype = |e: &Value| e.get("eventType").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let corr = |e: &Value| e.get("correlationId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        // Count invocations (`hook_received`) per hookId within this run.
+        let mut invocations: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for ev in &events {
+            if etype(ev) == "hook_received" {
+                let cid = corr(ev);
+                if !cid.is_empty() {
+                    *invocations.entry(cid).or_insert(0) += 1;
+                }
+            }
+        }
+        // One hook row per `hook_created` event; fold in dispose/conflict lifecycle.
+        for ev in &events {
+            if etype(ev) != "hook_created" {
+                continue;
+            }
+            let data = ev.get("eventData").cloned().unwrap_or(Value::Null);
+            let dget = |k: &str| data.get(k).cloned();
+            let hook_id = {
+                let c = corr(ev);
+                if !c.is_empty() {
+                    c
+                } else {
+                    dget("hookId").and_then(|x| x.as_str().map(String::from)).unwrap_or_default()
+                }
+            };
+            let token_val = dget("token").filter(|v| v.is_string()).unwrap_or(Value::Null);
+            let metadata = dget("metadata").unwrap_or(Value::Null);
+            let is_webhook = dget("isWebhook")
+                .and_then(|x| x.as_bool())
+                .or_else(|| metadata.get("isWebhook").and_then(|x| x.as_bool()))
+                .unwrap_or(false);
+            let created_at = ev.get("createdAt").cloned().unwrap_or(Value::Null);
+            let created_ms = secs_to_ms(ev.get("createdAt")).unwrap_or(0);
+            let inv_count = invocations.get(&hook_id).copied().unwrap_or(0);
+            // Optional lifecycle state from later `hook_disposed` / `hook_conflict`.
+            let matches_hook = |e: &Value| !hook_id.is_empty() && corr(e) == hook_id;
+            let disposed = events.iter().any(|e| etype(e) == "hook_disposed" && matches_hook(e));
+            let conflicted = events.iter().any(|e| etype(e) == "hook_conflict" && matches_hook(e));
+            let status = if conflicted {
+                "conflict"
+            } else if disposed {
+                "disposed"
+            } else {
+                "active"
+            };
+            out.push(json!({
+                "hookId": hook_id,
+                "runId": rid,
+                "token": token_val,
+                "isWebhook": is_webhook,
+                "metadata": metadata,
+                "createdAt": created_at,
+                "created_ms": created_ms,
+                "invocations": inv_count,
+                "status": status,
+                "project": project,
+            }));
+        }
+    }
+    // Newest-first by created_ms.
+    out.sort_by(|a, b| {
+        let am = a.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        let bm = b.get("created_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        bm.cmp(&am)
+    });
+    Some(out)
+}

@@ -20,7 +20,7 @@ import { fmtDuration } from "@/components/workflows";
  * declared graph (the steps/primitives and their edges), modeled on Vercel's
  * `@vercel/workflow` web dashboard flow-graph, adapted to this app's theme
  * tokens, layout and navbar. Node kinds are colour-coded with icons; the layout
- * flows top→bottom; conditionals render as diamonds.
+ * flows left→right (as upstream's viewer); conditionals render as diamonds.
  * ------------------------------------------------------------------------- */
 
 /** Per-node-kind visual metadata (colour + icon + label), mirroring the WDK set. */
@@ -52,22 +52,25 @@ function useDark() {
   return resolvedTheme === "dark";
 }
 
-/** A standard workflow node: rounded card, colour-coded by kind, top/bottom handles. */
-function FlowNode({ data, selected }: { data: { label: string; kind: string }; selected?: boolean }) {
+/** A standard workflow node: rounded card, colour-coded by kind, top/bottom handles.
+ *  When a run overlay supplies `runStatus`, a status dot + label reflect what
+ *  this run actually did at the node. */
+function FlowNode({ data, selected }: { data: { label: string; kind: string; runStatus?: string }; selected?: boolean }) {
   const dark = useDark();
   const m = kindMeta(data.kind);
   const Icon = m.Icon;
+  const statusColor = data.runStatus ? OVERLAY_COLORS[data.runStatus] ?? "#9ca3af" : null;
   return (
     <div
       className="rounded-lg border p-3 text-fg shadow-card"
       style={{
         width: 220,
-        borderColor: m.color,
-        background: tint(m.color, dark ? 0.18 : 0.1),
-        boxShadow: selected ? `0 0 0 2px ${tint(m.color, 0.6)}` : undefined,
+        borderColor: statusColor ?? m.color,
+        background: tint(statusColor ?? m.color, dark ? 0.18 : 0.1),
+        boxShadow: selected ? `0 0 0 2px ${tint(statusColor ?? m.color, 0.6)}` : undefined,
       }}
     >
-      <Handle type="target" position={Position.Top} style={{ width: 7, height: 7, background: m.color, border: "none" }} />
+      <Handle type="target" position={Position.Left} style={{ width: 7, height: 7, background: m.color, border: "none" }} />
       <div className="flex items-center gap-2">
         <span
           className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md"
@@ -76,11 +79,19 @@ function FlowNode({ data, selected }: { data: { label: string; kind: string }; s
           <Icon className="h-3.5 w-3.5" />
         </span>
         <span className="truncate text-sm font-medium">{data.label}</span>
+        {statusColor && (
+          <span
+            className={`ml-auto h-2 w-2 shrink-0 rounded-full ${data.runStatus === "running" ? "animate-pulse" : ""}`}
+            style={{ background: statusColor }}
+            title={data.runStatus}
+          />
+        )}
       </div>
-      <div className="mt-1.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.color }}>
-        {m.label}
+      <div className="mt-1.5 flex items-center justify-between text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.color }}>
+        <span>{m.label}</span>
+        {data.runStatus && <span style={{ color: statusColor ?? undefined }}>{data.runStatus}</span>}
       </div>
-      <Handle type="source" position={Position.Bottom} style={{ width: 7, height: 7, background: m.color, border: "none" }} />
+      <Handle type="source" position={Position.Right} style={{ width: 7, height: 7, background: m.color, border: "none" }} />
     </div>
   );
 }
@@ -91,7 +102,7 @@ function DiamondNode({ data, selected }: { data: { label: string; kind: string }
   const m = kindMeta("conditional");
   return (
     <div className="relative flex items-center justify-center" style={{ width: 132, height: 132 }}>
-      <Handle type="target" position={Position.Top} style={{ background: m.color, border: "none" }} />
+      <Handle type="target" position={Position.Left} style={{ background: m.color, border: "none" }} />
       <div
         className="rotate-45 rounded-md border-2"
         style={{
@@ -107,7 +118,7 @@ function DiamondNode({ data, selected }: { data: { label: string; kind: string }
         <span className="line-clamp-2 text-[11px] font-medium text-fg">{data.label}</span>
       </div>
       <Handle id="bottom" type="source" position={Position.Bottom} style={{ background: m.color, border: "none" }} />
-      <Handle id="left" type="source" position={Position.Left} style={{ background: m.color, border: "none" }} />
+      <Handle id="top" type="source" position={Position.Top} style={{ background: m.color, border: "none" }} />
       <Handle id="right" type="source" position={Position.Right} style={{ background: m.color, border: "none" }} />
     </div>
   );
@@ -193,9 +204,23 @@ function kindOf(n: any): string {
   return n?.data?.nodeKind || n?.data?.kind || n?.type || "step";
 }
 
+/** Per-run execution overlay: node label → status ("completed"/"running"/
+ *  "failed"/"pending"/"cancelled"), used by the run-detail Graph tab to tint
+ *  the declared graph with what this run actually did. */
+export type GraphOverlay = Record<string, string>;
+
+const OVERLAY_COLORS: Record<string, string> = {
+  completed: "#22c55e",
+  succeeded: "#22c55e",
+  running: "#3b82f6",
+  failed: "#ef4444",
+  cancelled: "#9ca3af",
+  pending: "#9ca3af",
+};
+
 /** Layered top→bottom layout (longest-path depth → row; siblings centred per row),
  *  honouring any explicit `position` carried in the manifest. */
-function layoutWdk(graph: { nodes: any[]; edges: any[] }): { nodes: Node[]; edges: Edge[] } {
+function layoutWdk(graph: { nodes: any[]; edges: any[] }, overlay?: GraphOverlay): { nodes: Node[]; edges: Edge[] } {
   const gnodes = graph?.nodes ?? [];
   const gedges = graph?.edges ?? [];
   const ids = gnodes.map((n) => n.id);
@@ -216,23 +241,25 @@ function layoutWdk(graph: { nodes: any[]; edges: any[] }): { nodes: Node[]; edge
       if (!seen.has(v)) { seen.add(v); queue.push(v); }
     }
   }
-  // Group ids per depth row, then spread them horizontally, centred.
+  // Group ids per depth column, then spread them vertically, centred — the
+  // graph flows LEFT→RIGHT (matching the upstream console's viewer).
   const rows: Record<number, string[]> = {};
   for (const id of ids) (rows[depth[id]] ??= []).push(id);
-  const H = 280, V = 168;
+  const H = 300, V = 150;
   const placed: Record<string, { x: number; y: number }> = {};
   for (const [d, rowIds] of Object.entries(rows)) {
     rowIds.forEach((id, i) => {
-      placed[id] = { x: (i - (rowIds.length - 1) / 2) * H, y: Number(d) * V };
+      placed[id] = { x: Number(d) * H, y: (i - (rowIds.length - 1) / 2) * V };
     });
   }
   const nodes: Node[] = gnodes.map((n) => {
     const kind = kindOf(n);
+    const label = n.data?.label || n.id;
     return {
       id: n.id,
       type: kind.toLowerCase().includes("conditional") ? "diamond" : "flow",
       position: n.position ?? placed[n.id] ?? { x: 0, y: 0 },
-      data: { label: n.data?.label || n.id, kind },
+      data: { label, kind, runStatus: overlay?.[label] },
     };
   });
   const edges: Edge[] = gedges.map((e, i) => {
@@ -273,8 +300,9 @@ function Legend() {
   );
 }
 
-export function WorkflowDefGraph({ def }: { def: WorkflowDef }) {
-  const laid = useMemo(() => layoutWdk(def.graph ?? { nodes: [], edges: [] }), [def.id, def.graph]);
+export function WorkflowDefGraph({ def, overlay }: { def: WorkflowDef; overlay?: GraphOverlay }) {
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const laid = useMemo(() => layoutWdk(def.graph ?? { nodes: [], edges: [] }, overlay), [def.id, def.graph, JSON.stringify(overlay ?? {})]);
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>(laid.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(laid.edges);
 
