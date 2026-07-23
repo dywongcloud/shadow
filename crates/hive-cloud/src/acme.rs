@@ -495,6 +495,14 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         .filter(|n| !n.is_self && n.healthy)
         .filter_map(|n| Some((n.peer_id?, n.iroh_addr?)))
         .collect();
+    // Query ALL peers and keep the NEWEST bundle (highest issued_ms), not the
+    // first responder. The old first-wins behavior let a peer still serving a
+    // STALE bundle (e.g. after the leader adds a SAN like relay./discovery. and
+    // re-issues) win the sync over the leader's freshly-issued newer one — so
+    // the SAN change never propagated and relay-cert probe churn persisted
+    // fleet-wide. Newest-wins guarantees convergence on the issuer's latest
+    // bundle regardless of which peer answers first.
+    let mut best: Option<CertBundle> = None;
     for (id, addr) in peers {
         let path = format!("/v1/tls/bundle?name={bundle}");
         // Bumped from 10s: give `PeerPool::acquire`'s fresh-discovery fallback room
@@ -509,17 +517,20 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
                 if key_pem.is_empty() || chain.is_empty() {
                     continue;
                 }
-                return Some(CertBundle {
-                    names: v.get("names").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default(),
-                    chain_pem: chain.to_string(),
-                    key_pem_enc: crate::secrets::encrypt(key_pem),
-                    issued_ms: v.get("issued_ms").and_then(|i| i.as_u64()).unwrap_or(0),
-                    not_after_ms: v.get("not_after_ms").and_then(|i| i.as_u64()).unwrap_or(0),
-                });
+                let issued = v.get("issued_ms").and_then(|i| i.as_u64()).unwrap_or(0);
+                if best.as_ref().map(|b| issued > b.issued_ms).unwrap_or(true) {
+                    best = Some(CertBundle {
+                        names: v.get("names").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default(),
+                        chain_pem: chain.to_string(),
+                        key_pem_enc: crate::secrets::encrypt(key_pem),
+                        issued_ms: issued,
+                        not_after_ms: v.get("not_after_ms").and_then(|i| i.as_u64()).unwrap_or(0),
+                    });
+                }
             }
         }
     }
-    None
+    best
 }
 
 /// The two bundles: (name, SANs, DNS zone the challenge records live in).
