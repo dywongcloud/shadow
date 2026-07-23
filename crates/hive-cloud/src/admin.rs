@@ -4738,6 +4738,25 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
                         s.insert(d.project);
                     }
                 }
+                // ALSO every tenant-owned project from the GOSSIPED settings
+                // store whose env carries a world config. World reads go over
+                // the project's own REST URL, which works from ANY node — but
+                // deriving the list from node-local deployment records alone
+                // meant only the node(s) that ran the deploy read the world
+                // directly; every other node answered the console's poll from
+                // the iroh fan-out, and one mesh hiccup turned a populated
+                // runs table into a false-[] on the next poll. Live-witnessed
+                // as the "rows load then flicker and disappear" report:
+                // local=true returned 8 rows on the leader and 0 on all six
+                // other public-serving nodes.
+                for (name, _) in c.projects.snapshot() {
+                    if !s.contains(&name)
+                        && crate::world::has_world(&c, &name)
+                        && project_owned_by(&c, &name, &team)
+                    {
+                        s.insert(name);
+                    }
+                }
                 s.into_iter().collect()
             }
         };
@@ -4783,6 +4802,33 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
                     }
                 }
             }
+        }
+    }
+    // LAST-KNOWN-GOOD belt: the console polls this endpoint and REPLACES its
+    // table with whatever comes back, so a single transiently-failed world
+    // read (downstash hiccup, mesh fan-out miss, provider timeout — all
+    // swallowed into an empty vec upstream) rendered as rows-flicker-then-
+    // disappear. If THIS poll came up empty but a recent poll for the same
+    // cache key had rows, serve those instead: a transient outage degrades to
+    // seconds-stale, never to false-empty. Genuine emptiness still wins once
+    // the hold expires (WF_LAST_GOOD_TTL), so a truly-cleared world shows
+    // empty within a minute rather than pinning stale rows forever.
+    const WF_LAST_GOOD_TTL_MS: u64 = 60_000;
+    type WfLastGoodMap = std::collections::HashMap<String, (u64, Value)>;
+    fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
+        static LG: std::sync::OnceLock<parking_lot::Mutex<WfLastGoodMap>> = std::sync::OnceLock::new();
+        LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
+    }
+    if is_top_level {
+        if runs.is_empty() {
+            let g = wf_last_good().lock();
+            if let Some((at, v)) = g.get(&cache_key) {
+                if hive_core::now_ms().saturating_sub(*at) < WF_LAST_GOOD_TTL_MS {
+                    return Json(v.clone());
+                }
+            }
+        } else {
+            wf_last_good().lock().insert(cache_key.clone(), (hive_core::now_ms(), json!(runs)));
         }
     }
     let result = json!(runs);
