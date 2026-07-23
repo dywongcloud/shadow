@@ -126,17 +126,28 @@ async fn edge_pipeline_inner(
             // the app's own polls AND every workflow-world read the platform
             // makes from the same host (witnessed: hairpinned leader reads of
             // db-*.downstash.xyz got RATE_LIMITED while loopback PONGed,
-            // silently emptying the workflows console). 2000/10s per IP keeps
-            // several chatty apps + platform readers comfortable while still
-            // shedding real floods.
+            // silently emptying the workflows console). Keyed per (IP, DB
+            // host), NOT per IP alone: every microVM cell on a node NATs out
+            // through the node's own public IP, so one chatty app's queue
+            // drain was eating the budget of every OTHER database reached
+            // from that node (witnessed: a 22-job workflow-journal replay
+            // burst RATE_LIMITED its own world mid-run). 5000/10s per
+            // (IP, db) rides out a full journal-replay drain while still
+            // shedding real floods; the body is JSON so Upstash-compatible
+            // clients surface a clean error instead of a JSON-parse crash.
             fn db_rest_rate_limiter() -> &'static hive_edge::RateLimiter {
                 static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
-                LIMITER.get_or_init(|| hive_edge::RateLimiter::new(2000, 10_000))
+                LIMITER.get_or_init(|| hive_edge::RateLimiter::new(5000, 10_000))
             }
-            if !db_rest_rate_limiter().check(&ip, hive_core::now_ms()) {
+            let rl_key = format!("{ip}|{hp}");
+            if !db_rest_rate_limiter().check(&rl_key, hive_core::now_ms()) {
                 let ev = cloud.event(&region, &method, &status_host, &path, 429, "rate-limited", &ip);
                 cloud.record(ev);
-                let mut resp = (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED").into_response();
+                let mut resp = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(serde_json::json!({ "error": "rate limited, retry shortly" })),
+                )
+                    .into_response();
                 set(&mut resp, "x-hive-ratelimit", "exceeded");
                 return resp;
             }

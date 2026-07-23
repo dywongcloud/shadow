@@ -751,6 +751,10 @@ async fn main() -> anyhow::Result<()> {
     // Self-heal provisioned DB backings (restart-killed / machine-reset
     // containers) — see spawn_db_reconcile's doc for the witnessed loss classes.
     databases::spawn_db_reconcile(cloud.clone());
+    // Reschedule orphaned workflow-world queue jobs (claimed-then-dropped
+    // deliveries) so a delivery-path failure can never strand runs in
+    // `pending` forever — see world::reconcile_orphan_jobs.
+    world::spawn_world_reconcile(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())

@@ -695,3 +695,95 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
     });
     Some(out)
 }
+
+/// Reschedule ORPHANED queue jobs: an `<p>:job:<msgId>` hash whose id is
+/// absent from the `<p>:sched` ZSET is a job some dispatcher CLAIMED (ZREM)
+/// and then failed to deliver without rescheduling — witnessed live when a
+/// client-side response-encoding mismatch 404'd every delivery and
+/// `@open-workflow/world-redis` 0.1.2's dispatchOne dropped the claim on any
+/// non-OK response (its comment assumes the handler wrapper reschedules, but
+/// the wrapper never RAN on a 404). The stranded run then sits `pending`
+/// forever. Delivery is idempotent (the handler treats a missing/terminal job
+/// as a no-op and caps attempts), so blanket rescheduling is safe. Jobs
+/// younger than the grace window are skipped: a just-claimed job legitimately
+/// lives outside the ZSET for the duration of its 307 trampoline chain.
+pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
+    const GRACE_MS: u64 = 120_000;
+    let mut scanned = 0usize;
+    let mut rescheduled = 0usize;
+    let projects: Vec<String> = cloud
+        .projects
+        .snapshot()
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|p| has_world(cloud, p))
+        .collect();
+    for project in projects {
+        let Some((url, token, p)) = world_config(cloud, &project) else { continue };
+        // Only the project's HOST node reconciles: every node CAN read the
+        // world (env is gossiped), and duplicate ZADDs are idempotent, but one
+        // writer keeps the reconcile log attributable and halves REST load.
+        if cloud.gw.git_for_project(&project).is_none() {
+            continue;
+        }
+        let sched: std::collections::HashSet<String> = match cmd(cloud, &url, &token, &["ZRANGE", &format!("{p}:sched"), "0", "-1"]).await {
+            Some(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+            _ => continue, // world unreachable — do not guess
+        };
+        let keys = match cmd(cloud, &url, &token, &["SCAN", "0", "MATCH", &format!("{p}:job:*"), "COUNT", "1000"]).await {
+            Some(Value::Array(a)) if a.len() == 2 => match &a[1] {
+                Value::Array(ks) => ks.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let now = hive_core::now_ms();
+        for key in keys {
+            scanned += 1;
+            let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else { continue };
+            if sched.contains(msg_id) {
+                continue;
+            }
+            // msg_<ULID>: the ULID's leading 10 chars carry the creation time —
+            // skip fresh jobs still inside a legitimate redirect-chain claim.
+            if let Some(ts) = ulid_ms(msg_id.trim_start_matches("msg_")) {
+                if now.saturating_sub(ts) < GRACE_MS {
+                    continue;
+                }
+            }
+            let score = format!("{now}");
+            if cmd(cloud, &url, &token, &["ZADD", &format!("{p}:sched"), &score, msg_id]).await.is_some() {
+                rescheduled += 1;
+                tracing::info!(project = %project, msg_id = %msg_id, "world reconcile: rescheduled orphaned queue job");
+            }
+        }
+    }
+    (scanned, rescheduled)
+}
+
+/// Crockford-base32 ULID timestamp (first 10 chars → ms since epoch).
+fn ulid_ms(ulid: &str) -> Option<u64> {
+    const ALPHA: &[u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let ts = ulid.get(..10)?;
+    let mut v: u64 = 0;
+    for ch in ts.bytes() {
+        let d = ALPHA.iter().position(|&a| a == ch.to_ascii_uppercase())? as u64;
+        v = v.checked_mul(32)?.checked_add(d)?;
+    }
+    Some(v)
+}
+
+/// 60s background loop around [`reconcile_orphan_jobs`].
+pub fn spawn_world_reconcile(cloud: Arc<CloudState>) {
+    tokio::spawn(async move {
+        // Let gossip/env settle after boot before the first pass.
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        loop {
+            let (scanned, fixed) = reconcile_orphan_jobs(&cloud).await;
+            if fixed > 0 {
+                tracing::warn!(scanned, fixed, "world reconcile: recovered orphaned workflow queue jobs");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}

@@ -378,6 +378,20 @@ mod linux {
             .env("PORT", launch.port.to_string())
             .envs(launch.env.iter())
             .stdin(Stdio::null());
+        // Wire the function's stdout/stderr to the VM serial console. This
+        // agent runs as PID1 with NO open fds (the kernel gives init none), so
+        // an inherited-stdio child wrote its output into the void — every app
+        // crash/console.error was unobservable from the host, which turned
+        // real production failures (e.g. an uncaught throw in a route handler)
+        // into blind 500s. /dev/console lands in the host-side per-cell
+        // console.log next to the kernel boot lines. Best-effort: a rootfs
+        // without /dev/console just keeps the old (silent) behavior.
+        if let Ok(con) = std::fs::OpenOptions::new().append(true).open("/dev/console") {
+            if let Ok(con2) = con.try_clone() {
+                cmd.stdout(Stdio::from(con));
+                cmd.stderr(Stdio::from(con2));
+            }
+        }
         // V8 compile-cache (Node cold-start): point Node at the artifact-seeded,
         // WRITABLE cache dir under the workdir. The build shipped precompiled bytecode
         // there; Node >=22.1 picks it up automatically (skips parse/compile on a cold

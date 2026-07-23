@@ -127,6 +127,21 @@ fn rest_conn_permit(db_id: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
 
 async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: Request) -> Response {
     let password = db.connection.get("password").cloned().unwrap_or_default();
+    // `Upstash-Encoding: base64` (sent BY DEFAULT by @upstash/redis >=1.x):
+    // the client base64-DECODES every string result (except the literal "OK")
+    // after parsing the JSON. Ignoring the header corrupts every read for
+    // those clients — a stored value that happens to be base64-alphabet text
+    // decodes into garbage ("flow" → "~Z0" was the live fingerprint: a
+    // workflow app's queue route double-decoded into a 404 URL and every CBOR
+    // blob into "Unexpected end of CBOR data", stalling all its runs). Honor
+    // it: base64-encode string results server-side so the client's decode is
+    // a clean round-trip.
+    let b64 = req
+        .headers()
+        .get("upstash-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("base64"))
+        .unwrap_or(false);
 
     // GET /<CMD>/<arg>/<arg>: path segments are the command, URL-decoded.
     if method == Method::GET && path != "/" && !path.is_empty() {
@@ -142,7 +157,7 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
         if let Some(deny) = command_denied(&parts[0]) {
             return deny;
         }
-        return run_redis(port, &password, &parts).await;
+        return run_redis(port, &password, &parts, b64).await;
     }
 
     if method != Method::POST {
@@ -176,7 +191,7 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
                     .iter()
                     .map(|r| match r {
                         crate::resp::Reply::Error(e) => json!({ "error": e }),
-                        ok => json!({ "result": ok.to_json() }),
+                        ok => json!({ "result": maybe_b64(ok.to_json(), b64) }),
                     })
                     .collect();
                 ok_json(json!(body))
@@ -195,13 +210,35 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
     if let Some(deny) = command_denied(&parts[0]) {
         return deny;
     }
-    run_redis(port, &password, &parts).await
+    run_redis(port, &password, &parts, b64).await
 }
 
-async fn run_redis(port: u16, password: &str, parts: &[String]) -> Response {
+/// Mirror of the @upstash/redis client's response decode, applied in the
+/// ENCODE direction (its `decode()` is: number/undefined unchanged; array →
+/// per-element string-decode with recursion into nested arrays; string → "OK"
+/// passthrough else base64decode). Encoding every non-"OK" string — including
+/// numeric-looking ones — is the correct round-trip: the client decodes them
+/// back verbatim.
+fn maybe_b64(v: Value, on: bool) -> Value {
+    use base64::Engine as _;
+    if !on {
+        return v;
+    }
+    fn enc(v: Value) -> Value {
+        match v {
+            Value::String(s) if s == "OK" => Value::String(s),
+            Value::String(s) => Value::String(base64::engine::general_purpose::STANDARD.encode(s.as_bytes())),
+            Value::Array(a) => Value::Array(a.into_iter().map(enc).collect()),
+            other => other,
+        }
+    }
+    enc(v)
+}
+
+async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Response {
     match tokio::time::timeout(ENGINE_TIMEOUT, crate::resp::run_command(port, password, parts)).await {
         Ok(Ok(crate::resp::Reply::Error(e))) => err(StatusCode::BAD_REQUEST, &e),
-        Ok(Ok(reply)) => ok_json(json!({ "result": reply.to_json() })),
+        Ok(Ok(reply)) => ok_json(json!({ "result": maybe_b64(reply.to_json(), b64) })),
         Ok(Err(e)) => err(StatusCode::BAD_GATEWAY, &format!("redis engine error: {e}")),
         Err(_) => err(StatusCode::GATEWAY_TIMEOUT, "redis engine timed out"),
     }
