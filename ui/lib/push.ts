@@ -37,6 +37,16 @@ export interface PushSettings {
   devices: PushDevice[];
   sms: SmsConfig | null;
   sms_quota: number | null;
+  /** Which Textbelt key the platform is using: operator override, env, or none. */
+  sms_key_source?: "override" | "env" | "none";
+  /** Masked tail of the active key ("…abc123"), never the key itself. */
+  sms_key?: string | null;
+}
+export interface SmsKeyPutResult {
+  ok: boolean;
+  sms_key: string | null;
+  sms_key_source: "override" | "env";
+  sms_quota: number | null;
 }
 export interface PushTestResult {
   web_push: { sent: number; failed: number; errors: string[]; devices?: number; pruned?: number };

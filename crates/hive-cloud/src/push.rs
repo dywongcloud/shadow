@@ -97,6 +97,16 @@ pub struct PushState {
     pub delivered: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub vapid: VapidKeys,
+    /// Operator-set Textbelt API key, preferred over `HIVE_TEXTBELT_KEY`.
+    /// EXISTS BECAUSE refilling is a paid action that mints a NEW key on
+    /// Textbelt's side — requiring per-node env surgery to activate a funded
+    /// key left SMS dead even after the user paid. Set via the operator-gated
+    /// `POST /v1/push/sms-key`; replicates fleet-wide with the rest of this
+    /// store (sync registry + persist), so pasting it once in the dashboard
+    /// activates every node, including the NA-egress relay peers. Empty =
+    /// unset (env fallback). NEVER serialized back to clients unmasked.
+    #[serde(default)]
+    pub sms_key_override: String,
 }
 
 #[derive(Default)]
@@ -116,6 +126,18 @@ pub enum SubscribeResult {
 impl PushStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The operator-set Textbelt key, if any (trimmed, non-empty).
+    pub fn sms_key_override(&self) -> Option<String> {
+        let s = self.inner.read();
+        let k = s.sms_key_override.trim();
+        if k.is_empty() { None } else { Some(k.to_string()) }
+    }
+
+    /// Set (non-empty) or clear (empty) the operator Textbelt key.
+    pub fn set_sms_key_override(&self, key: &str) {
+        self.inner.write().sms_key_override = key.trim().to_string();
     }
 
     /// Upsert this browser's subscription. Refuses to re-home an endpoint that
@@ -542,20 +564,33 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
                     }
                 }
             }
-            Err(sanitize_textbelt_error(&last))
+            Err(sanitize_textbelt_error(c, &last))
         }
-        Err(raw) => Err(sanitize_textbelt_error(&raw)),
+        Err(raw) => Err(sanitize_textbelt_error(c, &raw)),
     }
 }
 
 /// The single direct Textbelt call, no relay. Returns the RAW (unsanitized)
 /// Textbelt error so the caller can classify it; every path that surfaces the
 /// error outward must run it through `sanitize_textbelt_error` first.
+/// The effective Textbelt key: the operator-set store override (dashboard,
+/// fleet-replicated) wins over the `HIVE_TEXTBELT_KEY` env.
+pub fn textbelt_key(c: &Arc<CloudState>) -> Option<String> {
+    c.push
+        .sms_key_override()
+        .or_else(|| std::env::var("HIVE_TEXTBELT_KEY").ok().filter(|k| !k.trim().is_empty()))
+}
+
+/// Drop the cached quota reading (call after the key changes so the settings
+/// page reflects the NEW key's quota immediately, not the old key's for 60s).
+pub fn reset_sms_quota_cache() {
+    *QUOTA_CACHE.write() = None;
+}
+
 async fn send_sms_direct(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
-    let key = std::env::var("HIVE_TEXTBELT_KEY").unwrap_or_default();
-    if key.is_empty() {
-        return Err("HIVE_TEXTBELT_KEY not configured".into());
-    }
+    let Some(key) = textbelt_key(c) else {
+        return Err("no Textbelt key configured (set one in Settings → Notifications, or HIVE_TEXTBELT_KEY)".into());
+    };
     let key = if test_mode { format!("{key}_test") } else { key };
     let r = c
         .http
@@ -605,7 +640,7 @@ pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> ser
     }
     match send_sms_direct(c, phone, message, test_mode).await {
         Ok(()) => serde_json::json!({ "success": true }),
-        Err(raw) => serde_json::json!({ "success": false, "error": sanitize_textbelt_error(&raw) }),
+        Err(raw) => serde_json::json!({ "success": false, "error": sanitize_textbelt_error(c, &raw) }),
     }
 }
 
@@ -616,16 +651,25 @@ pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> ser
 /// MUST be scrubbed of the key before it leaves the process. Redact the exact
 /// key value AND any residual `key=`/purchase-URL fragment, and map the known
 /// out-of-quota case to a clean message with no URL at all.
-fn sanitize_textbelt_error(raw: &str) -> String {
+fn sanitize_textbelt_error(c: &Arc<CloudState>, raw: &str) -> String {
     if raw.to_ascii_lowercase().contains("out of quota") {
         return "SMS quota exhausted — refill your Textbelt account to send more.".into();
     }
     let mut s = raw.to_string();
-    if let Ok(key) = std::env::var("HIVE_TEXTBELT_KEY") {
-        if !key.is_empty() {
-            s = s.replace(&key, "***");
-            s = s.replace(&format!("{key}_test"), "***");
+    // Redact BOTH possible key sources (store override + env) — whichever the
+    // send actually used, the echo must not leave the process.
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(k) = c.push.sms_key_override() {
+        keys.push(k);
+    }
+    if let Ok(k) = std::env::var("HIVE_TEXTBELT_KEY") {
+        if !k.is_empty() {
+            keys.push(k);
         }
+    }
+    for key in keys {
+        s = s.replace(&format!("{key}_test"), "***");
+        s = s.replace(&key, "***");
     }
     // Belt-and-braces: drop any lingering key= query fragment (and everything
     // after it up to whitespace) even if the env value didn't textually match.
@@ -655,7 +699,7 @@ pub async fn sms_quota_cached(c: &Arc<CloudState>) -> Option<i64> {
 static QUOTA_CACHE: RwLock<Option<(u64, Option<i64>)>> = RwLock::new(None);
 
 async fn sms_quota(c: &Arc<CloudState>) -> Option<i64> {
-    let key = std::env::var("HIVE_TEXTBELT_KEY").ok().filter(|k| !k.is_empty())?;
+    let key = textbelt_key(c)?;
     let r = c
         .http
         .get(format!("https://textbelt.com/quota/{key}"))

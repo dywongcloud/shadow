@@ -193,6 +193,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/push/sms", axum::routing::put(push_sms_put))
         .route("/v1/push/sms/verify", post(push_sms_verify))
         .route("/v1/push/sms-relay", put(push_sms_relay))
+        .route("/v1/push/sms-key", post(push_sms_key_put))
         .route("/v1/push/test", post(push_test))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
@@ -6859,13 +6860,62 @@ async fn push_settings(
         .sms_for(&user, &team)
         .map(|s| json!({ "phone": s.phone, "enabled": s.enabled, "verified": s.verified }));
     let quota = crate::push::sms_quota_cached(&c).await;
-    Ok(Json(json!({ "devices": devices, "sms": sms, "sms_quota": quota })))
+    // Key state for the operator UI: which source is live and a masked tail —
+    // never the key itself.
+    let (key_source, key_masked) = match c.push.sms_key_override() {
+        Some(k) => ("override", json!(format!("…{}", &k[k.len().saturating_sub(6)..]))),
+        None => match std::env::var("HIVE_TEXTBELT_KEY").ok().filter(|k| !k.trim().is_empty()) {
+            Some(k) => ("env", json!(format!("…{}", &k[k.len().saturating_sub(6)..]))),
+            None => ("none", Value::Null),
+        },
+    };
+    Ok(Json(json!({ "devices": devices, "sms": sms, "sms_quota": quota,
+        "sms_key_source": key_source, "sms_key": key_masked })))
 }
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct PushSmsBody {
     phone: String,
     enabled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct PushSmsKeyBody {
+    /// The Textbelt API key to use platform-wide; empty string CLEARS the
+    /// override (falls back to the HIVE_TEXTBELT_KEY env).
+    key: String,
+}
+
+/// Operator-set Textbelt key (see `PushState::sms_key_override`): refilling
+/// Textbelt is a purchase that funds a specific key, and requiring per-node
+/// env surgery to activate it left SMS dead even after payment. Platform-admin
+/// gated (it changes billing-bearing behavior for the whole platform);
+/// leader-forwarded so the store-sync registry replicates it fleet-wide
+/// (including the NA-egress relay peers) instead of a follower write being
+/// clobbered. Responds with the masked state + the NEW key's live quota so
+/// the dashboard confirms the paste worked in one round trip.
+async fn push_sms_key_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(b): Json<PushSmsKeyBody>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    if crate::auth::enforced() && !claims.as_ref().map(|e| e.0.platform_admin).unwrap_or(false) {
+        return Err((StatusCode::FORBIDDEN, "platform operator only".into()));
+    }
+    let key = b.key.trim().to_string();
+    if key.len() > 128 || key.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        return Err((StatusCode::BAD_REQUEST, "malformed key".into()));
+    }
+    if !c.is_control_plane_leader() {
+        return forward_mutation_to_leader(&c, &headers, reqwest::Method::POST, "/v1/push/sms-key", &json!(PushSmsKeyBody { key })).await;
+    }
+    c.push.set_sms_key_override(&key);
+    crate::push::reset_sms_quota_cache();
+    crate::persist::persist(&c);
+    let quota = crate::push::sms_quota_cached(&c).await;
+    let masked = if key.is_empty() { Value::Null } else { json!(format!("…{}", &key[key.len().saturating_sub(6)..])) };
+    Ok(Json(json!({ "ok": true, "sms_key": masked, "sms_key_source": if key.is_empty() { "env" } else { "override" }, "sms_quota": quota })))
 }
 
 /// Deterministic 6-digit code from cryptographic bytes (no PRNG dep needed).

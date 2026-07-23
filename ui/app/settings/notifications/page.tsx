@@ -12,6 +12,7 @@ import {
   subscribePush,
   type PushSettings,
   type PushTestResult,
+  type SmsKeyPutResult,
   type SmsPutResult,
 } from "@/lib/push";
 import { timeAgo } from "@/lib/utils";
@@ -266,6 +267,35 @@ function PushSmsDelivery({
   const [code, setCode] = useState("");
   const [verifyBusy, setVerifyBusy] = useState(false);
   const [smsVerified, setSmsVerified] = useState(false);
+  // Operator SMS provider key (platform-wide; backend enforces platform_admin —
+  // the section is only shown to the owner client-side as a courtesy).
+  const [smsKey, setSmsKey] = useState("");
+  const [smsKeyBusy, setSmsKeyBusy] = useState(false);
+  const [smsKeyMsg, setSmsKeyMsg] = useState<string | null>(null);
+  const isOwner = typeof window !== "undefined" && localStorage.getItem("hive_is_owner") === "1";
+
+  async function saveSmsKey() {
+    setSmsKeyBusy(true);
+    setSmsKeyMsg(null);
+    try {
+      const r = await apiSend<SmsKeyPutResult>("POST", "/v1/push/sms-key", { key: smsKey.trim() });
+      // Immediate funded/unfunded feedback: the response carries the NEW
+      // key's live quota, so a paste of an unfunded key is visible instantly.
+      setSmsKeyMsg(
+        r.sms_key_source === "env"
+          ? "Override cleared — using the server-configured key."
+          : r.sms_quota != null && r.sms_quota > 0
+            ? `Key saved — ${r.sms_quota} SMS remaining.`
+            : "Key saved, but it has NO remaining quota — fund this key at textbelt.com/purchase."
+      );
+      setSmsKey("");
+      refresh();
+    } catch (e) {
+      setSmsKeyMsg(String(e instanceof Error ? e.message : e));
+    } finally {
+      setSmsKeyBusy(false);
+    }
+  }
   const smsSeeded = useRef(false);
   useEffect(() => {
     if (!data || smsSeeded.current) return;
@@ -565,6 +595,43 @@ function PushSmsDelivery({
             </div>
           )}
         </div>
+
+        {/* Operator: platform-wide SMS provider key. Textbelt purchases fund a
+            SPECIFIC key — paste the funded one here and it activates on every
+            node immediately (no server env changes). Backend is platform-admin
+            gated; shown only to the owner. */}
+        {isOwner && data?.sms_key_source && (
+          <div className="border-t border-border px-5 py-4">
+            <div className="flex items-center gap-3">
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-subtle text-secondary">
+                <Phone className="h-4 w-4" />
+              </span>
+              <div>
+                <div className="text-sm font-medium">SMS provider key (operator)</div>
+                <div className="text-xs text-secondary">
+                  {data.sms_key_source === "none"
+                    ? "No Textbelt key configured."
+                    : `Active key ${data.sms_key ?? ""} (${data.sms_key_source === "override" ? "set here" : "server env"})`}
+                  {" · a Textbelt purchase funds a specific key — paste the funded key here."}
+                </div>
+              </div>
+            </div>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
+              <Input
+                type="password"
+                value={smsKey}
+                onChange={(e) => setSmsKey(e.target.value)}
+                placeholder="Textbelt API key (empty to revert to server env)"
+                aria-label="Textbelt API key"
+                className="sm:max-w-96"
+              />
+              <Button variant="outline" onClick={saveSmsKey} disabled={smsKeyBusy}>
+                {smsKeyBusy ? "Saving…" : "Save key"}
+              </Button>
+            </div>
+            {smsKeyMsg && <div className="mt-2 text-sm text-secondary">{smsKeyMsg}</div>}
+          </div>
+        )}
       </Card>
 
       {err && <div className="mt-2 text-sm text-red-500">{err}</div>}
