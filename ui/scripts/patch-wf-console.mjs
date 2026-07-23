@@ -48,10 +48,13 @@
 //                      (hydration-consistent) — the shadw platform navbar is
 //                      the only chrome. The in-page Runs/Hooks/Workflows
 //                      segmented control is page content and survives.
-//   8. forced dark     the console's ThemeProvider defaults to "system" and
-//                      its picker is now hidden — force dark to match the
-//                      platform (a stale localStorage "light" choice would
-//                      otherwise stick forever with no toggle to undo it).
+//   8. theme sync      the console's ThemeProvider keeps its own storage key
+//                      ("workflow-theme") with NO forcedTheme — the platform
+//                      page (components/wf-console-frame.tsx) writes that key
+//                      from the dashboard's next-themes state before mount and
+//                      on every toggle, so the console follows the platform's
+//                      light/dark live. defaultTheme "dark" = fallback for a
+//                      direct /wfc visit only.
 //
 // Run before every `next build` (see package.json "build"). Re-runs are
 // no-ops. If an anchor is missing after an upstream version bump, the run
@@ -274,13 +277,20 @@ function patchHideHeader(file, s) {
   return { s: s.replaceAll(needle, replace), status: "patched" };
 }
 
-// With the theme picker hidden, force dark so the console always matches the
-// platform chrome (and a stale localStorage "light"/"system" choice can't
-// strand a mismatched theme with no visible toggle to undo it).
-function patchForcedDark(file, s) {
+// Theme SYNC (not force): the platform's WfConsoleFrame drives the console's
+// next-themes storage key ("workflow-theme") from the dashboard's own
+// next-themes state — pre-written before the iframe mounts (correct FIRST
+// paint via the console's SSR theme bootstrap) and live-updated on every
+// platform toggle (same-origin storage events reach the iframe's cross-tab
+// listener; the frame also reconciles the root class directly). So the
+// provider must NOT carry forcedTheme (an earlier patch generation forced
+// dark, which broke light-mode users — the reported bug). defaultTheme
+// "dark" stays as the brand fallback for a direct /wfc visit with no stored
+// key.
+function patchThemeSync(file, s) {
   const needle = `attribute: "class",\n    defaultTheme: "system"`;
-  const replace = `attribute: "class",\n    forcedTheme: "dark", /* __hive_forced_dark */\n    defaultTheme: "dark"`;
-  if (s.includes("__hive_forced_dark")) return { s, status: "skip-already" };
+  const replace = `attribute: "class",\n    defaultTheme: "dark" /* __hive_theme_sync */`;
+  if (s.includes("__hive_theme_sync")) return { s, status: "skip-already" };
   if (!s.includes(needle)) return { s, status: "no-anchor" };
   return { s: s.replaceAll(needle, replace), status: "patched" };
 }
@@ -295,7 +305,7 @@ const PATCHES = [
   ["manifest", patchManifestDelegation],
   ["run-ops", patchRunOps],
   ["hide-header", patchHideHeader],
-  ["forced-dark", patchForcedDark],
+  ["theme-sync", patchThemeSync],
 ];
 
 function collectBundleFiles() {
@@ -344,7 +354,7 @@ function main() {
       s.includes(`const basename = "${BASENAME}";`) &&
       s.includes("__hive_rpc_guard") &&
       s.includes("__hive_hide_header") &&
-      s.includes("__hive_forced_dark") &&
+      s.includes("__hive_theme_sync") &&
       s.includes("__hive_backend_id") &&
       s.includes("__hive_manifest_delegate") &&
       s.includes("__hive_op_cancel");

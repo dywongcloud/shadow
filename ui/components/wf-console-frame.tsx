@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { usePathname, useSearchParams } from "next/navigation";
+import { useTheme } from "next-themes";
 import { currentTeam, ensureSessionMinted, mintSessionToken } from "@/lib/api";
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,33 @@ import { currentTeam, ensureSessionMinted, mintSessionToken } from "@/lib/api";
 const REMINT_INTERVAL_MS = 4 * 60_000;
 const URL_SYNC_INTERVAL_MS = 300;
 
+// The embedded console runs its OWN next-themes instance on this storage key
+// (same origin — localStorage is shared). Writing the platform's RESOLVED
+// theme here before the iframe mounts makes the console's SSR theme
+// bootstrap paint correctly on first paint; writing it again on every
+// platform toggle fires a same-origin `storage` event that the console's
+// next-themes cross-tab listener applies live.
+const WF_THEME_KEY = "workflow-theme";
+
+/** Push the platform's resolved theme into the console: storage key (first
+ *  paint + next-themes storage listener) AND a direct root-class reconcile on
+ *  the live iframe document (covers the pre-hydration window). */
+function syncConsoleTheme(frame: HTMLIFrameElement | null, resolved: string | undefined) {
+  const theme = resolved === "light" ? "light" : "dark";
+  try {
+    localStorage.setItem(WF_THEME_KEY, theme);
+  } catch {
+    /* storage unavailable — the direct reconcile below still applies */
+  }
+  const doc = frame?.contentDocument;
+  if (doc?.documentElement) {
+    const root = doc.documentElement;
+    root.classList.remove(theme === "dark" ? "light" : "dark");
+    root.classList.add(theme);
+    root.style.colorScheme = theme;
+  }
+}
+
 export function WfConsoleFrame({
   project,
   initialPath = "",
@@ -48,6 +76,7 @@ export function WfConsoleFrame({
   const [height, setHeight] = useState<number>(640);
   const searchParams = useSearchParams();
   const pathname = usePathname();
+  const { resolvedTheme } = useTheme();
   // The parent URL we last wrote from an iframe navigation — distinguishes a
   // real outer navigation (Next router) from our own replaceState mirroring.
   const lastMirroredRef = useRef<string | null>(null);
@@ -75,6 +104,10 @@ export function WfConsoleFrame({
   // class, witnessed live on production).
   useEffect(() => {
     let alive = true;
+    // Theme BEFORE mount: the console's SSR bootstrap reads the storage key
+    // synchronously, so the first paint matches the platform theme (no
+    // wrong-theme flash). The frame isn't mounted yet — frame arg null.
+    syncConsoleTheme(null, resolvedTheme);
     void ensureSessionMinted().finally(() => {
       if (alive) setFrameName(`wfc|${currentTeam()}|${project ?? ""}`);
     });
@@ -90,6 +123,19 @@ export function WfConsoleFrame({
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [project]);
+
+  // Live theme sync: every platform toggle re-writes the console's storage
+  // key (its next-themes storage listener applies it) and reconciles the
+  // live iframe root class directly. Also re-applied on iframe load so a
+  // frame that navigated internally starts in the right theme.
+  useEffect(() => {
+    syncConsoleTheme(frameRef.current, resolvedTheme);
+    const frame = frameRef.current;
+    if (!frame) return;
+    const onLoad = () => syncConsoleTheme(frame, resolvedTheme);
+    frame.addEventListener("load", onLoad);
+    return () => frame.removeEventListener("load", onLoad);
+  }, [resolvedTheme, frameName]);
 
   // Fill the viewport below the navbar (measured, not hardcoded — survives
   // chrome-height changes) and track window resizes.
