@@ -61,6 +61,7 @@
 // reports `no-anchor` for that patch — re-locate the needle in the new
 // bundle and update it here.
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -320,6 +321,63 @@ function collectBundleFiles() {
   );
 }
 
+// Patching edits content-hashed, `immutable, max-age=1y`-cached client chunks
+// IN PLACE — serving changed bytes under an unchanged filename. A browser that
+// re-fetches ONE such chunk while holding immutable-cached copies of its
+// siblings ends up with a mixed module graph, which dies at import time
+// ("module './mermaid-…js' does not provide an export named 'B'") and kills
+// the console's hydration silently and PERMANENTLY (the poisoned entries never
+// revalidate). Fix at the root: any client chunk this patch run modified gets
+// a NEW name carrying a digest of its patched content (`x.h<8hex>.js`), and
+// every reference across the whole build (sibling chunk imports, the server
+// build's SSR asset manifest/preloads) is rewritten. Unmodified chunks keep
+// their upstream names — their bytes never change, so cached copies stay
+// valid. Idempotent: a re-run strips the previous marker, re-digests, and
+// no-ops when content is unchanged.
+function rehashPatchedClientAssets(dirtied) {
+  const clientAssets = path.join(BUILD, "client", "assets");
+  if (!fs.existsSync(clientAssets)) return;
+  const marker = /\.h[0-9a-f]{8}(?=\.(js|css)$)/;
+  const renames = new Map(); // old basename -> new basename
+  for (const f of fs.readdirSync(clientAssets)) {
+    const full = path.join(clientAssets, f);
+    const hadMarker = marker.test(f);
+    if (!dirtied.has(full) && !hadMarker) continue;
+    const content = fs.readFileSync(full);
+    const digest = crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
+    const stripped = f.replace(marker, "");
+    const ext = path.extname(stripped);
+    const next = `${stripped.slice(0, -ext.length)}.h${digest}${ext}`;
+    if (next === f) continue;
+    fs.renameSync(full, path.join(clientAssets, next));
+    renames.set(f, next);
+    console.log(`[patch-wf-console] rehash ${f} -> ${next}`);
+  }
+  if (renames.size === 0) return;
+  // Rewrite every reference across the build (basenames are high-entropy and
+  // globally unique, so a blind replaceAll is safe).
+  const targets = [];
+  const walk = (d) => {
+    for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.(js|mjs|css|html|json|map)$/.test(e.name)) targets.push(p);
+    }
+  };
+  walk(BUILD);
+  for (const t of targets) {
+    let s = fs.readFileSync(t, "utf8");
+    let dirty = false;
+    for (const [from, to] of renames) {
+      if (s.includes(from)) {
+        s = s.replaceAll(from, to);
+        dirty = true;
+      }
+    }
+    if (dirty) fs.writeFileSync(t, s);
+  }
+}
+
 function main() {
   if (!fs.existsSync(BUILD)) {
     console.log("[patch-wf-console] @workflow/web not installed — skipping");
@@ -327,6 +385,7 @@ function main() {
   }
   const files = collectBundleFiles();
   const totals = {};
+  const dirtied = new Set();
   for (const f of files) {
     let s = fs.readFileSync(f, "utf8");
     let dirty = false;
@@ -339,8 +398,12 @@ function main() {
         console.log(`[patch-wf-console] ${name} -> ${path.relative(WEB_PKG, f)}`);
       }
     }
-    if (dirty) fs.writeFileSync(f, s);
+    if (dirty) {
+      fs.writeFileSync(f, s);
+      dirtied.add(f);
+    }
   }
+  rehashPatchedClientAssets(dirtied);
   const summary = PATCHES.map(([n]) => `${n}:${totals[n] || 0}`).join(" ");
   console.log(`[patch-wf-console] done — ${summary} (files:${files.length})`);
   // The basename + rpc-guard + header patches are load-bearing: fail loudly

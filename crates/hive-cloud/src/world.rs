@@ -709,6 +709,16 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
 /// lives outside the ZSET for the duration of its 307 trampoline chain.
 pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
     const GRACE_MS: u64 = 120_000;
+    /// Reschedules before a persistently-undeliverable job is GC'd as poison.
+    const MAX_RECONCILES: i64 = 5;
+    // Ids seen orphaned on the PREVIOUS pass, per project. A job legitimately
+    // leaves the sched ZSET for the whole time a delivery is IN FLIGHT
+    // (dispatchOne ZREM-claims, then the handler wrapper re-schedules or
+    // deletes) — a single-pass check re-added those claims and DOUBLE-fired
+    // deliveries (witnessed: the same msg ids "rescheduled" 17-18x/20min).
+    // Only an id orphaned on TWO consecutive passes (>=60s apart) is treated
+    // as genuinely dropped.
+    static PREV_ORPHANS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
     let mut scanned = 0usize;
     let mut rescheduled = 0usize;
     let projects: Vec<String> = cloud
@@ -738,21 +748,73 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             _ => continue,
         };
         let now = hive_core::now_ms();
-        for key in keys {
-            scanned += 1;
-            let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else { continue };
-            if sched.contains(msg_id) {
-                continue;
-            }
-            // msg_<ULID>: the ULID's leading 10 chars carry the creation time —
-            // skip fresh jobs still inside a legitimate redirect-chain claim.
-            if let Some(ts) = ulid_ms(msg_id.trim_start_matches("msg_")) {
-                if now.saturating_sub(ts) < GRACE_MS {
+        let mut cur: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut confirmed: Vec<String> = Vec::new();
+        {
+            let prev_map = PREV_ORPHANS.get_or_init(Default::default);
+            let prev = prev_map.lock().get(&project).cloned().unwrap_or_default();
+            for key in keys {
+                scanned += 1;
+                let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else { continue };
+                // Real queue jobs only: `<p>:job:idem:*` are plain-string
+                // idempotency markers, not job hashes — never schedulable.
+                if !msg_id.starts_with("msg_") {
                     continue;
                 }
+                if sched.contains(msg_id) {
+                    continue;
+                }
+                // msg_<ULID>: the ULID's leading 10 chars carry the creation
+                // time — skip fresh jobs still inside a redirect-chain claim.
+                if let Some(ts) = ulid_ms(msg_id.trim_start_matches("msg_")) {
+                    if now.saturating_sub(ts) < GRACE_MS {
+                        continue;
+                    }
+                }
+                cur.insert(msg_id.to_string());
+                if prev.contains(msg_id) {
+                    confirmed.push(msg_id.to_string());
+                }
+            }
+            prev_map.lock().insert(project.clone(), cur);
+        }
+        for msg_id in confirmed {
+            // Terminal-run GC: a job whose run already finished will never be
+            // consumed by a delivery (the handler no-ops without deleting) —
+            // delete it instead of rescheduling forever.
+            if let Some(body) = cmd(cloud, &url, &token, &["HGET", &format!("{p}:job:{msg_id}"), "body"]).await {
+                if let Some(decoded) = decode_blob(&body) {
+                    let run_id = decoded
+                        .get("runId")
+                        .or_else(|| decoded.get("payload").and_then(|p| p.get("runId")))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !run_id.is_empty() {
+                        if let Some(run) = get_run(cloud, &url, &token, &p, run_id).await {
+                            let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                            if matches!(status, "completed" | "failed" | "cancelled") {
+                                let _ = cmd(cloud, &url, &token, &["DEL", &format!("{p}:job:{msg_id}")]).await;
+                                tracing::info!(project = %project, msg_id = %msg_id, status, "world reconcile: GC'd job for terminal run");
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // Poison cap: a job this loop keeps having to rescue is not being
+            // consumed by deliveries at all — stop churning it.
+            let n = match cmd(cloud, &url, &token, &["HINCRBY", &format!("{p}:job:{msg_id}"), "reconcile_n", "1"]).await {
+                Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+                Some(Value::String(s)) => s.parse().unwrap_or(0),
+                _ => 0,
+            };
+            if n > MAX_RECONCILES {
+                let _ = cmd(cloud, &url, &token, &["DEL", &format!("{p}:job:{msg_id}")]).await;
+                tracing::warn!(project = %project, msg_id = %msg_id, reconciles = n, "world reconcile: GC'd poison job (never consumed after repeated reschedules)");
+                continue;
             }
             let score = format!("{now}");
-            if cmd(cloud, &url, &token, &["ZADD", &format!("{p}:sched"), &score, msg_id]).await.is_some() {
+            if cmd(cloud, &url, &token, &["ZADD", &format!("{p}:sched"), &score, &msg_id]).await.is_some() {
                 rescheduled += 1;
                 tracing::info!(project = %project, msg_id = %msg_id, "world reconcile: rescheduled orphaned queue job");
             }
