@@ -94,6 +94,20 @@ impl KeyValueIndex {
     }
 }
 
+
+/// True for iroh-docs events that mean REMOTE state changed and the local index
+/// must be rebuilt. Local inserts are already applied by put_impl/delete_impl.
+fn is_remote_event(event: &std::result::Result<iroh_docs::engine::LiveEvent, impl std::fmt::Debug>) -> bool {
+    use iroh_docs::engine::LiveEvent;
+    matches!(
+        event,
+        Ok(LiveEvent::InsertRemote { .. })
+            | Ok(LiveEvent::ContentReady { .. })
+            | Ok(LiveEvent::PendingContentReady)
+            | Ok(LiveEvent::SyncFinished(_))
+    )
+}
+
 /// Rebuilds the in-memory index from the current state of the iroh-docs document.
 ///
 /// Function shared between `sync_index_from_docs` (manual load/sync) and the reactive
@@ -649,20 +663,48 @@ impl GuardianDBKeyValue {
             };
 
             use futures::StreamExt;
-            use iroh_docs::engine::LiveEvent;
-            while let Some(event) = stream.next().await {
-                // Rebuild the index ONLY on REMOTE-origin events (peer sync).
-                // Local events (InsertLocal) are already reflected by put_impl/delete_impl, and
-                // refreshing on them would race with the local write (clear_all + rebuild).
-                let is_remote = matches!(
-                    event,
-                    Ok(LiveEvent::InsertRemote { .. })
-                        | Ok(LiveEvent::ContentReady { .. })
-                        | Ok(LiveEvent::PendingContentReady)
-                        | Ok(LiveEvent::SyncFinished(_))
-                );
-                if is_remote && let Err(e) = refresh_kv_index(&docs, &doc, &client, &index).await {
-                    warn!("Failed to update KV index via live sync: {:?}", e);
+            // COALESCED rebuild: a remote sync burst can deliver hundreds of
+            // InsertRemote/ContentReady events in a few ms. Rebuilding the whole
+            // index (get_many + a `cat_bytes` per key, each allocating a Vec) on
+            // EVERY event turned a burst into an O(events x keys) allocation +
+            // network storm — a confirmed driver of the fleet's tokio-worker heap
+            // runaway/OOM under mesh sync storms. Instead we set a "dirty" flag on
+            // each remote event and rebuild AT MOST once per debounce window,
+            // draining every event that arrived during the rebuild into a single
+            // follow-up pass. Correctness is unchanged (a full rebuild reflects
+            // the latest doc state regardless of how many events it collapses);
+            // only the rebuild RATE is bounded.
+            const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+            let mut dirty = false;
+            loop {
+                if dirty {
+                    // Drain any events that arrived while we were waiting, so a
+                    // steady event stream still collapses to one rebuild/window.
+                    match tokio::time::timeout(DEBOUNCE, stream.next()).await {
+                        Ok(Some(event)) => {
+                            if is_remote_event(&event) {
+                                dirty = true;
+                            }
+                            continue; // keep draining until the window goes quiet
+                        }
+                        Ok(None) => break, // stream ended
+                        Err(_) => {
+                            // Quiet window elapsed with the index still dirty — rebuild once.
+                            dirty = false;
+                            if let Err(e) = refresh_kv_index(&docs, &doc, &client, &index).await {
+                                warn!("Failed to update KV index via live sync: {:?}", e);
+                            }
+                        }
+                    }
+                } else {
+                    match stream.next().await {
+                        Some(event) => {
+                            if is_remote_event(&event) {
+                                dirty = true;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
             debug!("Live index sync terminated for KV store");

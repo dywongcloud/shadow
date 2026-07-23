@@ -535,18 +535,52 @@ impl GuardianDBDocumentStore {
 
             use futures::StreamExt;
             use iroh_docs::engine::LiveEvent;
-            while let Some(event) = stream.next().await {
-                // Rebuild the index ONLY on REMOTE-origin events (peer sync),
-                // avoiding a race with local writes (which already update the index directly).
-                let is_remote = matches!(
+            // COALESCED rebuild — see the matching comment in kv_store::
+            // spawn_live_index_sync. A remote sync burst delivers many events in
+            // a few ms; rebuilding the whole document index (get_many + a
+            // per-key cat_bytes, each allocating) on EVERY event was an
+            // O(events x keys) allocation/network storm driving the fleet's
+            // tokio-worker heap runaway. Set dirty per remote event, rebuild at
+            // most once per debounce window. Correctness unchanged (a full
+            // rebuild reflects latest state regardless of how many events it
+            // collapses); only the rate is bounded.
+            let is_remote = |event: &std::result::Result<LiveEvent, _>| {
+                matches!(
                     event,
                     Ok(LiveEvent::InsertRemote { .. })
                         | Ok(LiveEvent::ContentReady { .. })
                         | Ok(LiveEvent::PendingContentReady)
                         | Ok(LiveEvent::SyncFinished(_))
-                );
-                if is_remote && let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
-                    warn!("Failed to update Document index via live sync: {:?}", e);
+                )
+            };
+            const DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(250);
+            let mut dirty = false;
+            loop {
+                if dirty {
+                    match tokio::time::timeout(DEBOUNCE, stream.next()).await {
+                        Ok(Some(event)) => {
+                            if is_remote(&event) {
+                                dirty = true;
+                            }
+                            continue;
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            dirty = false;
+                            if let Err(e) = refresh_doc_index(&docs, &doc, &client, &index).await {
+                                warn!("Failed to update Document index via live sync: {:?}", e);
+                            }
+                        }
+                    }
+                } else {
+                    match stream.next().await {
+                        Some(event) => {
+                            if is_remote(&event) {
+                                dirty = true;
+                            }
+                        }
+                        None => break,
+                    }
                 }
             }
             debug!("Live index sync terminated for Document store");

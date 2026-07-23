@@ -10,6 +10,7 @@ use lru::LruCache;
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, instrument, warn};
@@ -28,6 +29,19 @@ pub struct OptimizedCache {
     cache_config: CacheConfig,
     /// Access predictor for intelligent eviction.
     access_predictor: Arc<Mutex<AccessPredictor>>,
+    /// Live byte footprint of `data_cache` (uncompressed entry bytes).
+    ///
+    /// Guardian storage is content-addressed, so every mutated value is a NEW
+    /// CID that is never read again — the old CIDs pile up. The upstream cache
+    /// bounded ONLY by entry count (50k compressed / 10k data) with the byte
+    /// budgets (`max_*_cache_size`) never enforced, so 50k multi-MB blobs could
+    /// retain hundreds of GB of anon heap (the fleet's OOM/lockout root cause).
+    /// These counters make the BYTE budget the real bound: the LRUs are given a
+    /// huge entry capacity so their own count-eviction never fires, and every
+    /// insert enforces the byte budget via `pop_lru`, keeping the counter exact.
+    data_bytes: Arc<AtomicU64>,
+    /// Live byte footprint of `compressed_cache` (compressed entry bytes).
+    compressed_bytes: Arc<AtomicU64>,
 }
 
 /// Cache entry with performance metadata.
@@ -188,10 +202,20 @@ impl Default for CacheConfig {
 impl OptimizedCache {
     /// Creates a new instance of the optimized cache.
     pub fn new(cache_config: CacheConfig) -> Self {
+        // Give the LRUs a huge entry capacity so their OWN count-eviction never
+        // fires — the BYTE budget (enforced on every insert via `pop_lru`) is
+        // the real bound now, and it must be the sole evictor for the byte
+        // counters to stay exact. The configured entry caps
+        // (`max_*_entries`) are kept as an additional ceiling only if they are
+        // SMALLER than this sentinel (they are not, by default), so a caller
+        // that deliberately sets a tiny entry cap still gets it.
+        let big = NonZeroUsize::new(usize::MAX).unwrap();
         let data_cache_size = NonZeroUsize::new(cache_config.max_data_entries)
-            .unwrap_or(NonZeroUsize::new(10_000).unwrap());
+            .filter(|n| *n >= big)
+            .unwrap_or(big);
         let compressed_cache_size = NonZeroUsize::new(cache_config.max_compressed_entries)
-            .unwrap_or(NonZeroUsize::new(50_000).unwrap());
+            .filter(|n| *n >= big)
+            .unwrap_or(big);
 
         Self {
             data_cache: Arc::new(RwLock::new(LruCache::new(data_cache_size))),
@@ -204,6 +228,61 @@ impl OptimizedCache {
                 patterns: HashMap::new(),
                 analysis_window_secs: 3600 * 24, // 24 hours
             })),
+            data_bytes: Arc::new(AtomicU64::new(0)),
+            compressed_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Evict LRU entries from `compressed_cache` until its live byte footprint
+    /// is at or below `max_compressed_cache_size`. Called after every insert;
+    /// `compressed_bytes` is kept exact because this is the ONLY evictor.
+    async fn evict_compressed_to_budget(&self) {
+        let budget = self.cache_config.max_compressed_cache_size as u64;
+        if self.compressed_bytes.load(Ordering::Relaxed) <= budget {
+            return;
+        }
+        let mut freed = 0u64;
+        {
+            let mut cache = self.compressed_cache.write().await;
+            while self.compressed_bytes.load(Ordering::Relaxed).saturating_sub(freed) > budget {
+                match cache.pop_lru() {
+                    Some((_k, v)) => freed += v.compressed_data.len() as u64,
+                    None => break,
+                }
+            }
+        }
+        if freed > 0 {
+            self.compressed_bytes.fetch_sub(freed, Ordering::Relaxed);
+            let mut stats = self.stats.write().await;
+            stats.total_bytes_cached = stats.total_bytes_cached.saturating_sub(freed);
+            stats.evictions_count += 1;
+            debug!("compressed cache byte-eviction freed {} bytes", freed);
+        }
+    }
+
+    /// Evict LRU entries from `data_cache` until its live byte footprint is at
+    /// or below `max_data_cache_size`.
+    async fn evict_data_to_budget(&self) {
+        let budget = self.cache_config.max_data_cache_size as u64;
+        if self.data_bytes.load(Ordering::Relaxed) <= budget {
+            return;
+        }
+        let mut freed = 0u64;
+        {
+            let mut cache = self.data_cache.write().await;
+            while self.data_bytes.load(Ordering::Relaxed).saturating_sub(freed) > budget {
+                match cache.pop_lru() {
+                    Some((_k, v)) => freed += v.data.len() as u64,
+                    None => break,
+                }
+            }
+        }
+        if freed > 0 {
+            self.data_bytes.fetch_sub(freed, Ordering::Relaxed);
+            let mut stats = self.stats.write().await;
+            stats.total_bytes_cached = stats.total_bytes_cached.saturating_sub(freed);
+            stats.evictions_count += 1;
+            debug!("data cache byte-eviction freed {} bytes", freed);
         }
     }
 
@@ -259,10 +338,16 @@ impl OptimizedCache {
                             integrity_hash: self.calculate_hash(&decompressed),
                         };
 
+                        let promoted_bytes = cache_entry.data.len() as u64;
                         {
                             let mut data_cache = self.data_cache.write().await;
-                            data_cache.put(cid.to_string(), cache_entry);
+                            let old = data_cache.put(cid.to_string(), cache_entry);
+                            if let Some(old) = old {
+                                self.data_bytes.fetch_sub(old.data.len() as u64, Ordering::Relaxed);
+                            }
                         }
+                        self.data_bytes.fetch_add(promoted_bytes, Ordering::Relaxed);
+                        self.evict_data_to_budget().await;
 
                         // Update statistics.
                         let mut stats = self.stats.write().await;
@@ -280,8 +365,11 @@ impl OptimizedCache {
                     }
                     Err(e) => {
                         warn!("Failed to decompress cached data for {}: {}", cid, e);
-                        // Remove the corrupted entry.
-                        compressed_cache.pop(cid);
+                        // Remove the corrupted entry (keep the byte counter exact).
+                        if let Some(old) = compressed_cache.pop(cid) {
+                            self.compressed_bytes
+                                .fetch_sub(old.compressed_data.len() as u64, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -317,18 +405,30 @@ impl OptimizedCache {
                         compression_ratio,
                     };
 
-                    // Store it in the compressed cache.
+                    // Store it in the compressed cache, tracking the exact
+                    // compressed byte footprint (subtracting any prior value for
+                    // this same CID that `put` returns).
+                    let new_bytes = compressed_entry.compressed_data.len() as u64;
                     {
                         let mut compressed_cache = self.compressed_cache.write().await;
-                        compressed_cache.put(cid.to_string(), compressed_entry);
+                        let old = compressed_cache.put(cid.to_string(), compressed_entry);
+                        if let Some(old) = old {
+                            self.compressed_bytes
+                                .fetch_sub(old.compressed_data.len() as u64, Ordering::Relaxed);
+                        }
                     }
+                    self.compressed_bytes.fetch_add(new_bytes, Ordering::Relaxed);
 
                     // Update statistics.
-                    let mut stats = self.stats.write().await;
-                    stats.compressions_count += 1;
-                    stats.bytes_saved_compression +=
-                        (data_size as f64 * (1.0 - compression_ratio)) as u64;
-                    stats.total_bytes_cached += data_size as u64;
+                    {
+                        let mut stats = self.stats.write().await;
+                        stats.compressions_count += 1;
+                        stats.bytes_saved_compression +=
+                            (data_size as f64 * (1.0 - compression_ratio)) as u64;
+                        stats.total_bytes_cached += new_bytes;
+                    }
+                    // Enforce the compressed byte budget (the real bound).
+                    self.evict_compressed_to_budget().await;
 
                     info!(
                         "Data compressed and stored: {} ({} bytes -> {} bytes, ratio: {:.2})",
@@ -351,8 +451,12 @@ impl OptimizedCache {
             self.store_uncompressed(cid, data, integrity_hash).await?;
         }
 
-        // Check whether eviction is needed.
-        self.check_and_evict().await?;
+        // Byte-budget eviction already ran inside the insert paths above
+        // (`evict_compressed_to_budget` / `evict_data_to_budget`), which is the
+        // authoritative bound and keeps the byte counters exact. The old
+        // access-pattern `check_and_evict` is intentionally NOT called here: it
+        // decremented `total_bytes_cached` without updating the per-cache byte
+        // counters, which would desync them and cause over-eviction.
 
         Ok(())
     }
@@ -374,14 +478,22 @@ impl OptimizedCache {
             integrity_hash,
         };
 
+        let new_bytes = data.len() as u64;
         {
             let mut data_cache = self.data_cache.write().await;
-            data_cache.put(cid.to_string(), cache_entry);
+            let old = data_cache.put(cid.to_string(), cache_entry);
+            if let Some(old) = old {
+                self.data_bytes.fetch_sub(old.data.len() as u64, Ordering::Relaxed);
+            }
         }
+        self.data_bytes.fetch_add(new_bytes, Ordering::Relaxed);
 
         // Update statistics.
-        let mut stats = self.stats.write().await;
-        stats.total_bytes_cached += data.len() as u64;
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_bytes_cached += new_bytes;
+        }
+        self.evict_data_to_budget().await;
 
         debug!(
             "Data stored (without compression): {} ({} bytes)",
@@ -460,6 +572,7 @@ impl OptimizedCache {
     }
 
     /// Checks whether eviction is needed and performs it if so.
+    #[allow(dead_code)]
     async fn check_and_evict(&self) -> Result<()> {
         let stats = self.stats.read().await;
         let current_usage = stats.total_bytes_cached as f64;
@@ -475,6 +588,7 @@ impl OptimizedCache {
     }
 
     /// Performs intelligent eviction based on access patterns.
+    #[allow(dead_code)]
     async fn intelligent_eviction(&self) -> Result<()> {
         debug!("Starting intelligent cache eviction");
 
@@ -572,6 +686,8 @@ impl OptimizedCache {
             let mut stats = self.stats.write().await;
             *stats = CacheStats::default();
         }
+        self.data_bytes.store(0, Ordering::Relaxed);
+        self.compressed_bytes.store(0, Ordering::Relaxed);
 
         info!("Cache cleared completely");
         Ok(())

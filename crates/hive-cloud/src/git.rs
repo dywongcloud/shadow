@@ -103,6 +103,16 @@ impl BuildStore {
     fn log(&self, id: &str, line: impl Into<String>) {
         if let Some(b) = self.map.lock().get_mut(id) {
             b.lines.push(LogLine { ts_ms: now_ms(), line: line.into() });
+            // Cap per-build log retention: a chatty build could otherwise grow
+            // an unbounded Vec<LogLine> that is then cloned into EVERY 120s
+            // replicated platform snapshot (a real contributor to the fleet's
+            // snapshot-churn heap pressure). Keep the most recent lines; a build
+            // that needs more than this is already pathological.
+            const MAX_BUILD_LOG_LINES: usize = 2_000;
+            let len = b.lines.len();
+            if len > MAX_BUILD_LOG_LINES {
+                b.lines.drain(0..len - MAX_BUILD_LOG_LINES);
+            }
         }
     }
     fn update(&self, id: &str, f: impl FnOnce(&mut Build)) {

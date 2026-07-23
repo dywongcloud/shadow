@@ -18,6 +18,7 @@
 use std::sync::Arc;
 
 use base64::Engine;
+use ring::rand::SecureRandom;
 use serde_json::{json, Value};
 
 use crate::state::CloudState;
@@ -210,6 +211,345 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
         }
     }
     Some(json!({ "run": run, "steps": steps, "events": events, "project": project }))
+}
+
+// ===========================================================================
+// Managed-world WRITE layer — conformant with @workflow/world (Vercel WDK).
+//
+// The console's run operations (the upstream 3-dots menu: Cancel, Replay,
+// Re-enqueue, Cancel-Active-Sleeps/Wake) mutate world state. Because an app's
+// runtime replays EXCLUSIVELY from its own world (the `owf:*` keys in the
+// project's Upstash store), hive writes the SAME records/events the app reads —
+// the identical shapes `@open-workflow/world-redis` produces — rather than a
+// hive-private store. Effects mirror `@workflow/core` runtime/runs.ts:
+//   * cancelRun          → run_cancelled event + run.status=cancelled (+cleanup)
+//   * reenqueueRun       → enqueue {runId} on __wkf_workflow_<name> (no writes)
+//   * wakeUpRun          → complete pending waits (wait_completed events) + enqueue
+//   * recreateRun/replay → new run cloned from input + run_created + enqueue
+// Enqueue = the app's own world-redis queue schema (owf:job:<id> + owf:sched
+// ZSET), which the app's in-process dispatcher (50ms poll) delivers to its
+// /.well-known/workflow/v1/flow endpoint — so a resumed run actually EXECUTES.
+// All writes take the per-run lock `<p>:lock:run:<runId>` (SET NX PX + Lua
+// compare-delete) so they never interleave with the app runtime's own writes.
+// Every op runs on the project's HOST node (env decrypts locally); the
+// coordinator routes ops over the iroh mesh exactly like world reads.
+// ===========================================================================
+
+/// base64(CBOR(value)) — the on-wire encoding every `owf:*` entity/event uses
+/// (cbor-x on the app side round-trips it; serde_cbor encodes JSON numbers/
+/// strings/maps identically, and `z.coerce.date()` on the app accepts our
+/// epoch-ms number timestamps).
+fn encode_blob(v: &Value) -> String {
+    let bytes = serde_cbor::to_vec(v).unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+/// A Crockford-base32 ULID (26 chars): 48-bit big-endian ms timestamp + 80 bits
+/// of randomness. The app validates recreated run ids as real ULIDs whose
+/// embedded timestamp is within [-24h, +5min], so replay MUST mint a genuine
+/// ULID (a uuid would be rejected).
+fn ulid() -> String {
+    const ENC: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let ts = hive_core::now_ms();
+    let mut rnd = [0u8; 10];
+    let _ = ring::rand::SystemRandom::new().fill(&mut rnd).map_err(|_| {
+        // extremely unlikely; fall back to time-derived bytes so we never panic
+        for (i, b) in rnd.iter_mut().enumerate() {
+            *b = ((ts >> (i * 5)) & 0xff) as u8;
+        }
+    });
+    // 128-bit value: [48-bit ts][80-bit random]
+    let mut bytes = [0u8; 16];
+    bytes[0] = ((ts >> 40) & 0xff) as u8;
+    bytes[1] = ((ts >> 32) & 0xff) as u8;
+    bytes[2] = ((ts >> 24) & 0xff) as u8;
+    bytes[3] = ((ts >> 16) & 0xff) as u8;
+    bytes[4] = ((ts >> 8) & 0xff) as u8;
+    bytes[5] = (ts & 0xff) as u8;
+    bytes[6..16].copy_from_slice(&rnd);
+    // 128 bits -> 26 base32 chars, MSB-first (5 bits each; the top char only
+    // has 3 significant bits since 26*5 = 130 > 128).
+    let val = u128::from_be_bytes(bytes);
+    let mut out = [0u8; 26];
+    for (oi, i) in (0..26).rev().enumerate() {
+        let shift: u32 = (i as u32) * 5;
+        let idx = ((val >> shift) & 0x1f) as usize;
+        out[oi] = ENC[idx];
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Acquire the app's per-run lock (`SET <p>:lock:run:<id> <tok> NX PX 15000`).
+/// Returns the token to release with, or None if held (contention with the
+/// app runtime — the caller retries a few times).
+async fn world_lock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<String> {
+    let key = format!("{p}:lock:run:{run_id}");
+    let lock_tok = format!("hive-{}", ulid());
+    let res = cmd(cloud, url, token, &["SET", &key, &lock_tok, "NX", "PX", "15000"]).await?;
+    // Upstash returns "OK" on success, null when NX fails.
+    if res.as_str() == Some("OK") { Some(lock_tok) } else { None }
+}
+
+/// Release the lock only if we still hold it (Lua compare-and-delete — never
+/// delete a lock the app runtime re-acquired after ours expired).
+async fn world_unlock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, lock_tok: &str) {
+    let key = format!("{p}:lock:run:{run_id}");
+    let script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
+    let _ = cmd(cloud, url, token, &["EVAL", script, "1", &key, lock_tok]).await;
+}
+
+/// Take the run lock, retrying briefly if the app runtime holds it.
+async fn with_run_lock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<String> {
+    for _ in 0..8 {
+        if let Some(t) = world_lock(cloud, url, token, p, run_id).await {
+            return Some(t);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    None
+}
+
+/// Append one event: HSET the payload + RPUSH the id onto the run's event list
+/// + RPUSH the correlation index (exactly `@open-workflow/world-redis`
+/// `entities.js` appendEvent).
+async fn append_event(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, event: &Value) {
+    let event_id = event.get("eventId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let blob = encode_blob(event);
+    let _ = cmd(cloud, url, token, &["HSET", &format!("{p}:eventdata:{run_id}"), &event_id, &blob]).await;
+    let _ = cmd(cloud, url, token, &["RPUSH", &format!("{p}:events:{run_id}"), &event_id]).await;
+    if let Some(cid) = event.get("correlationId").and_then(|v| v.as_str()) {
+        if !cid.is_empty() {
+            let _ = cmd(cloud, url, token, &["RPUSH", &format!("{p}:corr:{cid}"), &format!("{run_id}|{event_id}")]).await;
+        }
+    }
+}
+
+/// Build one event record with a fresh id + created timestamp.
+fn make_event(run_id: &str, event_type: &str, correlation_id: Option<&str>, event_data: Value, spec_version: i64) -> Value {
+    let now = hive_core::now_ms();
+    let mut e = json!({
+        "eventId": format!("evnt_{}", ulid()),
+        "runId": run_id,
+        "eventType": event_type,
+        "createdAt": now,
+        "specVersion": spec_version,
+        "eventData": event_data,
+    });
+    if let Some(cid) = correlation_id {
+        e.as_object_mut().unwrap().insert("correlationId".into(), json!(cid));
+    }
+    e
+}
+
+/// Read one run record (decoded JSON) or None.
+async fn get_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<Value> {
+    cmd(cloud, url, token, &["GET", &format!("{p}:run:{run_id}")]).await.and_then(|v| decode_blob(&v))
+}
+
+/// Persist a run record + maintain the `<p>:runs` and per-status ZSET indexes.
+async fn put_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run: &Value, prev_status: Option<&str>) {
+    let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let created = run.get("createdAt").and_then(|v| v.as_f64()).unwrap_or(hive_core::now_ms() as f64);
+    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
+    let _ = cmd(cloud, url, token, &["SET", &format!("{p}:run:{run_id}"), &encode_blob(run)]).await;
+    let score = format!("{}", created as i64);
+    let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:runs"), &score, &run_id]).await;
+    if prev_status != Some(status.as_str()) {
+        if let Some(prev) = prev_status {
+            let _ = cmd(cloud, url, token, &["ZREM", &format!("{p}:runs:status:{prev}"), &run_id]).await;
+        }
+        let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:runs:status:{status}"), &score, &run_id]).await;
+    }
+}
+
+/// Enqueue `{runId}` on the app's own world-redis queue (job HASH + sched ZSET)
+/// so the app's in-process dispatcher delivers it to `/.well-known/workflow/v1/
+/// flow` and the run resumes/executes — the storage-level trigger of
+/// conformance-spec §4.3. `route` = "flow" for workflow topics.
+async fn enqueue_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, workflow_name: &str) {
+    let queue_name = format!("__wkf_workflow_{}", clean_name(workflow_name));
+    let msg_id = format!("msg_{}", ulid());
+    let body = json!({ "payload": { "runId": run_id }, "queueName": queue_name });
+    let body_b64 = encode_blob(&body);
+    // owf:job:<id> HASH { queueName, body(base64 CBOR), attempt, route }
+    let _ = cmd(cloud, url, token, &[
+        "HSET", &format!("{p}:job:{msg_id}"),
+        "queueName", &queue_name,
+        "body", &body_b64,
+        "attempt", "1",
+        "route", "flow",
+    ]).await;
+    // owf:sched ZSET score=runAt(now) member=msgId
+    let now = format!("{}", hive_core::now_ms());
+    let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:sched"), &now, &msg_id]).await;
+}
+
+/// The four run operations, each returning the updated/ new run's id + a small
+/// summary the console renders. `op` ∈ cancel|reenqueue|wakeup|replay.
+pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &str, cancel_reason: Option<&str>) -> Result<Value, String> {
+    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
+    let spec_version = run.get("specVersion").and_then(|v| v.as_i64()).unwrap_or(2);
+    let workflow_name = run.get("workflowName").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    match op {
+        "cancel" => {
+            let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+            let terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+            if !terminal {
+                let now = hive_core::now_ms();
+                let mut updated = run.clone();
+                if let Some(o) = updated.as_object_mut() {
+                    o.insert("status".into(), json!("cancelled"));
+                    o.insert("completedAt".into(), json!(now));
+                    o.insert("updatedAt".into(), json!(now));
+                    o.remove("output");
+                    o.remove("error");
+                }
+                let data = cancel_reason.map(|r| json!({ "cancelReason": r })).unwrap_or(json!({}));
+                append_event(cloud, &url, &token, &p, run_id, &make_event(run_id, "run_cancelled", None, data, spec_version)).await;
+                put_run(cloud, &url, &token, &p, &updated, Some(&status)).await;
+                terminal_cleanup(cloud, &url, &token, &p, run_id).await;
+            }
+            world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
+            Ok(json!({ "runId": run_id, "status": "cancelled", "op": "cancel", "alreadyTerminal": terminal }))
+        }
+        "reenqueue" => {
+            enqueue_run(cloud, &url, &token, &p, run_id, &workflow_name).await;
+            Ok(json!({ "runId": run_id, "op": "reenqueue", "enqueued": true }))
+        }
+        "wakeup" => {
+            let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+            let stopped = complete_pending_waits(cloud, &url, &token, &p, run_id, spec_version).await;
+            world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
+            if stopped > 0 {
+                enqueue_run(cloud, &url, &token, &p, run_id, &workflow_name).await;
+            }
+            Ok(json!({ "runId": run_id, "op": "wakeup", "stoppedCount": stopped }))
+        }
+        "replay" => {
+            // Clone the run from its ORIGINAL input bytes into a brand-new run.
+            let input = run.get("input").cloned().unwrap_or(Value::Null);
+            let deployment_id = run.get("deploymentId").and_then(|v| v.as_str()).unwrap_or("dpl_redis_local").to_string();
+            let execution_context = run.get("executionContext").cloned().unwrap_or(json!({}));
+            let new_id = format!("wrun_{}", ulid());
+            let now = hive_core::now_ms();
+            let new_run = json!({
+                "runId": new_id,
+                "status": "pending",
+                "deploymentId": deployment_id,
+                "workflowName": workflow_name,
+                "specVersion": spec_version,
+                "executionContext": execution_context,
+                "input": input,
+                "attributes": {},
+                "createdAt": now,
+                "updatedAt": now,
+                "replayedFromRunId": run_id,
+            });
+            let lock = with_run_lock(cloud, &url, &token, &p, &new_id).await.ok_or_else(|| "could not lock the new run".to_string())?;
+            append_event(cloud, &url, &token, &p, &new_id,
+                &make_event(&new_id, "run_created", None, json!({
+                    "deploymentId": deployment_id, "workflowName": workflow_name, "input": new_run["input"],
+                    "executionContext": execution_context,
+                }), spec_version)).await;
+            put_run(cloud, &url, &token, &p, &new_run, None).await;
+            world_unlock(cloud, &url, &token, &p, &new_id, &lock).await;
+            enqueue_run(cloud, &url, &token, &p, &new_id, &workflow_name).await;
+            Ok(json!({ "runId": new_id, "op": "replay", "replayedFromRunId": run_id }))
+        }
+        _ => Err(format!("unknown run op '{op}'")),
+    }
+}
+
+/// Complete every pending wait (a `wait_created` with no matching
+/// `wait_completed` by correlationId) — the "cancel active sleeps" effect. Reads
+/// the event log, writes a `wait_completed` per pending wait + flips the wait
+/// entity to completed. Returns how many were stopped.
+async fn complete_pending_waits(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, spec_version: i64) -> u64 {
+    let ev_ids = cmd(cloud, url, token, &["LRANGE", &format!("{p}:events:{run_id}"), "0", "-1"]).await;
+    let ev_ids: Vec<String> = ev_ids
+        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+        .unwrap_or_default();
+    if ev_ids.is_empty() {
+        return 0;
+    }
+    let mut hargs = vec!["HMGET".to_string(), format!("{p}:eventdata:{run_id}")];
+    hargs.extend(ev_ids.iter().cloned());
+    let hargs_ref: Vec<&str> = hargs.iter().map(|s| s.as_str()).collect();
+    let mut created: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(arr) = cmd(cloud, url, token, &hargs_ref).await.and_then(|v| v.as_array().cloned()) {
+        for b in arr {
+            if let Some(ev) = decode_blob(&b) {
+                let et = ev.get("eventType").and_then(|x| x.as_str()).unwrap_or("");
+                let cid = ev.get("correlationId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+                if cid.is_empty() { continue; }
+                match et {
+                    "wait_created" => { created.insert(cid, ev); }
+                    "wait_completed" => { completed.insert(cid); }
+                    _ => {}
+                }
+            }
+        }
+    }
+    let mut stopped = 0u64;
+    for (cid, ev) in created {
+        if completed.contains(&cid) { continue; }
+        let resume_at = ev.get("eventData").and_then(|d| d.get("resumeAt")).cloned().unwrap_or(json!(hive_core::now_ms()));
+        append_event(cloud, url, token, p, run_id,
+            &make_event(run_id, "wait_completed", Some(&cid), json!({ "resumeAt": resume_at }), spec_version)).await;
+        // Flip the wait entity to completed (best-effort; the event is the source of truth for replay).
+        if let Some(w) = cmd(cloud, url, token, &["GET", &format!("{p}:wait:{run_id}:{cid}")]).await.and_then(|v| decode_blob(&v)) {
+            let mut w2 = w;
+            if let Some(o) = w2.as_object_mut() {
+                o.insert("status".into(), json!("completed"));
+                o.insert("completedAt".into(), json!(hive_core::now_ms()));
+                o.insert("updatedAt".into(), json!(hive_core::now_ms()));
+            }
+            let _ = cmd(cloud, url, token, &["SET", &format!("{p}:wait:{run_id}:{cid}"), &encode_blob(&w2)]).await;
+        }
+        stopped += 1;
+    }
+    stopped
+}
+
+/// Terminal cleanup on cancel: drop the run's hooks (+ token claims) and waits,
+/// matching world-redis `terminalCleanup`. Best-effort.
+async fn terminal_cleanup(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) {
+    // hooks for this run
+    if let Some(ids) = cmd(cloud, url, token, &["ZRANGE", &format!("{p}:hooks:run:{run_id}"), "0", "-1"]).await.and_then(|v| v.as_array().cloned()) {
+        for h in ids {
+            if let Some(hid) = h.as_str() {
+                if let Some(hook) = cmd(cloud, url, token, &["GET", &format!("{p}:hook:{hid}")]).await.and_then(|v| decode_blob(&v)) {
+                    if let Some(tok) = hook.get("token").and_then(|t| t.as_str()) {
+                        let sha = sha256_hex(tok);
+                        let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hooktoken:{sha}")]).await;
+                    }
+                }
+                let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hook:{hid}")]).await;
+                let _ = cmd(cloud, url, token, &["ZREM", &format!("{p}:hooks"), hid]).await;
+            }
+        }
+        let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hooks:run:{run_id}")]).await;
+    }
+    // waits for this run
+    if let Some(ids) = cmd(cloud, url, token, &["ZRANGE", &format!("{p}:waits:{run_id}"), "0", "-1"]).await.and_then(|v| v.as_array().cloned()) {
+        for w in ids {
+            if let Some(cid) = w.as_str() {
+                let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:wait:{run_id}:{cid}")]).await;
+            }
+        }
+        let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:waits:{run_id}")]).await;
+    }
+}
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// List workflow "hooks" for a project (newest first), each tagged with `project`.

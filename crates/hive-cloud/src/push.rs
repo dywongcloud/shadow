@@ -511,9 +511,47 @@ pub async fn send_web_push(c: &Arc<CloudState>, sub: &PushSubscription, payload:
     }
 }
 
-/// Send one SMS via Textbelt. `test_mode` appends the documented `_test`
-/// suffix (full request validation, nothing sent, no quota consumed).
+/// Send one SMS via Textbelt, with an egress-geography fallback. `test_mode`
+/// appends the documented `_test` suffix (full request validation, nothing
+/// sent, no quota consumed).
+///
+/// The fallback exists because Textbelt's cheaper REGIONAL keys are gated on
+/// the API CALLER's IP geography, and several fleet nodes egress via Tencent
+/// AS ranges (or genuinely sit in Asia — bkk/hk), which Textbelt can classify
+/// as non-North-American. Live-witnessed: "North America region keys can only
+/// be used from North American countries" when a send originated from a
+/// non-NA-classified node during a leadership flap. On that specific error we
+/// retry the send THROUGH a peer whose egress is reliably NA-classified
+/// (`HIVE_SMS_EGRESS_NODES`, default the LA nodes) over the authenticated
+/// mesh, so SMS keeps working no matter which node runs the dispatcher.
 pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
+    match send_sms_direct(c, phone, message, test_mode).await {
+        Ok(()) => Ok(()),
+        Err(raw) if is_region_error(&raw) => {
+            tracing::warn!(node = %c.node_name, "textbelt rejected send for egress region; relaying via NA egress peer(s)");
+            let mut last = raw;
+            for peer in sms_egress_peers(&c.node_name) {
+                let body = serde_json::json!({ "phone": phone, "message": message, "test_mode": test_mode });
+                if let Some(v) = crate::admin::put_to_host(c, &peer, "/v1/push/sms-relay", "", &body).await {
+                    if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                        tracing::info!(%peer, "SMS relayed via NA egress peer");
+                        return Ok(());
+                    }
+                    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+                        last = e.to_string();
+                    }
+                }
+            }
+            Err(sanitize_textbelt_error(&last))
+        }
+        Err(raw) => Err(sanitize_textbelt_error(&raw)),
+    }
+}
+
+/// The single direct Textbelt call, no relay. Returns the RAW (unsanitized)
+/// Textbelt error so the caller can classify it; every path that surfaces the
+/// error outward must run it through `sanitize_textbelt_error` first.
+async fn send_sms_direct(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
     let key = std::env::var("HIVE_TEXTBELT_KEY").unwrap_or_default();
     if key.is_empty() {
         return Err("HIVE_TEXTBELT_KEY not configured".into());
@@ -531,8 +569,43 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
     if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
         Ok(())
     } else {
-        let raw = v.get("error").and_then(|e| e.as_str()).unwrap_or("textbelt send failed");
-        Err(sanitize_textbelt_error(raw))
+        Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("textbelt send failed").to_string())
+    }
+}
+
+/// Textbelt's regional-key geography rejection (exact live wording:
+/// "North America region keys can only be used from North American countries").
+fn is_region_error(raw: &str) -> bool {
+    let l = raw.to_ascii_lowercase();
+    l.contains("region keys can only be used") || l.contains("region key can only be used")
+}
+
+/// Peers whose egress is reliably classified North-American by Textbelt.
+/// Comma-separated node names via `HIVE_SMS_EGRESS_NODES`; defaults to the LA
+/// nodes (Charter residential egress — unambiguously NA). Self is skipped (we
+/// already failed locally).
+fn sms_egress_peers(self_name: &str) -> Vec<String> {
+    std::env::var("HIVE_SMS_EGRESS_NODES")
+        .unwrap_or_else(|_| "fc-lax,fc-lax2".into())
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s != self_name)
+        .collect()
+}
+
+/// Mesh/HTTP relay executor: run the DIRECT send on this node (never re-relay —
+/// the caller already chose this node for its egress) and report a sanitized
+/// result. Served by the `/v1/push/sms-relay` admin route and its gossip arm.
+pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> serde_json::Value {
+    let phone = body.get("phone").and_then(|v| v.as_str()).unwrap_or_default();
+    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+    let test_mode = body.get("test_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    if phone.is_empty() || message.is_empty() {
+        return serde_json::json!({ "success": false, "error": "missing phone/message" });
+    }
+    match send_sms_direct(c, phone, message, test_mode).await {
+        Ok(()) => serde_json::json!({ "success": true }),
+        Err(raw) => serde_json::json!({ "success": false, "error": sanitize_textbelt_error(&raw) }),
     }
 }
 

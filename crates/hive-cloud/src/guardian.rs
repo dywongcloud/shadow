@@ -362,6 +362,52 @@ pub fn replicate(snap: &PlatformSnapshot) {
         .filter_map(|(ns, doc)| serde_json::to_vec(&doc).ok().map(|v| (ns, v)))
         .collect();
     let full = serde_json::to_vec(snap).ok();
+
+    // CHURN GATE (fleet OOM fix): `capture()` stamps `saved_ms = now` on every
+    // snapshot, so the full snapshot's bytes DIFFER every 120s even when nothing
+    // meaningful changed — defeating the "identical bytes = same hash = no new
+    // blob" premise this loop was written on. A `put` of that byte-different
+    // snapshot creates a NEW content-addressed blob AND a doc-update event on
+    // every peer (author+seq bump) → mesh-wide index-rebuild + compressed-cache
+    // retention storm every 120s per node. We therefore gate each replicate on
+    // a content SIGNATURE that EXCLUDES saved_ms: the per-namespace payloads
+    // (which carry the meaningful, replicated tenant state and no saved_ms).
+    // When the signature is unchanged we skip ALL puts — no new blob, no doc
+    // event, no downstream churn. Node-local extras in the full snapshot
+    // (builds/database_data) are restored from the local FILE anyway
+    // (`strip_node_local`), so gating the full-snapshot put on meaningful
+    // content is safe.
+    let mut to_put: Vec<(String, Vec<u8>)> = Vec::new();
+    {
+        let mut guard = last_replica_hashes().lock().unwrap_or_else(|e| e.into_inner());
+        let mut sig: u64 = 1469598103934665603; // FNV offset basis
+        for (ns, json) in payloads {
+            let key = format!("ns/{ns}/state");
+            let h = hash_bytes(&json);
+            sig = (sig ^ h).wrapping_mul(1099511628211);
+            if guard.get(&key).copied() != Some(h) {
+                guard.insert(key.clone(), h);
+                to_put.push((key, json));
+            }
+        }
+        if let Some(fkey) = snapshot_key() {
+            // The full snapshot is re-put only when the meaningful per-namespace
+            // content changed (tracked by `sig`), NOT merely because saved_ms
+            // advanced.
+            if guard.get(&fkey).copied() != Some(sig) {
+                guard.insert(fkey.clone(), sig);
+                if let Some(bytes) = full {
+                    to_put.push((fkey, bytes));
+                }
+            }
+        }
+    }
+    if to_put.is_empty() {
+        // Nothing meaningful changed since the last replicate — do not touch
+        // GuardianDB (this is the steady state most of the time).
+        return;
+    }
+
     let task = async move {
         let h = match handle().await {
             Ok(h) => h,
@@ -370,15 +416,9 @@ pub fn replicate(snap: &PlatformSnapshot) {
                 return;
             }
         };
-        for (ns, json) in payloads {
-            let key = format!("ns/{ns}/state");
-            if let Err(e) = h.kv.put(&key, json).await {
-                tracing::debug!(namespace = %ns, error = %e, "GuardianDB put failed");
-            }
-        }
-        if let (Some(key), Some(bytes)) = (snapshot_key(), full) {
+        for (key, bytes) in to_put {
             if let Err(e) = h.kv.put(&key, bytes).await {
-                tracing::debug!(error = %e, "GuardianDB full-snapshot put failed");
+                tracing::debug!(key = %key, error = %e, "GuardianDB put failed");
             }
         }
     };
@@ -390,6 +430,25 @@ pub fn replicate(snap: &PlatformSnapshot) {
         }
         None => tracing::debug!("no tokio runtime; guardian replication skipped (snapshot on disk only)"),
     }
+}
+
+/// Last replicated content-hash per key (see `replicate`'s churn gate). Keeps
+/// steady-state replication a no-op so a stable fleet stops generating a new
+/// snapshot blob + doc-update storm every 120s.
+fn last_replica_hashes() -> &'static std::sync::Mutex<std::collections::HashMap<String, u64>> {
+    static H: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u64>>> =
+        std::sync::OnceLock::new();
+    H.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// FNV-1a hash of a byte slice (stable, fast, no deps).
+fn hash_bytes(b: &[u8]) -> u64 {
+    let mut h: u64 = 1469598103934665603;
+    for &byte in b {
+        h ^= byte as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    h
 }
 
 /// The replicated full snapshot for THIS node, if GuardianDB holds one.

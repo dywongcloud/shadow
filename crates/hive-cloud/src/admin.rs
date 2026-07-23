@@ -73,6 +73,13 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/workflows/hooks", get(wf_hooks))
         .route("/v1/workflows/runs", get(wf_runs))
         .route("/v1/workflows/runs/:id", get(wf_run_detail))
+        // Run operations (the upstream console's 3-dots menu): cancel, replay
+        // (recreate), reenqueue, wakeup (cancel active sleeps). Each mutates the
+        // project's world on its HOST node (env decrypts there) — host-routed.
+        .route("/v1/workflows/runs/:id/cancel", post(wf_run_cancel))
+        .route("/v1/workflows/runs/:id/replay", post(wf_run_replay))
+        .route("/v1/workflows/runs/:id/reenqueue", post(wf_run_reenqueue))
+        .route("/v1/workflows/runs/:id/wakeup", post(wf_run_wakeup))
         .route("/v1/workflows/:id/run", post(wf_run))
         .route("/v1/sandbox", post(sandbox))
         .route("/deployments", get(dep_list).post(dep_create))
@@ -184,6 +191,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/push/settings", get(push_settings))
         .route("/v1/push/sms", axum::routing::put(push_sms_put))
         .route("/v1/push/sms/verify", post(push_sms_verify))
+        .route("/v1/push/sms-relay", put(push_sms_relay))
         .route("/v1/push/test", post(push_test))
         // ---- Monitoring ----
         .route("/v1/metrics", get(metrics_get))
@@ -2211,7 +2219,7 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
 /// body-carrying counterpart of `post_to_host`, used to forward
 /// `PUT /v1/projects/:project/network` to a project's actual hosting node
 /// when the record isn't local (see `project_network_put`).
-async fn put_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
+pub(crate) async fn put_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
         if let Ok(r) = c
@@ -4445,6 +4453,141 @@ fn wf_in_team(c: &Arc<CloudState>, project: &str, team: &str) -> bool {
     project_owned_by(c, project, norm(team))
 }
 
+/// Body for a run operation (the console's 3-dots menu). All optional.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct RunOpBody {
+    /// Which project's world holds the run (lets the op skip the auto-scan).
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    /// Cancel reason (cancel op only).
+    #[serde(default, rename = "cancelReason")]
+    pub(crate) cancel_reason: Option<String>,
+    /// Internal: set on the host-forwarded hop to prevent a re-forward loop.
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    pub(crate) local: Option<bool>,
+}
+
+async fn wf_run_cancel(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>, body: Option<Json<RunOpBody>>) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_op_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, "cancel", body.map(|b| b.0).unwrap_or_default()).await
+}
+async fn wf_run_replay(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>, body: Option<Json<RunOpBody>>) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_op_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, "replay", body.map(|b| b.0).unwrap_or_default()).await
+}
+async fn wf_run_reenqueue(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>, body: Option<Json<RunOpBody>>) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_op_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, "reenqueue", body.map(|b| b.0).unwrap_or_default()).await
+}
+async fn wf_run_wakeup(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Path(id): Path<String>, body: Option<Json<RunOpBody>>) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_op_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, "wakeup", body.map(|b| b.0).unwrap_or_default()).await
+}
+
+/// Shared dispatch for the four run operations. Resolves the project (given or
+/// auto-scanned), checks tenant ownership, then runs the op on the project's
+/// HOST node (env decrypts locally): local when we host it, else forwarded over
+/// the iroh mesh with `local=1` so the host runs it without re-forwarding.
+pub(crate) async fn wf_run_op_dispatch(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    id: &str,
+    op: &str,
+    body: RunOpBody,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let team = tenant(c, headers, claims);
+    let is_forwarded = body.local.unwrap_or(false);
+    let cancel_reason = body.cancel_reason.clone();
+
+    // 1) Resolve the project that holds this run.
+    let project = if let Some(p) = body.project.clone() {
+        p
+    } else {
+        // Auto-scan: which of this tenant's world-backed projects has the run?
+        let locals: Vec<String> = {
+            let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for d in c.gw.list() {
+                if record_tenant(&d.tenant) == team {
+                    s.insert(d.project);
+                }
+            }
+            s.into_iter().filter(|p| crate::world::has_world(c, p)).collect()
+        };
+        let mut found = String::new();
+        for p in &locals {
+            if crate::world::run_detail(c, p, id).await.map(|d| d.get("run").map(|r| !r.is_null()).unwrap_or(false)).unwrap_or(false) {
+                found = p.clone();
+                break;
+            }
+        }
+        if found.is_empty() && !is_forwarded {
+            // Not on this node — fan the op out to peers hosting this tenant's projects.
+            let peers = peer_nodes_for_tenant(c, &team);
+            let body_json = json!({ "cancelReason": cancel_reason, "local": true });
+            for node in peers {
+                if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/{op}"), &team, &body_json).await {
+                    if v.get("error").is_none() {
+                        return Ok(Json(v));
+                    }
+                }
+            }
+            return Err((StatusCode::NOT_FOUND, "run not found on any reachable host".into()));
+        }
+        found
+    };
+
+    if project.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    // 2) Ownership.
+    if !wf_in_team(c, &project, &team) {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    // 3) If this project isn't hosted locally, forward to its host node.
+    if c.gw.git_for_project(&project).is_none() && !is_forwarded {
+        if let Some(node) = host_node_for_project(c, &project) {
+            let body_json = json!({ "project": project, "cancelReason": cancel_reason, "local": true });
+            if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/{op}"), &team, &body_json).await {
+                return if v.get("error").is_some() {
+                    Err((StatusCode::BAD_GATEWAY, v.get("error").and_then(|e| e.as_str()).unwrap_or("host op failed").to_string()))
+                } else {
+                    Ok(Json(v))
+                };
+            }
+            return Err((StatusCode::BAD_GATEWAY, format!("host node '{node}' for project '{project}' unreachable")));
+        }
+    }
+    // 4) Run it locally against the project's world.
+    match crate::world::run_op(c, &project, id, op, cancel_reason.as_deref()).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+/// POST a JSON body to a host node by NAME: HTTP admin POST if we know its URL,
+/// else the iroh mesh (`GOSSIP_POST` — same body/path dispatch). The
+/// body-carrying, POST-verb counterpart of `post_to_host`/`put_to_host`, used
+/// to forward run operations to a project's hosting node.
+pub(crate) async fn post_body_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Ok(r) = c.http.post(format!("{admin}{path}")).header("x-hive-team", team).timeout(std::time::Duration::from_secs(20)).json(body).send().await {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    let target = c.registry.nodes().into_iter().find(|n| n.name == node).and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((peer_id, addr)) = target {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
+        let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+        if let Some(b) = crate::gossip::request_to(c, &peer_id, &addr, hive_p2p::GOSSIP_POST, &p, &body_bytes, 25).await {
+            return serde_json::from_slice(&b).ok();
+        }
+    }
+    None
+}
+
 pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Workflows are ingested on the node that HOSTS a deployment. If this project
@@ -6434,6 +6577,13 @@ async fn incidents_list(
 /// leader directly, so this 502 only surfaces on direct API calls against a
 /// follower whose HTTP admin map lacks the leader — which previously LOST the
 /// write silently and now names the fix instead.
+/// Egress relay for Textbelt sends (see `push::send_sms`): runs the DIRECT
+/// send from THIS node so a regional key is presented from an NA-classified
+/// IP. Reached via `put_to_host` (HTTP admin in dev, gossip arm on the mesh).
+async fn push_sms_relay(State(c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
+    Json(crate::push::sms_relay_exec(&c, v).await)
+}
+
 async fn forward_mutation_to_leader(
     c: &Arc<CloudState>,
     headers: &HeaderMap,

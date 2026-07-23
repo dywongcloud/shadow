@@ -485,6 +485,33 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 _ => Vec::new(),
             }
         }
+        // Run operations (console 3-dots) forwarded to the project's HOST node
+        // over the mesh: the host runs the world write locally (env decrypts
+        // here). `local:true` in the body prevents a re-forward loop. Match
+        // before any generic `/v1/workflows` arm.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/workflows/runs/")
+            && (p.contains("/cancel") || p.contains("/replay") || p.contains("/reenqueue") || p.contains("/wakeup")) =>
+        {
+            let rest = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("");
+            let mut it = rest.splitn(2, '/');
+            let id = it.next().unwrap_or("").to_string();
+            let op = it.next().unwrap_or("");
+            let mut parsed: crate::admin::RunOpBody = serde_json::from_slice(body).unwrap_or_default();
+            parsed.local = Some(true); // host executes without re-forwarding
+            match crate::admin::wf_run_op_dispatch(cloud, &team_headers(p), team_claims(p).map(|axum::Extension(c)| c).as_ref(), &id, op, parsed).await {
+                Ok(axum::Json(v)) => jb(axum::Json(v)),
+                Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
+            }
+        }
+        // SMS egress relay (see push::send_sms): a node whose Textbelt call was
+        // rejected for egress geography forwards the send here; this node runs
+        // the DIRECT send (never re-relays) and returns {success, error?}.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/push/sms-relay") => {
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => jb(axum::Json(crate::push::sms_relay_exec(cloud, v).await)),
+                Err(_) => Vec::new(),
+            }
+        }
         // Cross-region DB replica control (register/remove) over the mesh.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
             match serde_json::from_slice::<serde_json::Value>(body) {
