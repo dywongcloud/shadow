@@ -57,25 +57,24 @@ const nextConfig = {
 
   async rewrites() {
     return {
-      // Upstream @workflow/web workflow console (isolated mount). These MUST
-      // run beforeFiles: hive ships a native app/workflows page, and
-      // filesystem routes would otherwise shadow the mount. The native page
-      // stays untouched on disk — these rewrites simply own the URL. The
-      // compiled React Router app is re-based to basename /workflows by
-      // scripts/patch-wf-console.mjs; every /workflows/* URL (HTML, .data
-      // loader fetches, /workflows/api/rpc CBOR, /workflows/api/stream/*,
-      // /workflows/__manifest) plus its content-hashed /assets/* files is
-      // forwarded into the wf-console bridge, which strips the /wf-console
-      // prefix and dispatches to the upstream Express app.
+      // Upstream @workflow/web workflow console (isolated mount) at /wfc.
+      // The user-facing /workflows page is a NORMAL dashboard page (platform
+      // navbar) that embeds /wfc in a seamless iframe — the upstream app
+      // never owns /workflows directly anymore. The compiled React Router app
+      // is re-based to basename /wfc by scripts/patch-wf-console.mjs; every
+      // /wfc/* URL (HTML, .data loader fetches, /wfc/api/rpc CBOR,
+      // /wfc/api/stream/*, /wfc/__manifest) plus its content-hashed
+      // /assets/* files is forwarded into the wf-console bridge, which strips
+      // the /wf-console prefix and dispatches to the upstream Express app.
       beforeFiles: [
-        { source: "/workflows", destination: "/wf-console/workflows" },
-        { source: "/workflows/:path*", destination: "/wf-console/workflows/:path*" },
+        { source: "/wfc", destination: "/wf-console/wfc" },
+        { source: "/wfc/:path*", destination: "/wf-console/wfc/:path*" },
         { source: "/assets/:path*", destination: "/wf-console/assets/:path*" },
         // Belt-and-suspenders for the root-absolute API URLs the upstream
         // client would use if an unpatched bundle ever ships: hive has no
         // /api/rpc or /api/stream routes, so these can't collide.
-        { source: "/api/rpc", destination: "/wf-console/workflows/api/rpc" },
-        { source: "/api/stream/:path*", destination: "/wf-console/workflows/api/stream/:path*" },
+        { source: "/api/rpc", destination: "/wf-console/wfc/api/rpc" },
+        { source: "/api/stream/:path*", destination: "/wf-console/wfc/api/stream/:path*" },
       ],
       afterFiles: [
         // SECURITY: the ZK preview endpoints (enroll + proof mint) are how a member
@@ -131,6 +130,13 @@ const nextConfig = {
       "/admin/:path*",
       "/projects/:project/settings/:path*",
       "/projects/:project",
+      // Workflow console surfaces: a stale-cached document referencing
+      // dead content-hashed /assets files (post-redeploy) renders unstyled —
+      // the first-load FOUC defect. Live observability is no-store anyway.
+      "/workflows",
+      "/workflows/:path*",
+      "/wfc",
+      "/wfc/:path*",
     ];
     const publicPaths = [
       "/",
@@ -213,7 +219,7 @@ const nextConfig = {
       // excludes the sensitive + public + API/asset paths handled above.
       {
         source:
-          "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up)[^.]*)",
+          "/((?!account|settings|teams|network|deployments|billing|admin|product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status|cloud|api|_next|sign-in|sign-up|workflows|wfc|assets)[^.]*)",
         headers: cc(PRIVATE_CACHE),
       },
     ];

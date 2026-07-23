@@ -119,7 +119,21 @@ async fn edge_pipeline_inner(
         let hp = host.split(':').next().unwrap_or(&host).to_ascii_lowercase();
         if hp == cloud.db_domain || hp.ends_with(&format!(".{}", cloud.db_domain)) {
             let status_host = hp.clone();
-            if !cloud.ratelimit.check(&ip, hive_core::now_ms()) {
+            // DEDICATED db-tier limiter, NOT the shared browsing-tier
+            // `cloud.ratelimit` (100/10s): a single WDK app's world-redis
+            // dispatcher polls its database every 50ms (200 req/10s), so the
+            // shared budget was permanently exhausted for that IP — 429ing
+            // the app's own polls AND every workflow-world read the platform
+            // makes from the same host (witnessed: hairpinned leader reads of
+            // db-*.downstash.xyz got RATE_LIMITED while loopback PONGed,
+            // silently emptying the workflows console). 2000/10s per IP keeps
+            // several chatty apps + platform readers comfortable while still
+            // shedding real floods.
+            fn db_rest_rate_limiter() -> &'static hive_edge::RateLimiter {
+                static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+                LIMITER.get_or_init(|| hive_edge::RateLimiter::new(2000, 10_000))
+            }
+            if !db_rest_rate_limiter().check(&ip, hive_core::now_ms()) {
                 let ev = cloud.event(&region, &method, &status_host, &path, 429, "rate-limited", &ip);
                 cloud.record(ev);
                 let mut resp = (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMITED").into_response();

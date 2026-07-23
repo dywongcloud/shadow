@@ -9,7 +9,7 @@ import {
 } from "lucide-react";
 import { Button, Card, Badge } from "@/components/ui";
 import { BuildLogs } from "@/components/build-logs";
-import { ProjectWorkflows } from "@/components/workflows";
+import { WfConsoleFrame } from "@/components/wf-console-frame";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { RawPortConnections } from "@/components/raw-port-connections";
 import { apiSend, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
@@ -108,9 +108,9 @@ function DeploymentDetail({ id }: { id: string }) {
         <ArrowLeft className="h-4 w-4" /> {dep ? dep.project : "Deployments"}
       </Link>
       {tab === "workflows" ? (
-        // Workflows scope-tab: this deployment's project workflows + runs (reuses
-        // the same component the project page uses).
-        (dep ? (<ProjectWorkflows project={dep.project} />) : (<div className="text-sm text-secondary">Loading…</div>))
+        // Workflows scope-tab: the upstream console, scoped to this
+        // deployment's project (same embed the project page uses).
+        (dep ? (<WfConsoleFrame project={dep.project} />) : (<div className="text-sm text-secondary">Loading…</div>))
       ) : tab === "logs" ? (
         // Request-logs scope-tab: THIS deployment's own traffic (its immutable
         // id/commit URLs plus whichever aliases it held when requests landed) —

@@ -7,7 +7,7 @@
  * media/fonts are cached stale-while-revalidate. Cache is the offline fallback.
  * Bump VERSION to evict every prior cache on activate. */
 
-const VERSION = "shadw-v2";
+const VERSION = "shadw-v3";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
 const PRECACHE = [
   "/offline.html",
@@ -63,7 +63,13 @@ self.addEventListener("fetch", (event) => {
       caches.open(STATIC_CACHE).then(async (cache) => {
         try {
           const res = await fetch(req);
-          if (res && res.status === 200 && res.type === "basic") cache.put(req, res.clone());
+          // `!res.redirected` guard: a 200 that arrived via a redirect (e.g.
+          // an auth bounce to a sign-in page) is NOT the asset — caching that
+          // HTML body under the .css/.js URL would poison the offline
+          // fallback with a MIME-mismatched document.
+          if (res && res.status === 200 && res.type === "basic" && !res.redirected) {
+            cache.put(req, res.clone());
+          }
           return res;
         } catch {
           const cached = await cache.match(req);
@@ -84,7 +90,9 @@ self.addEventListener("fetch", (event) => {
         const cached = await cache.match(req);
         const network = fetch(req)
           .then((res) => {
-            if (res && res.status === 200 && res.type === "basic") cache.put(req, res.clone());
+            if (res && res.status === 200 && res.type === "basic" && !res.redirected) {
+              cache.put(req, res.clone());
+            }
             return res;
           })
           .catch(() => cached);

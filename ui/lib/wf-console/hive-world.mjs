@@ -35,7 +35,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
 const ADMIN = process.env.HIVE_ADMIN || "http://127.0.0.1:8786";
-const DEFAULT_PROJECT = process.env.HIVE_WF_PROJECT || "shoomoo";
+// NO hardcoded project fallback: an unscoped console (the global /workflows
+// view) lists runs across ALL of the tenant's projects (the backend fans out
+// when the `project` query param is omitted), and run ops auto-scan for the
+// hosting project. HIVE_WF_PROJECT remains available as an explicit operator
+// override only.
+const DEFAULT_PROJECT = process.env.HIVE_WF_PROJECT || "";
 const DEFAULT_TEAM = process.env.HIVE_WF_TEAM || "personal";
 const TIMEOUT_MS = 20_000;
 
@@ -52,8 +57,21 @@ function ctx() {
   return als.getStore() || {};
 }
 
+/** The active project scope, or `undefined` when unscoped (global view). */
 function currentProject() {
-  return ctx().project || DEFAULT_PROJECT;
+  return ctx().project || DEFAULT_PROJECT || undefined;
+}
+
+/** `&project=<p>` (or "") for endpoints that fan out tenant-wide without it. */
+function projectParam() {
+  const p = currentProject();
+  return p ? `&project=${encodeURIComponent(p)}` : "";
+}
+
+/** `{ project }` spread for run-op bodies — omitted = backend auto-scan. */
+function projectBody() {
+  const p = currentProject();
+  return p ? { project: p } : {};
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +292,7 @@ function reshapeHook(h) {
     hookId: h.hookId || h.id || "",
     token: h.token || "",
     ownerId: h.ownerId || "",
-    projectId: h.projectId || currentProject(),
+    projectId: h.projectId || currentProject() || "",
     environment: h.environment || "production",
     metadata: decodeSerialized(h.metadata),
     createdAt: toDate(h.createdAt) || new Date(0),
@@ -343,12 +361,17 @@ async function fetchRunDetail(runId) {
   if (hit && Date.now() - hit.at < DETAIL_TTL_MS) return hit.promise;
   const promise = (async () => {
     const id = encodeURIComponent(runId);
-    const project = encodeURIComponent(currentProject());
+    const project = currentProject();
     let detail;
-    try {
-      detail = await hive(`/v1/workflows/runs/${id}?project=${project}`);
-    } catch (e) {
-      // Run may live in another project — the backend auto-scans without one.
+    if (project) {
+      try {
+        detail = await hive(`/v1/workflows/runs/${id}?project=${encodeURIComponent(project)}`);
+      } catch (e) {
+        // Run may live in another project — the backend auto-scans without one.
+        detail = await hive(`/v1/workflows/runs/${id}`);
+      }
+    } else {
+      // Unscoped (global console) — the backend auto-scans for the run's host.
       detail = await hive(`/v1/workflows/runs/${id}`);
     }
     const run = detail && detail.run;
@@ -380,8 +403,9 @@ function buildWorld() {
         return reshapeRun(detail.run, resolveData);
       },
       async list(params = {}) {
-        const project = encodeURIComponent(currentProject());
-        const rows = await hive(`/v1/workflows/runs?summary=1&project=${project}`);
+        // Scoped: one project's runs. Unscoped: the backend fans out across
+        // every project of the tenant (the global /workflows view).
+        const rows = await hive(`/v1/workflows/runs?summary=1${projectParam()}`);
         let runs = (Array.isArray(rows) ? rows : []).map((r) =>
           reshapeRun(r, "none")
         );
@@ -571,7 +595,7 @@ function buildWorld() {
         return hive(`/v1/workflows/runs/${encodeURIComponent(runId)}/cancel`, {
           method: "POST",
           body: JSON.stringify({
-            project: currentProject(),
+            ...projectBody(),
             ...(cancelReason ? { cancelReason } : {}),
           }),
         });
@@ -581,7 +605,7 @@ function buildWorld() {
           `/v1/workflows/runs/${encodeURIComponent(runId)}/replay`,
           {
             method: "POST",
-            body: JSON.stringify({ project: currentProject() }),
+            body: JSON.stringify(projectBody()),
           }
         );
         return (v && (v.runId || v.run_id || v.newRunId)) || String(v ?? "");
@@ -591,7 +615,7 @@ function buildWorld() {
           `/v1/workflows/runs/${encodeURIComponent(runId)}/reenqueue`,
           {
             method: "POST",
-            body: JSON.stringify({ project: currentProject() }),
+            body: JSON.stringify(projectBody()),
           }
         );
       },
@@ -600,7 +624,7 @@ function buildWorld() {
           `/v1/workflows/runs/${encodeURIComponent(runId)}/wakeup`,
           {
             method: "POST",
-            body: JSON.stringify({ project: currentProject() }),
+            body: JSON.stringify(projectBody()),
           }
         );
         return {
@@ -612,7 +636,6 @@ function buildWorld() {
 
     async hiveFetchWorkflowsManifest() {
       const workflows = {};
-      const project = encodeURIComponent(currentProject());
       const addEntry = (fullName, graph) => {
         const { filePath, name } = parseWfName(fullName);
         if (!workflows[filePath]) workflows[filePath] = {};
@@ -627,7 +650,8 @@ function buildWorld() {
         }
       };
       try {
-        const defs = await hive(`/v1/workflows?project=${project}`);
+        const p = currentProject();
+        const defs = await hive(p ? `/v1/workflows?project=${encodeURIComponent(p)}` : `/v1/workflows`);
         for (const d of Array.isArray(defs) ? defs : []) {
           const full = d.id && String(d.id).includes("//") ? d.id : d.name;
           addEntry(full || d.id || d.name, d.graph);
@@ -640,7 +664,7 @@ function buildWorld() {
         // Workflows tab still lists every workflow that has actually run.
         try {
           const rows = await hive(
-            `/v1/workflows/runs?summary=1&project=${project}`
+            `/v1/workflows/runs?summary=1${projectParam()}`
           );
           for (const r of Array.isArray(rows) ? rows : []) {
             if (r && (r.workflowName || r.name)) {

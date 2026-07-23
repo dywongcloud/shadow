@@ -1,21 +1,22 @@
 // app/wf-console/[[...slug]]/route.ts
 //
 // Catch-all Next.js route that serves the LITERAL upstream @workflow/web
-// dashboard (Vercel Workflow DevKit's packages/web) at /workflows inside
-// hive's dashboard. The upstream build lives in
+// dashboard (Vercel Workflow DevKit's packages/web) at /wfc — embedded by the
+// dashboard's own /workflows page (platform navbar + seamless iframe, see
+// components/wf-console-frame.tsx). The upstream build lives in
 // node_modules/@workflow/web/build/{client,server}; we mount its real Express
 // app through a small Node<->Web bridge so the untouched upstream code
 // answers every request — its own React Router SPA, its own Tailwind v4 CSS
 // (scoped to its own /assets/*.css files, fully isolated from hive's
-// Tailwind v3 dashboard), its own CBOR /api/rpc.
+// Tailwind v3 dashboard), its own CBOR /wfc/api/rpc.
 //
 // Mount strategy (the agentos wf-app pattern, adapted):
-//   - next.config.mjs rewrites /workflows, /workflows/:path* and /assets/*
-//     into /wf-console/*; this handler strips the /wf-console prefix and
+//   - next.config.mjs rewrites /wfc, /wfc/:path* and /assets/* into
+//     /wf-console/*; this handler strips the /wf-console prefix and
 //     hands the remaining path to the upstream Express app.
 //   - scripts/patch-wf-console.mjs re-bases the compiled React Router build
-//     to basename "/workflows", so the SSR HTML, client hydration, in-app
-//     navigation and .data loader fetches all agree on /workflows/* URLs.
+//     to basename "/wfc", so the SSR HTML, client hydration, in-app
+//     navigation and .data loader fetches all agree on /wfc/* URLs.
 //   - Data comes from hive: the bundle resolves its World via
 //     WORKFLOW_TARGET_WORLD -> lib/wf-console/hive-world.mjs, which proxies
 //     every read + run-op to hive's /v1/workflows/* API.
@@ -54,7 +55,7 @@ let appPromise: Promise<ExpressApp> | null = null;
 
 async function getApp(): Promise<ExpressApp> {
   if (appPromise) return appPromise;
-  appPromise = (async () => {
+  const p = (async () => {
     // The compiled bundle resolves its World with
     // require(process.env.WORKFLOW_TARGET_WORLD) — point it at the hive
     // World proxy BEFORE the bundle is imported. Overridable from the
@@ -97,8 +98,19 @@ async function getApp(): Promise<ExpressApp> {
     server.use(rrApp);
     return server;
   })();
-  return appPromise;
+  // A transiently-failed init (e.g. fs hiccup mid-deploy) must not stick as a
+  // forever-rejected cached promise — clear it so the next request retries.
+  appPromise = p;
+  p.catch(() => {
+    if (appPromise === p) appPromise = null;
+  });
+  return p;
 }
+
+// Warm the ~6MB upstream server bundle at module load so the FIRST console
+// request doesn't pay the import latency (a cold first paint racing its own
+// CSS was one ingredient of the unstyled-first-load defect).
+void getApp().catch(() => {});
 
 function isPublicAssetPath(p: string): boolean {
   return (
@@ -109,6 +121,34 @@ function isPublicAssetPath(p: string): boolean {
     p.endsWith(".woff") ||
     p.endsWith(".woff2")
   );
+}
+
+// Deterministic Content-Type by extension for the asset branch. The express
+// bridge was observed INTERMITTENTLY dropping Content-Type on large chunks
+// (same asset served with the header on one request and without it on the
+// next) — and with the platform-wide `X-Content-Type-Options: nosniff`, a
+// typeless module script is refused by the browser ("Failed to fetch
+// dynamically imported module: /assets/entry.client-….js"), which silently
+// killed the console's ENTIRE hydration: static SSR HTML, dead buttons, an
+// empty runs table that never fetches. Never depend on the pass-through for
+// something this load-bearing.
+const ASSET_TYPES: Record<string, string> = {
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
+
+function assetTypeFor(p: string): string | undefined {
+  const dot = p.lastIndexOf(".");
+  if (dot === -1) return undefined;
+  return ASSET_TYPES[p.slice(dot).toLowerCase()];
 }
 
 function readCookie(header: string | null, name: string): string | undefined {
@@ -148,7 +188,10 @@ async function handle(req: Request): Promise<Response> {
     }
   }
   const wfCtx: WfRequestContext = {
-    team: req.headers.get("x-hive-team") || undefined,
+    // The console's own fetches can't set headers on document/data requests,
+    // so the patched bundle rides the scope as query params (hiveTeam/
+    // hiveProject, sourced from window.name which the embedding iframe sets).
+    team: req.headers.get("x-hive-team") || url.searchParams.get("hiveTeam") || undefined,
     authToken,
     project: url.searchParams.get("hiveProject") || undefined,
   };
@@ -162,13 +205,30 @@ async function handle(req: Request): Promise<Response> {
   if (isPublicAssetPath(rewritten)) {
     const h = new Headers(resp.headers);
     h.set("Cache-Control", "public, max-age=300, must-revalidate");
+    // Only stamp on SUCCESS: a 404/500 body is not the asset and must not
+    // masquerade as JS/CSS.
+    if (resp.status === 200) {
+      const t = assetTypeFor(rewritten);
+      if (t) h.set("Content-Type", t);
+    }
     return new Response(resp.body, {
       status: resp.status,
       statusText: resp.statusText,
       headers: h,
     });
   }
-  return resp;
+  // HTML/data/rpc responses must NEVER be cached: a stale cached console HTML
+  // referencing content-hashed /assets files that no longer exist after a
+  // redeploy is exactly the unstyled-first-load (FOUC) failure the user hit —
+  // next.config's catch-all PRIVATE_CACHE previously applied max-age=60 +
+  // stale-while-revalidate here.
+  const h = new Headers(resp.headers);
+  h.set("Cache-Control", "private, no-store, max-age=0, must-revalidate");
+  return new Response(resp.body, {
+    status: resp.status,
+    statusText: resp.statusText,
+    headers: h,
+  });
 }
 
 export async function GET(req: Request) {

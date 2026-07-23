@@ -471,6 +471,29 @@ impl DatabaseStore {
         }
     }
 
+    /// UNMASKED reconcile view: every live-mode record with a named backing
+    /// container, plus the stored connection fields a re-create needs
+    /// (kind, local host port, raw password). Internal-only — never serialized
+    /// to a client.
+    pub(crate) fn containers_to_reconcile(&self) -> Vec<(String, DbKind, String, Option<String>, Option<String>, String)> {
+        self.dbs
+            .read()
+            .iter()
+            .filter(|d| d.mode == "live")
+            .filter_map(|d| {
+                let c = d.container.clone()?;
+                Some((
+                    d.id.clone(),
+                    d.kind,
+                    c,
+                    d.connection.get("local_port").or_else(|| d.connection.get("port")).cloned(),
+                    d.connection.get("password").cloned(),
+                    d.project.clone(),
+                ))
+            })
+            .collect()
+    }
+
     fn insert(&self, d: Database) {
         self.dbs.write().push(d);
     }
@@ -1030,6 +1053,74 @@ async fn provision_redis(
         }
     }
     Ok(("simulated".into(), conn, None))
+}
+
+/// Self-healing for provisioned DB backings. Two witnessed loss classes made
+/// this necessary (both took a project's live database — and everything above
+/// it, e.g. the WDK workflow world riding a provisioned Redis — down SILENTLY):
+///   1. `systemctl restart hive-node` SIGTERMs the whole service cgroup,
+///      which includes the conmon/db processes podman spawned from inside the
+///      service — every provisioned container exits (cleanly!) on every
+///      backend rollout, and nothing ever started them again.
+///   2. A podman machine reset (macOS) deletes the containers entirely.
+/// Every minute: `podman start` any exited backing; re-CREATE a vanished
+/// Redis backing from the record's own stored creds (same host port, same
+/// password — so injected env / gateway tokens keep working; data is
+/// acknowledged lost, service is restored); warn loudly for kinds we can't
+/// rebuild automatically rather than staying silent.
+pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            if !podman_available().await {
+                continue;
+            }
+            for (id, kind, cname, local_port, password, project) in cloud.databases.containers_to_reconcile() {
+                let inspect = Command::new("podman")
+                    .args(["inspect", &cname, "--format", "{{.State.Running}}"])
+                    .env("PATH", augmented_path())
+                    .output()
+                    .await;
+                match inspect {
+                    Ok(o) if o.status.success() => {
+                        if String::from_utf8_lossy(&o.stdout).trim() != "true" {
+                            match Command::new("podman").args(["start", &cname]).env("PATH", augmented_path()).output().await {
+                                Ok(s) if s.status.success() => {
+                                    tracing::info!(db = %id, container = %cname, "db-reconcile: restarted exited backing container");
+                                }
+                                Ok(s) => tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: start failed"),
+                                Err(e) => tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: start could not spawn podman"),
+                            }
+                        }
+                    }
+                    // inspect failed -> container record is GONE (machine reset /
+                    // pruned). Rebuild what we safely can.
+                    _ => match (kind, local_port.as_deref(), password.as_deref()) {
+                        (DbKind::Redis, Some(port), Some(pw)) if !port.is_empty() && !pw.is_empty() => {
+                            let args = [
+                                "run", "-d", "--name", &cname, "--replace",
+                                "-p", &format!("127.0.0.1:{port}:6379"),
+                                "docker.io/library/redis:7-alpine",
+                                "redis-server", "--requirepass", pw,
+                            ]
+                            .map(String::from)
+                            .to_vec();
+                            match Command::new("podman").args(&args).env("PATH", augmented_path()).output().await {
+                                Ok(s) if s.status.success() => {
+                                    tracing::warn!(db = %id, container = %cname, %project, %port, "db-reconcile: backing container was GONE — re-created empty Redis with the record's stored port/password (data lost, service restored)");
+                                }
+                                Ok(s) => tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: re-create failed"),
+                                Err(e) => tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: re-create could not spawn podman"),
+                            }
+                        }
+                        _ => {
+                            tracing::warn!(db = %id, container = %cname, %project, ?kind, "db-reconcile: backing container is GONE and this kind is not auto-rebuilt — the database is DOWN until re-provisioned");
+                        }
+                    },
+                }
+            }
+        }
+    });
 }
 
 async fn podman_available() -> bool {

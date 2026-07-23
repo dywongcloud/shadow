@@ -66,8 +66,26 @@ export async function expressToFetch(
       resolved = true;
       const body = chunks.length ? Buffer.concat(chunks) : Buffer.alloc(0);
       const h = new Headers();
+      // Base layer: the REAL ServerResponse's own header map — anything set
+      // through a path the interceptors below don't wrap (observed: express
+      // send() intermittently landing Content-Type only here) still counts.
+      // The intercepted `respHeaders` overlay wins on conflicts.
+      let real: Record<string, unknown> = {};
+      try {
+        real = res.getHeaders() as Record<string, unknown>;
+      } catch {
+        /* closed/aborted response — captured headers alone */
+      }
+      for (const [name, val] of Object.entries(real)) {
+        if (Array.isArray(val)) {
+          for (const v of val) h.append(name, String(v));
+        } else if (val !== undefined && val !== null) {
+          h.set(name, String(val));
+        }
+      }
       for (const [name, val] of Object.entries(respHeaders)) {
         if (Array.isArray(val)) {
+          h.delete(name);
           for (const v of val) h.append(name, String(v));
         } else if (val !== undefined && val !== null) {
           h.set(name, String(val));

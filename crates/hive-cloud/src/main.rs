@@ -133,6 +133,14 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info".into()),
         )
         .init();
+    // Install the process-level rustls CryptoProvider FIRST (later installs
+    // are idempotent no-ops). The dep tree links both `ring` and `aws-lc-rs`
+    // rustls features, so any rustls user that runs before one of the lazy
+    // installs in spawned tasks panics "Could not automatically determine the
+    // process-level CryptoProvider" — witnessed at boot on the ngrok-ingress
+    // path, where the panicking task leaked a redb open handle and wedged
+    // guardian init ("Database already open") until the next restart.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
 
     // Shared isolation backend. The ONLY component that is allowed to be mocked
@@ -740,6 +748,9 @@ async fn main() -> anyhow::Result<()> {
     // SNI resolver. No-ops entirely in ngrok ingress mode.
     acme::spawn_acme(cloud.clone());
     acme::spawn_cert_sync(cloud.clone());
+    // Self-heal provisioned DB backings (restart-killed / machine-reset
+    // containers) — see spawn_db_reconcile's doc for the witnessed loss classes.
+    databases::spawn_db_reconcile(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())

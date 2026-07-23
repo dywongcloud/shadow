@@ -37,7 +37,7 @@ const teamTabs = [
  *  SUB-tabs for that level take the top tab-bar position. Returns the tab set +
  *  the active key for the current URL. `tabParam` is the reactive `?tab=` value. */
 type TabItem = { href: string; label: string; key: string };
-function contextTabs(pathname: string, tabParam: string | null, wfParam: string | null): { items: TabItem[]; activeKey: string } | null {
+function contextTabs(pathname: string, tabParam: string | null): { items: TabItem[]; activeKey: string } | null {
   // Deployment detail: /deployments/<id>
   const dep = pathname.match(/^\/deployments\/([^/]+)/);
   if (dep) {
@@ -55,18 +55,9 @@ function contextTabs(pathname: string, tabParam: string | null, wfParam: string 
   if (proj) {
     const p = proj[1];
     const base = `/projects/${p}`;
-    // Drilled into a project's Workflows (breadcrumb Team / Project / Workflows):
-    // the top bar shows the workflow SUB-tabs (Runs / Workflows / Hooks via `?wf=`),
-    // mirroring the platform /workflows model — NOT the project's main tabs.
-    if (tabParam === "workflows" && !pathname.includes("/settings") && !pathname.includes("/logs")) {
-      const items: TabItem[] = [
-        { href: `${base}?tab=workflows&wf=runs`, label: "Runs", key: "runs" },
-        { href: `${base}?tab=workflows&wf=workflows`, label: "Workflows", key: "workflows" },
-        { href: `${base}?tab=workflows&wf=hooks`, label: "Hooks", key: "hooks" },
-      ];
-      const activeKey = ["runs", "workflows", "hooks"].includes(wfParam ?? "") ? wfParam! : "runs";
-      return { items, activeKey };
-    }
+    // (The project's Workflows tab now embeds the upstream console, which
+    // carries its own Runs/Hooks/Workflows segmented control — no ?wf=
+    // sub-tab override in the top bar anymore.)
     const items: TabItem[] = [
       { href: `${base}?tab=overview`, label: "Overview", key: "overview" },
       { href: `${base}?tab=graph`, label: "Service Graph", key: "graph" },
@@ -84,18 +75,9 @@ function contextTabs(pathname: string, tabParam: string | null, wfParam: string 
     else if (["graph", "workflows", "resources", "deployments"].includes(tabParam ?? "")) activeKey = tabParam!;
     return { items, activeKey };
   }
-  // Workflows: /workflows[/...] is a drilled-in context too — the top bar shows the
-  // Workflows SUB-tabs (Runs / Workflows / Hooks via `?tab=`), NOT the team tabs,
-  // matching the project/deployment breadcrumb-tabs model.
-  if (pathname === "/workflows" || pathname.startsWith("/workflows/")) {
-    const items: TabItem[] = [
-      { href: "/workflows?tab=runs", label: "Runs", key: "runs" },
-      { href: "/workflows?tab=workflows", label: "Workflows", key: "workflows" },
-      { href: "/workflows?tab=hooks", label: "Hooks", key: "hooks" },
-    ];
-    const activeKey = ["runs", "workflows", "hooks"].includes(tabParam ?? "") ? tabParam! : "runs";
-    return { items, activeKey };
-  }
+  // (/workflows embeds the upstream console, which carries its own
+  // Runs/Hooks/Workflows segmented control — the top bar keeps the normal
+  // team tabs there, no sub-tab override.)
   return null;
 }
 
@@ -239,7 +221,7 @@ function SectionTabs({ isActive }: { isActive: (href: string) => boolean }) {
   const pathname = usePathname();
   const searchParams = useSearchParams();
   const navRef = useRef<HTMLDivElement>(null);
-  const ctx = contextTabs(pathname, searchParams.get("tab"), searchParams.get("wf"));
+  const ctx = contextTabs(pathname, searchParams.get("tab"));
   // Center the active tab within the scroll container (it may start off-screen on
   // mobile). Only touches the container's scrollLeft — never scrolls the page.
   useEffect(() => {

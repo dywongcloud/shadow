@@ -107,6 +107,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/mesh/roster", get(mesh_roster_get))
         .route("/v1/mesh/admit", post(mesh_admit))
         .route("/v1/token", post(mint_token))
+        .route("/v1/tls/bundle-mesh", get(tls_bundle_mesh))
         .route("/v1/whoami", get(whoami))
         .route("/v1/auth", get(auth_status))
         .route("/v1/regions/catalog", get(region_catalog))
@@ -334,6 +335,47 @@ pub async fn admin_rate_limit(
         return (StatusCode::TOO_MANY_REQUESTS, "too many requests").into_response();
     }
     next.run(req).await
+}
+
+/// HTTP(S) fallback distribution path for TLS cert bundles — the same payload
+/// `acme::bundle_for_mesh` serves over the iroh mesh, but reachable via a
+/// plain admin URL (e.g. https://api.shadw.cloud). EXISTS BECAUSE of a
+/// bootstrap deadlock in the iroh path: a peer whose relay cert is stale can
+/// have no working relay fallback to the leader (the relay's own hostname is
+/// missing from the very cert it needs to fetch), and direct cloud-VM↔cloud-VM
+/// QUIC is unreliable (NAT/MTU, see the fleet mesh-reliability finding) — so
+/// `mesh_fetch` can spin forever while the fix it needs is one HTTPS GET away.
+///
+/// AUTH: serves a DECRYPTED private key, so this fails CLOSED unconditionally:
+/// a non-empty `HIVE_INTERNAL_TOKEN` must be configured AND presented via
+/// `x-hive-internal` (constant-time compare) — stricter than `mint_allowed`
+/// (no dev-mode open case), and rate-limited by the same tight mint limiter.
+async fn tls_bundle_mesh(
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
+    if !mint_rate_limiter().check(&peer.ip().to_string(), hive_core::now_ms()) {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "too many requests".into()));
+    }
+    let allowed = match std::env::var("HIVE_INTERNAL_TOKEN") {
+        Ok(t) if !t.trim().is_empty() => headers
+            .get("x-hive-internal")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| ct_eq(v, &t))
+            .unwrap_or(false),
+        _ => false,
+    };
+    if !allowed {
+        return Err((StatusCode::FORBIDDEN, "internal token required".into()));
+    }
+    let name = q.get("name").map(String::as_str).unwrap_or("");
+    let bytes = crate::acme::bundle_for_mesh(name);
+    if bytes.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "no such bundle".into()));
+    }
+    Ok(([(axum::http::header::CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
 async fn mint_token(

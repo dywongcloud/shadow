@@ -429,19 +429,61 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                 let cur = installed.get(&bundle).copied().unwrap_or(0);
                 // Guardian replica first (works when local == writer), then the
                 // authenticated mesh (the cross-node path: per-node AEAD keys
-                // make replicated ciphertext unreadable on peers).
+                // make replicated ciphertext unreadable on peers), then the
+                // plain HTTPS admin fallback (the path that still works when
+                // the iroh mesh to the issuer is down — including the
+                // bootstrap deadlock where the RELAY hostname is missing from
+                // the very cert being synced, so the relay fallback that
+                // mesh_fetch depends on is itself broken).
                 let mut candidate: Option<CertBundle> = None;
-                if let Some(bytes) = crate::guardian::get(&guardian_key(&bundle)).await {
+                // Bounded: a sick guardian (corrupt store looping re-init,
+                // witnessed live on fc-virginia) must never starve the whole
+                // cert-sync loop — the mesh + HTTPS fallbacks below are
+                // exactly for when guardian can't answer.
+                let guardian_bytes = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::guardian::get(&guardian_key(&bundle)),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    tracing::debug!(%bundle, "cert-sync: guardian::get timed out — falling through to mesh/http");
+                    None
+                });
+                if let Some(bytes) = guardian_bytes {
                     if let Ok(b) = serde_json::from_slice::<CertBundle>(&bytes) {
-                        if b.issued_ms > cur && install_bundle(&b).is_ok() {
-                            candidate = Some(b);
+                        if b.issued_ms > cur {
+                            match install_bundle(&b) {
+                                Ok(()) => candidate = Some(b),
+                                // EXPECTED on every non-writer node: the replica's
+                                // key_pem_enc is ciphertext under the WRITER's
+                                // per-node AEAD key. Named so the journal shows
+                                // why the newer guardian bundle didn't install.
+                                Err(e) => tracing::debug!(%bundle, newer_issued_ms = b.issued_ms, cur, "cert-sync: guardian replica newer but uninstallable here (foreign AEAD key?): {e}"),
+                            }
                         }
                     }
                 }
                 if candidate.is_none() {
-                    if let Some(b) = mesh_fetch(&cloud, &bundle).await {
-                        if b.issued_ms > cur && install_bundle(&b).is_ok() {
-                            candidate = Some(b);
+                    match mesh_fetch(&cloud, &bundle).await {
+                        Some(b) if b.issued_ms > cur => match install_bundle(&b) {
+                            Ok(()) => candidate = Some(b),
+                            Err(e) => tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: mesh bundle failed to install: {e}"),
+                        },
+                        Some(b) => {
+                            tracing::debug!(%bundle, mesh_issued_ms = b.issued_ms, cur, "cert-sync: mesh best is not newer than installed");
+                        }
+                        None => {
+                            tracing::debug!(%bundle, "cert-sync: mesh_fetch returned no bundle from any peer");
+                        }
+                    }
+                }
+                if candidate.is_none() {
+                    if let Some(b) = http_fetch(&cloud, &bundle).await {
+                        if b.issued_ms > cur {
+                            match install_bundle(&b) {
+                                Ok(()) => candidate = Some(b),
+                                Err(e) => tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: http bundle failed to install: {e}"),
+                            }
                         }
                     }
                 }
@@ -456,6 +498,77 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
             tokio::time::sleep(std::time::Duration::from_secs(if have_all { 300 } else { 20 })).await;
         }
     });
+}
+
+/// HTTPS-admin fallback for cert distribution, authenticated by the
+/// fleet-shared `HIVE_INTERNAL_TOKEN` (fails closed when unset). This is the
+/// iroh-independent path: it works whenever HTTPS to the platform edge works,
+/// which is exactly the condition dashboards and webhooks already rely on.
+///
+/// `api.<platform>` is multi-A round-robin, so ONE request lands on a random
+/// node (whose local bundle may itself be stale). Instead, sweep EVERY healthy
+/// fleet node deterministically: pin each registry `public_ip` under the valid
+/// `api.<platform>` TLS name via `reqwest`'s resolver override — the private
+/// key rides inside real TLS to each specific node — and keep the NEWEST
+/// bundle across all answers (same newest-wins rule as `mesh_fetch`).
+/// `HIVE_CERT_SYNC_URLS` (comma-separated) remains as an explicit override.
+async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle> {
+    let token = std::env::var("HIVE_INTERNAL_TOKEN").ok().filter(|t| !t.trim().is_empty())?;
+    let api_host = format!("api.{}", cloud.platform_domain);
+    let mut targets: Vec<(String, Option<std::net::SocketAddr>)> = Vec::new();
+    if let Ok(urls) = std::env::var("HIVE_CERT_SYNC_URLS") {
+        for u in urls.split(',').map(str::trim).filter(|u| !u.is_empty()) {
+            targets.push((u.trim_end_matches('/').to_string(), None));
+        }
+    }
+    for n in cloud.registry.nodes() {
+        if n.is_self || !n.healthy {
+            continue;
+        }
+        if let Some(ip) = n.public_ip.as_deref() {
+            if let Ok(addr) = format!("{ip}:443").parse::<std::net::SocketAddr>() {
+                targets.push((format!("https://{api_host}"), Some(addr)));
+            }
+        }
+    }
+    let mut best: Option<CertBundle> = None;
+    for (base, pin) in targets {
+        let url = format!("{base}/v1/tls/bundle-mesh?name={bundle}");
+        let mut builder = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10));
+        if let Some(addr) = pin {
+            builder = builder.resolve(&api_host, addr);
+        }
+        let Ok(client) = builder.build() else { continue };
+        let resp = match client.get(&url).header("x-hive-internal", &token).send().await {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::debug!(%bundle, %url, ?pin, status = %r.status(), "cert-sync: http fallback non-success");
+                continue;
+            }
+            Err(e) => {
+                tracing::debug!(%bundle, %url, ?pin, "cert-sync: http fallback unreachable: {e}");
+                continue;
+            }
+        };
+        let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+        let key_pem = v.get("key_pem").and_then(|k| k.as_str()).unwrap_or("");
+        let chain = v.get("chain_pem").and_then(|c| c.as_str()).unwrap_or("");
+        if key_pem.is_empty() || chain.is_empty() {
+            continue;
+        }
+        let issued = v.get("issued_ms").and_then(|i| i.as_u64()).unwrap_or(0);
+        if best.as_ref().map(|b| issued > b.issued_ms).unwrap_or(true) {
+            tracing::info!(%bundle, %url, ?pin, issued_ms = issued, "cert-sync: http fallback fetched bundle");
+            best = Some(CertBundle {
+                names: v.get("names").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default(),
+                chain_pem: chain.to_string(),
+                key_pem_enc: crate::secrets::encrypt(key_pem),
+                issued_ms: issued,
+                not_after_ms: v.get("not_after_ms").and_then(|i| i.as_u64()).unwrap_or(0),
+            });
+        }
+    }
+    best
 }
 
 /// Serve the local bundle to a MESH PEER with the private key DECRYPTED.

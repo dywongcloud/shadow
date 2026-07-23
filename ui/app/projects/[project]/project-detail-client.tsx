@@ -20,7 +20,7 @@ import {
 } from "lucide-react";
 import dynamic from "next/dynamic";
 import { Card, Button, Badge, Triangle, Table, Th, Td } from "@/components/ui";
-import { ProjectWorkflows, type WdkView } from "@/components/workflows";
+import { WfConsoleFrame } from "@/components/wf-console-frame";
 import { DeploymentResources } from "@/components/deployment-resources";
 import { DeploymentRowMenu } from "@/components/deployment-menu";
 import { RedeployModal } from "@/components/redeploy-modal";
@@ -78,10 +78,6 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
       : "overview";
   const setTab = (t: "overview" | "graph" | "workflows" | "resources" | "deployments") =>
     router.replace(`/projects/${encodeURIComponent(name)}?tab=${t}`, { scroll: false });
-  // Workflows sub-view (Runs / Workflows / Hooks), driven by the top-nav breadcrumb
-  // sub-tabs via `?wf=`; defaults to "runs".
-  const wfParam = searchParams.get("wf");
-  const wfView: WdkView = wfParam === "workflows" || wfParam === "hooks" ? wfParam : "runs";
   const [busy, setBusy] = useState("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);
@@ -188,7 +184,10 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
       {tab === "graph" ? (
         <ServiceGraph project={name} prod={prod} />
       ) : tab === "workflows" ? (
-        <ProjectWorkflows project={name} view={wfView} />
+        /* The LITERAL upstream @workflow/web console, project-scoped (the
+           iframe name carries the scope; its own Runs/Hooks/Workflows
+           segmented control replaces the old ?wf= sub-tabs). */
+        <WfConsoleFrame project={name} />
       ) : tab === "resources" ? (
         <DeploymentResources deploymentId={prod?.id} />
       ) : tab === "overview" ? (

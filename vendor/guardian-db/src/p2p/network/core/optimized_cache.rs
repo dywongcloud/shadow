@@ -8,7 +8,6 @@ use bytes::Bytes;
 use iroh_blobs::BlobFormat;
 use lru::LruCache;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -202,25 +201,19 @@ impl Default for CacheConfig {
 impl OptimizedCache {
     /// Creates a new instance of the optimized cache.
     pub fn new(cache_config: CacheConfig) -> Self {
-        // Give the LRUs a huge entry capacity so their OWN count-eviction never
-        // fires — the BYTE budget (enforced on every insert via `pop_lru`) is
-        // the real bound now, and it must be the sole evictor for the byte
-        // counters to stay exact. The configured entry caps
-        // (`max_*_entries`) are kept as an additional ceiling only if they are
-        // SMALLER than this sentinel (they are not, by default), so a caller
-        // that deliberately sets a tiny entry cap still gets it.
-        let big = NonZeroUsize::new(usize::MAX).unwrap();
-        let data_cache_size = NonZeroUsize::new(cache_config.max_data_entries)
-            .filter(|n| *n >= big)
-            .unwrap_or(big);
-        let compressed_cache_size = NonZeroUsize::new(cache_config.max_compressed_entries)
-            .filter(|n| *n >= big)
-            .unwrap_or(big);
-
+        // UNBOUNDED entry count so the LRUs' OWN count-eviction never fires —
+        // the BYTE budget (enforced on every insert via `pop_lru`) is the real
+        // bound, and it must be the sole evictor for the byte counters to stay
+        // exact. MUST be `LruCache::unbounded()`, NEVER
+        // `LruCache::new(usize::MAX)`: lru's `new` pre-reserves its hashbrown
+        // table for the requested capacity, and a usize::MAX reservation
+        // panics at guardian init ("Hash table capacity overflow") — witnessed
+        // live as a fleet-wide guardian init retry-loop that silently took
+        // store replication down while the node otherwise ran fine.
         Self {
-            data_cache: Arc::new(RwLock::new(LruCache::new(data_cache_size))),
+            data_cache: Arc::new(RwLock::new(LruCache::unbounded())),
             metadata_cache: Arc::new(RwLock::new(HashMap::new())),
-            compressed_cache: Arc::new(RwLock::new(LruCache::new(compressed_cache_size))),
+            compressed_cache: Arc::new(RwLock::new(LruCache::unbounded())),
             stats: Arc::new(RwLock::new(CacheStats::default())),
             cache_config,
             access_predictor: Arc::new(Mutex::new(AccessPredictor {

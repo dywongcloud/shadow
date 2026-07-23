@@ -31,6 +31,16 @@ const isPublic = createRouteMatcher([
   // rather than through the /admin UI.
   "/api(.*)",
   "/status(.*)", // public, user-facing incident/status board
+  // The embedded @workflow/web console mount (iframe inside /workflows).
+  // Its extensionless API surfaces (/wfc/api/rpc CBOR POSTs, /wfc/*.data
+  // loader fetches) MUST NOT be Clerk-redirected: a 307 → /sign-in on an
+  // expired session hands the sign-in HTML to the console's cbor-x decoder,
+  // which surfaced to the user as "Error loading runs — Unknown token 28".
+  // Data-plane auth is enforced by the hive_jwt cookie → backend JWT check
+  // (hive-world.mjs forwards it as a Bearer); with no valid session the
+  // backend 401s and the console renders a readable error + auto re-mints.
+  // The user-facing /workflows page (which embeds this) stays Clerk-gated.
+  "/wfc(.*)",
 ]);
 
 // Dev-only escape hatch: set HIVE_AUTH_BYPASS=1 to disable login gating entirely
@@ -54,6 +64,10 @@ const NO_STORE = [
   /^\/admin(\/|$)/,
   /^\/projects\/[^/]+\/settings(\/|$)/,
   /^\/projects\/[^/]+$/, // a project's overview = its deployments listing
+  // Workflow console: a stale-cached document referencing dead content-hashed
+  // /assets bundles (post-redeploy) renders unstyled — never cache these.
+  /^\/workflows(\/|$)/,
+  /^\/wfc(\/|$)/,
 ];
 
 // Public marketing / docs / status pages — shared (CDN) + browser cacheable.
