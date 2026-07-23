@@ -1096,6 +1096,46 @@ export interface WorkflowSummaryRow {
   failed: number;
   active: number;
 }
+/** Result of a run operation (the console's 3-dots menu). */
+export interface RunOpResult {
+  op: string;
+  runId: string;
+  status?: string;
+  /** replay: the newly-created run's id. */
+  replayedFromRunId?: string;
+  /** wakeup: number of active sleeps cancelled. */
+  stoppedCount?: number;
+  enqueued?: boolean;
+  alreadyTerminal?: boolean;
+}
+
+/** Run a workflow-run operation against the project's world (server-side,
+ *  host-routed over the mesh). `op` ∈ cancel | replay | reenqueue | wakeup.
+ *  Mirrors the upstream console's cancelRun / recreateRun / reenqueueRun /
+ *  wakeUpRun. */
+export async function runOp(
+  op: "cancel" | "replay" | "reenqueue" | "wakeup",
+  runId: string,
+  project: string,
+  extra?: { cancelReason?: string },
+): Promise<RunOpResult> {
+  const r = await fetchWithTimeout(
+    `${BASE}/v1/workflows/runs/${encodeURIComponent(runId)}/${op}`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json", ...teamHeaders() },
+      body: JSON.stringify({ project, ...(extra || {}) }),
+    },
+    40_000,
+  );
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error(detail?.trim() || `${op} -> ${r.status}`);
+  }
+  invalidateApiCache();
+  return r.json();
+}
+
 /** A workflow hook (webhook / createHook trigger), derived from world events.
  *  Mirrors the upstream console's Hooks table. */
 export interface WorkflowHook {

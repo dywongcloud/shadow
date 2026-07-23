@@ -31,6 +31,12 @@ const nextConfig = {
   reactStrictMode: true,
   productionBrowserSourceMaps: false,
 
+  // The upstream @workflow/web console (mounted at /workflows via
+  // app/wf-console/[[...slug]]/route.ts) loads its compiled Express app from
+  // node_modules at runtime — keep it (and express) external so Next doesn't
+  // inline the dashboard build and its dynamic asset paths keep resolving.
+  serverExternalPackages: ["express", "@workflow/web"],
+
   // Image Optimization (Vercel-parity): next/image serves responsive, correctly
   // sized, modern-format images with lazy loading by default. AVIF/WebP first;
   // the default device/image size ladder covers phones→desktops. remotePatterns
@@ -50,20 +56,42 @@ const nextConfig = {
   // `instrumentationHook` flag was removed (it now errors as an unknown key).
 
   async rewrites() {
-    return [
-      // SECURITY: the ZK preview endpoints (enroll + proof mint) are how a member
-      // gains preview access — they must NOT be reachable from the browser, or a
-      // signed-in non-member could self-enroll and mint a proof. They're called
-      // only server-to-server by /api/preview-unlock + /api/zk-enroll (which first
-      // verify Clerk org membership). Block the public proxy path (matched first).
-      { source: "/cloud/v1/zkauth/:path*", destination: "/api/blocked" },
-      // Proxy dashboard API calls to a hive-cloud node's admin API (avoids CORS).
-      { source: "/cloud/:path*", destination: `${ADMIN}/:path*` },
-      // Ops console → the dedicated admin host (admin.shadw.cloud).
-      { source: "/ops/:path*", destination: `${ADMIN_OPS}/:path*` },
-      // Multi-zone proxies (env-driven).
-      ...zoneRewrites(),
-    ];
+    return {
+      // Upstream @workflow/web workflow console (isolated mount). These MUST
+      // run beforeFiles: hive ships a native app/workflows page, and
+      // filesystem routes would otherwise shadow the mount. The native page
+      // stays untouched on disk — these rewrites simply own the URL. The
+      // compiled React Router app is re-based to basename /workflows by
+      // scripts/patch-wf-console.mjs; every /workflows/* URL (HTML, .data
+      // loader fetches, /workflows/api/rpc CBOR, /workflows/api/stream/*,
+      // /workflows/__manifest) plus its content-hashed /assets/* files is
+      // forwarded into the wf-console bridge, which strips the /wf-console
+      // prefix and dispatches to the upstream Express app.
+      beforeFiles: [
+        { source: "/workflows", destination: "/wf-console/workflows" },
+        { source: "/workflows/:path*", destination: "/wf-console/workflows/:path*" },
+        { source: "/assets/:path*", destination: "/wf-console/assets/:path*" },
+        // Belt-and-suspenders for the root-absolute API URLs the upstream
+        // client would use if an unpatched bundle ever ships: hive has no
+        // /api/rpc or /api/stream routes, so these can't collide.
+        { source: "/api/rpc", destination: "/wf-console/workflows/api/rpc" },
+        { source: "/api/stream/:path*", destination: "/wf-console/workflows/api/stream/:path*" },
+      ],
+      afterFiles: [
+        // SECURITY: the ZK preview endpoints (enroll + proof mint) are how a member
+        // gains preview access — they must NOT be reachable from the browser, or a
+        // signed-in non-member could self-enroll and mint a proof. They're called
+        // only server-to-server by /api/preview-unlock + /api/zk-enroll (which first
+        // verify Clerk org membership). Block the public proxy path (matched first).
+        { source: "/cloud/v1/zkauth/:path*", destination: "/api/blocked" },
+        // Proxy dashboard API calls to a hive-cloud node's admin API (avoids CORS).
+        { source: "/cloud/:path*", destination: `${ADMIN}/:path*` },
+        // Ops console → the dedicated admin host (admin.shadw.cloud).
+        { source: "/ops/:path*", destination: `${ADMIN_OPS}/:path*` },
+        // Multi-zone proxies (env-driven).
+        ...zoneRewrites(),
+      ],
+    };
   },
 
   // Permanent redirects for legacy / convenience paths.
@@ -75,6 +103,10 @@ const nextConfig = {
       { source: "/signup", destination: "/sign-up", permanent: true },
       { source: "/team", destination: "/teams", permanent: true },
       { source: "/marketplace", destination: "/integrations", permanent: false },
+      // hive's legacy run-detail URL shape (/workflows/runs/<id>) → the
+      // upstream console's route (/workflows/run/<id>) so old links land on
+      // the mounted @workflow/web run view.
+      { source: "/workflows/runs/:id", destination: "/workflows/run/:id", permanent: false },
     ];
   },
 

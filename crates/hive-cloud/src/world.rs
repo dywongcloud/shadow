@@ -14,6 +14,36 @@
 //! which the platform stores per-project. This MUST run on the node that holds
 //! the project's decrypted env (its host) — `env_map` only decrypts locally — so
 //! the coordinator proxies these reads to the hosting node (cross-region aware).
+//!
+//! ## Managed-world conformance (`@workflow/world` / world-vercel)
+//!
+//! Beyond reads, the lower half of this module is a WRITE layer that conforms to
+//! the Vercel WDK `@workflow/world` contract at the interface + store-schema
+//! level (the same level `world-redis`/`world-vercel`/`world-local` conform),
+//! adapted to hive's iroh p2p multi-region infrastructure:
+//!
+//! | @workflow/world concept        | hive mapping                                   |
+//! |--------------------------------|------------------------------------------------|
+//! | events.create(run_cancelled)   | `run_op(cancel)` → append_event + run status   |
+//! | recreateRunFromExisting        | `run_op(replay)` → new ULID run + run_created  |
+//! | reenqueueRun                   | `run_op(reenqueue)` → enqueue_run              |
+//! | wakeUpRun (cancel sleeps)      | `run_op(wakeup)` → complete_pending_waits+enq  |
+//! | Queue.queue(__wkf_workflow_…)  | `enqueue_run` → owf:job HASH + owf:sched ZSET  |
+//! | per-run write serialization    | `with_run_lock` (SET NX PX 15s + Lua unlock)   |
+//! | ULID run ids (ts-valid)        | `ulid()` (48-bit ms + 80-bit rand, base32)     |
+//! | base64(CBOR) entity/event enc  | `encode_blob` (serde_cbor; cbor-x round-trips) |
+//! | status union / EventType enum  | upstream vocab (pending/running/completed/…)   |
+//! | multi-region write routing     | host-routed over iroh, exactly like reads      |
+//!
+//! Storage lives in the PROJECT'S OWN world-redis store (the `owf:*` keys the
+//! app runtime replays from), never a hive-private store — so a hive-issued
+//! cancel/replay and the app's own runtime share one world state. The queue
+//! trigger uses the app's own `owf:job`/`owf:sched` schema, which the app's
+//! in-process world-redis dispatcher (50ms poll) delivers to
+//! `/.well-known/workflow/v1/flow`, so a resumed run actually EXECUTES. What is
+//! deliberately NOT reimplemented (Vercel-transport specifics, not part of the
+//! World contract): the v4 frame protocol, OIDC auth, s3rf:/kvrf: ref
+//! offloading, region-tagged ULIDs, VQS regional routing.
 
 use std::sync::Arc;
 

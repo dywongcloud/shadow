@@ -13,6 +13,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Loader2, Plus, Eye, EyeOff, GitBranch, X, ArrowDownUp, Workflow as WorkflowIcon, Webhook } from "lucide-react";
 import { apiSend, usePoll, type WorkflowDef, type WorkflowRun, type WorkflowHook } from "@/lib/api";
 import { Triangle } from "@/components/ui";
+import { RunActions } from "@/components/workflows/run-actions";
 import {
   CopyableText,
   EmptyState,
@@ -86,8 +87,8 @@ export function StatusChips({ runs }: { runs: WorkflowRun[] }) {
 /* Runs table (faithful columns)                                              */
 /* -------------------------------------------------------------------------- */
 
-const COLS_PROJECT = "grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1.6fr)_0.9fr_0.9fr_0.9fr]";
-const COLS_NO_PROJECT = "grid-cols-[minmax(0,1.6fr)_minmax(0,1.8fr)_0.9fr_0.9fr_0.9fr]";
+const COLS_PROJECT = "grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1.6fr)_0.9fr_0.9fr_0.9fr_2.5rem]";
+const COLS_NO_PROJECT = "grid-cols-[minmax(0,1.6fr)_minmax(0,1.8fr)_0.9fr_0.9fr_0.9fr_2.5rem]";
 
 export function RunsTable({ runs, now, showProject }: { runs: WorkflowRun[]; now: number; showProject?: boolean }) {
   const grid = showProject ? COLS_PROJECT : COLS_NO_PROJECT;
@@ -100,6 +101,7 @@ export function RunsTable({ runs, now, showProject }: { runs: WorkflowRun[]; now
         <span>Status</span>
         <span>Duration</span>
         <span>Started</span>
+        <span></span>
       </div>
       {runs.length === 0 ? (
         <EmptyState title="No runs" hint="Runs appear here as your deployed workflows execute." />
@@ -132,6 +134,11 @@ export function RunsTable({ runs, now, showProject }: { runs: WorkflowRun[]; now
               </span>
               <span className="text-muted">
                 <RelativeTime ms={r.started_ms} />
+              </span>
+              <span className="flex justify-end">
+                {r.project ? (
+                  <RunActions runId={r.id} project={r.project} status={r.status} hasPendingSleeps={live} variant="menu" />
+                ) : null}
               </span>
             </Link>
           );

@@ -12,6 +12,7 @@ import { apiGet, usePoll, type WorkflowDef } from "@/lib/api";
 import {
   AbsTime, CopyableText, EmptyState, StatusBadge, fmtDuration, decodeBlob, parseName, pretty, statusMeta, toMs, normStatus,
 } from "@/components/workflows/shared";
+import { RunActions } from "@/components/workflows/run-actions";
 
 // ---------------------------------------------------------------------------
 // Run detail — a faithful native port of the Vercel @workflow/web run view:
@@ -157,6 +158,22 @@ function RunDetail({ id }: { id: string }) {
     return out;
   }, [steps, events, isLive, now]);
 
+  // Active sleeps = wait_created events with no matching wait_completed
+  // (correlationId), mirroring the upstream analyzeEvents() gate for the
+  // "Cancel Active Sleeps" action.
+  const hasPendingSleeps = useMemo(() => {
+    const created = new Set<string>();
+    const done = new Set<string>();
+    for (const e of events) {
+      const cid = e.correlationId || e.eventData?.waitId;
+      if (!cid) continue;
+      if (e.eventType === "wait_created") created.add(cid);
+      else if (e.eventType === "wait_completed") done.add(cid);
+    }
+    for (const c of created) if (!done.has(c)) return true;
+    return false;
+  }, [events]);
+
   const queuedMs = toMs(run?.createdAt);
   const startedMs = toMs(run?.startedAt);
   const completedMs = toMs(run?.completedAt);
@@ -187,11 +204,22 @@ function RunDetail({ id }: { id: string }) {
           <h1 className="text-xl font-semibold tracking-tight">{wfName}</h1>
           <StatusBadge status={status} live={isLive} />
         </div>
-        {project && (
-          <Link href={`/projects/${encodeURIComponent(project)}?tab=workflows`} className="inline-flex items-center gap-1 text-sm text-link hover:underline">
-            {project} <ExternalLink className="h-3 w-3" />
-          </Link>
-        )}
+        <div className="flex items-center gap-3">
+          {run && project && (
+            <RunActions
+              runId={id}
+              project={project}
+              status={status}
+              hasPendingSleeps={hasPendingSleeps}
+              variant="header"
+            />
+          )}
+          {project && (
+            <Link href={`/projects/${encodeURIComponent(project)}?tab=workflows`} className="inline-flex items-center gap-1 text-sm text-link hover:underline">
+              {project} <ExternalLink className="h-3 w-3" />
+            </Link>
+          )}
+        </div>
       </div>
 
       {/* Stat row — upstream vocabulary: Status / Duration / Run ID / Queued /
