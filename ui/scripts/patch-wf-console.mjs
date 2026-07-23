@@ -334,23 +334,50 @@ function collectBundleFiles() {
 // their upstream names — their bytes never change, so cached copies stay
 // valid. Idempotent: a re-run strips the previous marker, re-digests, and
 // no-ops when content is unchanged.
-function rehashPatchedClientAssets(dirtied) {
+function rehashPatchedClientAssets(_dirtied) {
   const clientAssets = path.join(BUILD, "client", "assets");
   if (!fs.existsSync(clientAssets)) return;
   const marker = /\.h[0-9a-f]{8}(?=\.(js|css)$)/;
   const renames = new Map(); // old basename -> new basename
-  for (const f of fs.readdirSync(clientAssets)) {
+  // EVERY .js/.css asset is renamed, not just the ones this run's patches
+  // dirtied: end-user browsers were witnessed holding POISONED immutable
+  // cached copies of assets whose BYTES never changed (a css cached as an
+  // auth-redirect HTML body in an earlier serving-bug era renders the whole
+  // console unstyled forever) — the only recovery an origin can force against
+  // `immutable` is a NEW URL, so each patch generation fresh-names the whole
+  // set. Digest of the patched content keeps it deterministic/idempotent.
+  // One GENERATION fingerprint for the whole set (not per-file digests: the
+  // reference rewrite below changes file bytes after renaming, so per-file
+  // digests never converge across runs). Computed over every asset's content
+  // with existing markers normalized away, plus this script's own source —
+  // any upstream or patch change moves the ENTIRE set to fresh names
+  // atomically, which is exactly the coherence the module graph needs.
+  const genHash = crypto.createHash("sha256");
+  genHash.update(fs.readFileSync(fileURLToPath(import.meta.url)));
+  const assetNames = fs
+    .readdirSync(clientAssets)
+    .filter((f) => /\.(js|css)$/.test(f))
+    .sort();
+  for (const f of assetNames) {
+    genHash.update(f.replace(marker, ""));
+    genHash.update(
+      fs.readFileSync(path.join(clientAssets, f), "utf8").replace(/\.h[0-9a-f]{8}(?=\.(js|css))/g, "")
+    );
+  }
+  const gen = genHash.digest("hex").slice(0, 8);
+  for (const f of assetNames) {
     const full = path.join(clientAssets, f);
-    const hadMarker = marker.test(f);
-    if (!dirtied.has(full) && !hadMarker) continue;
-    const content = fs.readFileSync(full);
-    const digest = crypto.createHash("sha256").update(content).digest("hex").slice(0, 8);
     const stripped = f.replace(marker, "");
     const ext = path.extname(stripped);
-    const next = `${stripped.slice(0, -ext.length)}.h${digest}${ext}`;
+    const next = `${stripped.slice(0, -ext.length)}.h${gen}${ext}`;
     if (next === f) continue;
     fs.renameSync(full, path.join(clientAssets, next));
     renames.set(f, next);
+    // sourceMappingURL comments get rewritten to `<next>.map` by the global
+    // reference rewrite below — rename the sibling map to match.
+    if (fs.existsSync(full + ".map")) {
+      fs.renameSync(full + ".map", path.join(clientAssets, next + ".map"));
+    }
     console.log(`[patch-wf-console] rehash ${f} -> ${next}`);
   }
   if (renames.size === 0) return;

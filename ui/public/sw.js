@@ -7,7 +7,7 @@
  * media/fonts are cached stale-while-revalidate. Cache is the offline fallback.
  * Bump VERSION to evict every prior cache on activate. */
 
-const VERSION = "shadw-v3";
+const VERSION = "shadw-v4";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
 const PRECACHE = [
   "/offline.html",

@@ -507,6 +507,26 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         }
     }
     cloud.projects.load(snap.projects);
+    // Re-apply every persisted custom-domain alias into the just-restored
+    // `cloud.gw` — a runtime `POST /v1/projects/:p/domains` call only ever
+    // mutated the in-memory alias table (`cloud.gw.add_alias`), never
+    // anything `Gateway::restore` (above) replays; a bare-metal restart
+    // silently DROPPED every custom domain until the next redeploy or a
+    // fresh `add_alias` call. Live-witnessed standing up sms.shadw.cloud:
+    // it worked fleet-wide, then vanished fleet-wide across an unrelated
+    // binary roll's restarts. Best-effort — a domain whose project isn't
+    // hosted on THIS node correctly no-ops (this node was never going to
+    // serve it locally anyway; the gossiped route-table path handles that
+    // case once the real host's own restore re-adds it).
+    let mut healed_domains = 0u32;
+    for (project, domain) in cloud.projects.all_domains() {
+        if cloud.gw.add_alias(&domain, &project) {
+            healed_domains += 1;
+        }
+    }
+    if healed_domains > 0 {
+        tracing::info!(count = healed_domains, "persist::restore: re-applied custom-domain aliases");
+    }
     // Warm the git-webhook reverse index (`gitops::GitRepoIndex`) from what's
     // already known locally at this point: every deployment this node hosts was
     // just restored into `cloud.gw` above, so `git_for_project_fleet`'s local

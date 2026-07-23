@@ -667,6 +667,29 @@ impl CloudState {
         // keep host admission byte-identical to the pre-apps-domain behavior.
         (self.ingress != "ngrok" && host_matches_apps_domain(host, &self.apps_domain))
             || host_has_allowed_suffix(host, &self.deploy_suffixes)
+            // A CUSTOM DOMAIN attached to a project (`POST /v1/projects/:p/domains`)
+            // was rejected here as "a foreign root" 100% of the time — this gate
+            // predates that feature and was never taught about it. Two admission
+            // paths, matching the two ways this node can actually serve a host:
+            // 1. `serves_host` — this node itself owns the deployment (its OWN
+            //    `c.gw.aliases` has the entry directly).
+            // 2. `peer_routes` — the MESH GOSSIP already knows some OTHER node
+            //    owns it (the exact mechanism that already makes every node
+            //    admit `*.{apps_domain}` hosts it doesn't own locally and
+            //    mesh-proxy them to the real owner — apps_domain gets a
+            //    blanket admission above, but a customer's OWN custom domain
+            //    correctly does NOT, so it needs this per-alias existence
+            //    check instead). Once the real owner's periodic `serve_hosts`
+            //    publish carries a freshly-attached domain (see
+            //    `project_domain_add`, which now applies the alias ON the
+            //    owning node instead of wherever the admin write happened to
+            //    land), every OTHER node's `peer_routes` picks it up on the
+            //    next gossip cycle and can admit + mesh-proxy it too.
+            || self.gw.serves_host(host)
+            || {
+                let sub = host.split(':').next().unwrap_or(host).split('.').next().unwrap_or(host);
+                self.peer_routes.read().contains_key(sub)
+            }
     }
 
     /// Public URL for a deployment alias. Real-DNS ingress (`HIVE_INGRESS !=

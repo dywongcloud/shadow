@@ -667,6 +667,10 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
                 format!("webhook.{}", cloud.platform_domain),
                 cloud.platform_domain.clone(),
                 format!("www.{}", cloud.platform_domain),
+                // Self-hosted SMS-fallback service (platform-deployed app the
+                // edge routes by Host alias) — needs a real SAN like every
+                // other explicit platform host (no *.{platform_domain}).
+                format!("sms.{}", cloud.platform_domain),
             ],
             cloud.platform_domain.clone(),
         ),

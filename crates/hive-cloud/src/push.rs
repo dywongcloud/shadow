@@ -547,6 +547,28 @@ pub async fn send_web_push(c: &Arc<CloudState>, sub: &PushSubscription, payload:
 /// (`HIVE_SMS_EGRESS_NODES`, default the LA nodes) over the authenticated
 /// mesh, so SMS keeps working no matter which node runs the dispatcher.
 pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
+    let primary = send_sms_primary(c, phone, message, test_mode).await;
+    match primary {
+        Ok(()) => Ok(()),
+        Err(primary_err) => {
+            // Hosted-Textbelt failed (quota, region, network, missing key):
+            // try the SELF-HOSTED fallback service (the OSS textbelt deployed
+            // as a platform app at sms.{platform_domain}, carrier email-to-SMS
+            // gateways). A fallback success IS a delivery — report Ok but log
+            // loudly so the primary failure stays visible operationally.
+            match send_sms_fallback(c, phone, message).await {
+                Ok(()) => {
+                    tracing::warn!(node = %c.node_name, %primary_err, "primary SMS provider failed; delivered via self-hosted fallback");
+                    Ok(())
+                }
+                Err(fb_err) => Err(format!("{primary_err}; self-hosted fallback: {fb_err}")),
+            }
+        }
+    }
+}
+
+/// The hosted-Textbelt path (direct + NA-egress relay), unchanged semantics.
+async fn send_sms_primary(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
     match send_sms_direct(c, phone, message, test_mode).await {
         Ok(()) => Ok(()),
         Err(raw) if is_region_error(&raw) => {
@@ -567,6 +589,47 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
             Err(sanitize_textbelt_error(c, &last))
         }
         Err(raw) => Err(sanitize_textbelt_error(c, &raw)),
+    }
+}
+
+/// Self-hosted fallback: the OSS typpo/textbelt server (carrier email-to-SMS
+/// gateways) deployed as a platform app. `HIVE_SMS_FALLBACK_URL` overrides the
+/// endpoint; empty/"off" disables. The OSS API takes `number` (not `phone`)
+/// and replies `{success, message?}` — its failure text (e.g. an SMTP
+/// transport error) is surfaced verbatim; it contains no key material.
+async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> Result<(), String> {
+    let url = std::env::var("HIVE_SMS_FALLBACK_URL")
+        .unwrap_or_else(|_| format!("https://sms.{}/text", c.platform_domain));
+    if url.is_empty() || url.eq_ignore_ascii_case("off") {
+        return Err("disabled".into());
+    }
+    // The OSS textbelt `/text` route requires a bare 9-10 digit US number (its
+    // own `stripPhone` + length check, no country code) — hive stores E.164
+    // (`+1XXXXXXXXXX`, 11 digits after stripping non-digits), which it rejected
+    // outright as "Invalid phone number" (live-witnessed). Strip a leading
+    // country-code '1' when present so the fallback gets the shape it expects.
+    let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+    let local = if digits.len() == 11 && digits.starts_with('1') { digits[1..].to_string() } else { digits };
+    // The OSS service blasts an unknown-carrier number to all 15 US gateway
+    // domains CONCURRENTLY (Promise.allSettled), but a single stalling
+    // provider can legitimately take 6s connect + up to 6 SMTP replies x 10s
+    // each ≈ 66s worst case — a 20s client timeout aborted mid-response body
+    // on exactly that class of send (live-witnessed: "bad response: error
+    // decoding response body" on a real, in-progress blast). 90s comfortably
+    // clears the realistic worst case without waiting forever.
+    let r = c
+        .http
+        .post(&url)
+        .form(&[("number", local.as_str()), ("message", message)])
+        .timeout(std::time::Duration::from_secs(90))
+        .send()
+        .await
+        .map_err(|e| format!("unreachable: {e}"))?;
+    let v: serde_json::Value = r.json().await.map_err(|e| format!("bad response: {e}"))?;
+    if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(v.get("message").and_then(|m| m.as_str()).unwrap_or("send failed").to_string())
     }
 }
 

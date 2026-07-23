@@ -740,9 +740,35 @@ async fn project_domain_add(
     Path(project): Path<String>,
     Json(b): Json<AddDomain>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let team = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let ok = c.gw.add_alias(&b.domain, &project);
     if !ok {
+        // Not hosted locally — this project (unlike a static site fanned to
+        // every node) is placed on ONE real node, and every OTHER node only
+        // ever reaches it via mesh-proxy to that owner (confirmed live: this
+        // exact node served `smsrelay.shadw.app` at 200 purely by proxying,
+        // while its OWN `c.gw.aliases` never actually contained "smsrelay" —
+        // `add_alias` requires the LOCAL alias to derive the target deployment
+        // id, so it correctly 404'd here). Forward the add to the real owner
+        // (mirrors `project_network_put`'s identical not-local-forward
+        // pattern) instead of failing OR trying to fan the mutation to every
+        // node — most of which could never satisfy it anyway. Once applied on
+        // the true owner, that node's own next periodic `serve_hosts` gossip
+        // publish carries the new alias to every peer's `peer_routes` table
+        // automatically — the SAME distribution path that already makes
+        // `smsrelay.shadw.app` reachable from every node; no separate fanout
+        // mechanism needed once `host_allowed()` also admits `peer_routes`
+        // hits (see state.rs).
+        if let Some(node) = host_node_for_project(&c, &project) {
+            let body = json!({ "domain": b.domain });
+            if let Some(v) = post_to_host_json(&c, &node, &format!("/v1/projects/{project}/domains"), &team, &body).await {
+                return Ok(Json(v));
+            }
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!("project '{project}' is hosted on node '{node}' but the domain-add forward failed"),
+            ));
+        }
         return Err((StatusCode::NOT_FOUND, format!("no deployment for project '{project}'")));
     }
     c.projects.add_domain(&project, b.domain.clone());
@@ -750,6 +776,45 @@ async fn project_domain_add(
     let ev = c.event(&c.region, "DOMAIN", &b.domain, "/", 200, "domain-add", &project);
     c.record(ev);
     Ok(Json(json!({ "domain": b.domain, "project": project, "attached": true })))
+}
+
+/// Body-carrying POST forward to a specific node's admin surface — the POST
+/// counterpart of `put_to_host` (PUT), same node_admins-then-iroh-mesh
+/// fallback shape.
+async fn post_to_host_json(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Ok(r) = c
+            .http
+            .post(format!("{admin}{path}"))
+            .header("x-hive-team", team)
+            .timeout(std::time::Duration::from_secs(15))
+            .json(body)
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((id, addr)) = target {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
+        let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &body_bytes, 20).await {
+            return serde_json::from_slice(&b).ok();
+        }
+    }
+    None
 }
 
 pub(crate) async fn domains_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>, Query(q): Query<LocalQ>) -> Json<Value> {
