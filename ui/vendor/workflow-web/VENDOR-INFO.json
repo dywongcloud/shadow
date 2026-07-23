@@ -1,0 +1,18 @@
+{
+  "upstream": "https://github.com/vercel/workflow",
+  "commit": "1225258b5da66be40749c17d12c4e24d32197aa2",
+  "branch": "main",
+  "cloned": "2026-07-23T00:35:56Z",
+  "packages": {
+    "@workflow/web": "5.0.0-beta.36",
+    "@workflow/web-shared": "5.0.0-beta.36",
+    "@workflow/world": "5.0.0-beta.22",
+    "workflow": "5.0.0-beta.36"
+  },
+  "contents": {
+    "web/app": "packages/web/app (verbatim)",
+    "web/*.{json,ts}": "packages/web manifests+configs",
+    "web-shared/src": "packages/web-shared/src (verbatim)",
+    "world-types": "packages/world/src *.ts minus *.test.ts + package.json"
+  }
+}

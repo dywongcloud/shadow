@@ -1,0 +1,510 @@
+import type { Analytics } from './analytics.js';
+import type {
+  AttributeChange,
+  ExperimentalSetAttributesResult,
+} from './attributes.js';
+import type {
+  CreateEventParams,
+  CreateEventRequest,
+  Event,
+  EventResult,
+  GetEventParams,
+  ListEventsByCorrelationIdParams,
+  ListEventsParams,
+  RunCreatedEventRequest,
+} from './events.js';
+import type { GetHookParams, Hook, ListHooksParams } from './hooks.js';
+import type { Queue } from './queue.js';
+import type {
+  GetWorkflowRunParams,
+  ListWorkflowRunsParams,
+  WorkflowRun,
+  WorkflowRunWithoutData,
+} from './runs.js';
+import type {
+  GetChunksOptions,
+  PaginatedResponse,
+  StreamChunksResponse,
+  StreamInfoResponse,
+} from './shared.js';
+import type {
+  GetStepParams,
+  ListWorkflowRunStepsParams,
+  Step,
+  StepWithoutData,
+} from './steps.js';
+
+export interface Streamer {
+  /**
+   * Override the default flush interval (in milliseconds) for buffered stream writes.
+   * Chunks are accumulated in a buffer and flushed together on this interval.
+   *
+   * The default is 10ms, which is appropriate for HTTP-based backends where
+   * each flush is a network round-trip. For backends with sub-millisecond writes
+   * (e.g., Redis, local filesystem), a lower value (or 0 for immediate flushing) reduces
+   * end-to-end stream latency.
+   *
+   * Not supported by all worlds.
+   */
+  streamFlushIntervalMs?: number;
+
+  streams: {
+    write(
+      runId: string,
+      name: string,
+      chunk: string | Uint8Array
+    ): Promise<void>;
+
+    /**
+     * Write multiple chunks to a stream in a single operation.
+     * This is an optional optimization for world implementations that can
+     * batch multiple writes efficiently (e.g., single HTTP request for world-vercel).
+     *
+     * If not implemented, the caller should fall back to sequential write() calls.
+     *
+     * @param runId - The run ID
+     * @param name - The stream name
+     * @param chunks - Array of chunks to write, in order
+     */
+    writeMulti?(
+      runId: string,
+      name: string,
+      chunks: (string | Uint8Array)[]
+    ): Promise<void>;
+
+    close(runId: string, name: string): Promise<void>;
+
+    /**
+     * Read from a stream starting at the given chunk index.
+     * Positive values skip that many chunks from the start (0-based).
+     * Negative values start that many chunks before the current end
+     * (e.g. -3 on a 10-chunk stream starts at chunk 7). Clamped to 0.
+     */
+    get(
+      runId: string,
+      name: string,
+      startIndex?: number
+    ): Promise<ReadableStream<Uint8Array>>;
+
+    list(runId: string): Promise<string[]>;
+
+    /**
+     * Fetch stream chunks with cursor-based pagination.
+     *
+     * Unlike `get` (which returns a live `ReadableStream` that waits
+     * for new chunks in real-time), `getChunks` returns a snapshot of currently
+     * available chunks in a standard paginated response.
+     *
+     * @param runId - The workflow run ID that owns the stream
+     * @param name - The stream name/ID
+     * @param options - Pagination options (limit defaults to 100, max 1000)
+     * @returns Paginated chunks with a `done` flag indicating stream completion
+     */
+    getChunks(
+      runId: string,
+      name: string,
+      options?: GetChunksOptions
+    ): Promise<StreamChunksResponse>;
+
+    /**
+     * Retrieve lightweight metadata about a stream.
+     *
+     * Returns the tail index (index of the last known chunk, 0-based) and
+     * whether the stream is complete. This is useful for resolving a negative
+     * `startIndex` into an absolute position before connecting to a stream.
+     *
+     * @param runId - The workflow run ID that owns the stream
+     * @param name - The stream name/ID
+     */
+    getInfo(runId: string, name: string): Promise<StreamInfoResponse>;
+  };
+}
+
+/**
+ * Storage interface for workflow data.
+ *
+ * Workflow storage models an append-only event log, so all state changes are handled through `events.create()`.
+ * Run/Step/Hook entities provide materialized views into the current state, but entities can't be modified directly.
+ *
+ * User-originated state changes are also handled via events:
+ * - run_cancelled event for run cancellation
+ * - hook_disposed event for explicit hook disposal (optional)
+ *
+ * When a workflow reaches a terminal state, its Hooks can no longer be resumed.
+ * Worlds normally remove them and release their tokens. A Hook with minimum
+ * retention remains readable and keeps its token unavailable until its retention
+ * ends. A hook_disposed event always removes the Hook and releases its token.
+ */
+export interface Storage {
+  runs: {
+    get(
+      id: string,
+      params: GetWorkflowRunParams & { resolveData: 'none' }
+    ): Promise<WorkflowRunWithoutData>;
+    get(
+      id: string,
+      params?: GetWorkflowRunParams & { resolveData?: 'all' }
+    ): Promise<WorkflowRun>;
+    get(
+      id: string,
+      params?: GetWorkflowRunParams
+    ): Promise<WorkflowRun | WorkflowRunWithoutData>;
+
+    /**
+     * Retrieves several runs as one snapshot. The result preserves the input
+     * order and contains `null` for run IDs that do not exist.
+     */
+    getMany?: {
+      (
+        ids: readonly string[],
+        params: GetWorkflowRunParams & { resolveData: 'none' }
+      ): Promise<(WorkflowRunWithoutData | null)[]>;
+      (
+        ids: readonly string[],
+        params?: GetWorkflowRunParams & { resolveData?: 'all' }
+      ): Promise<(WorkflowRun | null)[]>;
+      (
+        ids: readonly string[],
+        params?: GetWorkflowRunParams
+      ): Promise<(WorkflowRun | WorkflowRunWithoutData | null)[]>;
+    };
+
+    list(
+      params: ListWorkflowRunsParams & { resolveData: 'none' }
+    ): Promise<PaginatedResponse<WorkflowRunWithoutData>>;
+    list(
+      params?: ListWorkflowRunsParams & { resolveData?: 'all' }
+    ): Promise<PaginatedResponse<WorkflowRun>>;
+    list(
+      params?: ListWorkflowRunsParams
+    ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>>;
+
+    /**
+     * Apply a batch of attribute changes to a run. Merge semantics:
+     * - `value: string` upserts the key
+     * - `value: null` removes the key
+     * - keys not listed in `changes` are untouched
+     *
+     * Returns the post-merge attribute snapshot on the run.
+     *
+     * Pass `options.allowReservedAttributes: true` to permit keys
+     * starting with the reserved `$` prefix. Default behavior rejects
+     * those keys so user code can't accidentally collide with
+     * framework / tooling namespaces; framework callers that own a
+     * sub-namespace flip this on.
+     *
+     * OPTIONAL. World implementations may omit this method; the SDK
+     * helper (`setAttributes` in `@workflow/core`) feature-detects its
+     * absence and no-ops with a one-time warning so third-party /
+     * community worlds keep working without adopting the experimental
+     * API.
+     *
+     * EXPERIMENTAL: this method exists as a stopgap until the
+     * `attr_set` event type lands in a future spec version. When that
+     * happens, `setAttributes` will dispatch through `events.create`
+     * instead, and this method is expected to be removed. See the
+     * `attributes-mvp` changelog entry for the migration shape.
+     */
+    experimentalSetAttributes?(
+      runId: string,
+      changes: AttributeChange[],
+      options?: { allowReservedAttributes?: boolean }
+    ): Promise<ExperimentalSetAttributesResult>;
+  };
+
+  steps: {
+    get(
+      runId: string,
+      stepId: string,
+      params: GetStepParams & { resolveData: 'none' }
+    ): Promise<StepWithoutData>;
+    get(
+      runId: string,
+      stepId: string,
+      params?: GetStepParams & { resolveData?: 'all' }
+    ): Promise<Step>;
+    get(
+      runId: string,
+      stepId: string,
+      params?: GetStepParams
+    ): Promise<Step | StepWithoutData>;
+
+    list(
+      params: ListWorkflowRunStepsParams & { resolveData: 'none' }
+    ): Promise<PaginatedResponse<StepWithoutData>>;
+    list(
+      params: ListWorkflowRunStepsParams & { resolveData?: 'all' }
+    ): Promise<PaginatedResponse<Step>>;
+    list(
+      params: ListWorkflowRunStepsParams
+    ): Promise<PaginatedResponse<Step | StepWithoutData>>;
+  };
+
+  events: {
+    /**
+     * Create a run_created event to start a new workflow run.
+     * The runId may be provided by the client or left as null for the server to generate.
+     *
+     * @param runId - Client-generated runId, or null for server-generated
+     * @param data - The run_created event data
+     * @param params - Optional parameters for event creation
+     * @returns Promise resolving to the created event and run entity
+     */
+    create(
+      runId: string | null,
+      data: RunCreatedEventRequest,
+      params?: CreateEventParams
+    ): Promise<EventResult>;
+
+    /**
+     * Create an event for an existing workflow run and atomically update the entity.
+     * Returns both the event and the affected entity (run/step/hook).
+     *
+     * @param runId - The workflow run ID (required for all events except run_created)
+     * @param data - The event to create
+     * @param params - Optional parameters for event creation
+     * @returns Promise resolving to the created event and affected entity
+     */
+    create(
+      runId: string,
+      data: CreateEventRequest,
+      params?: CreateEventParams
+    ): Promise<EventResult>;
+
+    get(
+      runId: string,
+      eventId: string,
+      params?: GetEventParams
+    ): Promise<Event>;
+
+    list(params: ListEventsParams): Promise<PaginatedResponse<Event>>;
+    listByCorrelationId(
+      params: ListEventsByCorrelationIdParams
+    ): Promise<PaginatedResponse<Event>>;
+  };
+
+  hooks: {
+    /**
+     * Returns a Hook by ID. A Hook kept by minimum retention remains readable
+     * after its run ends, but cannot be resumed.
+     */
+    get(hookId: string, params?: GetHookParams): Promise<Hook>;
+    /**
+     * Returns the Hook that owns a token, including a Hook kept by minimum
+     * retention after its run ends.
+     */
+    getByToken(token: string, params?: GetHookParams): Promise<Hook>;
+    /**
+     * Lists Hooks, including Hooks kept by minimum retention after their runs
+     * end.
+     */
+    list(params: ListHooksParams): Promise<PaginatedResponse<Hook>>;
+  };
+}
+
+/**
+ * Optional feature capabilities a World implementation declares so the core
+ * runtime can enable optimizations that depend on backend behavior, instead
+ * of inferring support from environment variables alone. Every capability
+ * defaults to "unsupported" when absent — runtime fast paths that rely on
+ * one must fail closed (keep their conservative behavior) unless the World
+ * explicitly declares it.
+ */
+export interface WorldCapabilities {
+  /**
+   * Supports `experimental_minRetention` for Hooks. Missing or inactive means
+   * the runtime rejects retained Hooks before registration.
+   */
+  hookRetention?: {
+    active: boolean;
+  };
+
+  /**
+   * The World enforces the optimistic-concurrency precondition guard: an
+   * event creation carrying a `stateUpdatedAt` snapshot is rejected with a
+   * `PreconditionFailedError` (412) when a newer out-of-band event (e.g. a
+   * received hook) was recorded after that snapshot. Worlds that accept but
+   * ignore `stateUpdatedAt` must leave this unset so runtime optimizations
+   * that rely on the 412 fence (see `WORKFLOW_PRECONDITION_GUARD`) are not
+   * enabled without an actual fence behind them.
+   */
+  preconditionGuard?: boolean;
+
+  /**
+   * The World's queue supports `maxConcurrency`-limited consumption — in
+   * particular the per-run flow topics consumed with `maxConcurrency: 1`
+   * that `WORKFLOW_SEQUENTIAL_REPLAYS=1` uses to serialize a run's
+   * orchestrator invocations. Worlds whose queue has no concurrency-limit
+   * concept must leave this unset.
+   *
+   * Note this declares queue *support*, not deployed configuration: the
+   * serialization also requires the build-time half (a flow trigger emitted
+   * with `maxConcurrency: 1`), which a runtime process cannot verify today.
+   * The core runtime therefore does not yet take any fast path from this
+   * capability alone — it exists so a future build-verified signal can be
+   * combined with it (and so Worlds document the contract explicitly).
+   */
+  maxConcurrency?: boolean;
+}
+
+/**
+ * The "World" interface represents how Workflows are able to communicate with the outside world.
+ */
+export interface World extends Queue, Streamer, Storage {
+  /**
+   * Optional analytics read namespace for observability surfaces.
+   *
+   * These APIs return metadata-only rows intended for UI/CLI listing and
+   * trace views. Payload-bearing fields remain on the canonical runtime
+   * storage APIs (`runs`, `steps`, `events`, `hooks`) and their RemoteRef
+   * resolution path.
+   */
+  analytics?: Analytics;
+
+  /**
+   * The Workflow protocol spec version this World implements.
+   *
+   * Current runtimes require this to exactly match their
+   * `SPEC_VERSION_CURRENT` before they create or replay runs.
+   */
+  specVersion: number;
+
+  /**
+   * Feature capabilities this World implementation supports — see
+   * {@link WorldCapabilities}. Absent (or absent members) means
+   * "unsupported": runtime optimizations gated on a capability fail closed.
+   */
+  capabilities?: WorldCapabilities;
+
+  /**
+   * Whether calling `process.exit(1)` from a queue handler is observed by
+   * the World as a delivery failure that will be retried.
+   *
+   * Set to `true` for worlds running inside a managed serverless platform
+   * (e.g. `world-vercel`) where the platform fails the invocation when the
+   * function process exits non-zero, and the queue redelivers the message
+   * via a separate fresh invocation.
+   *
+   * Set to `false` (the default) for in-process worlds (e.g. `world-local`,
+   * dev servers) where calling `process.exit()` would terminate the host
+   * process — including the user's `pnpm dev` — without producing a
+   * redelivery. Such worlds should instead surface failures via the event
+   * log and return normally.
+   *
+   * The core runtime reads this when deciding how to handle an exhausted
+   * replay budget: when `true` it exits so the queue redelivers; when
+   * `false` it writes `run_failed` best-effort and returns. See
+   * `packages/core/src/runtime/replay-budget.ts`.
+   */
+  processExitTriggersQueueRedelivery?: boolean;
+
+  /**
+   * A function that will be called to start any background tasks needed by the World implementation.
+   * For example, in the case of a queue backed World, this would start the queue processing.
+   */
+  start?(): Promise<void>;
+
+  /**
+   * Release any resources held by the World implementation (connection pools, listeners, etc.).
+   * After calling `close()`, the World instance should not be used again.
+   *
+   * This is important for CLI commands and short-lived processes that need to exit cleanly
+   * without relying on `process.exit()`.
+   */
+  close?(): Promise<void>;
+
+  /**
+   * Resolve the most recent deployment ID for the current deployment's environment.
+   *
+   * Used when `deploymentId: 'latest'` is passed to `start()`. The implementation
+   * determines the latest deployment that shares the same environment (e.g., same
+   * "production" target or same git branch for "preview" deployments) as the
+   * current deployment.
+   *
+   * Not all World implementations support this — it is only implemented by
+   * world-vercel where deployment routing is meaningful.
+   */
+  resolveLatestDeploymentId?(): Promise<string>;
+
+  /**
+   * Retrieve the AES-256 encryption key for a specific workflow run.
+   *
+   * The returned key is a ready-to-use 32-byte AES-256 key. The World
+   * implementation handles all key retrieval and derivation internally
+   * (e.g., HKDF from a deployment key). The core encryption module uses
+   * this key directly for AES-GCM encrypt/decrypt operations.
+   *
+   * Two overloads:
+   *
+   * - `getEncryptionKeyForRun(run)` — Preferred. Pass a `WorkflowRun` when
+   *   the run entity already exists. The World reads any context it needs
+   *   (e.g., `deploymentId`) directly from the run.
+   *
+   * - `getEncryptionKeyForRun(runId, context?)` — Used when the run entity
+   *   is not locally available, such as `start()` before run creation or a
+   *   forwarded writable stream carrying its owning deployment context. The
+   *   `context` parameter carries opaque world-specific data (e.g.,
+   *   `{ deploymentId }` for world-vercel) needed to resolve the correct key.
+   *   When `context` is omitted, the World assumes the current deployment.
+   *
+   * When not implemented, encryption is disabled — data is stored unencrypted.
+   */
+  getEncryptionKeyForRun?(run: WorkflowRun): Promise<Uint8Array | undefined>;
+  getEncryptionKeyForRun?(
+    runId: string,
+    context?: Record<string, unknown>
+  ): Promise<Uint8Array | undefined>;
+
+  /**
+   * Mint a new workflow run ID.
+   *
+   * Called by `start()` to generate the unique ID for a newly-created run.
+   * The returned value is the "bare" ID (without any `wrun_` prefix); the
+   * core attaches the prefix.
+   *
+   * Implementations are free to embed world-specific metadata in the ID
+   * (e.g., a region identifier) as long as the returned string remains a
+   * valid ULID. When omitted, `start()` falls back to generating a standard
+   * monotonic ULID.
+   *
+   * @param options - The full options bag passed to `start()` (typed as
+   *   `Record<string, unknown>` here to avoid a circular dependency with
+   *   `@workflow/core`). Worlds should read only the fields they
+   *   recognise — for example, `@workflow/world-vercel` reads
+   *   `options.region` to embed a region identifier. Unrecognised keys
+   *   must be ignored. `start()` always passes an object (an empty one
+   *   when it was called with no options), but implementations should
+   *   tolerate `undefined` for direct callers.
+   */
+  createRunId?(options?: Readonly<Record<string, unknown>>): string;
+
+  /**
+   * World-specific display fields for a run.
+   *
+   * Tooling — e.g. the `workflow inspect` CLI — calls this to enrich a
+   * run's listing row / detail output with fields only the world can
+   * derive: a region decoded from the run ID, placement read off the
+   * run's `executionContext`, a shard, a billing tier, etc. Consumers
+   * render each returned key as an additional column/property; when the
+   * hook is absent, no extra fields appear at all.
+   *
+   * The contract:
+   * - **Cheap and pure.** Called once per displayed run, so avoid I/O —
+   *   prefer deriving fields from the entity you are given.
+   * - **Read only what you recognise.** The argument is the run entity
+   *   as the caller has it (a full storage run, or a leaner analytics
+   *   row) — typed loosely for the same reason as {@link createRunId}.
+   *   Tolerate missing fields.
+   * - **Must not throw.**
+   * - A `null` field value means "applicable but undeterminable" and is
+   *   preserved as `null` in structured output (vs. the hook being
+   *   absent, where the key does not exist at all). Return `null` or an
+   *   empty object to add nothing for a given run.
+   */
+  describeRun?(
+    run: Readonly<Record<string, unknown>>
+  ):
+    | Record<string, string | null>
+    | null
+    | Promise<Record<string, string | null> | null>;
+}

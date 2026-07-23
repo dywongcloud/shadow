@@ -1,0 +1,116 @@
+/* CSS variables for edge labels */
+:root {
+  --conditional-label-bg: #1f2937; /* gray-800 */
+  --conditional-label-text: #ffffff;
+  --conditional-label-border: #374151; /* gray-700 */
+}
+
+.dark {
+  --conditional-label-bg: #1f2937; /* gray-800 */
+  --conditional-label-text: #ffffff;
+  --conditional-label-border: #4b5563; /* gray-600 */
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not(.dark) {
+    --conditional-label-bg: #374151; /* gray-700 */
+    --conditional-label-text: #ffffff;
+    --conditional-label-border: #4b5563; /* gray-600 */
+  }
+}
+
+/* Custom styling for React Flow controls in dark mode */
+.react-flow__controls {
+    button {
+      background-color: var(--background);
+      border: 1px solid var(--border);
+      color: var(--foreground);
+    }
+  
+    button:hover {
+      background-color: var(--accent);
+    }
+  
+    button path {
+      fill: currentColor;
+    }
+  }
+  
+  /* Ensure text wraps properly in nodes */
+  .react-flow__node {
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    white-space: normal;
+  }
+  
+  .react-flow__node-default,
+  .react-flow__node-input,
+  .react-flow__node-output {
+    width: 220px !important;
+    min-width: 220px !important;
+    max-width: 220px !important;
+    border-width: 1px;
+  }
+
+  /* Custom execution node types - remove default React Flow styling */
+  .react-flow__node-executionNode,
+  .react-flow__node-loopNode {
+    width: 220px !important;
+    min-width: 220px !important;
+    max-width: 220px !important;
+    background: transparent !important;
+    border: none !important;
+    padding: 0 !important;
+    box-shadow: none !important;
+  }
+  
+  /* Pulse animation for currently executing node */
+  @keyframes pulse-subtle {
+    0%, 100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.7;
+    }
+  }
+  
+  .animate-pulse-subtle {
+    animation: pulse-subtle 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Style for group nodes (parallel groups, loops) */
+  .react-flow__node-group {
+    pointer-events: none;
+    z-index: -1 !important;
+  }
+
+  /* Group labels positioned at top-left */
+  .react-flow__node-group::before {
+    content: attr(data-label);
+    position: absolute;
+    top: 8px;
+    left: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  /* Make edges cleaner with rounded corners */
+  .react-flow__edge-path {
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  /* Highlight executed path edges more prominently */
+  .react-flow__edge.animated .react-flow__edge-path {
+    stroke-width: 2.5px;
+  }
+
+  /* Style for loop-back edges - route them on the left side */
+  .react-flow__edge[data-edge-type="loop"] .react-flow__edge-path {
+    stroke-dasharray: 6 4;
+  }
+
+  
