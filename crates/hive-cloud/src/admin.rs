@@ -4701,8 +4701,20 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
             return Json(v);
         }
     }
+    // Scoped request for a project with a locally-readable, tenant-owned WORLD
+    // (env is gossiped, so this is true on EVERY node): never depend on the
+    // mesh forward for the world rows — the forward path returned a false-[]
+    // on any fan-out hiccup, live-witnessed as the project tab's runs table
+    // flickering to empty mid-poll even after the unscoped fix. The direct
+    // local world read below covers it; a best-effort host merge (dedup'd)
+    // still picks up the host's engine-local rows when reachable.
+    let scoped_world_local = q
+        .project
+        .as_deref()
+        .map(|p| crate::world::has_world(&c, p) && project_owned_by(&c, p, &team))
+        .unwrap_or(false);
     if let Some(project) = q.project.as_deref() {
-        if c.gw.git_for_project(project).is_none() {
+        if c.gw.git_for_project(project).is_none() && !scoped_world_local {
             if let Some(node) = host_node_for_project(&c, project) {
                 if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs?project={project}&local=true"), &team).await {
                     if is_top_level {
@@ -4726,7 +4738,11 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
     // coordinator gets these via the per-project / `local=true` proxy paths above.
     {
         let mut locals: Vec<String> = match q.project.as_deref() {
-            Some(p) if c.gw.git_for_project(p).is_some() => vec![p.to_string()],
+            // Direct world read whenever this node CAN (local deployment
+            // record OR gossiped world env + ownership) — see
+            // scoped_world_local above for why the mesh must not be the only
+            // source of a scoped table's rows.
+            Some(p) if c.gw.git_for_project(p).is_some() || scoped_world_local => vec![p.to_string()],
             Some(_) => vec![],
             None => {
                 let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -4782,6 +4798,29 @@ pub(crate) async fn wf_runs(State(c): State<Arc<CloudState>>, headers: HeaderMap
                     if let Some(id) = run_key(r) {
                         if seen.insert(id) {
                             runs.push(r.clone());
+                        }
+                    }
+                }
+            }
+        }
+    } else if let Some(project) = q.project.as_deref() {
+        // Scoped read served by the DIRECT local world (scoped_world_local)
+        // on a node with no local deployment record: the host node's
+        // engine-local rows for this project aren't in `runs` yet. Merge them
+        // best-effort (dedup'd) — a mesh miss here degrades to world-rows-only
+        // (still populated), never to an empty table, which is the whole
+        // point of the scoped-flicker fix.
+        if scoped_world_local && !q.local.unwrap_or(false) && c.gw.git_for_project(project).is_none() {
+            if let Some(node) = host_node_for_project(&c, project) {
+                let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
+                if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/workflows/runs?project={project}&local=true"), &team).await {
+                    if let Some(arr) = v.as_array() {
+                        for r in arr {
+                            if let Some(id) = run_key(r) {
+                                if seen.insert(id) {
+                                    runs.push(r.clone());
+                                }
+                            }
                         }
                     }
                 }
