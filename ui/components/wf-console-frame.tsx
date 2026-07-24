@@ -108,6 +108,19 @@ export function WfConsoleFrame({
     // synchronously, so the first paint matches the platform theme (no
     // wrong-theme flash). The frame isn't mounted yet — frame arg null.
     syncConsoleTheme(null, resolvedTheme);
+    // Perf: warm the ~6MB console bundle DURING the mint gate. The frame is
+    // deliberately not mounted until the mint resolves (above), so without
+    // this the browser only starts fetching /wfc + its entry chunk after the
+    // mint round-trip completes — serializing two latencies. A `prefetch`
+    // link for the console document (which cascades into its module graph on
+    // a warm connection) overlaps that download with the mint, so the iframe
+    // paints from cache the moment it mounts. Removed on cleanup so repeated
+    // mounts don't pile up <link> nodes.
+    const warm = document.createElement("link");
+    warm.rel = "prefetch";
+    warm.as = "document";
+    warm.href = src;
+    document.head.appendChild(warm);
     void ensureSessionMinted().finally(() => {
       if (alive) setFrameName(`wfc|${currentTeam()}|${project ?? ""}`);
     });
@@ -121,6 +134,7 @@ export function WfConsoleFrame({
       alive = false;
       clearInterval(iv);
       document.removeEventListener("visibilitychange", onVis);
+      warm.remove();
     };
   }, [project]);
 
@@ -212,6 +226,11 @@ export function WfConsoleFrame({
           title="Workflow console"
           className="block w-full border-0"
           style={{ height }}
+          // Defer the console's own resource load until the frame is near the
+          // viewport — a real win for the project-tab embed (where the frame
+          // can sit below the fold); on the full-page /workflows view it's
+          // already in-view so this is a harmless no-op there.
+          loading="lazy"
         />
       ) : (
         <div className="animate-pulse" style={{ height }} />

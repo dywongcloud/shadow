@@ -7,7 +7,7 @@
  * media/fonts are cached stale-while-revalidate. Cache is the offline fallback.
  * Bump VERSION to evict every prior cache on activate. */
 
-const VERSION = "shadw-v4";
+const VERSION = "shadw-v5";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
 const PRECACHE = [
   "/offline.html",
@@ -62,7 +62,18 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       caches.open(STATIC_CACHE).then(async (cache) => {
         try {
-          const res = await fetch(req);
+          // `{cache:'reload'}` is load-bearing: a plain `fetch(req)` still
+          // honors the browser's own HTTP cache, so a code chunk with a live
+          // `max-age` (e.g. the /wfc console assets) is served from that HTTP
+          // cache WITHOUT a network round-trip — which means one chunk can be
+          // served from an OLD cached build while a sibling chunk of the SAME
+          // page loads fresh, producing a mixed module graph and the fatal
+          // "requested module does not provide an export named X" crash the
+          // workflows console hit. `reload` forces a real revalidated network
+          // fetch every time, so every chunk of a page load comes from the
+          // SAME (internally-consistent) origin build. Bandwidth cost is a
+          // conditional request per chunk; ETag/304 keeps it cheap.
+          const res = await fetch(req, { cache: "reload" });
           // `!res.redirected` guard: a 200 that arrived via a redirect (e.g.
           // an auth bounce to a sign-in page) is NOT the asset — caching that
           // HTML body under the .css/.js URL would poison the offline

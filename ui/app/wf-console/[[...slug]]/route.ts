@@ -198,13 +198,20 @@ async function handle(req: Request): Promise<Response> {
 
   const resp = await als.run(wfCtx, () => expressToFetch(app, req, rewriteUrl));
 
-  // The upstream express.static stamps assets immutable for a year keyed on
+  // The upstream express.static stamps assets `immutable, max-age=1y` keyed on
   // content-hash filenames — but scripts/patch-wf-console.mjs patches those
-  // files IN PLACE (same filename, new bytes). Override to a short
-  // revalidating TTL so patched bundles reach browsers.
+  // files IN PLACE (same filename, new bytes) and a fleet roll can change the
+  // patched output under an unchanged name. A stale `max-age` window let a
+  // browser serve ONE chunk from an old cached build while a sibling chunk
+  // loaded fresh — a mixed module graph and the fatal "does not provide an
+  // export named X" crash. `no-cache` (revalidate ALWAYS, ETag-gated — NOT
+  // `no-store`) closes that window entirely: every chunk of a page load is
+  // revalidated against the origin, so they always come from the SAME
+  // internally-consistent build. Cost is a conditional request per asset;
+  // express.static's ETag makes the common case a cheap 304.
   if (isPublicAssetPath(rewritten)) {
     const h = new Headers(resp.headers);
-    h.set("Cache-Control", "public, max-age=300, must-revalidate");
+    h.set("Cache-Control", "no-cache");
     // Only stamp on SUCCESS: a 404/500 body is not the asset and must not
     // masquerade as JS/CSS.
     if (resp.status === 200) {

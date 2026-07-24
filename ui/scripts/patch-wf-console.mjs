@@ -430,7 +430,22 @@ function main() {
       dirtied.add(f);
     }
   }
-  rehashPatchedClientAssets(dirtied);
+  // Rehash-all-assets (renaming patched chunks to a content-derived name +
+  // rewriting every cross-chunk import) is DELIBERATELY DISABLED. It existed
+  // to work around `immutable, max-age=1y` caching pinning stale patched
+  // bundles — but that is now solved more simply and robustly at the caching
+  // layer: the bridge route serves /wfc assets `no-cache` (always revalidate)
+  // and the service worker fetches code chunks with `{cache:'reload'}`, so
+  // every chunk of a page load is revalidated against the origin and always
+  // comes from the SAME internally-consistent build. The renaming's own
+  // machinery (a shared generation hash + a blind cross-file basename rewrite)
+  // was itself fragile — it contributed to repeated "does not provide an
+  // export named X" module-graph breakages — so removing it eliminates that
+  // failure surface entirely. Upstream's own content-hash filenames are kept
+  // as-is; `no-cache` revalidation, not the filename, guarantees freshness.
+  // (The function is retained above, unreferenced, for a quick revert if a
+  // future caching regression ever makes per-file content-addressing needed.)
+  void rehashPatchedClientAssets;
   const summary = PATCHES.map(([n]) => `${n}:${totals[n] || 0}`).join(" ");
   console.log(`[patch-wf-console] done — ${summary} (files:${files.length})`);
   // The basename + rpc-guard + header patches are load-bearing: fail loudly
