@@ -512,6 +512,15 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err(_) => Vec::new(),
             }
         }
+        // Direct-MX carrier-gateway SMS relay: the leader (cloud node, :25
+        // blocked) forwards a direct-MX send here to an NA-egress peer (LA Mac,
+        // :25 open) whose IP a carrier gateway accepts. Runs the blast locally.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/push/sms-direct-mx") => {
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(v) => jb(axum::Json(crate::push::sms_direct_mx_exec(v).await)),
+                Err(_) => Vec::new(),
+            }
+        }
         // Cross-region DB replica control (register/remove) over the mesh.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
             match serde_json::from_slice::<serde_json::Value>(body) {

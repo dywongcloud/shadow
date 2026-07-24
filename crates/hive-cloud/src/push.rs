@@ -561,7 +561,33 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
                     tracing::warn!(node = %c.node_name, %primary_err, "primary SMS provider failed; delivered via self-hosted fallback");
                     Ok(())
                 }
-                Err(fb_err) => Err(format!("{primary_err}; self-hosted fallback: {fb_err}")),
+                Err(fb_err) => {
+                    // LAST resort: direct-MX to the carrier gateways. This node
+                    // (leader/dispatcher) is almost always a cloud node whose
+                    // outbound :25 is blocked — so DON'T attempt it locally;
+                    // relay to an NA-egress peer (fc-lax/fc-lax2) whose :25 is
+                    // open. Proven: US Cellular's gateway accepts from those
+                    // Macs, so a 909 US Cellular number the hosted+cloud paths
+                    // can't reach delivers here. Best-effort: a peer that also
+                    // can't reach any accepting gateway just fails and we
+                    // surface the combined error.
+                    for peer in sms_egress_peers(&c.node_name) {
+                        let dm = serde_json::json!({ "phone": phone, "message": message });
+                        if let Some(v) = crate::admin::put_to_host(c, &peer, "/v1/push/sms-direct-mx", "", &dm).await {
+                            if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+                                tracing::warn!(node = %c.node_name, %peer, %primary_err, %fb_err, "delivered via direct-MX carrier gateway on NA-egress peer");
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // If THIS node itself has open :25 (e.g. an LA Mac running
+                    // the dispatcher), try locally too before giving up.
+                    if let Ok(()) = send_direct_mx(phone, message).await {
+                        tracing::warn!(node = %c.node_name, %primary_err, %fb_err, "delivered via local direct-MX carrier gateway");
+                        return Ok(());
+                    }
+                    Err(format!("{primary_err}; self-hosted fallback: {fb_err}"))
+                }
             }
         }
     }
@@ -704,6 +730,173 @@ pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> ser
     match send_sms_direct(c, phone, message, test_mode).await {
         Ok(()) => serde_json::json!({ "success": true }),
         Err(raw) => serde_json::json!({ "success": false, "error": sanitize_textbelt_error(c, &raw) }),
+    }
+}
+
+// ---- Self-contained direct-MX carrier-gateway SMS (no external provider) -------
+//
+// The zero-provider path: resolve each US carrier email-to-SMS gateway domain's
+// MX and speak minimal SMTP to deliver `<number>@<gateway>`. This ONLY reaches a
+// carrier from a node whose outbound :25 is open AND whose IP that carrier's MX
+// accepts. Cloud nodes block :25 entirely; the LA Mac nodes (fc-lax/fc-lax2,
+// residential egress) have :25 open and — proven live — US Cellular's
+// `email.uscc.net` MX accepts from them (a 909 US Cellular number that the
+// hosted-Textbelt + cloud-fallback paths could not reach now delivers). Major
+// carriers (Verizon/T-Mobile/AT&T) still block the residential IP by reputation,
+// so this is a best-effort blast: success = ANY gateway returns 2xx.
+
+/// US carrier email-to-SMS gateway domains (the live subset of typpo/textbelt's
+/// `providers.us` — dead carriers whose MX no longer resolves are dropped so a
+/// blast isn't dominated by NXDOMAIN noise; unknown-carrier sends still fan out
+/// to every listed gateway and the recipient's real carrier is whichever one
+/// accepts + delivers).
+const US_SMS_GATEWAYS: &[&str] = &[
+    "email.uscc.net",       // US Cellular  (proven accepting from fc-lax)
+    "vtext.com",            // Verizon
+    "tmomail.net",          // T-Mobile
+    "txt.att.net",          // AT&T
+    "sms.ntwls.net",        // Nextech
+    "msg.fi.google.com",    // Google Fi
+    "text.republicwireless.com",
+    "qwestmp.com",
+];
+
+/// Deliver ONE plaintext message to one carrier-gateway recipient over SMTP.
+/// Returns Ok on a 2xx to the final `.`; Err with the SMTP reason otherwise.
+async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let domain = to.split('@').nth(1).ok_or_else(|| format!("bad recipient {to}"))?;
+    // MX lookup (falls back to the domain itself as an implicit MX per RFC 5321).
+    let resolver = hickory_resolver::Resolver::builder_tokio()
+        .map_err(|e| format!("resolver init: {e}"))?
+        .build()
+        .map_err(|e| format!("resolver build: {e}"))?;
+    let host = match resolver.mx_lookup(domain).await {
+        Ok(lookup) => {
+            // Iterate the underlying records (the MxLookup deref-shadows a
+            // generic `iter`, so read MX rdata off the records directly), pick
+            // the lowest-preference exchange.
+            let mut mxs: Vec<(u16, String)> = lookup
+                .answers()
+                .iter()
+                .filter_map(|r| match &r.data {
+                    hickory_resolver::proto::rr::RData::MX(mx) => {
+                        Some((mx.preference, mx.exchange.to_utf8()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            mxs.sort_by_key(|(pref, _)| *pref);
+            mxs.into_iter().next().map(|(_, h)| h).ok_or_else(|| format!("no MX for {domain}"))?
+        }
+        Err(_) => return Err(format!("no MX for {domain}")),
+    };
+    let host = host.trim_end_matches('.').to_string();
+
+    let connect = tokio::time::timeout(
+        std::time::Duration::from_secs(6),
+        tokio::net::TcpStream::connect((host.as_str(), 25)),
+    )
+    .await
+    .map_err(|_| format!("connect timeout to {host}:25"))?
+    .map_err(|e| format!("connect {host}:25: {e}"))?;
+    let mut sock = connect;
+
+    // Read one SMTP reply line, bounded — a peer that accepts the TCP session
+    // but never replies (witnessed) must not hang the whole blast.
+    async fn read_reply(sock: &mut tokio::net::TcpStream, want: u8) -> Result<String, String> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 512];
+        loop {
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), sock.read(&mut chunk))
+                .await
+                .map_err(|_| "SMTP reply timeout".to_string())?
+                .map_err(|e| format!("read: {e}"))?;
+            if n == 0 {
+                return Err("connection closed".into());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            // A complete reply ends with a line whose 4th char is a space
+            // ("NNN " — final) rather than '-' (continuation).
+            if let Some(line) = String::from_utf8_lossy(&buf).lines().last().map(str::to_string) {
+                if line.len() >= 4 && line.as_bytes()[3] == b' ' {
+                    let code = &line[..3];
+                    if code.starts_with(want as char) {
+                        return Ok(line);
+                    }
+                    return Err(format!("SMTP {line}"));
+                }
+            }
+        }
+    }
+    async fn send_line(sock: &mut tokio::net::TcpStream, line: &str) -> Result<(), String> {
+        sock.write_all(format!("{line}\r\n").as_bytes())
+            .await
+            .map_err(|e| format!("write: {e}"))
+    }
+
+    let helo = std::env::var("SMS_HELO").unwrap_or_else(|_| "sms.shadw.cloud".into());
+    read_reply(&mut sock, b'2').await?; // greeting
+    send_line(&mut sock, &format!("HELO {helo}")).await?;
+    read_reply(&mut sock, b'2').await?;
+    send_line(&mut sock, &format!("MAIL FROM:<{from}>")).await?;
+    read_reply(&mut sock, b'2').await?;
+    send_line(&mut sock, &format!("RCPT TO:<{to}>")).await?;
+    read_reply(&mut sock, b'2').await?;
+    send_line(&mut sock, "DATA").await?;
+    read_reply(&mut sock, b'3').await?;
+    let body = format!(
+        "From: {from}\r\nTo: {to}\r\nSubject: \r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{text}\r\n."
+    );
+    send_line(&mut sock, &body).await?;
+    read_reply(&mut sock, b'2').await?;
+    let _ = send_line(&mut sock, "QUIT").await;
+    Ok(())
+}
+
+/// Best-effort direct-MX blast to every US carrier gateway concurrently.
+/// Ok if ANY gateway accepted (the recipient's real carrier is whichever one
+/// honors the number); Err with the first failure reason if none did.
+pub async fn send_direct_mx(phone: &str, message: &str) -> Result<(), String> {
+    // Bare 10-digit local number (gateways want no country code).
+    let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
+    let local = if digits.len() == 11 && digits.starts_with('1') { digits[1..].to_string() } else { digits };
+    if local.len() != 10 {
+        return Err(format!("not a US 10-digit number: {phone}"));
+    }
+    let from = std::env::var("SMS_FROM").unwrap_or_else(|_| "sms@shadw.cloud".into());
+    let from = from.rsplit('<').next().unwrap_or(&from).trim_end_matches('>').to_string();
+    let futs = US_SMS_GATEWAYS.iter().map(|gw| {
+        let to = format!("{local}@{gw}");
+        let from = from.clone();
+        let message = message.to_string();
+        async move { (to.clone(), smtp_deliver_one(&to, &from, &message).await) }
+    });
+    let results = futures::future::join_all(futs).await;
+    let accepted: Vec<&String> = results.iter().filter(|(_, r)| r.is_ok()).map(|(to, _)| to).collect();
+    if !accepted.is_empty() {
+        tracing::info!(?accepted, "direct-MX SMS accepted by carrier gateway(s)");
+        return Ok(());
+    }
+    let first_err = results
+        .iter()
+        .find_map(|(to, r)| r.as_ref().err().map(|e| format!("{to}: {e}")))
+        .unwrap_or_else(|| "no gateways attempted".into());
+    Err(first_err)
+}
+
+/// Direct-MX relay executor: run the direct-MX blast on THIS node (the caller
+/// chose it for its open :25 egress). Served by `/v1/push/sms-direct-mx`.
+pub async fn sms_direct_mx_exec(body: serde_json::Value) -> serde_json::Value {
+    let phone = body.get("phone").and_then(|v| v.as_str()).unwrap_or_default();
+    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+    if phone.is_empty() || message.is_empty() {
+        return serde_json::json!({ "success": false, "error": "missing phone/message" });
+    }
+    match send_direct_mx(phone, message).await {
+        Ok(()) => serde_json::json!({ "success": true }),
+        Err(e) => serde_json::json!({ "success": false, "error": e }),
     }
 }
 

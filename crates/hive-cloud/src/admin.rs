@@ -193,6 +193,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/push/sms", axum::routing::put(push_sms_put))
         .route("/v1/push/sms/verify", post(push_sms_verify))
         .route("/v1/push/sms-relay", put(push_sms_relay))
+        .route("/v1/push/sms-direct-mx", put(push_sms_direct_mx))
         .route("/v1/push/sms-key", post(push_sms_key_put))
         .route("/v1/push/test", post(push_test))
         // ---- Monitoring ----
@@ -6775,6 +6776,13 @@ async fn incidents_list(
 /// IP. Reached via `put_to_host` (HTTP admin in dev, gossip arm on the mesh).
 async fn push_sms_relay(State(c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
     Json(crate::push::sms_relay_exec(&c, v).await)
+}
+
+/// Direct-MX carrier-gateway SMS relay: run the direct-MX blast on THIS node
+/// (chosen by the caller for its open outbound :25). Same node-to-node relay
+/// shape as `/v1/push/sms-relay`; the leader forwards here to an NA-egress peer.
+async fn push_sms_direct_mx(State(_c): State<Arc<CloudState>>, Json(v): Json<Value>) -> Json<Value> {
+    Json(crate::push::sms_direct_mx_exec(v).await)
 }
 
 async fn forward_mutation_to_leader(
