@@ -707,6 +707,56 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
 /// as a no-op and caps attempts), so blanket rescheduling is safe. Jobs
 /// younger than the grace window are skipped: a just-claimed job legitimately
 /// lives outside the ZSET for the duration of its 307 trampoline chain.
+/// Deliver an orphaned workflow queue job to the app's `flow` endpoint FROM THE
+/// HOST NODE, bypassing the app's own in-cell dispatcher.
+///
+/// WHY this exists: the `@open-workflow/world-redis` dispatcher runs INSIDE the
+/// app cell and delivers each job by POSTing to the app's own PUBLIC url
+/// (`https://<app>/.well-known/workflow/v1/flow`). A cell cannot reliably reach
+/// its own public host — the per-cell NAT hairpin (cell → node's own public IP)
+/// is dropped — so that in-cell POST fails `RUNTIME_TUNNEL_FAILED`/`NOT_RETRYABLE`,
+/// the dispatcher drops the job, and the run stalls forever (witnessed live on
+/// shoomoo: 0×200 / N×502 from inside the cell while the SAME POST from a host
+/// node returns 200). A host-origin POST reaches the local edge without the
+/// hairpin, so the host CAN deliver what the cell can't. Delivery is idempotent
+/// (the flow handler keys on the msg id), so this racing a lucky in-cell attempt
+/// is safe. Returns true only on a 2xx ack. Single bounded attempt — the 60s
+/// reconcile cycle IS the retry cadence, so one slow/dead cell can't wedge the
+/// pass.
+async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str) -> bool {
+    let domain = cloud.apps_domain.trim().trim_start_matches('.');
+    if domain.is_empty() {
+        return false;
+    }
+    let url = format!("https://{project}.{domain}/.well-known/workflow/v1/flow?msg={msg_id}");
+    // A single app can spread across several cells that cold-start under load, so
+    // any one delivery attempt can transiently 502 (RUNTIME_TUNNEL_FAILED) while
+    // a sibling instance is warming — the SAME endpoint returns 200 moments later.
+    // A few spaced attempts catch a warm instance within that flap window instead
+    // of dropping the job back to the (broken) in-cell dispatcher for another 60s.
+    for attempt in 0..3u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1200 * attempt as u64)).await;
+        }
+        match cloud
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .timeout(std::time::Duration::from_secs(12))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => return true,
+            // A 404 means the app has no such job to run (already consumed, or its
+            // run is gone) — not deliverable, and retrying won't change that.
+            Ok(r) if r.status().as_u16() == 404 => return false,
+            _ => continue,
+        }
+    }
+    false
+}
+
 pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
     const GRACE_MS: u64 = 120_000;
     /// Reschedules before a persistently-undeliverable job is GC'd as poison.
@@ -721,6 +771,7 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
     static PREV_ORPHANS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
     let mut scanned = 0usize;
     let mut rescheduled = 0usize;
+    let mut delivered = 0usize;
     let projects: Vec<String> = cloud
         .projects
         .snapshot()
@@ -801,6 +852,18 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                     }
                 }
             }
+            // HOST-DELIVER FIRST: the app's in-cell dispatcher can't reach its
+            // own public url (NAT hairpin), so deliver the job from here — the
+            // host CAN reach the flow endpoint. On success the flow handler
+            // consumes the job; nothing to reschedule. Only if the host can't
+            // deliver either (cell genuinely down) do we fall through to the
+            // reschedule/poison path so the app dispatcher still gets a shot and
+            // a permanently-dead job still gets GC'd.
+            if deliver_orphan_job(cloud, &project, &msg_id).await {
+                delivered += 1;
+                tracing::info!(project = %project, msg_id = %msg_id, "world reconcile: delivered orphaned queue job from host (bypassing broken in-cell dispatch)");
+                continue;
+            }
             // Poison cap: a job this loop keeps having to rescue is not being
             // consumed by deliveries at all — stop churning it.
             let n = match cmd(cloud, &url, &token, &["HINCRBY", &format!("{p}:job:{msg_id}"), "reconcile_n", "1"]).await {
@@ -820,7 +883,7 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             }
         }
     }
-    (scanned, rescheduled)
+    (scanned, rescheduled + delivered)
 }
 
 /// Crockford-base32 ULID timestamp (first 10 chars → ms since epoch).
