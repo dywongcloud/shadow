@@ -1,5 +1,24 @@
 # Changelog
 
+## (pending) — Auto-deploy webhook-less git projects by polling the tracked branch
+
+`git push` silently never deployed for any project imported as a plain public
+repo URL (or whose owner never completed the GitHub connection): those have
+`git_ci == None` and no webhook, so GitHub never notifies the platform and the
+sole auto-deploy trigger (`admin::git_webhook`) never fires — with no visible
+error (no failed delivery, because no webhook object exists). This was the exact
+break for `shoomoo` (public repo `fatbearsk/serverless-clawdbot`, branch
+`xstate`: deployed `664328b` while HEAD was `e80e18c2`). Added
+`git::spawn_git_poll_reconcile`, a leader-only reconciler that polls each
+git-sourced project's tracked-branch HEAD with `git ls-remote` (host-agnostic,
+no GitHub REST rate limit, no credential for a public repo) and starts the same
+build the webhook would whenever HEAD has advanced past the deployed commit.
+Per-project SHA dedup (`CloudState::git_poll_seen`, seeded from the deployed
+commit) makes a push deploy exactly once and never lets the poller and a real
+webhook double-fire. Witnessed live: on rollout the leader auto-deployed six
+previously-stuck webhook-less projects, each exactly once, and left already-
+current projects (including the just-caught-up `shoomoo`) untouched.
+
 ## (pending) — Fix GitOps sync silently reading the wrong tenant + unbounded hang
 
 Production GitOps sync intermittently showed "GitOps sync failed / Failed to

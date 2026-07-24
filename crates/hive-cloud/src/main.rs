@@ -756,6 +756,12 @@ async fn main() -> anyhow::Result<()> {
     // `pending` forever — see world::reconcile_orphan_jobs.
     world::spawn_world_reconcile(cloud.clone());
 
+    // Auto-deploy git-sourced projects that have NO installed webhook by polling
+    // their tracked branch's HEAD (leader-only) — the credential-free path that
+    // makes `git push` deploy even when the owner's GitHub connection is dead or
+    // the project was imported as a plain public URL. See git::spawn_git_poll_reconcile.
+    git::spawn_git_poll_reconcile(cloud.clone());
+
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())
         .layer(axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline));

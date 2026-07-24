@@ -36,6 +36,23 @@ history).
   extend the prefix list for new providers rather than trusting the UI
   checkbox alone. Detail: `recall("secret-detection")`.
 
+## Deploys
+
+- `git push` auto-deploys through TWO independent triggers, never assume the
+  webhook is the only one. (1) The GitHub webhook (`admin::git_webhook`,
+  `/v1/git/webhook`) fires only when a hook was actually installed — a project
+  imported as a plain public repo URL, or whose owner never completed the
+  GitHub connection, has `git_ci == None` and NO hook, so GitHub never notifies
+  the platform. (2) `git::spawn_git_poll_reconcile` (leader-only, registered in
+  `main.rs`) covers exactly that gap: it polls every git-sourced project's
+  tracked-branch HEAD with `git ls-remote` and starts the SAME build the webhook
+  would whenever HEAD has advanced past the deployed commit. Both dedup on the
+  commit SHA (`CloudState::git_poll_seen`, seeded from the deployed commit) so a
+  push deploys exactly once regardless of which trigger sees it first — never
+  add a deploy path that bypasses that SHA check. A public repo needs no
+  credential; a private repo reuses `git_webhook`'s token resolution
+  (`github_app_auth` install token, else node `GITHUB_TOKEN`).
+
 ## Process
 
 - Git only via the `gm` skill's git verbs (`git_finalize`, `git_push`, etc.)

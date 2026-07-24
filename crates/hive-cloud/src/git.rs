@@ -4255,6 +4255,265 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
     }
 }
 
+// ===========================================================================
+// Webhook-less git auto-deploy: commit-polling reconciler.
+//
+// The GitHub webhook (`admin::git_webhook`) is the ONLY event-driven auto-deploy
+// trigger, and it only ever fires if a hook was actually installed on the repo.
+// A project imported as a plain public URL (the common "paste a repo URL" flow)
+// or whose owner never completed the GitHub OAuth/App connection gets NEITHER a
+// webhook NOR the Actions-workflow fallback (`git_ci == None`), so GitHub never
+// notifies us of a push and no `git push` ever deploys — with zero visible error
+// (no failed delivery, because no webhook object exists).
+//
+// This reconciler closes that gap WITHOUT any credential or owner action: it
+// polls each git-sourced project's tracked-branch HEAD with `git ls-remote` and
+// starts the SAME build the webhook would, whenever HEAD has advanced past the
+// deployed commit. It is the credential-free build-past for the chronically-dead
+// GitHub connection — for a public repo it needs nothing at all.
+// ===========================================================================
+
+/// Spawn the leader-only git commit-poll reconciler. See the module comment
+/// above. Cheap when nothing changed (one `ls-remote` per git project per tick,
+/// short-circuited by an in-memory SHA cache).
+pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
+    tokio::spawn(async move {
+        // Let the initial gossip / deployment-record sync settle so projects have
+        // a real deployed-commit baseline before the first poll (else a cold
+        // leader would treat every project as "unknown" at once).
+        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(90));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            // LEADER ONLY: exactly one node polls + deploys, mirroring every other
+            // reconciler's control-plane gate — otherwise each node would start the
+            // same build for the same push.
+            if !cloud.is_control_plane_leader() {
+                continue;
+            }
+            git_poll_cycle(&cloud).await;
+        }
+    });
+}
+
+/// One poll pass over every git-sourced project. Never panics: a per-project
+/// failure (unreachable remote, missing branch, auth failure) is logged at debug
+/// and skipped so it can't wedge the other projects or the loop.
+async fn git_poll_cycle(cloud: &Arc<CloudState>) {
+    let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
+    let mut n_git = 0u32; // git-sourced projects actually polled this cycle
+    let mut n_deployed = 0u32; // projects whose HEAD advanced -> build started
+    for project in projects {
+        // Fleet-aware source; skip non-git (zip `upload://`, image `image://`)
+        // and never-deployed / unbound projects.
+        let Some(src) = crate::admin::git_for_project_fleet(cloud, &project) else {
+            continue;
+        };
+        if !src.is_real_git() {
+            continue;
+        }
+        n_git += 1;
+        // Tracked branch: the project's production branch, else the deployment's
+        // own branch. Empty => nothing to poll.
+        let branch = {
+            let pb = cloud.projects.production_branch_of(&project);
+            if pb.is_empty() { src.branch.clone() } else { pb }
+        };
+        if branch.is_empty() {
+            continue;
+        }
+
+        // Token for a PRIVATE github repo (public repos need none): the same
+        // resolution `git_webhook` uses — a GitHub App installation token first,
+        // else a node-wide GITHUB_TOKEN. Carried into both the `ls-remote` read
+        // and the deploy request's clone.
+        let token = resolve_git_poll_token(&src.repo_url).await;
+
+        let head = match git_ls_remote_head(&src.repo_url, &branch, token.as_deref()).await {
+            Some(h) if !h.is_empty() => h,
+            // Branch not found / remote unreachable / auth failure: skip this
+            // cycle, retry next tick. Never treated as "no commit -> deploy".
+            _ => continue,
+        };
+
+        // Baseline: the in-memory last-seen SHA if we've observed this project
+        // before, else the currently-deployed commit. This is what makes the
+        // FIRST poll after a boot deploy shoomoo-style undeployed pushes (deployed
+        // != HEAD) while leaving already-current projects alone (deployed == HEAD).
+        let baseline = cloud
+            .git_poll_seen
+            .read()
+            .get(&project)
+            .cloned()
+            .unwrap_or_else(|| src.commit.clone());
+
+        if commit_eq(&head, &baseline) {
+            // Up to date: record HEAD so subsequent cycles are a cheap compare.
+            cloud.git_poll_seen.write().insert(project.clone(), head);
+            continue;
+        }
+
+        // A genuine advance. Don't stack on a build for this exact commit that's
+        // already in flight LOCALLY (best-effort — a build placed on a peer node
+        // isn't in this leader's list; the SHA-dedup below is the real guard).
+        let already_building = cloud.builds.list().iter().any(|b| {
+            b.project == project
+                && matches!(b.state, DeployState::Queued | DeployState::Building)
+                && commit_eq(&b.commit, &head)
+        });
+        // Record BEFORE enqueue so a slow build can't be re-enqueued next tick and
+        // a real webhook + this poller can't double-fire (whoever deploys HEAD
+        // first, the other sees deployed == HEAD and skips).
+        cloud.git_poll_seen.write().insert(project.clone(), head.clone());
+        if already_building {
+            continue;
+        }
+
+        let root_dir =
+            Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+        let req = GitDeployRequest {
+            repo_url: src.repo_url.clone(),
+            branch: Some(branch.clone()).filter(|b| !b.is_empty()),
+            // Pin the EXACT polled SHA (same race protection as the webhook path).
+            commit: Some(head.clone()),
+            head_repo_url: None, // polling only ever tracks the project's own repo
+            project: Some(project.clone()),
+            creator: Some("git-poll".into()),
+            production: true, // legacy field; classification uses target/branch
+            target: None,     // branch-classified: production branch => production
+            use_cache: true,
+            root_dir,
+            env: None, // env comes from the project store on a push redeploy
+            no_fanout: false, // coordinator deploy: schedule + fanout to placement
+            fanout_secondary: false,
+            build_config: None,
+            function_settings: None,
+            redeploy: false,
+            zip_b64: None,
+            image_ref: None,
+            image_port: None,
+            image_protocol: None,
+            image_memory: None,
+            image_cpus: None,
+            image_pids: None,
+            image_ports: None,
+            git_token: token,
+        };
+        let build_id = start_build(cloud.clone(), req);
+        let ev = cloud.event(
+            &cloud.region,
+            "DEPLOY",
+            &format!("{project}.localhost"),
+            "/",
+            200,
+            "git-poll",
+            &format!(
+                "git-poll {} {} @ {}",
+                src.repo_url,
+                branch,
+                head.chars().take(7).collect::<String>()
+            ),
+        );
+        cloud.record(ev);
+        tracing::info!(
+            project = %project,
+            repo = %src.repo_url,
+            branch = %branch,
+            commit = %head,
+            build = %build_id,
+            "git_poll: tracked branch advanced past the deployed commit — auto-deploy started (no webhook installed)"
+        );
+        n_deployed += 1;
+    }
+    tracing::debug!(
+        git_projects = n_git,
+        deployed = n_deployed,
+        "git_poll: cycle complete"
+    );
+}
+
+/// True when two commit strings refer to the same commit, tolerant of one being
+/// an abbreviated prefix of the other (a deployment record may store a short
+/// SHA while `ls-remote` returns the full 40-char one). Empty never matches.
+fn commit_eq(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let (long, short) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+    short.len() >= 7 && long.starts_with(short)
+}
+
+/// `git ls-remote <url> refs/heads/<branch>` → the branch HEAD SHA. Host-agnostic
+/// (github/gitlab/bitbucket/self-hosted) and free of GitHub's REST rate limit.
+/// Bounded by a hard timeout so a hung remote can't wedge the poll cycle, and it
+/// never prompts for credentials (a private repo without a token just fails and
+/// is skipped). Returns None on any failure or an absent branch.
+async fn git_ls_remote_head(repo_url: &str, branch: &str, token: Option<&str>) -> Option<String> {
+    let url = git_poll_authed_url(repo_url, token);
+    let fut = Command::new("git")
+        .arg("-c")
+        .arg("credential.helper=") // ignore any global credential helper
+        .arg("ls-remote")
+        .arg(&url)
+        .arg(format!("refs/heads/{branch}"))
+        .env("GIT_TERMINAL_PROMPT", "0") // never block on an interactive prompt
+        .output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(20), fut)
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Output line: "<sha>\trefs/heads/<branch>".
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|s| s.len() >= 7 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|s| s.to_string())
+}
+
+/// Inject a github token into an https github URL for a PRIVATE-repo read. Only
+/// `https://github.com/...` URLs are touched, so a token is never leaked to
+/// another forge; every other URL (public github, gitlab, self-hosted, ssh)
+/// passes through unchanged.
+fn git_poll_authed_url(repo_url: &str, token: Option<&str>) -> String {
+    match token {
+        Some(t) if !t.is_empty() && repo_url.starts_with("https://github.com/") => {
+            repo_url.replacen("https://", &format!("https://x-access-token:{t}@"), 1)
+        }
+        _ => repo_url.to_string(),
+    }
+}
+
+/// Token for polling/cloning a PRIVATE github repo: a GitHub App installation
+/// token (minted server-side, no user session) first, else a node-wide
+/// `GITHUB_TOKEN`. `None` for a public repo (or a non-github host) — nothing is
+/// needed there. Mirrors `git_webhook`'s own resolution so the two auto-deploy
+/// paths authenticate identically.
+async fn resolve_git_poll_token(repo_url: &str) -> Option<String> {
+    if !repo_url.starts_with("https://github.com/") {
+        return None;
+    }
+    if crate::github_app_auth::configured() {
+        let path = repo_url
+            .trim_start_matches("https://github.com/")
+            .trim_end_matches(".git");
+        if let Some((owner, repo)) = path.split_once('/') {
+            if let Ok(Some(tok)) =
+                crate::github_app_auth::installation_token_for_repo(owner, repo).await
+            {
+                return Some(tok);
+            }
+        }
+    }
+    std::env::var("GITHUB_TOKEN").ok().filter(|s| !s.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

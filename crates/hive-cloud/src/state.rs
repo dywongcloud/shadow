@@ -213,6 +213,13 @@ pub struct CloudState {
     /// that the placement scheduler placed on OTHER nodes (e.g. the default
     /// San-Jose placement), not just the ones this coordinator hosts locally.
     pub peer_deployments: RwLock<std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>>,
+    /// Per-project last-seen tracked-branch HEAD SHA for the webhook-less git
+    /// auto-deploy poller (`git::spawn_git_poll_reconcile`). Keyed by project.
+    /// Seeded from the deployed commit on first sight so an already-current
+    /// project never spuriously redeploys on boot; a value change is a real push.
+    /// Purely in-memory — after a leader restart/failover it re-baselines from
+    /// the deployment record, so it never double-deploys an already-built HEAD.
+    pub git_poll_seen: RwLock<std::collections::HashMap<String, String>>,
     /// This node's iroh P2P endpoint (real QUIC mesh transport), if bound. Used to
     /// dial peers and tunnel cross-node requests over QUIC (with HTTP fallback).
     pub iroh: RwLock<Option<hive_p2p::Endpoint>>,
@@ -553,6 +560,7 @@ impl CloudState {
             last_gossip_ok_ms: std::sync::atomic::AtomicU64::new(0),
             peer_routes: RwLock::new(std::collections::HashMap::new()),
             peer_deployments: RwLock::new(std::collections::HashMap::new()),
+            git_poll_seen: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),
             mesh: RwLock::new(None),
             relay_set: RwLock::new(None),
