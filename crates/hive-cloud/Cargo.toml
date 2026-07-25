@@ -108,6 +108,15 @@ hive-zkauth = { workspace = true, optional = true }
 rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
 
 [features]
-default = []
+# `zkauth` is DEFAULT-ON: it implements preview-deployment access protection
+# (the `#[cfg(feature="zkauth")]` `/_shadw/zk` bootstrap + `cookie_access`
+# member-unlock path in edge.rs, and the `/v1/zkauth/*` admin routes). It used
+# to be opt-in, which meant a plain `cargo build -p hive-cloud` (used for
+# routine fleet rebuilds) silently STRIPPED preview protection's unlock flow
+# fleet-wide — a recurring, security-relevant regression. Making it a default
+# feature closes that hole at the source: every ordinary build now ships it,
+# and there is no longer a build path that omits it by accident. Turn it off
+# only deliberately with `--no-default-features` (which no fleet build does).
+default = ["zkauth"]
 raft = ["dep:openraft"]
 zkauth = ["dep:hive-zkauth"]
