@@ -234,10 +234,11 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::microfrontends_api::routes())
         // ---- Platform-native Sandboxes (isolated on-demand Linux environments) ----
         .merge(crate::sandboxes_api::routes())
-        .with_state(cloud);
+        .with_state(cloud.clone());
     // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
-    let app = app.merge(crate::zkauth::routes());
+    let app = app.merge(crate::zkauth::routes(cloud.clone()));
+    let _ = &cloud;
     app
 }
 

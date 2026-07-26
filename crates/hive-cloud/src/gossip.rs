@@ -235,6 +235,19 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         "/v1/guardian/heads" => jb(crate::admin::guardian_heads(State(cloud.clone())).await),
         #[cfg(feature = "zkauth")]
         "/v1/zkauth/roster-export" => jb(crate::zkauth::roster_export().await),
+        // Mint a preview-membership proof ON THIS NODE for a peer that received
+        // the unlock request but doesn't serve the preview host. A ring proof
+        // only verifies against the exact ring it was signed over, so the mint
+        // has to happen where the verification will (see `zkauth::preview_proof`).
+        // Modelled as a GET because minting is idempotent, which lets it reuse
+        // the existing cross-node read helper rather than a new POST path.
+        #[cfg(feature = "zkauth")]
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/zkauth/mint") => {
+            let team = qparam(p, "team").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
+            let user = qparam(p, "user").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
+            let project = qparam(p, "project").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
+            jb(crate::zkauth::mint_rpc(&team, &user, &project).await)
+        }
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
         // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
         // since the iroh transport carries no HTTP headers.

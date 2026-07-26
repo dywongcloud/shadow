@@ -25,10 +25,154 @@ static KEY: OnceLock<LessSafeKey> = OnceLock::new();
 
 fn key() -> &'static LessSafeKey {
     KEY.get_or_init(|| {
-        let raw = load_or_create_key();
-        let unbound = UnboundKey::new(&CHACHA20_POLY1305, &raw).expect("valid 32-byte key");
+        let unbound = UnboundKey::new(&CHACHA20_POLY1305, raw_key()).expect("valid 32-byte key");
         LessSafeKey::new(unbound)
     })
+}
+
+/// The raw 32-byte key material behind [`key`], memoized separately so callers
+/// that need to DERIVE from it (rather than seal with it) don't re-read the env
+/// or the key file — `LessSafeKey` deliberately doesn't expose its bytes.
+fn raw_key() -> &'static [u8; 32] {
+    static RAW: OnceLock<[u8; 32]> = OnceLock::new();
+    RAW.get_or_init(load_or_create_key)
+}
+
+/// Key material for deriving *other* secrets deterministically (see
+/// `zkauth::derive_secret`). Sharing one key fleet-wide (`HIVE_SECRET_KEY`) is
+/// what lets every node derive an identical value for the same input — the
+/// property that makes derived data survive a request landing on any node.
+pub(crate) fn key_material() -> [u8; 32] {
+    *raw_key()
+}
+
+/// Keys that are no longer used for SEALING but must still be able to OPEN
+/// previously-sealed data.
+///
+/// `load_or_create_key` prefers `HIVE_SECRET_KEY` and only falls back to the
+/// persisted `secret.key` file. So the day that env var was introduced on an
+/// already-running node, every value sealed under the file key silently became
+/// undecryptable — `decrypt` returns its input unchanged on AEAD failure, so
+/// the damage surfaced as garbage `enc:v1:…` strings handed to callers rather
+/// than as an error. Measured on a live node before this fix: 56 of 61 sealed
+/// values could no longer be opened.
+///
+/// Keeping superseded keys as read-only openers makes rotation non-destructive:
+/// old data still reads, and because `encrypt` always seals with the CURRENT
+/// key, each value re-seals forward the next time it is written.
+fn legacy_keys() -> &'static Vec<[u8; 32]> {
+    static LEGACY: OnceLock<Vec<[u8; 32]>> = OnceLock::new();
+    LEGACY.get_or_init(|| {
+        let mut keys: Vec<[u8; 32]> = Vec::new();
+        let mut push = |k: [u8; 32]| {
+            if k != *raw_key() && !keys.contains(&k) {
+                keys.push(k);
+            }
+        };
+        // Explicitly-configured previous keys (comma-separated hex), for a
+        // deliberate rotation.
+        if let Ok(list) = std::env::var("HIVE_SECRET_KEY_OLD") {
+            for part in list.split(',') {
+                if let Some(k) = hex_to_32(part) {
+                    push(k);
+                }
+            }
+        }
+        // The persisted per-node key, which `HIVE_SECRET_KEY` supersedes when
+        // set — the exact case that broke this fleet.
+        if let Ok(s) = std::fs::read_to_string(crate::persist::data_dir().join("secret.key")) {
+            if let Some(k) = hex_to_32(&s) {
+                push(k);
+            }
+        }
+        keys
+    })
+}
+
+/// Open a sealed value, returning `None` when it genuinely cannot be opened.
+///
+/// [`decrypt`] has to stay lossy (it returns its input unchanged so values
+/// written before encryption existed still load), which makes "this is
+/// plaintext" and "this is ciphertext I can't open" indistinguishable to its
+/// callers. Anything that needs to TELL THE DIFFERENCE — an audit, a health
+/// check, a migration — must use this instead.
+pub(crate) fn try_decrypt(s: &str) -> Option<String> {
+    let b64 = s.strip_prefix(PREFIX)?;
+    let raw = B64.decode(b64).ok()?;
+    if raw.len() <= NONCE_LEN {
+        return None;
+    }
+    let (nonce_b, ct) = raw.split_at(NONCE_LEN);
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(nonce_b);
+    for opener in std::iter::once(key()).chain(legacy_openers()) {
+        let mut buf = ct.to_vec();
+        if let Ok(pt) = opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf) {
+            return Some(String::from_utf8_lossy(pt).into_owned());
+        }
+    }
+    None
+}
+
+/// Boot-time at-rest audit: how many sealed values on this node can no longer
+/// be opened by ANY key we hold.
+///
+/// This exists because the failure it detects is otherwise invisible. A key
+/// change orphans previously-sealed data, `decrypt` hands the raw ciphertext
+/// back to the caller instead of failing, and the app just receives a nonsense
+/// secret — no log line, no error, no health-check change. Counting the
+/// unopenable values at startup turns a silent, indefinite breakage into one
+/// loud line an operator can act on.
+pub(crate) fn audit_at_rest() {
+    let dir = crate::persist::data_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let (mut sealed, mut broken) = (0usize, 0usize);
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        for (i, _) in raw.match_indices(PREFIX) {
+            // The sealed token runs to the next non-base64 character.
+            let tail = &raw[i..];
+            let end = tail
+                .char_indices()
+                .skip(PREFIX.len())
+                .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '+' || *c == '/' || *c == '='))
+                .map(|(j, _)| j)
+                .unwrap_or(tail.len());
+            sealed += 1;
+            if try_decrypt(&tail[..end]).is_none() {
+                broken += 1;
+            }
+        }
+    }
+    if broken > 0 {
+        tracing::error!(
+            sealed,
+            broken,
+            dir = ?dir,
+            "at-rest secrets cannot be decrypted with any configured key — they were sealed under a \
+             superseded key. Set HIVE_SECRET_KEY_OLD to the previous key (comma-separated hex) so they \
+             can be read and re-sealed; until then these values are served as raw ciphertext."
+        );
+    } else if sealed > 0 {
+        tracing::info!(sealed, "at-rest secrets: all sealed values open cleanly");
+    }
+}
+
+/// Prepared AEAD openers for every superseded key, built once.
+fn legacy_openers() -> impl Iterator<Item = &'static LessSafeKey> {
+    static OPENERS: OnceLock<Vec<LessSafeKey>> = OnceLock::new();
+    OPENERS
+        .get_or_init(|| {
+            legacy_keys()
+                .iter()
+                .filter_map(|k| UnboundKey::new(&CHACHA20_POLY1305, k).ok().map(LessSafeKey::new))
+                .collect()
+        })
+        .iter()
 }
 
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
@@ -121,11 +265,18 @@ pub fn decrypt(s: &str) -> String {
     let (nonce_b, ct) = raw.split_at(NONCE_LEN);
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(nonce_b);
-    let mut buf = ct.to_vec();
-    match key().open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf) {
-        Ok(pt) => String::from_utf8_lossy(pt).into_owned(),
-        Err(_) => s.to_string(),
+    // Try the current key first, then any superseded key. Without the fallback,
+    // introducing `HIVE_SECRET_KEY` on a node that had been using its persisted
+    // `secret.key` silently orphaned everything sealed beforehand — the value
+    // fell through to the passthrough below and callers received the raw
+    // `enc:v1:…` ciphertext as if it were the secret.
+    for opener in std::iter::once(key()).chain(legacy_openers()) {
+        let mut buf = ct.to_vec();
+        if let Ok(pt) = opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf) {
+            return String::from_utf8_lossy(pt).into_owned();
+        }
     }
+    s.to_string()
 }
 
 #[cfg(test)]

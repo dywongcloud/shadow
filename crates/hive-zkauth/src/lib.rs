@@ -84,6 +84,19 @@ impl SecretKey {
             .map(SecretKey)
             .ok_or(Error::Malformed)
     }
+
+    /// Derive a key **deterministically** from 64 bytes of seed material (e.g.
+    /// a SHA-512 of some domain-separated identity string).
+    ///
+    /// Unlike [`SecretKey::from_bytes`], which requires an already-canonical
+    /// scalar and therefore rejects most raw hash outputs, this reduces the
+    /// wide input modulo the group order — so *any* 64 bytes yield a valid key
+    /// and the derivation can never fail. That makes it usable as a pure
+    /// function of an identity: the same seed always produces the same member
+    /// key, on any machine, with nothing to store or replicate.
+    pub fn from_seed(seed: &[u8; 64]) -> SecretKey {
+        SecretKey(Scalar::from_bytes_mod_order_wide(seed))
+    }
 }
 
 impl PublicKey {

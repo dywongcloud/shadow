@@ -386,6 +386,12 @@ async fn main() -> anyhow::Result<()> {
     // the very next `/v1/nodes/announce` gossip broadcast, no new RPC surface.
     registry.set_self_relay_url(own_relay_url.clone());
 
+    // Report any at-rest secret this node can no longer open. A key change
+    // orphans previously-sealed values silently (decrypt hands back the raw
+    // ciphertext rather than failing), so without this the breakage is
+    // invisible until an app misbehaves for unrelated-looking reasons.
+    crate::secrets::audit_at_rest();
+
     let cloud = CloudState::new(
         region.clone(),
         args.name.clone(),

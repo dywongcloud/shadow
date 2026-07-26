@@ -28,10 +28,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::{
     body::Body,
+    extract::State,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -40,6 +41,7 @@ use axum::{
 use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha512};
 
 use hive_zkauth::{prove, verify, Proof, PublicKey, Role, Roster, SecretKey};
 
@@ -57,9 +59,13 @@ struct Store {
 #[derive(Serialize, Deserialize, Clone)]
 struct MemberRec {
     user_id: String,
-    pubkey: String,      // hex
-    role: String,        // viewer|member|admin|owner
-    secret_sealed: String, // crate::secrets::encrypt(hex(secret))
+    pubkey: String, // hex — derived, see `derive_secret`
+    role: String,   // viewer|member|admin|owner
+    /// DEAD FIELD, retained only so rosters written by the old scheme still
+    /// deserialize. Member secrets are derived now (never stored), so this is
+    /// always written empty and never read; see [`derive_secret`] for why.
+    #[serde(default)]
+    secret_sealed: String,
 }
 
 fn store_path() -> PathBuf {
@@ -202,24 +208,74 @@ pub fn ingest_peer_export(v: &Value) {
 
 // ----------------------------- core ops -----------------------------
 
-/// Idempotently ensure a member has a ZK key enrolled in the team roster.
+/// Domain separator for member-key derivation.
+const KEY_DOMAIN: &[u8] = b"hive/zkauth/v1/member-key";
+
+/// Derive a member's ZK secret **deterministically** from the fleet-shared
+/// at-rest key plus their `(team, user_id)`.
+///
+/// This replaces the original design, which generated a *random* secret per
+/// member and stored it sealed in the enrolling node's `zkauth.json`. Storing
+/// it had two failure modes that both ended with a legitimate member being told
+/// their own preview was private:
+///
+/// 1. **Node affinity.** The sealed secret only ever existed on whichever node
+///    happened to serve the enrollment. The dashboard reaches the fleet through
+///    a round-robin address, so the follow-up mint request routinely landed on
+///    a different node, which had no key and answered 404.
+/// 2. **Silent staleness.** If the at-rest key changed, every previously-sealed
+///    secret became undecryptable — and because enrollment short-circuited on
+///    the still-parseable *public* key, re-registering could never repair it.
+///    Affected members were locked out permanently, with no operator signal.
+///
+/// Deriving instead of storing removes both at the root: there is nothing to
+/// replicate and nothing that can go stale. Every node computes the same key
+/// for the same member, so any node can mint, and the public key becomes a pure
+/// function of the identity. Security is unchanged — anyone holding the at-rest
+/// key could already open every sealed secret.
+fn derive_secret(team: &str, user_id: &str) -> SecretKey {
+    let mut h = Sha512::new();
+    h.update(KEY_DOMAIN);
+    h.update(crate::secrets::key_material());
+    // Length-prefix each field so ("ab","c") and ("a","bc") can't collide.
+    h.update((team.len() as u64).to_le_bytes());
+    h.update(team.as_bytes());
+    h.update((user_id.len() as u64).to_le_bytes());
+    h.update(user_id.as_bytes());
+    let mut seed = [0u8; 64];
+    seed.copy_from_slice(&h.finalize());
+    SecretKey::from_seed(&seed)
+}
+
+/// Idempotently ensure a member's roster row matches their derived key.
+///
+/// Because the key is derived rather than generated, this is really "reconcile
+/// the row with the derivation" — which is what silently REPAIRS rows left by
+/// the old random-secret scheme (or sealed under a superseded at-rest key).
+/// A previously locked-out member is healed the next time they unlock, with no
+/// migration step and no operator action.
 fn ensure_member(team: &str, user_id: &str, role: Role) -> PublicKey {
+    let pk = derive_secret(team, user_id).public();
+    let pk_hex = hex(&pk.to_bytes());
     let mut s = store().lock().unwrap();
     let members = s.teams.entry(team.to_string()).or_default();
-    if let Some(m) = members.iter().find(|m| m.user_id == user_id) {
-        if let Some(pk) = unhex(&m.pubkey).and_then(|b| arr32(&b)).and_then(|a| PublicKey::from_bytes(&a).ok()) {
-            return pk;
+    match members.iter_mut().find(|m| m.user_id == user_id) {
+        // Already reconciled — don't rewrite the file on every unlock.
+        Some(m) if m.pubkey == pk_hex && m.secret_sealed.is_empty() => return pk,
+        // Present but stale: rewrite in place so the ring converges on the
+        // derived key. The existing role is preserved — enrollment must never
+        // silently demote an admin/owner to member.
+        Some(m) => {
+            m.pubkey = pk_hex;
+            m.secret_sealed = String::new();
         }
+        None => members.push(MemberRec {
+            user_id: user_id.to_string(),
+            pubkey: pk_hex,
+            role: role_name(role).to_string(),
+            secret_sealed: String::new(),
+        }),
     }
-    let sk = SecretKey::generate();
-    let pk = sk.public();
-    members.retain(|m| m.user_id != user_id);
-    members.push(MemberRec {
-        user_id: user_id.to_string(),
-        pubkey: hex(&pk.to_bytes()),
-        role: role_name(role).to_string(),
-        secret_sealed: crate::secrets::encrypt(&hex(&sk.to_bytes())),
-    });
     save(&s);
     pk
 }
@@ -231,12 +287,21 @@ fn bucket() -> u64 {
 
 /// Mint an anonymous membership proof for `project` on behalf of `user_id`'s key.
 /// Uses the role-≥-viewer ring (everyone), so the proof reveals only "a member".
+///
+/// The caller (the dashboard's unlock route) has already verified real team
+/// membership before we get here, so a member this node hasn't seen before is
+/// enrolled on the spot rather than rejected: with a derived key, "not enrolled
+/// on THIS node" is a bookkeeping gap, never a reason a legitimate member can't
+/// be served. That is what makes the flow survive a request landing on any node.
 fn mint(team: &str, user_id: &str, project: &str) -> Option<(String, String)> {
-    let s = store().lock().unwrap();
-    let rec = s.teams.get(team)?.iter().find(|m| m.user_id == user_id)?.clone();
-    let secret_hex = crate::secrets::decrypt(&rec.secret_sealed);
-    let sk = SecretKey::from_bytes(&arr32(&unhex(&secret_hex)?)?).ok()?;
-    let ring = roster_of(team, &s).ring(Role::Viewer);
+    let sk = derive_secret(team, user_id);
+    // Enroll first (own lock), so the ring we sign over contains our key and
+    // peers pick it up through the existing roster gossip.
+    ensure_member(team, user_id, Role::Member);
+    let ring = {
+        let s = store().lock().unwrap();
+        roster_of(team, &s).ring(Role::Viewer)
+    };
     let scope = format!("{SCOPE_PREFIX}{project}");
     let message = bucket().to_string();
     let proof = prove(&sk, &ring, scope.as_bytes(), message.as_bytes()).ok()?;
@@ -326,7 +391,7 @@ pub fn bootstrap(cloud: &std::sync::Arc<crate::state::CloudState>, host: &str, q
 }
 
 /// Minimal percent-decoding for the `next` redirect target.
-fn urldecode(s: &str) -> String {
+pub(crate) fn urldecode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -346,12 +411,59 @@ fn urldecode(s: &str) -> String {
 
 // ----------------------------- admin routes -----------------------------
 
-pub fn routes() -> Router {
+pub fn routes(cloud: Arc<crate::state::CloudState>) -> Router {
     Router::new()
         .route("/v1/zkauth/register", post(register))
         .route("/v1/zkauth/preview-proof", post(preview_proof))
         .route("/v1/zkauth/roster", get(roster))
         .route("/v1/zkauth/roster-export", get(roster_export))
+        .with_state(cloud)
+}
+
+/// Mint on behalf of a peer that received the unlock request but doesn't serve
+/// the preview host — the mesh half of [`preview_proof`]'s co-location rule.
+pub(crate) async fn mint_rpc(team: &str, user_id: &str, project: &str) -> Json<Value> {
+    match mint(team, user_id, project) {
+        Some((proof, message)) => Json(json!({ "proof": proof, "message": message, "team": team })),
+        None => Json(json!({ "error": "could not construct a membership proof" })),
+    }
+}
+
+/// Percent-encode a value for the mesh query string (mint is forwarded as a GET
+/// so it can reuse the existing cross-node helper).
+fn pctenc(s: &str) -> String {
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// Ask the node that actually serves `host` to mint the proof.
+///
+/// A ring signature only verifies against the EXACT ring it was signed over,
+/// and every node's ring is its own roster unioned with whichever peers it
+/// reached in the last gossip cycle — a set that legitimately differs across
+/// the fleet (observed live: rings of 10, 22 and 26 members on different
+/// nodes). Minting where the proof will be VERIFIED makes the two rings the
+/// same object by construction, instead of depending on global convergence.
+async fn mint_on_owner(cloud: &Arc<crate::state::CloudState>, team: &str, req: &ProveReq) -> Option<Value> {
+    let bare = req.host.split(':').next().unwrap_or(&req.host);
+    let sub = bare.split('.').next().unwrap_or(bare).to_string();
+    let node = {
+        let routes = cloud.peer_routes.read();
+        let rs = routes.get(&sub)?;
+        rs.iter().find(|r| r.healthy).or_else(|| rs.first()).map(|r| r.node_id.clone())?
+    };
+    let path = format!(
+        "/v1/zkauth/mint?team={}&user={}&project={}",
+        pctenc(team),
+        pctenc(&req.user_id),
+        pctenc(&req.project),
+    );
+    let v = crate::admin::fetch_from_host(cloud, &node, &path, team).await?;
+    v.get("proof").is_some().then_some(v)
 }
 
 /// Node-to-node: this node's local public roster, for mesh replication so peers
@@ -407,15 +519,36 @@ async fn register(headers: HeaderMap, Json(req): Json<RegisterReq>) -> Result<Js
 struct ProveReq {
     user_id: String,
     project: String,
+    /// The preview host being unlocked. Optional so older callers still work,
+    /// but supplying it is what lets the mint be co-located with the verifier
+    /// (see [`mint_on_owner`]) instead of landing on an arbitrary node.
+    #[serde(default)]
+    host: String,
 }
-async fn preview_proof(headers: HeaderMap, Json(req): Json<ProveReq>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn preview_proof(
+    State(cloud): State<Arc<crate::state::CloudState>>,
+    headers: HeaderMap,
+    Json(req): Json<ProveReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     if !internal_ok(&headers) {
         return Err((StatusCode::FORBIDDEN, "proof minting is server-only".into()));
     }
     let team = team_of(&headers);
+    // The dashboard reaches the fleet through a round-robin address, so this
+    // request lands on an arbitrary node — which is usually NOT the node that
+    // serves the preview and will verify the proof. Hand the mint to that node.
+    if !req.host.is_empty() && !cloud.gw.serves_host(&req.host) {
+        if let Some(v) = mint_on_owner(&cloud, &team, &req).await {
+            return Ok(Json(v));
+        }
+    }
     match mint(&team, &req.user_id, &req.project) {
         Some((proof, message)) => Ok(Json(json!({ "proof": proof, "message": message, "team": team }))),
-        None => Err((StatusCode::NOT_FOUND, "no membership key for this user/team".into())),
+        // Enrollment is now unconditional, so this is no longer "we don't know
+        // you" (which used to surface as a misleading 404) — reaching here means
+        // proof construction itself failed, which is a server fault, not a
+        // missing membership.
+        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "could not construct a membership proof".into())),
     }
 }
 
