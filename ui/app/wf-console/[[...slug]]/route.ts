@@ -231,12 +231,39 @@ async function handle(req: Request): Promise<Response> {
   // stale-while-revalidate here.
   const h = new Headers(resp.headers);
   h.set("Cache-Control", "private, no-store, max-age=0, must-revalidate");
+
+  // The console is embedded in an iframe on /workflows, where the PLATFORM
+  // shell already paints the page background. Its own document background would
+  // sit on top of that and read as an opaque panel, so make the embedded
+  // document transparent and let the platform background show through.
+  //
+  // Done here rather than in scripts/patch-wf-console.mjs so it needs no
+  // rebuild of the vendored bundle, and gated strictly on `text/html`: the RPC
+  // responses are CBOR and `/api/stream/*` is SSE — buffering either would
+  // corrupt the payload or stall the stream.
+  if ((resp.headers.get("content-type") || "").includes("text/html")) {
+    const html = await resp.text();
+    const injected = html.includes("</head>")
+      ? html.replace("</head>", `${TRANSPARENT_EMBED_CSS}</head>`)
+      : TRANSPARENT_EMBED_CSS + html;
+    h.delete("content-length"); // body length changed
+    return new Response(injected, { status: resp.status, statusText: resp.statusText, headers: h });
+  }
   return new Response(resp.body, {
     status: resp.status,
     statusText: resp.statusText,
     headers: h,
   });
 }
+
+/// Transparent-background override for the embedded console document. Scoped to
+/// the document surfaces only (html/body and the app's own root element) —
+/// deliberately NOT a blanket override of the `bg-background` utility, which the
+/// console also uses for real surfaces like cards and the sticky header that
+/// SHOULD stay filled.
+const TRANSPARENT_EMBED_CSS =
+  '<style id="hive-transparent-embed">html,body{background:transparent !important}' +
+  "body>#root,body>div[data-reactroot],body>div:first-of-type{background:transparent !important}</style>";
 
 export async function GET(req: Request) {
   return handle(req);

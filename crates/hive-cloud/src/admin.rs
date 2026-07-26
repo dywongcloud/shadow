@@ -3999,6 +3999,11 @@ async fn relay_stats(
                     "api_errors": crate::vercel_dns::STATS.api_errors.load(std::sync::atomic::Ordering::Relaxed),
                     "empty_set_blocks": crate::vercel_dns::STATS.empty_set_blocks.load(std::sync::atomic::Ordering::Relaxed),
                     "per_name_holds": crate::vercel_dns::STATS.per_name_holds.load(std::sync::atomic::Ordering::Relaxed),
+                    // Host labels currently pinned straight to their owning node
+                    // (deployment affinity) rather than falling through to the
+                    // all-nodes wildcard — 0 means every request is still a coin
+                    // flip across the fleet.
+                    "affinity_records": crate::vercel_dns::STATS.affinity_records.load(std::sync::atomic::Ordering::Relaxed),
                     "last_pass_ms": crate::vercel_dns::STATS.last_pass_ms.load(std::sync::atomic::Ordering::Relaxed),
                 },
                 // ACME/TLS state: which zones have an installed certificate.

@@ -197,6 +197,108 @@ pub fn desired_apps(nodes: &[PublishNode]) -> Vec<DesiredRecord> {
     out
 }
 
+/// True for an immutable per-commit alias like `myapp-c7416ec` — a URL minted
+/// once per build that nobody navigates to twice.
+///
+/// These dominate the alias set the same way `dpl-*` does (one live node carried
+/// 211 aliases: 96 `dpl-*` and most of the rest per-commit), so pinning them
+/// would spend the whole Vercel create budget on URLs that are visited once,
+/// starving the aliases people actually use. They keep the wildcard's all-nodes
+/// behaviour, so they still resolve — only the affinity optimisation skips them.
+///
+/// `*-git-<branch>` is explicitly NOT a commit alias: it's the stable
+/// per-branch preview URL and is worth pinning. A project genuinely named
+/// `foo-abc123` would be skipped here, which is harmless — it just keeps the
+/// pre-existing wildcard behaviour rather than gaining the optimisation.
+fn is_commit_alias(label: &str) -> bool {
+    if label.contains("-git-") {
+        return false;
+    }
+    match label.rsplit_once('-') {
+        Some((prefix, tail)) => {
+            !prefix.is_empty()
+                && (6..=12).contains(&tail.len())
+                && tail.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => false,
+    }
+}
+
+/// Deployment-affinity records for the APPS zone: one **specific** A/AAAA per
+/// served host label pointing at the node that actually hosts it.
+///
+/// Why: the wildcard `*.{apps}` resolves to EVERY publishable node, so a client
+/// reached the owning node only 1-in-N times and otherwise paid a cross-node
+/// forward — measured at +41ms within a region and up to +380ms from Bangkok to
+/// San Jose. A specific record beats the wildcard in DNS, so publishing
+/// `<label> → owner` sends the client straight to the right region and node and
+/// the forward simply doesn't happen. The wildcard stays as the fallback (and
+/// for TLS coverage) so an unknown or just-created label still resolves.
+///
+/// This is the same shape already proven for the DB zone (`<slug>` → the node
+/// holding that database's container), reused rather than reinvented.
+///
+/// `owners` is `(label, node_name)`; later duplicates for a label are ignored so
+/// the caller controls precedence (local first, then peers). Only single-label
+/// names are emitted — a value carrying dots would create a record in the wrong
+/// place. `cap` bounds how many specific records we publish, because Vercel
+/// rate-limits record creation per call; ordering is sorted so the set that
+/// survives the cap is stable across passes instead of flapping.
+pub fn desired_apps_affinity(
+    owners: &[(String, String)],
+    nodes: &[PublishNode],
+    cap: usize,
+) -> (Vec<DesiredRecord>, Vec<String>) {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (label, node) in owners {
+        // Normalise to the FIRST DNS label: `served_hosts()` keys are already
+        // bare labels, but a full host slipping in must not become a record
+        // named `app.example.com` inside the apps zone.
+        let label = label.split(':').next().unwrap_or(label);
+        let label = label.split('.').next().unwrap_or(label).trim().to_ascii_lowercase();
+        if label.is_empty() || label == "*" || label == "www" {
+            continue;
+        }
+        // Skip immutable per-deployment URLs (`dpl-<id>`). Every deployment ever
+        // made owns one, so they dominate the alias set by an order of magnitude
+        // — publishing them burned the Vercel create budget (live-observed:
+        // `create shadw.app A dpl-198f8dbaff: 429 Too Many Requests`) and
+        // starved the aliases people actually visit. They keep the wildcard's
+        // all-nodes behaviour, which is correct: a one-off build URL is not
+        // worth a record, and it still resolves.
+        if label.starts_with("dpl-") || is_commit_alias(&label) {
+            continue;
+        }
+        if !seen.insert(label.clone()) {
+            continue; // first writer wins (caller-ordered precedence)
+        }
+        pairs.push((label, node.clone()));
+    }
+    pairs.sort();
+    pairs.truncate(cap);
+
+    let mut out = Vec::new();
+    let mut managed = Vec::new();
+    for (label, node) in pairs {
+        // Only a PUBLISHABLE node may be named: pointing a specific record at an
+        // unhealthy/NAT'd node would be strictly worse than the wildcard, since
+        // the specific record wins and the client would have no other answer.
+        let Some(n) = nodes.iter().find(|n| n.name == node) else { continue };
+        if n.ip4.is_none() && n.ip6.is_none() {
+            continue;
+        }
+        managed.push(label.clone());
+        if let Some(ip) = &n.ip4 {
+            out.push(DesiredRecord { name: label.clone(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+        }
+        if let Some(ip) = &n.ip6 {
+            out.push(DesiredRecord { name: label.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+        }
+    }
+    (out, managed)
+}
+
 /// Desired records for the PLATFORM zone: `api.` (TTL 60, all publishable
 /// nodes) + `relay.`/`discovery.` (TTL 300, from env IP lists — those services
 /// run on operator-chosen nodes, not every gateway).
@@ -306,6 +408,10 @@ pub struct ReconcilerStats {
     pub api_errors: AtomicU64,
     pub empty_set_blocks: AtomicU64,
     pub per_name_holds: AtomicU64,
+    /// How many deployment-affinity records the last pass published — i.e. how
+    /// many host labels currently resolve straight to their owning node instead
+    /// of falling through to the all-nodes wildcard.
+    pub affinity_records: AtomicU64,
     pub last_pass_ms: AtomicU64,
 }
 
@@ -316,8 +422,22 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     api_errors: AtomicU64::new(0),
     empty_set_blocks: AtomicU64::new(0),
     per_name_holds: AtomicU64::new(0),
+    affinity_records: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
 };
+
+/// Upper bound on deployment-affinity records. Vercel rate-limits record
+/// creation, and the wildcard already guarantees every label resolves — so the
+/// cap degrades gracefully (labels beyond it just keep the old all-nodes
+/// behaviour) instead of stalling the whole reconcile pass. Deliberately modest:
+/// a first attempt at 200 (including per-deployment `dpl-*` URLs) produced a
+/// sustained 429 storm that aborted every pass before it converged.
+const APPS_AFFINITY_CAP: usize = 60;
+
+/// Delay between record creates. The Vercel DNS API rate-limits creates
+/// individually, so an unpaced burst 429s partway through and the pass makes no
+/// progress at all.
+const CREATE_PACING: std::time::Duration = std::time::Duration::from_millis(1100);
 
 fn env_ips(key: &str) -> Vec<String> {
     std::env::var(key)
@@ -415,16 +535,56 @@ async fn reconcile_zone<A: DnsApi>(
     if creates.is_empty() && deletes.is_empty() {
         return Ok(()); // converged — write nothing
     }
-    for rec in &creates {
-        api.create(domain, rec).await?;
-        STATS.creates.fetch_add(1, Ordering::Relaxed);
+    // Creates are PACED and individually fault-tolerant. Previously this was a
+    // tight `api.create(...).await?` loop: the first rate-limited create aborted
+    // the whole pass, so a zone needing more creates than the API budget allowed
+    // could never converge — every pass re-failed at the same point, made zero
+    // progress, and pushed the reconciler into backoff, which also delayed the
+    // other zones sharing this task. Now each failure is recorded and the loop
+    // continues, so every pass lands whatever it can and the remainder is picked
+    // up next pass; the pass still reports failure at the end so the caller's
+    // backoff (and the error log) still happen.
+    let mut failed: Option<anyhow::Error> = None;
+    let mut created = 0usize;
+    for (i, rec) in creates.iter().enumerate() {
+        if i > 0 {
+            tokio::time::sleep(CREATE_PACING).await;
+        }
+        match api.create(domain, rec).await {
+            Ok(_) => {
+                created += 1;
+                STATS.creates.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(%domain, name = %rec.name, rtype = %rec.rtype, error = %e, "DNS create failed; continuing (retried next pass)");
+                if failed.is_none() {
+                    failed = Some(e);
+                }
+            }
+        }
+    }
+    if created > 0 {
+        tracing::info!(%domain, created, remaining = creates.len() - created, "DNS reconciler: records created");
     }
     for id in &deletes {
-        api.delete(domain, id).await?;
+        // Same fault-tolerance as creates: one failed delete must not abort the
+        // pass and strand the rest (deletes are also rate-limited).
+        if let Err(e) = api.delete(domain, id).await {
+            tracing::warn!(%domain, id = %id, error = %e, "DNS delete failed; continuing (retried next pass)");
+            if failed.is_none() {
+                failed = Some(e);
+            }
+            continue;
+        }
         STATS.deletes.fetch_add(1, Ordering::Relaxed);
     }
+    if let Some(e) = failed {
+        // Partial progress already landed; surface the failure so the caller
+        // backs off and the operator sees it.
+        return Err(e);
+    }
     let published: Vec<String> = desired.iter().map(|r| format!("{} {} {}", r.name, r.rtype, r.value)).collect();
-    tracing::info!(%domain, created = creates.len(), deleted = deletes.len(), published = ?published, "DNS reconciled");
+    tracing::info!(%domain, created = created, deleted = deletes.len(), published = ?published, "DNS reconciled");
     Ok(())
 }
 
@@ -493,12 +653,37 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let publish = publishable(&nodes, &mut streaks);
             let relay_ips = env_ips("HIVE_RELAY_IPS");
             let discovery_ips = env_ips("HIVE_DISCOVERY_IPS");
-            let apps = desired_apps(&publish);
+            let mut apps = desired_apps(&publish);
+            // Deployment affinity: point each served label straight at its host
+            // node so a client lands on the owner instead of a random node that
+            // then has to forward. Local aliases first (authoritative for what
+            // WE serve), then the gossiped peer route table — first writer wins,
+            // so a host we serve is never attributed to a peer.
+            let mut owners: Vec<(String, String)> =
+                cloud.gw.served_hosts().into_iter().map(|h| (h, cloud.node_name.clone())).collect();
+            {
+                let routes = cloud.peer_routes.read();
+                for (label, rs) in routes.iter() {
+                    // Lowest-latency healthy route wins when several nodes serve
+                    // the same label (replicas): that is the best single answer
+                    // we can give, and the wildcard still covers the rest.
+                    if let Some(best) = rs.iter().filter(|r| r.healthy).min_by_key(|r| r.latency_ms) {
+                        owners.push((label.clone(), best.node_id.clone()));
+                    }
+                }
+            }
+            let (affinity, affinity_names) = desired_apps_affinity(&owners, &publish, APPS_AFFINITY_CAP);
+            let affinity_count = affinity_names.len();
+            apps.extend(affinity);
+            let mut apps_managed: Vec<String> = vec!["*".into(), String::new()];
+            apps_managed.extend(affinity_names);
+            let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
+            STATS.affinity_records.store(affinity_count as u64, Ordering::Relaxed);
             let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
             let platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard);
 
             let mut ok = true;
-            if let Err(e) = reconcile_zone(&api, &cloud.apps_domain, &apps, &["*", ""], &cloud).await {
+            if let Err(e) = reconcile_zone(&api, &cloud.apps_domain, &apps, &apps_managed_refs, &cloud).await {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.apps_domain, "DNS reconcile failed");
                 ok = false;

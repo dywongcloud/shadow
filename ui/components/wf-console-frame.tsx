@@ -212,10 +212,14 @@ export function WfConsoleFrame({
   return (
     <div
       ref={wrapRef}
+      // No background of its own: the platform shell already paints the page
+      // background, and repainting it here (previously `bg-bg` on both layouts)
+      // stacked a second opaque surface over it — so the console read as a flat
+      // panel instead of sitting on the platform background.
       className={
         bleed
-          ? "-mx-4 -my-8 sm:-mx-6 overflow-hidden bg-bg"
-          : "overflow-hidden rounded-xl border border-border bg-bg"
+          ? "-mx-4 -my-8 sm:-mx-6 overflow-hidden bg-transparent"
+          : "overflow-hidden rounded-xl border border-border bg-transparent"
       }
     >
       {frameName ? (
@@ -224,8 +228,12 @@ export function WfConsoleFrame({
           src={src}
           name={frameName}
           title="Workflow console"
-          className="block w-full border-0"
-          style={{ height }}
+          className="block w-full border-0 bg-transparent"
+          // A transparent wrapper is not enough: the iframe element itself
+          // paints the browser default canvas unless told not to, which would
+          // still cover the platform background behind it.
+          style={{ height, background: "transparent" }}
+          allowTransparency
           // Defer the console's own resource load until the frame is near the
           // viewport — a real win for the project-tab embed (where the frame
           // can sit below the fold); on the full-page /workflows view it's
