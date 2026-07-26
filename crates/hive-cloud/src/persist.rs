@@ -40,6 +40,10 @@ pub struct PlatformSnapshot {
     pub projects: HashMap<String, ProjectSettings>,
     #[serde(default)]
     pub waf_rules: Vec<WafRule>,
+    /// L7 rate-limit config (enabled, limit, window_ms). Held in-process as
+    /// atomics, so without this the setting silently vanished on every restart.
+    #[serde(default)]
+    pub ratelimit: Option<(bool, u32, u64)>,
     #[serde(default)]
     pub cron: Vec<CronJob>,
     #[serde(default)]
@@ -324,6 +328,10 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         deployments: cloud.gw.deployment_records(),
         projects: cloud.projects.snapshot(),
         waf_rules: cloud.waf.rules(),
+        ratelimit: {
+            let s = cloud.ratelimit.stats();
+            Some((s.enabled, s.limit, s.window_ms))
+        },
         cron: cloud.cron.list(),
         redirects: cloud.router.redirects(),
         rewrites: cloud.router.rewrites(),
@@ -544,6 +552,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     );
     if !snap.waf_rules.is_empty() {
         cloud.waf.set_rules(snap.waf_rules);
+    }
+    if let Some((enabled, limit, window_ms)) = snap.ratelimit {
+        cloud.ratelimit.set(enabled, limit, window_ms);
     }
     // replace_all (deduped by id), NOT add() in a loop: add() pushes
     // unconditionally, so a snapshot that already carried a job — and every

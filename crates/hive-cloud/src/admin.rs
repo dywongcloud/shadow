@@ -2932,7 +2932,9 @@ fn fleet_deployments_all(c: &Arc<CloudState>) -> Vec<Value> {
 /// actually ran on the Firecracker nodes. Each `FunctionStats` carries its `tenant`.
 pub async fn fleet_function_stats(c: &Arc<CloudState>) -> Vec<fluid_compute::FunctionStats> {
     let mut out: Vec<fluid_compute::FunctionStats> = c.fluid.stats();
-    for v in fan_out_peers(c, &all_healthy_peers(c), "", "/v1/functions").await {
+    // `local=true` is REQUIRED now that `/v1/functions` fans out itself —
+    // without it each peer would re-fan to every other peer.
+    for v in fan_out_peers(c, &all_healthy_peers(c), "", "/v1/functions?local=true").await {
         if let Ok(mut stats) = serde_json::from_value::<Vec<fluid_compute::FunctionStats>>(v) {
             out.append(&mut stats);
         }
@@ -3907,9 +3909,46 @@ pub async fn functions(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::extract::Query(q): axum::extract::Query<LocalQ>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let list: Vec<_> = c.fluid.stats().into_iter().filter(|f| norm(&f.tenant) == t).collect();
+    // `fleet_function_stats` (the billing meter) reads this endpoint on every
+    // peer over a signed node-to-node delegation with an EMPTY tenant, which
+    // `resolve_tenant` maps to "personal" — so the meter was only ever counting
+    // each peer's personal-tenant functions and silently UNDER-COUNTING org
+    // compute. A verified `service` delegation asking for its own local slice is
+    // the internal aggregation path, so it gets the unfiltered view; everything
+    // else stays tenant-scoped exactly as before.
+    let internal = claims.as_ref().map(|e| e.0.role == "service").unwrap_or(false);
+    let mut list: Vec<Value> = c
+        .fluid
+        .stats()
+        .into_iter()
+        .filter(|f| (internal && q.local == Some(true)) || norm(&f.tenant) == t)
+        .map(|f| json!(f))
+        .collect();
+    // `c.fluid` is THIS node's in-process runtime, but functions run wherever
+    // the placement scheduler put them — so the dashboard, polling through the
+    // round-robin, kept landing on a node hosting none of the tenant's
+    // functions and rendering an empty Functions page and zero usage. The
+    // `local=true` guard is required: `fleet_function_stats` also reads this
+    // endpoint on every peer, and without it the fan-out would recurse.
+    if q.local != Some(true) {
+        let peers = all_healthy_peers(&c);
+        for v in fan_out_peers(&c, &peers, &t, "/v1/functions?local=true").await {
+            if let Some(arr) = v.as_array() {
+                list.extend(arr.iter().cloned());
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        list.retain(|v| {
+            seen.insert(format!(
+                "{}|{}",
+                v.get("id").and_then(|x| x.as_str()).unwrap_or(""),
+                v.get("name").and_then(|x| x.as_str()).unwrap_or("")
+            ))
+        });
+    }
     Json(json!(list))
 }
 
@@ -5796,9 +5835,29 @@ async fn webhook_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, cl
 async fn webhook_deliveries(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::extract::Query(q): axum::extract::Query<LocalQ>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!(c.webhooks.deliveries(100))))
+    let mut all: Vec<Value> = c.webhooks.deliveries(100).into_iter().map(|d| json!(d)).collect();
+    // The delivery ring is in-process and NOT replicated, and dispatches fire
+    // both from the leader (promote/delete/database/incident mutations) and
+    // from whichever node ran a build (git.rs). So a single node's view is a
+    // slice: the operator saw an empty panel and concluded webhooks were
+    // broken when they had in fact delivered. `local=true` stops the recursion.
+    if q.local != Some(true) {
+        let peers = all_healthy_peers(&c);
+        for v in fan_out_peers(&c, &peers, "", "/v1/webhooks/deliveries?local=true").await {
+            if let Some(arr) = v.as_array() {
+                all.extend(arr.iter().cloned());
+            }
+        }
+        let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+        all.sort_by(|a, b| ts(b).cmp(&ts(a)));
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|v| seen.insert(v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string()));
+        all.truncate(100);
+    }
+    Ok(Json(json!(all)))
 }
 
 // ============================ Databases ============================
@@ -7512,12 +7571,38 @@ pub(crate) fn build_notifications(c: &Arc<CloudState>, team: &str) -> Vec<crate:
     out
 }
 
-async fn notifications_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
+async fn notifications_list(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::extract::Query(q): axum::extract::Query<LocalQ>,
+) -> Json<Value> {
     let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let items = build_notifications(&c, &team);
-    let inbox = items.iter().filter(|n| !n.archived).count();
-    let unread = items.iter().filter(|n| !n.archived && !n.read).count();
-    Json(json!({ "unread": unread, "inbox": inbox, "items": items }))
+    if q.local == Some(true) {
+        return Json(json!({ "unread": 0, "inbox": 0, "items": items }));
+    }
+    // Every ITEM is derived from node-local sources (`gw.list`, `builds.list`,
+    // `recent_events`) even though the read/archived flags are replicated. A
+    // deploy that fails on the FC node hosting it produced no notification on
+    // the other nodes, so the bell's 8s poll made the badge appear and vanish
+    // depending on which node answered — and a failed production deploy could
+    // go unseen. Merge peers by the already-deterministic notification id.
+    let mut merged: Vec<Value> = items.iter().map(|n| json!(n)).collect();
+    let peers = peer_nodes_for_tenant(&c, &team);
+    for v in fan_out_peers(&c, &peers, &team, "/v1/notifications?local=true").await {
+        if let Some(arr) = v.get("items").and_then(|x| x.as_array()) {
+            merged.extend(arr.iter().cloned());
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    merged.retain(|v| seen.insert(v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string()));
+    let ts = |v: &Value| v.get("ts_ms").and_then(|x| x.as_u64()).unwrap_or(0);
+    merged.sort_by(|a, b| ts(b).cmp(&ts(a)));
+    let flag = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_bool()).unwrap_or(false);
+    let inbox = merged.iter().filter(|n| !flag(n, "archived")).count();
+    let unread = merged.iter().filter(|n| !flag(n, "archived") && !flag(n, "read")).count();
+    Json(json!({ "unread": unread, "inbox": inbox, "items": merged }))
 }
 
 async fn notification_archive(
@@ -8407,7 +8492,7 @@ async fn sql_query(
 
 /// Preview metadata for a project's production deployment: a site thumbnail for
 /// frontends, or the JSON/text body for backend services.
-async fn project_preview(
+pub(crate) async fn project_preview(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8421,6 +8506,15 @@ async fn project_preview(
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
         .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
+        // `c.gw.list()` is LOCALLY-hosted deployments only. Most projects are
+        // placed on a peer, so without this the project page showed a
+        // permanently empty preview card on every node but the host. Sibling
+        // deployment reads here already proxy the same way.
+        if let Some(node) = host_node_for_project(&c, &project) {
+            if let Some(v) = fetch_from_host(&c, &node, &format!("/v1/projects/{}/preview", urlencode(&project)), &t).await {
+                return Json(v);
+            }
+        }
         return Json(json!({ "kind": "none" }));
     };
     let alias = dep.alias.clone();
@@ -8478,6 +8572,15 @@ async fn project_thumbnail(
     let dep = c.gw.list().into_iter().find(|d| d.project == project && d.production)
         .or_else(|| c.gw.list().into_iter().find(|d| d.project == project));
     let Some(dep) = dep else {
+        // Locally-hosted deployments only (see `project_preview`), and the PNG
+        // cache below lives under this node's own data dir — so a remotely
+        // placed project 404'd its thumbnail on every node but the host.
+        if let Some(node) = host_node_for_project(&c, &project) {
+            let path = format!("/v1/projects/{}/thumbnail", urlencode(&project));
+            if let Some(b) = fetch_bytes_from_host(&c, &node, &path, &t).await {
+                return ([(axum::http::header::CONTENT_TYPE, "image/png"), (axum::http::header::CACHE_CONTROL, "public, max-age=60")], b).into_response();
+            }
+        }
         return (StatusCode::NOT_FOUND, "no deployment").into_response();
     };
     let cache = crate::persist::data_dir().join("thumbnails");

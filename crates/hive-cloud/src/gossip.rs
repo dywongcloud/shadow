@@ -324,6 +324,16 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // read without a local row. Ownership is checked against THIS node's row
         // or its own hosted deployments' tenant tags (the delete-cascade arm's
         // exact gate); serving is local-only so there is no re-proxy loop.
+        // Preview card for a project hosted on THIS node, answered for a peer
+        // that received the dashboard read but doesn't host the deployment.
+        // Ownership is enforced by `project_preview` itself from the verified
+        // delegation token, exactly as the `/settings` arm below does.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/preview") => {
+            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+            let hdrs = axum::http::HeaderMap::new();
+            let claims = team_claims(p);
+            jb(crate::admin::project_preview(State(cloud.clone()), hdrs, claims, axum::extract::Path(project)).await)
+        }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/settings") => {
             let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
             // Tenant from the VERIFIED mesh delegation token (`?tok=`), never a

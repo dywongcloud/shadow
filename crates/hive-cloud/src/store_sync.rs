@@ -375,7 +375,38 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(1)
         },
     },
+    // L7 rate limiting was the one edge control NOT replicated here, which made
+    // it worse than merely mis-displayed: `PUT /v1/ratelimit` is a mutation, so
+    // it configured the leader's in-process atomics only — the limit was
+    // ENFORCED on the leader alone while the Network page, polling back through
+    // the round-robin, read `enabled: false` from everyone else. A security
+    // control that reports as configured but isn't.
+    //
+    // Only the CONFIG is synced. `tracked_ips`/`blocked_total` are per-node
+    // counters; including them would make every node's snapshot differ on every
+    // request and defeat the content-compare that gates a replication write.
+    SyncedStore {
+        name: "ratelimit",
+        snapshot: |c| {
+            let s = c.ratelimit.stats();
+            enc(&RateLimitConfig { enabled: s.enabled, limit: s.limit, window_ms: s.window_ms })
+        },
+        adopt: |c, b| {
+            let cfg: RateLimitConfig = serde_json::from_slice(b).ok()?;
+            c.ratelimit.set(cfg.enabled, cfg.limit, cfg.window_ms);
+            Some(1)
+        },
+    },
 ];
+
+/// Rate-limit config wire shape — deliberately config-only (see the registry
+/// entry above for why the live counters are excluded).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RateLimitConfig {
+    enabled: bool,
+    limit: u32,
+    window_ms: u64,
+}
 
 /// WAF config wire shape (rules + managed-ruleset toggle) — the store exposes
 /// these as separate accessors, so the snapshot bundles them.
