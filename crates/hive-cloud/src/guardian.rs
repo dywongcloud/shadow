@@ -98,13 +98,21 @@ const GUARDIAN_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// freezing two hosts into console-reboot territory.
 const INIT_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Set once an init failure proves in-process retries can never succeed:
-/// redb's "Database already open. Cannot acquire lock." means a PREVIOUS
-/// leaked/timed-out attempt in THIS process still holds the file lock, so
-/// every further attempt is guaranteed to fail — and to leak another full
-/// iroh client doing so. Once latched, `handle()` fails fast with a message
-/// naming the only real recovery (restart the node process).
+/// Set once an init failure proves in-process retries can never succeed. Two
+/// causes latch it:
+///  - redb's "Database already open. Cannot acquire lock." — a PREVIOUS
+///    leaked/timed-out attempt in THIS process still holds the file lock, so
+///    every further attempt is guaranteed to fail, and to leak another full
+///    iroh client doing so.
+///  - a PANIC inside init (see `handle`) — deterministic, so it will panic
+///    identically on every retry.
+///
+/// Once latched, `handle()` fails fast, naming the reason and the only real
+/// recovery (restart the node process).
 static INIT_WEDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Why the wedge latched, so the fail-fast message doesn't misattribute a
+/// panic to redb's lock (which sent an operator down the wrong path once).
+static WEDGE_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static LAST_FAILED_INIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lazily open (once) the GuardianDB KV store, retrying on a previous failure
@@ -115,9 +123,12 @@ async fn handle() -> anyhow::Result<&'static Handle> {
         return Ok(h);
     }
     if INIT_WEDGED.load(Ordering::Relaxed) {
-        anyhow::bail!(
-            "guardian is wedged in this process (redb lock held by a leaked prior init attempt); restart hive-cloud to recover"
-        );
+        let why = WEDGE_REASON
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .unwrap_or_else(|| "redb lock held by a leaked prior init attempt".to_string());
+        anyhow::bail!("guardian is wedged in this process ({why}); restart hive-cloud to recover");
     }
     let last_failed = LAST_FAILED_INIT_MS.load(Ordering::Relaxed);
     if last_failed != 0 {
@@ -128,11 +139,41 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     }
     let result = HANDLE
         .get_or_try_init(|| async {
-            match tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()).await {
-                Ok(result) => result,
-                Err(_) => Err(anyhow::anyhow!(
+            // A PANIC inside init must be caught here, not allowed to unwind.
+            // Live-witnessed fleet-wide: guardian-db's `IrohClient::new` panics
+            // "Hash table capacity overflow" (hashbrown) on EVERY attempt. A
+            // panic unwinds straight past the failure bookkeeping below, so
+            // `LAST_FAILED_INIT_MS` was never stamped, the backoff gate never
+            // engaged, and every guardian caller re-ran a full init immediately
+            // — ~18 panics/minute on all 7 nodes, indefinitely. Converting the
+            // panic into an `Err` lets the existing throttle apply, and because
+            // a deterministic panic cannot succeed on retry we also latch the
+            // wedge so subsequent calls fail fast instead of re-panicking.
+            use futures::FutureExt;
+            let attempt = std::panic::AssertUnwindSafe(tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()));
+            match attempt.catch_unwind().await {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => Err(anyhow::anyhow!(
                     "guardian init timed out after {GUARDIAN_INIT_TIMEOUT:?} (iroh endpoint bind / keystore / docs bring-up never completed); will retry after backoff"
                 )),
+                Err(panic) => {
+                    let what = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "unknown panic payload".to_string());
+                    INIT_WEDGED.store(true, Ordering::Relaxed);
+                    if let Ok(mut slot) = WEDGE_REASON.lock() {
+                        *slot = Some(format!("init panicked: {what}"));
+                    }
+                    tracing::error!(
+                        panic = %what,
+                        "guardian init PANICKED — latching wedged state so callers stop re-attempting. \
+                         The guardian store is UNAVAILABLE on this node until the panic is fixed and \
+                         hive-cloud is restarted."
+                    );
+                    Err(anyhow::anyhow!("guardian init panicked: {what}"))
+                }
             }
         })
         .await;
