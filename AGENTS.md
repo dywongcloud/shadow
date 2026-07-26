@@ -29,7 +29,41 @@ history).
   existing match-arm pattern. Detail: `recall("relay-antientropy")` /
   `crates/hive-cloud/src/main.rs` (`spawn_anti_entropy_loop`), `crates/hive-edge`.
 
+## Round-robin reads vs leader-forwarded writes
+
+- `admin_ingress` forwards MUTATIONS (POST/PUT/DELETE/PATCH) to the current
+  control-plane leader but serves every GET/HEAD **locally**, and the public
+  `api.<domain>` / dashboard hosts are round-robin DNS across all nodes. So any
+  endpoint whose data is NODE-LOCAL — a file under `persist::data_dir()`, an
+  in-process `Mutex`/`RwLock`/`OnceLock`/broadcast channel — that is WRITTEN by
+  a mutation and READ by a GET will read the wrong node and return
+  empty/404/0, silently and permanently. This one split has caused the zkauth
+  preview lockout, blob-storage 404s, `queue_depth` always 0, and pub/sub
+  delivering to nobody.
+- **Every new endpoint must declare which side it is on.** A GET backed by
+  node-local state needs an owner/leader proxy fallback — model it on
+  `build_get` / `fetch_from_host` / `fetch_bytes_from_host` (binary payloads) /
+  `sandboxes_api::proxy_to_owner` — or the state must move into a replicated
+  store (`store_sync::REGISTRY`) or fan out (`db_replicate::fanout_all`, plus a
+  matching `apply_mirrored_write` arm). A cross-node read added via
+  `fetch_from_host` also needs its `gossip::dispatch` arm, ordered
+  longest-prefix-first so a broader arm doesn't shadow it.
+- Verify the fix by writing through the public round-robin host and reading it
+  back several times, AND directly against a node still running the previous
+  binary — the old node must still fail. That contrast is the proof.
+
 ## Secrets
+
+- `HIVE_SECRET_KEY` is the fleet-shared at-rest key. **Never introduce or
+  rotate it without carrying the previous key in `HIVE_SECRET_KEY_OLD`**
+  (comma-separated hex): `secrets::load_or_create_key` prefers the env var over
+  the persisted `$HIVE_DATA/secret.key`, so adding it orphaned every
+  previously-sealed value fleet-wide — and `decrypt` returns its input
+  unchanged on AEAD failure, so callers silently received raw `enc:v1:`
+  ciphertext instead of the secret. `secrets::audit_at_rest()` logs any value
+  no configured key can open at boot; `try_decrypt` is the honest,
+  `Option`-returning variant for anything that must distinguish plaintext from
+  undecryptable ciphertext.
 
 - `ProjectStore::put_env` force-masks credential-shaped values regardless of
   the caller's `sensitive` flag (`project_settings::looks_like_secret`) —

@@ -561,6 +561,15 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // on a perfectly healthy mesh connection, not just during a QUIC flap.
         // Longest-prefix arms first so `/v1/billing/invoices` and
         // `/v1/billing/ledger` don't get shadowed by the bare `/v1/billing` arm.
+        // MUST precede the bare `/v1/billing` arm below, which would otherwise
+        // shadow it (longest-prefix-first ordering, same as invoices/ledger).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/checkout/") => {
+            let id = p.trim_start_matches("/v1/billing/checkout/").split('?').next().unwrap_or("").to_string();
+            match crate::admin::billing_checkout_get(State(cloud.clone()), axum::extract::Path(id)).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/invoices") => {
             jb(crate::admin::billing_invoices(State(cloud.clone()), team_headers(p), team_claims(p)).await)
         }

@@ -7879,8 +7879,20 @@ async fn billing_checkout(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
     Json(json!({ "url": format!("/billing/checkout?session={}", co.id), "mock": true, "session": co.id }))
 }
 
-async fn billing_checkout_get(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
-    c.billing.get_checkout(&id).map(|co| Json(json!(co))).ok_or(StatusCode::NOT_FOUND)
+pub(crate) async fn billing_checkout_get(State(c): State<Arc<CloudState>>, Path(id): Path<String>) -> Result<Json<Value>, StatusCode> {
+    if let Some(co) = c.billing.get_checkout(&id) {
+        return Ok(Json(json!(co)));
+    }
+    // Checkouts live in an in-process map on whichever node opened them, and
+    // `POST /v1/billing/checkout` is a mutation so it always runs on the billing
+    // authority. The browser then navigates to /billing/checkout?session=<id>,
+    // whose GET round-robins — landing anywhere else it 404'd and the upgrade
+    // flow dead-ended with "Checkout session not found". The sibling billing
+    // reads already proxy this way; this one was missed.
+    if let Some(v) = proxy_billing_read(&c, &format!("/v1/billing/checkout/{id}"), "").await {
+        return Ok(Json(v));
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 #[derive(Deserialize)]
