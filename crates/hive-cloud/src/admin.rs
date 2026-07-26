@@ -2820,6 +2820,29 @@ fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
 }
 
 /// GET `path` from a peer admin, forwarding the team header; returns parsed JSON.
+/// Byte-oriented sibling of [`fetch_from_host`], for reads whose payload isn't
+/// JSON (blob objects). Kept deliberately simple — HTTP admin URL only — since
+/// its callers all fall back to their existing not-found behaviour when it
+/// returns `None`, so it can never make a read worse than it is today.
+async fn fetch_bytes_from_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Vec<u8>> {
+    let admin = c.node_admins.read().get(node).cloned()?;
+    let mut rb = c
+        .http
+        .get(format!("{admin}{path}"))
+        .header("x-hive-team", team)
+        .timeout(std::time::Duration::from_secs(15));
+    if crate::auth::enforced() {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, 60) {
+            rb = rb.bearer_auth(tok);
+        }
+    }
+    let resp = rb.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.bytes().await.ok().map(|b| b.to_vec())
+}
+
 async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str) -> Option<Value> {
     let mut rb = c
         .http
@@ -6074,6 +6097,21 @@ pub(crate) async fn apply_mirrored_write(c: &Arc<CloudState>, path: &str, body: 
                 }
             }
         }
+        // Realtime rooms ride the same broker as pub/sub topics. Without this
+        // arm a fanned-out room frame was accepted and then dropped, so two
+        // browsers in the same room but on different nodes never saw each other.
+        "realtime" => {
+            if let Some(room) = segs.get(3) {
+                if let Ok(v) = serde_json::from_slice::<Value>(body) {
+                    if let Some(msg) = v.get("message") {
+                        // Room frames are raw text on the wire; keep them raw so a
+                        // mirrored frame is byte-identical to a locally-published one.
+                        let text = msg.as_str().map(|s| s.to_string()).unwrap_or_else(|| msg.to_string());
+                        c.databases.publish(&format!("{team}::{room}"), text);
+                    }
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -6158,7 +6196,23 @@ async fn blob_get(
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
     match c.databases.blob_get(&nsb, &key) {
         Some(data) => Ok(data.into_response()),
-        None => Err(StatusCode::NOT_FOUND),
+        None => {
+            // Blob bytes live on node-local disk, but `admin_ingress` forwards
+            // mutations to the control-plane leader while serving reads
+            // LOCALLY. `BLOB_ENDPOINT` handed to every app points at the
+            // round-robin api host, so a PUT lands on the leader and the
+            // matching GET lands anywhere — 404 forever, with no sync path that
+            // ever heals it. Same leader fallback `build_get` already uses.
+            if !c.is_control_plane_leader() {
+                let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+                let leader = c.control_plane_leader();
+                let path = format!("/v1/storage/blob/{bucket}/{key}");
+                if let Some(b) = fetch_bytes_from_host(&c, &leader, &path, &t).await {
+                    return Ok(b.into_response());
+                }
+            }
+            Err(StatusCode::NOT_FOUND)
+        }
     }
 }
 
@@ -6169,7 +6223,17 @@ async fn blob_list_keys(
     Path(bucket): Path<String>,
 ) -> Json<Value> {
     let nsb = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &bucket);
-    Json(json!({ "bucket": bucket, "keys": c.databases.blob_list(&nsb) }))
+    let keys = c.databases.blob_list(&nsb);
+    // An empty listing on a non-leader almost always means "the objects were
+    // PUT on the leader" rather than "the bucket is empty" — see `blob_get`.
+    if keys.is_empty() && !c.is_control_plane_leader() {
+        let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+        let leader = c.control_plane_leader();
+        if let Some(v) = fetch_from_host(&c, &leader, &format!("/v1/storage/blob/{bucket}"), &t).await {
+            return Json(v);
+        }
+    }
+    Json(json!({ "bucket": bucket, "keys": keys }))
 }
 
 #[derive(Deserialize)]
@@ -6211,7 +6275,20 @@ async fn queue_depth(
     Path(queue): Path<String>,
 ) -> Json<Value> {
     let nsq = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &queue);
-    Json(json!({ "queue": queue, "depth": c.databases.queue_depth(&nsq) }))
+    let depth = c.databases.queue_depth(&nsq);
+    // `queue_push`/`queue_pop` are mutations and so run on the leader, while
+    // this read serves locally — so every non-leader node reports 0 no matter
+    // how deep the real queue is.
+    if depth == 0 && !c.is_control_plane_leader() {
+        let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+        let leader = c.control_plane_leader();
+        // NOTE: depth is served by GET on the queue route itself
+        // (`/v1/storage/queue/:queue`) — there is no `/depth` sub-route.
+        if let Some(v) = fetch_from_host(&c, &leader, &format!("/v1/storage/queue/{queue}"), &t).await {
+            return Json(v);
+        }
+    }
+    Json(json!({ "queue": queue, "depth": depth }))
 }
 
 #[derive(Deserialize)]
@@ -6323,8 +6400,18 @@ async fn pubsub_publish(
     let nst = format!("{team}::{topic}");
     let delivered = c.databases.publish(&nst, b.message.to_string());
     let mirror_body = serde_json::to_vec(&json!({ "message": b.message })).unwrap_or_default();
-    crate::db_replicate::on_write(&c, is_mirror, &team, &topic, "POST", format!("/v1/storage/pubsub/{topic}/publish"), "application/json", mirror_body);
-    Json(json!({ "topic": topic, "delivered": delivered }))
+    // Fan to EVERY node, not just replica regions: the broker is per-process and
+    // subscribers sit on whichever node their WebSocket landed on, so anything
+    // less silently delivers to a subset (usually just the leader's own).
+    crate::db_replicate::fanout_all(
+        &c,
+        is_mirror,
+        &team,
+        format!("/v1/storage/pubsub/{topic}/publish"),
+        "application/json",
+        mirror_body,
+    );
+    Json(json!({ "topic": topic, "delivered": delivered, "fanout": !is_mirror }))
 }
 
 async fn ws_pubsub(
@@ -6362,9 +6449,12 @@ async fn ws_realtime(
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Path(room): Path<String>,
 ) -> axum::response::Response {
+    let raw_room = room.clone();
+    let team = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let room = ns(&c, &headers, claims.as_ref().map(|e| &e.0), &room);
     let mut rx = c.databases.subscribe(&room);
     let db = c.databases.clone();
+    let cloud = c.clone();
     ws.on_upgrade(move |mut socket| async move {
         use axum::extract::ws::Message;
         let _ = socket
@@ -6378,7 +6468,20 @@ async fn ws_realtime(
                 },
                 client = socket.recv() => match client {
                     // Bidirectional: a client message is broadcast to the whole room.
-                    Some(Ok(Message::Text(t))) => { db.publish(&room, t); }
+                    Some(Ok(Message::Text(t))) => {
+                        db.publish(&room, t.clone());
+                        // Subscribers sit on whichever node their socket landed
+                        // on, so a room frame has to reach every node — locally
+                        // only, two browsers in the same room never see each other.
+                        crate::db_replicate::fanout_all(
+                            &cloud,
+                            false,
+                            &team,
+                            format!("/v1/storage/realtime/{raw_room}"),
+                            "application/json",
+                            serde_json::to_vec(&json!({ "message": t })).unwrap_or_default(),
+                        );
+                    }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
                 }

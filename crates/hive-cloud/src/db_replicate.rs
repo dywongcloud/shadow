@@ -193,6 +193,54 @@ pub fn on_write(
     if targets.is_empty() {
         return;
     }
+    send_mirrored(cloud, targets, team, method, rel_path, content_type, body);
+}
+
+/// Fan a write to EVERY healthy peer rather than to configured replica regions.
+///
+/// Pub/Sub and Realtime aren't durable stores with a replica policy — they are
+/// live delivery over a per-process broker. `admin_ingress` sends the publish (a
+/// mutation) to the control-plane leader while WebSocket subscribers (reads)
+/// stay on whichever node they connected to, so a publish reached only the
+/// subscribers that happened to share a node with the leader — and still
+/// reported `delivered` as if it had succeeded. Delivery therefore has to reach
+/// every node that might be holding a subscriber, which means all of them.
+pub fn fanout_all(
+    cloud: &Arc<CloudState>,
+    is_mirror: bool,
+    team: &str,
+    rel_path: String,
+    content_type: &str,
+    body: Vec<u8>,
+) {
+    if is_mirror {
+        return; // this call IS the fan-out arriving; delivering again would loop
+    }
+    let targets: Vec<Target> = cloud
+        .registry
+        .nodes()
+        .iter()
+        .filter(|n| n.healthy && n.name != cloud.node_name)
+        .filter_map(|n| target_for(cloud, n))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    send_mirrored(cloud, targets, team, "POST", rel_path, content_type, body);
+}
+
+/// Deliver one write to a fixed target set, over HTTP admin or the iroh mesh.
+/// Shared by replica mirroring and pub/sub fan-out so both carry the identical
+/// signed mirror proof and loop-breaker semantics.
+fn send_mirrored(
+    cloud: &Arc<CloudState>,
+    targets: Vec<Target>,
+    team: &str,
+    method: &str,
+    rel_path: String,
+    content_type: &str,
+    body: Vec<u8>,
+) {
     let cloud = cloud.clone();
     let team = team.to_string();
     let method = method.to_string();
