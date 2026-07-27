@@ -191,6 +191,16 @@ impl TeamStore {
         Some(t.clone())
     }
 
+    /// Delete a team outright. Returns the removed record, or `None` if there
+    /// was no such team.
+    ///
+    /// Callers MUST enforce the safety rules themselves (owner-only, never a
+    /// personal namespace, never while the team still owns projects) — this is
+    /// the raw store operation. See `team_delete` in `admin.rs`.
+    pub fn remove(&self, slug: &str) -> Option<Team> {
+        self.teams.write().remove(slug)
+    }
+
     pub fn add_member(&self, slug: &str, email: &str, role: Role) -> Option<Team> {
         let mut m = self.teams.write();
         let t = m.get_mut(slug)?;

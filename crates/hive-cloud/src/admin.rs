@@ -133,7 +133,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/domains/:domain/ssl/renew", post(domain_renew_ssl))
         // ---- Teams ----
         .route("/v1/teams", get(teams_list).post(team_create))
-        .route("/v1/teams/:slug", get(team_get))
+        .route("/v1/teams/:slug", get(team_get).delete(team_delete))
         .route("/v1/teams/:slug/members", post(team_add_member))
         .route("/v1/teams/:slug/members/:email", delete(team_remove_member))
         .route("/v1/teams/:slug/plan", put(team_set_plan))
@@ -5506,6 +5506,43 @@ async fn team_set_plan(
 #[derive(Deserialize)]
 struct SetSso {
     enabled: bool,
+}
+
+/// Delete a team. Owner-only, and deliberately refuses in the cases where
+/// deleting would strand resources or break the caller's own identity:
+///
+/// * a PERSONAL namespace (`personal`, `u_<uid>`) is a user's own space, not a
+///   team someone chose to create — removing it would leave that user with no
+///   tenant at all;
+/// * a team that still owns projects, because project records carry the team
+///   slug and would be orphaned (delete or move the projects first).
+///
+/// The billing account is cleared alongside the team record so a deleted team
+/// cannot leave a stray tier/quota row behind — the same
+/// both-halves-or-neither rule `apply_plan_everywhere` exists to enforce.
+async fn team_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(slug): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_team(&c, &headers, claims.as_ref().map(|e| &e.0), &slug, &["owner"])?;
+    let s = norm(&slug).to_string();
+    if s == "personal" || s.starts_with("u_") {
+        return Err((StatusCode::BAD_REQUEST, "a personal namespace cannot be deleted".into()));
+    }
+    let projects = c.projects.count_for_team(&s);
+    if projects > 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("team still owns {projects} project(s) — delete or move them first"),
+        ));
+    }
+    c.teams.remove(&s).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    c.billing.remove_account(&s);
+    c.audit.record(&s, "user", "team_delete", "team", &s, "team deleted");
+    crate::persist::persist(&c);
+    Ok(Json(json!({ "ok": true, "deleted": s })))
 }
 
 /// Toggle team/org SSO — Enterprise only.

@@ -668,6 +668,14 @@ impl BillingStore {
         self.checkouts.read().get(id).cloned()
     }
 
+    /// Drop a tenant's billing account entirely (used when its team is deleted),
+    /// so a removed tenant cannot leave a stray tier/quota row behind. The
+    /// LEDGER is deliberately left intact: it is the financial record of what
+    /// actually happened and must survive the account it describes.
+    pub fn remove_account(&self, tenant: &str) -> Option<BillingAccount> {
+        self.accounts.write().remove(tenant)
+    }
+
     /// Complete a checkout: apply the plan change or credit top-up. Idempotent
     /// (consumes the session).
     pub fn confirm_checkout(&self, id: &str) -> Option<(Checkout, BillingAccount)> {
