@@ -157,6 +157,29 @@ history).
   billing account with the team record. The billing LEDGER is deliberately kept:
   it is the financial record and must outlive the account it describes.
 
+## Serverless GPU
+
+- GPU serving is the **container path only**: Firecracker has no PCI
+  passthrough, but on FC nodes containers run via host podman, which is where
+  the GPUs live. A gpu launch adds CDI `--device nvidia.com/gpu=all` (from the
+  nvidia-container-toolkit spec at `/etc/cdi/nvidia.yaml` on GPU hosts); the
+  existing retry-on-default-runtime fallback covers runsc-without-nvproxy.
+- The request flows `FunctionSettings.gpu` (project toggle) OR
+  `fluid.json functions[].gpu` → `FunctionConfig.gpu` → placement →
+  `FunctionLaunch.gpu` → podman. Settings can turn GPU **on** but never strip a
+  function's own declared need (the manifest build ORs them).
+- Placement: gpu deployments are eligible **only** on nodes advertising
+  `NodeInfo::gpu_count > 0` (boot `nvidia-smi` probe, `HIVE_GPUS` override) —
+  including the lease-stickiness path. Deliberately NO silent fallback to CPU
+  nodes; empty placement beats cold-starting into CUDA errors.
+- GPU time is metered as instance **wall-time** (`fluid_ms`), not active-CPU —
+  the GPU is held for the instance's whole life. `RateCard.gpu_hr_cents`.
+- Fleet-roll gotcha (cost a silent stale build): `rsync -a` preserves local
+  mtimes, so a build that finishes **after** a sync lands can leave cargo
+  fingerprints newer than the fresh sources — cargo then silently skips
+  rebuilding the changed crate. If a just-rolled node still runs old behavior,
+  `touch` the synced sources before rebuilding.
+
 ## Deploys
 
 - `git push` auto-deploys through TWO independent triggers, never assume the

@@ -92,7 +92,7 @@ export default function NetworkPage() {
                 ? <Badge tone="purple">{n.gpu_count}× {n.gpu_model ?? "GPU"}</Badge>
                 : <span className="text-secondary">—</span>}</Td>
               <Td>{n.is_self ? <Badge tone="green">this node</Badge> : <Badge>peer</Badge>}</Td>
-              <Td className="text-secondary">{timeAgo(n.last_seen_ms)} ago</Td>
+              <Td className="text-secondary">{timeAgo(n.last_seen_ms)}</Td>
             </tr>
           ))}
         </tbody>
