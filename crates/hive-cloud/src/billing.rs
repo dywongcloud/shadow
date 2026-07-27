@@ -467,7 +467,24 @@ impl BillingStore {
         let (delta, carry) = {
             let mut meters = self.meters.write();
             let st = meters.entry(tenant.to_string()).or_default();
-            let sub = |cur: u64, last: u64| if cur >= last { cur - last } else { cur };
+            // These are CUMULATIVE counters summed across the whole fleet
+            // (`fleet_function_stats`), so `cur < last` means a counter RESET,
+            // not usage — a single node restarting drops its contribution and
+            // with it the fleet total.
+            //
+            // Charging `cur` in that case (the previous behaviour) re-bills the
+            // ENTIRE fleet's accumulated usage as if it were brand new, every
+            // time any one node restarts. A rolling fleet upgrade therefore
+            // bills the whole fleet over and over: witnessed as a tenant landing
+            // at -$55 against a $5 allowance during a session that restarted all
+            // 12 nodes several times, which then tripped the can_deploy credit
+            // lock and refused deploys.
+            //
+            // Treat a decrease as a re-baseline: charge nothing for this tick and
+            // adopt the new floor. That can under-count the usage accrued between
+            // the last sample and the restart, which is the correct direction to
+            // err for billing — never charge a customer for a counter reset.
+            let sub = |cur: u64, last: u64| if cur >= last { cur - last } else { 0 };
             let delta = UsageTotals {
                 active_cpu_ms: sub(current.active_cpu_ms, st.last.active_cpu_ms),
                 mem_gb_hr_milli: sub(current.mem_gb_hr_milli, st.last.mem_gb_hr_milli),
