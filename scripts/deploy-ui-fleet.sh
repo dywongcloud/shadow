@@ -41,12 +41,34 @@ DEFAULT_HOSTS=(
   43.153.106.173   # fc-gpu-sj-1  (4x Tesla T4)
   170.106.155.130  # fc-gpu-sj-2  (4x Tesla T4)
   43.153.34.250    # fc-gpu-sj-3  (4x Tesla T4)
+  43.166.223.197   # fc-cvm-sj-1  (PVM 7.1, 2x Tesla T4)
+  43.166.233.114   # fc-cvm-sj-2  (PVM 7.1, 1x Tesla T4)
 )
 HOSTS=("${@:-${DEFAULT_HOSTS[@]}}")
 
 ssh_opts=(-i "$PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=8)
 
+# Hosts that failed any step. The loop deliberately continues past a failure so
+# one bad node doesn't strand the rest, but the script MUST exit non-zero at the
+# end -- it previously returned 0 even when a host had no nodejs installed at
+# all, so "npm ci + next build" silently did nothing and the operator saw a
+# clean run while that node kept serving a stale dashboard (or none).
+failed=()
+
 for host in "${HOSTS[@]}"; do
+  echo "==> $host: preflight (node, npm, hive-ui unit)"
+  if ! ssh "${ssh_opts[@]}" "root@$host" '
+      command -v node >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: nodejs not installed"; exit 1; }
+      command -v npm  >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: npm not installed"; exit 1; }
+      [ -f /etc/systemd/system/hive-ui.service ] || { echo "PREFLIGHT FAIL: hive-ui.service unit missing"; exit 1; }
+      echo "  node $(node --version), npm $(npm --version), unit present"
+    '; then
+    echo "==> $host: SKIPPED (preflight failed)"
+    failed+=("$host")
+    echo
+    continue
+  fi
+
   echo "==> $host: syncing ui/ source (preserving .env.local + node_modules + .next)"
   rsync -az --delete \
     --exclude node_modules \
@@ -68,7 +90,13 @@ for host in "${HOSTS[@]}"; do
     sleep 2
     systemctl is-active hive-ui
     curl -fsS -o /dev/null -w "local :3002 status=%{http_code}\n" http://127.0.0.1:3002/ || true
-  '
+  ' || { echo "==> $host: FAILED (build/restart step)"; failed+=("$host"); echo; continue; }
   echo "==> $host: done"
   echo
 done
+
+if [ ${#failed[@]} -gt 0 ]; then
+  echo "DEPLOY INCOMPLETE — ${#failed[@]} host(s) failed: ${failed[*]}" >&2
+  exit 1
+fi
+echo "All ${#HOSTS[@]} host(s) deployed."
