@@ -122,8 +122,21 @@ async fn refresh_kv_index(
         .get_many(doc, Query::single_latest_per_key().build())
         .await?;
 
+    // Snapshot BEFORE clear_all so a transient content-fetch failure can fall
+    // back to last-known-good instead of dropping the key. This refresh fully
+    // clears and rebuilds, so without the snapshot one flaky `cat_bytes` makes a
+    // key that a PRIOR refresh had already fetched simply vanish. That exact bug
+    // was already found and fixed in the sibling document_store (see its Err arm
+    // — "witnessed live as SELECT COUNT ... intermittently returning 0 on
+    // healthy, fully-synced fleet nodes"); kv_store had the identical structure
+    // and never received the fix.
+    let previous = index.get_all();
     index.clear_all();
     let mut count = 0;
+    // Aggregated failure reporting (see the Err arm below).
+    let mut failed = 0usize;
+    let mut stale_served = 0usize;
+    let mut first_failure: Option<(String, String)> = None;
 
     for entry in &entries {
         let key = String::from_utf8_lossy(entry.key()).to_string();
@@ -141,14 +154,48 @@ async fn refresh_kv_index(
                 count += 1;
             }
             Err(e) => {
-                warn!("Failed to read content for key from iroh-docs: {:?}", e);
+                // A failed content read SKIPS the entry, so this key is silently
+                // absent from the rebuilt index — that is a completeness problem, not
+                // cosmetic. Previously this warned once PER ENTRY per sync, which
+                // produced bursts of identical lines (four inside the same
+                // millisecond, repeatedly) that drowned every other log on the
+                // node and still never said how many keys were actually lost.
+                // Aggregate instead: one line per sync, with the count and one
+                // representative key/error.
+                match previous.get(&key) {
+                    // Transient fetch failure on a key we already had: serve the
+                    // last-known-good value rather than letting it disappear.
+                    Some(prev) => {
+                        index.insert(key.clone(), prev.clone());
+                        stale_served += 1;
+                    }
+                    None => {
+                        failed += 1;
+                        if first_failure.is_none() {
+                            first_failure = Some((key.clone(), format!("{e:?}")));
+                        }
+                    }
+                }
             }
         }
     }
 
+    if failed > 0 {
+        let (k, e) = first_failure
+            .clone()
+            .unwrap_or_else(|| ("<unknown>".to_string(), "<none>".to_string()));
+        warn!(
+            "KeyValue index sync: {} of {} entries could not be read from iroh-docs and are MISSING from the index (first: key={} err={})",
+            failed,
+            failed + count,
+            k,
+            e
+        );
+    }
+
     debug!(
-        "KeyValue index synchronized from iroh-docs: {} entries",
-        count
+        "KeyValue index synchronized from iroh-docs: {} entries ({} served stale, {} unreadable)",
+        count, stale_served, failed
     );
     Ok(count)
 }
