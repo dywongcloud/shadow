@@ -157,6 +157,38 @@ history).
   billing account with the team record. The billing LEDGER is deliberately kept:
   it is the financial record and must outlive the account it describes.
 
+## PVM kernels (KVM without hardware virt)
+
+Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
+(`dywongcloud/pvm-no-fsgsbase-rdtscp`: `patches/pvm6.12to7.1complete.patch` is
+the PVM series itself and applies onto a **vanilla** tree — that repo's
+`kernel/` dir is the old 6.12.33 base, not the build target).
+
+- **`pti=off` is REQUIRED.** With PTI active `kvm_pvm` refuses to load
+  ("Support for host KPTI is not included yet") and `/dev/kvm` silently
+  disappears, taking Firecracker with it. Fleet convention (see fc-virginia).
+- **`make install` RESETS grubby args** — re-apply and re-verify `pti=off
+  panic=5` after *every* kernel install, not just the first.
+- **`x86_64_defconfig + KVM_PVM + X86_FRED` is nowhere near enough to host
+  containers or microVMs.** That minimal config cost four rebuild cycles to
+  discover; enable all of:
+  - storage/net: `OVERLAY_FS`, `FUSE_FS`, `BRIDGE`, `VETH`, `TUN` (TUN also
+    gates Firecracker TAP networking)
+  - NAT: `NETFILTER_ADVANCED` (off hides the symbols entirely), plus — new
+    symbol splits in 7.1 — `IP_NF_IPTABLES_LEGACY` and
+    `NETFILTER_XTABLES_LEGACY`, which `IP_NF_NAT`/`IP_NF_FILTER` now depend on.
+    Without them netavark fails with "Module ip_tables not found".
+  - containers: `USER_NS` (crun dies on `/proc/self/uid_map`), `MEMCG` (the
+    platform sets `HIVE_CONTAINER_MEMORY`; cgroup2 has no memory controller
+    without it), `FANOTIFY`
+  - cgroup2 device controller: `BPF_SYSCALL`, `CGROUP_BPF`, `BPF_JIT` — else
+    crun fails "bpf create: Function not implemented"
+  - Firecracker vsock: `VSOCKETS`, `VHOST_VSOCK`; plus `VFIO`/`VFIO_PCI`
+- `CONFIG_X86_FRED=y` is required on 7.1 even without FRED hardware, and
+  vendor KVM (`KVM_INTEL`/`KVM_AMD`) must be off — PVM replaces them.
+- Verify functionally, not by device-node existence: open `/dev/kvm` and do a
+  real `KVM_CREATE_VM` + `KVM_CREATE_VCPU`, then actually run a container.
+
 ## Bringing a node into the mesh
 
 - **Seed `HIVE_BOOTSTRAP_PEERS` with ADDRESSED peers, never bare node ids.** The
