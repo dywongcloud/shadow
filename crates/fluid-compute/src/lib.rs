@@ -312,6 +312,45 @@ pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
     cap.max(1)
 }
 
+/// Releases a cold start's `provisioning` reservation and records the failure if
+/// the cold start did not produce an instance — including when the future is
+/// simply DROPPED because the caller gave up. See [`Fluid::cold_start`].
+struct ColdStartGuard {
+    fluid: Arc<Fluid>,
+    key: String,
+    /// Cleared on success; while armed, Drop treats this as a failed cold start.
+    armed: bool,
+    /// `None` while armed means the future was cancelled rather than returning an
+    /// error — worth distinguishing in the log, since an abandoned cold start
+    /// points at a caller/proxy deadline rather than a broken deployment.
+    error: Option<String>,
+}
+
+impl Drop for ColdStartGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut streak = 0u32;
+        if let Some(p) = self.fluid.registry.lock().get_mut(&self.key) {
+            p.provisioning = p.provisioning.saturating_sub(1);
+            p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+            p.warm_backoff_until_ms = now_ms() + (1000u64 << p.warm_fail_streak.min(6));
+            p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
+            streak = p.warm_fail_streak;
+        }
+        // The line to read first when a deployment will not start: it names the
+        // streak driving the circuit and whether the caller waited for the answer.
+        warn!(
+            func = %self.key,
+            fail_streak = streak,
+            abandoned = self.error.is_none(),
+            error = self.error.as_deref().unwrap_or("caller gave up before the cold start finished"),
+            "cold start failed"
+        );
+    }
+}
+
 /// CPU thresholds (% of a cell's allocated vCPU budget) for the adaptive
 /// concurrency controller (#2). Above HIGH we back off; below LOW we recover; the
 /// band between is hysteresis so we don't oscillate.
@@ -383,6 +422,31 @@ impl Fluid {
         let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
         let safe_concurrency = if rec < cfg.max_concurrency { Some(rec) } else { None };
         let mut reg = self.registry.lock();
+        // Re-registering a key (a redeploy, or a boot restore over a live pool)
+        // installs a fresh pool whose `instances` is empty. Anything the OLD pool
+        // was running would then be orphaned: still alive on the host, still
+        // holding a lock/process slot/memory/published port, but unknown to the
+        // pool — so never reused, never drained, never terminated. Mark them
+        // draining instead and let the reconcile loop terminate them properly.
+        let orphans: Vec<Instance> = reg
+            .get_mut(&key)
+            .map(|old| {
+                old.instances
+                    .drain(..)
+                    .map(|mut i| {
+                        i.draining = true;
+                        i
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !orphans.is_empty() {
+            warn!(
+                func = %key,
+                count = orphans.len(),
+                "re-registering a pool with live instances — draining them instead of orphaning"
+            );
+        }
         reg.insert(
             key,
             FunctionPool {
@@ -390,7 +454,7 @@ impl Fluid {
                 tenant,
                 image,
                 workdir,
-                instances: Vec::new(),
+                instances: orphans,
                 provisioning: 0,
                 requests: 0,
                 served_ms_sum: 0,
@@ -665,16 +729,10 @@ impl Fluid {
                         // runs) could fail its cold start on every single request
                         // forever, each caller paying the full startup timeout plus the
                         // reroute budget, with nothing anywhere counting the failures.
-                        if let Some(p) = self.registry.lock().get_mut(key) {
-                            p.provisioning = p.provisioning.saturating_sub(1);
-                            p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
-                            let backoff_ms = 1000u64 << p.warm_fail_streak.min(6);
-                            p.warm_backoff_until_ms = now_ms() + backoff_ms;
-                            // Hold the circuit shut well past this failure's own
-                            // duration, so the NEXT caller fails fast instead of
-                            // repeating it.
-                            p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
-                        }
+                        // The reservation release AND the failure count both
+                        // happen in `cold_start`'s Drop guard, so that a client
+                        // who gives up mid-cold-start is handled identically to
+                        // an explicit error. Doing it here too would double-count.
                         return Err(e);
                     }
                 },
@@ -755,7 +813,48 @@ impl Fluid {
 
     /// Provision a cell and start the function in it. `provisioning` was already
     /// incremented by the caller; on success we add the instance with inflight=1.
+    /// Count EVERY failing cold start here, CANCELLATION-SAFELY — the one point
+    /// all callers funnel through (keep-warm, a request-path lease, any future
+    /// caller).
+    ///
+    /// Two distinct bugs made the earlier per-caller counting useless, both
+    /// witnessed live:
+    ///
+    /// 1. Only the caller that actually RUNS the cold start reaches its own error
+    ///    branch. Every request that coalesced behind an in-flight one bailed with
+    ///    "cold-start coalesce timed out" and counted nothing — and those waiters
+    ///    are the majority under load.
+    /// 2. Worse, when the CLIENT gives up (curl timeout, browser navigation away,
+    ///    an upstream proxy deadline), axum drops the request future mid-await. A
+    ///    dropped future never returns `Err` at all, so no error branch anywhere
+    ///    runs: the failure went uncounted AND the `provisioning` reservation
+    ///    taken in `decide_lease` was never released. A leaked reservation is the
+    ///    expensive half — `live_count()` includes `provisioning`, so it both makes
+    ///    every later request coalesce until the lease deadline instead of trying,
+    ///    and convinces keep-warm the pool is already at `min_instances` so it
+    ///    stops warming. The pool wedges permanently with nothing running.
+    ///
+    /// A Drop guard is the only correct shape here: it fires on success-with-error,
+    /// on early return, AND on cancellation, which is exactly the set of ways a
+    /// cold start can fail to produce an instance.
     async fn cold_start(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
+        let mut guard = ColdStartGuard {
+            fluid: self.clone(),
+            key: key.to_string(),
+            armed: true,
+            error: None,
+        };
+        let r = self.cold_start_inner(key).await;
+        match &r {
+            // `cold_start_inner` already released the reservation and pushed the
+            // instance on this path, so there is nothing for the guard to undo.
+            Ok(_) => guard.armed = false,
+            Err(e) => guard.error = Some(e.to_string()),
+        }
+        r
+    }
+
+    async fn cold_start_inner(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
         // Bound concurrent provisioning so a burst can't saturate the host. Held
         // for the whole provision+start; dropped when this fn returns.
         let _permit = self.cold_start_sem.clone().acquire_owned().await;
@@ -1104,16 +1203,11 @@ impl Fluid {
                         debug!(func = %key, "warm instance ready");
                     }
                     Err(e) => {
-                        if let Some(pool) = f.registry.lock().get_mut(&key) {
-                            pool.provisioning = pool.provisioning.saturating_sub(1);
-                            // Exponential backoff: 2s, 4s, 8s … capped at ~64s,
-                            // so a persistently failing pool stops storming.
-                            pool.warm_fail_streak = pool.warm_fail_streak.saturating_add(1);
-                            let backoff_ms = 1000u64 << pool.warm_fail_streak.min(6);
-                            pool.warm_backoff_until_ms = now_ms() + backoff_ms;
-                            pool.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
-                        }
-                        warn!(func = %key, error = %e, "keep-warm cold start failed");
+                        // Reservation release, backoff (2s, 4s, 8s … capped ~64s)
+                        // and the circuit gate are all armed by `cold_start`'s Drop
+                        // guard, so a pool that keeps failing stops storming no
+                        // matter which caller drove the attempt.
+                        debug!(func = %key, error = %e, "keep-warm cold start failed");
                     }
                 }
             });
