@@ -469,7 +469,15 @@ async fn run_build(
         if needs_gpu && targets.is_empty() {
             let gpu_nodes = cloud.registry.nodes().into_iter().filter(|n| n.gpu_count > 0).count();
             let msg = format!(
-                "this project requests a serverless GPU, but no healthy GPU-capable node is currently                  reachable ({gpu_nodes} GPU node(s) known to the mesh). The deploy was NOT placed on a                  CPU node, because the GPU passthrough would fail there. Check GPU node health, or turn                  off Serverless GPU in Function Settings to deploy on ordinary compute."
+                // Assembled from single-line pieces on purpose: a `\`-continued
+                // Rust string literal keeps its source indentation, which shipped
+                // as a run of spaces mid-sentence in a message users actually read.
+                "{} {} {}",
+                format_args!(
+                    "this project requests a serverless GPU, but no healthy GPU-capable node is currently reachable ({gpu_nodes} GPU node(s) known to the mesh)."
+                ),
+                "The deploy was NOT placed on a CPU node, because the GPU passthrough would fail there.",
+                "Check GPU node health, or turn off Serverless GPU in Function Settings to deploy on ordinary compute."
             );
             log(msg.clone());
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
