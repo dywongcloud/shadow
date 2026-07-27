@@ -70,6 +70,49 @@ history).
   extend the prefix list for new providers rather than trusting the UI
   checkbox alone. Detail: `recall("secret-detection")`.
 
+## Containers: the podman lock pool
+
+- podman allocates one lock from a **fixed pool** (`num_locks`, default 2048)
+  per CONTAINER **and per VOLUME**. The pool is per-host and shared by every
+  tenant, so leaking locks starves the whole node: witnessed 2032 leaked
+  volumes + 16 containers = exactly 2048, `freeLocks: 0`, after which NO
+  container could start on that node and every cold start surfaced to users as
+  503 `CAPACITY_EXHAUSTED` — a message blaming capacity for a leaked host
+  resource. Because volumes count too, reaping containers alone does not fix it.
+- **Any code path that removes a container must pass `-v`**
+  (`container_cli::rm_args`), or it reclaims the container's lock and leaks its
+  anonymous volume's lock forever.
+- **Never `podman volume prune`** to reclaim locks. It deletes unused NAMED
+  volumes, which is customer data — `hive-vol-postgres` and
+  `hive-vol-minecraft-server-3` were both sitting prunable when this was
+  diagnosed. Reclaim is gated on `is_anonymous_volume` (exactly 64 ascii-hex,
+  podman's anonymous-id shape) AND `dangling=true`.
+- Raising `num_locks` in `containers.conf` does **nothing** on its own: podman
+  sizes the pool once and only re-sizes on `podman system renumber`. A config
+  claiming a bigger pool while `podman info` still reports the old `freeLocks`
+  is inert, not effective.
+- `spawn_container_lock_sweep` (every node, not leader-only — the resource is
+  per-host) reclaims under `LOCK_HEADROOM_FLOOR` and WARNs with the counts; the
+  container-run path also self-heals reactively on `is_lock_exhaustion`.
+
+## Crash-looping deployments
+
+- A deployment can fail in two shapes that need **separate** handling, and
+  conflating them is how one misconfigured app churned a host unchecked:
+  the instance **starts then dies later** (`cold_start` returns `Ok`, tracked by
+  `crash_streak` + `last_warm_ok_ms`), or it **never listens at all**
+  (`cold_start` returns `Err` — "exited before listening on 127.0.0.1:PORT",
+  tracked by `warm_fail_streak`). Never clear a failure streak merely because a
+  start succeeded; only surviving `CRASH_LOOP_WINDOW_MS` counts as healthy.
+- Both the autoscaler AND the request path must record cold-start failures. A
+  pool with `min_instances=0` is never warmed, so keep-warm alone counts
+  nothing and every request re-runs the doomed cold start.
+- A broken deployment must report `DEPLOYMENT_CIRCUIT_OPEN`, never
+  `CAPACITY_EXHAUSTED` — `classify_lease_error`'s `else` arm is a catch-all that
+  otherwise blames the host for an app-level fault. Circuits are half-open by
+  construction (backoff expires → next request probes → success clears), so a
+  fixed deployment recovers with no operator action.
+
 ## Deploys
 
 - `git push` auto-deploys through TWO independent triggers, never assume the
