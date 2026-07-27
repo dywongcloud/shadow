@@ -5456,6 +5456,28 @@ async fn team_remove_member(
     Ok(Json(json!(t)))
 }
 
+/// Apply a tier change to a tenant EVERYWHERE it is stored.
+///
+/// A tenant's tier lives in two places that are read for different things:
+/// `c.teams` (feature gating via `team_plan()`) and `c.billing` (project/seat
+/// quotas, the `can_deploy` credit lock, and everything the billing UI shows).
+/// Four separate call sites used to write only the billing half — the free-plan
+/// checkout shortcut, Stripe `customer.subscription.deleted`, the operator
+/// grant, and checkout confirmation — so the two drifted apart silently and a
+/// tenant could read Enterprise for features while being quota-limited as
+/// Hobby. Every tier change goes through here so that cannot happen again.
+///
+/// `teams.set_plan` returning `None` is normal, not an error: personal
+/// namespaces (`personal`, `u_<uid>`) have a billing account but no team row.
+pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &str) {
+    c.teams.set_plan(tenant, plan);
+    c.billing.set_plan(tenant, plan);
+    // Downgrades drop Enterprise-only SSO, matching `team_set_plan`.
+    if !crate::billing::plan_allows_sso(plan) {
+        c.teams.set_sso(tenant, false);
+    }
+}
+
 #[derive(Deserialize)]
 struct SetPlan {
     plan: String,
@@ -5475,12 +5497,8 @@ async fn team_set_plan(
     if !matches!(plan.as_str(), "hobby" | "pro" | "enterprise") {
         return Err((StatusCode::BAD_REQUEST, "unknown plan".into()));
     }
-    c.teams.set_plan(&slug, &plan).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
-    c.billing.set_plan(&slug, &plan);
-    // Downgrades drop Enterprise-only SSO.
-    if !crate::billing::plan_allows_sso(&plan) {
-        c.teams.set_sso(&slug, false);
-    }
+    c.teams.get(&slug).ok_or((StatusCode::NOT_FOUND, "no such team".into()))?;
+    apply_plan_everywhere(&c, &slug, &plan);
     crate::persist::persist(&c);
     Ok(Json(json!(c.teams.get(&slug))))
 }
@@ -7946,7 +7964,8 @@ async fn billing_checkout(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
     // no reason to round-trip it at all. Apply immediately, same as the mock
     // path always did for this case.
     if amount == 0 {
-        let acc = c.billing.set_plan(&t, &plan);
+        apply_plan_everywhere(&c, &t, &plan);
+        let acc = c.billing.account(&t);
         c.audit.record(&t, "user", "plan_change", "billing", &plan, "switched to a free plan (no checkout needed)");
         crate::persist::persist(&c);
         return Json(json!({ "url": "", "mock": false, "applied": true, "account": acc }));
@@ -8017,6 +8036,11 @@ async fn billing_confirm(State(c): State<Arc<CloudState>>, headers: HeaderMap, c
         stripe_subscription = status.subscription.unwrap_or_default();
     }
     let (co, acc) = c.billing.confirm_checkout(&req.session).ok_or(StatusCode::NOT_FOUND)?;
+    // `confirm_checkout` only moves the billing half; mirror it into the team
+    // record so a completed upgrade is not half-applied.
+    if co.kind != "credits" {
+        apply_plan_everywhere(&c, &co.tenant, &co.plan);
+    }
     if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
         c.billing.set_stripe_ids(&co.tenant, &stripe_customer, &stripe_subscription);
     }
@@ -8061,6 +8085,9 @@ async fn billing_webhook(State(c): State<Arc<CloudState>>, headers: HeaderMap, b
             let checkout_id = obj.get("metadata").and_then(|m| m.get("checkout_id")).and_then(|s| s.as_str()).unwrap_or("");
             if !checkout_id.is_empty() {
                 if let Some((co, _acc)) = c.billing.confirm_checkout(checkout_id) {
+                    if co.kind != "credits" {
+                        apply_plan_everywhere(&c, &co.tenant, &co.plan);
+                    }
                     let customer = obj.get("customer").and_then(|s| s.as_str()).unwrap_or("");
                     let subscription = obj.get("subscription").and_then(|s| s.as_str()).unwrap_or("");
                     if !customer.is_empty() || !subscription.is_empty() {
@@ -8081,7 +8108,7 @@ async fn billing_webhook(State(c): State<Arc<CloudState>>, headers: HeaderMap, b
         "customer.subscription.deleted" => {
             let sub_id = obj.get("id").and_then(|s| s.as_str()).unwrap_or("");
             if let Some(tenant) = (!sub_id.is_empty()).then(|| c.billing.tenant_for_subscription(sub_id)).flatten() {
-                c.billing.set_plan(&tenant, "hobby");
+                apply_plan_everywhere(&c, &tenant, "hobby");
                 c.audit.record(&tenant, "system", "plan_change", "billing", sub_id, "stripe webhook: subscription canceled -> downgraded to hobby");
                 crate::persist::persist(&c);
             }
@@ -8161,7 +8188,7 @@ async fn billing_grant(
     }
     let note = if req.note.is_empty() { "Operator grant".to_string() } else { req.note.clone() };
     if !req.plan.is_empty() {
-        c.billing.set_plan(t, &req.plan);
+        apply_plan_everywhere(&c, t, &req.plan);
     }
     let acc = if req.credit_cents > 0 { c.billing.add_credits(t, req.credit_cents, &note) } else { c.billing.account(t) };
     c.audit.record(
