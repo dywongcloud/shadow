@@ -1596,6 +1596,7 @@ async fn mirror_remote_build(
     node: &str,
 ) -> bool {
     let mut mirrored = 0usize;
+    let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -1606,19 +1607,40 @@ async fn mirror_remote_build(
                 None => None,
             }
         } else if let Some((id, addr)) = &target.iroh {
-            crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_GET, &format!("/v1/builds/{target_bid}"), &[], 8)
+            // 20s, matching the DISPATCH timeout above. This poll used to get 8s,
+            // which is a shorter budget than the request that successfully placed
+            // the deploy in the first place — an iroh dial that has to fall back
+            // through a relay can exceed it, and then every single poll returns
+            // None while the remote build has actually already finished.
+            crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_GET, &format!("/v1/builds/{target_bid}"), &[], 20)
                 .await
                 .and_then(|b| serde_json::from_slice(&b).ok())
         } else {
             None
         };
         let Some(v) = v else {
+            // A failed poll used to be SILENT (request_to just returns None), so a
+            // build stuck at "Building" for a deploy that had really succeeded gave
+            // the next reader nothing to go on — it took reading the TARGET's own
+            // build record to discover it was `ready` all along. Log the first
+            // failure and then every ~30s so the transport, not the app, is
+            // implicated immediately.
+            polls_failed += 1;
+            if polls_failed == 1 || polls_failed % 20 == 0 {
+                tracing::warn!(
+                    node = %node, build = %bid, target_build = %target_bid,
+                    transport = if target.admin.is_some() { "http" } else { "iroh" },
+                    polls_failed,
+                    "cannot read the remote build state — mirrored deploy status will stall"
+                );
+            }
             if now_ms() > deadline {
-                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build"));
+                cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
                 return false;
             }
             continue;
         };
+        polls_failed = 0;
         // Stream any log lines we haven't mirrored yet.
         if let Some(lines) = v.get("lines").and_then(|x| x.as_array()) {
             for line in lines.iter().skip(mirrored) {
