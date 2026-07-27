@@ -531,6 +531,55 @@ async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
     (vols, cells)
 }
 
+/// Reclaim below this many free podman locks. The pool defaults to 2048 and
+/// legitimate peak usage across the fleet was ~18 volumes + 7 containers, so a
+/// node under this figure is leaking, not busy.
+pub const LOCK_HEADROOM_FLOOR: u64 = 1536;
+
+/// podman's currently-free lock count, or `None` if podman isn't present /
+/// doesn't report it. This is the number that hit 0 on the leader.
+pub async fn podman_free_locks(path_env: &str) -> Option<u64> {
+    use tokio::process::Command;
+    let out = Command::new(crate::container_cli::bin(false))
+        .args(["info", "--format", "{{.Host.FreeLocks}}"])
+        .env("PATH", path_env)
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+}
+
+/// PROACTIVE lock sweep: reclaim leaked locks BEFORE anything fails.
+///
+/// The reactive path inside the run-failure handler only fires once a cold start
+/// has already failed, so the first request after exhaustion still eats a failure
+/// plus a retry. This runs on an interval instead: if free locks have fallen
+/// under [`LOCK_HEADROOM_FLOOR`], run the same conservative reclaim. Returns
+/// `(free_locks_before, volumes, cells)`; `volumes`/`cells` are 0 when there was
+/// nothing to do, which is the normal case.
+///
+/// Safe to call on a host with no podman (returns `None`) and on a healthy host
+/// (measures, reclaims nothing). Never touches running containers or named
+/// volumes — see [`reclaim_podman_locks`].
+pub async fn sweep_container_locks(path_env: &str) -> Option<(u64, usize, usize)> {
+    let free = podman_free_locks(path_env).await?;
+    if free >= LOCK_HEADROOM_FLOOR {
+        return Some((free, 0, 0));
+    }
+    let (vols, cells) = reclaim_podman_locks(crate::container_cli::bin(false), path_env).await;
+    tracing::warn!(
+        free_locks_before = free,
+        floor = LOCK_HEADROOM_FLOOR,
+        volumes_reclaimed = vols,
+        cells_reclaimed = cells,
+        "podman lock headroom low — proactively reclaimed leaked locks"
+    );
+    Some((free, vols, cells))
+}
+
 fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
     let pinned = net
         .as_ref()

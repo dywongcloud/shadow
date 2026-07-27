@@ -768,6 +768,16 @@ async fn main() -> anyhow::Result<()> {
     // the project was imported as a plain public URL. See git::spawn_git_poll_reconcile.
     git::spawn_git_poll_reconcile(cloud.clone());
 
+    // Keep podman's shared lock pool from filling up. Containers AND volumes each
+    // consume one lock out of a fixed pool (default 2048), so a leak starves the
+    // whole HOST: witnessed 2032 leaked volumes on the leader, freeLocks 0, and
+    // every deployment's cold start on that node failing as 503
+    // CAPACITY_EXHAUSTED. The leak itself is fixed (`podman rm -v`) and the run
+    // path self-heals reactively, but this sweep restores headroom BEFORE a
+    // request pays for it — and covers locks leaked by anything outside that
+    // path (a crashed node, a manual podman run).
+    spawn_container_lock_sweep();
+
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone())
         .layer(axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline));
@@ -1621,6 +1631,41 @@ fn spawn_metrics_persist_loop(cloud: Arc<CloudState>) {
         loop {
             tokio::time::sleep(interval).await;
             crate::persist::persist(&cloud);
+        }
+    });
+}
+
+/// Periodic podman lock-headroom sweep — see the call site's comment in `main()`.
+///
+/// Takes no `CloudState`: it reads the HOST's podman state, nothing of ours.
+/// Runs on every node (not leader-only) because the lock pool it protects is
+/// per-host. `HIVE_LOCK_SWEEP_SECS=0` disables it.
+fn spawn_container_lock_sweep() {
+    let secs = env_u64("HIVE_LOCK_SWEEP_SECS", 300);
+    if secs == 0 {
+        return;
+    }
+    let interval = Duration::from_secs(secs);
+    tokio::spawn(async move {
+        // One immediate pass at boot: a node coming back from a crash or a
+        // podman-machine reset is exactly when leaked locks are already there.
+        loop {
+            let path_env = crate::git::podman_path_env();
+            match hive_backend::sweep_container_locks(&path_env).await {
+                // Healthy — recorded at debug so a normal node stays quiet.
+                Some((free, 0, 0)) => tracing::debug!(free_locks = free, "podman lock headroom ok"),
+                Some((free, vols, cells)) => tracing::warn!(
+                    free_locks_before = free,
+                    volumes_reclaimed = vols,
+                    cells_reclaimed = cells,
+                    "reclaimed leaked podman locks"
+                ),
+                // No podman on this host (or it doesn't report FreeLocks) — nothing
+                // to protect; keep looping cheaply rather than killing the task, so
+                // a podman installed later is still covered.
+                None => {}
+            }
+            tokio::time::sleep(interval).await;
         }
     });
 }

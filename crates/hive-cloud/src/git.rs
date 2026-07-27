@@ -3559,7 +3559,7 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str,
 }
 
 /// The PATH podman needs on both Linux FC hosts (/usr/bin) and macOS (/opt/homebrew).
-fn podman_path_env() -> String {
+pub(crate) fn podman_path_env() -> String {
     let base = std::env::var("PATH").unwrap_or_default();
     format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base}")
 }

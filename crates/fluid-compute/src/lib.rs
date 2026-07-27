@@ -540,14 +540,37 @@ impl Fluid {
         // app stops masquerading as host CAPACITY_EXHAUSTED. Reconcile keeps
         // retrying on its backoff curve, so a fixed deployment recovers on its own.
         if let Some(p) = self.registry.lock().get(key) {
-            if p.crash_streak >= CRASH_CIRCUIT_THRESHOLD && p.instances.is_empty() {
-                let n = p.crash_streak;
-                anyhow::bail!(
-                    "function '{key}' is crash-looping — {n} consecutive instances exited \
-                     within {}s of starting; check the deployment's logs, entrypoint and \
-                     required env (DeploymentCircuitOpen)",
-                    CRASH_LOOP_WINDOW_MS / 1000
-                );
+            // Only with NO live instance: a pool serving traffic is never circuited.
+            if p.instances.is_empty() {
+                // (a) Instances come up and then die on their own.
+                if p.crash_streak >= CRASH_CIRCUIT_THRESHOLD {
+                    let n = p.crash_streak;
+                    anyhow::bail!(
+                        "function '{key}' is crash-looping — {n} consecutive instances exited \
+                         within {}s of starting; check the deployment's logs, entrypoint and \
+                         required env (DeploymentCircuitOpen)",
+                        CRASH_LOOP_WINDOW_MS / 1000
+                    );
+                }
+                // (b) Instances never reach a listening state at all (the witnessed
+                // "exited before listening on 127.0.0.1:PORT" shape). Keep-warm
+                // already backs off on this, but the REQUEST path did not: every
+                // incoming request re-ran the doomed cold start and then burned the
+                // reroute budget on top, so the caller waited ~45s to be told
+                // CAPACITY_EXHAUSTED. Fail fast for the duration of the backoff the
+                // failures already armed — when it expires the next request probes
+                // again (half-open), so a fixed deployment recovers with no operator
+                // action.
+                if p.warm_fail_streak >= CRASH_CIRCUIT_THRESHOLD
+                    && now_ms() < p.warm_backoff_until_ms
+                {
+                    let n = p.warm_fail_streak;
+                    anyhow::bail!(
+                        "function '{key}' cannot start — {n} consecutive cold starts failed \
+                         (the container exits before it listens on its port); check the \
+                         deployment's logs, entrypoint and required env (DeploymentCircuitOpen)"
+                    );
+                }
             }
         }
         let deadline = tokio::time::Instant::now() + self.cfg.lease_timeout;
@@ -588,6 +611,13 @@ impl Fluid {
                 }
                 LeaseDecision::ColdStart => match self.cold_start(key).await {
                     Ok((cell_id, endpoint)) => {
+                        // Started fine — close the circuit. A pool with
+                        // min_instances=0 is never warmed by the autoscaler, so this
+                        // is the ONLY place its failure streak can be cleared.
+                        if let Some(p) = self.registry.lock().get_mut(key) {
+                            p.warm_fail_streak = 0;
+                            p.warm_backoff_until_ms = 0;
+                        }
                         return Ok(Lease {
                             fluid: self.clone(),
                             key: key.to_string(),
@@ -598,9 +628,17 @@ impl Fluid {
                         });
                     }
                     Err(e) => {
-                        // Release the provisioning reservation and surface the error.
+                        // Release the provisioning reservation, and record the failure
+                        // against the SAME streak/backoff keep-warm uses. Without this
+                        // a request-driven pool (min_instances=0, so keep-warm never
+                        // runs) could fail its cold start on every single request
+                        // forever, each caller paying the full startup timeout plus the
+                        // reroute budget, with nothing anywhere counting the failures.
                         if let Some(p) = self.registry.lock().get_mut(key) {
                             p.provisioning = p.provisioning.saturating_sub(1);
+                            p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+                            let backoff_ms = 1000u64 << p.warm_fail_streak.min(6);
+                            p.warm_backoff_until_ms = now_ms() + backoff_ms;
                         }
                         return Err(e);
                     }
