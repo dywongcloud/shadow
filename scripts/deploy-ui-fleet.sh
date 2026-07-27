@@ -19,31 +19,39 @@ set -euo pipefail
 PEM="${HIVE_FLEET_PEM:-$HOME/Documents/billing.pem}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# SOURCE OF TRUTH: ansible/inventory/hosts.ini ([platform:children] -> the
-# fc_kvm + fc_pvm groups, ansible_host= values). This array is a hand-copied
-# mirror of those same 7 IPs, NOT auto-derived from the ini file, because the
-# order below (fc-sanjose/control-plane-leader first, then the rest) is a
-# deliberate rollout-safety curation that does not match hosts.ini's
-# group/file order -- parsing it back out would silently reorder deploys.
-# If a fleet node is added/removed/re-IP'd in hosts.ini, update this array in
-# the same change, or this script will deploy to a stale host list. Re-check
-# for drift with:
-#   diff <(grep -oE 'ansible_host=[0-9.]+' ansible/inventory/hosts.ini | cut -d= -f2 | sort) \
-#        <(awk '/^DEFAULT_HOSTS=\(/{f=1;next} /^\)/{f=0} f{print $1}' scripts/deploy-ui-fleet.sh | sort)
-DEFAULT_HOSTS=(
-  170.106.158.151  # fc-sanjose (control-plane leader)
-  170.106.40.67    # fc-virginia-2
-  43.128.46.225    # fc-hongkong
-  43.152.247.70    # fc-bangkok
-  43.166.206.175   # fc-virginia
-  43.172.25.45     # fc-virginia-3
-  43.173.78.95     # fc-sanjose-2
-  43.153.106.173   # fc-gpu-sj-1  (4x Tesla T4)
-  170.106.155.130  # fc-gpu-sj-2  (4x Tesla T4)
-  43.153.34.250    # fc-gpu-sj-3  (4x Tesla T4)
-  43.166.223.197   # fc-cvm-sj-1  (PVM 7.1, 2x Tesla T4)
-  43.166.233.114   # fc-cvm-sj-2  (PVM 7.1, 1x Tesla T4)
+# SOURCE OF TRUTH: ansible/inventory/hosts.ini. The host list is DERIVED from it
+# at runtime rather than hand-mirrored here -- a hand-copied array drifts, and it
+# did: the three GPU nodes were added to the fleet and silently never received
+# the dashboard because this array still listed the original seven, while the
+# script exited 0 as though it had done the work.
+#
+# Ordering intent is preserved programmatically instead of by hand-curation: the
+# control-plane leader (first name in hive_cp_owner_chain) is deployed FIRST,
+# then every other host in inventory order. That was the only reason the array
+# existed, so deriving membership costs nothing.
+INVENTORY="$REPO_ROOT/ansible/inventory/hosts.ini"
+[ -f "$INVENTORY" ] || { echo "inventory not found: $INVENTORY" >&2; exit 1; }
+
+# name -> ip, plus the leader's ip resolved via hive_cp_owner_chain's first entry.
+mapfile -t DEFAULT_HOSTS < <(
+  awk '
+    /^hive_cp_owner_chain=/ { sub(/^hive_cp_owner_chain=/,""); split($0, c, ","); leader_name=c[1] }
+    /ansible_host=/ {
+      ip=""; name="";
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^ansible_host=/) { split($i, a, "="); ip=a[2] }
+        if ($i ~ /^hive_name=/)    { split($i, b, "="); name=b[2] }
+      }
+      if (ip != "") { ips[++n]=ip; names[n]=name }
+    }
+    END {
+      for (i=1; i<=n; i++) if (names[i] == leader_name) print ips[i];
+      for (i=1; i<=n; i++) if (names[i] != leader_name) print ips[i];
+    }
+  ' "$INVENTORY"
 )
+[ ${#DEFAULT_HOSTS[@]} -gt 0 ] || { echo "no ansible_host entries parsed from $INVENTORY" >&2; exit 1; }
+
 HOSTS=("${@:-${DEFAULT_HOSTS[@]}}")
 
 ssh_opts=(-i "$PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=8)
