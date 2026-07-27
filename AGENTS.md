@@ -138,6 +138,25 @@ history).
   load they are the majority — a streak counted per-caller stays stuck near
   zero and any threshold built on it never fires.
 
+## Tenant tier (plan) is stored twice — write it through one helper
+
+- A tenant's tier lives in BOTH `c.teams` (feature gating via `team_plan()`) and
+  `c.billing` (project/seat quotas, the `can_deploy` credit lock, and everything
+  the billing UI shows). Neither is authoritative on its own, and which half you
+  read decides what the platform believes.
+- **Every tier change goes through `admin::apply_plan_everywhere`.** Four call
+  sites used to write only the billing half — the free-plan checkout shortcut,
+  the Stripe `customer.subscription.deleted` downgrade, the operator grant, and
+  checkout confirmation — so the halves drifted apart silently in BOTH
+  directions: a completed upgrade left `teams` behind, and a downgrade left it
+  high. Witnessed live: a tenant reading `enterprise` for features while being
+  quota-limited and seat-capped as `hobby`.
+- `teams.set_plan` returning `None` is normal, not a failure: personal
+  namespaces (`personal`, `u_<uid>`) have a billing account and no team row.
+- Same both-halves-or-neither rule on deletion — `team_delete` clears the
+  billing account with the team record. The billing LEDGER is deliberately kept:
+  it is the financial record and must outlive the account it describes.
+
 ## Deploys
 
 - `git push` auto-deploys through TWO independent triggers, never assume the
