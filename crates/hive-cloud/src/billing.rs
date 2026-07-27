@@ -688,12 +688,22 @@ impl BillingStore {
 
     /// Complete a checkout: apply the plan change or credit top-up. Idempotent
     /// (consumes the session).
+    /// Complete a checkout. A CREDIT top-up is applied here (it touches only the
+    /// balance). A PLAN checkout deliberately does NOT write the plan here: the
+    /// caller applies it via `admin::apply_plan_everywhere`, which writes BOTH
+    /// the billing account and the team record and emits the audit entry.
+    ///
+    /// This used to call `set_plan` itself, which made it a SECOND, silent plan
+    /// writer behind the caller's back — a tier could change with no audit
+    /// record and with the team record left stale, which is exactly the split
+    /// (`teams: enterprise` / `billing: hobby`, no `plan_change` in the audit
+    /// log) witnessed in production. One writer only.
     pub fn confirm_checkout(&self, id: &str) -> Option<(Checkout, BillingAccount)> {
         let c = self.checkouts.write().remove(id)?;
         let acc = if c.kind == "credits" {
             self.add_credits(&c.tenant, c.amount_cents, "Credit top-up (checkout)")
         } else {
-            self.set_plan(&c.tenant, &c.plan)
+            self.account(&c.tenant)
         };
         Some((c, acc))
     }
