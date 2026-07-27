@@ -557,6 +557,19 @@ impl Fluid {
         // app stops masquerading as host CAPACITY_EXHAUSTED. Reconcile keeps
         // retrying on its backoff curve, so a fixed deployment recovers on its own.
         if let Some(p) = self.registry.lock().get(key) {
+            // Why a struggling pool did or did not circuit. Gated on a non-zero
+            // streak so a healthy pool logs nothing, which also makes this the
+            // first thing to read when a deployment is failing in production.
+            if p.warm_fail_streak > 0 || p.crash_streak > 0 {
+                warn!(
+                    func = %key,
+                    instances = p.instances.len(),
+                    warm_fail_streak = p.warm_fail_streak,
+                    crash_streak = p.crash_streak,
+                    probe_gate_ms_left = p.circuit_probe_after_ms.saturating_sub(now_ms()),
+                    "lease against a failing pool"
+                );
+            }
             // Only with NO live instance: a pool serving traffic is never circuited.
             if p.instances.is_empty() {
                 // (a) Instances come up and then die on their own.
