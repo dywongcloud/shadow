@@ -458,6 +458,23 @@ async fn run_build(
         let known_container = req.image_ref.is_some();
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
         let targets = crate::schedule::place_for_project(cloud, &project, &regions, known_container, known_container, needs_gpu);
+        // A GPU deployment must NEVER fall through to this node when placement
+        // found no GPU-capable target. Everywhere else an empty `targets` means
+        // "host locally", which is the right default — but for a GPU request that
+        // silently lands the deployment on a GPU-less host, and every cold start
+        // then dies with `unresolvable CDI devices nvidia.com/gpu=all`. Witnessed
+        // live: a gpu project was placed on the CPU-only leader (its GPU nodes had
+        // been marked unhealthy) and served 503 DEPLOYMENT_CIRCUIT_OPEN instead of
+        // reporting the real reason. Fail loudly here, naming the actual cause.
+        if needs_gpu && targets.is_empty() {
+            let gpu_nodes = cloud.registry.nodes().into_iter().filter(|n| n.gpu_count > 0).count();
+            let msg = format!(
+                "this project requests a serverless GPU, but no healthy GPU-capable node is currently                  reachable ({gpu_nodes} GPU node(s) known to the mesh). The deploy was NOT placed on a                  CPU node, because the GPU passthrough would fail there. Check GPU node health, or turn                  off Serverless GPU in Function Settings to deploy on ordinary compute."
+            );
+            log(msg.clone());
+            tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
+            return Err(anyhow::anyhow!(msg));
+        }
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.

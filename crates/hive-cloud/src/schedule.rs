@@ -221,7 +221,19 @@ pub fn place(
             }
             // Prefer eligible nodes; if none are eligible, honor the explicit
             // region choice with any healthy node there (e.g. los-angeles → local).
+            //
+            // EXCEPT for a GPU request: widening here would hand the deployment to
+            // a node with no GPU, and the launch then fails on the CDI device that
+            // host cannot resolve ("unresolvable CDI devices nvidia.com/gpu=all").
+            // Witnessed live — this widening is what silently defeated the
+            // gpu_count filter and put a gpu deployment on a CPU node. Skipping the
+            // region entirely is correct: `targets` staying empty is the signal the
+            // caller turns into an explicit failure.
             let eligibles: Vec<&NodeInfo> = cands.iter().copied().filter(|n| capable(n)).collect();
+            if needs_gpu && eligibles.is_empty() {
+                tracing::warn!(region = %region, "placement: no GPU-capable node in this region — not widening (gpu request)");
+                continue;
+            }
             let mut pool = if eligibles.is_empty() { cands } else { eligibles };
             pool.sort_by_key(|n| load_of(&n.name));
             // Prefer the COORDINATOR itself when it's a valid candidate for this
@@ -254,7 +266,14 @@ pub fn place(
         });
     let mut elig: Vec<&NodeInfo> = nodes.iter().filter(|n| capable(n) && reachable(n)).collect();
     if elig.is_empty() {
-        return Vec::new(); // caller hosts locally as a fallback
+        // Empty = "no target chosen". For an ordinary deployment the caller hosts
+        // locally, which is the long-standing safe default. For a GPU request the
+        // caller MUST instead fail the deploy (see `deploy_targets_or_fail` in
+        // git.rs) — hosting locally would put it on a GPU-less node.
+        if needs_gpu {
+            tracing::warn!("placement: gpu requested but no healthy GPU-capable node is reachable");
+        }
+        return Vec::new();
     }
     let dist = |n: &NodeInfo| -> f64 {
         match (self_geo, n.lat, n.lon) {
