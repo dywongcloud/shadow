@@ -38,6 +38,9 @@ DEFAULT_HOSTS=(
   43.166.206.175   # fc-virginia
   43.172.25.45     # fc-virginia-3
   43.173.78.95     # fc-sanjose-2
+  43.153.106.173   # fc-gpu-sj-1  (4x Tesla T4)
+  170.106.155.130  # fc-gpu-sj-2  (4x Tesla T4)
+  43.153.34.250    # fc-gpu-sj-3  (4x Tesla T4)
 )
 HOSTS=("${@:-${DEFAULT_HOSTS[@]}}")
 
