@@ -112,6 +112,31 @@ history).
   otherwise blames the host for an app-level fault. Circuits are half-open by
   construction (backoff expires → next request probes → success clears), so a
   fixed deployment recovers with no operator action.
+- **A circuit's open window must outlast the failure it guards.** Reusing the
+  keep-warm backoff (2–8s) to gate a circuit against a ~20s failure meant every
+  arriving request found the window already expired and paid the full cost
+  again; `CIRCUIT_PROBE_INTERVAL_MS` is separate from `warm_backoff_until_ms`
+  for exactly this reason.
+
+## Request cancellation is a failure mode, not an edge case
+
+- **Anything a request path reserves must be released by a `Drop` guard, never
+  only on the `Err` branch.** When a client gives up (curl timeout, browser
+  navigation, upstream proxy deadline) axum DROPS the request future mid-await.
+  A dropped future never returns `Err`, so no error branch anywhere runs — every
+  "release on failure" that lives in a caller is silently skipped.
+- This wedged a whole function pool: the `provisioning` reservation taken in
+  `decide_lease` leaked on every abandoned cold start, and because
+  `live_count()` counts `provisioning`, the pool both refused to cold-start
+  (every later request coalesced to the lease deadline instead of trying) AND
+  looked already-at-`min_instances` to keep-warm, so it stopped being warmed.
+  Nothing running, nothing counted, no recovery. `ColdStartGuard` is the fix and
+  the pattern to copy.
+- Corollary for counters that drive policy: count at the ONE chokepoint every
+  caller funnels through, not in each caller. Callers that coalesce or wait
+  (`LeaseDecision::WaitForWarm`) never reach their own error branch, and under
+  load they are the majority — a streak counted per-caller stays stuck near
+  zero and any threshold built on it never fires.
 
 ## Deploys
 
