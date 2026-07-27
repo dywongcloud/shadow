@@ -157,6 +157,27 @@ history).
   billing account with the team record. The billing LEDGER is deliberately kept:
   it is the financial record and must outlive the account it describes.
 
+## Bringing a node into the mesh
+
+- **Seed `HIVE_BOOTSTRAP_PEERS` with ADDRESSED peers, never bare node ids.** The
+  format (`hive_p2p::parse_seed_addr`) is
+  `<64hex-id>[@ip:port[+ip:port]][|relay-url]`; a bare id is accepted but then
+  cold-start rendezvous depends entirely on n0/Seer discovery resolving it,
+  which is not reliable. Witnessed: three nodes with bare-id seeds served
+  healthz 200 and opened 25 mesh trunks, yet each saw ONLY ITSELF in
+  `/v1/nodes` while the rest of the fleet couldn't see them either — invisible
+  to the dashboard, to placement, and to DNS. Relay-addressed seeds
+  (`<id>|http://<public-ip>:3340`) converged the registry immediately.
+- `peer_iroh.json` stores each peer's **private** addrs (10.x/172.16/192.168),
+  so copying a populated peer book from one node to seed another does not give
+  a dialable address — use public IPs / relay URLs for seeds.
+- A node's own trust drop-in must list EVERY fleet id (`HIVE_TRUSTED_NODE_IDS`
+  + `HIVE_PEER_TRUST=1`), and so must every existing node's — gossip is
+  non-transitive and the trust list is an allowlist.
+- Health probes run over **iroh**, not HTTP, so a restrictive cloud security
+  group that blocks 8786/8787 does NOT by itself make a node unhealthy — but it
+  does stop HTTP admin dispatch, which pushes deploys onto the iroh path.
+
 ## Serverless GPU
 
 - GPU serving is the **container path only**: Firecracker has no PCI
