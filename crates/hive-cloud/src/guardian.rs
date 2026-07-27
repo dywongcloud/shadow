@@ -114,6 +114,12 @@ static INIT_WEDGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// panic to redb's lock (which sent an operator down the wrong path once).
 static WEDGE_REASON: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static LAST_FAILED_INIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many init attempts THIS process has made. Used to tell apart the two very
+/// different causes of redb's "Database already open": a lock held by a prior
+/// attempt of OURS (permanent — latch), versus a lock still held by the OUTGOING
+/// process during a `systemctl restart` overlap (transient — retry). See the
+/// latch site for the incident this distinction fixes.
+static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Lazily open (once) the GuardianDB KV store, retrying on a previous failure
 /// — but throttled (see `INIT_RETRY_BACKOFF`) and never after a wedge latch.
@@ -150,6 +156,7 @@ async fn handle() -> anyhow::Result<&'static Handle> {
             // a deterministic panic cannot succeed on retry we also latch the
             // wedge so subsequent calls fail fast instead of re-panicking.
             use futures::FutureExt;
+            INIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
             let attempt = std::panic::AssertUnwindSafe(tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()));
             match attempt.catch_unwind().await {
                 Ok(Ok(result)) => result,
@@ -180,11 +187,34 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     if let Err(e) = &result {
         LAST_FAILED_INIT_MS.store(hive_core::now_ms(), Ordering::Relaxed);
         if e.to_string().contains("Database already open") {
-            INIT_WEDGED.store(true, Ordering::Relaxed);
-            tracing::error!(
-                "guardian init hit redb 'Database already open' — a leaked prior attempt holds the lock; \
-                 latching wedged state (no further in-process retries; restart hive-cloud to recover)"
-            );
+            // Only OUR OWN leaked attempt makes this permanent. On the FIRST
+            // attempt of a fresh process the lock belongs to somebody else —
+            // in practice the outgoing hive-cloud during a `systemctl restart`
+            // overlap, which releases it moments later.
+            //
+            // Latching on that transient case disabled guardian for the entire
+            // life of the new process: witnessed on fc-bangkok latching 31s
+            // into a FRESH start and then rejecting every mesh/roster put with
+            // "restart hive-cloud to recover" — advice that could not work,
+            // because each restart re-raced the same overlap. Retry instead;
+            // the existing INIT_RETRY_BACKOFF throttles it and a genuinely
+            // stuck lock still latches on the next attempt.
+            let attempts = INIT_ATTEMPTS.load(Ordering::Relaxed);
+            if attempts <= 1 {
+                // LAST_FAILED_INIT_MS is already stamped just above, so the
+                // normal INIT_RETRY_BACKOFF gate applies and the next caller
+                // retries once the outgoing process has released the lock.
+                tracing::warn!(
+                    attempts,
+                    "guardian init hit redb 'Database already open' on this process's FIRST attempt — the lock is held by ANOTHER process (typically the outgoing hive-cloud during a restart overlap), not by a leak of ours; retrying after backoff instead of latching"
+                );
+            } else {
+                INIT_WEDGED.store(true, Ordering::Relaxed);
+                tracing::error!(
+                    attempts,
+                    "guardian init hit redb 'Database already open' after repeated attempts — a leaked prior attempt in THIS process holds the lock; latching wedged state (no further in-process retries; restart hive-cloud to recover)"
+                );
+            }
         }
     }
     result
