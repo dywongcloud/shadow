@@ -1679,6 +1679,12 @@ async fn proxy_function(
 fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
     if es.contains("TenantQuota") {
         fluid_core::FailureClass::TenantThrottled
+    } else if es.contains("DeploymentCircuitOpen") {
+        // The DEPLOYMENT is broken (its instances keep exiting right after start),
+        // not the host. Reporting this as CAPACITY_EXHAUSTED sent users hunting a
+        // platform capacity problem that did not exist while their container was
+        // dying on a missing env var.
+        fluid_core::FailureClass::DeploymentCircuitOpen
     } else {
         fluid_core::FailureClass::CapacityExhausted
     }

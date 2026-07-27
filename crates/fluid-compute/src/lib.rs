@@ -96,6 +96,20 @@ struct FunctionPool {
     warm_backoff_until_ms: u64,
     /// Consecutive keep-warm failures; drives the exponential backoff above.
     warm_fail_streak: u32,
+    /// `now_ms()` of the last keep-warm cold start that RETURNED Ok. A successful
+    /// `cold_start` only means the backend accepted the launch — it says nothing
+    /// about whether the instance stayed up. Paired with `crash_streak` below to
+    /// tell "warmed and healthy" apart from "warmed and died seconds later".
+    last_warm_ok_ms: u64,
+    /// Consecutive times an instance this pool successfully warmed VANISHED
+    /// inside `CRASH_LOOP_WINDOW_MS`. This is the crash-loop signal the plain
+    /// `warm_fail_streak` cannot see: a container that starts fine and then
+    /// exits on its own (bad entrypoint, unaccepted licence prompt, missing env)
+    /// takes the `Ok` branch, so without this the streak reset every tick and
+    /// keep-warm relaunched it forever — one misconfigured app churning the host
+    /// and, before the volume leak was fixed, draining podman's shared lock pool
+    /// until EVERY other deployment on the node failed with CAPACITY_EXHAUSTED.
+    crash_streak: u32,
     /// Dynamic per-instance safe-concurrency ceiling. `None` = use
     /// `cfg.max_concurrency`. A pressure monitor LOWERS this (CPU-heavy / event-loop
     /// lag / memory pressure) so the scheduler scales out earlier instead of piling
@@ -293,6 +307,15 @@ pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
 pub const AIMD_CPU_HIGH: f32 = 85.0;
 pub const AIMD_CPU_LOW: f32 = 60.0;
 
+/// An instance that disappears within this long of a SUCCESSFUL warm did not get
+/// scaled down — it exited on its own. Wide enough to catch a container that dies
+/// on its entrypoint (the observed case died in ~2s) without mistaking a genuine
+/// idle-drain for a crash.
+pub const CRASH_LOOP_WINDOW_MS: u64 = 30_000;
+/// Consecutive crash-loop deaths after which the pool's circuit OPENS and leases
+/// fail fast instead of cold-starting into the same immediate death.
+pub const CRASH_CIRCUIT_THRESHOLD: u32 = 3;
+
 /// One AIMD step for a function's per-instance safe-concurrency ceiling (#2), given
 /// the most-pressured instance's CPU utilization (% of allocated vCPU). Classic
 /// additive-increase / multiplicative-decrease driven by a REAL CPU signal (not
@@ -359,6 +382,8 @@ impl Fluid {
                 dead_reaped: 0,
                 warm_backoff_until_ms: 0,
                 warm_fail_streak: 0,
+                last_warm_ok_ms: 0,
+                crash_streak: 0,
                 safe_concurrency,
                 nack_concurrency: 0,
                 nack_quota: 0,
@@ -507,6 +532,24 @@ impl Fluid {
     /// Acquire a slot on an instance for one request. Reuses a running instance
     /// (least-loaded with a free slot) or cold-starts when saturated.
     pub async fn lease(self: &Arc<Self>, key: &str) -> anyhow::Result<Lease> {
+        // Open circuit: this deployment's instances keep dying seconds after they
+        // start, so cold-starting another one just dies the same way while the
+        // caller waits out the whole lease timeout (the observed symptom was a
+        // request hanging ~90s). Fail fast and name the REAL cause —
+        // `classify_lease_error` maps this to DEPLOYMENT_CIRCUIT_OPEN so a broken
+        // app stops masquerading as host CAPACITY_EXHAUSTED. Reconcile keeps
+        // retrying on its backoff curve, so a fixed deployment recovers on its own.
+        if let Some(p) = self.registry.lock().get(key) {
+            if p.crash_streak >= CRASH_CIRCUIT_THRESHOLD && p.instances.is_empty() {
+                let n = p.crash_streak;
+                anyhow::bail!(
+                    "function '{key}' is crash-looping — {n} consecutive instances exited \
+                     within {}s of starting; check the deployment's logs, entrypoint and \
+                     required env (DeploymentCircuitOpen)",
+                    CRASH_LOOP_WINDOW_MS / 1000
+                );
+            }
+        }
         let deadline = tokio::time::Instant::now() + self.cfg.lease_timeout;
         // Coalesce window: how long a request waits for an in-flight cold start
         // (singleflight) before it's allowed to launch its own. Bounded so a slow
@@ -883,6 +926,34 @@ impl Fluid {
                 // pool is in failure backoff (its cold starts keep failing, so
                 // don't hammer the host every tick).
                 let live = pool.live_count();
+                // Crash-loop detection, BEFORE the keep-warm decision below so an
+                // armed backoff suppresses this very tick. Nothing in this loop
+                // drains a pool below `min_instances` (scale-to-zero explicitly
+                // keeps min; recycling needs an age/request count a seconds-old
+                // instance cannot have), so an instance missing this soon after a
+                // successful warm exited on its own.
+                if live < pool.cfg.min_instances
+                    && pool.last_warm_ok_ms != 0
+                    && now.saturating_sub(pool.last_warm_ok_ms) < CRASH_LOOP_WINDOW_MS
+                {
+                    pool.crash_streak = pool.crash_streak.saturating_add(1);
+                    pool.last_warm_ok_ms = 0; // count each death exactly once
+                    let backoff_ms = 1000u64 << pool.crash_streak.min(6);
+                    pool.warm_backoff_until_ms = now + backoff_ms;
+                    warn!(
+                        func = %key,
+                        crash_streak = pool.crash_streak,
+                        backoff_ms,
+                        "instance exited seconds after a successful warm — backing off (crash loop)"
+                    );
+                } else if live >= pool.cfg.min_instances
+                    && pool.last_warm_ok_ms != 0
+                    && now.saturating_sub(pool.last_warm_ok_ms) >= CRASH_LOOP_WINDOW_MS
+                {
+                    // Stayed up past the window — genuinely healthy, close the circuit.
+                    pool.crash_streak = 0;
+                }
+                let live = pool.live_count();
                 if live < pool.cfg.min_instances && now >= pool.warm_backoff_until_ms {
                     for _ in 0..(pool.cfg.min_instances - live) {
                         pool.provisioning += 1;
@@ -946,9 +1017,15 @@ impl Fluid {
                                 inst.inflight = 0;
                                 inst.last_active_ms = now_ms();
                             }
-                            // Healthy again — clear the failure backoff.
+                            // The backend accepted the launch — clear the hard-failure
+                            // backoff. `crash_streak` is deliberately NOT cleared here:
+                            // Ok only means it STARTED, and clearing it on start is
+                            // exactly what let a start-then-die container relaunch
+                            // forever. Reconcile clears it once the instance has
+                            // actually survived CRASH_LOOP_WINDOW_MS.
                             pool.warm_fail_streak = 0;
                             pool.warm_backoff_until_ms = 0;
+                            pool.last_warm_ok_ms = now_ms();
                         }
                         debug!(func = %key, "warm instance ready");
                     }

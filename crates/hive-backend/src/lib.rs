@@ -450,6 +450,87 @@ fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<
 /// wording `parse_ipam_conflict` extracts an id from. Only meaningful when the
 /// launch actually pinned an ip (compose); a standalone deploy has none, so this
 /// is always false there and the normal error path is preserved.
+/// True when a failed `podman run` failed because podman's LOCK POOL is empty
+/// ("allocating lock for new container: allocation failed; exceeded num_locks").
+///
+/// podman allocates one lock per container AND one per VOLUME from a single pool
+/// (`num_locks`, default 2048). Witnessed live: 2032 volumes against 16
+/// containers had consumed the entire pool, so NO container could start on that
+/// node and every cold start surfaced to users as 503 CAPACITY_EXHAUSTED —
+/// which reads as "you need more capacity" when the truth is "the host's lock
+/// pool leaked". This is the signal that the pool, not capacity, is the problem.
+fn is_lock_exhaustion(stderr: &str) -> bool {
+    let e = stderr.to_lowercase();
+    e.contains("num_locks") || (e.contains("allocating lock") && e.contains("allocation failed"))
+}
+
+/// Is this an ANONYMOUS podman volume id (64 hex chars)?
+///
+/// Load-bearing safety check for [`reclaim_podman_locks`]: podman names
+/// anonymous volumes with a 64-hex id, while every volume the platform creates
+/// on purpose is NAMED (`hive-vol-postgres`, …). A blanket `podman volume prune`
+/// would delete a provisioned DATABASE volume the moment its container happened
+/// to be down — witnessed live: `hive-vol-postgres` sitting unused and therefore
+/// prunable. Only ids matching this shape are ever removed.
+fn is_anonymous_volume(name: &str) -> bool {
+    name.len() == 64 && name.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Reclaim podman locks so containers can start again. Returns (volumes, cells).
+///
+/// Escalating, and deliberately conservative: remove EXITED `hive-cell-*`
+/// containers (ephemeral by construction) and DANGLING ANONYMOUS volumes. Never
+/// touches a running container, a named volume, or anything not recognisably
+/// ours. Called only when [`is_lock_exhaustion`] matched, so it does no work in
+/// the normal case.
+async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
+    use tokio::process::Command;
+    let mut vols = 0usize;
+    let mut cells = 0usize;
+    // Exited cell containers first: cheap, and each holds a lock plus (before
+    // `rm -v` shipped) a leaked anonymous volume.
+    if let Ok(out) = Command::new(bin)
+        .args(["ps", "-a", "--filter", "status=exited", "--format", "{{.Names}}"])
+        .env("PATH", path_env)
+        .output()
+        .await
+    {
+        for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|n| n.starts_with("hive-cell-")) {
+            if Command::new(bin)
+                .args(["rm", "-f", "-v", name])
+                .env("PATH", path_env)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                cells += 1;
+            }
+        }
+    }
+    // Then dangling anonymous volumes — the actual leak that fills the pool.
+    if let Ok(out) = Command::new(bin)
+        .args(["volume", "ls", "--filter", "dangling=true", "--format", "{{.Name}}"])
+        .env("PATH", path_env)
+        .output()
+        .await
+    {
+        for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|n| is_anonymous_volume(n)) {
+            if Command::new(bin)
+                .args(["volume", "rm", "-f", name])
+                .env("PATH", path_env)
+                .output()
+                .await
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+            {
+                vols += 1;
+            }
+        }
+    }
+    (vols, cells)
+}
+
 fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
     let pinned = net
         .as_ref()
@@ -799,6 +880,41 @@ pub(crate) async fn podman_run_container(
                 retry.extend(dyn_base);
                 out = Command::new(bin).args(&retry).env("PATH", path_env).output().await?;
             }
+        }
+    }
+    // LOCK-POOL self-heal: podman's `num_locks` pool is shared by containers AND
+    // volumes, and an exhausted pool means NO container can start on this node —
+    // every deployment cold-starting here 503s as CAPACITY_EXHAUSTED until a
+    // human intervenes. That is exactly what happened: 2032 volumes (2025 of
+    // them dangling anonymous leftovers) against 16 containers filled the pool,
+    // and a manual sweep was the only thing that brought it back. Reclaim and
+    // retry ONCE here, at the same chokepoint every launch flows through, so the
+    // condition heals itself. `rm_args` now carries `-v` so the leak stops at
+    // source too; this handles a pool already exhausted by the old behaviour (or
+    // by anything else that leaks a volume).
+    if !apple && !out.status.success() && is_lock_exhaustion(&String::from_utf8_lossy(&out.stderr)) {
+        let (vols, cells) = reclaim_podman_locks(bin, path_env).await;
+        if vols > 0 || cells > 0 {
+            tracing::warn!(
+                reclaimed_volumes = vols,
+                reclaimed_cells = cells,
+                "podman lock pool was exhausted — reclaimed dangling anonymous volumes + exited cells, retrying container start"
+            );
+            let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+            let mut retry: Vec<String> = vec!["run".into()];
+            if let Some(rt) = runtime {
+                retry.push("--runtime".into());
+                retry.push(rt.to_string());
+            }
+            retry.extend(base.iter().cloned());
+            out = Command::new(bin).args(&retry).env("PATH", path_env).output().await?;
+        } else {
+            // Nothing was reclaimable, so the pool is genuinely full of live
+            // objects — raising `num_locks` is the real remedy. Say so instead of
+            // letting this surface as a generic capacity error.
+            tracing::error!(
+                "podman lock pool exhausted and NOTHING was reclaimable — raise num_locks in containers.conf (then `podman system renumber`); containers cannot start on this node"
+            );
         }
     }
     if !out.status.success() {

@@ -75,9 +75,26 @@ pub fn needs_podman_networking(net: &serde_json::Value) -> bool {
 }
 
 /// Args to remove a container by name (best-effort teardown).
+///
+/// podman gets `-v`, which removes the container's ANONYMOUS volumes along with
+/// it. Without it every container that ran an image declaring `VOLUME` left its
+/// anonymous volume behind forever — and podman allocates one lock per VOLUME as
+/// well as per container out of a single `num_locks` pool (default 2048). Live
+/// on the leader that pool was fully consumed by 2032 volumes against just 16
+/// containers, so `podman run` failed with "allocating lock for new container:
+/// exceeded num_locks (2048)" and every cold start 503'd as CAPACITY_EXHAUSTED.
+///
+/// `-v` is specifically safe: it removes only anonymous volumes, never NAMED
+/// ones — so a provisioned database volume (`hive-vol-postgres`) is untouched.
+/// That is why this is the right place to fix the leak, rather than pruning
+/// unused volumes later (a blanket prune WOULD delete named DB volumes).
+/// Apple's `container delete` has no `-v` equivalent, so it is unchanged.
 pub fn rm_args(apple: bool, name: &str) -> Vec<String> {
-    let verb = if apple { "delete" } else { "rm" };
-    vec![verb.into(), "-f".into(), name.into()]
+    if apple {
+        vec!["delete".into(), "-f".into(), name.into()]
+    } else {
+        vec!["rm".into(), "-f".into(), "-v".into(), name.into()]
+    }
 }
 
 /// Args to remove a volume by name. `container volume delete` has no force
@@ -246,7 +263,10 @@ mod tests {
     #[test]
     fn rm_args_use_the_right_verb_per_cli() {
         assert_eq!(rm_args(true, "hive-abc"), vec!["delete", "-f", "hive-abc"]);
-        assert_eq!(rm_args(false, "hive-abc"), vec!["rm", "-f", "hive-abc"]);
+        // podman MUST carry `-v` so the container's anonymous volumes die with
+        // it — omitting it leaked one podman lock per removed container until
+        // the whole `num_locks` pool was gone and no container could start.
+        assert_eq!(rm_args(false, "hive-abc"), vec!["rm", "-f", "-v", "hive-abc"]);
     }
 
     #[test]
