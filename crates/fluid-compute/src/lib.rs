@@ -110,6 +110,17 @@ struct FunctionPool {
     /// and, before the volume leak was fixed, draining podman's shared lock pool
     /// until EVERY other deployment on the node failed with CAPACITY_EXHAUSTED.
     crash_streak: u32,
+    /// Circuit half-open gate: while `now_ms()` is under this, a pool whose
+    /// failure streak has crossed the threshold fails leases FAST; once past it,
+    /// exactly one request is allowed through as a probe (which re-arms this on
+    /// failure, or clears the streak on success).
+    ///
+    /// Deliberately SEPARATE from `warm_backoff_until_ms`. That one is tuned for
+    /// how often to re-warm (seconds), and reusing it made the circuit useless:
+    /// a failing cold start takes far longer than its own 2-8s backoff, so every
+    /// arriving request found the window already expired and paid the full
+    /// startup cost again. The gate has to outlast the failure it is guarding.
+    circuit_probe_after_ms: u64,
     /// Dynamic per-instance safe-concurrency ceiling. `None` = use
     /// `cfg.max_concurrency`. A pressure monitor LOWERS this (CPU-heavy / event-loop
     /// lag / memory pressure) so the scheduler scales out earlier instead of piling
@@ -315,6 +326,11 @@ pub const CRASH_LOOP_WINDOW_MS: u64 = 30_000;
 /// Consecutive crash-loop deaths after which the pool's circuit OPENS and leases
 /// fail fast instead of cold-starting into the same immediate death.
 pub const CRASH_CIRCUIT_THRESHOLD: u32 = 3;
+/// How long an open circuit stays open before letting ONE probe request through.
+/// Must comfortably exceed how long a failing cold start takes (observed ~20s for
+/// a container that exits before listening), or arriving requests keep finding the
+/// gate expired and pay the full failure cost every time.
+pub const CIRCUIT_PROBE_INTERVAL_MS: u64 = 30_000;
 
 /// One AIMD step for a function's per-instance safe-concurrency ceiling (#2), given
 /// the most-pressured instance's CPU utilization (% of allocated vCPU). Classic
@@ -384,6 +400,7 @@ impl Fluid {
                 warm_fail_streak: 0,
                 last_warm_ok_ms: 0,
                 crash_streak: 0,
+                circuit_probe_after_ms: 0,
                 safe_concurrency,
                 nack_concurrency: 0,
                 nack_quota: 0,
@@ -562,7 +579,7 @@ impl Fluid {
                 // again (half-open), so a fixed deployment recovers with no operator
                 // action.
                 if p.warm_fail_streak >= CRASH_CIRCUIT_THRESHOLD
-                    && now_ms() < p.warm_backoff_until_ms
+                    && now_ms() < p.circuit_probe_after_ms
                 {
                     let n = p.warm_fail_streak;
                     anyhow::bail!(
@@ -617,6 +634,7 @@ impl Fluid {
                         if let Some(p) = self.registry.lock().get_mut(key) {
                             p.warm_fail_streak = 0;
                             p.warm_backoff_until_ms = 0;
+                            p.circuit_probe_after_ms = 0;
                         }
                         return Ok(Lease {
                             fluid: self.clone(),
@@ -639,6 +657,10 @@ impl Fluid {
                             p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
                             let backoff_ms = 1000u64 << p.warm_fail_streak.min(6);
                             p.warm_backoff_until_ms = now_ms() + backoff_ms;
+                            // Hold the circuit shut well past this failure's own
+                            // duration, so the NEXT caller fails fast instead of
+                            // repeating it.
+                            p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
                         }
                         return Err(e);
                     }
@@ -1063,6 +1085,7 @@ impl Fluid {
                             // actually survived CRASH_LOOP_WINDOW_MS.
                             pool.warm_fail_streak = 0;
                             pool.warm_backoff_until_ms = 0;
+                            pool.circuit_probe_after_ms = 0;
                             pool.last_warm_ok_ms = now_ms();
                         }
                         debug!(func = %key, "warm instance ready");
@@ -1075,6 +1098,7 @@ impl Fluid {
                             pool.warm_fail_streak = pool.warm_fail_streak.saturating_add(1);
                             let backoff_ms = 1000u64 << pool.warm_fail_streak.min(6);
                             pool.warm_backoff_until_ms = now_ms() + backoff_ms;
+                            pool.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
                         }
                         warn!(func = %key, error = %e, "keep-warm cold start failed");
                     }
