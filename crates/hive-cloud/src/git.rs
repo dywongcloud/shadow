@@ -456,7 +456,8 @@ async fn run_build(
         // branch, which never reaches the tail here and whose `no_fanout`
         // sub-builds skip both of this coordinator's gates.
         let known_container = req.image_ref.is_some();
-        let targets = crate::schedule::place_for_project(cloud, &project, &regions, known_container, known_container);
+        let needs_gpu = cloud.projects.get(&project).functions.gpu;
+        let targets = crate::schedule::place_for_project(cloud, &project, &regions, known_container, known_container, needs_gpu);
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
@@ -992,6 +993,11 @@ async fn run_build(
         f.max_duration_secs = fsettings.default_max_duration_secs;
         f.vcpus = fsettings.vcpus.max(1);
         f.memory_mib = fsettings.memory_mib;
+        // Serverless GPU: the project-level toggle marks every function; a
+        // per-function fluid.json `gpu: true` (already parsed into the manifest)
+        // is preserved — settings can only turn GPU ON, never strip a
+        // function's own declared need.
+        f.gpu = f.gpu || fsettings.gpu;
         // Fluid Compute (the project's `fluid_enabled` toggle): when ON (default),
         // one warm instance serves MANY concurrent requests (in-instance
         // concurrency — ideal for I/O-bound work like LLM/DB calls that sit idle
@@ -1411,7 +1417,8 @@ async fn run_build(
         // hosted here would otherwise be replicated to every other selected region
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
-        let targets = crate::schedule::place(cloud, &regions, false, is_stateful);
+        let needs_gpu = cloud.projects.get(&project).functions.gpu;
+        let targets = crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu);
         if targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none()) {
             let remote: Vec<crate::schedule::Target> =
                 targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();

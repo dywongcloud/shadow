@@ -110,6 +110,12 @@ pub struct FunctionSettings {
     #[serde(default = "default_vcpus")]
     pub vcpus: u32,
     pub memory_mib: u32,
+    /// Serverless GPU: this project's functions run on GPU-equipped nodes with
+    /// the host GPUs passed through to the cell. Placement then only targets
+    /// nodes advertising `gpu_count > 0`. Default off; absent in stored
+    /// settings from before this field existed deserializes to off.
+    #[serde(default)]
+    pub gpu: bool,
 }
 fn default_vcpus() -> u32 {
     1
@@ -127,6 +133,7 @@ impl Default for FunctionSettings {
             // Standard serverless tier: 1 vCPU / 2 GB.
             vcpus: 1,
             memory_mib: 2048,
+            gpu: false,
         }
     }
 }

@@ -292,6 +292,14 @@ pub struct FunctionLaunch {
     /// messages wire-compatible. Ignored by the microVM/process paths.
     #[serde(default)]
     pub udp_ports: Vec<UdpPublish>,
+    /// Pass the host's GPUs through to a CONTAINER function's cell (CDI
+    /// `nvidia.com/gpu=all`; with a `runsc` sandbox runtime, gVisor `nvproxy`).
+    /// Set by fluid-compute's `cold_start` from `FunctionConfig::gpu`. `false`
+    /// (the wire-compat default) launches exactly as before. Ignored by the
+    /// microVM/process paths — Firecracker has no PCI passthrough, and on FC
+    /// nodes containers run via host podman, which is where the GPU lives.
+    #[serde(default)]
+    pub gpu: bool,
 }
 
 fn default_max_conc() -> u32 {
@@ -444,6 +452,7 @@ mod runtime_tests {
             runtime: Runtime::Bun,
             raw_proxy: false,
             udp_ports: Vec::new(),
+            gpu: false,
         };
         let json = serde_json::to_string(&launch).unwrap();
         assert!(json.contains("\"runtime\":\"bun\""));

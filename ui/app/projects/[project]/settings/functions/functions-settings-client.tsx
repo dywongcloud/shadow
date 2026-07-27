@@ -36,6 +36,7 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
         // Standard serverless tier: 1 vCPU / 2 GB.
         vcpus: 1,
         memory_mib: 2048,
+        gpu: false,
       };
       const fn = { ...fallback, ...(s.functions ?? {}) };
       setFs(fn);
@@ -93,6 +94,17 @@ export function FunctionsSettings({ paramsPromise }: { paramsPromise: Promise<{ 
         <div className="flex items-center gap-3">
           <Switch checked={fs.fluid_enabled} onChange={(v) => save({ ...fs, fluid_enabled: v })} label="Fluid compute" />
           <span className="text-sm font-medium">{fs.fluid_enabled ? "Enabled" : "Disabled"}</span>
+        </div>
+      </SettingCard>
+      {/* Serverless GPU — placement targets GPU nodes and passes the host GPUs through. */}
+      <SettingCard
+        title="Serverless GPU"
+        desc="Run this project's functions on GPU-equipped infrastructure (NVIDIA Tesla T4). Deployments are placed only on nodes with GPUs, and the GPUs are passed through to your function's container."
+        footer="A new deployment is required for changes to take effect. GPU usage is metered."
+      >
+        <div className="flex items-center gap-3">
+          <Switch checked={!!fs.gpu} onChange={(v) => save({ ...fs, gpu: v })} label="Serverless GPU" />
+          <span className="text-sm font-medium">{fs.gpu ? "Enabled" : "Disabled"}</span>
         </div>
       </SettingCard>
       {/* CPU & Memory tier — one microVM per instance. */}

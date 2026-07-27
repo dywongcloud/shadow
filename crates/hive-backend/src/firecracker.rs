@@ -778,6 +778,8 @@ impl CellBackend for FirecrackerBackend {
                 &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids),
                 // Non-HTTP protocol (gRPC/TCP/UDP): raw byte-splice tunnel mode.
                 func.raw_proxy,
+                // Serverless GPU: CDI passthrough of the host's GPUs.
+                func.gpu,
             )
             .await?;
             self.containers.lock().await.insert(cell.id.clone(), name);

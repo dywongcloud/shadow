@@ -641,6 +641,14 @@ pub(crate) async fn podman_run_container(
     // zero HTTP framing — instead of the HTTP-framed multiplexed path, which
     // would corrupt e.g. Postgres or Minecraft wire bytes by HTTP-parsing them.
     raw_proxy: bool,
+    // Pass the host's GPUs through via CDI (`nvidia.com/gpu=all` from the
+    // nvidia-container-toolkit-generated spec at /etc/cdi/nvidia.yaml). podman
+    // only — Apple's `container` has no GPU passthrough. When the sandbox
+    // runtime is gVisor `runsc` this composes with nvproxy on hosts configured
+    // for it; on hosts where runsc lacks nvproxy the existing
+    // retry-on-default-runtime fallback below already lands the container on
+    // the default runtime, GPUs intact.
+    gpu: bool,
 ) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
     use tokio::process::Command;
     anyhow::ensure!(!ports.is_empty(), "podman_run_container: at least one port must be published");
@@ -770,6 +778,11 @@ pub(crate) async fn podman_run_container(
     // Resource ceilings + privilege drop — DoS / escalation defense-in-depth.
     // These are `run` OPTIONS, so they must precede the image name below.
     base.extend(crate::container_cli::resource_flags(apple, limits));
+    // Serverless GPU: CDI device injection (see the `gpu` param doc above).
+    if gpu && !apple {
+        base.push("--device".into());
+        base.push("nvidia.com/gpu=all".into());
+    }
     // One `-p` per published port; UDP gets podman's literal `/udp` suffix on
     // the internal port, TCP (the default, and today's only case) gets none —
     // byte-identical to the pre-multi-port single `-p` for a one-TCP-port spec.
@@ -1329,6 +1342,7 @@ mod apple_container_live_tests {
             None, // single container, no compose network
             &limits,
             false, // HTTP-family service — the framed tunnel path
+            false, // no GPU on the test host
         )
         .await;
 

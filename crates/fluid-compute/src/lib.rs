@@ -165,6 +165,10 @@ pub struct FunctionStats {
     pub key: String,
     pub instances: usize,
     pub inflight: u32,
+    /// This pool's function requests a serverless GPU — its instance-time is
+    /// metered on the GPU dimension in addition to CPU/memory.
+    #[serde(default)]
+    pub gpu: bool,
     pub provisioning: u32,
     pub max_concurrency: u32,
     pub min_instances: u32,
@@ -579,6 +583,7 @@ impl Fluid {
                     key: k.clone(),
                     instances: p.instances.iter().filter(|i| !i.draining).count(),
                     inflight: p.total_inflight(),
+                    gpu: p.cfg.gpu,
                     provisioning: p.provisioning,
                     max_concurrency: p.cfg.max_concurrency,
                     min_instances: p.cfg.min_instances,
@@ -907,6 +912,9 @@ impl Fluid {
                 // Minecraft wire bytes by HTTP-parsing them).
                 raw_proxy: pool.cfg.needs_raw_proxy(),
                 udp_ports,
+                // Serverless GPU: the backend's podman path passes the host
+                // GPUs through (CDI) when set.
+                gpu: pool.cfg.gpu,
             };
             (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
         };

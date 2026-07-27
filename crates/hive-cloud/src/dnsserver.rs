@@ -303,6 +303,9 @@ mod tests {
     /// Minimal NodeInfo for the load-balancer tests.
     fn ni(name: &str, healthy: bool, ip4: Option<&str>, ip6: Option<&str>, latency: u64) -> NodeInfo {
         NodeInfo {
+            gpu_count: 0,
+            gpu_model: None,
+            gpu_vram_mb: 0,
             id: name.into(),
             name: name.into(),
             region: "test".into(),

@@ -90,6 +90,21 @@ pub struct NodeInfo {
     /// explicitly selected for them.
     #[serde(default)]
     pub backend: String,
+    /// GPUs physically present AND driver-visible on this host (`nvidia-smi`
+    /// probe at boot — see `hive-cloud`'s `detect_gpus`). 0 = no GPUs, which is
+    /// also what every pre-upgrade peer deserializes to (`serde(default)`), so
+    /// old nodes simply read as GPU-less rather than erroring. Placement only
+    /// targets `gpu_count > 0` nodes for functions that request a GPU; these
+    /// fields are informational for everything else (dashboard, capacity sums).
+    #[serde(default)]
+    pub gpu_count: u32,
+    /// Marketing model name of the first GPU (e.g. "Tesla T4"); hosts are
+    /// homogeneous in practice, and a mixed host still reports a usable name.
+    #[serde(default)]
+    pub gpu_model: Option<String>,
+    /// Total VRAM across all GPUs on the host, MiB.
+    #[serde(default)]
+    pub gpu_vram_mb: u64,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -361,6 +376,9 @@ mod tests {
 
     fn node(id: &str, region: &str, latency: u64, healthy: bool) -> NodeInfo {
         NodeInfo {
+            gpu_count: 0,
+            gpu_model: None,
+            gpu_vram_mb: 0,
             id: id.into(),
             name: id.into(),
             region: region.into(),

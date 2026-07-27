@@ -77,7 +77,7 @@ export default function NetworkPage() {
         </span>
       </div>
       <Table>
-        <thead><tr><Th>Node</Th><Th>Region</Th><Th>Endpoint</Th><Th>vCPU</Th><Th>Memory</Th><Th>Disk</Th><Th>Role</Th><Th>Seen</Th></tr></thead>
+        <thead><tr><Th>Node</Th><Th>Region</Th><Th>Endpoint</Th><Th>vCPU</Th><Th>Memory</Th><Th>Disk</Th><Th>GPU</Th><Th>Role</Th><Th>Seen</Th></tr></thead>
         <tbody>
           {(nodes ?? []).map((n) => (
             <tr key={n.id}>
@@ -88,6 +88,9 @@ export default function NetworkPage() {
               <Td className="tabular-nums">{n.cpu_cores ?? "—"}</Td>
               <Td className="tabular-nums">{fmtMem(n.mem_total_mb)}</Td>
               <Td className="tabular-nums">{n.disk_total_gb ? `${n.disk_total_gb} GB` : "—"}</Td>
+              <Td>{(n.gpu_count ?? 0) > 0
+                ? <Badge tone="purple">{n.gpu_count}× {n.gpu_model ?? "GPU"}</Badge>
+                : <span className="text-secondary">—</span>}</Td>
               <Td>{n.is_self ? <Badge tone="green">this node</Badge> : <Badge>peer</Badge>}</Td>
               <Td className="text-secondary">{timeAgo(n.last_seen_ms)} ago</Td>
             </tr>

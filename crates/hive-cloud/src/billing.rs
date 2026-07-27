@@ -160,6 +160,8 @@ pub struct RateCard {
     pub requests_per_million_cents: f64,
     /// WAF-blocked requests, cents per million.
     pub waf_per_million_cents: f64,
+    /// Serverless GPU instance-time, cents per GPU-hour (Tesla T4 class).
+    pub gpu_hr_cents: f64,
 }
 
 pub const RATE_CARD: RateCard = RateCard {
@@ -167,6 +169,7 @@ pub const RATE_CARD: RateCard = RateCard {
     mem_gb_hr_cents: 1.06,             // $0.0106 / GB-hr
     requests_per_million_cents: 200.0, // $2.00 / M requests
     waf_per_million_cents: 60.0,       // $0.60 / M blocked
+    gpu_hr_cents: 60.0,                // $0.60 / GPU-hr (T4 class)
 };
 
 /// Cumulative usage counters for a tenant (as measured from live metrics).
@@ -177,6 +180,11 @@ pub struct UsageTotals {
     pub mem_gb_hr_milli: u64,
     pub requests: u64,
     pub blocked: u64,
+    /// GPU instance wall-time, ms (a GPU function's fluid_ms — the GPU is held
+    /// for the instance's whole life, so wall-time not active-CPU is the honest
+    /// unit). `serde(default)` keeps persisted pre-GPU snapshots loading.
+    #[serde(default)]
+    pub gpu_ms: u64,
 }
 
 impl RateCard {
@@ -186,6 +194,7 @@ impl RateCard {
             + (u.mem_gb_hr_milli as f64 / 1000.0) * self.mem_gb_hr_cents
             + (u.requests as f64 / 1_000_000.0) * self.requests_per_million_cents
             + (u.blocked as f64 / 1_000_000.0) * self.waf_per_million_cents
+            + (u.gpu_ms as f64 / 3_600_000.0) * self.gpu_hr_cents
     }
 }
 
@@ -464,6 +473,7 @@ impl BillingStore {
                 mem_gb_hr_milli: sub(current.mem_gb_hr_milli, st.last.mem_gb_hr_milli),
                 requests: sub(current.requests, st.last.requests),
                 blocked: sub(current.blocked, st.last.blocked),
+                gpu_ms: sub(current.gpu_ms, st.last.gpu_ms),
             };
             st.last = current;
             (delta, st.frac_cents)
@@ -872,7 +882,7 @@ mod tests {
     #[test]
     fn rate_card_cost_matches_ui() {
         // 1 CPU-hr = $0.128 = 12.8¢; 1 GB-hr = 1.06¢; 1M req = $2 = 200¢.
-        let u = UsageTotals { active_cpu_ms: 3_600_000, mem_gb_hr_milli: 1000, requests: 1_000_000, blocked: 0 };
+        let u = UsageTotals { active_cpu_ms: 3_600_000, mem_gb_hr_milli: 1000, requests: 1_000_000, blocked: 0, gpu_ms: 0 };
         let c = RATE_CARD.cost_cents(&u);
         assert!((c - (12.8 + 1.06 + 200.0)).abs() < 1e-6, "got {c}");
     }

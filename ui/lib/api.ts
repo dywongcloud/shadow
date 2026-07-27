@@ -598,6 +598,10 @@ export interface NodeInfo {
   cpu_cores?: number;
   mem_total_mb?: number;
   disk_total_gb?: number;
+  /** GPUs driver-visible on the host (0 / absent = none). */
+  gpu_count?: number;
+  gpu_model?: string | null;
+  gpu_vram_mb?: number;
 }
 
 export interface AnycastTable {
@@ -765,6 +769,8 @@ export interface FunctionSettings {
   /** vCPUs per instance (microVM). Standard tier = 1, Performance tier = 2. */
   vcpus: number;
   memory_mib: number;
+  /** Serverless GPU: run this project's functions on GPU-equipped nodes with the host GPUs passed through. */
+  gpu?: boolean;
 }
 
 export interface ProjectSettings {

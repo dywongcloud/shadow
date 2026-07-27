@@ -71,6 +71,7 @@ pub fn place_for_project(
     regions: &[String],
     is_container: bool,
     stateful: bool,
+    needs_gpu: bool,
 ) -> Vec<Target> {
     if let Some(holder) = cloud.leases.owner_of(project) {
         let nodes = cloud.registry.nodes();
@@ -80,7 +81,8 @@ pub fn place_for_project(
             let reachable = n.name == cloud.node_name
                 || cloud.node_admins.read().contains_key(&n.name)
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
-            if n.healthy && region_ok && reachable {
+            let gpu_ok = !needs_gpu || n.gpu_count > 0;
+            if n.healthy && region_ok && reachable && gpu_ok {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 let target = if n.name == cloud.node_name {
                     Target { node: n.name.clone(), admin: None, iroh: None }
@@ -97,7 +99,7 @@ pub fn place_for_project(
             }
         }
     }
-    place(cloud, regions, is_container, stateful)
+    place(cloud, regions, is_container, stateful, needs_gpu)
 }
 
 /// Choose placement targets. See module docs for the policy. `is_container` routes
@@ -123,7 +125,19 @@ pub fn place_for_project(
 /// default with a logged explanation rather than hard-failing the deploy (see the
 /// module doc's "if nothing is eligible/reachable" fallback, and
 /// `place_for_project`'s lease-holder stickiness, for the same pattern).
-pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool, stateful: bool) -> Vec<Target> {
+pub fn place(
+    cloud: &Arc<CloudState>,
+    regions: &[String],
+    is_container: bool,
+    stateful: bool,
+    // The project's functions request a serverless GPU: only nodes ADVERTISING
+    // GPUs (NodeInfo::gpu_count > 0, from the boot nvidia-smi probe) are
+    // capable. There is deliberately NO silent fallback to a CPU node — a GPU
+    // workload placed on a GPU-less host would cold-start into CUDA errors,
+    // which is strictly worse than the explicit empty-placement failure the
+    // caller already handles for "nothing eligible".
+    needs_gpu: bool,
+) -> Vec<Target> {
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
@@ -156,6 +170,9 @@ pub fn place(cloud: &Arc<CloudState>, regions: &[String], is_container: bool, st
     // a Firecracker node (preferred: more resources) OR the mock/podman backend.
     // Non-container functions still want a Firecracker microVM node.
     let capable = |n: &NodeInfo| -> bool {
+        if needs_gpu && n.gpu_count == 0 {
+            return false;
+        }
         if is_container {
             eligible(n) || (n.healthy && n.backend == "mock")
         } else {
@@ -270,6 +287,9 @@ mod tests {
 
     fn node(name: &str, region: &str, backend: &str, mem: u64, lat: f64, lon: f64, healthy: bool) -> NodeInfo {
         NodeInfo {
+            gpu_count: 0,
+            gpu_model: None,
+            gpu_vram_mb: 0,
             id: name.into(),
             name: name.into(),
             region: region.into(),

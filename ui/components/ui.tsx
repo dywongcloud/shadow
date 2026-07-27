@@ -34,7 +34,7 @@ export function Badge({
   className,
 }: {
   children: React.ReactNode;
-  tone?: "default" | "green" | "red" | "blue" | "amber";
+  tone?: "default" | "green" | "red" | "blue" | "amber" | "purple";
   className?: string;
 }) {
   const tones: Record<string, string> = {
@@ -43,6 +43,7 @@ export function Badge({
     red: "border-red-500/30 text-red-600 bg-red-500/10 dark:text-red-400",
     blue: "border-blue-500/30 text-blue-600 bg-blue-500/10 dark:text-blue-400",
     amber: "border-amber-500/30 text-amber-600 bg-amber-500/10 dark:text-amber-400",
+    purple: "border-purple-500/30 text-purple-600 bg-purple-500/10 dark:text-purple-400",
   };
   return (
     <span

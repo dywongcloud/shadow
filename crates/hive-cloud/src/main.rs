@@ -234,6 +234,9 @@ async fn main() -> anyhow::Result<()> {
     let workflows = WorkflowEngine::new();
     let public_base = format!("http://{}", args.listen);
     let cap = resources::capacity();
+    // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
+    // gossip so placement can target GPU hosts for gpu-requesting functions.
+    let gpus = resources::detect_gpus();
     // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
     // node has a real peer id and can serve/accept Hive tunnels across networks.
     // Best-effort with a timeout: if it can't bind (offline), the node still boots
@@ -378,8 +381,15 @@ async fn main() -> anyhow::Result<()> {
         mem_total_mb: cap.1,
         disk_total_gb: cap.2,
         backend: backend_name.clone(),
+        gpu_count: gpus.0,
+        gpu_model: gpus.1.clone(),
+        gpu_vram_mb: gpus.2,
     };
-    tracing::info!(cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name, "node host capacity");
+    tracing::info!(
+        cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name,
+        gpus = gpus.0, gpu_model = gpus.1.as_deref().unwrap_or("-"), gpu_vram_mb = gpus.2,
+        "node host capacity"
+    );
     let registry = NodeRegistry::new(me);
     // Populate this node's own relay_url now that `registry` exists (mirrors
     // `set_self_guardian_addr`'s post-boot fill-in pattern) — it rides along in
@@ -2595,6 +2605,11 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                 t.mem_gb_hr_milli =
                     t.mem_gb_hr_milli.saturating_add((s.memory_gb_hrs * 1000.0) as u64);
                 t.requests = t.requests.saturating_add(s.requests);
+                if s.gpu {
+                    // GPU is held for the instance's entire life — meter its
+                    // wall-time (fluid_ms), not just active CPU.
+                    t.gpu_ms = t.gpu_ms.saturating_add(s.fluid_ms);
+                }
             }
             let mut charged_any = 0u64;
             for (tenant, tot) in totals {

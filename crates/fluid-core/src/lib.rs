@@ -337,6 +337,19 @@ pub struct FunctionConfig {
     /// [`PortSpec::single`]/[`PortSpec::from_legacy_port`] when they migrate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortSpec>,
+    /// This function needs a serverless GPU. Placement then only targets nodes
+    /// advertising GPUs (`NodeInfo::gpu_count > 0`) and the container launch
+    /// passes the host GPUs through (CDI `nvidia.com/gpu=all`, plus gVisor
+    /// `nvproxy` when the sandbox runtime is `runsc`). `false`/absent = today's
+    /// behavior exactly, for every existing deployment and every pre-upgrade
+    /// peer (`serde(default)`). From fluid.json `functions[].gpu` / the
+    /// dashboard function-settings toggle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub gpu: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn is_default_protocol(p: &ServiceProtocol) -> bool {
@@ -404,6 +417,7 @@ impl Default for FunctionConfig {
             exclude_files: None,
             protocol: ServiceProtocol::default(),
             ports: Vec::new(),
+            gpu: false,
         }
     }
 }
