@@ -500,8 +500,17 @@ pub fn diff(
         .map(|r| r.id.clone())
         .collect();
 
-    let want_key = |r: &DesiredRecord| (r.name.clone(), r.rtype.clone(), r.value.clone());
-    let have_key = |r: &RecordView| (r.name.clone(), r.rtype.clone(), r.value.clone());
+    // Compare values in a NORMALIZED form. Vercel stores a hostname-valued
+    // record (NS, CNAME) with a trailing root dot — `ns-x.shadw.app.` for a
+    // desired `ns-x.shadw.app` — so a raw string compare never matches, and
+    // the reconciler deletes and recreates the same record on EVERY pass.
+    // Live-witnessed: that churn burned the whole create budget and turned
+    // into a sustained `429 Too Many Requests` storm that also starved
+    // unrelated records (apex, api, per-deployment aliases) of their creates.
+    // The trailing dot is presentation, not identity.
+    let norm_value = |v: &str| v.trim().trim_end_matches('.').to_ascii_lowercase();
+    let want_key = |r: &DesiredRecord| (r.name.clone(), r.rtype.clone(), norm_value(&r.value));
+    let have_key = |r: &RecordView| (r.name.clone(), r.rtype.clone(), norm_value(&r.value));
 
     let want_set: std::collections::HashSet<_> = desired
         .iter()
