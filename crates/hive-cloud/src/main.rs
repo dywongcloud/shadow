@@ -996,9 +996,29 @@ fn host_switch_router(
                 .next()
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            if host == api_host || host == admin_host || host == webhook_host {
+            // `api-<region>.<platform>` is the region-pinned API surface: same
+            // dispatch as `api.`, but its DNS record names ONE region's nodes,
+            // so a client that wants a specific region uses the hostname alone.
+            // Pattern-matched rather than enumerated — the region list lives in
+            // the DNS reconciler/ACME SANs, and an api-<x> host that was never
+            // published simply doesn't resolve, so accepting the shape is safe.
+            let region_api = api_host
+                .strip_prefix("api.")
+                .map(|domain| {
+                    // `api-<region>.<domain>` exactly: the suffix must be a REAL
+                    // label boundary (`.domain`), or `api-evil-shadw.cloud`-style
+                    // hosts would match a bare ends_with(domain).
+                    let suffix = format!(".{domain}");
+                    host.starts_with("api-")
+                        && host.ends_with(&suffix)
+                        && host.len() > "api-".len() + suffix.len()
+                        && !host["api-".len()..host.len() - suffix.len()].contains('.')
+                })
+                .unwrap_or(false);
+            if host == api_host || host == admin_host || host == webhook_host || region_api {
                 // Pass the MATCHED host so a leader-forward pins to the right SNI
-                // (the platform cert covers api./admin./webhook.).
+                // (the platform cert covers api./admin./webhook. and, once the
+                // SAN-coverage reissue lands, every api-<region>.).
                 return admin_ingress(cloud, admin, host, req).await;
             }
             // Dashboard hosts: reverse-proxy to the configured origin — each

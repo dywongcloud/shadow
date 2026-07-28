@@ -375,9 +375,18 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                     // restart, and the new SANs land in one pass.
                     let force_path = crate::persist::data_dir().join(format!("acme-force-{bundle}"));
                     let forced = std::fs::metadata(&force_path).is_ok();
+                    // Fresh = young enough AND covering every wanted name. The
+                    // coverage check is what makes a SAN ADDITION (a new region's
+                    // `api-<region>` host, a new explicit platform host) reissue
+                    // automatically — before it, the only path was the manual
+                    // force sentinel, and a forgotten sentinel meant a name that
+                    // resolved in DNS but failed TLS until the 60-day renewal.
                     let fresh = !forced
                         && load_bundle_local(&bundle)
-                            .map(|b| hive_core::now_ms() < b.issued_ms + RENEW_AFTER_MS)
+                            .map(|b| {
+                                hive_core::now_ms() < b.issued_ms + RENEW_AFTER_MS
+                                    && names.iter().all(|n| b.names.contains(n))
+                            })
                             .unwrap_or(false);
                     if fresh {
                         continue;
@@ -675,6 +684,27 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
             cloud.platform_domain.clone(),
         ),
     ];
+    // Per-region API hosts (`api-<region>.<platform>`), matching the DNS records
+    // the reconciler publishes for them — a name that resolves but fails TLS is
+    // not usable, which is exactly what shipping the DNS half alone produced.
+    // Regions come from the registry; sorted so the SAN list is deterministic
+    // across passes (an order-flapping list would defeat the superset check that
+    // triggers reissue). A region joining later grows the wanted set, the cached
+    // bundle stops covering it, and the next ACME pass reissues automatically.
+    {
+        let mut regions: Vec<String> = cloud
+            .registry
+            .nodes()
+            .into_iter()
+            .map(|n| n.region.trim().to_ascii_lowercase())
+            .filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'))
+            .collect();
+        regions.sort();
+        regions.dedup();
+        for r in regions {
+            v[1].1.push(format!("api-{r}.{}", cloud.platform_domain));
+        }
+    }
     // relay/discovery terminate their own TLS (iroh) — only add on request.
     if std::env::var("HIVE_ACME_PLATFORM_EXTRA").map(|x| x == "1").unwrap_or(false) {
         v[1].1.push(format!("relay.{}", cloud.platform_domain));
