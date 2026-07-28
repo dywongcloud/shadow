@@ -27,7 +27,7 @@ use hive_edge::NodeInfo;
 /// The deploy wildcard zone whose A/AAAA are answered dynamically (healthy node IPs).
 /// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadw.app` → `deploy.shadw.app` + `*.deploy.shadw.app`.
 /// Cached: a per-query env read would be a syscall on the hot path. Lowercased, dot-trimmed.
-fn deploy_zone() -> Option<&'static str> {
+pub(crate) fn deploy_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
     Z.get_or_init(|| {
         std::env::var("HIVE_DEPLOY_ZONE")
@@ -372,6 +372,7 @@ mod tests {
             iroh_addr: None,
             guardian_iroh_addr: None,
             relay_url: None,
+            dns_ns: None,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

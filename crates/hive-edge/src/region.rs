@@ -51,6 +51,16 @@ pub struct NodeInfo {
     /// so older gossiped/persisted records without this field deserialize fine.
     #[serde(default)]
     pub relay_url: Option<String>,
+    /// This node answers authoritative DNS (Seer) on port 53, i.e. it is a
+    /// usable NAMESERVER for zones the platform delegates to itself. Set at
+    /// boot from `HIVE_DNS_ADDR` (only when the bind is a real public
+    /// `:53`, never a loopback/dev bind) and gossiped, so the DNS reconciler
+    /// can derive the NS/glue record set for the geo zone from the same
+    /// health-damped registry every other record already comes from instead
+    /// of a hand-maintained nameserver list. `None` = not a nameserver.
+    /// `#[serde(default)]` so pre-upgrade peers deserialize fine.
+    #[serde(default)]
+    pub dns_ns: Option<String>,
     /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
     /// on every owner promotion/failover). Gossiped so the whole fleet converges
     /// on the highest epoch — the fencing token that lets a node reject admin
@@ -465,6 +475,7 @@ mod tests {
             iroh_addr: None,
             guardian_iroh_addr: None,
             relay_url: None,
+            dns_ns: None,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

@@ -179,6 +179,10 @@ pub struct PublishNode {
     pub name: String,
     pub ip4: Option<String>,
     pub ip6: Option<String>,
+    /// This node answers authoritative DNS on a public `:53` (gossiped
+    /// `NodeInfo::dns_ns`) — i.e. it is eligible to appear in the geo zone's
+    /// NS set. See `desired_geo_delegation`.
+    pub dns_ns: bool,
     /// The node's region code (`san-jose`, `bangkok`, …) — carried through from
     /// the registry so the per-region names can be derived from the same
     /// health-damped set every other record already comes from.
@@ -199,6 +203,66 @@ pub fn desired_apps(nodes: &[PublishNode]) -> Vec<DesiredRecord> {
         }
     }
     out
+}
+
+/// The label the geo zone hangs off inside the apps zone, derived from
+/// `HIVE_DEPLOY_ZONE`: `deploy.shadw.app` inside apps zone `shadw.app` → `deploy`.
+/// `None` when the deploy zone is unset or is not a child of the apps zone (then
+/// there is nothing this reconciler can delegate and it stays out of the way).
+pub fn geo_label(deploy_zone: &str, apps_domain: &str) -> Option<String> {
+    let dz = deploy_zone.trim().trim_matches('.').to_lowercase();
+    let apps = apps_domain.trim().trim_matches('.').to_lowercase();
+    if dz.is_empty() || apps.is_empty() {
+        return None;
+    }
+    dz.strip_suffix(&format!(".{apps}")).filter(|l| !l.is_empty() && !l.contains('.')).map(str::to_string)
+}
+
+/// Stable nameserver label for a node: `ns-<node-name>`, so the record set is a
+/// pure function of the registry (no index that renumbers when a node drops out
+/// and silently repoints an existing NS at a different machine).
+pub fn ns_label(node_name: &str) -> String {
+    format!("ns-{}", node_name.trim().to_lowercase())
+}
+
+/// Delegation records for the geo zone: NS records on `<label>` pointing at
+/// per-node nameserver names inside the apps zone, plus the glue A/AAAA for
+/// those names.
+///
+/// Why this exists: the apps/platform zones are hosted by Vercel DNS, which is
+/// plain authoritative DNS with no geo or health routing — so the platform's
+/// own geo-aware server (Seer, `dnsserver.rs`) can only ever answer queries for
+/// names actually DELEGATED to it. This publishes that delegation, derived from
+/// the same health-damped `PublishNode` set every other record comes from, so a
+/// nameserver that goes unhealthy or loses its public IP leaves the NS set by
+/// the normal diff instead of a hand-maintained list going stale.
+///
+/// Only nodes that really answer DNS are eligible (`PublishNode::dns_ns`, set at
+/// boot from a public `:53` bind and gossiped) — advertising a node that has no
+/// listener would put a black hole in the delegated zone.
+pub fn desired_geo_delegation(nodes: &[PublishNode], label: &str) -> (Vec<DesiredRecord>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut managed = vec![label.to_string()];
+    for n in nodes.iter().filter(|n| n.dns_ns) {
+        let ns = ns_label(&n.name);
+        if let Some(ip) = &n.ip4 {
+            out.push(DesiredRecord { name: ns.clone(), rtype: "A".into(), value: ip.clone(), ttl: 300 });
+        }
+        if let Some(ip) = &n.ip6 {
+            out.push(DesiredRecord { name: ns.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 300 });
+        }
+        if n.ip4.is_some() || n.ip6.is_some() {
+            out.push(DesiredRecord { name: label.to_string(), rtype: "NS".into(), value: ns.clone(), ttl: 300 });
+            managed.push(ns);
+        }
+    }
+    // A delegation with a single nameserver is a single point of failure for
+    // every name in the zone; below two, publish nothing and leave the zone
+    // undelegated (it keeps resolving through the parent's own records).
+    if out.iter().filter(|r| r.rtype == "NS").count() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    (out, managed)
 }
 
 /// True for an immutable per-commit alias like `myapp-c7416ec` — a URL minted
@@ -400,7 +464,11 @@ pub fn diff(
     managed_names: &[&str],
 ) -> (Vec<DesiredRecord>, Vec<String>) {
     let managed = |name: &str| managed_names.contains(&name);
-    let addr_type = |t: &str| t == "A" || t == "AAAA";
+    // NS joins A/AAAA as a reconciler-owned type so the geo zone's delegation
+    // (see `desired_geo_delegation`) is diffed by the same delta-only path as
+    // every address record. TXT stays excluded on purpose — the ACME solver's
+    // `_acme-challenge` is not ours to delete.
+    let addr_type = |t: &str| t == "A" || t == "AAAA" || t == "NS";
 
     let have: Vec<&RecordView> = current
         .iter()
@@ -466,6 +534,8 @@ pub struct ReconcilerStats {
     /// region with at least one publishable node).
     pub region_records: AtomicU64,
     pub last_pass_ms: AtomicU64,
+    /// NS+glue records published for the delegated geo zone (0 = undelegated).
+    pub geo_delegation_records: AtomicU64,
 }
 
 pub static STATS: ReconcilerStats = ReconcilerStats {
@@ -478,6 +548,7 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     affinity_records: AtomicU64::new(0),
     region_records: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
+    geo_delegation_records: AtomicU64::new(0),
 };
 
 /// Upper bound on deployment-affinity records. Vercel rate-limits record
@@ -512,6 +583,9 @@ pub struct NodeView {
     pub ip4: Option<String>,
     pub ip6: Option<String>,
     pub region: String,
+    /// Gossiped `NodeInfo::dns_ns` presence — carried through so the geo
+    /// delegation's NS set comes from the same health-damped view.
+    pub dns_ns: bool,
 }
 
 /// The publishable node set with flap damping: a node stays published while its
@@ -534,6 +608,7 @@ pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Ve
                 ip4: n.ip4.clone(),
                 ip6: n.ip6.clone(),
                 region: n.region.clone(),
+                dns_ns: n.dns_ns,
             });
         }
     }
@@ -719,6 +794,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 .nodes()
                 .into_iter()
                 .map(|n| NodeView {
+                    dns_ns: n.dns_ns.is_some(),
                     name: n.name,
                     healthy: n.healthy,
                     ip4: n.public_ip,
@@ -772,6 +848,18 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let mut apps_managed: Vec<String> = vec!["*".into(), String::new()];
             apps_managed.extend(apps_region_names.into_iter().filter(|n| !claimed.contains(n.as_str())));
             apps_managed.extend(affinity_names);
+            // Geo-zone delegation: hand the deploy zone to the fleet's own
+            // nameservers so Seer's geo/health-aware answers are actually
+            // reachable (Vercel DNS itself has no geo routing). Published into
+            // the apps zone because the deploy zone is a child of it, and only
+            // when >=2 real nameservers exist (see desired_geo_delegation).
+            let (geo_records, geo_names) = crate::dnsserver::deploy_zone()
+                .and_then(|dz| geo_label(dz, &cloud.apps_domain))
+                .map(|label| desired_geo_delegation(&publish, &label))
+                .unwrap_or_default();
+            STATS.geo_delegation_records.store(geo_records.len() as u64, Ordering::Relaxed);
+            apps.extend(geo_records);
+            apps_managed.extend(geo_names);
             let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
             STATS.affinity_records.store(affinity_count as u64, Ordering::Relaxed);
             let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
@@ -963,6 +1051,7 @@ mod tests {
         let mut streaks = HashMap::new();
         let view = |healthy| {
             vec![NodeView {
+                dns_ns: false,
                 name: "n1".into(),
                 healthy,
                 ip4: Some("1.1.1.1".into()),
@@ -985,6 +1074,7 @@ mod tests {
     fn no_public_ip_never_published() {
         let mut streaks = HashMap::new();
         let nodes = vec![NodeView {
+            dns_ns: false,
             name: "nat-node".into(),
             healthy: true,
             ip4: None,
@@ -997,6 +1087,7 @@ mod tests {
     #[test]
     fn desired_sets_cover_wildcard_apex_api_relay() {
         let nodes = vec![PublishNode {
+            dns_ns: false,
             name: "n1".into(),
             ip4: Some("1.1.1.1".into()),
             ip6: Some("::1".into()),

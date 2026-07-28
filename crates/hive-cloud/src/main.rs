@@ -380,6 +380,16 @@ async fn main() -> anyhow::Result<()> {
         // when/why it's `None` (still filled in this same boot, just after the
         // registry the setter needs is constructed).
         relay_url: None,
+        // Nameserver capability: only a REAL public `:53` bind counts. A
+        // loopback/dev bind (the default 127.0.0.1:5354) is not reachable by
+        // any resolver, so advertising it would put a black hole in the
+        // delegated zone's NS set.
+        dns_ns: std::env::var("HIVE_DNS_ADDR").ok().and_then(|a| {
+            let port_is_53 = a.rsplit(':').next() == Some("53");
+            let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+            let public_bind = host == "0.0.0.0" || host == "[::]" || host == "::";
+            (port_is_53 && public_bind).then(|| a.clone())
+        }),
         // Boot value; the gossip loop refreshes this every round from the
         // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,
