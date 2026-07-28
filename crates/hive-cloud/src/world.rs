@@ -100,11 +100,46 @@ async fn pipeline(cloud: &Arc<CloudState>, url: &str, token: &str, cmds: Vec<Vec
 }
 
 /// Decode a base64(CBOR) blob into JSON (unwrapping cbor-x tags like Date).
+///
+/// Every failure path logs instead of silently returning `None` — the real
+/// `@workflow/world` spec has `SPEC_VERSION_SUPPORTS_COMPRESSION` (a
+/// gzip/zstd wrapper this fn has zero awareness of), so a future dispatcher
+/// version writing compressed payloads would otherwise make every read
+/// through here silently vanish rather than surface as a diagnosable error —
+/// the exact "decrypt returns ciphertext instead of failing" shape that cost
+/// real debugging time elsewhere in this codebase (see the at-rest-secret
+/// supersession incident). Distinguishes "this looks like a known
+/// compression format we don't handle" from genuine corruption so the two
+/// don't get confused when triaging a future occurrence.
 fn decode_blob(v: &Value) -> Option<Value> {
-    let b64 = v.as_str()?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
-    let cv: serde_cbor::Value = serde_cbor::from_slice(&bytes).ok()?;
-    Some(cbor_to_json(cv))
+    let b64 = v.as_str().or_else(|| {
+        tracing::warn!(value = %v, "decode_blob: stored value is not a string (expected base64)");
+        None
+    })?;
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(b64) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, len = b64.len(), "decode_blob: base64 decode failed");
+            return None;
+        }
+    };
+    match serde_cbor::from_slice::<serde_cbor::Value>(&bytes) {
+        Ok(cv) => Some(cbor_to_json(cv)),
+        Err(e) => {
+            let looks_gzip = bytes.starts_with(&[0x1f, 0x8b]);
+            let looks_zstd = bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]);
+            if looks_gzip || looks_zstd {
+                tracing::warn!(
+                    format = if looks_gzip { "gzip" } else { "zstd" },
+                    bytes = bytes.len(),
+                    "decode_blob: payload looks compressed (SPEC_VERSION_SUPPORTS_COMPRESSION?) — decompression is NOT implemented, this event/run is unreadable until it is"
+                );
+            } else {
+                tracing::warn!(error = %e, bytes = bytes.len(), first_bytes = ?&bytes[..bytes.len().min(8)], "decode_blob: CBOR decode failed (corrupt or unrecognized format)");
+            }
+            None
+        }
+    }
 }
 
 /// serde_cbor::Value → serde_json::Value. Tags are unwrapped to their inner value
