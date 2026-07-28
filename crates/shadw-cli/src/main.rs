@@ -88,6 +88,15 @@ enum AuthCmd {
         api: Option<String>,
         #[arg(long)]
         team: Option<String>,
+        /// Account email (mint-mode: recorded in minted tokens so the backend
+        /// can derive platform-operator status from its own owner config).
+        #[arg(long)]
+        email: Option<String>,
+        /// HIVE_INTERNAL_TOKEN for mint-mode auto-login: the CLI then mints and
+        /// auto-refreshes a platform JWT, so mutations work on an enforced
+        /// platform without pasting short-lived tokens.
+        #[arg(long)]
+        internal_token: Option<String>,
     },
     /// Show the active config + verify the token works.
     Whoami,
@@ -380,7 +389,12 @@ struct ApiArgs {
 async fn main() {
     let cli = Cli::parse();
     let out = Out { json: cli.json };
-    let c = Client::resolve(cli.api.clone(), cli.token.clone(), cli.team.clone());
+    let explicit_token = cli.token.is_some() || std::env::var("SHADW_TOKEN").is_ok() || std::env::var("SHADW_API_KEY").is_ok();
+    let mut c = Client::resolve(cli.api.clone(), cli.token.clone(), cli.team.clone());
+    // Mint-mode auto-login (config `internal_token`): transparently swap in a
+    // fresh platform JWT so mutations pass the enforced ingress. No-op for the
+    // plain API-key flow or an explicit --token/env token.
+    c.ensure_fresh_token(explicit_token).await;
     if let Err(e) = run(cli, &c, out).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
@@ -425,47 +439,67 @@ async fn run(cli: Cli, c: &Client, out: Out) -> Result<()> {
 
 async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
     match a {
-        AuthCmd::Login { token, api, team } => {
+        AuthCmd::Login { token, api, team, email, internal_token } => {
+            let prev = client::load_config();
             let cfg = Config {
                 api: api.or_else(|| Some(c.api.clone())),
                 token: token.or_else(|| c.token.clone()),
                 team: team.or_else(|| c.team.clone()),
+                email: email.or(prev.email),
+                internal_token: internal_token.or(prev.internal_token),
+                // Force a fresh mint under the possibly-changed identity.
+                jwt: None,
+                jwt_exp: None,
             };
-            if cfg.token.as_deref().unwrap_or("").is_empty() {
-                return Err(anyhow!("no API key provided — pass --token shadw_… (create one in the dashboard: Settings → API Keys)"));
+            let mint_mode = cfg.internal_token.as_deref().unwrap_or("") != "";
+            if !mint_mode && cfg.token.as_deref().unwrap_or("").is_empty() {
+                return Err(anyhow!("no credentials provided — pass --token hive_… (dashboard: Settings → API Keys) or --internal-token for mint-mode auto-login"));
             }
             client::save_config(&cfg)?;
-            // Verify by hitting an authenticated endpoint scoped to the key's team.
-            let verify = Client::resolve(cfg.api.clone(), cfg.token.clone(), cfg.team.clone());
-            let keys = verify.get("/v1/apikeys").await?;
-            let team = keys.as_array().and_then(|a| a.first()).and_then(|k| k["team"].as_str()).unwrap_or("");
+            // Verify with a freshly-resolved client (mint-mode mints here).
+            let mut verify = Client::resolve(cfg.api.clone(), cfg.token.clone(), cfg.team.clone());
+            verify.ensure_fresh_token(false).await;
+            let who = verify.get("/v1/whoami").await?;
+            let authed = who["authenticated"].as_bool().unwrap_or(false);
+            if !authed {
+                return Err(anyhow!("saved config, but /v1/whoami reports unauthenticated — check the token/internal token"));
+            }
             println!(
-                "Logged in to {}{}. Config saved to {}.",
+                "Logged in to {} as {} (tenant: {}). Config saved to {}.",
                 cfg.api.as_deref().unwrap_or(""),
-                if team.is_empty() { String::new() } else { format!(" (team: {team})") },
+                who["sub"].as_str().unwrap_or(cfg.email.as_deref().unwrap_or("?")),
+                who["tenant"].as_str().unwrap_or("?"),
                 client::config_path().display()
             );
             Ok(())
         }
         AuthCmd::Whoami => {
+            let cfg = client::load_config();
             println!("API:   {}", c.api);
             println!("Token: {}", c.token.as_deref().map(mask).unwrap_or_else(|| "(none)".into()));
             if let Some(t) = &c.team {
                 println!("Team:  {t}");
             }
+            if let Some(e) = &cfg.email {
+                println!("Email: {e}");
+            }
+            if cfg.internal_token.is_some() {
+                println!("Auth:  mint-mode (auto-refreshed platform JWT)");
+            }
+            let who = c.get("/v1/whoami").await?;
+            println!("Authenticated: {} (sub: {}, tenant: {})",
+                who["authenticated"].as_bool().unwrap_or(false),
+                who["sub"].as_str().unwrap_or("-"),
+                who["tenant"].as_str().unwrap_or("-"));
             let auth = c.get("/v1/auth").await?;
             println!("Auth enforced: {}", auth["enforced"].as_bool().unwrap_or(false));
-            let keys = c.get("/v1/apikeys").await?;
-            if let Some(arr) = keys.as_array() {
-                if let Some(k) = arr.first() {
-                    println!("Active team: {}", k["team"].as_str().unwrap_or("?"));
-                }
-                println!("API keys on this team: {}", arr.len());
-            }
             Ok(())
         }
         AuthCmd::Token { sub, tenant, role } => {
-            out.value(&c.post("/v1/token", json!({ "sub": sub, "tenant": tenant, "role": role })).await?);
+            // Include the account email so the backend derives platform-operator
+            // status from its own owner config (it never trusts a client claim).
+            let email = client::load_config().email.unwrap_or_default();
+            out.value(&c.post("/v1/token", json!({ "sub": sub, "tenant": tenant, "role": role, "email": email })).await?);
             Ok(())
         }
         AuthCmd::Logout => {

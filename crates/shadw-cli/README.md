@@ -17,8 +17,19 @@ cargo install --path crates/shadw-cli   # installs `shadw` on your PATH
 Create a key in the dashboard (Settings → API Keys), then:
 
 ```bash
-shadw auth login --token shadw_xxxxxxxx --api https://api.shadw.cloud
+shadw auth login --token hive_xxxxxxxx --api https://api.shadw.cloud
 shadw auth whoami
+```
+
+**Note (enforced platforms):** the ingress accepts only platform JWTs on
+mutations, so an API key alone is read-only there. For full read+write
+auto-login (self-hosted operators holding `HIVE_INTERNAL_TOKEN`), use
+**mint-mode** — the CLI then mints and auto-refreshes a 1-hour platform JWT
+transparently, caching it in the config to stay under the mint rate limit:
+
+```bash
+shadw auth login --api https://api.shadw.cloud \
+  --email you@example.com --internal-token "$HIVE_INTERNAL_TOKEN"
 ```
 
 `login` saves `~/.shadw/config.json`. Config is resolved (highest priority first)

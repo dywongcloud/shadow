@@ -19,6 +19,23 @@ pub struct Config {
     pub token: Option<String>,
     #[serde(default)]
     pub team: Option<String>,
+    /// Account email for mint-mode auto-login (drives the backend's own
+    /// platform-operator derivation; never trusted client-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// `HIVE_INTERNAL_TOKEN` for mint-mode: when set, the CLI transparently
+    /// mints a short-lived platform JWT via `POST /v1/token` and uses it as the
+    /// bearer. This is what makes MUTATIONS work at the enforced ingress, which
+    /// accepts only JWTs on writes (an API key alone is read-only there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub internal_token: Option<String>,
+    /// Cached minted JWT + its unix-seconds expiry, refreshed automatically
+    /// when fewer than 5 minutes remain. Cache exists so scripted CLI use
+    /// doesn't hit the mint endpoint's 20/60s per-IP rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jwt_exp: Option<u64>,
 }
 
 /// Path to the CLI config file (`~/.shadw/config.json`).
@@ -100,6 +117,73 @@ impl Client {
         }
     }
 
+    /// Mint-mode auto-login: when the saved config carries `internal_token`,
+    /// replace the bearer with a fresh platform JWT (minted via `POST
+    /// /v1/token`, cached in the config until <5 min from expiry). An explicit
+    /// `--token`/`SHADW_TOKEN` wins — mint mode only upgrades the DEFAULT
+    /// resolution, so the documented API-key flow is untouched. On mint
+    /// failure the resolved token (API key, read-only at the enforced
+    /// ingress) is kept and the failure is reported on stderr, loudly.
+    pub async fn ensure_fresh_token(&mut self, explicit_token: bool) {
+        if explicit_token {
+            return;
+        }
+        let mut cfg = load_config();
+        let Some(internal) = cfg.internal_token.clone().filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let (Some(jwt), Some(exp)) = (cfg.jwt.clone(), cfg.jwt_exp) {
+            if exp > now + 300 {
+                self.token = Some(jwt);
+                return;
+            }
+        }
+        let email = cfg.email.clone().unwrap_or_default();
+        let tenant = cfg.team.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "personal".into());
+        let body = serde_json::json!({
+            "sub": format!("cli:{}", if email.is_empty() { "shadw" } else { &email }),
+            "tenant": tenant,
+            "role": "owner",
+            "email": email,
+        });
+        let url = join_url(&self.api, "/v1/token");
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-hive-internal", internal)
+            .json(&body)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().await.unwrap_or(Value::Null);
+                if let Some(tok) = v["token"].as_str().filter(|s| !s.is_empty()) {
+                    let ttl = v["expires_in"].as_u64().unwrap_or(3600);
+                    cfg.jwt = Some(tok.to_string());
+                    cfg.jwt_exp = Some(now + ttl);
+                    if let Err(e) = save_config(&cfg) {
+                        eprintln!("warning: minted a session token but could not cache it: {e:#}");
+                    }
+                    self.token = Some(tok.to_string());
+                } else {
+                    eprintln!("warning: {url} returned no token (backend unenforced?); keeping existing credentials");
+                }
+            }
+            Ok(r) => {
+                let status = r.status();
+                let text = r.text().await.unwrap_or_default();
+                eprintln!("warning: token mint failed: HTTP {status}: {} — falling back to the saved API key (read-only on an enforced platform)", text.trim());
+            }
+            Err(e) => {
+                eprintln!("warning: token mint unreachable ({url}): {e} — falling back to the saved API key (read-only on an enforced platform)");
+            }
+        }
+    }
+
     fn url(&self, path: &str) -> String {
         join_url(&self.api, path)
     }
@@ -172,7 +256,7 @@ mod tests {
 
     #[test]
     fn precedence_flag_over_env_over_config_over_default() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()) };
+        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()), ..Default::default() };
         // Flags win over everything.
         let (api, tok, team) = resolve_settings(
             Some("http://flag".into()), Some("flag_tok".into()), Some("flag_team".into()),
@@ -185,7 +269,7 @@ mod tests {
 
     #[test]
     fn env_wins_over_config_when_no_flag() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: None };
+        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: None, ..Default::default() };
         let (api, tok, _) = resolve_settings(None, None, None, &cfg, env_of(&[("SHADW_API_URL", "http://env"), ("SHADW_TOKEN", "env_tok")]));
         assert_eq!(api, "http://env");
         assert_eq!(tok.as_deref(), Some("env_tok"));
@@ -193,7 +277,7 @@ mod tests {
 
     #[test]
     fn config_used_when_no_flag_or_env() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()) };
+        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()), ..Default::default() };
         let (api, tok, team) = resolve_settings(None, None, None, &cfg, env_of(&[]));
         assert_eq!(api, "http://cfg");
         assert_eq!(tok.as_deref(), Some("cfg_tok"));

@@ -89,6 +89,16 @@ use hive_edge::{
 
 use state::CloudState;
 
+/// The public HTTPS listener's `axum_server::Handle`, set once at listener
+/// startup so the SIGTERM handler (defined earlier in `main`, run before the
+/// listener spawns in source order but racing it at runtime) can reach it
+/// without threading an extra parameter through every intervening call. A
+/// `OnceLock` rather than a plain global `Handle` because the listener is only
+/// created in the `cloud.ingress != "ngrok"` branch — ngrok ingress has no
+/// public listener here to drain, and the shutdown handler already treats
+/// "not set" as that case, not an error.
+static SHUTDOWN_HTTPS_HANDLE: std::sync::OnceLock<axum_server::Handle> = std::sync::OnceLock::new();
+
 #[derive(Parser, Debug)]
 #[command(name = "hive-cloud", about = "A unified cloud node (builds + serving + edge + cron + workflows)")]
 struct Args {
@@ -441,8 +451,16 @@ async fn main() -> anyhow::Result<()> {
     // loop's identical "periodic flush independent of mutation timing" fix for the
     // same underlying bug class.
     spawn_metrics_persist_loop(cloud.clone());
-    // Graceful-shutdown flush: on SIGTERM/SIGINT (e.g. `systemctl restart`) write the
-    // latest state synchronously so a restart loses nothing from the coalescing window.
+    // Graceful-shutdown flush: on SIGTERM/SIGINT (e.g. `systemctl restart`) drain
+    // the public listener's in-flight connections (bounded), THEN write the
+    // latest state synchronously so a restart loses nothing from the coalescing
+    // window. Previously this exited immediately on signal, severing every
+    // in-flight request AND every gateway tunnel proxying to a placed app's cell
+    // the instant SIGTERM arrived — the literal mechanism behind "a hive-node
+    // restart breaks placed apps' cell tunnels". Bounded by
+    // HIVE_SHUTDOWN_GRACE_SECS (default 15s) so a stuck connection cannot hang a
+    // restart forever; systemd's own TimeoutStopSec is the final backstop if this
+    // grace window is somehow exceeded.
     {
         let flush_cloud = cloud.clone();
         tokio::spawn(async move {
@@ -458,6 +476,15 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 _ = term.recv() => {}
                 _ = intr.recv() => {}
+            }
+            let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
+            if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
+                tracing::info!(?grace, "shutdown signal → draining public listener (in-flight requests + cell tunnels)");
+                handle.graceful_shutdown(Some(grace));
+                // graceful_shutdown stops new connections and gives existing ones
+                // the grace window; wait for it here since exit() below would
+                // otherwise kill them the instant this task returns regardless.
+                tokio::time::sleep(grace).await;
             }
             tracing::info!("shutdown signal → flushing platform state");
             persist::flush_blocking();
@@ -902,11 +929,22 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "0.0.0.0:80".parse().unwrap());
         let https_router = public.clone();
+        // Graceful-shutdown handle for the PUBLIC listener specifically — this is
+        // the one carrying real customer traffic (including active gateway tunnel
+        // proxying to placed apps' cells), so it is the highest-value target for
+        // "a restart must not break placed apps' cell tunnels". Cloned into the
+        // SIGTERM handler below; `graceful_shutdown` stops accepting NEW
+        // connections and gives already-open ones up to the grace window to
+        // finish instead of the previous behavior (immediate `process::exit`
+        // severing every in-flight request/tunnel the instant SIGTERM arrived).
+        let https_shutdown_handle = axum_server::Handle::new();
+        SHUTDOWN_HTTPS_HANDLE.set(https_shutdown_handle.clone()).ok();
         tokio::spawn(async move {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(acme::server_config());
             tracing::info!(%https_addr, "public HTTPS listener (SNI resolver, ACME-managed certs)");
             if let Err(e) = axum_server::bind_rustls(https_addr, cfg)
+                .handle(https_shutdown_handle)
                 .serve(https_router.into_make_service_with_connect_info::<SocketAddr>())
                 .await
             {
