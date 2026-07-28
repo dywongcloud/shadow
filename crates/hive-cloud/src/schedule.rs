@@ -174,7 +174,20 @@ pub fn place(
             return false;
         }
         if is_container {
-            eligible(n) || (n.healthy && n.backend == "mock")
+            // A container deployment is served on this node's own public host —
+            // never through the microVM guest network — so a node with NO public
+            // address can win placement (it's `reachable()` for build DISPATCH via
+            // admin/iroh) but the resulting deployment is then unreachable by any
+            // real client: only 127.0.0.1. Witnessed as a live risk when the local
+            // Mac dev nodes moved region to san-jose — the mock-backend widening
+            // below exists so containers can run on them at all, but a
+            // region-pinned container could land there and silently never serve.
+            // Require a public address for EITHER family, on every backend
+            // (firecracker included — a NAT'd FC node has the identical problem,
+            // this is not mock-specific), so an unreachable node simply isn't a
+            // candidate rather than winning and quietly failing to serve.
+            let has_public = n.public_ip.is_some() || n.public_ip6.is_some();
+            has_public && (eligible(n) || (n.healthy && n.backend == "mock"))
         } else {
             eligible(n)
         }
