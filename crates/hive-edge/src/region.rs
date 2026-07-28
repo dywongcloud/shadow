@@ -345,6 +345,24 @@ impl NodeRegistry {
     pub fn upsert_peer(&self, mut peer: NodeInfo) {
         peer.is_self = false;
         let mut peers = self.peers.write();
+        // A node's `id` is its operator-chosen `--name`, not a stable identity —
+        // `peer_id` (the real iroh endpoint id) is. Renaming a node keeps the
+        // same `peer_id` but changes `id`, so without this the OLD name's entry
+        // never naturally expires: the active health-probe loop (main.rs
+        // spawn_health_loop) dials by `peer_id`/`iroh_addr`, and since those are
+        // unchanged the probe keeps succeeding and keeps refreshing the OLD
+        // entry's `last_seen_ms` forever — a permanent ghost duplicate,
+        // live-witnessed renaming fc-gpu-sj-1 -> fc-sanjose-gpu-1 (both names
+        // stayed `healthy: true` with a freshening `last_seen_ms` for minutes,
+        // across every peer in the mesh, with no sign of self-expiry). Evict
+        // any other entry sharing this peer's `peer_id` before inserting the
+        // new one, so a rename converges to exactly one entry within one
+        // gossip round instead of never.
+        if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
+            peers.retain(|k, v| {
+                k == &peer.id || v.peer_id.as_deref() != Some(pid)
+            });
+        }
         if let Some(existing) = peers.get(&peer.id) {
             // Health + latency are owned by our OWN direct probes, never second-hand gossip.
             peer.healthy = existing.healthy;

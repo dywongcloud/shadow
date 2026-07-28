@@ -3,12 +3,25 @@
 # host settings every hive-cloud node needs regardless of KVM/PVM flavor.
 # Idempotent throughout -- safe to re-run.
 
-- name: "Assert a RHEL-family distro (matches the current fleet: TencentOS/Rocky 10)"
+- name: "Assert a dnf-based distro (matches the current fleet: TencentOS/Rocky 10)"
   ansible.builtin.assert:
-    that: ansible_os_family == "RedHat"
+    # ansible_pkg_mgr, not ansible_os_family: TencentOS Server reports
+    # os_family as the literal string "TencentOS Server", not "RedHat" --
+    # ansible's fact-gathering doesn't classify it into the RedHat bucket
+    # even though it's dnf-based and RHEL-app-compatible enough to run every
+    # task in this role. Live-witnessed this assert never actually firing
+    # against a TencentOS node in this fleet's history (it's been here since
+    # the very first ansible commit) because every current TencentOS node
+    # was hand-provisioned before this role ever ran against it -- the first
+    # real run, mid this-session, would have failed outright on a distro
+    # this role has run dnf against successfully all along. pkg_mgr is also
+    # more directly meaningful here than any os-family label: this role's
+    # own tasks are dnf-based, so "is dnf the package manager" is exactly
+    # the question that matters.
+    that: ansible_pkg_mgr == "dnf"
     fail_msg: >-
-      This role's package tasks are dnf-based (RHEL family). The fleet this
-      repo was built from runs TencentOS Server / Rocky Linux 10. Porting to
+      This role's package tasks are dnf-based. The fleet this repo was built
+      from runs TencentOS Server / Rocky Linux 10 (both dnf). Porting to
       Debian/Ubuntu means swapping this task file's `dnf:` module for `apt:`
       with the Debian-named equivalents of the same packages -- no other
       role depends on the package manager.

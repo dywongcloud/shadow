@@ -6,10 +6,19 @@
     that: ansible_architecture == "x86_64"
     fail_msg: "PVM is x86_64-only (found {{ ansible_architecture }})."
 
-- name: Require a RHEL-family distro (Rocky/Alma/RHEL 10 tested)
+- name: Require a dnf-based distro (Rocky/Alma/RHEL 10 tested, TencentOS also live in this fleet)
   ansible.builtin.assert:
-    that: ansible_os_family == "RedHat"
-    fail_msg: "This role targets the RHEL family (found {{ ansible_distribution }})."
+    # ansible_pkg_mgr, not ansible_os_family -- TencentOS Server (fc-hongkong,
+    # in this fleet's OWN fc_pvm group: no hardware virt, so it genuinely
+    # needs PVM same as va/va2/va3/sj/sj2) reports os_family as the literal
+    # string "TencentOS Server", not "RedHat", so this assert failed on a
+    # real fc_pvm-group host that has been running under PVM successfully --
+    # live-witnessed this session running `ansible-playbook site.yml --tags
+    # fail2ban` against the whole fleet: every other host succeeded, hk
+    # failed here even though the tag scoping had nothing to do with this
+    # role. Matches the identical fix in ansible/roles/prerequisites.
+    that: ansible_pkg_mgr == "dnf"
+    fail_msg: "This role targets dnf-based distros (found {{ ansible_distribution }}, pkg_mgr {{ ansible_pkg_mgr }})."
 
 - name: Read CPU flags
   ansible.builtin.command: grep -m1 '^flags' /proc/cpuinfo
