@@ -245,35 +245,44 @@ async fn health_ok(port: u16) -> bool {
 /// llama-server child; updates status in the runtime map.
 async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::project_settings::InferenceSpec) {
     let port = port_for(project);
-    // Fast path: our recorded child is alive and the server answers.
-    {
+    // A LIVE child is never relaunched, healthy or not: llama-server answers
+    // /health with 503 for the entire multi-minute model load (tensor upload
+    // to RPC members dominates for pooled models), and treating that as dead
+    // spawned a doomed duplicate every tick — the duplicate failed to bind
+    // the port held by the loading child and exited, while overwriting (and
+    // orphaning) the real child's handle. Live-witnessed on the first pooled
+    // 14B endpoint. Only an EXITED child triggers a relaunch; health merely
+    // flips the reported status.
+    let child_running = {
         let mut servers = cloud.inference.servers.lock();
         if let Some((child, st)) = servers.get_mut(project) {
             if let Some(c) = child {
                 match c.try_wait() {
-                    Ok(None) => {
-                        // Still running; verify liveness outside the lock below.
-                    }
+                    Ok(None) => true,
                     _ => {
                         *child = None;
                         st.status = "starting".into();
+                        false
                     }
                 }
+            } else {
+                false
             }
+        } else {
+            false
         }
-    }
-    let alive = {
-        let has_child =
-            cloud.inference.servers.lock().get(project).map(|(c, _)| c.is_some()).unwrap_or(false);
-        has_child && health_ok(port).await
     };
-    if alive {
+    if child_running {
+        let healthy = health_ok(port).await;
         let mut servers = cloud.inference.servers.lock();
         if let Some((_, st)) = servers.get_mut(project) {
-            if st.status != "running" {
-                st.status = "running".into();
+            let new_status = if healthy { "running" } else { "starting" };
+            if st.status != new_status {
+                st.status = new_status.into();
                 st.updated_ms = hive_core::now_ms();
-                tracing::info!(project, port, "inference: endpoint healthy");
+                if healthy {
+                    tracing::info!(project, port, "inference: endpoint healthy");
+                }
             }
         }
         return;
@@ -329,6 +338,15 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
         .filter(|n| members.contains(&n.name))
         .filter_map(|n| n.public_ip.map(|ip| format!("{ip}:50052")))
         .collect();
+
+    // Kill any UNTRACKED llama-server for this project first (a survivor of a
+    // previous hive-node process, or an orphan of the pre-fix overwrite bug) —
+    // it holds the port, and a tracked child must own the endpoint so kill/
+    // reassign semantics stay real.
+    let _ = tokio::process::Command::new("pkill")
+        .args(["-f", &format!("llama-server.*--alias {project}")])
+        .output()
+        .await;
 
     let mut cmd = tokio::process::Command::new(llama_bin());
     cmd.arg("-m")
