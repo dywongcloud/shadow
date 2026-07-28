@@ -396,10 +396,30 @@ async fn put_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run: 
 /// so the app's in-process dispatcher delivers it to `/.well-known/workflow/v1/
 /// flow` and the run resumes/executes — the storage-level trigger of
 /// conformance-spec §4.3. `route` = "flow" for workflow topics.
+///
+/// The stored `body` shape is dictated by the REAL consumer, not us: the real
+/// `@open-workflow/world-redis` dispatcher's HTTP handler ignores the request
+/// body entirely (`dispatchOne` POSTs an EMPTY body — the `?msg=` query param
+/// is the lookup key) and reads the job it stores server-side via
+/// `readJob(msgId)`, then `decodeBlob(job.body)`, then reads `message.runId`
+/// DIRECTLY off the decoded value — see the vendored 0.1.2 source,
+/// `createQueueHandler`: `const message = decodeBlob(job.body); const runId =
+/// message?.runId ?? message?.workflowRunId;`. That flows straight into
+/// `@workflow/core`'s runtime, which parses it against
+/// `WorkflowInvokePayloadSchema = z.object({ runId: z.string(), ... })` — a
+/// FLAT top-level `runId`, never `{payload:{runId}}`. Live-witnessed the exact
+/// failure this produces: a manually delivered job with the old nested shape
+/// hit a real app-level 500, `Zod: "runId" expected string, received
+/// undefined` — the request reached the app fine (proving the gateway/tunnel
+/// layer, fixed earlier this session via the iroh_addr staleness fix, was
+/// never the remaining problem); the STORED MESSAGE SHAPE was wrong the whole
+/// time, so no run could ever have progressed past this call even on a
+/// perfectly healthy tunnel — which is the real, deeper root cause of
+/// [`reconcile_orphan_jobs`]'s endless orphan/reschedule/poison churn.
 async fn enqueue_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, workflow_name: &str) {
     let queue_name = format!("__wkf_workflow_{}", clean_name(workflow_name));
     let msg_id = format!("msg_{}", ulid());
-    let body = json!({ "payload": { "runId": run_id }, "queueName": queue_name });
+    let body = json!({ "runId": run_id });
     let body_b64 = encode_blob(&body);
     // owf:job:<id> HASH { queueName, body(base64 CBOR), attempt, route }
     let _ = cmd(cloud, url, token, &[
@@ -741,8 +761,13 @@ async fn deliver_orphan_job(cloud: &Arc<CloudState>, project: &str, msg_id: &str
         match cloud
             .http
             .post(&url)
+            // Matches the real dispatcher's own request exactly (world-redis
+            // 0.1.2 `dispatchOne`): `?msg=` present means the handler looks the
+            // job up server-side via `readJob(msgId)` and never reads the
+            // request body at all, so an empty body is correct, not a
+            // placeholder — sending `{}` worked identically only by accident.
             .header("content-type", "application/json")
-            .body("{}")
+            .body("")
             .timeout(std::time::Duration::from_secs(12))
             .send()
             .await
