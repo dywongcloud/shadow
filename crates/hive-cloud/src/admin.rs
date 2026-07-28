@@ -31,6 +31,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // watchdog polling it has no JWT.
         .route("/v1/mesh", get(mesh_health))
         .route("/v1/overview", get(overview))
+        .route("/v1/tasks/health", get(tasks_health))
         .route("/v1/nodes", get(nodes))
         .route("/v1/serve-hosts", get(serve_hosts))
         .route("/v1/resources", get(resources_get))
@@ -3709,6 +3710,20 @@ async fn mesh_admit(
 /// HTTP") tells you nothing about mesh membership. See `MeshHealth`'s doc.
 async fn mesh_health(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.mesh_health()))
+}
+
+/// THIS node's supervised background loops: restart counts + heartbeat age.
+/// Operator-only, and deliberately NODE-LOCAL (no leader proxy): each node
+/// reports its OWN loops — a dead reconciler on node X is only visible by
+/// asking X, so the round-robin read split is the semantics here, not a bug.
+/// Answers "is the world reconciler / lock sweep / anti-entropy loop actually
+/// alive on this node?" — the question that previously required inferring from
+/// which log lines had STOPPED appearing.
+async fn tasks_health(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!({ "tasks": crate::supervise::snapshot() })))
 }
 
 async fn overview(

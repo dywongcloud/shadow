@@ -898,17 +898,24 @@ fn ulid_ms(ulid: &str) -> Option<u64> {
     Some(v)
 }
 
-/// 60s background loop around [`reconcile_orphan_jobs`].
+/// 60s background loop around [`reconcile_orphan_jobs`]. Supervised: this loop
+/// is the one whose silent death was indistinguishable from "queue is clean"
+/// (it logs only when it fixes something), which is exactly what supervision's
+/// heartbeat + restart visibility exists to disambiguate.
 pub fn spawn_world_reconcile(cloud: Arc<CloudState>) {
-    tokio::spawn(async move {
-        // Let gossip/env settle after boot before the first pass.
-        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-        loop {
-            let (scanned, fixed) = reconcile_orphan_jobs(&cloud).await;
-            if fixed > 0 {
-                tracing::warn!(scanned, fixed, "world reconcile: recovered orphaned workflow queue jobs");
+    crate::supervise::spawn_supervised("world-reconcile", move || {
+        let cloud = cloud.clone();
+        async move {
+            // Let gossip/env settle after boot before the first pass.
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            loop {
+                crate::supervise::beat("world-reconcile");
+                let (scanned, fixed) = reconcile_orphan_jobs(&cloud).await;
+                if fixed > 0 {
+                    tracing::warn!(scanned, fixed, "world reconcile: recovered orphaned workflow queue jobs");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
         }
     });
 }

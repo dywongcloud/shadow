@@ -53,6 +53,7 @@ mod sandboxes;
 mod sandboxes_api;
 mod sandboxes_platform;
 mod store_sync;
+mod supervise;
 mod schedule;
 mod world;
 mod world_queue;
@@ -1677,10 +1678,11 @@ fn spawn_container_lock_sweep() {
         return;
     }
     let interval = Duration::from_secs(secs);
-    tokio::spawn(async move {
+    crate::supervise::spawn_supervised("container-lock-sweep", move || async move {
         // One immediate pass at boot: a node coming back from a crash or a
         // podman-machine reset is exactly when leaked locks are already there.
         loop {
+            crate::supervise::beat("container-lock-sweep");
             let path_env = crate::git::podman_path_env();
             match hive_backend::sweep_container_locks(&path_env).await {
                 // Healthy — recorded at debug so a normal node stays quiet.
@@ -2325,11 +2327,15 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
 fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_ANTI_ENTROPY_INTERVAL_SECS", 60));
     tracing::info!(?interval, "guardian-db anti-entropy loop (head-CID exchange + targeted reconciliation)");
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
-        loop {
-            tick.tick().await;
-            anti_entropy_round(&cloud).await;
+    crate::supervise::spawn_supervised("anti-entropy", move || {
+        let cloud = cloud.clone();
+        async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                crate::supervise::beat("anti-entropy");
+                anti_entropy_round(&cloud).await;
+            }
         }
     });
 }
@@ -2434,7 +2440,9 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
 fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_RELATIONAL_MIRROR_SECS", 60));
     tracing::info!(?interval, "relational mirror loop (teams/members/deployments + billing backfill → SQL view)");
-    tokio::spawn(async move {
+    crate::supervise::spawn_supervised("relational-mirror", move || {
+        let cloud = cloud.clone();
+        async move {
         let hash_of = |s: &str| {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2449,6 +2457,7 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
             .filter(|s| !s.is_empty());
         loop {
             tick.tick().await;
+            crate::supervise::beat("relational-mirror");
             // Deployments: every node, own rows only.
             let deps = cloud.gw.list();
             if let Ok(json) = serde_json::to_string(&deps) {
@@ -2556,6 +2565,7 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                     }
                 }
             }
+        }
         }
     });
 }

@@ -1069,8 +1069,11 @@ async fn provision_redis(
 /// acknowledged lost, service is restored); warn loudly for kinds we can't
 /// rebuild automatically rather than staying silent.
 pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
-    tokio::spawn(async move {
+    crate::supervise::spawn_supervised("db-reconcile", move || {
+        let cloud = cloud.clone();
+        async move {
         loop {
+            crate::supervise::beat("db-reconcile");
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             if !podman_available().await {
                 continue;
@@ -1119,6 +1122,7 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                     },
                 }
             }
+        }
         }
     });
 }

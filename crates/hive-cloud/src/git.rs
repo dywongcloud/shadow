@@ -4331,7 +4331,9 @@ async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
 /// above. Cheap when nothing changed (one `ls-remote` per git project per tick,
 /// short-circuited by an in-memory SHA cache).
 pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
-    tokio::spawn(async move {
+    crate::supervise::spawn_supervised("git-poll-reconcile", move || {
+        let cloud = cloud.clone();
+        async move {
         // Let the initial gossip / deployment-record sync settle so projects have
         // a real deployed-commit baseline before the first poll (else a cold
         // leader would treat every project as "unknown" at once).
@@ -4340,6 +4342,7 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tick.tick().await;
+            crate::supervise::beat("git-poll-reconcile");
             // LEADER ONLY: exactly one node polls + deploys, mirroring every other
             // reconciler's control-plane gate — otherwise each node would start the
             // same build for the same push.
@@ -4347,6 +4350,7 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
                 continue;
             }
             git_poll_cycle(&cloud).await;
+        }
         }
     });
 }
