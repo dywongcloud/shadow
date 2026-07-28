@@ -529,12 +529,31 @@ async fn edge_pipeline_inner(
             let mut attempted = false;
             let mut refused_retry = false;
 
-            for cand in &cands {
+            'cands: for cand in &cands {
                 // One coherent per-candidate deadline (#H4): iroh (bounded ~connect
                 // + open + firstbyte) and the HTTP fallback SHARE this budget rather
                 // than stacking (iroh worst-case + a full fresh 30s). The HTTP
                 // fallback below gets whatever time is left.
                 let cand_start = std::time::Instant::now();
+                // TRANSPORT SELECTION BY COST, from live measurement rather than a
+                // blanket preference: iroh is 2–3.6x FASTER cross-region (0.07–0.4s
+                // vs 0.27–0.79s, its QUIC path beating a fresh cross-ocean TCP+TLS
+                // handshake), but it carries a ~40ms per-request stream-setup cost
+                // that DOMINATES when the network RTT is small — measured 0.052s
+                // iroh vs 0.012s direct HTTP to a same-region peer. So: a
+                // SAME-REGION candidate with a public gateway gets direct HTTP
+                // FIRST (bounded short, see below, so a dead peer can't eat the
+                // budget) with iroh as its fallback; everything else keeps
+                // iroh-first with HTTP as the fallback. Same two attempts, same
+                // retry gates, same shared budget — only the order changes.
+                let same_region_http_first = !cand.region.is_empty()
+                    && cand.region == region
+                    && !cand.gateway.trim().is_empty();
+                // Two passes per candidate — the SAME two attempts as before, in
+                // the cost-chosen order. Pass 0 is the preferred transport.
+                for pass in 0..2u8 {
+                let do_iroh = (pass == 0) != same_region_http_first;
+                if do_iroh {
                 // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
                 // works across NATs. STREAM the response so SSE / chunked bodies
                 // arrive incrementally cross-node (#1). Fall through to HTTP on error.
@@ -544,7 +563,7 @@ async fn edge_pipeline_inner(
                         && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
                     {
                         refused_retry = true;
-                        break;
+                        break 'cands;
                     }
                     attempted = true;
                     match pool.request_stream(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
@@ -594,17 +613,21 @@ async fn edge_pipeline_inner(
                                 cloud.registry.set_health(&cand.node_id, u64::MAX, false);
                                 tracing::warn!(node = %cand.node_id, "p2p peer marked unhealthy after connect/open timeout");
                             }
-                            /* iroh failed → try HTTP for this candidate */
+                            /* iroh failed → the other transport gets the next pass */
                         }
                     }
                 }
-                // Gate the HTTP attempt too (it's a re-attempt after iroh for this
-                // candidate, or after a previous candidate). First attempt passes.
+                continue; // this pass was iroh; next pass (if any) is HTTP
+                }
+                // ---- HTTP attempt (preferred pass for a same-region public peer,
+                // fallback pass otherwise) ----
+                // Gate it like any re-attempt (after iroh for this candidate, or
+                // after a previous candidate). First attempt passes.
                 if attempted
                     && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
                 {
                     refused_retry = true;
-                    break;
+                    break 'cands;
                 }
                 attempted = true;
                 let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
@@ -614,7 +637,18 @@ async fn edge_pipeline_inner(
                     .header("host", &host)
                     .header("x-hive-proxied", "1")
                     .header("x-hive-request-id", &rid)
-                    .timeout(http_fallback_budget(cand_start))
+                    .timeout(if same_region_http_first && pass == 0 {
+                        // Preferred intra-region direct hop: bound it SHORT so a
+                        // dead same-region peer costs ~2s before iroh gets the
+                        // rest of the budget — measured healthy latency here is
+                        // ~12ms, so 2s is two orders of magnitude of headroom.
+                        std::time::Duration::from_millis(
+                            std::env::var("HIVE_FORWARD_INTRA_HTTP_MS").ok().and_then(|s| s.parse().ok()).filter(|&v| v > 0).unwrap_or(2000),
+                        )
+                        .min(http_fallback_budget(cand_start))
+                    } else {
+                        http_fallback_budget(cand_start)
+                    })
                     .body(body_bytes.clone());
                 for (k, v) in &headers_vec {
                     let lk = k.to_lowercase();
@@ -647,6 +681,12 @@ async fn edge_pipeline_inner(
                             .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
                         let serve_region = if cand.region.is_empty() { region.as_str() } else { cand.region.as_str() };
                         set(&mut out, "x-hive-routed-to", &cand.node_id);
+                        // Which transport actually served, so the cost-based
+                        // choice above is observable instead of inferred (the
+                        // iroh path has always set this; the HTTP path never did,
+                        // which is why "everything uses iroh" had to be measured
+                        // by elimination).
+                        set(&mut out, "x-hive-transport", "http-direct");
                         set(&mut out, "x-hive-region", serve_region);
                         set(&mut out, "x-hive-request-id", &rid);
                         let mut ev = cloud.event(serve_region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
@@ -654,8 +694,9 @@ async fn edge_pipeline_inner(
                         cloud.record(ev);
                         return out;
                     }
-                    Err(_) => continue, // peer down → fail over to the next candidate
+                    Err(_) => {} // this pass failed — the other transport gets the next pass (if any)
                 }
+                } // end per-transport pass loop
             }
             // Either every candidate failed, OR the first attempt failed and the
             // request was not safe to retry (non-idempotent / non-replayable). In the
