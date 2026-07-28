@@ -13,6 +13,14 @@
 # (that sub-crate pulls the same chain independently, with its own lockfile).
 [advisories]
 ignore = [
+    # quick-xml: Apple-only transitive dependency through plist.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+
+    # Temporarily accepted unmaintained transitive crates.
+    "RUSTSEC-2026-0192", # ttf-parser
+    "RUSTSEC-2026-0196", # cgmath
+    "RUSTSEC-2026-0173", # proc-macro-error2
+    "RUSTSEC-2024-0370", # proc-macro-error
+    "RUSTSEC-2022-0104", # structopt
 ]
