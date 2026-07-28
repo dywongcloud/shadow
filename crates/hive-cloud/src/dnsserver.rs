@@ -348,6 +348,17 @@ fn lookup(
                     let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
                     return (rrs, true, tailored);
                 }
+                // The zone's OWN apex records. An authoritative server that
+                // serves neither its SOA nor its NS is a half-configured
+                // delegation: without the SOA a resolver cannot negative-cache
+                // (RFC 2308), so every query for a nonexistent name under the
+                // zone returns to us forever — a real amplification surface on
+                // a public nameserver — and a child whose NS RRset is missing
+                // while the parent publishes one is flagged by validators.
+                // Only answered AT the apex; a subdomain keeps the no-data
+                // behavior below.
+                2 if qname == zone => return (apex_ns_rrs(cloud), true, false),
+                6 if qname == zone => return (apex_soa_rrs(cloud), true, false),
                 // FORWARD-COMPAT (phase 2): `_acme-challenge.<zone>` TXT for ACME DNS-01,
                 // and CAA, branch here. Phase 1 is authoritative no-data for them.
                 _ => return (Vec::new(), true, false),
@@ -527,6 +538,58 @@ fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
         }
         _ => None,
     }
+}
+
+/// TTL for the zone's own apex records. Longer than the health-driven address
+/// TTL: the NS/SOA set changes only when the nameserver roster does, and a
+/// short TTL here just multiplies apex queries.
+const APEX_TTL: u32 = 300;
+
+/// Negative-cache TTL published in the SOA MINIMUM field — how long a resolver
+/// may remember "this name does not exist" (RFC 2308). Deliberately modest so
+/// a freshly-created deployment name is not shadowed by a stale negative.
+const NEGATIVE_TTL: u32 = 60;
+
+/// The nameserver hostnames this zone is served by, derived from the SAME
+/// eligible-node rule the DNS reconciler uses to publish NS at the parent, so
+/// parent and child cannot disagree about the zone's NS RRset.
+fn apex_ns_names(cloud: &Arc<CloudState>) -> Vec<String> {
+    let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
+    let mut names: Vec<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.healthy && n.dns_ns.is_some() && (n.public_ip.is_some() || n.public_ip6.is_some()))
+        .map(|n| format!("{}.{}", crate::vercel_dns::ns_label(&n.name), apps))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn apex_ns_rrs(cloud: &Arc<CloudState>) -> Vec<(u16, u32, Vec<u8>)> {
+    apex_ns_names(cloud).into_iter().map(|n| (2u16, APEX_TTL, encode_name(&n))).collect()
+}
+
+/// The zone's SOA. MNAME is the lexically-first nameserver (stable across
+/// nodes, so every server in the zone reports the same primary); SERIAL is
+/// derived from the node roster so it advances when the zone's own NS set
+/// really changes rather than on every restart.
+fn apex_soa_rrs(cloud: &Arc<CloudState>) -> Vec<(u16, u32, Vec<u8>)> {
+    let names = apex_ns_names(cloud);
+    let Some(primary) = names.first() else {
+        return Vec::new();
+    };
+    let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
+    let mut rdata = encode_name(primary);
+    rdata.extend_from_slice(&encode_name(&format!("hostmaster.{apps}")));
+    let serial: u32 = names.iter().fold(0u32, |acc, n| {
+        n.bytes().fold(acc, |a, b| a.wrapping_mul(31).wrapping_add(b as u32))
+    });
+    for v in [serial, 7200u32, 3600u32, 1_209_600u32, NEGATIVE_TTL] {
+        rdata.extend_from_slice(&v.to_be_bytes());
+    }
+    vec![(6u16, APEX_TTL, rdata)]
 }
 
 fn encode_name(name: &str) -> Vec<u8> {
