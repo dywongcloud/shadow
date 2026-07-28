@@ -158,6 +158,39 @@ impl InferenceRuntime {
     }
 }
 
+/// Transient-scope unit name for a project's inference server. Stable, so a
+/// teardown/restart can stop the right scope by name (see `reconcile_local`).
+fn scope_name(project: &str) -> String {
+    let safe: String =
+        project.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
+    format!("hive-inference-{safe}")
+}
+
+/// The slice every inference scope runs under, so the whole class of inference
+/// workloads is accountable (and capped) as one unit, separately from
+/// `hive-node.service`.
+fn inference_slice() -> String {
+    std::env::var("HIVE_INFERENCE_SLICE").unwrap_or_else(|_| "hive-inference.slice".into())
+}
+
+/// Per-endpoint memory ceiling for the scope. Generous by default (a large
+/// quantized model is legitimately many GB resident) but bounded, so one
+/// endpoint cannot consume the host.
+fn scope_memory_max() -> String {
+    std::env::var("HIVE_INFERENCE_MEMORY_MAX").unwrap_or_else(|_| "48G".into())
+}
+
+/// Whether `systemd-run` is actually usable here — a node without systemd (or
+/// a container) falls back to a plain child rather than failing to launch.
+async fn which_systemd_run() -> bool {
+    tokio::process::Command::new("systemd-run")
+        .arg("--version")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 fn llama_bin() -> String {
     std::env::var("HIVE_LLAMA_BIN").unwrap_or_else(|_| "/opt/llama/bin/llama-server".into())
 }
@@ -358,13 +391,43 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
     // Kill any UNTRACKED llama-server for this project first (a survivor of a
     // previous hive-node process, or an orphan of the pre-fix overwrite bug) —
     // it holds the port, and a tracked child must own the endpoint so kill/
-    // reassign semantics stay real.
+    // reassign semantics stay real. Both shapes are swept: a bare child and a
+    // transient scope (the scope is stopped by name, which kills its members).
     let _ = tokio::process::Command::new("pkill")
         .args(["-f", &format!("llama-server.*--alias {project}")])
         .output()
         .await;
+    let _ = tokio::process::Command::new("systemctl")
+        .args(["stop", &format!("{}.scope", scope_name(project))])
+        .output()
+        .await;
 
-    let mut cmd = tokio::process::Command::new(llama_bin());
+    // Run the server in its OWN cgroup, never as a plain child of hive-cloud.
+    // A plain child lands in hive-node.service's memory cgroup, so a model's
+    // resident footprint (15.7GB for a 14B Q8) competes with the platform
+    // process against the SERVICE's MemoryMax — live-witnessed on
+    // fc-sanjose-cvm-2 as `Memory cgroup out of memory: Killed process ...
+    // (hive-cloud) ... oom_memcg=/system.slice/hive-node.service`: the kernel
+    // killed the NODE's platform process, not the inference server. A transient
+    // scope under a dedicated slice accounts inference memory separately, so an
+    // over-large model fails only its own endpoint (honest `failed` status)
+    // and can never take hive-node down with it.
+    let use_scope = std::env::var("HIVE_INFERENCE_SCOPE").map(|v| v != "0").unwrap_or(true)
+        && which_systemd_run().await;
+    let mut cmd = if use_scope {
+        let mut c = tokio::process::Command::new("systemd-run");
+        c.arg("--scope")
+            .arg("--collect")
+            .arg(format!("--unit={}", scope_name(project)))
+            .arg(format!("--slice={}", inference_slice()))
+            .arg(format!("--property=MemoryMax={}", scope_memory_max()))
+            .arg("--property=MemorySwapMax=0")
+            .arg("--quiet")
+            .arg(llama_bin());
+        c
+    } else {
+        tokio::process::Command::new(llama_bin())
+    };
     cmd.arg("-m")
         .arg(&model_path)
         .arg("--host")
@@ -469,8 +532,19 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                     }
                 }
                 for p in kill {
-                    if let Some((Some(mut child), _)) = servers.remove(&p) {
-                        let _ = child.start_kill();
+                    if let Some((child, _)) = servers.remove(&p) {
+                        if let Some(mut c) = child {
+                            let _ = c.start_kill();
+                        }
+                        // A transient scope OUTLIVES the process that spawned
+                        // it (that is the point — inference memory is accounted
+                        // separately from hive-node.service), so killing the
+                        // spawn handle is not enough: stop the unit by name or
+                        // the server keeps serving a project that moved away.
+                        let unit = format!("{}.scope", scope_name(&p));
+                        tokio::spawn(async move {
+                            let _ = tokio::process::Command::new("systemctl").args(["stop", &unit]).output().await;
+                        });
                         tracing::info!(project = %p, "inference: stopped endpoint (no longer desired/assigned here)");
                     }
                 }
