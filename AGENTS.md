@@ -260,7 +260,8 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   (curl against a running node, SSH to a fleet node) — never a mock standing
   in for a real service.
 - Fleet has two glibc groups needing separate native builds — **2.38**: bkk,
-  hk, AND all five GPU/CVM nodes (fc-gpu-sj-1/2/3, fc-cvm-sj-1/2 — TencentOS);
+  hk, AND all five GPU/CVM nodes (fc-sanjose-gpu-1/2/3, fc-sanjose-cvm-1/2 —
+  TencentOS);
   **2.39**: va/va2/va3/sj/sj2. The GPU nodes LOOK like the San Jose 2.39 group
   by region and were once rolled a 2.39 binary on that assumption — instant
   fleet-wide crash-loop on that node (`GLIBC_2.39 not found`, restart counter

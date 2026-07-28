@@ -2260,7 +2260,7 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             // `bind_full` returned — before the endpoint has had any time to
             // register with its relay or learn hole-punch candidates, so it
             // shipped private-addrs-only in the gossip round every OTHER node
-            // uses to dial this one. Root-caused live: fc-gpu-sj-2's `iroh_addr`
+            // uses to dial this one. Root-caused live: fc-sanjose-gpu-2's `iroh_addr`
             // still read `{"id":...,"addrs":[{"Ip":"10.0.2.2:48670"}]}` (no
             // relay, no public IP) an hour after boot with its security group
             // open the whole time, while its SEPARATE `guardian_iroh_addr` (which
