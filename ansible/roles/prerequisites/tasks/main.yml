@@ -46,9 +46,14 @@
     masked: true
   failed_when: false   # some images (e.g. bkk's TencentOS) never had it installed at all
 
-- name: Install hive-lockdown.sh (canonical source, not hand-copied per node)
+# Single canonical source in scripts/ -- this role used to carry its own
+# hand-mirrored copy under files/, and its PEERS roster silently drifted from
+# scripts/hive-lockdown.sh's (6 of 12 current nodes). Regenerate the PEERS
+# list via scripts/gen-hive-lockdown.sh before running this role; never
+# hand-edit a second copy.
+- name: Install hive-lockdown.sh
   ansible.builtin.copy:
-    src: hive-lockdown.sh
+    src: "{{ role_path }}/../../../scripts/hive-lockdown.sh"
     dest: /usr/local/sbin/hive-lockdown.sh
     mode: "0755"
 
