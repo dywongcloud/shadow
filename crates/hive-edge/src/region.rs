@@ -59,6 +59,13 @@ pub struct NodeInfo {
     /// health-damped registry every other record already comes from instead
     /// of a hand-maintained nameserver list. `None` = not a nameserver.
     /// `#[serde(default)]` so pre-upgrade peers deserialize fine.
+    ///
+    /// This is a statement of INTENT, not of reachability: it is read out of
+    /// this node's OWN environment and proves only that it meant to bind. Two
+    /// live nameservers were advertised from it while being unusable from the
+    /// public internet — one silently firewalled upstream of the host, one
+    /// answering with zero records. What actually gates advertisement is
+    /// `dns_attest` below.
     #[serde(default)]
     pub dns_ns: Option<String>,
     /// This node's Seer also serves the platform API zone (`api.{platform}`)
@@ -70,6 +77,19 @@ pub struct NodeInfo {
     /// deserialize `false` and are simply never eligible.
     #[serde(default)]
     pub dns_api: bool,
+    /// **Peer attestation**: names of OTHER nodes this node has just PROVEN
+    /// answer authoritative DNS on their public `:53`, by querying them over
+    /// the public internet from this host (`hive-cloud`'s `dns_probe`).
+    /// Gossiped so the DNS reconciler can require independent, off-host
+    /// evidence from several regions before publishing a node as a nameserver
+    /// — the thing `dns_ns` alone cannot give, since no check performed ON a
+    /// host can see an inbound block upstream of it, or an answer that is only
+    /// wrong for other people's clients. Never contains this node's own name:
+    /// self-attestation is precisely the assumption this field replaces. Empty
+    /// from pre-upgrade peers (`serde(default)`), which attests nothing —
+    /// safe, because it WITHHOLDS advertisement rather than granting it.
+    #[serde(default)]
+    pub dns_attest: Vec<String>,
     /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
     /// on every owner promotion/failover). Gossiped so the whole fleet converges
     /// on the highest epoch — the fencing token that lets a node reject admin
@@ -289,6 +309,20 @@ impl NodeRegistry {
         }
     }
 
+    /// Publish which peers this node currently ATTESTS as working nameservers
+    /// (see `NodeInfo::dns_attest`). Mirrors `set_self_relay_url`: idempotent,
+    /// safe every prober round, picked up by the next gossip broadcast.
+    ///
+    /// The caller is expected to pass a SORTED list — the value is compared for
+    /// change and gossiped verbatim, so an unstable order would look like a
+    /// fresh value on every round for no reason.
+    pub fn set_self_dns_attest(&self, attest: Vec<String>) {
+        let mut me = self.me.write();
+        if me.dns_attest != attest {
+            me.dns_attest = attest;
+        }
+    }
+
     /// Update this node's gossiped control-plane epoch (see
     /// `NodeInfo.cp_epoch`) — refreshed each gossip round from the cluster's
     /// observed-owner tracker.
@@ -410,6 +444,15 @@ impl NodeRegistry {
             // Health + latency are owned by our OWN direct probes, never second-hand gossip.
             peer.healthy = existing.healthy;
             peer.latency_ms = existing.latency_ms;
+            // DNS attestations are only as good as the record they rode in on.
+            // A STALER relayed copy must not overwrite a fresher self-report:
+            // attestations change every prober round, so the same
+            // last-relay-wins race that used to flap `guardian_iroh_addr`
+            // Some -> None would here silently un-attest a working nameserver
+            // and pull it out of a live delegation. Freshness decides.
+            if peer.last_seen_ms < existing.last_seen_ms {
+                peer.dns_attest = existing.dns_attest.clone();
+            }
             // Keep the freshest origin timestamp seen (a relayed copy may arrive stale).
             peer.last_seen_ms = peer.last_seen_ms.max(existing.last_seen_ms);
             // Never regress guardian_iroh_addr to None. A peer's OWN direct
@@ -486,6 +529,7 @@ mod tests {
             relay_url: None,
             dns_ns: None,
             dns_api: false,
+            dns_attest: Vec::new(),
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

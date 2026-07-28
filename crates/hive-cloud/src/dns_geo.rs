@@ -194,7 +194,9 @@ fn skip_rr(msg: &[u8], off: usize) -> Option<usize> {
 }
 
 /// Skip a (possibly compressed) domain name, returning the offset just past it.
-fn skip_name(msg: &[u8], mut off: usize) -> Option<usize> {
+/// Shared with [`crate::dns_probe`]'s response parser — the same wire rules,
+/// parsed once.
+pub(crate) fn skip_name(msg: &[u8], mut off: usize) -> Option<usize> {
     loop {
         let len = *msg.get(off)? as usize;
         if len == 0 {
@@ -401,6 +403,22 @@ impl GeoCache {
         drop(w);
         let _ = self.queue.send(net);
         None
+    }
+
+    /// The client networks this node has actually LOCATED — real observed
+    /// client subnets, in a stable order.
+    ///
+    /// Used by the nameserver prover ([`crate::dns_probe`]) to ask a candidate
+    /// nameserver how it would answer for clients that are not the prober.
+    /// Sourcing them from traffic this node has really served, rather than a
+    /// hand-written list of "representative" prefixes, keeps the probe pointed
+    /// at the population that would actually be hurt by a wrong answer.
+    pub fn known_networks(&self) -> Vec<IpAddr> {
+        let r = self.entries.read();
+        let mut v: Vec<IpAddr> =
+            r.iter().filter(|(_, e)| matches!(e, Entry::Known(..))).map(|(k, _)| *k).collect();
+        v.sort();
+        v
     }
 
     /// (known, pending, unlocatable) — surfaced by the DNS stats endpoint so the

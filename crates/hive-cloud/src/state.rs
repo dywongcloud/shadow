@@ -177,6 +177,12 @@ pub struct CloudState {
     /// answers (see [`crate::dns_geo`]). Lives here rather than as a static so
     /// it shares the platform's HTTP client and dies with the state.
     pub dns_geo: Arc<crate::dns_geo::GeoCache>,
+    /// What THIS node has directly PROVEN about its peers' nameservers by
+    /// querying their public `:53` from here (see [`crate::dns_probe`]).
+    /// Deliberately node-local — it IS this node's vantage, and the whole
+    /// mechanism depends on vantages being independent. Only the derived
+    /// attestation list is gossiped (`NodeInfo::dns_attest`).
+    pub dns_probes: Arc<crate::dns_probe::NsProbes>,
     /// Hive's own native Queue backend for the Vercel WDK `World` interface
     /// (managed-world service) -- no external queue dependency.
     pub world_queue: Arc<crate::world_queue::WorldQueue>,
@@ -557,6 +563,7 @@ impl CloudState {
             hive,
             http: reqwest::Client::new(),
             dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
+            dns_probes: Arc::new(crate::dns_probe::NsProbes::new()),
             world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),

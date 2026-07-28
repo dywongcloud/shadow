@@ -4172,6 +4172,48 @@ async fn dns_stats(
             "cache_unlocatable": unlocatable,
         },
         "delegation_records": crate::vercel_dns::STATS.geo_delegation_records.load(Ordering::Relaxed),
+        // Prove-before-advertise, made visible. `nameservers` is the SAME
+        // verdict the DNS reconciler publishes from (`validate_nameservers`
+        // over the same gossiped registry) — an operator asking "why is this
+        // node not in the NS set?" gets the actual reason, plus who attested
+        // it and from which regions, rather than having to infer it. `probes`
+        // is this node's OWN raw evidence, which is what makes a disagreement
+        // between vantages diagnosable instead of mysterious.
+        "nameservers": crate::dns_probe::validate_nameservers(&c.registry.nodes())
+            .into_iter()
+            .map(|v| json!({
+                "node": v.node,
+                "region": v.region,
+                "ip4": v.ip4,
+                "ip6": v.ip6,
+                "declared": v.declared,
+                "validated": v.validated,
+                "reason": v.reason,
+                "attesters": v.attesters,
+                "attester_regions": v.attester_regions,
+                "required_regions": v.required_regions,
+            }))
+            .collect::<Vec<_>>(),
+        "probes": c.dns_probes.snapshot().into_iter().map(|(node, p)| json!({
+            "node": node,
+            "ip": p.ip,
+            "ok": p.ok,
+            "attested": p.attested,
+            "reason": p.reason,
+            "rtt_ms": p.rtt_ms,
+            "answers": p.answers,
+            "queries": p.queries,
+            "client_subnets": p.subnets,
+            "fail_streak": p.fail_streak,
+            "checked_ms": p.checked_ms,
+        })).collect::<Vec<_>>(),
+        "validation": {
+            "proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
+            "unproven": crate::vercel_dns::STATS.geo_ns_unproven.load(Ordering::Relaxed),
+            "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
+            "min_attester_regions": crate::dns_probe::MIN_ATTESTER_REGIONS,
+            "failed_rounds_before_withdraw": crate::dns_probe::FAILED_ROUNDS_BEFORE_WITHDRAW,
+        },
         "answer_first_histogram": answers,
     })))
 }

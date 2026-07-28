@@ -179,14 +179,18 @@ pub struct PublishNode {
     pub name: String,
     pub ip4: Option<String>,
     pub ip6: Option<String>,
-    /// This node answers authoritative DNS on a public `:53` (gossiped
-    /// `NodeInfo::dns_ns`) — i.e. it is eligible to appear in the geo zone's
-    /// NS set. See `desired_geo_delegation`.
+    /// This node CLAIMS to answer authoritative DNS on a public `:53`
+    /// (gossiped `NodeInfo::dns_ns`) — a necessary condition for the geo
+    /// zone's NS set, never a sufficient one. See `desired_geo_delegation`.
     pub dns_ns: bool,
     /// This node's Seer also serves the platform API zone (gossiped
     /// `NodeInfo::dns_api`) — required, on top of `dns_ns`, to appear in the
     /// `api` label's NS set. See `desired_api_delegation`.
     pub dns_api: bool,
+    /// Peers have PROVEN, from their own hosts across the public internet,
+    /// that this node currently answers DNS usefully
+    /// (`dns_probe::validate_nameservers`). Only this gates the NS set.
+    pub dns_validated: bool,
     /// The node's region code (`san-jose`, `bangkok`, …) — carried through from
     /// the registry so the per-region names can be derived from the same
     /// health-damped set every other record already comes from.
@@ -241,9 +245,25 @@ pub fn ns_label(node_name: &str) -> String {
 /// nameserver that goes unhealthy or loses its public IP leaves the NS set by
 /// the normal diff instead of a hand-maintained list going stale.
 ///
-/// Only nodes that really answer DNS are eligible (`PublishNode::dns_ns`, set at
-/// boot from a public `:53` bind and gossiped) — advertising a node that has no
-/// listener would put a black hole in the delegated zone.
+/// Eligibility is **proof, not configuration**. `PublishNode::dns_ns` only says
+/// the node's own env asked it to bind a public `:53`; `dns_validated` says
+/// peers in at least two regions have just queried that address over the public
+/// internet and got a usable authoritative answer back
+/// (`dns_probe::validate_nameservers`). Publishing on the former alone is what
+/// put two dead nameservers into the live `deploy.shadw.app` delegation — one
+/// firewalled upstream of its host, one answering with zero records — either of
+/// which makes the whole zone resolve intermittently for anyone whose resolver
+/// picks it.
+///
+/// **Below two proven nameservers this publishes NOTHING AND MANAGES NOTHING**,
+/// which is a deliberate HOLD, not a withdrawal. Returning an empty managed-name
+/// list means the reconciler's diff never considers the delegation records its
+/// own, so an already-published delegation is left exactly as it is. The
+/// alternative — treating "0 or 1 proven" as the desired state — would delete
+/// every NS record for the zone and blackhole every name under it, turning a
+/// degraded delegation into a total outage. Stale-but-partly-working beats gone,
+/// the same last-known-good rule `reconcile_zone` already applies to addresses;
+/// the caller logs and raises an incident so the hold is loud rather than quiet.
 pub fn desired_geo_delegation(
     nodes: &[PublishNode],
     label: &str,
@@ -251,7 +271,7 @@ pub fn desired_geo_delegation(
 ) -> (Vec<DesiredRecord>, Vec<String>) {
     let mut out = Vec::new();
     let mut managed = vec![label.to_string()];
-    for n in nodes.iter().filter(|n| n.dns_ns) {
+    for n in nodes.iter().filter(|n| n.dns_ns && n.dns_validated) {
         let ns = ns_label(&n.name);
         if let Some(ip) = &n.ip4 {
             out.push(DesiredRecord { name: ns.clone(), rtype: "A".into(), value: ip.clone(), ttl: 300 });
@@ -271,8 +291,10 @@ pub fn desired_geo_delegation(
         }
     }
     // A delegation with a single nameserver is a single point of failure for
-    // every name in the zone; below two, publish nothing and leave the zone
-    // undelegated (it keeps resolving through the parent's own records).
+    // every name in the zone. Below two PROVEN nameservers: publish nothing and
+    // manage nothing — an unpublished zone keeps resolving through the parent's
+    // own records, and an ALREADY-published one is held untouched rather than
+    // deleted (see this function's doc for why deleting is the worse failure).
     if out.iter().filter(|r| r.rtype == "NS").count() < 2 {
         return (Vec::new(), Vec::new());
     }
@@ -601,6 +623,15 @@ pub struct ReconcilerStats {
     pub last_pass_ms: AtomicU64,
     /// NS+glue records published for the delegated geo zone (0 = undelegated).
     pub geo_delegation_records: AtomicU64,
+    /// Nodes whose `dns_ns` claim is currently backed by peer proof.
+    pub geo_ns_validated: AtomicU64,
+    /// Nodes CLAIMING `dns_ns` that no peer set currently proves — the count an
+    /// operator watches after a rollout or a security-group change.
+    pub geo_ns_unproven: AtomicU64,
+    /// Passes that HELD an existing delegation because fewer than two
+    /// nameservers were proven (see `desired_geo_delegation`). A number that
+    /// keeps climbing means the zone is running on last-known-good NS records.
+    pub geo_delegation_holds: AtomicU64,
 }
 
 pub static STATS: ReconcilerStats = ReconcilerStats {
@@ -614,6 +645,9 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     region_records: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
     geo_delegation_records: AtomicU64::new(0),
+    geo_ns_validated: AtomicU64::new(0),
+    geo_ns_unproven: AtomicU64::new(0),
+    geo_delegation_holds: AtomicU64::new(0),
 };
 
 /// Upper bound on deployment-affinity records. Vercel rate-limits record
@@ -653,6 +687,9 @@ pub struct NodeView {
     pub dns_ns: bool,
     /// Gossiped `NodeInfo::dns_api` — see `PublishNode::dns_api`.
     pub dns_api: bool,
+    /// Currently PROVEN to serve DNS from off its own host, per
+    /// `dns_probe::validate_nameservers` over the gossiped peer attestations.
+    pub dns_validated: bool,
 }
 
 /// The publishable node set with flap damping: a node stays published while its
@@ -677,6 +714,7 @@ pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Ve
                 region: n.region.clone(),
                 dns_ns: n.dns_ns,
                 dns_api: n.dns_api,
+                dns_validated: n.dns_validated,
             });
         }
     }
@@ -819,6 +857,8 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         let mut streaks: HashMap<String, u32> = HashMap::new();
         let mut backoff: u64 = 0; // consecutive failures
+        // Edge-trigger for the "delegation held" incident (see the call site).
+        let mut geo_hold_active = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
         loop {
             tick.tick().await;
@@ -857,18 +897,29 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
                 continue;
             }
-            let nodes: Vec<NodeView> = cloud
-                .registry
-                .nodes()
-                .into_iter()
+            // Nameserver eligibility is decided ONCE per pass, from the same
+            // registry snapshot everything else in the pass uses, by the same
+            // function `GET /v1/dns/stats` calls — an operator must never be
+            // looking at a different verdict than the one being published.
+            let registry_nodes = cloud.registry.nodes();
+            let verdicts = crate::dns_probe::validate_nameservers(&registry_nodes);
+            let proven: std::collections::HashSet<&str> =
+                verdicts.iter().filter(|v| v.validated).map(|v| v.node.as_str()).collect();
+            let unproven: Vec<&str> =
+                verdicts.iter().filter(|v| !v.validated).map(|v| v.node.as_str()).collect();
+            STATS.geo_ns_validated.store(proven.len() as u64, Ordering::Relaxed);
+            STATS.geo_ns_unproven.store(unproven.len() as u64, Ordering::Relaxed);
+            let nodes: Vec<NodeView> = registry_nodes
+                .iter()
                 .map(|n| NodeView {
                     dns_ns: n.dns_ns.is_some(),
                     dns_api: n.dns_api,
-                    name: n.name,
+                    dns_validated: proven.contains(n.name.as_str()),
+                    name: n.name.clone(),
                     healthy: n.healthy,
-                    ip4: n.public_ip,
-                    ip6: n.public_ip6,
-                    region: n.region,
+                    ip4: n.public_ip.clone(),
+                    ip6: n.public_ip6.clone(),
+                    region: n.region.clone(),
                 })
                 .collect();
             let publish = publishable(&nodes, &mut streaks);
@@ -921,12 +972,47 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // nameservers so Seer's geo/health-aware answers are actually
             // reachable (Vercel DNS itself has no geo routing). Published into
             // the apps zone because the deploy zone is a child of it, and only
-            // when >=2 real nameservers exist (see desired_geo_delegation).
-            let (geo_records, geo_names) = crate::dnsserver::deploy_zone()
-                .and_then(|dz| geo_label(dz, &cloud.apps_domain))
-                .map(|label| desired_geo_delegation(&publish, &label, &cloud.apps_domain))
+            // for nodes PEERS HAVE PROVEN answer DNS, never for nodes that
+            // merely claim to (see desired_geo_delegation).
+            let geo_zone_label = crate::dnsserver::deploy_zone().and_then(|dz| geo_label(dz, &cloud.apps_domain));
+            let (geo_records, geo_names) = geo_zone_label
+                .as_deref()
+                .map(|label| desired_geo_delegation(&publish, label, &cloud.apps_domain))
                 .unwrap_or_default();
             STATS.geo_delegation_records.store(geo_records.len() as u64, Ordering::Relaxed);
+            // A HELD delegation must be loud. `desired_geo_delegation` returning
+            // nothing while nodes still declare `dns_ns` means the zone is
+            // running on last-known-good NS records that nobody can currently
+            // prove — publishing the (0 or 1) proven ones would blackhole it,
+            // and staying silent about it would leave an operator believing the
+            // delegation is healthy. Incident on the TRANSITION only: this
+            // condition persists for as long as the proof is missing, and
+            // `incidents::open` does not dedup, so per-pass would bury the
+            // incident list.
+            if geo_zone_label.is_some() && geo_records.is_empty() && nodes.iter().any(|n| n.dns_ns) {
+                STATS.geo_delegation_holds.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    proven = proven.len(),
+                    unproven = ?unproven,
+                    "geo delegation HELD: fewer than 2 nameservers are currently proven reachable — keeping the published NS records rather than deleting them (deleting would blackhole the whole zone)"
+                );
+                if !geo_hold_active {
+                    geo_hold_active = true;
+                    cloud.incidents.open(crate::incidents::OpenReq {
+                        title: "Geo-DNS delegation held: fewer than 2 proven nameservers".into(),
+                        severity: crate::incidents::Severity::Major,
+                        affected: vec!["dns".into()],
+                        message: format!(
+                            "Nameservers declaring dns_ns but currently unproven from peer vantages: {}. \
+                             The existing NS records are being held (not deleted) so the zone keeps resolving. \
+                             See GET /v1/dns/stats for the per-node evidence.",
+                            if unproven.is_empty() { "-".to_string() } else { unproven.join(", ") }
+                        ),
+                    });
+                }
+            } else {
+                geo_hold_active = false;
+            }
             apps.extend(geo_records);
             apps_managed.extend(geo_names);
             let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
@@ -1130,6 +1216,7 @@ mod tests {
             vec![NodeView {
                 dns_ns: false,
                 dns_api: false,
+                dns_validated: false,
                 name: "n1".into(),
                 healthy,
                 ip4: Some("1.1.1.1".into()),
@@ -1154,6 +1241,7 @@ mod tests {
         let nodes = vec![NodeView {
             dns_ns: false,
             dns_api: false,
+            dns_validated: false,
             name: "nat-node".into(),
             healthy: true,
             ip4: None,
@@ -1168,6 +1256,7 @@ mod tests {
         let nodes = vec![PublishNode {
             dns_ns: false,
             dns_api: false,
+            dns_validated: false,
             name: "n1".into(),
             ip4: Some("1.1.1.1".into()),
             ip6: Some("::1".into()),

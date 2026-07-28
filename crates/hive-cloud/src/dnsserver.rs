@@ -675,6 +675,7 @@ mod tests {
             relay_url: None,
             dns_ns: None,
             dns_api: false,
+            dns_attest: Vec::new(),
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

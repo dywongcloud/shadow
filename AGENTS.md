@@ -244,9 +244,45 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   the same health-damped `PublishNode` set every other record uses, so a
   nameserver that goes unhealthy leaves the NS set by the normal diff. It
   refuses to publish below **two** nameservers — a one-NS zone is a single
-  point of failure for every name under it. Eligibility is the gossiped
-  `NodeInfo::dns_ns`, set at boot ONLY for a real public `:53` bind (the dev
-  default `127.0.0.1:5354` must never be advertised).
+  point of failure for every name under it.
+- **Advertise only what peers have PROVEN, never what a node claims.**
+  `NodeInfo::dns_ns` (set at boot ONLY for a real public `:53` bind — the dev
+  default `127.0.0.1:5354` must never be advertised) is a necessary condition
+  and never a sufficient one: it is read out of the node's own env and says
+  nothing about reachability. Publishing on it alone put two dead nameservers
+  into the live delegation — `ns-fc-hongkong` unreachable (inbound `:53`
+  dropped upstream of the host, invisible from on it) and `ns-fc-sanjose-cvm-2`
+  answering authoritatively with ZERO records. `dns_probe` closes it: EVERY
+  node (not leader-only — the value is independent vantages) queries every
+  peer's public `:53` over the public internet, requires `NOERROR` + `AA` +
+  ≥1 address record, and gossips the passers as `NodeInfo::dns_attest`.
+  `validate_nameservers` then admits a node only while attested from
+  **two distinct REGIONS** (a same-datacenter peer is exactly the vantage most
+  likely to sit inside whatever still permits the traffic), degrading to one
+  only when the fleet has no second region. Never self-attest. Withdrawal is
+  damped by 2 consecutive failed rounds, same K as host-health damping.
+  Because "responds" is not the bar, the probe also asks on behalf of a
+  ROTATING sample of the real client subnets `GeoCache` has located — the
+  cvm-2 defect is client-location specific (measured live: 8 records for one
+  client, 0 for another), so a probe that only asks on its own behalf is blind
+  to the whole class. It samples; it does not prove-for-all-clients.
+- **Below two PROVEN nameservers the reconciler HOLDS, it does not withdraw.**
+  `desired_geo_delegation` returns no records AND no managed names, so the diff
+  never treats the delegation as its own and an already-published NS set is
+  left exactly as it is — deleting every NS would turn a degraded delegation
+  into a blackholed zone. The hold is loud: `geo_delegation_holds` counts it,
+  every pass logs it, and the transition INTO the hold opens an incident (edge
+  triggered — `incidents::open` does not dedup).
+- **Rollout property to expect:** attestations arrive empty from pre-upgrade
+  peers, which withholds advertisement rather than granting it. A fleet where
+  too few nodes run the prover therefore HOLDS the existing delegation until
+  two regions' worth of provers are up — that is the designed direction of
+  failure, not a regression.
+- `hive-cloud --dns-probe <ip>[,<ip>…]` runs the SAME probe from any host
+  (laptop, bastion, peer) and exits non-zero on failure —
+  `HIVE_DEPLOY_ZONE` picks the zone, `HIVE_DNS_PROBE_SUBNETS` adds client
+  subnets. Answering "is this nameserver serving?" with a second
+  implementation is how the diagnostic and the decision quietly diverge.
 - **Two tailoring inputs, one rule.** `dns_geo.rs` locates the client by EDNS
   Client Subnet when the resolver sends one, else by the query's source
   address. `GeoCache` **never blocks the DNS loop**: an unseen prefix is
@@ -266,7 +302,9 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   only meaningful once the zone is delegated here.
 - **Env that matters:** `HIVE_DNS_ADDR` (bind; `0.0.0.0:53` in prod),
   `HIVE_DEPLOY_ZONE` (the delegated geo zone), `HIVE_DNS_SERVE_APPS`,
-  `HIVE_DNS_GEO_ENDPOINT` (geo lookup override). **Gotcha that cost real
+  `HIVE_DNS_GEO_ENDPOINT` (geo lookup override), `HIVE_DNS_PROBE_SECS` /
+  `HIVE_DNS_PROBE_TIMEOUT_MS` (nameserver prover cadence + per-query budget).
+  **Gotcha that cost real
   debugging time:** a systemd DROP-IN (`hive-node.service.d/seer.conf`) can
   override the main unit's value — the unit file read correct while the RUNNING
   process had a typo'd zone, silently keying the entire geo path on a domain
@@ -275,7 +313,11 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   rule); geo endpoint down → generic answers, never an outage; unknown subnet →
   generic answer plus a queued lookup. `GET /v1/dns/stats` (operator) exposes
   query counts, the tailored-vs-generic split, GeoCache hit/pending, published
-  delegation-record count, and which node each answer handed out first.
+  delegation-record count, which node each answer handed out first, the
+  per-node nameserver VERDICT (declared / validated / attesters / attester
+  regions / reason — the same `validate_nameservers` call the reconciler
+  publishes from, so the two can never disagree), and this node's own raw
+  probe evidence.
 
 ## Managed inference (serverless GPU pooling)
 

@@ -18,6 +18,7 @@ mod db_replicate;
 mod db_rest;
 mod dns;
 mod dns_geo;
+mod dns_probe;
 mod dnsserver;
 mod docstore;
 mod edge;
@@ -137,6 +138,16 @@ struct Args {
     /// `HIVE_OWN_RELAY_PORT` overrides this at runtime.
     #[arg(long, default_value_t = 3341)]
     relay_port: u16,
+    /// Operator diagnostic: PROVE that the given addresses serve the delegated
+    /// zone as authoritative nameservers, from THIS host, then exit without
+    /// starting a node. Runs the exact code the prover loop runs
+    /// (`dns_probe::probe_nameserver`) — asking the question with a second
+    /// implementation is how the diagnostic and the decision quietly diverge.
+    /// Zone from `HIVE_DEPLOY_ZONE`; `HIVE_DNS_PROBE_SUBNETS` (comma-separated
+    /// CIDRs) adds client subnets to ask on behalf of. Non-zero exit if any
+    /// target fails, so it composes into a shell check.
+    #[arg(long = "dns-probe", value_delimiter = ',')]
+    dns_probe: Vec<String>,
 }
 
 #[tokio::main]
@@ -156,6 +167,13 @@ async fn main() -> anyhow::Result<()> {
     // guardian init ("Database already open") until the next restart.
     let _ = rustls::crypto::ring::default_provider().install_default();
     let args = Args::parse();
+
+    // Operator diagnostic — answered and exited BEFORE any node state exists,
+    // so it can be run safely from a laptop, a bastion or a live fleet node
+    // without joining the mesh or touching a port.
+    if !args.dns_probe.is_empty() {
+        return dns_probe::run_cli(&args.dns_probe).await;
+    }
 
     // Shared isolation backend. The ONLY component that is allowed to be mocked
     // (and only when a real microVM host isn't available): we auto-select the real
@@ -380,10 +398,14 @@ async fn main() -> anyhow::Result<()> {
         // when/why it's `None` (still filled in this same boot, just after the
         // registry the setter needs is constructed).
         relay_url: None,
-        // Nameserver capability: only a REAL public `:53` bind counts. A
+        // Nameserver INTENT: only a REAL public `:53` bind counts. A
         // loopback/dev bind (the default 127.0.0.1:5354) is not reachable by
         // any resolver, so advertising it would put a black hole in the
-        // delegated zone's NS set.
+        // delegated zone's NS set. This is a necessary condition, never a
+        // sufficient one — it says nothing about whether the internet can
+        // reach the listener. Peers prove that separately and gossip the
+        // result (`dns_attest`, `dns_probe::spawn_ns_prober`), and the DNS
+        // reconciler publishes an NS only for a node that is currently proven.
         dns_ns: std::env::var("HIVE_DNS_ADDR").ok().and_then(|a| {
             let port_is_53 = a.rsplit(':').next() == Some("53");
             let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
@@ -402,6 +424,10 @@ async fn main() -> anyhow::Result<()> {
             }).unwrap_or(false);
             ns_ok && std::env::var("HIVE_PLATFORM_DOMAIN").map(|v| !v.trim().is_empty()).unwrap_or(false)
         },
+        // Filled in by `dns_probe::spawn_ns_prober` from this node's own
+        // off-host probes of its peers, refreshed every round (same post-boot
+        // fill-in pattern as `relay_url`/`guardian_iroh_addr`).
+        dns_attest: Vec::new(),
         // Boot value; the gossip loop refreshes this every round from the
         // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,
@@ -808,6 +834,12 @@ async fn main() -> anyhow::Result<()> {
     // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
     // World interface -- no external queue dependency).
     tokio::spawn(crate::world_queue::run_delivery_loop(cloud.clone(), cloud.world_queue.clone()));
+
+    // Nameserver prover: EVERY node (not leader-only — the whole value is
+    // independent vantages) queries every peer that claims a public `:53` and
+    // gossips the ones that actually answer, so the reconciler below can
+    // publish an NS only for a node proven reachable from off its own host.
+    dns_probe::spawn_ns_prober(cloud.clone());
 
     // Vercel DNS reconciler (ngrok retirement): leader-elected loop publishing
     // healthy node IPs to api.{platform}/*.{apps} via the Vercel API. No-op in
