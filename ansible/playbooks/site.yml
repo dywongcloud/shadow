@@ -21,6 +21,8 @@
   roles:
     - role: prerequisites
       tags: [prerequisites]
+    - role: fail2ban
+      tags: [fail2ban]
 
 - name: Firecracker (real hardware KVM)
   hosts: fc_kvm

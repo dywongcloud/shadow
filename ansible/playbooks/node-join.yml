@@ -44,6 +44,7 @@
   gather_facts: true
   roles:
     - role: prerequisites
+    - role: fail2ban
 
 - name: Provision the new node -- Firecracker (real KVM)
   hosts: "{{ new_node }}"

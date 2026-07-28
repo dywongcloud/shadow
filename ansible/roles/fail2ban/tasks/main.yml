@@ -1,0 +1,142 @@
+---
+# fail2ban, fleet-wide -- bans an IP's SSH access after repeated failed
+# logins. Applied to every node in `platform` so a future node gets it
+# automatically, not hand-run once.
+#
+# WHY FROM SOURCE, NOT THE DISTRO PACKAGE: this fleet mixes two OS families
+# (Rocky Linux 10, TencentOS Server 4 -- see AGENTS.md's glibc-groups note),
+# and only Rocky's own repos carry a working fail2ban RPM. TencentOS has
+# neither a native fail2ban package nor a usable EPEL: EPEL's release RPM
+# hard-requires a real `redhat-release` provide TencentOS doesn't ship, and
+# even a hand-added EPEL9 repo's fail2ban RPM hard-requires
+# `python(abi) = 3.9` while TencentOS ships Python 3.11 -- neither
+# `--skip-broken` workaround is a real install. fail2ban is pure Python with
+# no compiled extension, so installing straight from the upstream GitHub
+# release tarball via `setup.py install` works identically on both families
+# and was live-verified on both (Rocky nodes already carried the distro
+# package from earlier fleet work; every TencentOS node in this fleet was
+# fresh-installed this way and confirmed banning real attacker IPs within
+# seconds of going active). Using ONE method fleet-wide, rather than
+# branching on OS family, is deliberate: it is what is actually proven live
+# on every node this fleet has today, and it is what a brand new node -- of
+# either family -- gets from a clean checkout.
+#
+# A prior stopgap, sshguard, was already active on at least one node
+# (installed out-of-band, predating this role) -- disabled here since running
+# two independent ban daemons against the same sshd log is pure redundancy
+# and the user asked for fail2ban by name.
+- name: Check whether fail2ban is already installed and active (idempotency)
+  ansible.builtin.command: systemctl is-active fail2ban
+  register: f2b_active
+  changed_when: false
+  failed_when: false
+
+- name: Disable any pre-existing sshguard stopgap (fail2ban replaces it)
+  ansible.builtin.systemd:
+    name: sshguard
+    state: stopped
+    enabled: false
+  failed_when: false
+  when: f2b_active.stdout != "active"
+
+- name: Download fail2ban 1.1.0 release tarball
+  ansible.builtin.get_url:
+    url: https://github.com/fail2ban/fail2ban/archive/refs/tags/1.1.0.tar.gz
+    dest: /tmp/fail2ban-1.1.0.tar.gz
+    mode: "0644"
+  when: f2b_active.stdout != "active"
+
+- name: Extract fail2ban source
+  ansible.builtin.unarchive:
+    src: /tmp/fail2ban-1.1.0.tar.gz
+    dest: /tmp
+    remote_src: true
+    creates: /tmp/fail2ban-1.1.0/setup.py
+  when: f2b_active.stdout != "active"
+
+- name: Install fail2ban via setup.py (pure Python, no compiled extension --
+    works identically across this fleet's mixed glibc/Python versions)
+  ansible.builtin.command: python3 setup.py install
+  args:
+    chdir: /tmp/fail2ban-1.1.0
+  when: f2b_active.stdout != "active"
+
+- name: Install the fail2ban systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/fail2ban.service
+    mode: "0644"
+    # No PYTHONNOUSERSITE here -- upstream's own template sets it, but on
+    # this fleet's Python 3.11/3.12 builds that env var ALSO excludes
+    # /usr/local/lib/pythonX.Y/site-packages (where setup.py installs),
+    # not just the true per-user ~/.local site -- live-witnessed on
+    # fc-bangkok as "ModuleNotFoundError: No module named 'fail2ban'" under
+    # systemd's clean environment despite `python3 -c 'import fail2ban'`
+    # working fine interactively. Root-only server, no untrusted per-user
+    # installs to guard against, so the flag buys nothing here anyway.
+    content: |
+      [Unit]
+      Description=Fail2Ban Service
+      Documentation=man:fail2ban(1)
+      After=network.target
+
+      [Service]
+      Type=simple
+      ExecStartPre=/bin/mkdir -p /run/fail2ban
+      ExecStart=/usr/local/bin/fail2ban-server -xf start
+      ExecStop=/usr/local/bin/fail2ban-client stop
+      ExecReload=/usr/local/bin/fail2ban-client reload
+      PIDFile=/run/fail2ban/fail2ban.pid
+      Restart=on-failure
+      RestartPreventExitStatus=0 255
+
+      [Install]
+      WantedBy=multi-user.target
+
+- name: Install the sshd jail config -- explicit logpath/backend rather than
+    relying on fail2ban's own OS auto-detection (TencentOS is not a distro
+    fail2ban recognizes, so its default sshd_log path resolution misses;
+    live-witnessed as "Have not found any log file for sshd jail" before
+    this was made explicit)
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.d/sshd.local
+    mode: "0644"
+    content: |
+      [sshd]
+      enabled = true
+      port = ssh
+      logpath = /var/log/secure
+      backend = auto
+      maxretry = 5
+      bantime = 3600
+      findtime = 600
+
+- name: Install jail.local DEFAULTs (bantime/findtime/maxretry tuned for a
+    fleet the operator SSHes into from a stable but non-whitelisted IP --
+    long enough to deter scanning, short enough not to risk a real self-lockout)
+  ansible.builtin.copy:
+    dest: /etc/fail2ban/jail.local
+    mode: "0644"
+    content: |
+      [DEFAULT]
+      banaction = iptables-multiport
+      banaction_allports = iptables-allports
+      bantime = 3600
+      findtime = 600
+      maxretry = 5
+
+      [sshd]
+      enabled = true
+
+- name: Enable + start fail2ban
+  ansible.builtin.systemd:
+    name: fail2ban
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Verify the sshd jail is actually active (fail loud, not silent, if
+    the config didn't take)
+  ansible.builtin.command: fail2ban-client status sshd
+  register: f2b_jail_status
+  changed_when: false
+  failed_when: "'ERROR' in f2b_jail_status.stdout or 'ERROR' in f2b_jail_status.stderr"
