@@ -834,7 +834,7 @@ async fn main() -> anyhow::Result<()> {
     );
     let admin_router = admin::router(cloud.clone())
         .layer(axum::middleware::from_fn(admin_cache_headers))
-        .layer(axum::middleware::from_fn(auth::require_auth))
+        .layer(axum::middleware::from_fn_with_state(cloud.clone(), auth::require_auth))
         .layer(axum::middleware::from_fn(admin::admin_rate_limit))
         .layer(tower_http::limit::RequestBodyLimitLayer::new(admin_max_body))
         .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
@@ -1194,7 +1194,12 @@ async fn admin_ingress(
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof";
         if is_mutation && !open {
-            let ok = crate::auth::extract_token(req.headers()).and_then(|t| crate::auth::verify(&t).ok()).is_some();
+            // Accept a platform JWT or a dashboard API key (`hive_…`) — the
+            // leader's `require_auth` re-verifies either; this gate only
+            // fails fast. JWT-only here made API keys silently read-only.
+            let ok = crate::auth::extract_token(req.headers())
+                .map(|t| crate::auth::verify(&t).is_ok() || crate::auth::api_key_claims(&cloud, &t).is_some())
+                .unwrap_or(false);
             if !ok {
                 return (axum::http::StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
             }

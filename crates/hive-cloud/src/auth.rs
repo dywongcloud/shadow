@@ -107,23 +107,53 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
     })
 }
 
+/// Resolve a bearer that is a dashboard-issued API key (`hive_…`, see
+/// `apikeys.rs`) into synthesized tenant-scoped [`Claims`]. API keys are the
+/// documented CLI/SDK credential, so they must clear the same mutation gates a
+/// platform JWT does — before this, the JWT-only check silently made every API
+/// key READ-ONLY on an enforced platform (mutations 401'd at both gates).
+/// `platform_admin` is always false: a key scopes to its team, never to
+/// platform-operator authority.
+pub fn api_key_claims(c: &crate::state::CloudState, token: &str) -> Option<Claims> {
+    if !token.starts_with("hive_") {
+        return None;
+    }
+    let k = c.apikeys.verify(token)?;
+    let now = chrono::Utc::now().timestamp() as usize;
+    Some(Claims {
+        sub: format!("key:{}", k.id),
+        tenant: k.team,
+        role: k.role,
+        iat: now,
+        exp: now + 3600,
+        platform_admin: false,
+    })
+}
+
 /// Middleware: when a JWT secret is configured, require a valid bearer token on
 /// mutating requests (POST/PUT/DELETE). Reads are always allowed. With no secret
 /// configured it is a pass-through (dev mode).
 ///
-/// Tenancy: whenever a valid platform JWT is presented (read OR write), the
-/// verified [`Claims`] are inserted into the request's extensions so downstream
-/// handlers can resolve the tenant from the cryptographically-bound `tenant`
-/// claim — never from a client-supplied `x-hive-team` header, which is spoofable.
-/// Extensions are in-process only and cannot be set by the client.
-pub async fn require_auth(mut req: Request, next: Next) -> Response {
+/// Tenancy: whenever a valid platform JWT — or a valid dashboard API key — is
+/// presented (read OR write), the verified [`Claims`] are inserted into the
+/// request's extensions so downstream handlers can resolve the tenant from the
+/// cryptographically-bound `tenant` claim — never from a client-supplied
+/// `x-hive-team` header, which is spoofable. Extensions are in-process only and
+/// cannot be set by the client.
+pub async fn require_auth(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<crate::state::CloudState>>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     if !enforced() {
         return next.run(req).await;
     }
     // Verify the bearer token (if any) up front and bind its claims to the
     // request. This runs for reads too, so read handlers also get the
-    // authoritative tenant.
-    let claims = extract_token(req.headers()).and_then(|t| verify(&t).ok());
+    // authoritative tenant. A JWT wins; a dashboard API key is an equal
+    // second-class citizen (tenant-scoped claims, never platform_admin).
+    let claims = extract_token(req.headers())
+        .and_then(|t| verify(&t).ok().or_else(|| api_key_claims(&state, &t)));
     let authed = claims.is_some();
     if let Some(c) = claims {
         req.extensions_mut().insert(c);
