@@ -460,7 +460,20 @@ fn lookup(
 /// so this stays a pure function of (registry, qtype, client location) and can be
 /// exercised directly without a `CloudState`.
 fn lb_records(nodes: &[NodeInfo], qtype: u16, client: Option<(f64, f64)>) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
-    let mut healthy: Vec<&NodeInfo> = nodes.iter().filter(|n| n.healthy).collect();
+    // Serveable = healthy AND actually reachable in the requested address
+    // family. Both filters must run BEFORE proximity ordering, not after:
+    // proximity truncates to the nearest N, so a nearby node with no public
+    // address consumes a slot and then vanishes when the answer is built,
+    // yielding an EMPTY response — a total outage for exactly the clients
+    // closest to it. Live-witnessed: a San-Jose-area client got 0 answers
+    // (tcpdump on the server showed the query arriving and a 0/0/0 reply)
+    // because the two nearest nodes were NAT'd Macs carrying real
+    // coordinates but no public IP, while distant clients were served
+    // normally.
+    let mut healthy: Vec<&NodeInfo> = nodes
+        .iter()
+        .filter(|n| n.healthy && node_addr_rrs(n, qtype).len() == 1)
+        .collect();
     // Health-ordered by the SERVING node's own latency is the fallback, not the
     // goal: that number describes us, not the client. It only decides the order
     // when the client's location is unknown.
