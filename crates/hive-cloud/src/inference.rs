@@ -341,7 +341,10 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
         .arg("99")
         .arg("--alias")
         .arg(project)
-        .env("LD_LIBRARY_PATH", "/opt/llama/lib");
+        // Both dirs: the CUDA runtime libs live in lib/, but the build's own
+        // libggml*.so land in bin/ — the proven-working invocation from the
+        // node bring-up used exactly this pair.
+        .env("LD_LIBRARY_PATH", "/opt/llama/bin:/opt/llama/lib");
     if !member_addrs.is_empty() {
         cmd.arg("--rpc").arg(member_addrs.join(","));
     }
