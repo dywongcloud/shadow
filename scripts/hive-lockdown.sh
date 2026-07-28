@@ -28,8 +28,13 @@ PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
 PEERS="43.152.247.70 43.128.46.225 43.166.206.175 170.106.40.67 43.172.25.45 170.106.158.151 43.173.78.95 43.166.76.159 43.153.106.173 170.106.155.130 162.62.83.91 43.166.223.197 43.166.233.114"
 # 50052 = llama.cpp rpc-server on the GPU nodes (ggml RPC backend, NO
 # authentication of its own -- must never be internet-reachable; peers only).
-# Listed fleet-wide: harmless on nodes with nothing bound there.
-LOCKED_PORTS="8787 9090 3000 7799 7800 7801 7802 7803 7804 50052"
+# 50100:50999 = managed-inference llama-server endpoints (inference.rs) --
+# fleet-internal OpenAI-compatible APIs reached via HIVE_INFERENCE_URL from
+# app containers (whose egress NATs through a peer host IP); never public.
+# Listed fleet-wide: harmless on nodes with nothing bound there. A colon
+# range token works verbatim for iptables --dport; the nft branch converts
+# it to nft's dash form.
+LOCKED_PORTS="8787 9090 3000 7799 7800 7801 7802 7803 7804 50052 50100:50999"
 
 if command -v iptables >/dev/null 2>&1; then
   iptables -D INPUT -j HIVE_LOCKDOWN 2>/dev/null || true
@@ -46,7 +51,7 @@ elif command -v nft >/dev/null 2>&1; then
   # instead of a second hardcoded list -- the iptables loop above and this
   # branch can no longer drift apart from each other, only $PEERS can go stale.
   PEERS_NFT="$(echo "$PEERS" | tr ' ' ',')"
-  PORTS_NFT="$(echo "$LOCKED_PORTS" | tr ' ' ',')"
+  PORTS_NFT="$(echo "$LOCKED_PORTS" | tr ' :' ',-')"
   nft delete table inet hive_lockdown 2>/dev/null || true
   nft add table inet hive_lockdown
   nft 'add chain inet hive_lockdown input { type filter hook input priority -100 ; policy accept ; }'

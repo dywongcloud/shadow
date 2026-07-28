@@ -1005,6 +1005,33 @@ async fn run_build(
         }
     }
 
+    // Sync the fluid.json top-level `inference` block into project settings —
+    // presence creates/updates the managed llama.cpp endpoint (see
+    // inference.rs), absence tears it down. Parsed from the RAW file so it
+    // works identically across every manifest-shape path (FDI, explicit
+    // fluid.json, container) rather than only the paths that deserialize the
+    // whole file into `Manifest`.
+    {
+        #[derive(serde::Deserialize)]
+        struct InfWrap {
+            #[serde(default)]
+            inference: Option<crate::project_settings::InferenceSpec>,
+        }
+        let spec = match tokio::fs::read_to_string(build_dir.join("fluid.json")).await {
+            Ok(txt) => serde_json::from_str::<InfWrap>(&txt).map(|w| w.inference).unwrap_or(None),
+            Err(_) => None,
+        };
+        let current = cloud.projects.get(&manifest.project).inference;
+        if current != spec {
+            if let Some(s) = &spec {
+                log(format!("Managed inference requested: model {} (pool: {}).", s.model, s.pool));
+            } else if current.is_some() {
+                log("Managed inference removed (no inference block in fluid.json).".into());
+            }
+            cloud.projects.set_inference(&manifest.project, spec);
+        }
+    }
+
     // Inject project env vars + function settings.
     let env = cloud.projects.env_map(&manifest.project);
     let fsettings = cloud.projects.get(&manifest.project).functions;

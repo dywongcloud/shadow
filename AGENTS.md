@@ -233,6 +233,33 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   rebuilding the changed crate. If a just-rolled node still runs old behavior,
   `touch` the synced sources before rebuilding.
 
+## Managed inference (serverless GPU pooling)
+
+- A project opts in with a `fluid.json` TOP-LEVEL block:
+  `{"inference": {"model": "<direct GGUF URL or org/repo/file.gguf HF path>",
+  "pool": true}}`. The deploy path syncs it into
+  `ProjectSettings.inference`; `inference::spawn_reconcile` (every node) does
+  the rest — the app itself needs NO GPU code and NO GPU placement: it just
+  reads `HIVE_INFERENCE_URL` (leader-injected env, same precedent as DB env
+  auto-injection) and speaks OpenAI protocol
+  (`$HIVE_INFERENCE_URL/chat/completions`) from any framework.
+- The backend is real llama.cpp: every GPU node runs `llama-rpc.service`
+  (CUDA `rpc-server`, port 50052, peers-only). Per project, a COORDINATOR GPU
+  node is elected deterministically (FNV(project) over the sorted GPU roster
+  of the largest-VRAM region — every node computes the same answer from
+  gossiped state, no election protocol) and runs `llama-server` on a
+  deterministic port (`50100 + FNV(project) % 900`, range locked down
+  fleet-wide). Models cache under `/root/models`.
+- Placement is pool-aware, single-node-first: fits the coordinator's free
+  VRAM (`gpu_pool` live figures) → runs alone; doesn't fit AND `pool: true` →
+  `--rpc member:50052,...` layer-distribution across enough same-region
+  members to cover; can't fit even the whole pool (or pooling disabled) →
+  the endpoint parks `failed: <honest reason>` — never a silent CPU fallback,
+  matching the GPU-placement rule above. `GET /v1/inference` (operator) lists
+  every endpoint's coordinator/port/URL + the serving node's live statuses.
+- Rebuild constraint from the node half: fc-sanjose-gpu-2 runs driver
+  570.211.01 — any llama.cpp rebuild must stay on CUDA 12.x, not 13.x.
+
 ## Deploys
 
 - `git push` auto-deploys through TWO independent triggers, never assume the

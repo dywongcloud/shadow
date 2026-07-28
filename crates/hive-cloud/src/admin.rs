@@ -48,6 +48,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
         .route("/v1/gpu-pools", get(gpu_pools))
+        .route("/v1/inference", get(inference_endpoints))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -4089,6 +4090,45 @@ async fn gpu_pools(
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let regions = crate::gpu_pool::snapshot(&c).await;
     Ok(Json(json!(regions)))
+}
+
+/// Managed-inference endpoint listing (operator): every project with an
+/// inference spec, its deterministic coordinator/port/URL, plus THIS node's
+/// own live server statuses (authoritative only for endpoints coordinated
+/// here — the listing names the coordinator so an operator knows where the
+/// authoritative status lives).
+async fn inference_endpoints(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let desired: Vec<Value> = c
+        .projects
+        .snapshot()
+        .into_iter()
+        .filter_map(|(p, s)| s.inference.map(|i| (p, i)))
+        .map(|(p, i)| {
+            let coord = crate::inference::coordinator_for(&c, &p);
+            let port = crate::inference::port_for(&p);
+            let url = coord
+                .as_ref()
+                .and_then(|n| n.public_ip.clone())
+                .map(|ip| format!("http://{ip}:{port}/v1"));
+            json!({
+                "project": p,
+                "model": i.model,
+                "pool": i.pool,
+                "coordinator": coord.map(|n| n.name),
+                "port": port,
+                "url": url,
+            })
+        })
+        .collect();
+    Ok(Json(json!({
+        "endpoints": desired,
+        "local_servers": c.inference.statuses(),
+        "node": c.node_name,
+    })))
 }
 
 #[derive(Deserialize)]

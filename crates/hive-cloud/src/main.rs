@@ -29,6 +29,7 @@ mod gossip;
 mod discovery;
 mod gitops;
 mod gpu_pool;
+mod inference;
 mod lease;
 mod mesh_raw;
 mod guardian;
@@ -799,6 +800,10 @@ async fn main() -> anyhow::Result<()> {
     // Self-heal provisioned DB backings (restart-killed / machine-reset
     // containers) — see spawn_db_reconcile's doc for the witnessed loss classes.
     databases::spawn_db_reconcile(cloud.clone());
+    // Managed serverless-GPU inference endpoints (llama.cpp): coordinator
+    // nodes run/converge llama-server children, the leader injects
+    // HIVE_INFERENCE_URL — see inference.rs's module doc.
+    inference::spawn_reconcile(cloud.clone());
     // Reschedule orphaned workflow-world queue jobs (claimed-then-dropped
     // deliveries) so a delivery-path failure can never strand runs in
     // `pending` forever — see world::reconcile_orphan_jobs.

@@ -138,6 +138,21 @@ impl Default for FunctionSettings {
     }
 }
 
+/// `fluid.json` top-level `inference` block — the developer-facing serverless
+/// GPU inference convention. `model` is a real model ref (direct GGUF URL, or
+/// an `org/repo/file.gguf` HuggingFace path); `pool: true` allows the platform
+/// to combine multiple same-region GPU nodes (llama.cpp RPC layer-distribution)
+/// when the model does not fit a single node's free VRAM. The platform
+/// provisions the real backend and injects `HIVE_INFERENCE_URL` (an
+/// OpenAI-compatible endpoint) into the project env — the app just fetches it,
+/// same precedent as DB env auto-injection.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct InferenceSpec {
+    pub model: String,
+    #[serde(default)]
+    pub pool: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
     #[serde(default)]
@@ -146,6 +161,10 @@ pub struct ProjectSettings {
     pub build: BuildConfig,
     #[serde(default)]
     pub functions: FunctionSettings,
+    /// Managed inference backend request (fluid.json `inference`), if any.
+    /// Synced from the deploy path; consumed by `inference::spawn_reconcile`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inference: Option<InferenceSpec>,
     #[serde(default)]
     pub domains: Vec<String>,
     /// Team that owns this project (slug). Defaults to "personal".
@@ -219,6 +238,7 @@ impl Default for ProjectSettings {
             env: Vec::new(),
             build: BuildConfig::default(),
             functions: FunctionSettings::default(),
+            inference: None,
             domains: Vec::new(),
             team: default_team(),
             production_branch: String::new(),
@@ -297,6 +317,11 @@ impl ProjectStore {
     pub fn set_functions(&self, project: &str, f: FunctionSettings) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().functions = f;
+    }
+
+    pub fn set_inference(&self, project: &str, spec: Option<InferenceSpec>) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().inference = spec;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {
