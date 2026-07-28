@@ -491,6 +491,9 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 who["authenticated"].as_bool().unwrap_or(false),
                 who["sub"].as_str().unwrap_or("-"),
                 who["tenant"].as_str().unwrap_or("-"));
+            if let Some(admin) = c.token.as_deref().and_then(|t| client::jwt_claim_bool(t, "platform_admin")) {
+                println!("Platform admin: {admin}");
+            }
             let auth = c.get("/v1/auth").await?;
             println!("Auth enforced: {}", auth["enforced"].as_bool().unwrap_or(false));
             Ok(())

@@ -95,6 +95,36 @@ pub(crate) fn resolve_settings(
     (api.trim_end_matches('/').to_string(), token, team)
 }
 
+/// Read a boolean claim out of a JWT payload WITHOUT verifying the signature —
+/// client-side introspection only (picking the best of several minted tokens,
+/// display); the backend remains the sole verifier.
+pub fn jwt_claim_bool(token: &str, claim: &str) -> Option<bool> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = b64url_decode(payload)?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v[claim].as_bool()
+}
+
+fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in s.as_bytes() {
+        if c == b'=' {
+            break;
+        }
+        let idx = ALPHABET.iter().position(|&a| a == c)? as u32;
+        buf = (buf << 6) | idx;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Join a base URL with a path, tolerating a leading slash or not.
 pub(crate) fn join_url(base: &str, path: &str) -> String {
     if path.starts_with('/') {
@@ -151,36 +181,53 @@ impl Client {
             "email": email,
         });
         let url = join_url(&self.api, "/v1/token");
-        let resp = self
-            .http
-            .post(&url)
-            .header("x-hive-internal", internal)
-            .json(&body)
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let v: Value = r.json().await.unwrap_or(Value::Null);
-                if let Some(tok) = v["token"].as_str().filter(|s| !s.is_empty()) {
-                    let ttl = v["expires_in"].as_u64().unwrap_or(3600);
-                    cfg.jwt = Some(tok.to_string());
-                    cfg.jwt_exp = Some(now + ttl);
-                    if let Err(e) = save_config(&cfg) {
-                        eprintln!("warning: minted a session token but could not cache it: {e:#}");
+        // The api host is round-robin DNS and each node derives `platform_admin`
+        // from its OWN env — a node with drifted config mints a token that lacks
+        // it. Retry a few times (fresh connection each attempt lands on a
+        // different node) and keep the first operator-grade token; the last
+        // mint is kept regardless so a fully-drifted fleet still logs in.
+        let mut best: Option<(String, u64)> = None;
+        for _ in 0..4 {
+            let resp = reqwest::Client::new()
+                .post(&url)
+                .header("x-hive-internal", internal.clone())
+                .json(&body)
+                .send()
+                .await;
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    let v: Value = r.json().await.unwrap_or(Value::Null);
+                    if let Some(tok) = v["token"].as_str().filter(|s| !s.is_empty()) {
+                        let ttl = v["expires_in"].as_u64().unwrap_or(3600);
+                        let admin = jwt_claim_bool(tok, "platform_admin").unwrap_or(false);
+                        best = Some((tok.to_string(), ttl));
+                        if admin || email.is_empty() {
+                            break;
+                        }
+                    } else {
+                        eprintln!("warning: {url} returned no token (backend unenforced?); keeping existing credentials");
+                        return;
                     }
-                    self.token = Some(tok.to_string());
-                } else {
-                    eprintln!("warning: {url} returned no token (backend unenforced?); keeping existing credentials");
+                }
+                Ok(r) => {
+                    let status = r.status();
+                    let text = r.text().await.unwrap_or_default();
+                    eprintln!("warning: token mint failed: HTTP {status}: {} — falling back to the saved API key (read-only on an enforced platform)", text.trim());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("warning: token mint unreachable ({url}): {e} — falling back to the saved API key (read-only on an enforced platform)");
+                    return;
                 }
             }
-            Ok(r) => {
-                let status = r.status();
-                let text = r.text().await.unwrap_or_default();
-                eprintln!("warning: token mint failed: HTTP {status}: {} — falling back to the saved API key (read-only on an enforced platform)", text.trim());
+        }
+        if let Some((tok, ttl)) = best {
+            cfg.jwt = Some(tok.clone());
+            cfg.jwt_exp = Some(now + ttl);
+            if let Err(e) = save_config(&cfg) {
+                eprintln!("warning: minted a session token but could not cache it: {e:#}");
             }
-            Err(e) => {
-                eprintln!("warning: token mint unreachable ({url}): {e} — falling back to the saved API key (read-only on an enforced platform)");
-            }
+            self.token = Some(tok);
         }
     }
 
