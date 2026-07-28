@@ -2202,6 +2202,24 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                 roster_hash = h;
                 tokio::spawn(async move { crate::guardian::put("mesh/roster", roster_json).await });
             }
+            // Refresh THIS node's own MESH iroh_addr (re-serialize `ep.addr()`
+            // every round, same pattern as guardian_iroh_addr/relay_url below).
+            // `iroh_addr` was previously captured EXACTLY ONCE, at the instant
+            // `bind_full` returned — before the endpoint has had any time to
+            // register with its relay or learn hole-punch candidates, so it
+            // shipped private-addrs-only in the gossip round every OTHER node
+            // uses to dial this one. Root-caused live: fc-gpu-sj-2's `iroh_addr`
+            // still read `{"id":...,"addrs":[{"Ip":"10.0.2.2:48670"}]}` (no
+            // relay, no public IP) an hour after boot with its security group
+            // open the whole time, while its SEPARATE `guardian_iroh_addr` (which
+            // DOES refresh every round, see below) correctly carried the relay
+            // hint and the real public IP — proving the gap was staleness, not
+            // reachability. This is exactly the class of bug
+            // `dnsserver-nearest-by-geo`'s sibling row (`geo-refresh-not-only-at-
+            // boot`) fixed for lat/lon; same shape here for the mesh address.
+            if let Some(addr) = cloud.iroh.read().as_ref().and_then(hive_p2p::addr_json) {
+                cloud.registry.set_self_iroh_addr(addr);
+            }
             // Publish THIS node's own GuardianDB-specific address (a SEPARATE
             // iroh identity from the mesh's iroh_addr above — GuardianDB runs
             // its own independent client) once it's ready, so peers can gossip

@@ -241,6 +241,22 @@ impl NodeRegistry {
         }
     }
 
+    /// Refresh this node's own MESH `iroh_addr` (the address peers dial for
+    /// gossip/forward RPCs — a DIFFERENT iroh identity from GuardianDB's own
+    /// client, see `guardian_iroh_addr`'s doc). Mirrors `set_self_guardian_addr`:
+    /// best-effort, idempotent, safe every gossip round, picked up by the next
+    /// outgoing broadcast. `iroh_addr` used to be captured exactly once at bind
+    /// time — before the endpoint had registered with its relay or learned
+    /// hole-punch candidates — so it shipped private-addrs-only forever; this
+    /// setter is what makes it converge to the endpoint's ACTUAL current
+    /// knowledge of itself instead of a stale boot snapshot.
+    pub fn set_self_iroh_addr(&self, addr: String) {
+        let mut me = self.me.write();
+        if me.iroh_addr.as_deref() != Some(addr.as_str()) {
+            me.iroh_addr = Some(addr);
+        }
+    }
+
     /// Update this node's own `relay_url` once the embedded iroh-relay listener
     /// has bound (see `relay_url`'s own doc comment). Mirrors
     /// `set_self_guardian_addr`: best-effort, idempotent, safe to call every
