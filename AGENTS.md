@@ -233,6 +233,50 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   rebuilding the changed crate. If a just-rolled node still runs old behavior,
   `touch` the synced sources before rebuilding.
 
+## Geo-DNS (Seer)
+
+- **The delegation boundary is the whole story.** `shadw.app`/`shadw.cloud` are
+  delegated to `ns1/ns2.vercel-dns.com`, and Vercel DNS is plain authoritative
+  DNS with **no geo or health routing** — so the platform's own geo-aware
+  server (`dnsserver.rs`, "Seer") can only answer for names actually delegated
+  to it. `vercel_dns::desired_geo_delegation` publishes that delegation (NS on
+  the deploy-zone label + `ns-<node>` glue) into the Vercel-hosted parent from
+  the same health-damped `PublishNode` set every other record uses, so a
+  nameserver that goes unhealthy leaves the NS set by the normal diff. It
+  refuses to publish below **two** nameservers — a one-NS zone is a single
+  point of failure for every name under it. Eligibility is the gossiped
+  `NodeInfo::dns_ns`, set at boot ONLY for a real public `:53` bind (the dev
+  default `127.0.0.1:5354` must never be advertised).
+- **Two tailoring inputs, one rule.** `dns_geo.rs` locates the client by EDNS
+  Client Subnet when the resolver sends one, else by the query's source
+  address. `GeoCache` **never blocks the DNS loop**: an unseen prefix is
+  answered generically and queued for a background lookup, so the FIRST query
+  for a prefix is generic (ECS scope 0) and later ones are tailored (scope =
+  the responding prefix length). That is the designed contract, not a bug —
+  a tailored answer must carry a non-zero scope so recursives cannot reuse it
+  for clients it wasn't computed for.
+- **Health beats proximity, always.** `lb_records` filters to healthy nodes
+  with a public address of the requested family BEFORE proximity ordering, so
+  the nearest-but-dead node is never returned.
+- **Apps zone: affinity first, then proximity.** When `HIVE_DNS_SERVE_APPS` is
+  on, Seer answers the customer zone with the same two-tier rule the published
+  records encode — a host attributable to a specific node resolves to THAT node
+  (the deployment runs there; anywhere else buys a cross-node forward), and
+  everything else gets the proximity-ordered healthy set. Off by default: it is
+  only meaningful once the zone is delegated here.
+- **Env that matters:** `HIVE_DNS_ADDR` (bind; `0.0.0.0:53` in prod),
+  `HIVE_DEPLOY_ZONE` (the delegated geo zone), `HIVE_DNS_SERVE_APPS`,
+  `HIVE_DNS_GEO_ENDPOINT` (geo lookup override). **Gotcha that cost real
+  debugging time:** a systemd DROP-IN (`hive-node.service.d/seer.conf`) can
+  override the main unit's value — the unit file read correct while the RUNNING
+  process had a typo'd zone, silently keying the entire geo path on a domain
+  nobody owns. Verify with `/proc/<pid>/environ`, never the unit file.
+- **Failure modes:** Seer down → delegated names go dark (hence the ≥2-NS
+  rule); geo endpoint down → generic answers, never an outage; unknown subnet →
+  generic answer plus a queued lookup. `GET /v1/dns/stats` (operator) exposes
+  query counts, the tailored-vs-generic split, GeoCache hit/pending, published
+  delegation-record count, and which node each answer handed out first.
+
 ## Managed inference (serverless GPU pooling)
 
 - A project opts in with a `fluid.json` TOP-LEVEL block:
