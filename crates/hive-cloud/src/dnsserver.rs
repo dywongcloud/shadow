@@ -81,6 +81,61 @@ fn rdata_ip(atype: u16, rdata: &[u8]) -> Option<String> {
     }
 }
 
+/// Whether this server answers the customer-facing apps zone. Off by default:
+/// the zone is Vercel-served until an operator delegates it here.
+fn serve_apps_zone() -> bool {
+    std::env::var("HIVE_DNS_SERVE_APPS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+}
+
+/// The node currently serving `label` in the apps zone, if any — local aliases
+/// first (authoritative for what THIS node serves), then the gossiped peer
+/// route table with the lowest-latency healthy route winning. Same ownership
+/// rule the DNS reconciler's affinity records already encode, so the two paths
+/// cannot disagree about who owns a host.
+fn apps_host_owner(cloud: &Arc<CloudState>, label: &str) -> Option<String> {
+    if label.is_empty() {
+        return None;
+    }
+    let norm = |h: &str| {
+        h.split(':').next().unwrap_or(h).split('.').next().unwrap_or(h).trim().to_ascii_lowercase()
+    };
+    if cloud.gw.served_hosts().iter().any(|h| norm(h) == label) {
+        return Some(cloud.node_name.clone());
+    }
+    let routes = cloud.peer_routes.read();
+    for (host, rs) in routes.iter() {
+        if norm(host) == label {
+            if let Some(best) = rs.iter().filter(|r| r.healthy).min_by_key(|r| r.latency_ms) {
+                return Some(best.node_id.clone());
+            }
+        }
+    }
+    None
+}
+
+/// A/AAAA answer RRs for one node, matching the requested family.
+fn node_addr_rrs(n: &NodeInfo, qtype: u16) -> Vec<(u16, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    match qtype {
+        1 => {
+            if let Some(ip) = n.public_ip.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()) {
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    out.push((1u16, DEPLOY_TTL, ip.octets().to_vec()));
+                }
+            }
+        }
+        28 => {
+            if let Some(ip) = n.public_ip6.as_deref().and_then(|s| s.parse::<Ipv6Addr>().ok()) {
+                if !ip.is_unspecified() && !ip.is_loopback() {
+                    out.push((28u16, DEPLOY_TTL, ip.octets().to_vec()));
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 pub(crate) fn deploy_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
     Z.get_or_init(|| {
@@ -295,6 +350,49 @@ fn lookup(
                 }
                 // FORWARD-COMPAT (phase 2): `_acme-challenge.<zone>` TXT for ACME DNS-01,
                 // and CAA, branch here. Phase 1 is authoritative no-data for them.
+                _ => return (Vec::new(), true, false),
+            }
+        }
+    }
+
+    // ---- Plane A, apps zone: affinity FIRST, then proximity ----
+    // The customer-facing zone (`HIVE_APPS_DOMAIN`) is answered here with the
+    // same two-tier rule the Vercel-published records encode, so this server is
+    // a drop-in authority for it: a host we can attribute to a specific node
+    // (the deployment actually runs there) resolves to THAT node — sending the
+    // client anywhere else just buys a cross-node forward, which proximity
+    // cannot make up for — and everything else (the wildcard case) gets the
+    // proximity-ordered healthy set instead of Vercel's flat all-nodes list.
+    //
+    // Serving is opt-in via `HIVE_DNS_SERVE_APPS`, because turning it on is
+    // only meaningful once the zone is actually delegated here; until then the
+    // capability is real and directly witnessable by querying this server, with
+    // zero effect on the live Vercel-served path.
+    if serve_apps_zone() {
+        let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
+        if !apps.is_empty() && (qname == apps || qname.ends_with(&format!(".{apps}"))) {
+            match qtype {
+                1 | 28 => {
+                    let label = qname
+                        .strip_suffix(&format!(".{apps}"))
+                        .unwrap_or("")
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let nodes = cloud.registry.nodes();
+                    if let Some(owner) = apps_host_owner(cloud, &label) {
+                        if let Some(n) = nodes.iter().find(|n| n.name == owner && n.healthy) {
+                            let rrs = node_addr_rrs(n, qtype);
+                            if !rrs.is_empty() {
+                                return (rrs, true, false);
+                            }
+                        }
+                    }
+                    let client = cloud.dns_geo.locate(asker.locate_addr());
+                    let (rrs, tailored) = lb_records(&nodes, qtype, client);
+                    return (rrs, true, tailored);
+                }
                 _ => return (Vec::new(), true, false),
             }
         }
