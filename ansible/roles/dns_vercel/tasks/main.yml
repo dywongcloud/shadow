@@ -15,7 +15,19 @@
       nodes.
   when: hive_ingress_enabled | default(true)
 
-- name: Open 80/443 (public ingress) -- redundant with prerequisites but explicit here since this role can run standalone
+# This fleet's convention (roles/prerequisites) is firewalld DISABLED+MASKED --
+# scripts/hive-lockdown.sh is the sole firewall, and it never blocks 80/443.
+# On such hosts there is nothing to open and the firewalld module hard-fails
+# ("firewall is not currently running"), which broke node-join on the first
+# fresh node this role ever ran against (fc-saopaulo). Only act when a host
+# genuinely runs firewalld (a non-fleet/standalone use of this role).
+- name: Check whether firewalld is running (fleet convention is masked -- hive-lockdown.sh is the sole firewall)
+  ansible.builtin.command: systemctl is-active firewalld
+  register: _firewalld_active
+  changed_when: false
+  failed_when: false
+
+- name: Open 80/443 (public ingress) -- only on hosts that actually run firewalld
   ansible.posix.firewalld:
     port: "{{ item }}"
     permanent: true
@@ -24,7 +36,7 @@
   loop:
     - "80/tcp"
     - "443/tcp"
-  when: hive_ingress_enabled | default(true)
+  when: (hive_ingress_enabled | default(true)) and _firewalld_active.stdout == "active"
 
 - name: Ensure the systemd drop-in directory exists
   ansible.builtin.file:
