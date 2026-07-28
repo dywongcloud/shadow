@@ -123,6 +123,9 @@ pub struct Event {
 pub struct CloudState {
     pub region: String,
     pub node_name: String,
+    /// epoch-ms this process started — the reference point `mesh_health`'s
+    /// `uptime_ms` is computed from.
+    pub boot_ms: u64,
     pub public_base: String,
     /// Host suffixes this node will route on (the pooled wildcard ingress roots,
     /// e.g. `deployment.shadow.ngrok.pizza`). A multi-label Host that doesn't end
@@ -363,6 +366,14 @@ pub struct MeshHealth {
     /// True iff peers were expected but NONE are currently visible — the exact
     /// shape of the node-a/node-b isolation incident (see `mesh_isolated`).
     pub isolated: bool,
+    /// ms since this process started. Turns "sees only self" from an opaque
+    /// log line into an answerable question: still within the normal
+    /// convergence window, or has it been stuck? Measured live this session:
+    /// a healthy restart converged (first successful DNS reconcile) in ~58s;
+    /// a node stuck past several minutes of this counter climbing while
+    /// `visible_healthy_peers` stays 0 is the genuinely-stuck signal the old
+    /// silent skip-log gave no way to distinguish from "still warming up".
+    pub uptime_ms: u64,
 }
 
 /// Pure core of mesh-isolation detection (unit-testable without a node). Compares
@@ -513,6 +524,7 @@ impl CloudState {
         Arc::new(CloudState {
             region,
             node_name,
+            boot_ms: hive_core::now_ms(),
             public_base,
             deploy_suffixes,
             apps_domain,
@@ -636,6 +648,7 @@ impl CloudState {
             expected_peers: expected.len(),
             visible_healthy_peers: visible.len(),
             isolated: mesh_isolated(expected.len(), visible.len()),
+            uptime_ms: hive_core::now_ms().saturating_sub(self.boot_ms),
         }
     }
 
