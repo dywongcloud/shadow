@@ -264,6 +264,24 @@ impl NodeRegistry {
         }
     }
 
+    /// Update this node's own geolocation (lat/lon/city/country) when a
+    /// periodic re-check finds it moved (see `spawn_geo_refresh` in
+    /// hive-cloud). Mirrors `set_self_relay_url`: best-effort, idempotent, no
+    /// write when unchanged, picked up by the next gossip round. Deliberately
+    /// does NOT touch `region` — a node's region is its stable identity
+    /// (baked into DNS names, ACME SANs, placement), while lat/lon only feed
+    /// the regions map and DNS-nearest-by-geo; re-deriving `region` from a
+    /// drifted geolocation would be the disruptive kind of "fix".
+    pub fn set_self_geo(&self, lat: f64, lon: f64, city: String, country: String) {
+        let mut me = self.me.write();
+        if me.lat != Some(lat) || me.lon != Some(lon) {
+            me.lat = Some(lat);
+            me.lon = Some(lon);
+            me.city = Some(city);
+            me.country = Some(country);
+        }
+    }
+
     /// Record a peer's measured latency + health (from probing).
     pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
         if let Some(p) = self.peers.write().get_mut(id) {

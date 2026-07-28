@@ -733,6 +733,8 @@ async fn main() -> anyhow::Result<()> {
     // offline/partitioned during a peer's write, ticket exchange never ran
     // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
     spawn_anti_entropy_loop(cloud.clone());
+    spawn_geo_refresh(cloud.registry.clone());
+    spawn_memory_pressure_alarm();
 
     // Billing meter loop: periodically converts measured fleet compute usage into
     // charges (usage → rate card → ledger → invoice). Runs whether Stripe is
@@ -1448,6 +1450,56 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Periodic re-geolocation so a machine that MOVES (a laptop node, or a cloud
+/// host whose ISP re-homes its IP) doesn't report a stale location until the
+/// next restart — the exact drift observed live on the LA-boot/San-Jose-now
+/// laptop nodes. `HIVE_GEO` still wins unconditionally on every call
+/// (`geolocate()`'s own first check), so a manually-pinned node is unaffected;
+/// this only helps the auto-detected case. Deliberately does NOT update
+/// `region` — see `NodeRegistry::set_self_geo`'s doc for why re-deriving a
+/// node's stable identity from a drifted geolocation would be the disruptive
+/// half of a "fix", not this row's ask. Only writes when the position moved
+/// MATERIALLY (`HIVE_GEO_REFRESH_MIN_KM`, default 50km — a routine BGP reroute
+/// within the same city must not spuriously churn the registry every tick).
+fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
+    // `--region` pinned explicitly (not "auto") means the operator already
+    // decided the identity; still worth refreshing lat/lon for DNS-nearest
+    // accuracy, so this loop runs unconditionally rather than gating on that.
+    let interval = Duration::from_secs(env_u64("HIVE_GEO_REFRESH_SECS", 3600));
+    if interval.is_zero() {
+        return; // HIVE_GEO_REFRESH_SECS=0 opts out entirely
+    }
+    let min_km = std::env::var("HIVE_GEO_REFRESH_MIN_KM")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(50.0);
+    crate::supervise::spawn_supervised("geo-refresh", move || {
+        let registry = registry.clone();
+        async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                crate::supervise::beat("geo-refresh");
+                let Some((lat, lon, city, country, _ip)) = geolocate().await else { continue };
+                let (prev_lat, prev_lon) = {
+                    let me = registry.me();
+                    (me.lat, me.lon)
+                };
+                let moved = match (prev_lat, prev_lon) {
+                    (Some(plat), Some(plon)) => hive_edge::haversine_km((plat, plon), (lat, lon)) >= min_km,
+                    // No prior geo at all (boot geolocation failed, e.g. offline
+                    // at start) — any successful lookup now is real information.
+                    _ => true,
+                };
+                if moved {
+                    tracing::info!(city = %city, country = %country, lat, lon, "node re-geolocated — position moved materially, updating registry");
+                    registry.set_self_geo(lat, lon, city, country);
+                }
+            }
+        }
+    });
 }
 
 /// Best-effort IP geolocation at startup → (lat, lon, city, country, public_ip). Uses
@@ -2676,6 +2728,42 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
 /// the backstop for a peer that's both unprobeable and gone. Config:
 /// `HIVE_HEALTH_INTERVAL` (s, def 5), `HIVE_HEALTH_TIMEOUT` (s, def 2),
 /// `HIVE_HEALTH_FAIL_THRESHOLD` (consecutive misses, def 2).
+/// Loud, cheap, self-observed early warning for the fc-sanjose-2 shape: a
+/// process climbing toward its cgroup memory ceiling while every EXTERNAL
+/// signal (systemd is-active, /healthz 200, even :443 customer traffic) stays
+/// green. Distinct from `spawn_health_loop` (which is PEER-observed reachability,
+/// the right check for routing decisions) — this is a SELF-check for exactly
+/// the failure class no peer probe can see, because the process is still
+/// answering everything a probe would ask, right up until it isn't.
+/// `HIVE_MEMORY_ALARM_PCT` (default 80.0): once RSS crosses this fraction of
+/// the cgroup limit, warn on every tick until it drops back below — noisy on
+/// purpose, since the incident this guards against was invisible for however
+/// long the climb took.
+fn spawn_memory_pressure_alarm() {
+    let alarm_pct = std::env::var("HIVE_MEMORY_ALARM_PCT")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(80.0);
+    crate::supervise::spawn_supervised("memory-pressure-alarm", move || async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            crate::supervise::beat("memory-pressure-alarm");
+            let m = crate::supervise::memory_pressure();
+            if let Some(pct) = m.pct_of_limit {
+                if pct >= alarm_pct {
+                    tracing::warn!(
+                        rss_mb = m.rss_mb,
+                        cgroup_limit_mb = m.cgroup_limit_mb,
+                        pct_of_limit = pct,
+                        "memory pressure high — this node may be approaching the fc-sanjose-2 wedge shape (climbing RSS while every external health signal stays green)"
+                    );
+                }
+            }
+        }
+    });
+}
+
 fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
     let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));

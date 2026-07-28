@@ -3723,7 +3723,7 @@ async fn tasks_health(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
-    Ok(Json(json!({ "tasks": crate::supervise::snapshot() })))
+    Ok(Json(json!({ "tasks": crate::supervise::snapshot(), "memory": crate::supervise::memory_pressure() })))
 }
 
 async fn overview(

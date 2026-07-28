@@ -81,6 +81,54 @@ pub fn snapshot() -> Vec<TaskHealth> {
         .collect()
 }
 
+/// This process's own memory pressure — the direct signal behind the
+/// fc-sanjose-2 incident, which no health check surfaced because the wedge
+/// was PARTIAL: :443 (customer traffic, what DNS/mesh health already covers
+/// via the peer-observed gossip probe in `spawn_health_loop` — a real
+/// `GOSSIP_GET` dispatch, not a bare connect) kept serving fine while the
+/// process quietly climbed toward its cgroup memory ceiling. Systemd
+/// `is-active` and the admin `/healthz` 200 both stayed green throughout — a
+/// process that answers can still be minutes from an OOM kill. Reading this
+/// number directly (rather than inferring RSS from behavior after the fact,
+/// the way the incident was actually diagnosed) is what would let an operator
+/// or a future alarm catch the NEXT one climbing, before it reaches the cap.
+#[derive(Serialize)]
+pub struct MemoryPressure {
+    /// This process's resident set (MB), from `/proc/self/status` on Linux.
+    /// `None` off-Linux (macOS dev nodes) — no portable equivalent worth the
+    /// complexity for a fleet that is Linux in production.
+    pub rss_mb: Option<u64>,
+    /// The cgroup v2 memory ceiling (MB) this process is confined to, from
+    /// `/sys/fs/cgroup/memory.max` — the number that actually matters (the
+    /// host's total RAM is not the constraint; the systemd `MemoryMax=` unit
+    /// setting is). `None` when unreadable (no cgroup, cgroup v1, or the unit
+    /// has no limit set — `max` is left unparsed rather than reported as an
+    /// artificial number).
+    pub cgroup_limit_mb: Option<u64>,
+    /// rss_mb / cgroup_limit_mb, when both are known — the number worth
+    /// alerting on directly rather than computing at every call site.
+    pub pct_of_limit: Option<f64>,
+}
+
+pub fn memory_pressure() -> MemoryPressure {
+    let rss_mb = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("VmRSS:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|kb| kb.parse::<u64>().ok())
+            .map(|kb| kb / 1024)
+    });
+    let cgroup_limit_mb = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|bytes| bytes / (1024 * 1024));
+    let pct_of_limit = match (rss_mb, cgroup_limit_mb) {
+        (Some(r), Some(l)) if l > 0 => Some((r as f64 / l as f64) * 100.0),
+        _ => None,
+    };
+    MemoryPressure { rss_mb, cgroup_limit_mb, pct_of_limit }
+}
+
 /// Spawn `make()`'s future and keep it alive: on panic OR return, log, back
 /// off (5s doubling to 5min — a deterministic crash must not spin hot), and
 /// re-spawn. `make` is a factory because the future is consumed per attempt.
