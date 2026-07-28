@@ -240,7 +240,11 @@ pub fn ns_label(node_name: &str) -> String {
 /// Only nodes that really answer DNS are eligible (`PublishNode::dns_ns`, set at
 /// boot from a public `:53` bind and gossiped) — advertising a node that has no
 /// listener would put a black hole in the delegated zone.
-pub fn desired_geo_delegation(nodes: &[PublishNode], label: &str) -> (Vec<DesiredRecord>, Vec<String>) {
+pub fn desired_geo_delegation(
+    nodes: &[PublishNode],
+    label: &str,
+    apps_domain: &str,
+) -> (Vec<DesiredRecord>, Vec<String>) {
     let mut out = Vec::new();
     let mut managed = vec![label.to_string()];
     for n in nodes.iter().filter(|n| n.dns_ns) {
@@ -252,7 +256,13 @@ pub fn desired_geo_delegation(nodes: &[PublishNode], label: &str) -> (Vec<Desire
             out.push(DesiredRecord { name: ns.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 300 });
         }
         if n.ip4.is_some() || n.ip6.is_some() {
-            out.push(DesiredRecord { name: label.to_string(), rtype: "NS".into(), value: ns.clone(), ttl: 300 });
+            // FULLY QUALIFIED, always: Vercel rejects a relative NS target
+            // outright — `{"code":"invalid_value","message":"The NS value is
+            // not a fully qualified domain name."}` — which is why the glue A
+            // records published while every NS create silently failed, leaving
+            // the zone undelegated with correct-looking glue in place.
+            let target = format!("{ns}.{}", apps_domain.trim().trim_matches('.'));
+            out.push(DesiredRecord { name: label.to_string(), rtype: "NS".into(), value: target, ttl: 300 });
             managed.push(ns);
         }
     }
@@ -855,7 +865,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // when >=2 real nameservers exist (see desired_geo_delegation).
             let (geo_records, geo_names) = crate::dnsserver::deploy_zone()
                 .and_then(|dz| geo_label(dz, &cloud.apps_domain))
-                .map(|label| desired_geo_delegation(&publish, &label))
+                .map(|label| desired_geo_delegation(&publish, &label, &cloud.apps_domain))
                 .unwrap_or_default();
             STATS.geo_delegation_records.store(geo_records.len() as u64, Ordering::Relaxed);
             apps.extend(geo_records);
