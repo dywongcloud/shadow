@@ -451,7 +451,7 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 jwt: None,
                 jwt_exp: None,
             };
-            let mint_mode = cfg.internal_token.as_deref().unwrap_or("") != "";
+            let mint_mode = !cfg.internal_token.as_deref().unwrap_or("").is_empty();
             if !mint_mode && cfg.token.as_deref().unwrap_or("").is_empty() {
                 return Err(anyhow!("no credentials provided — pass --token hive_… (dashboard: Settings → API Keys) or --internal-token for mint-mode auto-login"));
             }
