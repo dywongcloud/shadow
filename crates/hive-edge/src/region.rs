@@ -61,6 +61,15 @@ pub struct NodeInfo {
     /// `#[serde(default)]` so pre-upgrade peers deserialize fine.
     #[serde(default)]
     pub dns_ns: Option<String>,
+    /// This node's Seer also serves the platform API zone (`api.{platform}`)
+    /// geo/health-aware — advertised only by binaries that actually carry that
+    /// answering path. Gates the `api` label's NS delegation at the parent so
+    /// the NS set can never name a nameserver that would NXDOMAIN the zone
+    /// (an older binary with `dns_ns` set answers the deploy zone fine but
+    /// knows nothing of the api zone). `#[serde(default)]`: pre-upgrade peers
+    /// deserialize `false` and are simply never eligible.
+    #[serde(default)]
+    pub dns_api: bool,
     /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
     /// on every owner promotion/failover). Gossiped so the whole fleet converges
     /// on the highest epoch — the fencing token that lets a node reject admin
@@ -476,6 +485,7 @@ mod tests {
             guardian_iroh_addr: None,
             relay_url: None,
             dns_ns: None,
+            dns_api: false,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

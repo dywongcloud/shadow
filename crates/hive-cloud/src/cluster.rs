@@ -255,6 +255,7 @@ mod tests {
             guardian_iroh_addr: None,
             relay_url: None,
             dns_ns: None,
+            dns_api: false,
             cp_epoch: 0,
             last_seen_ms: 0,
             is_self: false,

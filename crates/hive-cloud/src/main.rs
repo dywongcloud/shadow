@@ -390,6 +390,18 @@ async fn main() -> anyhow::Result<()> {
             let public_bind = host == "0.0.0.0" || host == "[::]" || host == "::";
             (port_is_53 && public_bind).then(|| a.clone())
         }),
+        // API-zone capability: this binary's Seer answers `api.{platform}`
+        // (see dnsserver::api_zone), so a public-`:53` node may appear in that
+        // zone's NS set. Older binaries never set this, which is what gates the
+        // api delegation until enough of the fleet can actually answer it.
+        dns_api: {
+            let ns_ok = std::env::var("HIVE_DNS_ADDR").ok().map(|a| {
+                let port_is_53 = a.rsplit(':').next() == Some("53");
+                let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+                port_is_53 && (host == "0.0.0.0" || host == "[::]" || host == "::")
+            }).unwrap_or(false);
+            ns_ok && std::env::var("HIVE_PLATFORM_DOMAIN").map(|v| !v.trim().is_empty()).unwrap_or(false)
+        },
         // Boot value; the gossip loop refreshes this every round from the
         // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,

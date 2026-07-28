@@ -147,6 +147,24 @@ pub(crate) fn deploy_zone() -> Option<&'static str> {
     .as_deref()
 }
 
+/// The platform API zone (`api.{platform_domain}`) — served health-aware and
+/// proximity-ordered exactly like the deploy zone, replacing the static
+/// round-robin A set the Vercel reconciler used to publish for `api`. Derived
+/// from `HIVE_PLATFORM_DOMAIN` (no extra env: serving a zone nobody has
+/// delegated yet is harmless, and the delegation side is gated separately on
+/// the gossiped `dns_api` capability).
+pub(crate) fn api_zone() -> Option<&'static str> {
+    static Z: OnceLock<Option<String>> = OnceLock::new();
+    Z.get_or_init(|| {
+        std::env::var("HIVE_PLATFORM_DOMAIN")
+            .ok()
+            .map(|s| s.trim().trim_matches('.').to_lowercase())
+            .filter(|s| !s.is_empty())
+            .map(|d| format!("api.{d}"))
+    })
+    .as_deref()
+}
+
 /// TTL (seconds) for dynamic deploy-zone answers — short, so an unhealthy node drains
 /// from resolver caches quickly when it's dropped from the registry.
 const DEPLOY_TTL: u32 = 60;
@@ -357,10 +375,35 @@ fn lookup(
                 // while the parent publishes one is flagged by validators.
                 // Only answered AT the apex; a subdomain keeps the no-data
                 // behavior below.
-                2 if qname == zone => return (apex_ns_rrs(cloud), true, false),
-                6 if qname == zone => return (apex_soa_rrs(cloud), true, false),
+                2 if qname == zone => return (apex_ns_rrs(cloud, false), true, false),
+                6 if qname == zone => return (apex_soa_rrs(cloud, false), true, false),
                 // FORWARD-COMPAT (phase 2): `_acme-challenge.<zone>` TXT for ACME DNS-01,
                 // and CAA, branch here. Phase 1 is authoritative no-data for them.
+                _ => return (Vec::new(), true, false),
+            }
+        }
+    }
+
+    // ---- Plane A: the platform API zone (`api.{platform}`) ----
+    // Same health-before-proximity answer set as the deploy zone: the API host
+    // was a flat Vercel round-robin over the whole fleet, so a client in
+    // Bangkok was as likely to land on Virginia as on its own region and an
+    // unhealthy node stayed in the answer for the record's full TTL. Serving
+    // it here gives health-damped, ECS/geo-tailored answers with the same
+    // ordering rule; the parent-side NS delegation for `api` is published only
+    // when >=2 `dns_api`-capable nameservers exist (see
+    // `vercel_dns::desired_api_delegation`), so until then this branch simply
+    // answers queries nobody routes here — witnessable, zero live effect.
+    if let Some(zone) = api_zone() {
+        if qname == zone || qname.ends_with(&format!(".{zone}")) {
+            match qtype {
+                1 | 28 => {
+                    let client = cloud.dns_geo.locate(asker.locate_addr());
+                    let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
+                    return (rrs, true, tailored);
+                }
+                2 if qname == zone => return (apex_ns_rrs(cloud, true), true, false),
+                6 if qname == zone => return (apex_soa_rrs(cloud, true), true, false),
                 _ => return (Vec::new(), true, false),
             }
         }
@@ -553,13 +596,19 @@ const NEGATIVE_TTL: u32 = 60;
 /// The nameserver hostnames this zone is served by, derived from the SAME
 /// eligible-node rule the DNS reconciler uses to publish NS at the parent, so
 /// parent and child cannot disagree about the zone's NS RRset.
-fn apex_ns_names(cloud: &Arc<CloudState>) -> Vec<String> {
+///
+/// `require_api`: the API zone's NS set additionally demands the gossiped
+/// `dns_api` capability — an older binary's Seer answers the deploy zone fine
+/// but would NXDOMAIN `api.{platform}`, so it must never be named there. The
+/// reconciler's `desired_api_delegation` applies the identical filter.
+fn apex_ns_names(cloud: &Arc<CloudState>, require_api: bool) -> Vec<String> {
     let apps = cloud.apps_domain.trim().trim_matches('.').to_lowercase();
     let mut names: Vec<String> = cloud
         .registry
         .nodes()
         .into_iter()
         .filter(|n| n.healthy && n.dns_ns.is_some() && (n.public_ip.is_some() || n.public_ip6.is_some()))
+        .filter(|n| !require_api || n.dns_api)
         .map(|n| format!("{}.{}", crate::vercel_dns::ns_label(&n.name), apps))
         .collect();
     names.sort();
@@ -567,16 +616,16 @@ fn apex_ns_names(cloud: &Arc<CloudState>) -> Vec<String> {
     names
 }
 
-fn apex_ns_rrs(cloud: &Arc<CloudState>) -> Vec<(u16, u32, Vec<u8>)> {
-    apex_ns_names(cloud).into_iter().map(|n| (2u16, APEX_TTL, encode_name(&n))).collect()
+fn apex_ns_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec<u8>)> {
+    apex_ns_names(cloud, require_api).into_iter().map(|n| (2u16, APEX_TTL, encode_name(&n))).collect()
 }
 
 /// The zone's SOA. MNAME is the lexically-first nameserver (stable across
 /// nodes, so every server in the zone reports the same primary); SERIAL is
 /// derived from the node roster so it advances when the zone's own NS set
 /// really changes rather than on every restart.
-fn apex_soa_rrs(cloud: &Arc<CloudState>) -> Vec<(u16, u32, Vec<u8>)> {
-    let names = apex_ns_names(cloud);
+fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec<u8>)> {
+    let names = apex_ns_names(cloud, require_api);
     let Some(primary) = names.first() else {
         return Vec::new();
     };
@@ -625,6 +674,7 @@ mod tests {
             guardian_iroh_addr: None,
             relay_url: None,
             dns_ns: None,
+            dns_api: false,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

@@ -183,6 +183,10 @@ pub struct PublishNode {
     /// `NodeInfo::dns_ns`) — i.e. it is eligible to appear in the geo zone's
     /// NS set. See `desired_geo_delegation`.
     pub dns_ns: bool,
+    /// This node's Seer also serves the platform API zone (gossiped
+    /// `NodeInfo::dns_api`) — required, on top of `dns_ns`, to appear in the
+    /// `api` label's NS set. See `desired_api_delegation`.
+    pub dns_api: bool,
     /// The node's region code (`san-jose`, `bangkok`, …) — carried through from
     /// the registry so the per-region names can be derived from the same
     /// health-damped set every other record already comes from.
@@ -273,6 +277,43 @@ pub fn desired_geo_delegation(
         return (Vec::new(), Vec::new());
     }
     (out, managed)
+}
+
+/// NS-only delegation for the `api` label in the PLATFORM zone, handing the
+/// API host to the fleet's own geo/health-aware nameservers instead of the
+/// flat round-robin A set `desired_platform` publishes.
+///
+/// Differences from `desired_geo_delegation`, both deliberate:
+/// * **No glue records.** The NS targets (`ns-<node>.{apps}`) live in the APPS
+///   zone, where the deploy-zone delegation already publishes and maintains
+///   their A/AAAA; emitting `ns-<node>` names into the PLATFORM zone would
+///   create orphan records no resolver ever consults.
+/// * **Eligibility additionally requires the gossiped `dns_api` capability** —
+///   an older binary answers the deploy zone but would NXDOMAIN
+///   `api.{platform}`, so it must never be named here. Seer's own apex NS/SOA
+///   for the api zone applies the identical filter (`apex_ns_names(_, true)`),
+///   keeping parent and child in agreement.
+///
+/// Same `>=2` nameserver floor: below two, returns nothing and the caller
+/// keeps publishing the flat A set — the safe, self-healing fallback both
+/// before the fleet rolls this capability and if the capable set ever shrinks.
+pub fn desired_api_delegation(nodes: &[PublishNode], apps_domain: &str) -> Vec<DesiredRecord> {
+    let apps = apps_domain.trim().trim_matches('.');
+    let mut out: Vec<DesiredRecord> = nodes
+        .iter()
+        .filter(|n| n.dns_ns && n.dns_api && (n.ip4.is_some() || n.ip6.is_some()))
+        .map(|n| DesiredRecord {
+            name: "api".into(),
+            rtype: "NS".into(),
+            value: format!("{}.{apps}", ns_label(&n.name)),
+            ttl: 300,
+        })
+        .collect();
+    if out.len() < 2 {
+        return Vec::new();
+    }
+    out.sort_by(|a, b| a.value.cmp(&b.value));
+    out
 }
 
 /// True for an immutable per-commit alias like `myapp-c7416ec` — a URL minted
@@ -430,7 +471,8 @@ pub fn desired_platform(
     nodes: &[PublishNode],
     relay_ips: &[String],
     discovery_ips: &[String],
-    dashboard: bool, // publish apex + www too (nodes reverse-proxy the dashboard)
+    dashboard: bool,    // publish apex + www too (nodes reverse-proxy the dashboard)
+    delegate_api: bool, // `api` is NS-delegated to Seer this pass → no flat A set for it
 ) -> Vec<DesiredRecord> {
     let mut out = Vec::new();
     // `api` = developer/API-key surface, `admin` = ops/admin console surface,
@@ -439,7 +481,11 @@ pub fn desired_platform(
     // host-switch dispatch), published together.
     // `sms` = the self-hosted SMS-fallback service (a platform-deployed app the
     // edge routes by Host alias) — same gateway-node A/AAAA set as the rest.
-    let mut names: Vec<&str> = vec!["api", "admin", "webhook", "sms"];
+    // When the api label is NS-delegated (see `desired_api_delegation`), its
+    // flat A/AAAA set is withheld: address records at a zone cut are occluded
+    // by the delegation anyway, and publishing both makes the diff fight
+    // itself every pass.
+    let mut names: Vec<&str> = if delegate_api { vec!["admin", "webhook", "sms"] } else { vec!["api", "admin", "webhook", "sms"] };
     if dashboard {
         names.push("");
         names.push("www");
@@ -605,6 +651,8 @@ pub struct NodeView {
     /// Gossiped `NodeInfo::dns_ns` presence — carried through so the geo
     /// delegation's NS set comes from the same health-damped view.
     pub dns_ns: bool,
+    /// Gossiped `NodeInfo::dns_api` — see `PublishNode::dns_api`.
+    pub dns_api: bool,
 }
 
 /// The publishable node set with flap damping: a node stays published while its
@@ -628,6 +676,7 @@ pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Ve
                 ip6: n.ip6.clone(),
                 region: n.region.clone(),
                 dns_ns: n.dns_ns,
+                dns_api: n.dns_api,
             });
         }
     }
@@ -814,6 +863,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 .into_iter()
                 .map(|n| NodeView {
                     dns_ns: n.dns_ns.is_some(),
+                    dns_api: n.dns_api,
                     name: n.name,
                     healthy: n.healthy,
                     ip4: n.public_ip,
@@ -882,7 +932,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
             STATS.affinity_records.store(affinity_count as u64, Ordering::Relaxed);
             let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
-            let mut platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard);
+            // Geo-DNS for the API host: when >=2 `dns_api`-capable nameservers
+            // exist, delegate the `api` label to Seer (health-aware, proximity-
+            // ordered answers) and withhold the flat round-robin A set; below
+            // the floor, the flat set stays — self-healing in both directions
+            // as the fleet rolls or the capable set shrinks.
+            let api_delegation = desired_api_delegation(&publish, &cloud.apps_domain);
+            let delegate_api = !api_delegation.is_empty();
+            let mut platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard, delegate_api);
+            platform.extend(api_delegation);
             let (platform_region, platform_region_names) = desired_region_names(&publish, "api-");
             platform.extend(platform_region);
             STATS.region_records.store(platform_region_names.len() as u64, Ordering::Relaxed);
@@ -1071,6 +1129,7 @@ mod tests {
         let view = |healthy| {
             vec![NodeView {
                 dns_ns: false,
+                dns_api: false,
                 name: "n1".into(),
                 healthy,
                 ip4: Some("1.1.1.1".into()),
@@ -1094,6 +1153,7 @@ mod tests {
         let mut streaks = HashMap::new();
         let nodes = vec![NodeView {
             dns_ns: false,
+            dns_api: false,
             name: "nat-node".into(),
             healthy: true,
             ip4: None,
@@ -1107,6 +1167,7 @@ mod tests {
     fn desired_sets_cover_wildcard_apex_api_relay() {
         let nodes = vec![PublishNode {
             dns_ns: false,
+            dns_api: false,
             name: "n1".into(),
             ip4: Some("1.1.1.1".into()),
             ip6: Some("::1".into()),
@@ -1115,7 +1176,7 @@ mod tests {
         let apps = desired_apps(&nodes);
         assert!(apps.contains(&DesiredRecord { name: "*".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
         assert!(apps.contains(&DesiredRecord { name: "".into(), rtype: "AAAA".into(), value: "::1".into(), ttl: 60 }));
-        let plat = desired_platform(&nodes, &["2.2.2.2".into()], &["3.3.3.3".into()], true);
+        let plat = desired_platform(&nodes, &["2.2.2.2".into()], &["3.3.3.3".into()], true, false);
         assert!(plat.contains(&DesiredRecord { name: "".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }), "apex published when dashboard hosting on");
         assert!(plat.contains(&DesiredRecord { name: "www".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
         assert!(plat.contains(&DesiredRecord { name: "api".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
