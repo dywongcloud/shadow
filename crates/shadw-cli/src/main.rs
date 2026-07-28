@@ -461,14 +461,27 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
             verify.ensure_fresh_token(false).await;
             let who = verify.get("/v1/whoami").await?;
             let authed = who["authenticated"].as_bool().unwrap_or(false);
-            if !authed {
+            // Only an ENFORCING platform can prove credentials are wrong. An
+            // unenforced (dev) node reports `authenticated:false` for anything
+            // it cannot bind, so refusing there would break local development.
+            if !authed && who["enforced"].as_bool().unwrap_or(false) {
                 return Err(anyhow!("saved config, but /v1/whoami reports unauthenticated — check the token/internal token"));
             }
+            // Fall back to the key's own team when the node bound no identity.
+            let tenant = match who["tenant"].as_str().filter(|s| !s.is_empty()) {
+                Some(t) => t.to_string(),
+                None => verify
+                    .get("/v1/apikeys")
+                    .await
+                    .ok()
+                    .and_then(|k| k.as_array().and_then(|a| a.first()).and_then(|k| k["team"].as_str().map(String::from)))
+                    .unwrap_or_else(|| "?".into()),
+            };
             println!(
                 "Logged in to {} as {} (tenant: {}). Config saved to {}.",
                 cfg.api.as_deref().unwrap_or(""),
                 who["sub"].as_str().unwrap_or(cfg.email.as_deref().unwrap_or("?")),
-                who["tenant"].as_str().unwrap_or("?"),
+                tenant,
                 client::config_path().display()
             );
             Ok(())
@@ -493,6 +506,16 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 who["tenant"].as_str().unwrap_or("-"));
             if let Some(admin) = c.token.as_deref().and_then(|t| client::jwt_claim_bool(t, "platform_admin")) {
                 println!("Platform admin: {admin}");
+            }
+            // The key's own team, independent of whether this node bound an
+            // identity — the answer to "which team am I acting as".
+            if let Ok(keys) = c.get("/v1/apikeys").await {
+                if let Some(arr) = keys.as_array() {
+                    if let Some(k) = arr.first() {
+                        println!("Active team: {}", k["team"].as_str().unwrap_or("?"));
+                    }
+                    println!("API keys on this team: {}", arr.len());
+                }
             }
             let auth = c.get("/v1/auth").await?;
             println!("Auth enforced: {}", auth["enforced"].as_bool().unwrap_or(false));

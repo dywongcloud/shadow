@@ -428,15 +428,19 @@ async fn mint_token(
 /// Echo the verified caller identity (tenant/role/sub) so the dashboard can
 /// confirm its session mapping. Reads the JWT claims bound by `require_auth`
 /// (from Bearer or the `hive_jwt` cookie); returns `authenticated:false` in dev.
-async fn whoami(headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>) -> Json<Value> {
-    if let Some(c) = claims.as_ref().map(|e| &e.0) {
-        return Json(json!({ "authenticated": true, "sub": c.sub, "tenant": c.tenant, "role": c.role, "enforced": crate::auth::enforced() }));
+async fn whoami(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Json<Value> {
+    if let Some(cl) = claims.as_ref().map(|e| &e.0) {
+        return Json(json!({ "authenticated": true, "sub": cl.sub, "tenant": cl.tenant, "role": cl.role, "enforced": crate::auth::enforced() }));
     }
-    // Not bound by middleware (e.g. dev pass-through) — try a best-effort verify so
-    // the endpoint is useful when called directly.
+    // Not bound by middleware (e.g. called directly, bypassing the layer) —
+    // best-effort resolve either credential so the endpoint is still honest.
     let tok = crate::auth::extract_token(&headers);
-    match tok.and_then(|t| crate::auth::verify(&t).ok()) {
-        Some(c) => Json(json!({ "authenticated": true, "sub": c.sub, "tenant": c.tenant, "role": c.role, "enforced": crate::auth::enforced() })),
+    match tok.and_then(|t| crate::auth::verify(&t).ok().or_else(|| crate::auth::api_key_claims(&c, &t))) {
+        Some(cl) => Json(json!({ "authenticated": true, "sub": cl.sub, "tenant": cl.tenant, "role": cl.role, "enforced": crate::auth::enforced() })),
         None => Json(json!({ "authenticated": false, "enforced": crate::auth::enforced() })),
     }
 }

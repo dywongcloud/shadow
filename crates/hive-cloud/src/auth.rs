@@ -145,18 +145,24 @@ pub async fn require_auth(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if !enforced() {
-        return next.run(req).await;
-    }
     // Verify the bearer token (if any) up front and bind its claims to the
     // request. This runs for reads too, so read handlers also get the
     // authoritative tenant. A JWT wins; a dashboard API key is an equal
     // second-class citizen (tenant-scoped claims, never platform_admin).
+    //
+    // API-key claims are bound even in DEV (no `HIVE_JWT_SECRET`): key
+    // verification is self-contained (hash lookup), needs no signing secret, and
+    // an identity endpoint must not report a valid key as unauthenticated just
+    // because the platform isn't enforcing JWTs. Only the JWT half depends on
+    // the secret.
     let claims = extract_token(req.headers())
         .and_then(|t| verify(&t).ok().or_else(|| api_key_claims(&state, &t)));
     let authed = claims.is_some();
     if let Some(c) = claims {
         req.extensions_mut().insert(c);
+    }
+    if !enforced() {
+        return next.run(req).await;
     }
     let method = req.method().clone();
     let is_mutation = matches!(method.as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
