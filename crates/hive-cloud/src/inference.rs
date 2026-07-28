@@ -77,8 +77,15 @@ fn gpu_roster(cloud: &Arc<CloudState>) -> Vec<hive_edge::NodeInfo> {
 
 /// Deterministic coordinator election: same inputs (gossiped registry) →
 /// same answer on every node. Region choice: the region with the largest
-/// total pool VRAM (stable, capacity-anchored); coordinator: project-hash
-/// over that region's sorted members.
+/// total pool VRAM (stable, capacity-anchored). Within the region,
+/// RENDEZVOUS (highest-random-weight) hashing, not modulo: a node dropping
+/// out of the roster moves ONLY the endpoints that hashed onto that node,
+/// and — critically — when the roster recovers (a health flap, a rolling
+/// restart) every endpoint's winner is the SAME node as before, so routine
+/// fleet rolls stop reassigning (and therefore killing) mid-load inference
+/// servers. Live-witnessed with modulo: a rolling GPU-group restart shifted
+/// every project's slot and the reconcile killed a 25-minutes-into-load 14B
+/// endpoint mid tensor-upload.
 pub fn coordinator_for(cloud: &Arc<CloudState>, project: &str) -> Option<hive_edge::NodeInfo> {
     let roster = gpu_roster(cloud);
     if roster.is_empty() {
@@ -94,8 +101,7 @@ pub fn coordinator_for(cloud: &Arc<CloudState>, project: &str) -> Option<hive_ed
         .into_iter()
         .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.0.cmp(&a.0)))
         .map(|(k, v)| (k.clone(), v))?;
-    let idx = (fnv(project) % members.len() as u64) as usize;
-    members.into_iter().nth(idx)
+    members.into_iter().max_by_key(|n| fnv(&format!("{project}|{}", n.name)))
 }
 
 /// Resolve a model ref to a fetchable URL: pass-through for http(s), else
@@ -126,6 +132,15 @@ pub struct EndpointStatus {
     /// "starting" | "running" | "failed: <reason>"
     pub status: String,
     pub updated_ms: u64,
+    /// 0 while this node is the elected coordinator; else the moment the
+    /// election first pointed elsewhere — drives the reassignment grace
+    /// window (see the teardown split in `spawn_reconcile`).
+    #[serde(skip_serializing_if = "u64_is_zero", default)]
+    pub unassigned_since_ms: u64,
+}
+
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 #[derive(Default)]
@@ -299,6 +314,7 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
                 pool: spec.pool,
                 rpc_members: Vec::new(),
                 status: "starting".into(),
+                unassigned_since_ms: 0,
                 updated_ms: hive_core::now_ms(),
             })
         });
@@ -415,16 +431,47 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                 }
             }
             {
-                // Kill servers no longer desired here (spec removed or
-                // coordinator moved elsewhere on roster change).
-                let keep: std::collections::HashSet<&String> = mine.iter().map(|(p, _)| p).collect();
+                // Teardown split, deliberately asymmetric:
+                //  * spec REMOVED (project gone from `desired`) → kill now —
+                //    a deleted project's endpoint must not linger;
+                //  * assignment MOVED (still desired, elected elsewhere) →
+                //    grace window before killing. Rendezvous hashing already
+                //    makes reassignment rare, but a coordinator that dropped
+                //    out of the roster long enough to lose its endpoints
+                //    shouldn't slaughter a mid-load server the moment it
+                //    rejoins and briefly computes a partial roster.
+                let assigned: std::collections::HashSet<&String> =
+                    mine.iter().map(|(p, _)| p).collect();
+                let specd: std::collections::HashSet<&String> =
+                    desired.iter().map(|(p, _)| p).collect();
+                let grace_ms = std::env::var("HIVE_INFERENCE_REASSIGN_GRACE_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(600)
+                    * 1000;
+                let now = hive_core::now_ms();
                 let mut servers = cloud.inference.servers.lock();
-                let stale: Vec<String> =
-                    servers.keys().filter(|k| !keep.contains(k)).cloned().collect();
-                for p in stale {
+                let mut kill: Vec<String> = Vec::new();
+                for (p, (_, st)) in servers.iter_mut() {
+                    if assigned.contains(p) {
+                        st.unassigned_since_ms = 0;
+                        continue;
+                    }
+                    if !specd.contains(p) {
+                        kill.push(p.clone());
+                        continue;
+                    }
+                    if st.unassigned_since_ms == 0 {
+                        st.unassigned_since_ms = now;
+                        tracing::info!(project = %p, "inference: assignment moved elsewhere — holding through grace window");
+                    } else if now.saturating_sub(st.unassigned_since_ms) > grace_ms {
+                        kill.push(p.clone());
+                    }
+                }
+                for p in kill {
                     if let Some((Some(mut child), _)) = servers.remove(&p) {
                         let _ = child.start_kill();
-                        tracing::info!(project = %p, "inference: stopped endpoint (no longer assigned here)");
+                        tracing::info!(project = %p, "inference: stopped endpoint (no longer desired/assigned here)");
                     }
                 }
             }
