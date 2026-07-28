@@ -22,11 +22,20 @@
       - "--exclude=target"
       - "--exclude=.git"
 
+# vendor/ needs the SAME excludes as crates/ above. Without them this ships
+# vendor/guardian-db/target — 2.9GB of local build artifacts (gitignored, so
+# invisible in the repo) plus a 155MB tmp/ — to every node on every deploy,
+# against 4.3MB of actual source. Measured live: a five-node roll spent over an
+# hour transferring that to bandwidth-limited hosts before any build started.
 - name: Sync vendor/ (patched crates, e.g. guardian-db)
   ansible.posix.synchronize:
     src: "{{ playbook_dir }}/../../vendor/"
     dest: "{{ hive_src_dir }}/vendor/"
     delete: true
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=tmp"
+      - "--exclude=.git"
 
 - name: Copy Cargo.toml + Cargo.lock (workspace manifest, exact-pinned)
   ansible.builtin.copy:
