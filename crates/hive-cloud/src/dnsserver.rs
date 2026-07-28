@@ -3,7 +3,7 @@
 //!   * **Static** records from the dashboard-managed `dns::DomainStore` (A, AAAA,
 //!     CNAME, TXT) — apex, `www`, custom domains, CAA/TXT.
 //!   * **Dynamic, health-aware** A/AAAA for the deploy wildcard zone `HIVE_DEPLOY_ZONE`
-//!     (e.g. `*.deploy.shadow.app`): returns the **public IPs of healthy nodes** so a
+//!     (e.g. `*.deploy.shadw.app`): returns the **public IPs of healthy nodes** so a
 //!     browser connects straight to a reachable node — the piece that replaces ngrok as
 //!     ingress. NAT'd / unhealthy nodes are excluded (a client must only get a node it
 //!     can actually reach over HTTPS). It's a **local read** of the gossiped registry —
@@ -25,7 +25,7 @@ use crate::state::CloudState;
 use hive_edge::NodeInfo;
 
 /// The deploy wildcard zone whose A/AAAA are answered dynamically (healthy node IPs).
-/// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadow.app` → `deploy.shadow.app` + `*.deploy.shadow.app`.
+/// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadw.app` → `deploy.shadw.app` + `*.deploy.shadw.app`.
 /// Cached: a per-query env read would be a syscall on the hot path. Lowercased, dot-trimmed.
 fn deploy_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
