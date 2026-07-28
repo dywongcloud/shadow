@@ -259,9 +259,14 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   existing test suite (`cargo test --workspace`) plus real, live execution
   (curl against a running node, SSH to a fleet node) — never a mock standing
   in for a real service.
-- Fleet has two glibc groups needing separate native builds (bkk/hk vs
-  va/va2/va3/sj); always sha256-verify + `.old`-backup a binary before
-  swapping. Detail: `recall("fleet-glibc-groups")`.
+- Fleet has two glibc groups needing separate native builds — **2.38**: bkk,
+  hk, AND all five GPU/CVM nodes (fc-gpu-sj-1/2/3, fc-cvm-sj-1/2 — TencentOS);
+  **2.39**: va/va2/va3/sj/sj2. The GPU nodes LOOK like the San Jose 2.39 group
+  by region and were once rolled a 2.39 binary on that assumption — instant
+  fleet-wide crash-loop on that node (`GLIBC_2.39 not found`, restart counter
+  120+) until the `.old` binary was restored. Membership is by OS image, not
+  region. Always sha256-verify + `.old`-backup a binary before swapping.
+  Detail: `recall("fleet-glibc-groups")`.
 - The dashboard's `/ops/*` proxy forwards every admin request to the CURRENT
   control-plane leader, not the node running the dashboard process — verify
   new admin endpoints through the real dashboard. Detail:
