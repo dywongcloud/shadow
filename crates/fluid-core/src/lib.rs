@@ -1645,6 +1645,16 @@ pub enum FailureClass {
     NoHealthyRegion,
     /// The runtime tunnel to the chosen instance failed. 502.
     RuntimeTunnelFailed,
+    /// The tunnel CONNECTED and the function never produced a response head,
+    /// on every instance we rerouted to. 504.
+    ///
+    /// Deliberately distinct from [`FailureClass::RuntimeTunnelFailed`]: both
+    /// used to report `RUNTIME_TUNNEL_FAILED`, and because that name blames the
+    /// transport, several debugging sessions were spent on vsock/tunnel plumbing
+    /// while the real fault was an app that accepted the connection and then hung.
+    /// Also distinct from `FUNCTION_INVOCATION_TIMEOUT`, which means one
+    /// invocation outran its own `max_duration` on an otherwise healthy instance.
+    FunctionNoResponse,
     /// The chosen peer was unreachable over both iroh and HTTP. 502.
     PeerUnreachable,
     /// First attempt failed and the request was not safe to retry (#6/#7/#8). 502.
@@ -1669,7 +1679,7 @@ impl FailureClass {
             FailureClass::RuntimeTunnelFailed
             | FailureClass::PeerUnreachable
             | FailureClass::NotRetryable => 502,
-            FailureClass::DeadlineExceeded => 504,
+            FailureClass::DeadlineExceeded | FailureClass::FunctionNoResponse => 504,
             FailureClass::DeploymentNotFound | FailureClass::HostRejected => 404,
         }
     }
@@ -1682,6 +1692,7 @@ impl FailureClass {
             FailureClass::NoHealthyPeer => "NO_HEALTHY_PEER",
             FailureClass::NoHealthyRegion => "NO_HEALTHY_REGION",
             FailureClass::RuntimeTunnelFailed => "RUNTIME_TUNNEL_FAILED",
+            FailureClass::FunctionNoResponse => "FUNCTION_NO_RESPONSE",
             FailureClass::PeerUnreachable => "PEER_UNREACHABLE",
             FailureClass::NotRetryable => "NOT_RETRYABLE",
             FailureClass::DeadlineExceeded => "DEADLINE_EXCEEDED",

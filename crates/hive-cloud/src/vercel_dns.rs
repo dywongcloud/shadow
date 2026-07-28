@@ -179,6 +179,10 @@ pub struct PublishNode {
     pub name: String,
     pub ip4: Option<String>,
     pub ip6: Option<String>,
+    /// The node's region code (`san-jose`, `bangkok`, …) — carried through from
+    /// the registry so the per-region names can be derived from the same
+    /// health-damped set every other record already comes from.
+    pub region: String,
 }
 
 /// Desired records for the APPS zone (`*.{apps}` + apex), TTL 60.
@@ -299,6 +303,52 @@ pub fn desired_apps_affinity(
     (out, managed)
 }
 
+/// Deterministic per-region names, from the same health-damped publishable set
+/// every other record is built from: `<prefix><region>` → every publishable node
+/// in that region.
+///
+/// Why this exists: today the ONLY way to reach a specific region is to already
+/// know a node's raw IP. `api.<platform>` and `*.<apps>` are both flat
+/// round-robin over the whole fleet, so nothing in the system can NAME a region
+/// — not a client wanting to pin one, not a redirect wanting to hand off to a
+/// closer one, and not a future anycast cutover wanting a per-region origin.
+/// `api-san-jose.<platform>` / `san-jose.<apps>` give that a stable answer
+/// without needing geo DNS or EDNS support anywhere.
+///
+/// Returns `(records, names)` — the names must be added to the zone's MANAGED
+/// list or the reconciler can never diff, update or withdraw them again (the
+/// bug that left `sms` pointing at a foreign IP forever).
+///
+/// Region codes come from the registry, so they are already DNS-label-shaped
+/// (`san-jose`, `hong-kong`); anything that isn't is skipped rather than
+/// published as an invalid name. An empty region (a node that never reported
+/// one) is skipped for the same reason.
+pub fn desired_region_names(nodes: &[PublishNode], prefix: &str) -> (Vec<DesiredRecord>, Vec<String>) {
+    let mut by_region: std::collections::BTreeMap<String, Vec<&PublishNode>> = Default::default();
+    for n in nodes {
+        let r = n.region.trim().to_ascii_lowercase();
+        if r.is_empty() || !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || r.starts_with('-') || r.ends_with('-') {
+            continue;
+        }
+        by_region.entry(r).or_default().push(n);
+    }
+    let mut out = Vec::new();
+    let mut names = Vec::new();
+    for (region, ns) in by_region {
+        let name = format!("{prefix}{region}");
+        names.push(name.clone());
+        for n in ns {
+            if let Some(ip) = &n.ip4 {
+                out.push(DesiredRecord { name: name.clone(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+            }
+            if let Some(ip) = &n.ip6 {
+                out.push(DesiredRecord { name: name.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+            }
+        }
+    }
+    (out, names)
+}
+
 /// Desired records for the PLATFORM zone: `api.` (TTL 60, all publishable
 /// nodes) + `relay.`/`discovery.` (TTL 300, from env IP lists — those services
 /// run on operator-chosen nodes, not every gateway).
@@ -412,6 +462,9 @@ pub struct ReconcilerStats {
     /// many host labels currently resolve straight to their owning node instead
     /// of falling through to the all-nodes wildcard.
     pub affinity_records: AtomicU64,
+    /// How many deterministic per-region names the last pass published (one per
+    /// region with at least one publishable node).
+    pub region_records: AtomicU64,
     pub last_pass_ms: AtomicU64,
 }
 
@@ -423,6 +476,7 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     empty_set_blocks: AtomicU64::new(0),
     per_name_holds: AtomicU64::new(0),
     affinity_records: AtomicU64::new(0),
+    region_records: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
 };
 
@@ -446,29 +500,45 @@ fn env_ips(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The registry facts one reconcile pass needs about a node. Named rather than a
+/// positional tuple: this started as `(String, bool, Option<String>,
+/// Option<String>)` and adding `region` for the per-region names made a 5-wide
+/// positional soup where two adjacent fields have the SAME type — exactly the
+/// shape where a call site silently swaps them.
+#[derive(Clone, Debug)]
+pub struct NodeView {
+    pub name: String,
+    pub healthy: bool,
+    pub ip4: Option<String>,
+    pub ip6: Option<String>,
+    pub region: String,
+}
+
 /// The publishable node set with flap damping: a node stays published while its
 /// consecutive-unhealthy streak is below the threshold. Pure; unit-tested.
-pub fn publishable(
-    nodes: &[(String, bool, Option<String>, Option<String>)], // (name, healthy, ip4, ip6)
-    streaks: &mut HashMap<String, u32>,
-) -> Vec<PublishNode> {
+pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Vec<PublishNode> {
     let mut out = Vec::new();
-    for (name, healthy, ip4, ip6) in nodes {
-        if ip4.is_none() && ip6.is_none() {
+    for n in nodes {
+        if n.ip4.is_none() && n.ip6.is_none() {
             continue; // never publishable without a public IP
         }
-        let streak = streaks.entry(name.clone()).or_insert(0);
-        if *healthy {
+        let streak = streaks.entry(n.name.clone()).or_insert(0);
+        if n.healthy {
             *streak = 0;
         } else {
             *streak = streak.saturating_add(1);
         }
-        if *healthy || *streak < UNHEALTHY_PASSES_BEFORE_WITHDRAW {
-            out.push(PublishNode { name: name.clone(), ip4: ip4.clone(), ip6: ip6.clone() });
+        if n.healthy || *streak < UNHEALTHY_PASSES_BEFORE_WITHDRAW {
+            out.push(PublishNode {
+                name: n.name.clone(),
+                ip4: n.ip4.clone(),
+                ip6: n.ip6.clone(),
+                region: n.region.clone(),
+            });
         }
     }
     // Drop streak entries for nodes that vanished from the registry entirely.
-    let known: std::collections::HashSet<&String> = nodes.iter().map(|(n, ..)| n).collect();
+    let known: std::collections::HashSet<&String> = nodes.iter().map(|n| &n.name).collect();
     streaks.retain(|k, _| known.contains(k));
     out
 }
@@ -644,11 +714,17 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
                 continue;
             }
-            let nodes: Vec<(String, bool, Option<String>, Option<String>)> = cloud
+            let nodes: Vec<NodeView> = cloud
                 .registry
                 .nodes()
                 .into_iter()
-                .map(|n| (n.name, n.healthy, n.public_ip, n.public_ip6))
+                .map(|n| NodeView {
+                    name: n.name,
+                    healthy: n.healthy,
+                    ip4: n.public_ip,
+                    ip6: n.public_ip6,
+                    region: n.region,
+                })
                 .collect();
             let publish = publishable(&nodes, &mut streaks);
             let relay_ips = env_ips("HIVE_RELAY_IPS");
@@ -675,12 +751,34 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let (affinity, affinity_names) = desired_apps_affinity(&owners, &publish, APPS_AFFINITY_CAP);
             let affinity_count = affinity_names.len();
             apps.extend(affinity);
+            // Per-region names in BOTH zones: `<region>.<apps>` for app traffic
+            // and `api-<region>.<platform>` for the API/control surface.
+            //
+            // COLLISION: a project literally named `san-jose` owns that same
+            // single label in the apps zone. A real deployment is user-visible
+            // and predates this feature, so the affinity record wins and the
+            // region name is dropped for that one region — publishing both would
+            // put two different A sets under one name and break the deployment.
+            let (apps_region, apps_region_names) = desired_region_names(&publish, "");
+            let claimed: std::collections::HashSet<&str> = affinity_names.iter().map(|s| s.as_str()).collect();
+            let dropped: Vec<&String> = apps_region_names.iter().filter(|n| claimed.contains(n.as_str())).collect();
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    names = ?dropped,
+                    "per-region apps name(s) collide with a deployment label — deployment wins, region name not published"
+                );
+            }
+            apps.extend(apps_region.into_iter().filter(|r| !claimed.contains(r.name.as_str())));
             let mut apps_managed: Vec<String> = vec!["*".into(), String::new()];
+            apps_managed.extend(apps_region_names.into_iter().filter(|n| !claimed.contains(n.as_str())));
             apps_managed.extend(affinity_names);
             let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
             STATS.affinity_records.store(affinity_count as u64, Ordering::Relaxed);
             let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
-            let platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard);
+            let mut platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard);
+            let (platform_region, platform_region_names) = desired_region_names(&publish, "api-");
+            platform.extend(platform_region);
+            STATS.region_records.store(platform_region_names.len() as u64, Ordering::Relaxed);
 
             let mut ok = true;
             if let Err(e) = reconcile_zone(&api, &cloud.apps_domain, &apps, &apps_managed_refs, &cloud).await {
@@ -698,9 +796,20 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // stale and replaced, since `diff()` never considers a name outside
             // this list at all. Recurring gap; closed here for `sms` alongside
             // the prior two.
-            let platform_managed: &[&str] =
-                if dashboard { &["api", "admin", "webhook", "sms", "relay", "discovery", "", "www"] } else { &["api", "admin", "webhook", "sms", "relay", "discovery"] };
-            if let Err(e) = reconcile_zone(&api, &cloud.platform_domain, &platform, platform_managed, &cloud).await {
+            let mut platform_managed: Vec<String> = ["api", "admin", "webhook", "sms", "relay", "discovery"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if dashboard {
+                platform_managed.push(String::new());
+                platform_managed.push("www".into());
+            }
+            // `api-<region>` must be managed for the same reason as `sms` above:
+            // an unmanaged name is invisible to diff() forever, so a withdrawn
+            // region's records would never be cleaned up.
+            platform_managed.extend(platform_region_names);
+            let platform_managed_refs: Vec<&str> = platform_managed.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = reconcile_zone(&api, &cloud.platform_domain, &platform, &platform_managed_refs, &cloud).await {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");
                 ok = false;
@@ -852,8 +961,16 @@ mod tests {
     #[test]
     fn damping_withdraws_only_after_k_passes() {
         let mut streaks = HashMap::new();
-        let up = vec![("n1".to_string(), true, Some("1.1.1.1".to_string()), None)];
-        let down = vec![("n1".to_string(), false, Some("1.1.1.1".to_string()), None)];
+        let view = |healthy| {
+            vec![NodeView {
+                name: "n1".into(),
+                healthy,
+                ip4: Some("1.1.1.1".into()),
+                ip6: None,
+                region: "san-jose".into(),
+            }]
+        };
+        let (up, down) = (view(true), view(false));
         assert_eq!(publishable(&up, &mut streaks).len(), 1);
         // 1st unhealthy pass: still published (damping)
         assert_eq!(publishable(&down, &mut streaks).len(), 1);
@@ -867,13 +984,24 @@ mod tests {
     #[test]
     fn no_public_ip_never_published() {
         let mut streaks = HashMap::new();
-        let nodes = vec![("nat-node".to_string(), true, None, None)];
+        let nodes = vec![NodeView {
+            name: "nat-node".into(),
+            healthy: true,
+            ip4: None,
+            ip6: None,
+            region: "bangkok".into(),
+        }];
         assert!(publishable(&nodes, &mut streaks).is_empty());
     }
 
     #[test]
     fn desired_sets_cover_wildcard_apex_api_relay() {
-        let nodes = vec![PublishNode { name: "n1".into(), ip4: Some("1.1.1.1".into()), ip6: Some("::1".into()) }];
+        let nodes = vec![PublishNode {
+            name: "n1".into(),
+            ip4: Some("1.1.1.1".into()),
+            ip6: Some("::1".into()),
+            region: "san-jose".into(),
+        }];
         let apps = desired_apps(&nodes);
         assert!(apps.contains(&DesiredRecord { name: "*".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
         assert!(apps.contains(&DesiredRecord { name: "".into(), rtype: "AAAA".into(), value: "::1".into(), ttl: 60 }));

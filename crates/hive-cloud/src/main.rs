@@ -17,6 +17,7 @@ mod db_gateway;
 mod db_replicate;
 mod db_rest;
 mod dns;
+mod dns_geo;
 mod dnsserver;
 mod docstore;
 mod edge;

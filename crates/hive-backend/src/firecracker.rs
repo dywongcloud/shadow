@@ -294,16 +294,48 @@ impl FirecrackerBackend {
         // Internet egress return-traffic is unaffected (src is external, so the
         // 172.16→172.16 pair never matches), and host↔guest control-plane traffic
         // uses OUTPUT/INPUT, not FORWARD.
+        // HAIRPIN: a guest that POSTs to its OWN deployment's public hostname
+        // resolves the node's PUBLIC ip, but that address lives on the cloud
+        // provider's 1:1 NAT and not on any host interface — so the packet is
+        // MASQUERADEd out the default route and dropped by the provider, which
+        // surfaced as `RUNTIME_TUNNEL_FAILED` on a callback the app made to
+        // itself. hive-cloud already listens on 0.0.0.0:{80,443}, so redirecting
+        // those flows back into the host is all that's needed. Scoped to THIS
+        // node's own public ip: traffic to any other node still egresses
+        // normally, and because REDIRECT lands the packet on the host's INPUT
+        // path the cell↔cell FORWARD DROP above is untouched (a guest still
+        // cannot reach another guest this way — it reaches the same public
+        // host-routing hive-cloud serves everyone).
+        let hairpin = match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+            // `auto` is a real configured value meaning "detect at runtime", not
+            // an address — and an unset/unparseable value means this host has no
+            // inbound-reachable address to hairpin to at all.
+            Some(ip) if ip.parse::<std::net::Ipv4Addr>().is_ok() => ip,
+            _ => String::new(),
+        };
+        // `HAIRPIN_IP` arrives as an ENV VAR rather than interpolated into the
+        // script: the nft branch is full of `{ ... }` chain bodies, so a
+        // `format!` here would need every brace escaped, and an env var also
+        // leaves no shell-injection surface for a configured value.
         let script = r#"
             export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH
             sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
             if command -v iptables >/dev/null 2>&1; then
+              if [ -n "$HAIRPIN_IP" ]; then
+                iptables -t nat -C PREROUTING -s 172.16.0.0/16 -d "$HAIRPIN_IP" -p tcp -m multiport --dports 80,443 -j REDIRECT 2>/dev/null \
+                  || iptables -t nat -I PREROUTING 1 -s 172.16.0.0/16 -d "$HAIRPIN_IP" -p tcp -m multiport --dports 80,443 -j REDIRECT
+              fi
               iptables -C FORWARD -s 172.16.0.0/16 -d 172.16.0.0/16 -j DROP 2>/dev/null || iptables -I FORWARD 1 -s 172.16.0.0/16 -d 172.16.0.0/16 -j DROP
               iptables -t nat -C POSTROUTING -s 172.16.0.0/16 -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 172.16.0.0/16 -j MASQUERADE
               iptables -C FORWARD -s 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -s 172.16.0.0/16 -j ACCEPT
               iptables -C FORWARD -d 172.16.0.0/16 -j ACCEPT 2>/dev/null || iptables -A FORWARD -d 172.16.0.0/16 -j ACCEPT
             elif command -v nft >/dev/null 2>&1; then
               nft add table ip hive_nat 2>/dev/null
+              if [ -n "$HAIRPIN_IP" ]; then
+                nft 'add chain ip hive_nat pre { type nat hook prerouting priority -100 ; }' 2>/dev/null
+                nft flush chain ip hive_nat pre 2>/dev/null
+                nft add rule ip hive_nat pre ip saddr 172.16.0.0/16 ip daddr "$HAIRPIN_IP" tcp dport '{80, 443}' redirect 2>/dev/null
+              fi
               nft 'add chain ip hive_nat post { type nat hook postrouting priority 100 ; }' 2>/dev/null
               nft flush chain ip hive_nat post 2>/dev/null
               nft add rule ip hive_nat post ip saddr 172.16.0.0/16 masquerade 2>/dev/null
@@ -313,7 +345,12 @@ impl FirecrackerBackend {
               nft add rule ip hive_nat fwd ip saddr 172.16.0.0/16 accept 2>/dev/null
               nft add rule ip hive_nat fwd ip daddr 172.16.0.0/16 accept 2>/dev/null
             fi"#;
-        let _ = Command::new("/bin/sh").arg("-c").arg(script).output().await;
+        let _ = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("HAIRPIN_IP", &hairpin)
+            .output()
+            .await;
     }
 
     /// Allocate a /30 egress subnet + host TAP for a cell. Returns the kernel

@@ -60,7 +60,7 @@ pub async fn serve(cloud: Arc<CloudState>, addr: SocketAddr) -> std::io::Result<
             Ok(x) => x,
             Err(_) => continue,
         };
-        if let Some(resp) = handle_query(&cloud, &buf[..n]) {
+        if let Some(resp) = handle_query(&cloud, &buf[..n], peer.ip()) {
             let _ = sock.send_to(&resp, peer).await;
         }
     }
@@ -70,7 +70,7 @@ pub async fn serve(cloud: Arc<CloudState>, addr: SocketAddr) -> std::io::Result<
 async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
-        let Ok((mut stream, _)) = listener.accept().await else { continue };
+        let Ok((mut stream, peer)) = listener.accept().await else { continue };
         let cloud = cloud.clone();
         tokio::spawn(async move {
             // One query per accept is sufficient for our resolvers; keep it simple.
@@ -86,7 +86,7 @@ async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
             if stream.read_exact(&mut msg).await.is_err() {
                 return;
             }
-            if let Some(resp) = handle_query(&cloud, &msg) {
+            if let Some(resp) = handle_query(&cloud, &msg, peer.ip()) {
                 let mut framed = (resp.len() as u16).to_be_bytes().to_vec();
                 framed.extend_from_slice(&resp);
                 let _ = stream.write_all(&framed).await;
@@ -96,7 +96,7 @@ async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
 }
 
 /// Parse a DNS query and build a response from the platform's records.
-fn handle_query(cloud: &Arc<CloudState>, q: &[u8]) -> Option<Vec<u8>> {
+fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Option<Vec<u8>> {
     if q.len() < 12 {
         return None;
     }
@@ -106,6 +106,11 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8]) -> Option<Vec<u8>> {
     if qdcount < 1 {
         return None;
     }
+    let counts = (
+        u16::from_be_bytes([q[6], q[7]]),   // ANCOUNT
+        u16::from_be_bytes([q[8], q[9]]),   // NSCOUNT
+        u16::from_be_bytes([q[10], q[11]]), // ARCOUNT
+    );
 
     // ---- parse the (first) question ----
     let mut off = 12usize;
@@ -137,10 +142,27 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8]) -> Option<Vec<u8>> {
     let q_end = off + 4; // include qtype(2)+qclass(2)
     let question = &q[12..q_end];
 
+    // ---- who is asking (EDNS Client Subnet, else the query source) ----
+    // A malformed OPT yields `None` and a generic answer; it never rejects the
+    // query, since an unfamiliar resolver must not become an outage.
+    let asker = crate::dns_geo::Asker {
+        source: src,
+        subnet: crate::dns_geo::parse_client_subnet(q, q_end, counts),
+    };
+    let client_had_ecs = asker.subnet.is_some();
+
     // ---- look up matching records ----
-    let (answers, found_domain) = lookup(cloud, &qname, qtype);
+    let (answers, found_domain, proximity) = lookup(cloud, &qname, qtype, &asker);
 
     // ---- build response ----
+    // The OPT RR is echoed only when the client sent one (RFC 6891: never add
+    // EDNS to a response the requester didn't opt into). SCOPE PREFIX-LENGTH is
+    // the asker's prefix when the answer really is client-specific, else 0 so a
+    // resolver may share the generic answer with everyone behind it.
+    let opt_rr = client_had_ecs
+        .then(|| crate::dns_geo::encode_opt_rr(asker.subnet, if proximity { asker.scope_prefix() } else { 0 }));
+    let arcount: u16 = opt_rr.is_some() as u16;
+
     let mut resp = Vec::with_capacity(64);
     resp.extend_from_slice(&id);
     // flags: QR=1, AA=1, RD echoed, RA=0; rcode 0 (NOERROR) or 3 (NXDOMAIN)
@@ -150,7 +172,7 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8]) -> Option<Vec<u8>> {
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     resp.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
     resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
-    resp.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+    resp.extend_from_slice(&arcount.to_be_bytes()); // ARCOUNT (the OPT RR, if any)
     resp.extend_from_slice(question);
     for (atype, ttl, rdata) in &answers {
         resp.extend_from_slice(&[0xC0, 0x0C]); // NAME → pointer to question (offset 12)
@@ -160,11 +182,23 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8]) -> Option<Vec<u8>> {
         resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
         resp.extend_from_slice(rdata);
     }
+    // ADDITIONAL section last, so the OPT RR follows the answers.
+    if let Some(rr) = opt_rr {
+        resp.extend_from_slice(&rr);
+    }
     Some(resp)
 }
 
-/// Returns (answer RRs, whether the zone/domain is authoritative here).
-fn lookup(cloud: &Arc<CloudState>, qname: &str, qtype: u16) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
+/// Returns (answer RRs, whether the zone/domain is authoritative here, whether
+/// the answer was tailored to THIS client's location). The third value decides
+/// the ECS scope the caller echoes: a tailored answer must not be cached for
+/// clients it wasn't computed for.
+fn lookup(
+    cloud: &Arc<CloudState>,
+    qname: &str,
+    qtype: u16,
+    asker: &crate::dns_geo::Asker,
+) -> (Vec<(u16, u32, Vec<u8>)>, bool, bool) {
     // ---- Plane A: dynamic, health-aware deploy zone (the Seer load balancer) ----
     // For any name in HIVE_DEPLOY_ZONE (apex or wildcard subdomain), A/AAAA resolve to
     // the public IPs of healthy nodes — bypassing static records entirely. We're
@@ -173,10 +207,17 @@ fn lookup(cloud: &Arc<CloudState>, qname: &str, qtype: u16) -> (Vec<(u16, u32, V
     if let Some(zone) = deploy_zone() {
         if qname == zone || qname.ends_with(&format!(".{zone}")) {
             match qtype {
-                1 | 28 => return (lb_records(&cloud.registry.nodes(), qtype), true),
+                1 | 28 => {
+                    // Resolve the asker's location HERE (never blocking: an
+                    // unknown subnet is queued for background lookup and
+                    // reported unknown for now), then let `lb_records` stay pure.
+                    let client = cloud.dns_geo.locate(asker.locate_addr());
+                    let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
+                    return (rrs, true, tailored);
+                }
                 // FORWARD-COMPAT (phase 2): `_acme-challenge.<zone>` TXT for ACME DNS-01,
                 // and CAA, branch here. Phase 1 is authoritative no-data for them.
-                _ => return (Vec::new(), true),
+                _ => return (Vec::new(), true, false),
             }
         }
     }
@@ -188,7 +229,7 @@ fn lookup(cloud: &Arc<CloudState>, qname: &str, qtype: u16) -> (Vec<(u16, u32, V
         .filter(|d| qname == d.domain || qname.ends_with(&format!(".{}", d.domain)))
         .max_by_key(|d| d.domain.len())
     else {
-        return (Vec::new(), false);
+        return (Vec::new(), false, false);
     };
 
     // The record name within the zone ("" = apex).
@@ -229,7 +270,8 @@ fn lookup(cloud: &Arc<CloudState>, qname: &str, qtype: u16) -> (Vec<(u16, u32, V
             out.push((atype, r.ttl, rd));
         }
     }
-    (out, true)
+    // Static records are the operator's own answer, identical for every client.
+    (out, true, false)
 }
 
 /// Build the dynamic A (qtype 1) or AAAA (qtype 28) answer set for the deploy zone:
@@ -238,9 +280,20 @@ fn lookup(cloud: &Arc<CloudState>, qname: &str, qtype: u16) -> (Vec<(u16, u32, V
 /// must only ever receive a node it can actually reach over HTTPS. Ordered lowest-latency
 /// first (self = 0) for a sensible default; resolvers round-robin the set. Capped so the
 /// answer comfortably fits a 512-byte UDP datagram.
-fn lb_records(nodes: &[NodeInfo], qtype: u16) -> Vec<(u16, u32, Vec<u8>)> {
+/// `client` is the asker's location when already known — resolved by the CALLER
+/// so this stays a pure function of (registry, qtype, client location) and can be
+/// exercised directly without a `CloudState`.
+fn lb_records(nodes: &[NodeInfo], qtype: u16, client: Option<(f64, f64)>) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
     let mut healthy: Vec<&NodeInfo> = nodes.iter().filter(|n| n.healthy).collect();
+    // Health-ordered by the SERVING node's own latency is the fallback, not the
+    // goal: that number describes us, not the client. It only decides the order
+    // when the client's location is unknown.
     healthy.sort_by_key(|n| n.latency_ms);
+    let mut tailored = false;
+    if let Some(near) = crate::dns_geo::nearest_first(&healthy, client) {
+        healthy = near;
+        tailored = true;
+    }
     let mut out = Vec::new();
     for n in healthy {
         match qtype {
@@ -262,7 +315,10 @@ fn lb_records(nodes: &[NodeInfo], qtype: u16) -> Vec<(u16, u32, Vec<u8>)> {
         }
     }
     out.truncate(8);
-    out
+    // `tailored` only holds if proximity actually shaped the answer AND survived
+    // the address-family filter above — an empty set is not client-specific.
+    let tailored = tailored && !out.is_empty();
+    (out, tailored)
 }
 
 fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
@@ -339,7 +395,8 @@ mod tests {
             ni("healthy-natd", true, None, None, 1), // NAT'd: no public IP → excluded
             ni("unhealthy-public", false, Some("203.0.113.99"), None, 0), // down → excluded
         ];
-        let a = lb_records(&nodes, 1);
+        let (a, tailored) = lb_records(&nodes, 1, None);
+        assert!(!tailored, "no client location → generic answer");
         assert_eq!(a.len(), 1, "only the healthy+public node is returned");
         assert_eq!(a[0].0, 1, "A record");
         assert_eq!(a[0].1, DEPLOY_TTL);
@@ -350,11 +407,11 @@ mod tests {
     fn marking_unhealthy_or_nat_removes_from_answers() {
         // Healthy+public → present; flip to unhealthy → gone; NAT'd never appears.
         let up = vec![ni("n1", true, Some("198.51.100.7"), None, 0)];
-        assert_eq!(lb_records(&up, 1).len(), 1);
+        assert_eq!(lb_records(&up, 1, None).0.len(), 1);
         let down = vec![ni("n1", false, Some("198.51.100.7"), None, 0)];
-        assert!(lb_records(&down, 1).is_empty(), "unhealthy node excluded");
+        assert!(lb_records(&down, 1, None).0.is_empty(), "unhealthy node excluded");
         let natd = vec![ni("n1", true, None, None, 0)];
-        assert!(lb_records(&natd, 1).is_empty(), "NAT'd node (no public IP) excluded");
+        assert!(lb_records(&natd, 1, None).0.is_empty(), "NAT'd node (no public IP) excluded");
     }
 
     #[test]
@@ -364,12 +421,12 @@ mod tests {
             ni("v6-bogus", true, None, Some("::"), 1), // unspecified → excluded
             ni("v4-only", true, Some("203.0.113.2"), None, 2), // no v6 → no AAAA
         ];
-        let aaaa = lb_records(&nodes, 28);
+        let (aaaa, _) = lb_records(&nodes, 28, None);
         assert_eq!(aaaa.len(), 1, "only the node with a real public IPv6");
         assert_eq!(aaaa[0].0, 28, "AAAA record");
         assert_eq!(aaaa[0].2, "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec());
         // And A still works for the v4 nodes.
-        assert_eq!(lb_records(&nodes, 1).len(), 2);
+        assert_eq!(lb_records(&nodes, 1, None).0.len(), 2);
     }
 
     #[test]
@@ -379,7 +436,7 @@ mod tests {
             ni("near", true, Some("203.0.113.1"), None, 2),
             ni("mid", true, Some("203.0.113.2"), None, 30),
         ];
-        let a = lb_records(&nodes, 1);
+        let (a, _) = lb_records(&nodes, 1, None);
         let ips: Vec<Vec<u8>> = a.iter().map(|r| r.2.clone()).collect();
         assert_eq!(ips[0], Ipv4Addr::new(203, 0, 113, 1).octets().to_vec(), "nearest first");
         assert_eq!(ips[2], Ipv4Addr::new(203, 0, 113, 3).octets().to_vec(), "farthest last");

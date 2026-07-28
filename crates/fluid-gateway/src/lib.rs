@@ -1604,6 +1604,12 @@ async fn proxy_function(
 
     const MAX_REROUTES: usize = 3;
     let mut last_err = String::from("unknown");
+    // WHICH SHAPE the last attempt failed in. Both shapes used to report
+    // RUNTIME_TUNNEL_FAILED, and that single label is why the shoomoo outage was
+    // chased through vsock/tunnel plumbing for multiple sessions: the real
+    // `last_err` was "timed out waiting for response head", i.e. the tunnel had
+    // connected fine and the app never answered. Keep them apart.
+    let mut upstream_silent = false;
     for attempt in 0..MAX_REROUTES {
         let lease = match gw.fluid.lease(&key).await {
             Ok(l) => l,
@@ -1626,6 +1632,7 @@ async fn proxy_function(
             Ok(c) => c,
             Err(e) => {
                 last_err = e.to_string();
+                upstream_silent = false; // the transport itself never came up
                 tracing::debug!(cell = %cell, attempt, error = %last_err, "tunnel connect failed");
                 drop(lease);
                 gw.fluid.mark_dead(&key, &cell).await;
@@ -1653,17 +1660,31 @@ async fn proxy_function(
                 drop(lease);
                 // Tunnel-level failure: if it's closed the instance is gone.
                 if client.is_closed() {
+                    upstream_silent = false;
                     gw.fluid.mark_dead(&key, &cell).await;
                     gw.drop_tunnel(&cell).await;
+                } else {
+                    // The tunnel is still OPEN and the request failed anyway —
+                    // response-head timeout, nack, overload. The transport is
+                    // fine; the function is what didn't answer.
+                    upstream_silent = true;
                 }
-                // else: nack/overload — just reroute to another instance.
             }
         }
     }
-    // Reroute budget exhausted — runtime tunnel kept failing. Public code only;
-    // the internal `last_err` (tunnel internals) stays in the log (#18).
-    warn!(func = %key, error = %last_err, "upstream failed after reroute budget");
-    let class = fluid_core::FailureClass::RuntimeTunnelFailed;
+    // Reroute budget exhausted. Public code only; the internal `last_err`
+    // stays in the log (#18) — but the CLASS now matches which half broke.
+    let class = if upstream_silent {
+        fluid_core::FailureClass::FunctionNoResponse
+    } else {
+        fluid_core::FailureClass::RuntimeTunnelFailed
+    };
+    warn!(
+        func = %key,
+        error = %last_err,
+        code = class.code(),
+        "upstream failed after reroute budget"
+    );
     let mut resp = (StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY), class.code()).into_response();
     resp.headers_mut().insert("x-hive-error", HeaderValue::from_static(class.code()));
     resp

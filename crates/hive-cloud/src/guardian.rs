@@ -18,7 +18,7 @@
 //!
 //! [guardian-db]: https://github.com/wmaslonek/guardian-db
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::guardian::error::GuardianError;
@@ -81,11 +81,32 @@ pub(crate) async fn sql_db() -> anyhow::Result<SqlDb> {
 /// indefinitely with zero error and zero log output — `tokio::sync::OnceCell`
 /// then blocks every future caller forever, since a never-resolving init future
 /// never lets `get_or_try_init` return. A bounded timeout converts that into a
-/// clean, retryable failure: the in-flight future is dropped (its owned
-/// FsStore/redb/iroh Endpoint handles release synchronously on `Drop`, so a
-/// retry does not inherit stuck locks), and the NEXT call to `handle()` tries
-/// again from scratch instead of joining a wedged wait forever.
-const GUARDIAN_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// clean, retryable failure so the NEXT call to `handle()` can make progress
+/// instead of joining a wedged wait forever.
+///
+/// This bounds the WAIT, never the work. An earlier version of this comment
+/// claimed the dropped init future released "its owned FsStore/redb/iroh
+/// Endpoint handles ... synchronously on `Drop`, so a retry does not inherit
+/// stuck locks" — that was WRONG, and live evidence contradicted it: the
+/// spawned actor tasks inside guardian-db hold the Arcs, so a cancelled init
+/// kept the redb lock and the next attempt hit "Database already open". See
+/// [`INIT_INFLIGHT`] for what actually happens on expiry now.
+///
+/// `HIVE_GUARDIAN_INIT_TIMEOUT_MS` overrides the 30s default. Tunable because a
+/// slow host legitimately needs longer, and because the expiry path is otherwise
+/// unreachable to exercise on a healthy node — a very low value drives the
+/// park-and-re-await branch on demand.
+fn guardian_init_timeout() -> std::time::Duration {
+    static T: OnceLock<std::time::Duration> = OnceLock::new();
+    *T.get_or_init(|| {
+        std::env::var("HIVE_GUARDIAN_INIT_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(std::time::Duration::from_millis)
+            .unwrap_or(std::time::Duration::from_secs(30))
+    })
+}
 
 /// Minimum spacing between full init attempts after a failure. Every guardian
 /// caller (gossip puts, the anti-entropy loop, the relational mirror loop,
@@ -121,6 +142,33 @@ static LAST_FAILED_INIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 /// latch site for the incident this distinction fixes.
 static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The in-flight init task, when a previous caller stopped WAITING for it.
+///
+/// `init_handle` already shuts the partial client down on every failure past
+/// `IrohClient::new`, but that code cannot run when the init future is
+/// CANCELLED — and `tokio::time::timeout` cancels by dropping. So a timed-out
+/// init used to strand everything it had built: the iroh endpoint and
+/// blobs/docs stores stayed alive (their spawned actor tasks hold the Arc), the
+/// redb file lock was never released, and `INIT_RETRY_BACKOFF` then started a
+/// SECOND full init 30s later on top of the first. Every subsequent attempt
+/// added another stranded stack, so the node both wedged on redb's "Database
+/// already open" and grew without bound — measured on fc-sanjose-2 at ~7 GB/h
+/// up to a 47.3 GB RSS with guardian permanently unavailable.
+///
+/// The fix is to stop cancelling the WORK when we stop cancelling the WAIT: the
+/// init runs in its own task, and a caller that times out parks the
+/// `JoinHandle` here instead of dropping the future. The next caller awaits the
+/// SAME attempt rather than racing a second one, so at most one init stack can
+/// ever exist, and a slow-but-successful init is adopted instead of thrown away.
+static INIT_INFLIGHT: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> =
+    std::sync::Mutex::new(None);
+
+fn inflight_slot() -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
+    // A poisoned lock here must not take guardian down — the slot holds a
+    // JoinHandle, and recovering it is strictly better than failing init.
+    INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Lazily open (once) the GuardianDB KV store, retrying on a previous failure
 /// — but throttled (see `INIT_RETRY_BACKOFF`) and never after a wedge latch.
 async fn handle() -> anyhow::Result<&'static Handle> {
@@ -145,7 +193,9 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     }
     let result = HANDLE
         .get_or_try_init(|| async {
-            // A PANIC inside init must be caught here, not allowed to unwind.
+            // A PANIC inside init must not unwind past this closure. It now runs
+            // in its own task, so the panic arrives as a `JoinError` rather than
+            // needing `catch_unwind` around the future.
             // Live-witnessed fleet-wide: guardian-db's `IrohClient::new` panics
             // "Hash table capacity overflow" (hashbrown) on EVERY attempt. A
             // panic unwinds straight past the failure bookkeeping below, so
@@ -155,20 +205,46 @@ async fn handle() -> anyhow::Result<&'static Handle> {
             // panic into an `Err` lets the existing throttle apply, and because
             // a deterministic panic cannot succeed on retry we also latch the
             // wedge so subsequent calls fail fast instead of re-panicking.
-            use futures::FutureExt;
-            INIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
-            let attempt = std::panic::AssertUnwindSafe(tokio::time::timeout(GUARDIAN_INIT_TIMEOUT, init_handle()));
-            match attempt.catch_unwind().await {
+            // Adopt an init that a previous caller stopped waiting for, rather
+            // than spawning a second one on top of it (see `INIT_INFLIGHT`).
+            // Only a genuinely NEW attempt counts toward `INIT_ATTEMPTS`, which
+            // keeps the "Database already open" discrimination below honest:
+            // attempts > 1 now means we really did start a second full init.
+            let mut task = match inflight_slot().take() {
+                Some(existing) => {
+                    tracing::info!("guardian init: re-awaiting the init already in flight (not starting a second one)");
+                    existing
+                }
+                None => {
+                    INIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+                    tokio::spawn(init_handle())
+                }
+            };
+            // The timeout bounds only how long we WAIT. On expiry the task is
+            // parked, still running, so nothing it built is stranded.
+            match tokio::time::timeout(guardian_init_timeout(), &mut task).await {
                 Ok(Ok(result)) => result,
-                Ok(Err(_)) => Err(anyhow::anyhow!(
-                    "guardian init timed out after {GUARDIAN_INIT_TIMEOUT:?} (iroh endpoint bind / keystore / docs bring-up never completed); will retry after backoff"
-                )),
-                Err(panic) => {
-                    let what = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "unknown panic payload".to_string());
+                Err(_) => {
+                    *inflight_slot() = Some(task);
+                    Err(anyhow::anyhow!(
+                        "guardian init timed out after {:?} (iroh endpoint bind / keystore / docs bring-up never completed); the attempt is still running and will be re-awaited, not restarted",
+                        guardian_init_timeout()
+                    ))
+                }
+                Ok(Err(join_err)) => {
+                    // The task panicked (or was aborted, which we never do).
+                    // `JoinError` carries the payload, so the panic no longer has
+                    // to be caught with `catch_unwind` around the future itself.
+                    let what = if join_err.is_panic() {
+                        let panic = join_err.into_panic();
+                        panic
+                            .downcast_ref::<&str>()
+                            .map(|s| s.to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "unknown panic payload".to_string())
+                    } else {
+                        "init task cancelled".to_string()
+                    };
                     INIT_WEDGED.store(true, Ordering::Relaxed);
                     if let Ok(mut slot) = WEDGE_REASON.lock() {
                         *slot = Some(format!("init panicked: {what}"));

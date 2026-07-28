@@ -170,6 +170,10 @@ pub struct CloudState {
     pub fluid: Arc<Fluid>,
     pub hive: Arc<Hive>,
     pub http: reqwest::Client,
+    /// Subnet → location cache backing the authoritative DNS's client-proximity
+    /// answers (see [`crate::dns_geo`]). Lives here rather than as a static so
+    /// it shares the platform's HTTP client and dies with the state.
+    pub dns_geo: Arc<crate::dns_geo::GeoCache>,
     /// Hive's own native Queue backend for the Vercel WDK `World` interface
     /// (managed-world service) -- no external queue dependency.
     pub world_queue: Arc<crate::world_queue::WorldQueue>,
@@ -537,6 +541,7 @@ impl CloudState {
             fluid,
             hive,
             http: reqwest::Client::new(),
+            dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
             world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
