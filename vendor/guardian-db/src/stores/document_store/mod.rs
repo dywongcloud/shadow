@@ -111,6 +111,13 @@ async fn refresh_doc_index(
     let mut new_index: HashMap<String, Vec<u8>> = HashMap::new();
     let mut count = 0;
     let mut stale_served = 0;
+    // Aggregated reporting for keys with no previous value to fall back to (see
+    // the Err arm). Warning once PER ENTRY produced hundreds of identical lines
+    // per sync — measured on a live node as 366 of them against 18 aggregated
+    // lines from the sibling kv_store — which buried every other log on the box
+    // and still never said how many keys were actually missing.
+    let mut lost = 0usize;
+    let mut first_lost: Option<(String, String)> = None;
 
     for entry in &entries {
         let key = String::from_utf8_lossy(entry.key()).to_string();
@@ -145,7 +152,10 @@ async fn refresh_doc_index(
                         stale_served += 1;
                     }
                     None => {
-                        warn!("Failed to read content for key from iroh-docs: {:?}", e);
+                        lost += 1;
+                        if first_lost.is_none() {
+                            first_lost = Some((key.clone(), format!("{e:?}")));
+                        }
                     }
                 }
             }
@@ -155,11 +165,23 @@ async fn refresh_doc_index(
     if stale_served > 0 {
         debug!(stale_served, "DocumentStore index: served last-known-good content for keys whose blob re-fetch failed this round");
     }
+    if lost > 0 {
+        let (k, e) = first_lost
+            .clone()
+            .unwrap_or_else(|| ("<unknown>".to_string(), "<none>".to_string()));
+        warn!(
+            "DocumentStore index sync: {} of {} entries could not be read from iroh-docs and have NO previous value to fall back on, so they are MISSING from the index (first: key={} err={})",
+            lost,
+            lost + count,
+            k,
+            e
+        );
+    }
     index.replace_all(new_index);
 
     debug!(
-        "DocumentStore index synchronized from iroh-docs: {} entries",
-        count
+        "DocumentStore index synchronized from iroh-docs: {} entries ({} served stale, {} missing)",
+        count, stale_served, lost
     );
     Ok(count)
 }
