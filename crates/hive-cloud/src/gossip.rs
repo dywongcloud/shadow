@@ -526,6 +526,53 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
             }
         }
+        // Operator-only run event/attributes ops, forwarded to the project's
+        // HOST node exactly like the run-op arm above. These are gated by
+        // `require_operator_or_internal` (platform_admin), unlike cancel/
+        // replay/reenqueue/wakeup — so the synthesized claims here mirror
+        // `mesh_operator_claims`'s rationale (a peer reaching this dispatch
+        // already passed the P2P trust/admission gate, which is what the
+        // ORIGINATING node's `require_operator` check already gated on before
+        // it ever forwarded here) while still carrying the real tenant from
+        // `team_claims` (needed for the `wf_in_team` ownership check these
+        // ops also enforce, unlike the fully-global `require_operator`
+        // call sites `mesh_operator_claims` was built for).
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/workflows/runs/")
+            && (p.contains("/events") || p.contains("/attributes")) =>
+        {
+            let rest = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("");
+            let mut it = rest.splitn(2, '/');
+            let id = it.next().unwrap_or("").to_string();
+            let op = it.next().unwrap_or("");
+            let mut claims = team_claims(p).map(|axum::Extension(c)| c).unwrap_or(crate::auth::Claims {
+                sub: "mesh-internal".into(),
+                tenant: String::new(),
+                role: "service".into(),
+                iat: 0,
+                exp: 0,
+                platform_admin: false,
+            });
+            claims.platform_admin = true;
+            match op {
+                "events" => {
+                    let mut parsed: crate::admin::RunEventBody = serde_json::from_slice(body).unwrap_or_default();
+                    parsed.local = Some(true);
+                    match crate::admin::wf_run_event_dispatch(cloud, &team_headers(p), Some(&claims), &id, parsed).await {
+                        Ok(axum::Json(v)) => jb(axum::Json(v)),
+                        Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
+                    }
+                }
+                "attributes" => {
+                    let mut parsed: crate::admin::RunAttributesBody = serde_json::from_slice(body).unwrap_or_default();
+                    parsed.local = Some(true);
+                    match crate::admin::wf_run_attributes_dispatch(cloud, &team_headers(p), Some(&claims), &id, parsed).await {
+                        Ok(axum::Json(v)) => jb(axum::Json(v)),
+                        Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
+                    }
+                }
+                _ => Vec::new(),
+            }
+        }
         // SMS egress relay (see push::send_sms): a node whose Textbelt call was
         // rejected for egress geography forwards the send here; this node runs
         // the DIRECT send (never re-relays) and returns {success, error?}.

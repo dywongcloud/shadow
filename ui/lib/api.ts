@@ -602,6 +602,12 @@ export interface NodeInfo {
   gpu_count?: number;
   gpu_model?: string | null;
   gpu_vram_mb?: number;
+  /** This node's own embedded iroh-relay listener URL — `null`/absent when
+   *  unbound or the node has no reachable public address to advertise. */
+  relay_url?: string | null;
+  /** GuardianDB's own dialable iroh address (a separate identity from the
+   *  request-routing mesh) — `null`/absent until that client has bound. */
+  guardian_iroh_addr?: string | null;
 }
 
 export interface AnycastTable {

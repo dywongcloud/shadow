@@ -6,7 +6,7 @@ use std::time::Duration;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Json, Router,
 };
 use base64::Engine;
@@ -47,6 +47,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/functions", get(functions))
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
+        .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -81,6 +82,14 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/workflows/runs/:id/replay", post(wf_run_replay))
         .route("/v1/workflows/runs/:id/reenqueue", post(wf_run_reenqueue))
         .route("/v1/workflows/runs/:id/wakeup", post(wf_run_wakeup))
+        // Operator-only manual recovery primitives, conformant with the real
+        // `@workflow/world` spec's generic `events.create` /
+        // `experimentalSetAttributes` — see `require_operator_or_internal`.
+        .route("/v1/workflows/runs/:id/events", post(wf_run_add_event))
+        // `.post(..)` too: `post_body_to_host` (internal node-to-node forward,
+        // shared with cancel/replay/reenqueue/wakeup) always issues a POST —
+        // the public method stays PATCH, matching the spec's merge semantics.
+        .route("/v1/workflows/runs/:id/attributes", patch(wf_run_set_attributes).post(wf_run_set_attributes))
         .route("/v1/workflows/:id/run", post(wf_run))
         .route("/v1/sandbox", post(sandbox))
         .route("/deployments", get(dep_list).post(dep_create))
@@ -2084,6 +2093,32 @@ pub(crate) fn require_operator(claims: Option<&crate::auth::Claims>) -> Result<(
     }
 }
 
+/// Like [`require_operator`], but also honors the internal node-to-node
+/// forward trust already used elsewhere in this file (`x-hive-internal` ==
+/// `HIVE_INTERNAL_TOKEN`, constant-time compare — see `mint_allowed` /
+/// `tls_bundle_mesh`). Needed because, unlike every other `require_operator`
+/// call site (global infra mutations executed on whichever node receives
+/// them), the two run-mutation endpoints that use this guard forward to a
+/// run's project's HOST node exactly like `cancel`/`replay`/`wakeup` do (env
+/// decrypts locally) — and `post_body_to_host` carries no Authorization
+/// header across that hop, only `x-hive-team`. A bare `require_operator`
+/// would 403 every legitimately-forwarded internal hop the instant auth is
+/// enforced, breaking these ops for any run not hosted on the node the
+/// operator happened to hit.
+pub(crate) fn require_operator_or_internal(headers: &HeaderMap, claims: Option<&crate::auth::Claims>) -> Result<(), (StatusCode, String)> {
+    if operator_allowed(claims, crate::auth::enforced()) {
+        return Ok(());
+    }
+    if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+        if !t.trim().is_empty()
+            && headers.get("x-hive-internal").and_then(|v| v.to_str().ok()).map(|v| ct_eq(v, &t)).unwrap_or(false)
+        {
+            return Ok(());
+        }
+    }
+    Err((StatusCode::FORBIDDEN, "platform-level change requires a platform operator".into()))
+}
+
 /// Authenticated-READ guard for the topology views the dashboard shows every
 /// signed-in user (network page: nodes/cluster/overview). Any verified claims
 /// pass — the handler then decides between the full operator payload and the
@@ -4040,6 +4075,20 @@ async fn relay_stats(
     })
 }
 
+/// Serverless GPU pool snapshot (operator-only, same guard as `/v1/tunnels` /
+/// `/v1/relay`): every healthy `gpu_count > 0` node grouped into a named pool
+/// by region, with live aggregate + per-node free VRAM. See `gpu_pool`'s
+/// module doc for the allocate/release discipline and the fan-out rationale
+/// (per AGENTS.md's round-robin doc — live instance counts are node-local).
+async fn gpu_pools(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let regions = crate::gpu_pool::snapshot(&c).await;
+    Ok(Json(json!(regions)))
+}
+
 #[derive(Deserialize)]
 pub(crate) struct LimitQ {
     pub(crate) limit: Option<usize>,
@@ -4760,7 +4809,18 @@ pub(crate) async fn wf_run_op_dispatch(
 pub(crate) async fn post_body_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str, body: &Value) -> Option<Value> {
     let admin = c.node_admins.read().get(node).cloned();
     if let Some(admin) = admin {
-        if let Ok(r) = c.http.post(format!("{admin}{path}")).header("x-hive-team", team).timeout(std::time::Duration::from_secs(20)).json(body).send().await {
+        let mut req = c.http.post(format!("{admin}{path}")).header("x-hive-team", team);
+        // Carry the internal node-to-node trust token, when configured, so a
+        // handler gated by `require_operator_or_internal` (run events/
+        // attributes) still passes on this forwarded hop, which never carries
+        // the caller's Authorization header. Inert extra header for every
+        // other forwarded route, which doesn't check it.
+        if let Ok(t) = std::env::var("HIVE_INTERNAL_TOKEN") {
+            if !t.trim().is_empty() {
+                req = req.header("x-hive-internal", t);
+            }
+        }
+        if let Ok(r) = req.timeout(std::time::Duration::from_secs(20)).json(body).send().await {
             if r.status().is_success() {
                 if let Ok(v) = r.json::<Value>().await {
                     return Some(v);
@@ -4778,6 +4838,233 @@ pub(crate) async fn post_body_to_host(c: &Arc<CloudState>, node: &str, path: &st
         }
     }
     None
+}
+
+/// Body for the operator-only generic run-event append, matching the real
+/// `@workflow/world` spec's `events.create(runId, data, params)` shape:
+/// `eventType` = the event name (required — this is what makes the endpoint
+/// GENERIC, unlike the three hardcoded call sites in [`crate::world::run_op`]),
+/// `eventData` = its payload (spec's `data`), `correlationId` = spec's
+/// `params.correlationId`.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct RunEventBody {
+    /// Which project's world holds the run (lets the op skip the auto-scan).
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    #[serde(default, rename = "eventType")]
+    pub(crate) event_type: Option<String>,
+    /// Arbitrary event payload; defaults to `{}`.
+    #[serde(default, rename = "eventData")]
+    pub(crate) event_data: Option<Value>,
+    #[serde(default, rename = "correlationId")]
+    pub(crate) correlation_id: Option<String>,
+    /// Internal: set on the host-forwarded hop to prevent a re-forward loop.
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    pub(crate) local: Option<bool>,
+}
+
+/// Body for the operator-only run-attributes merge, matching the real spec's
+/// `experimentalSetAttributes(runId, changes, options)`: `attributes` = the
+/// spec's `changes`, merged (top-level keys, overwriting) into the run's
+/// stored `attributes` object.
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct RunAttributesBody {
+    #[serde(default)]
+    pub(crate) project: Option<String>,
+    /// Required — must be a JSON object.
+    #[serde(default)]
+    pub(crate) attributes: Option<Value>,
+    #[serde(default, deserialize_with = "de_lenient_bool")]
+    pub(crate) local: Option<bool>,
+}
+
+async fn wf_run_add_event(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+    body: Option<Json<RunEventBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_event_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, body.map(|b| b.0).unwrap_or_default()).await
+}
+
+async fn wf_run_set_attributes(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+    body: Option<Json<RunAttributesBody>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    wf_run_attributes_dispatch(&c, &headers, claims.as_ref().map(|e| &e.0), &id, body.map(|b| b.0).unwrap_or_default()).await
+}
+
+/// Shared dispatch for the operator-only "append arbitrary event to a run"
+/// op. Mirrors [`wf_run_op_dispatch`]'s project-resolution + host-forward
+/// shape exactly (this is the same node-local world data cancel/replay/
+/// wakeup mutate — see AGENTS.md's round-robin-reads-vs-leader-forwarded-
+/// writes section), but gated by [`require_operator_or_internal`] instead of
+/// tenant ownership alone: this is a manual incident-recovery primitive for
+/// platform operators, not a tenant self-service action like the 3-dots menu.
+pub(crate) async fn wf_run_event_dispatch(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    id: &str,
+    body: RunEventBody,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator_or_internal(headers, claims)?;
+    let event_type = body
+        .event_type
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "eventType is required".to_string()))?;
+    let event_data = body.event_data.clone().unwrap_or_else(|| json!({}));
+    let correlation_id = body.correlation_id.clone();
+    let team = tenant(c, headers, claims);
+    let is_forwarded = body.local.unwrap_or(false);
+
+    // 1) Resolve the project that holds this run — identical shape to
+    // `wf_run_op_dispatch`'s auto-scan/fan-out.
+    let project = if let Some(p) = body.project.clone() {
+        p
+    } else {
+        let locals: Vec<String> = {
+            let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for d in c.gw.list() {
+                if record_tenant(&d.tenant) == team {
+                    s.insert(d.project);
+                }
+            }
+            s.into_iter().filter(|p| crate::world::has_world(c, p)).collect()
+        };
+        let mut found = String::new();
+        for p in &locals {
+            if crate::world::run_detail(c, p, id).await.map(|d| d.get("run").map(|r| !r.is_null()).unwrap_or(false)).unwrap_or(false) {
+                found = p.clone();
+                break;
+            }
+        }
+        if found.is_empty() && !is_forwarded {
+            let peers = peer_nodes_for_tenant(c, &team);
+            let body_json = json!({ "eventType": event_type, "eventData": event_data, "correlationId": correlation_id, "local": true });
+            for node in peers {
+                if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/events"), &team, &body_json).await {
+                    if v.get("error").is_none() {
+                        return Ok(Json(v));
+                    }
+                }
+            }
+            return Err((StatusCode::NOT_FOUND, "run not found on any reachable host".into()));
+        }
+        found
+    };
+
+    if project.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    // 2) Ownership.
+    if !wf_in_team(c, &project, &team) {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    // 3) If this project isn't hosted locally, forward to its host node.
+    if c.gw.git_for_project(&project).is_none() && !is_forwarded {
+        if let Some(node) = host_node_for_project(c, &project) {
+            let body_json = json!({ "project": project, "eventType": event_type, "eventData": event_data, "correlationId": correlation_id, "local": true });
+            if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/events"), &team, &body_json).await {
+                return if v.get("error").is_some() {
+                    Err((StatusCode::BAD_GATEWAY, v.get("error").and_then(|e| e.as_str()).unwrap_or("host op failed").to_string()))
+                } else {
+                    Ok(Json(v))
+                };
+            }
+            return Err((StatusCode::BAD_GATEWAY, format!("host node '{node}' for project '{project}' unreachable")));
+        }
+    }
+    // 4) Run it locally against the project's world.
+    match crate::world::append_run_event(c, &project, id, &event_type, event_data, correlation_id.as_deref()).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
+}
+
+/// Shared dispatch for the operator-only "merge run attributes" op — same
+/// shape as [`wf_run_event_dispatch`] (and [`wf_run_op_dispatch`]), routed to
+/// [`crate::world::merge_run_attributes`] instead.
+pub(crate) async fn wf_run_attributes_dispatch(
+    c: &Arc<CloudState>,
+    headers: &HeaderMap,
+    claims: Option<&crate::auth::Claims>,
+    id: &str,
+    body: RunAttributesBody,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator_or_internal(headers, claims)?;
+    let attributes = body
+        .attributes
+        .clone()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "attributes is required".to_string()))?;
+    if !attributes.is_object() {
+        return Err((StatusCode::BAD_REQUEST, "attributes must be a JSON object".to_string()));
+    }
+    let team = tenant(c, headers, claims);
+    let is_forwarded = body.local.unwrap_or(false);
+
+    let project = if let Some(p) = body.project.clone() {
+        p
+    } else {
+        let locals: Vec<String> = {
+            let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for d in c.gw.list() {
+                if record_tenant(&d.tenant) == team {
+                    s.insert(d.project);
+                }
+            }
+            s.into_iter().filter(|p| crate::world::has_world(c, p)).collect()
+        };
+        let mut found = String::new();
+        for p in &locals {
+            if crate::world::run_detail(c, p, id).await.map(|d| d.get("run").map(|r| !r.is_null()).unwrap_or(false)).unwrap_or(false) {
+                found = p.clone();
+                break;
+            }
+        }
+        if found.is_empty() && !is_forwarded {
+            let peers = peer_nodes_for_tenant(c, &team);
+            let body_json = json!({ "attributes": attributes, "local": true });
+            for node in peers {
+                if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/attributes"), &team, &body_json).await {
+                    if v.get("error").is_none() {
+                        return Ok(Json(v));
+                    }
+                }
+            }
+            return Err((StatusCode::NOT_FOUND, "run not found on any reachable host".into()));
+        }
+        found
+    };
+
+    if project.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    if !wf_in_team(c, &project, &team) {
+        return Err((StatusCode::NOT_FOUND, "run not found".into()));
+    }
+    if c.gw.git_for_project(&project).is_none() && !is_forwarded {
+        if let Some(node) = host_node_for_project(c, &project) {
+            let body_json = json!({ "project": project, "attributes": attributes, "local": true });
+            if let Some(v) = post_body_to_host(c, &node, &format!("/v1/workflows/runs/{id}/attributes"), &team, &body_json).await {
+                return if v.get("error").is_some() {
+                    Err((StatusCode::BAD_GATEWAY, v.get("error").and_then(|e| e.as_str()).unwrap_or("host op failed").to_string()))
+                } else {
+                    Ok(Json(v))
+                };
+            }
+            return Err((StatusCode::BAD_GATEWAY, format!("host node '{node}' for project '{project}' unreachable")));
+        }
+    }
+    match crate::world::merge_run_attributes(c, &project, id, &attributes).await {
+        Ok(v) => Ok(Json(v)),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
+    }
 }
 
 pub(crate) async fn wf_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Option<axum::Extension<crate::auth::Claims>>,Query(q): Query<WfQuery>) -> Json<Value> {

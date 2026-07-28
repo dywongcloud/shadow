@@ -28,6 +28,7 @@ mod github_app_auth;
 mod gossip;
 mod discovery;
 mod gitops;
+mod gpu_pool;
 mod lease;
 mod mesh_raw;
 mod guardian;

@@ -278,7 +278,7 @@ function ComputedNode({ data }: { data: any }) {
 
 const nodeTypes = { ingress: IngressNode, service: ServiceNode, resource: ResourceNode, adder: AdderNode, computed: ComputedNode };
 
-interface SgNode { id: string; kind: string; name: string; tech: string; group?: string | null; detail: string; source: string }
+interface SgNode { id: string; kind: string; name: string; tech: string; group?: string | null; detail: string; source: string; start_cmd?: string }
 interface SgEdge { from: string; to: string; label?: string }
 interface SvcGraph { project: string; deployment_id: string; nodes: SgNode[]; edges: SgEdge[]; env_keys: string[]; readme?: string }
 
@@ -352,6 +352,7 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
 
     // ---- Intelligent computed graph (Issue #2) ----
     const appNodesSg = (sg?.nodes ?? []).filter((n) => n.kind !== "ingress" && n.kind !== "database");
+    const procLabel = kind === "container" ? "Container" : kind === "static" ? "Static Site" : "Web Process";
     if (sg && appNodesSg.length) {
       const groupCounts: Record<string, number> = {};
       for (const n of sg.nodes) if (n.group) groupCounts[n.group] = (groupCounts[n.group] || 0) + 1;
@@ -364,10 +365,26 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
       // A detected DB the user hasn't explicitly provisioned → show it (consumed).
       const detected = sgDbs.filter((n) => !provisionedKinds.has((techToKind[n.tech] || "") as never));
 
+      const primaryNode = appNodesSg[0];
+      const primary = primaryNode.id;
+      const serviceNodeSourceHandle = (id: string) => (id === primary ? "svc-out" : "out");
+      const primaryCardHeight = 260;
+
       const ns: Node[] = [
         { id: "ingress", type: "ingress", position: { x: 0, y: 180 }, data: { ddos, cdn: cdnActive } },
-        ...appNodesSg.map((n, i) => ({
-          id: n.id, type: "computed" as const, position: { x: 340, y: i * 108 },
+        {
+          id: primary, type: "service", position: { x: 340, y: 0 },
+          data: {
+            project, kind, procLabel: primaryNode.tech || procLabel, state: prod?.state,
+            startCmd: primaryNode.start_cmd || (kind === "container" ? "podman run" : kind === "static" ? "—" : "npm start"),
+            resources: kind === "static" ? "Edge" : `${memory} MB`,
+            instances, domain: prod?.alias ?? "—",
+            logsHref: `/projects/${encodeURIComponent(project)}/logs`,
+            settingsHref: `/projects/${encodeURIComponent(project)}/settings`,
+          },
+        },
+        ...appNodesSg.slice(1).map((n, i) => ({
+          id: n.id, type: "computed" as const, position: { x: 340, y: primaryCardHeight + i * 108 },
           data: { name: n.name, tech: n.tech, kind: n.kind, detail: n.detail, grouped: n.group ? groupCounts[n.group] > 1 : false },
         })),
       ];
@@ -382,7 +399,6 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
       }
       ns.push({ id: "adder", type: "adder", position: { x: 820, y: ry + (ry ? 8 : 0) }, data: { project, onAdd, gitops } });
 
-      const primary = appNodesSg[0].id;
       const es: Edge[] = [
         { id: "e-ingress", type: "smoothstep", source: "ingress", sourceHandle: "out", target: primary, targetHandle: "in", animated: true, style: { stroke: "#f5a623", strokeWidth: 2 } },
       ];
@@ -391,21 +407,19 @@ export function ServiceGraph({ project, prod }: { project: string; prod: Deploym
         if (e.from === "ingress" || e.to === "ingress") continue;
         const okTarget = appNodesSg.some((a) => a.id === e.to) || detected.some((d) => d.id === e.to);
         if (!okTarget) continue;
-        es.push({ id: `e-${e.from}-${e.to}`, type: "smoothstep", source: e.from, sourceHandle: "out", target: e.to, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
+        es.push({ id: `e-${e.from}-${e.to}`, type: "smoothstep", source: e.from, sourceHandle: serviceNodeSourceHandle(e.from), target: e.to, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
       }
       // Provisioned resources hang off the primary app node.
       for (const c of conns) {
-        es.push({ id: `e-res-${c.id}`, type: "smoothstep", source: primary, sourceHandle: "out", target: `res-${c.id}`, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
+        es.push({ id: `e-res-${c.id}`, type: "smoothstep", source: primary, sourceHandle: serviceNodeSourceHandle(primary), target: `res-${c.id}`, targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 2 } });
       }
-      es.push({ id: "e-adder", type: "smoothstep", source: primary, sourceHandle: "out", target: "adder", targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 1.5, strokeDasharray: "5 5" } });
+      es.push({ id: "e-adder", type: "smoothstep", source: primary, sourceHandle: serviceNodeSourceHandle(primary), target: "adder", targetHandle: "in", animated: true, style: { stroke: "hsl(var(--border-strong))", strokeWidth: 1.5, strokeDasharray: "5 5" } });
 
       setNodes(ns);
       setEdges(es);
       setTimeout(() => rf.current && fitOut(rf.current), 80);
       return;
     }
-
-    const procLabel = kind === "container" ? "Container" : kind === "static" ? "Static Site" : "Web Process";
     const ns: Node[] = [
       { id: "ingress", type: "ingress", position: { x: 0, y: 140 }, data: { ddos, cdn: cdnActive } },
       {

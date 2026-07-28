@@ -37,15 +37,40 @@ export interface MapMarker {
   lon: number;
   label?: string;
   /** Marker color; defaults to emerald. Pass distinct colors to tell co-located
-   *  nodes apart. */
+   *  nodes apart. GPU nodes should pass `GPU_COLOR` (see `isGpu`) rather than a
+   *  round-robin palette slot. */
   color?: string;
+  /** GPU-bearing node (`gpu_count > 0`). Purely informational here — the
+   *  caller is expected to have already set `color` to `GPU_COLOR` — but kept
+   *  on the marker so the map can render GPU-specific affordances without
+   *  re-deriving it from color equality. */
+  isGpu?: boolean;
+  /** This node advertises a `relay_url` — rendered as a small relay badge so
+   *  the constellation shows which nodes provide mesh relay service. */
+  hasRelay?: boolean;
+  /** This node's GuardianDB client has a live `guardian_iroh_addr` (and the
+   *  node itself is healthy) — rendered as a small DB/guardian badge. */
+  hasGuardian?: boolean;
 }
 
-// Distinct, high-contrast palette so co-located nodes are visually separable.
-const PALETTE = [
-  "#10b981", "#3b82f6", "#f59e0b", "#ef4444", "#a855f7",
-  "#06b6d4", "#ec4899", "#84cc16", "#f97316", "#14b8a6",
+/** Fixed, unambiguous color for GPU-bearing nodes (`gpu_count > 0`) — never
+ *  assigned round-robin, so blue reads as "this node has a GPU" fleet-wide,
+ *  on both the map marker and any table/list color swatch (see regions page). */
+export const GPU_COLOR = "#3b82f6";
+
+/** Distinct, high-contrast palette so co-located non-GPU nodes are visually
+ *  separable. Deliberately excludes `GPU_COLOR`'s blue so hue alone tells GPU
+ *  nodes apart from everything else — a neutral node never lands on blue by
+ *  round-robin chance. */
+export const PALETTE = [
+  "#10b981", "#f59e0b", "#ef4444", "#a855f7", "#06b6d4",
+  "#ec4899", "#84cc16", "#f97316", "#14b8a6", "#6366f1",
 ];
+
+/** Capability badge colors — distinct from both `GPU_COLOR` and `PALETTE` so
+ *  they read as an overlay annotation, not a competing node color. */
+const RELAY_BADGE_COLOR = "#a855f7";
+const GUARDIAN_BADGE_COLOR = "#f59e0b";
 
 /**
  * Inline equirectangular world map. Markers are placed at their ACTUAL lat/lon
@@ -70,7 +95,9 @@ export function RegionMap({ markers, autoColor = false }: { markers: MapMarker[]
       .filter((m) => Number.isFinite(m.lat) && Number.isFinite(m.lon))
       .map((m, i) => {
         const [x, y] = project(m.lon, m.lat);
-        return { ...m, x, y, color: m.color || (autoColor ? PALETTE[i % PALETTE.length] : "#10b981") };
+        const color =
+          m.color || (m.isGpu ? GPU_COLOR : autoColor ? PALETTE[i % PALETTE.length] : "#10b981");
+        return { ...m, x, y, color };
       });
     const groups = new Map<string, typeof proj>();
     for (const p of proj) {
@@ -109,8 +136,42 @@ export function RegionMap({ markers, autoColor = false }: { markers: MapMarker[]
         <g key={`${m.id}-${i}`}>
           <circle cx={m.x} cy={m.y} r={2.4} fill={m.color} opacity={0.2} className="animate-pulse" />
           <circle cx={m.x} cy={m.y} r={1.3} fill={m.color} opacity={0.35} />
+          {/* GPU nodes get an extra ring beyond the fixed blue fill, so the
+              "this is a GPU node" signal survives even where fill color is
+              hard to judge (small marker, dense cluster). */}
+          {m.isGpu && (
+            <circle
+              cx={m.x}
+              cy={m.y}
+              r={1.7}
+              fill="none"
+              stroke={GPU_COLOR}
+              strokeWidth={0.18}
+              strokeDasharray="0.5 0.4"
+            />
+          )}
           <circle cx={m.x} cy={m.y} r={0.9} fill={m.color} stroke="#ffffff" strokeWidth={0.16} />
           <title>{m.label || m.id}</title>
+          {/* Per-node mesh-service badges — small offset dots so a glance at
+              the constellation shows which nodes provide relay / GuardianDB,
+              not just where they are located. */}
+          {m.hasRelay && (
+            <circle cx={m.x + 1.15} cy={m.y - 1.15} r={0.55} fill={RELAY_BADGE_COLOR} stroke="#ffffff" strokeWidth={0.14}>
+              <title>Relay — {m.label || m.id}</title>
+            </circle>
+          )}
+          {m.hasGuardian && (
+            <circle
+              cx={m.x - 1.15}
+              cy={m.y - 1.15}
+              r={0.55}
+              fill={GUARDIAN_BADGE_COLOR}
+              stroke="#ffffff"
+              strokeWidth={0.14}
+            >
+              <title>GuardianDB — {m.label || m.id}</title>
+            </circle>
+          )}
         </g>
       ))}
     </svg>

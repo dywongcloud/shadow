@@ -34,6 +34,8 @@ pub struct SvcNode {
     pub detail: String,
     /// How it was detected (the evidence — keeps the graph honest/auditable).
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_cmd: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,6 +161,7 @@ pub fn build_graph(
         group: None,
         detail: "Public entrypoint (TLS, CDN, WAF)".into(),
         source: "platform".into(),
+        start_cmd: None,
     });
 
     // Bundling group id — nodes that live in ONE container/PID share it.
@@ -174,6 +177,8 @@ pub fn build_graph(
     let frontend = FRONTEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(_, t)| *t);
     let bundled = backend.is_some() && frontend.is_some();
 
+    let start_cmd = derive_start_cmd(scan);
+
     let mut app_ids: Vec<String> = Vec::new();
     if bundled {
         // TWO nodes, SAME group → one PID/container, but visualized separately.
@@ -187,6 +192,7 @@ pub fn build_graph(
             group: group.clone(),
             detail: "UI bundled in the same container".into(),
             source: format!("dep: {}", FRONTEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(d, _)| *d).unwrap_or("")),
+            start_cmd: start_cmd.clone(),
         });
         nodes.push(SvcNode {
             id: "app-backend".into(),
@@ -196,6 +202,7 @@ pub fn build_graph(
             group: group.clone(),
             detail: "API bundled in the same container".into(),
             source: format!("dep: {}", BACKEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(d, _)| *d).unwrap_or("")),
+            start_cmd: start_cmd.clone(),
         });
         // Frontend calls backend (same PID) — show the internal edge.
         edges.push(SvcEdge { from: "app-frontend".into(), to: "app-backend".into(), label: "internal".into() });
@@ -225,6 +232,7 @@ pub fn build_graph(
             group: group.clone(),
             detail: scan.readme.clone(),
             source: if !scan.framework.is_empty() { format!("framework: {}", scan.framework) } else { "manifest".into() },
+            start_cmd: start_cmd.clone(),
         });
         edges.push(SvcEdge { from: "ingress".into(), to: "app".into(), label: "".into() });
         app_ids.push("app".into());
@@ -241,6 +249,7 @@ pub fn build_graph(
             group: group.clone(),
             detail: "Workspace package".into(),
             source: "monorepo workspace".into(),
+            start_cmd: None,
         });
         // A consumed package is used by the primary app node.
         if let Some(app) = app_ids.first() {
@@ -264,6 +273,7 @@ pub fn build_graph(
             group: None,
             detail: "Data store consumed by the app".into(),
             source,
+            start_cmd: None,
         });
         // All app nodes depend on the datastore.
         for app in &app_ids {
@@ -295,6 +305,26 @@ pub fn build_graph(
 
 fn slug(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect()
+}
+
+fn derive_start_cmd(scan: &Scan) -> Option<String> {
+    if scan.has_dockerfile {
+        if let Some(dockerfile_cmd) = scan.run_cmds.iter().rev().find(|c| {
+            c.starts_with("CMD ") || c.starts_with("ENTRYPOINT ") || c.starts_with("RUN ")
+        }) {
+            return Some(strip_dockerfile_instruction_prefix(dockerfile_cmd));
+        }
+    }
+    scan.run_cmds.first().map(|c| strip_dockerfile_instruction_prefix(c))
+}
+
+fn strip_dockerfile_instruction_prefix(c: &str) -> String {
+    for prefix in ["CMD ", "ENTRYPOINT ", "RUN "] {
+        if let Some(rest) = c.strip_prefix(prefix) {
+            return rest.trim().to_string();
+        }
+    }
+    c.to_string()
 }
 
 // ---- filesystem scan (the only impure part) -------------------------------------

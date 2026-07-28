@@ -28,6 +28,8 @@
 //! | recreateRunFromExisting        | `run_op(replay)` → new ULID run + run_created  |
 //! | reenqueueRun                   | `run_op(reenqueue)` → enqueue_run              |
 //! | wakeUpRun (cancel sleeps)      | `run_op(wakeup)` → complete_pending_waits+enq  |
+//! | events.create(runId,data,…)    | `append_run_event` → append_event (generic)    |
+//! | experimentalSetAttributes(…)   | `merge_run_attributes` → put_run (merge)       |
 //! | Queue.queue(__wkf_workflow_…)  | `enqueue_run` → owf:job HASH + owf:sched ZSET  |
 //! | per-run write serialization    | `with_run_lock` (SET NX PX 15s + Lua unlock)   |
 //! | ULID run ids (ts-valid)        | `ulid()` (48-bit ms + 80-bit rand, base32)     |
@@ -546,6 +548,74 @@ pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &s
         }
         _ => Err(format!("unknown run op '{op}'")),
     }
+}
+
+/// Append an arbitrary event to a run's event log — the generic entry point
+/// the real `@workflow/world` spec exposes as `events.create(runId, data,
+/// params)`. Everything above (`cancel`/`replay`/`wakeup`) already calls the
+/// same underlying [`append_event`] primitive, just hardcoded to one
+/// `event_type` each (`run_cancelled`/`run_created`/`wait_completed`); this is
+/// the un-hardcoded version, for operator-driven incident annotation (e.g.
+/// recording what a human did to unstick a run) without a new bespoke code
+/// path per event type. Takes the same per-run lock cancel/wakeup do so this
+/// never interleaves with the app runtime's own event writes; does NOT touch
+/// run status — a pure event-log append.
+pub async fn append_run_event(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    run_id: &str,
+    event_type: &str,
+    event_data: Value,
+    correlation_id: Option<&str>,
+) -> Result<Value, String> {
+    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
+    let spec_version = run.get("specVersion").and_then(|v| v.as_i64()).unwrap_or(2);
+    let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+    let event = make_event(run_id, event_type, correlation_id, event_data, spec_version);
+    let event_id = event.get("eventId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    append_event(cloud, &url, &token, &p, run_id, &event).await;
+    world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
+    Ok(json!({ "runId": run_id, "eventId": event_id, "eventType": event_type, "op": "event" }))
+}
+
+/// Merge a JSON object into a run's stored `attributes` field — the write
+/// counterpart of the real `@workflow/world` spec's
+/// `experimentalSetAttributes(runId, changes, options)`, which had no
+/// equivalent anywhere in this module: `replay` seeds a fresh `attributes: {}`
+/// on the new run, but nothing afterward ever let attributes be SET from
+/// outside. Read-modify-write under `with_run_lock`, the exact same pattern
+/// `cancel`/`replay` already prove via their own `put_run` calls. Top-level
+/// key merge (`changes`' keys overwrite, every other existing key is left
+/// alone) — matching the spec's shape, never a deep merge.
+pub async fn merge_run_attributes(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    run_id: &str,
+    changes: &Value,
+) -> Result<Value, String> {
+    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
+    let changes_obj = changes.as_object().ok_or_else(|| "attributes must be a JSON object".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
+    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+    let now = hive_core::now_ms();
+    let mut updated = run.clone();
+    if let Some(o) = updated.as_object_mut() {
+        let attrs = o.entry("attributes").or_insert_with(|| json!({}));
+        if !attrs.is_object() {
+            *attrs = json!({});
+        }
+        if let Some(attrs_obj) = attrs.as_object_mut() {
+            for (k, v) in changes_obj {
+                attrs_obj.insert(k.clone(), v.clone());
+            }
+        }
+        o.insert("updatedAt".into(), json!(now));
+    }
+    put_run(cloud, &url, &token, &p, &updated, Some(&status)).await;
+    world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
+    Ok(json!({ "runId": run_id, "attributes": updated.get("attributes").cloned().unwrap_or_else(|| json!({})), "op": "attributes" }))
 }
 
 /// Complete every pending wait (a `wait_created` with no matching
