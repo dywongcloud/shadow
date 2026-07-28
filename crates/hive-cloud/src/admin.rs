@@ -49,6 +49,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/relay", get(relay_stats))
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
+        .route("/v1/dns/stats", get(dns_stats))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -4128,6 +4129,46 @@ async fn inference_endpoints(
         "endpoints": desired,
         "local_servers": c.inference.statuses(),
         "node": c.node_name,
+    })))
+}
+
+/// Geo-DNS observability (operator): live Seer query counters, the
+/// tailored-vs-generic split that actually tells you whether proximity routing
+/// is working, GeoCache hit/pending/unlocatable, the delegation record count
+/// the DNS reconciler published, and the per-node histogram of which address
+/// each answer handed out first.
+async fn dns_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    use std::sync::atomic::Ordering;
+    let s = &crate::dnsserver::DNS_STATS;
+    let (known, pending, unlocatable) = c.dns_geo.stats();
+    let answers: std::collections::BTreeMap<String, u64> =
+        crate::dnsserver::ANSWER_FIRST.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
+    Ok(Json(json!({
+        "node": c.node_name,
+        "deploy_zone": crate::dnsserver::deploy_zone(),
+        "listening": std::env::var("HIVE_DNS_ADDR").ok(),
+        "queries": {
+            "total": s.queries.load(Ordering::Relaxed),
+            "a": s.queries_a.load(Ordering::Relaxed),
+            "aaaa": s.queries_aaaa.load(Ordering::Relaxed),
+            "other": s.queries_other.load(Ordering::Relaxed),
+            "nxdomain": s.nxdomain.load(Ordering::Relaxed),
+            "over_tcp": s.over_tcp.load(Ordering::Relaxed),
+        },
+        "geo": {
+            "tailored": s.tailored.load(Ordering::Relaxed),
+            "generic": s.generic.load(Ordering::Relaxed),
+            "with_ecs": s.with_ecs.load(Ordering::Relaxed),
+            "cache_known": known,
+            "cache_pending": pending,
+            "cache_unlocatable": unlocatable,
+        },
+        "delegation_records": crate::vercel_dns::STATS.geo_delegation_records.load(Ordering::Relaxed),
+        "answer_first_histogram": answers,
     })))
 }
 

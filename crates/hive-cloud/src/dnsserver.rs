@@ -17,6 +17,7 @@
 //! NS here. Focused wire-format impl — no heavy dependency.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::net::{TcpListener, UdpSocket};
@@ -27,6 +28,59 @@ use hive_edge::NodeInfo;
 /// The deploy wildcard zone whose A/AAAA are answered dynamically (healthy node IPs).
 /// `HIVE_DEPLOY_ZONE`, e.g. `deploy.shadw.app` → `deploy.shadw.app` + `*.deploy.shadw.app`.
 /// Cached: a per-query env read would be a syscall on the hot path. Lowercased, dot-trimmed.
+/// Live Seer query counters — geo-DNS is otherwise invisible: without these
+/// there is no way to tell a working proximity path from a silently generic
+/// one except by hand-digging from several vantages. Surfaced by
+/// `GET /v1/dns/stats` alongside the GeoCache's own hit/pending/unlocatable
+/// counts.
+pub struct DnsStats {
+    pub queries: AtomicU64,
+    pub queries_a: AtomicU64,
+    pub queries_aaaa: AtomicU64,
+    pub queries_other: AtomicU64,
+    /// Answers ordered for THIS client (proximity applied) vs the generic set.
+    pub tailored: AtomicU64,
+    pub generic: AtomicU64,
+    /// Client sent EDNS Client Subnet (a resolver forwarding its client's
+    /// prefix) vs bare source-address geolocation.
+    pub with_ecs: AtomicU64,
+    /// Queries for a name this server is not authoritative for (NXDOMAIN).
+    pub nxdomain: AtomicU64,
+    pub over_tcp: AtomicU64,
+}
+
+pub static DNS_STATS: DnsStats = DnsStats {
+    queries: AtomicU64::new(0),
+    queries_a: AtomicU64::new(0),
+    queries_aaaa: AtomicU64::new(0),
+    queries_other: AtomicU64::new(0),
+    tailored: AtomicU64::new(0),
+    generic: AtomicU64::new(0),
+    with_ecs: AtomicU64::new(0),
+    nxdomain: AtomicU64::new(0),
+    over_tcp: AtomicU64::new(0),
+};
+
+/// Which node each answer actually handed out first — the histogram that shows
+/// whether traffic is really being spread by proximity or collapsing onto one
+/// node. Keyed by the first A/AAAA address in the answer.
+pub static ANSWER_FIRST: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+/// Render an A/AAAA rdata blob back to a printable address for the answer
+/// histogram (nothing else needs this — the wire format is built, not parsed).
+fn rdata_ip(atype: u16, rdata: &[u8]) -> Option<String> {
+    match (atype, rdata.len()) {
+        (1, 4) => Some(std::net::Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]).to_string()),
+        (28, 16) => {
+            let mut o = [0u8; 16];
+            o.copy_from_slice(rdata);
+            Some(std::net::Ipv6Addr::from(o).to_string())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn deploy_zone() -> Option<&'static str> {
     static Z: OnceLock<Option<String>> = OnceLock::new();
     Z.get_or_init(|| {
@@ -87,6 +141,7 @@ async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
                 return;
             }
             if let Some(resp) = handle_query(&cloud, &msg, peer.ip()) {
+                DNS_STATS.over_tcp.fetch_add(1, Ordering::Relaxed);
                 let mut framed = (resp.len() as u16).to_be_bytes().to_vec();
                 framed.extend_from_slice(&resp);
                 let _ = stream.write_all(&framed).await;
@@ -153,6 +208,29 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
 
     // ---- look up matching records ----
     let (answers, found_domain, proximity) = lookup(cloud, &qname, qtype, &asker);
+
+    DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
+    match qtype {
+        1 => DNS_STATS.queries_a.fetch_add(1, Ordering::Relaxed),
+        28 => DNS_STATS.queries_aaaa.fetch_add(1, Ordering::Relaxed),
+        _ => DNS_STATS.queries_other.fetch_add(1, Ordering::Relaxed),
+    };
+    if client_had_ecs {
+        DNS_STATS.with_ecs.fetch_add(1, Ordering::Relaxed);
+    }
+    if proximity {
+        DNS_STATS.tailored.fetch_add(1, Ordering::Relaxed);
+    } else {
+        DNS_STATS.generic.fetch_add(1, Ordering::Relaxed);
+    }
+    if !found_domain {
+        DNS_STATS.nxdomain.fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some((atype, _, rdata)) = answers.first() {
+        if let Some(ip) = rdata_ip(*atype, rdata) {
+            *ANSWER_FIRST.lock().entry(ip).or_insert(0) += 1;
+        }
+    }
 
     // ---- build response ----
     // The OPT RR is echoed only when the client sent one (RFC 6891: never add
