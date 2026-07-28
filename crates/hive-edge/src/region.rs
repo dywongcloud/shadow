@@ -342,26 +342,50 @@ impl NodeRegistry {
     /// aged out. Keeping the origin timestamp means a dead node's record freezes and
     /// drops mesh-wide via the 30s staleness window in `nodes()` (clocks are NTP-synced,
     /// skew ≪ window). Direct probes (`set_health`) still bump freshness for OUR peers.
+    /// Upsert a peer from its OWN announcement (hot-join proof, `/v1/announce`,
+    /// or the first — self — entry of the peer's own `/v1/nodes` response).
+    ///
+    /// A node's `id` is its operator-chosen `--name`, not a stable identity —
+    /// `peer_id` (the real iroh endpoint id) is. Renaming a node keeps the
+    /// same `peer_id` but changes `id`, so without eviction here the OLD
+    /// name's entry never naturally expires: the active health-probe loop
+    /// (main.rs spawn_health_loop) dials by `peer_id`/`iroh_addr`, and since
+    /// those are unchanged the probe keeps succeeding and keeps refreshing
+    /// the OLD entry's `last_seen_ms` forever — a permanent ghost duplicate,
+    /// live-witnessed renaming fc-gpu-sj-1 -> fc-sanjose-gpu-1 (both names
+    /// stayed `healthy: true` with freshening `last_seen_ms` for minutes,
+    /// on every peer in the mesh, with no sign of self-expiry).
+    ///
+    /// Only a SELF-report may rename: eviction lives here and not in
+    /// `upsert_peer` because relayed third-party copies of the old name keep
+    /// circulating in other registries' `/v1/nodes` responses for a while —
+    /// letting a relay evict-and-rename made the two names fight (last relay
+    /// wins each gossip round, also live-witnessed: the mesh settled on the
+    /// GHOST name while the process itself was announcing the real one).
+    pub fn upsert_peer_self_report(&self, peer: NodeInfo) {
+        if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
+            let pid = pid.to_string();
+            self.peers.write().retain(|k, v| k == &peer.id || v.peer_id.as_deref() != Some(pid.as_str()));
+        }
+        self.upsert_peer(peer);
+    }
+
+    /// Upsert a peer from a RELAYED copy (any non-self entry of another
+    /// node's `/v1/nodes` response). A relay may update an entry it agrees
+    /// with on identity, or introduce a peer never heard from directly — but
+    /// it must never RENAME: if an entry with the same `peer_id` already
+    /// exists under a different `id`, the relayed copy is a stale echo of a
+    /// pre-rename name and is dropped (see `upsert_peer_self_report`).
     pub fn upsert_peer(&self, mut peer: NodeInfo) {
         peer.is_self = false;
         let mut peers = self.peers.write();
-        // A node's `id` is its operator-chosen `--name`, not a stable identity —
-        // `peer_id` (the real iroh endpoint id) is. Renaming a node keeps the
-        // same `peer_id` but changes `id`, so without this the OLD name's entry
-        // never naturally expires: the active health-probe loop (main.rs
-        // spawn_health_loop) dials by `peer_id`/`iroh_addr`, and since those are
-        // unchanged the probe keeps succeeding and keeps refreshing the OLD
-        // entry's `last_seen_ms` forever — a permanent ghost duplicate,
-        // live-witnessed renaming fc-gpu-sj-1 -> fc-sanjose-gpu-1 (both names
-        // stayed `healthy: true` with a freshening `last_seen_ms` for minutes,
-        // across every peer in the mesh, with no sign of self-expiry). Evict
-        // any other entry sharing this peer's `peer_id` before inserting the
-        // new one, so a rename converges to exactly one entry within one
-        // gossip round instead of never.
         if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
-            peers.retain(|k, v| {
-                k == &peer.id || v.peer_id.as_deref() != Some(pid)
-            });
+            let renamed_elsewhere = peers
+                .iter()
+                .any(|(k, v)| k != &peer.id && v.peer_id.as_deref() == Some(pid));
+            if renamed_elsewhere {
+                return;
+            }
         }
         if let Some(existing) = peers.get(&peer.id) {
             // Health + latency are owned by our OWN direct probes, never second-hand gossip.

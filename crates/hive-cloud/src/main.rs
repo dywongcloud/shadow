@@ -595,7 +595,7 @@ async fn main() -> anyhow::Result<()> {
                             cloud.peer_iroh.write().insert(remote_id.clone(), (remote_id.clone(), addr));
                         }
                         let name = node.name.clone();
-                        cloud.registry.upsert_peer(node);
+                        cloud.registry.upsert_peer_self_report(node);
                         cloud.audit.record("_global", "mesh", "join", "node", &name, &format!("endpoint {remote_id} admitted via join proof"));
                         tracing::info!(peer = %remote_id, node = %name, "mesh join ADMITTED (hot-join, key-addressed)");
                         serde_json::to_vec(&cloud.registry.nodes()).unwrap_or_default()
@@ -1915,7 +1915,15 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     // Converge the control-plane fencing epoch on the max
                     // witnessed anywhere in the fleet (monotonic; see cluster.rs).
                     cloud.cluster.adopt_epoch(n.cp_epoch);
-                    cloud.registry.upsert_peer(n);
+                    // The response's first entry is the answering peer's OWN
+                    // self-report — the only copy allowed to rename it (see
+                    // upsert_peer_self_report); everything after it is a
+                    // relayed third-party copy that must never rename.
+                    if peer_self_id.as_deref() == Some(n.id.as_str()) {
+                        cloud.registry.upsert_peer_self_report(n);
+                    } else {
+                        cloud.registry.upsert_peer(n);
+                    }
                 }
             }
             if let Some(pid) = peer_self_id {

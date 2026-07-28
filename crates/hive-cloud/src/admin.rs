@@ -3684,7 +3684,9 @@ pub(crate) async fn node_announce(
 ) -> Json<Value> {
     // Converge the control-plane fencing epoch on the max witnessed anywhere.
     c.cluster.adopt_epoch(node.cp_epoch);
-    c.registry.upsert_peer(node);
+    // The announcing node is describing ITSELF — the authoritative copy that
+    // may rename it past a stale registry entry (upsert_peer_self_report).
+    c.registry.upsert_peer_self_report(node);
     Json(json!(c.registry.nodes()))
 }
 
