@@ -4267,6 +4267,12 @@ async fn dns_stats(
             "reconciler_last_pass_proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
             "reconciler_last_pass_unproven": crate::vercel_dns::STATS.geo_ns_unproven.load(Ordering::Relaxed),
             "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
+            // Never-dark cutover telemetry: cutovers completed, rollbacks
+            // (a climbing rollback count = a delegation RETRYING, never
+            // stranding), and ACME orphan challenges swept.
+            "delegation_cutovers": crate::vercel_dns::STATS.delegation_cutovers.load(Ordering::Relaxed),
+            "delegation_cutover_rollbacks": crate::vercel_dns::STATS.delegation_cutover_rollbacks.load(Ordering::Relaxed),
+            "acme_orphans_swept": crate::vercel_dns::STATS.acme_orphans_swept.load(Ordering::Relaxed),
             "min_attester_regions": crate::dns_probe::MIN_ATTESTER_REGIONS,
             "failed_rounds_before_withdraw": crate::dns_probe::FAILED_ROUNDS_BEFORE_WITHDRAW,
         },

@@ -349,12 +349,39 @@ async fn issue(
             let host = challenge.identifier().to_string();
             let value = challenge.key_authorization().dns_value();
             let rec_name = challenge_record_name(&host, zone);
-            api.create(zone, &DesiredRecord { name: rec_name.clone(), rtype: "TXT".into(), value: value.clone(), ttl: 60 }).await?;
+            let fqdn = format!("{rec_name}.{zone}");
             // BOTH authorities on purpose: Vercel answers while the zone (or a
             // sub-zone like `api.`/the deploy label) is still Vercel-served,
             // and the replicated challenge store is what lets every advertised
-            // Seer nameserver answer once the NS delegation moves here.
-            challenges.insert(&format!("{rec_name}.{zone}"), &value);
+            // Seer nameserver answer once the NS delegation moves here. Once a
+            // name IS delegated, Vercel refuses the TXT create as a child of
+            // the delegation (the same 409 record_conflicts rule witnessed
+            // stranding the api cutover) — that refusal must not kill the
+            // renewal, because Seer is then the authority that matters. Any
+            // other failure stays fatal.
+            if let Err(e) = api.create(zone, &DesiredRecord { name: rec_name.clone(), rtype: "TXT".into(), value: value.clone(), ttl: 60 }).await {
+                // The gate must be the LIVE delegation state, never static
+                // zone config: below the capable-NS floor the api delegation
+                // deliberately disengages back to the flat A set (Vercel
+                // authoritative again), and swallowing a 409 THERE would
+                // place nothing at the authority that matters and fail the
+                // order opaquely minutes later at LE validation
+                // (adversarial-review confirmed). The reconciler stamps these
+                // gauges every pass on this same node (the single designation
+                // leads ACME and DNS reconcile together).
+                let conflict = e.to_string().contains("409");
+                let under = |z: Option<&str>| z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}"))).unwrap_or(false);
+                let delegated_live = (under(crate::dnsserver::deploy_zone())
+                    && crate::vercel_dns::STATS.geo_delegation_records.load(std::sync::atomic::Ordering::Relaxed) > 0)
+                    || (under(crate::dnsserver::api_zone())
+                        && crate::vercel_dns::STATS.api_delegation_records.load(std::sync::atomic::Ordering::Relaxed) > 0);
+                if conflict && delegated_live {
+                    tracing::warn!(%fqdn, error = %e, "ACME dns-01 Vercel TXT refused under a live-Seer-delegated name — proceeding via the challenge store");
+                } else {
+                    return Err(e);
+                }
+            }
+            challenges.insert(&fqdn, &value);
             tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via Vercel API + Seer challenge store");
             txt_names.push((rec_name, value));
         }

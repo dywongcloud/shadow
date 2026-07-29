@@ -38,6 +38,21 @@ use crate::state::CloudState;
 /// withdrawn (flap damping).
 pub const UNHEALTHY_PASSES_BEFORE_WITHDRAW: u32 = 2;
 
+/// How many consecutive HEALTHY passes a withdrawn node needs before its
+/// records are republished (re-add flap damping). Paired with the withdraw
+/// threshold this collapses the create/delete treadmill a flapping node
+/// otherwise drives across every managed name — live-witnessed 2026-07-29: a
+/// post-roll reconvergence flapped five nodes in and out of the healthy set
+/// and the reconciler burned 6–15 Vercel writes per ~30s pass, drew sustained
+/// 429s, and briefly DELETED real address records mid-treadmill.
+pub const HEALTHY_PASSES_BEFORE_REPUBLISH: u32 = 2;
+
+/// Minimum age before an `_acme-challenge.*` TXT unknown to the in-flight
+/// challenge store may be swept as an orphan. ACME orders complete in minutes,
+/// so 15 minutes is far outside any legitimate order while still protecting a
+/// record whose placement just raced the pass's own zone listing.
+const ACME_ORPHAN_MIN_AGE_MS: u64 = 15 * 60 * 1000;
+
 /// A DNS record as it exists at Vercel (subset we care about).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordView {
@@ -47,6 +62,10 @@ pub struct RecordView {
     /// `A` | `AAAA` | `TXT` | …
     pub rtype: String,
     pub value: String,
+    /// Vercel's creation timestamp (ms epoch) when the API reports it. The ACME
+    /// orphan sweeper uses it as a minimum-age gate so a just-placed challenge
+    /// is never swept from under an in-flight order.
+    pub created_ms: Option<u64>,
 }
 
 /// A record we want to exist.
@@ -144,6 +163,10 @@ impl DnsApi for VercelApi {
                                 name: r.get("name")?.as_str()?.to_string(),
                                 rtype: r.get("type")?.as_str()?.to_string(),
                                 value: r.get("value")?.as_str()?.to_string(),
+                                created_ms: r
+                                    .get("created")
+                                    .and_then(|c| c.as_u64())
+                                    .or_else(|| r.get("createdAt").and_then(|c| c.as_u64())),
                             })
                         })
                         .collect()
@@ -668,6 +691,11 @@ pub struct ReconcilerStats {
     pub last_pass_ms: AtomicU64,
     /// NS+glue records published for the delegated geo zone (0 = undelegated).
     pub geo_delegation_records: AtomicU64,
+    /// NS records published for the `api` label delegation this pass
+    /// (0 = not delegated — the flat A set is published instead). Read by
+    /// acme.rs's delegated-zone best-effort gate, which must key on the LIVE
+    /// delegation state, never static zone config.
+    pub api_delegation_records: AtomicU64,
     /// Nodes whose `dns_ns` claim is currently backed by peer proof.
     pub geo_ns_validated: AtomicU64,
     /// Nodes CLAIMING `dns_ns` that no peer set currently proves — the count an
@@ -677,6 +705,15 @@ pub struct ReconcilerStats {
     /// nameservers were proven (see `desired_geo_delegation`). A number that
     /// keeps climbing means the zone is running on last-known-good NS records.
     pub geo_delegation_holds: AtomicU64,
+    /// Delegation cutovers completed by the never-dark transaction (flat
+    /// addresses removed AND the full NS set confirmed created, same pass).
+    pub delegation_cutovers: AtomicU64,
+    /// Cutover attempts rolled back: an NS create failed after the flat
+    /// addresses were removed, so the addresses were immediately restored.
+    /// A climbing counter means a delegation is RETRYING, not stranding.
+    pub delegation_cutover_rollbacks: AtomicU64,
+    /// Orphaned `_acme-challenge.*` TXT records swept (no in-flight order).
+    pub acme_orphans_swept: AtomicU64,
 }
 
 pub static STATS: ReconcilerStats = ReconcilerStats {
@@ -690,9 +727,13 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     region_records: AtomicU64::new(0),
     last_pass_ms: AtomicU64::new(0),
     geo_delegation_records: AtomicU64::new(0),
+    api_delegation_records: AtomicU64::new(0),
     geo_ns_validated: AtomicU64::new(0),
     geo_ns_unproven: AtomicU64::new(0),
     geo_delegation_holds: AtomicU64::new(0),
+    delegation_cutovers: AtomicU64::new(0),
+    delegation_cutover_rollbacks: AtomicU64::new(0),
+    acme_orphans_swept: AtomicU64::new(0),
 };
 
 /// Upper bound on deployment-affinity records. Vercel rate-limits record
@@ -739,37 +780,186 @@ pub struct NodeView {
     pub dashboard: bool,
 }
 
-/// The publishable node set with flap damping: a node stays published while its
-/// consecutive-unhealthy streak is below the threshold. Pure; unit-tested.
-pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Vec<PublishNode> {
+/// Two-sided flap-damping state for `publishable`. One struct so the withdraw
+/// streaks, republish streaks, and withdrawn set can't drift apart across
+/// passes.
+#[derive(Default)]
+pub struct PublishDamping {
+    /// Consecutive-unhealthy streak per node (drives withdrawal).
+    unhealthy: HashMap<String, u32>,
+    /// Consecutive-healthy streak per WITHHELD node (drives re-admission).
+    healthy: HashMap<String, u32>,
+    /// Nodes currently withdrawn from the published set. Once here, the ONLY
+    /// way back is `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive healthy
+    /// passes — a single damped unhealthy pass must not fling the door back
+    /// open, or a flapping node keeps churning writes at half rate.
+    withheld: std::collections::HashSet<String>,
+}
+
+/// The publishable node set with two-sided flap damping: a node stays published
+/// while its consecutive-unhealthy streak is below the withdraw threshold, and
+/// — once withdrawn — re-enters only after `HEALTHY_PASSES_BEFORE_REPUBLISH`
+/// consecutive healthy passes. Withdrawals stay fast (a dead node must drain),
+/// re-adds are what get damped (a returning node must prove it's stable), so a
+/// flapping node can no longer drive a create/delete write treadmill against
+/// the DNS API. A node seen for the FIRST time healthy publishes immediately —
+/// new nodes must not wait. Pure; unit-tested.
+pub fn publishable(nodes: &[NodeView], damping: &mut PublishDamping) -> Vec<PublishNode> {
     let mut out = Vec::new();
     for n in nodes {
         if n.ip4.is_none() && n.ip6.is_none() {
             continue; // never publishable without a public IP
         }
-        let streak = streaks.entry(n.name.clone()).or_insert(0);
         if n.healthy {
-            *streak = 0;
+            damping.unhealthy.insert(n.name.clone(), 0);
+            if damping.withheld.contains(&n.name) {
+                let streak = damping.healthy.entry(n.name.clone()).or_insert(0);
+                *streak = streak.saturating_add(1);
+                if *streak >= HEALTHY_PASSES_BEFORE_REPUBLISH {
+                    damping.withheld.remove(&n.name);
+                    damping.healthy.remove(&n.name);
+                } else {
+                    continue; // still earning its way back into the set
+                }
+            }
         } else {
+            damping.healthy.insert(n.name.clone(), 0);
+            let streak = damping.unhealthy.entry(n.name.clone()).or_insert(0);
             *streak = streak.saturating_add(1);
+            if *streak >= UNHEALTHY_PASSES_BEFORE_WITHDRAW {
+                damping.withheld.insert(n.name.clone());
+            }
+            if damping.withheld.contains(&n.name) {
+                continue;
+            }
         }
-        if n.healthy || *streak < UNHEALTHY_PASSES_BEFORE_WITHDRAW {
-            out.push(PublishNode {
-                name: n.name.clone(),
-                ip4: n.ip4.clone(),
-                ip6: n.ip6.clone(),
-                region: n.region.clone(),
-                dns_ns: n.dns_ns,
-                dns_api: n.dns_api,
-                dns_validated: n.dns_validated,
-                dashboard: n.dashboard,
-            });
-        }
+        out.push(PublishNode {
+            name: n.name.clone(),
+            ip4: n.ip4.clone(),
+            ip6: n.ip6.clone(),
+            region: n.region.clone(),
+            dns_ns: n.dns_ns,
+            dns_api: n.dns_api,
+            dns_validated: n.dns_validated,
+            dashboard: n.dashboard,
+        });
     }
-    // Drop streak entries for nodes that vanished from the registry entirely.
+    // Drop damping state for nodes that vanished from the registry entirely.
     let known: std::collections::HashSet<&String> = nodes.iter().map(|n| &n.name).collect();
-    streaks.retain(|k, _| known.contains(k));
+    damping.unhealthy.retain(|k, _| known.contains(k));
+    damping.healthy.retain(|k, _| known.contains(k));
+    damping.withheld.retain(|k| known.contains(k));
     out
+}
+
+/// The write plan for one pass, ordered so neither a delegation cutover nor a
+/// disengagement can strand a name with NEITHER addresses NOR delegation at
+/// the parent. Vercel forbids NS records coexisting with any other record on
+/// one name — and forbids CREATING one while anything else sits on the name
+/// (live-witnessed 2026-07-29: every NS create for `api` 409'd against the
+/// flat A set, and the hold-exempted A-delete then stranded `api.shadw.cloud`
+/// dark for ~90 minutes) — so both transitions are sequenced explicitly:
+/// cutovers run as restore-on-failure transactions, and disengagement deletes
+/// NS BEFORE the flat addresses are re-created (with a symmetric NS restore
+/// when those address creates fail). Pure; unit-tested.
+struct WritePlan {
+    /// NS deletes that must precede any address create (a TRUE disengagement
+    /// only: the name has NO desired NS, so the delegation frees it for the
+    /// flat set). A rotation on a name that STAYS delegated is deliberately
+    /// NOT hoisted — the replacement NS is created before the old one is
+    /// removed, so the set never dips below its target count.
+    ns_deletes_first: Vec<String>,
+    /// Per delegated name: every record currently blocking its NS creation
+    /// (the address set PLUS any squatter — foreign NS target, CNAME, ALIAS,
+    /// stray TXT; any of them 409s the NS create) + the NS records to create,
+    /// executed as ONE transaction with full restore on failure.
+    cutovers: Vec<(String, Vec<RecordView>, Vec<DesiredRecord>)>,
+    /// Everything else, in the usual creates-then-deletes order.
+    creates: Vec<DesiredRecord>,
+    deletes: Vec<String>,
+}
+
+fn plan_writes(
+    current: &[RecordView],
+    desired: &[DesiredRecord],
+    managed_names: &[&str],
+    mut creates: Vec<DesiredRecord>,
+    mut deletes: Vec<String>,
+) -> WritePlan {
+    let by_id: HashMap<&str, &RecordView> = current.iter().map(|r| (r.id.as_str(), r)).collect();
+    let norm = |v: &str| v.trim().trim_end_matches('.').to_ascii_lowercase();
+    let mut cutovers = Vec::new();
+    // Names this pass wants NS-delegated (desired carries NS for them).
+    let delegated: Vec<&str> = managed_names
+        .iter()
+        .copied()
+        .filter(|n| desired.iter().any(|d| d.name == *n && d.rtype == "NS"))
+        .collect();
+    for name in delegated {
+        // Desired NS not yet present at the parent.
+        let missing_ns: Vec<DesiredRecord> = desired
+            .iter()
+            .filter(|d| d.name == name && d.rtype == "NS")
+            .filter(|d| !current.iter().any(|r| r.name == name && r.rtype == "NS" && norm(&r.value) == norm(&d.value)))
+            .cloned()
+            .collect();
+        if missing_ns.is_empty() {
+            continue; // already fully delegated — normal flow
+        }
+        // EVERYTHING currently on the name that an NS create would 409
+        // against: the address set AND any squatter (CNAME, ALIAS, stray
+        // TXT). Leaving a squatter out of the transaction deadlocks the
+        // cutover into a rollback loop every pass while the squatter blocks
+        // NS creation forever (adversarial-review confirmed). NS records are
+        // NEVER blockers — an RRset grows by adding members (the live 8-NS
+        // deploy delegation was built exactly that way), so a foreign target
+        // rides the normal creates-then-deletes flow instead.
+        let blockers: Vec<RecordView> = current
+            .iter()
+            .filter(|r| r.name == name)
+            .filter(|r| match r.rtype.as_str() {
+                "A" | "AAAA" => true,
+                "NS" => false,
+                _ => true,
+            })
+            .map(|r| (*r).clone())
+            .collect();
+        if blockers.is_empty() {
+            continue; // nothing blocks — the NS creates flow normally
+        }
+        let blocker_ids: std::collections::HashSet<&str> = blockers.iter().map(|r| r.id.as_str()).collect();
+        deletes.retain(|id| !blocker_ids.contains(id.as_str()));
+        creates.retain(|c| !(c.name == name && c.rtype == "NS" && missing_ns.iter().any(|m| m.value == c.value)));
+        cutovers.push((name.to_string(), blockers, missing_ns));
+    }
+    // NS deletes are hoisted ONLY for names with NO desired NS (a true
+    // disengagement freeing the name for its flat set). Rotation on a name
+    // that stays delegated keeps normal creates-then-deletes order.
+    let (ns_first, rest): (Vec<String>, Vec<String>) = deletes.into_iter().partition(|id| {
+        by_id
+            .get(id.as_str())
+            .map(|r| r.rtype == "NS" && !desired.iter().any(|d| d.name == r.name && d.rtype == "NS"))
+            .unwrap_or(false)
+    });
+    WritePlan { ns_deletes_first: ns_first, cutovers, creates, deletes: rest }
+}
+
+/// Is this `_acme-challenge.*` TXT an orphan candidate? The replicated
+/// challenge store is the placement source of truth; the 15-minute age gate is
+/// benefit-of-the-doubt for placement racing the pass's own zone listing — and
+/// a record whose age the API does not report (Vercel's schema marks
+/// `created`/`createdAt` NULLABLE) gets the SAME doubt: a delete is forever,
+/// so doubt always means KEEP (adversarial-review confirmed the fail-open
+/// alternative could sweep a live in-flight challenge after a leadership
+/// flap). Pure; unit-tested.
+fn is_orphan_candidate(in_flight: bool, created_ms: Option<u64>, now_ms: u64) -> bool {
+    if in_flight {
+        return false;
+    }
+    match created_ms {
+        Some(c) => now_ms.saturating_sub(c) >= ACME_ORPHAN_MIN_AGE_MS,
+        None => false,
+    }
 }
 
 /// One reconcile pass over one zone. Returns Err on API failure (caller backs off).
@@ -845,7 +1035,39 @@ async fn reconcile_zone<A: DnsApi>(
         }
         kept
     };
-    if creates.is_empty() && deletes.is_empty() {
+    // ACME DNS-01 orphan sweep — runs EVERY pass, converged or not. Issuance
+    // cleanup races Vercel's eventually-consistent listing (create returns
+    // before list shows the record), so a finished order's TXT can survive
+    // cleanup and sit under its name forever — live-witnessed 2026-07-29: an
+    // orphaned `_acme-challenge.api` TXT made Vercel answer every NS create
+    // for the api delegation with 409 record_conflicts ("child records
+    // exist"), stranding api.shadw.cloud dark. Any `_acme-challenge.*` TXT
+    // whose value is NOT an in-flight challenge (the replicated store is the
+    // placement source of truth) and older than the minimum age is an orphan:
+    // delete it here, where the zone listing already exists, instead of
+    // letting it veto a future delegation.
+    let now_ms = hive_core::now_ms();
+    for r in current
+        .iter()
+        .filter(|r| r.rtype == "TXT" && (r.name == "_acme-challenge" || r.name.starts_with("_acme-challenge.")))
+    {
+        let fqdn = format!("{}.{}", r.name, domain);
+        if !is_orphan_candidate(!cloud.acme_challenges.lookup(&fqdn).is_empty(), r.created_ms, now_ms) {
+            continue;
+        }
+        match api.delete(domain, &r.id).await {
+            Ok(_) => {
+                STATS.acme_orphans_swept.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(%domain, name = %r.name, id = %r.id, "swept orphaned ACME dns-01 TXT (no in-flight order)");
+            }
+            Err(e) => {
+                tracing::warn!(%domain, id = %r.id, error = %e, "ACME orphan sweep delete failed; retried next pass");
+            }
+        }
+    }
+
+    let plan = plan_writes(&current, desired, managed_names, creates, deletes);
+    if plan.ns_deletes_first.is_empty() && plan.cutovers.is_empty() && plan.creates.is_empty() && plan.deletes.is_empty() {
         return Ok(()); // converged — write nothing
     }
     // Creates are PACED and individually fault-tolerant. Previously this was a
@@ -858,8 +1080,116 @@ async fn reconcile_zone<A: DnsApi>(
     // up next pass; the pass still reports failure at the end so the caller's
     // backoff (and the error log) still happen.
     let mut failed: Option<anyhow::Error> = None;
+
+    // Phase 0: a disengaging delegation's NS deletes free the name for any
+    // address creates below (Vercel forbids NS and address records coexisting
+    // on one name). The deleted NS records are REMEMBERED per name: if the
+    // flat-address creates for that name then ALL fail (sustained 429s), the
+    // delegation is restored below — the never-dark rule is symmetric, or a
+    // fleet roll dipping the capable set below floor would strand the api
+    // label for a whole backoff interval (adversarial-review confirmed).
+    let by_id: HashMap<&str, &RecordView> = current.iter().map(|r| (r.id.as_str(), r)).collect();
+    let mut disengaged_ns: HashMap<&str, Vec<&RecordView>> = HashMap::new();
+    for id in &plan.ns_deletes_first {
+        if let Err(e) = api.delete(domain, id).await {
+            tracing::warn!(%domain, id = %id, error = %e, "DNS delete failed; continuing (retried next pass)");
+            if failed.is_none() {
+                failed = Some(e);
+            }
+            continue;
+        }
+        STATS.deletes.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = by_id.get(id.as_str()) {
+            disengaged_ns.entry(r.name.as_str()).or_default().push(r);
+        }
+    }
+
+    // Phase 1: delegation cutovers as restore-on-failure transactions — the
+    // NEVER-DARK rule. The name's flat addresses must go before Vercel accepts
+    // its NS records, so the dark window is bounded to this one transaction;
+    // if ANY NS create fails, every NS placed here is removed and every
+    // address record restored immediately, leaving the name exactly as it was
+    // (last-known-good) for next pass's retry.
+    for (name, addr_records, ns_records) in &plan.cutovers {
+        let mut deleted_addr: Vec<&RecordView> = Vec::new();
+        for r in addr_records {
+            match api.delete(domain, &r.id).await {
+                Ok(_) => {
+                    STATS.deletes.fetch_add(1, Ordering::Relaxed);
+                    deleted_addr.push(r);
+                }
+                Err(e) => {
+                    tracing::warn!(%domain, name = %name, id = %r.id, error = %e, "cutover: address delete failed; continuing (retried next pass)");
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
+                }
+            }
+        }
+        let mut created_ns_ids: Vec<String> = Vec::new();
+        let mut ns_ok = true;
+        for (i, rec) in ns_records.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(CREATE_PACING).await;
+            }
+            match api.create(domain, rec).await {
+                Ok(id) => {
+                    STATS.creates.fetch_add(1, Ordering::Relaxed);
+                    created_ns_ids.push(id);
+                }
+                Err(e) => {
+                    tracing::warn!(%domain, name = %name, error = %e, "delegation cutover: NS create failed — rolling back");
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
+                    ns_ok = false;
+                    break;
+                }
+            }
+        }
+        if ns_ok {
+            STATS.delegation_cutovers.fetch_add(1, Ordering::Relaxed);
+            tracing::info!(%domain, name = %name, ns = ns_records.len(), "delegation cutover complete: flat addresses removed, full NS set confirmed created");
+            continue;
+        }
+        STATS.delegation_cutover_rollbacks.fetch_add(1, Ordering::Relaxed);
+        // Roll back: remove the partial NS (both what this pass created AND
+        // any leftovers already present — either blocks the address restores)
+        // before re-creating the flat addresses.
+        let leftover_ns: Vec<&RecordView> =
+            current.iter().filter(|r| r.name == *name && r.rtype == "NS").collect();
+        for id in created_ns_ids.iter().map(|s| s.as_str()).chain(leftover_ns.iter().map(|r| r.id.as_str())) {
+            if let Err(e) = api.delete(domain, id).await {
+                tracing::warn!(%domain, name = %name, id = %id, error = %e, "cutover rollback: partial-NS delete failed; continuing");
+                if failed.is_none() {
+                    failed = Some(e);
+                }
+            }
+        }
+        for r in &deleted_addr {
+            let restore =
+                DesiredRecord { name: r.name.clone(), rtype: r.rtype.clone(), value: r.value.clone(), ttl: 60 };
+            tokio::time::sleep(CREATE_PACING).await;
+            match api.create(domain, &restore).await {
+                Ok(_) => {
+                    STATS.creates.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(%domain, name = %r.name, error = %e, "cutover rollback: address restore failed (retried next pass)");
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
+                }
+            }
+        }
+        tracing::error!(%domain, name = %name, "delegation cutover ROLLED BACK — flat addresses restored, NS delegation retries next pass");
+    }
+
+    // Phase 2: the ordinary creates-then-deletes flow for everything else.
     let mut created = 0usize;
-    for (i, rec) in creates.iter().enumerate() {
+    let mut addr_create_ok: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut addr_create_failed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for (i, rec) in plan.creates.iter().enumerate() {
         if i > 0 {
             tokio::time::sleep(CREATE_PACING).await;
         }
@@ -867,9 +1197,15 @@ async fn reconcile_zone<A: DnsApi>(
             Ok(_) => {
                 created += 1;
                 STATS.creates.fetch_add(1, Ordering::Relaxed);
+                if rec.rtype == "A" || rec.rtype == "AAAA" {
+                    addr_create_ok.insert(rec.name.as_str());
+                }
             }
             Err(e) => {
                 tracing::warn!(%domain, name = %rec.name, rtype = %rec.rtype, error = %e, "DNS create failed; continuing (retried next pass)");
+                if rec.rtype == "A" || rec.rtype == "AAAA" {
+                    addr_create_failed.insert(rec.name.as_str());
+                }
                 if failed.is_none() {
                     failed = Some(e);
                 }
@@ -877,9 +1213,38 @@ async fn reconcile_zone<A: DnsApi>(
         }
     }
     if created > 0 {
-        tracing::info!(%domain, created, remaining = creates.len() - created, "DNS reconciler: records created");
+        tracing::info!(%domain, created, remaining = plan.creates.len() - created, "DNS reconciler: records created");
     }
-    for id in &deletes {
+    // Disengagement rollback (symmetric never-dark): a name whose NS records
+    // were deleted in phase 0 and whose flat-address creates then ALL failed
+    // gets its delegation BACK — the child zone keeps answering while the
+    // flat set retries next pass. When at least one address create succeeded,
+    // coexistence forbids the NS restore and the partial address set serves
+    // (degraded, not dark) until the next pass completes it.
+    for (name, ns_records) in disengaged_ns {
+        if !addr_create_failed.contains(name) || addr_create_ok.contains(name) {
+            continue;
+        }
+        STATS.delegation_cutover_rollbacks.fetch_add(1, Ordering::Relaxed);
+        for r in ns_records {
+            let restore =
+                DesiredRecord { name: r.name.clone(), rtype: "NS".into(), value: r.value.clone(), ttl: 300 };
+            tokio::time::sleep(CREATE_PACING).await;
+            match api.create(domain, &restore).await {
+                Ok(_) => {
+                    STATS.creates.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(%domain, name = %name, error = %e, "disengagement rollback: NS restore failed (retried next pass)");
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
+                }
+            }
+        }
+        tracing::error!(%domain, name = %name, "disengagement ROLLED BACK — NS delegation restored, flat addresses retry next pass");
+    }
+    for id in &plan.deletes {
         // Same fault-tolerance as creates: one failed delete must not abort the
         // pass and strand the rest (deletes are also rate-limited).
         if let Err(e) = api.delete(domain, id).await {
@@ -897,7 +1262,7 @@ async fn reconcile_zone<A: DnsApi>(
         return Err(e);
     }
     let published: Vec<String> = desired.iter().map(|r| format!("{} {} {}", r.name, r.rtype, r.value)).collect();
-    tracing::info!(%domain, created = created, deleted = deletes.len(), published = ?published, "DNS reconciled");
+    tracing::info!(%domain, created = created, deleted = plan.deletes.len(), published = ?published, "DNS reconciled");
     Ok(())
 }
 
@@ -917,7 +1282,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
     let interval = std::env::var("HIVE_DNS_RECONCILE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
     tracing::info!(interval, apps = %cloud.apps_domain, platform = %cloud.platform_domain, "Vercel DNS reconciler up (leader-elected)");
     tokio::spawn(async move {
-        let mut streaks: HashMap<String, u32> = HashMap::new();
+        let mut damping = PublishDamping::default();
         let mut backoff: u64 = 0; // consecutive failures
         // Edge-trigger for the "delegation held" incident (see the call site).
         let mut geo_hold_active = false;
@@ -985,7 +1350,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     region: n.region.clone(),
                 })
                 .collect();
-            let publish = publishable(&nodes, &mut streaks);
+            let publish = publishable(&nodes, &mut damping);
             let relay_ips = env_ips("HIVE_RELAY_IPS");
             let discovery_ips = env_ips("HIVE_DISCOVERY_IPS");
             let mut apps = desired_apps(&publish);
@@ -1087,6 +1452,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // the floor, the flat set stays — self-healing in both directions
             // as the fleet rolls or the capable set shrinks.
             let api_delegation = desired_api_delegation(&publish, &cloud.apps_domain);
+            STATS.api_delegation_records.store(api_delegation.len() as u64, Ordering::Relaxed);
             let delegate_api = !api_delegation.is_empty();
             let mut platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard, delegate_api);
             platform.extend(api_delegation);
@@ -1214,7 +1580,7 @@ mod tests {
     use super::*;
 
     fn rv(id: &str, name: &str, t: &str, v: &str) -> RecordView {
-        RecordView { id: id.into(), name: name.into(), rtype: t.into(), value: v.into() }
+        RecordView { id: id.into(), name: name.into(), rtype: t.into(), value: v.into(), created_ms: None }
     }
     fn dr(name: &str, t: &str, v: &str) -> DesiredRecord {
         DesiredRecord { name: name.into(), rtype: t.into(), value: v.into(), ttl: 60 }
@@ -1273,8 +1639,8 @@ mod tests {
     }
 
     #[test]
-    fn damping_withdraws_only_after_k_passes() {
-        let mut streaks = HashMap::new();
+    fn damping_withdraws_after_k_and_damps_readd() {
+        let mut damping = PublishDamping::default();
         let view = |healthy| {
             vec![NodeView {
                 dashboard: false,
@@ -1289,19 +1655,158 @@ mod tests {
             }]
         };
         let (up, down) = (view(true), view(false));
-        assert_eq!(publishable(&up, &mut streaks).len(), 1);
-        // 1st unhealthy pass: still published (damping)
-        assert_eq!(publishable(&down, &mut streaks).len(), 1);
+        // First-sight healthy publishes immediately — new nodes never wait.
+        assert_eq!(publishable(&up, &mut damping).len(), 1);
+        // 1st unhealthy pass: still published (withdraw damping)
+        assert_eq!(publishable(&down, &mut damping).len(), 1);
         // 2nd unhealthy pass: withdrawn
-        assert_eq!(publishable(&down, &mut streaks).len(), 0);
-        // recovery resets the streak instantly
-        assert_eq!(publishable(&up, &mut streaks).len(), 1);
-        assert_eq!(publishable(&down, &mut streaks).len(), 1);
+        assert_eq!(publishable(&down, &mut damping).len(), 0);
+        // Re-add is damped: one healthy pass is not enough...
+        assert_eq!(publishable(&up, &mut damping).len(), 0);
+        // ...two consecutive healthy passes republish.
+        assert_eq!(publishable(&up, &mut damping).len(), 1);
+        // And once back, the withdraw window re-arms.
+        assert_eq!(publishable(&down, &mut damping).len(), 1);
+    }
+
+    #[test]
+    fn damping_flapping_node_stays_withheld() {
+        // The treadmill this two-sided damping exists to kill: a node flapping
+        // healthy/unhealthy must NOT re-enter on every healthy blip — once
+        // withheld, only sustained health republishes it.
+        let mut damping = PublishDamping::default();
+        let view = |healthy| {
+            vec![NodeView {
+                dashboard: false,
+                dns_ns: false,
+                dns_api: false,
+                dns_validated: false,
+                name: "flap".into(),
+                healthy,
+                ip4: Some("1.1.1.1".into()),
+                ip6: None,
+                region: "san-jose".into(),
+            }]
+        };
+        let (up, down) = (view(true), view(false));
+        assert_eq!(publishable(&up, &mut damping).len(), 1);
+        // Drive it out: two unhealthy passes.
+        assert_eq!(publishable(&down, &mut damping).len(), 1);
+        assert_eq!(publishable(&down, &mut damping).len(), 0);
+        // Flap: healthy, unhealthy, healthy — a single damped unhealthy pass
+        // must not fling the door back open either.
+        assert_eq!(publishable(&up, &mut damping).len(), 0);
+        assert_eq!(publishable(&down, &mut damping).len(), 0);
+        assert_eq!(publishable(&up, &mut damping).len(), 0);
+        // Only sustained health returns it.
+        assert_eq!(publishable(&up, &mut damping).len(), 1);
+    }
+
+    #[test]
+    fn plan_writes_packs_cutover_transaction() {
+        // Delegation cutover: api has flat A records at the parent, desired
+        // wants NS instead — the pair must come out of the ordinary flow as
+        // ONE restore-on-failure transaction.
+        let current = vec![rv("a1", "api", "A", "9.9.9.9"), rv("a2", "api", "A", "8.8.8.8")];
+        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let (creates, deletes) = diff(&current, &desired, &["api"]);
+        assert_eq!(creates.len(), 2);
+        assert_eq!(deletes.len(), 2);
+        let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
+        assert_eq!(plan.cutovers.len(), 1);
+        let (name, addr, ns) = &plan.cutovers[0];
+        assert_eq!(name, "api");
+        assert_eq!(addr.len(), 2, "both flat addresses ride the transaction");
+        assert_eq!(ns.len(), 2, "both missing NS ride the transaction");
+        assert!(plan.creates.is_empty() && plan.deletes.is_empty() && plan.ns_deletes_first.is_empty());
+    }
+
+    #[test]
+    fn plan_writes_ns_deletes_precede_address_creates() {
+        // Disengagement: api is delegated (NS present), desired wants the flat
+        // A set back — the NS delete must run FIRST or the A create 409s.
+        let current = vec![rv("n1", "api", "NS", "ns-n1.shadw.app."), rv("n2", "api", "NS", "ns-n2.shadw.app.")];
+        let desired = vec![dr("api", "A", "1.1.1.1")];
+        let (creates, deletes) = diff(&current, &desired, &["api"]);
+        let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
+        assert_eq!(plan.ns_deletes_first.len(), 2);
+        assert_eq!(plan.creates.len(), 1);
+        assert!(plan.cutovers.is_empty() && plan.deletes.is_empty());
+    }
+
+    #[test]
+    fn plan_writes_complete_delegation_flows_normally() {
+        // Already fully delegated (both NS present) with a leftover address
+        // record to clean: no transaction needed, ordinary flow.
+        let current = vec![
+            rv("n1", "api", "NS", "ns-n1.shadw.app."),
+            rv("n2", "api", "NS", "ns-n2.shadw.app."),
+            rv("a1", "api", "A", "9.9.9.9"),
+        ];
+        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let (creates, deletes) = diff(&current, &desired, &["api"]);
+        let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
+        assert!(plan.cutovers.is_empty(), "complete NS set = no cutover transaction");
+        assert!(plan.creates.is_empty());
+        assert_eq!(plan.deletes.len(), 1, "the stale address delete flows normally");
+    }
+
+    #[test]
+    fn plan_writes_rotation_does_not_hoist_ns_deletes() {
+        // NS-target ROTATION on a name that stays delegated: the replacement
+        // must be created BEFORE the old target is removed, or the set dips
+        // below its target count (adversarial-review confirmed the hoist
+        // opened a below-floor window). Hoisting is only for names with NO
+        // desired NS (true disengagement).
+        let current = vec![rv("n1", "api", "NS", "ns-old.shadw.app."), rv("n2", "api", "NS", "ns-old2.shadw.app.")];
+        let desired = vec![dr("api", "NS", "ns-new.shadw.app"), dr("api", "NS", "ns-old2.shadw.app")];
+        let (creates, deletes) = diff(&current, &desired, &["api"]);
+        let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
+        assert!(plan.ns_deletes_first.is_empty(), "rotation keeps creates-then-deletes order");
+        assert!(plan.cutovers.is_empty(), "no address blockers -> no transaction");
+        assert_eq!(plan.creates.len(), 1, "the replacement NS flows as a normal create");
+        assert_eq!(plan.deletes.len(), 1, "the retired NS flows as a normal delete");
+    }
+
+    #[test]
+    fn plan_writes_packs_squatters_into_cutover() {
+        // A squatter that is neither an address nor a desired NS (CNAME,
+        // ALIAS, stray TXT, foreign NS target) 409s the NS create exactly
+        // like an address does — it must ride the transaction's
+        // delete+restore set or the cutover rollback-loops forever.
+        let current = vec![
+            rv("a1", "api", "A", "9.9.9.9"),
+            rv("s1", "api", "CNAME", "squat.example.com."),
+            rv("s2", "api", "TXT", "verify-me"),
+            rv("s3", "api", "NS", "ns-foreign.shadw.app."),
+        ];
+        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let (creates, deletes) = diff(&current, &desired, &["api"]);
+        let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
+        assert_eq!(plan.cutovers.len(), 1);
+        let (name, blockers, ns) = &plan.cutovers[0];
+        assert_eq!(name, "api");
+        assert_eq!(blockers.len(), 3, "address + CNAME + stray TXT ride the transaction");
+        assert_eq!(ns.len(), 2);
+        assert!(plan.creates.is_empty());
+        assert_eq!(plan.deletes.len(), 1, "the foreign NS target is no blocker — it leaves as a normal delete");
+    }
+
+    #[test]
+    fn orphan_candidate_conservative_rules() {
+        let now = 1_000_000u64;
+        let old = Some(now - ACME_ORPHAN_MIN_AGE_MS - 1);
+        let young = Some(now - ACME_ORPHAN_MIN_AGE_MS + 1);
+        assert!(!is_orphan_candidate(true, old, now), "in-flight is never swept");
+        assert!(!is_orphan_candidate(true, None, now));
+        assert!(is_orphan_candidate(false, old, now), "store-unknown + provably old = orphan");
+        assert!(!is_orphan_candidate(false, young, now), "store-unknown but brand-new: keep");
+        assert!(!is_orphan_candidate(false, None, now), "age unknowable (schema-nullable): keep — deletes are forever");
     }
 
     #[test]
     fn no_public_ip_never_published() {
-        let mut streaks = HashMap::new();
+        let mut damping = PublishDamping::default();
         let nodes = vec![NodeView {
             dns_ns: false,
             dns_api: false,
@@ -1313,7 +1818,7 @@ mod tests {
             ip6: None,
             region: "bangkok".into(),
         }];
-        assert!(publishable(&nodes, &mut streaks).is_empty());
+        assert!(publishable(&nodes, &mut damping).is_empty());
     }
 
     #[test]
@@ -1369,7 +1874,7 @@ mod tests {
             *id += 1;
             *self.creates.lock().unwrap() += 1;
             let rid = id.to_string();
-            self.records.lock().unwrap().push(RecordView { id: rid.clone(), name: rec.name.clone(), rtype: rec.rtype.clone(), value: rec.value.clone() });
+            self.records.lock().unwrap().push(RecordView { id: rid.clone(), name: rec.name.clone(), rtype: rec.rtype.clone(), value: rec.value.clone(), created_ms: None });
             Ok(rid)
         }
         async fn delete(&self, _d: &str, id: &str) -> anyhow::Result<()> {
