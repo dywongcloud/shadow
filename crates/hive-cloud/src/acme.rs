@@ -542,7 +542,28 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                                 tracing::info!(%bundle, zones = ?installed_zones(), "certificate installed + replicated");
                             }
                         }
-                        Err(e) => tracing::warn!(error = %e, %bundle, "ACME issuance failed (will retry next pass)"),
+                        Err(e) => {
+                            // A Let's Encrypt rate-limit is a BUDGET event, not a
+                            // transient: the duplicate-certificate window (5 per
+                            // 168h per exact identifier set) closes the bundle
+                            // until the window opens — live-witnessed 2026-07-29
+                            // after five forced renewals in a week ('retry after
+                            // 2026-07-30 10:06:58 UTC'), which also silently
+                            // disarmed the acme-force sentinel path. Warn alone
+                            // buried that; make it an incident so the operator
+                            // sees the window (and that force-renewals spend it).
+                            if e.to_string().contains("rateLimited") {
+                                cloud.incidents.open(crate::incidents::OpenReq {
+                                    title: format!("ACME rate-limited by Let's Encrypt ({bundle})"),
+                                    severity: crate::incidents::Severity::Major,
+                                    affected: vec!["tls".into(), "acme".into()],
+                                    message: format!(
+                                        "Issuance of the {bundle} bundle hit an LE rate limit — the bundle cannot renew (including via the acme-force sentinel) until the window opens. Error: {e}"
+                                    ),
+                                });
+                            }
+                            tracing::warn!(error = %e, %bundle, "ACME issuance failed (will retry next pass)");
+                        }
                     }
                 }
             }
