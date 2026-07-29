@@ -805,10 +805,24 @@ async fn reconcile_zone<A: DnsApi>(
     // publishing only relay/discovery and blackholing the domain behind
     // Vercel's wildcard ALIAS while the real leader raced to re-create them).
     // Never delete a name's address records while desiring NO addresses for it.
+    //
+    // A desired NS delegation counts as "this name is deliberately
+    // address-less at the parent" — its addresses live in the child zone.
+    // Without that exemption this hold DEADLOCKS the delegation cutover,
+    // live-witnessed on the api label: the hold refused to delete the flat
+    // api A set (zero desired A/AAAA once delegate_api engaged) while Vercel
+    // answered every NS create with 409 Conflict against those very held
+    // records — NS and address records cannot coexist on one name. The hold
+    // still protects every name that lost its addresses WITHOUT a delegation
+    // taking their place.
     let empty_names: std::collections::HashSet<&str> = managed_names
         .iter()
         .copied()
-        .filter(|n| !desired.iter().any(|d| d.name == *n && (d.rtype == "A" || d.rtype == "AAAA")))
+        .filter(|n| {
+            !desired
+                .iter()
+                .any(|d| d.name == *n && (d.rtype == "A" || d.rtype == "AAAA" || d.rtype == "NS"))
+        })
         .collect();
     let deletes: Vec<String> = if empty_names.is_empty() {
         deletes

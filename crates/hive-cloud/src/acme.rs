@@ -136,6 +136,104 @@ pub fn db_server_config() -> Arc<rustls::ServerConfig> {
     )
 }
 
+// ---- DNS-01 challenges for Seer-answered zones ----------------------------------
+
+/// How long a challenge entry may live before it stops being answered and is
+/// swept: ACME validates within minutes, so 1h covers the slowest retry loop
+/// while guaranteeing an abandoned entry (leader died mid-order, cleanup never
+/// ran) cannot accumulate or keep answering forever.
+const CHALLENGE_TTL_MS: u64 = 60 * 60 * 1000;
+
+/// One name's pending DNS-01 TXT values (a wildcard+apex order places TWO
+/// challenges on the SAME `_acme-challenge.<zone>` name, hence a Vec).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct AcmeChallenge {
+    pub values: Vec<String>,
+    pub created_ms: u64,
+}
+
+/// fqdn (lowercase, no trailing dot) → pending DNS-01 TXT values.
+///
+/// Written on the LEADER at challenge placement alongside the Vercel API write
+/// — Vercel still serves every name in zones NOT delegated to Seer, but for a
+/// zone that IS (the deploy zone, `api.{platform}` once its NS moves), Let's
+/// Encrypt may query ANY of the advertised fleet nameservers while the ACME
+/// client runs only on the leader — so the values replicate to every node via
+/// the `acme_challenges` entry in `store_sync::REGISTRY`. Read by
+/// `dnsserver::lookup`'s delegated-zone TXT arms.
+pub struct AcmeChallengeStore {
+    inner: parking_lot::RwLock<std::collections::BTreeMap<String, AcmeChallenge>>,
+}
+
+impl AcmeChallengeStore {
+    pub fn new() -> Self {
+        Self { inner: parking_lot::RwLock::new(std::collections::BTreeMap::new()) }
+    }
+
+    fn norm(fqdn: &str) -> String {
+        fqdn.trim().trim_end_matches('.').to_ascii_lowercase()
+    }
+
+    /// Add `value` under `fqdn`. Also sweeps every expired entry while holding
+    /// the write lock — issuance is the natural sweep cadence (the map only
+    /// ever grows when challenges churn), so abandoned entries never pile up.
+    pub fn insert(&self, fqdn: &str, value: &str) {
+        let now = hive_core::now_ms();
+        let mut m = self.inner.write();
+        m.retain(|_, e| now.saturating_sub(e.created_ms) < CHALLENGE_TTL_MS);
+        let e = m
+            .entry(Self::norm(fqdn))
+            .or_insert_with(|| AcmeChallenge { values: Vec::new(), created_ms: now });
+        e.created_ms = now;
+        if !e.values.iter().any(|v| v == value) {
+            e.values.push(value.to_string());
+        }
+    }
+
+    /// Remove one placed value (post-issuance cleanup); the entry goes with its
+    /// last value.
+    pub fn remove(&self, fqdn: &str, value: &str) {
+        let mut m = self.inner.write();
+        let k = Self::norm(fqdn);
+        if let Some(e) = m.get_mut(&k) {
+            e.values.retain(|v| v != value);
+            if e.values.is_empty() {
+                m.remove(&k);
+            }
+        }
+    }
+
+    /// TXT values for `fqdn` — empty when unknown or past TTL (the DNS side
+    /// then keeps its authoritative no-data answer). The TTL gate matters on
+    /// FOLLOWERS too: store-sync adoption declines an empty leader snapshot
+    /// (registry-wide never-wipe rule), so a follower's copy of a cleaned-up
+    /// challenge ages out here instead.
+    pub fn lookup(&self, fqdn: &str) -> Vec<String> {
+        self.inner
+            .read()
+            .get(&Self::norm(fqdn))
+            .filter(|e| hive_core::now_ms().saturating_sub(e.created_ms) < CHALLENGE_TTL_MS)
+            .map(|e| e.values.clone())
+            .unwrap_or_default()
+    }
+
+    /// BTreeMap-backed → already deterministic bytes for `store_sync`'s
+    /// byte-compare change gate.
+    pub fn snapshot(&self) -> std::collections::BTreeMap<String, AcmeChallenge> {
+        self.inner.read().clone()
+    }
+
+    pub fn load(&self, m: std::collections::BTreeMap<String, AcmeChallenge>) {
+        *self.inner.write() = m;
+    }
+}
+
+impl Default for AcmeChallengeStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---- issuance -------------------------------------------------------------------
 
 /// The `_acme-challenge` record NAME relative to `zone` for an identifier:
@@ -227,6 +325,7 @@ async fn issue(
     api: &VercelApi,
     names: &[String],
     zone: &str,
+    challenges: &AcmeChallengeStore,
 ) -> anyhow::Result<CertBundle> {
     // instant-acme's internal HTTPS client needs a process-level rustls provider;
     // idempotent, so install unconditionally (the listener may not have run yet).
@@ -251,7 +350,12 @@ async fn issue(
             let value = challenge.key_authorization().dns_value();
             let rec_name = challenge_record_name(&host, zone);
             api.create(zone, &DesiredRecord { name: rec_name.clone(), rtype: "TXT".into(), value: value.clone(), ttl: 60 }).await?;
-            tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via Vercel API");
+            // BOTH authorities on purpose: Vercel answers while the zone (or a
+            // sub-zone like `api.`/the deploy label) is still Vercel-served,
+            // and the replicated challenge store is what lets every advertised
+            // Seer nameserver answer once the NS delegation moves here.
+            challenges.insert(&format!("{rec_name}.{zone}"), &value);
+            tracing::info!(zone, record = %rec_name, "ACME dns-01 TXT written via Vercel API + Seer challenge store");
             txt_names.push((rec_name, value));
         }
     }
@@ -284,12 +388,12 @@ async fn issue(
     let retry = instant_acme::RetryPolicy::default();
     let status = order.poll_ready(&retry).await?;
     if status != OrderStatus::Ready {
-        cleanup_txt(api, zone, &txt_names).await;
+        cleanup_txt(api, zone, &txt_names, challenges).await;
         anyhow::bail!("ACME order not ready (status {status:?})");
     }
     let key_pem = order.finalize().await?;
     let chain = order.poll_certificate(&retry).await?;
-    cleanup_txt(api, zone, &txt_names).await;
+    cleanup_txt(api, zone, &txt_names, challenges).await;
 
     let now = hive_core::now_ms();
     Ok(CertBundle {
@@ -301,9 +405,13 @@ async fn issue(
     })
 }
 
-async fn cleanup_txt(api: &VercelApi, zone: &str, txts: &[(String, String)]) {
+async fn cleanup_txt(api: &VercelApi, zone: &str, txts: &[(String, String)], challenges: &AcmeChallengeStore) {
     if txts.is_empty() {
         return;
+    }
+    // Mirror of the double-write at placement: drop the Seer-answered copy too.
+    for (n, v) in txts {
+        challenges.remove(&format!("{n}.{zone}"), v);
     }
     if let Ok(records) = api.list(zone).await {
         for r in records {
@@ -392,7 +500,7 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                         continue;
                     }
                     tracing::info!(%bundle, ?names, forced, "ACME: issuing/renewing certificate bundle");
-                    match issue(&cloud.http, &api, &names, &zone).await {
+                    match issue(&cloud.http, &api, &names, &zone, &cloud.acme_challenges).await {
                         Ok(b) => {
                             store_bundle_local(&bundle, &b);
                             if forced {
@@ -740,7 +848,8 @@ mod tests {
         let api = VercelApi::from_env(http.clone()).expect("VERCEL_API_TOKEN required");
         let apps = std::env::var("HIVE_APPS_DOMAIN").unwrap_or_else(|_| "shadw.app".into());
         let names = vec![format!("*.{apps}"), apps.clone()];
-        let bundle = issue(&http, &api, &names, &apps).await.expect("staging issuance failed");
+        let challenges = AcmeChallengeStore::new();
+        let bundle = issue(&http, &api, &names, &apps, &challenges).await.expect("staging issuance failed");
         assert!(bundle.chain_pem.contains("BEGIN CERTIFICATE"));
         assert!(bundle.key_pem_enc.starts_with("enc:v1:"), "key must be AEAD-encrypted");
         install_bundle(&bundle).expect("bundle must install into the SNI resolver");

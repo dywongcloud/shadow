@@ -149,6 +149,14 @@ struct Args {
     /// target fails, so it composes into a shell check.
     #[arg(long = "dns-probe", value_delimiter = ',')]
     dns_probe: Vec<String>,
+    /// Operator diagnostic (same family as `--dns-probe`): seed the ACME
+    /// DNS-01 challenge store at boot with `<fqdn>=<txt value>` — through the
+    /// SAME `AcmeChallengeStore::insert` the real issuance path calls — then
+    /// serve normally, so `dig TXT <fqdn>` against `HIVE_DNS_ADDR` proves the
+    /// Seer challenge-answer path end-to-end without burning a real ACME
+    /// order. The seed ages out on the store's own TTL like any challenge.
+    #[arg(long = "acme-txt-selftest")]
+    acme_txt_selftest: Option<String>,
 }
 
 #[tokio::main]
@@ -486,6 +494,12 @@ async fn main() -> anyhow::Result<()> {
         hive,
         sandbox_fc,
     );
+
+    // `--acme-txt-selftest` seed (see the arg's doc comment).
+    if let Some((fqdn, value)) = args.acme_txt_selftest.as_deref().and_then(|s| s.split_once('=')) {
+        cloud.acme_challenges.insert(fqdn, value);
+        tracing::info!(%fqdn, "ACME DNS-01 selftest TXT seeded into the challenge store");
+    }
 
     // Restore persisted platform state from disk (deployments, settings, WAF…).
     persist::restore(&cloud, persist::load());

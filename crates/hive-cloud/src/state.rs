@@ -183,6 +183,11 @@ pub struct CloudState {
     /// mechanism depends on vantages being independent. Only the derived
     /// attestation list is gossiped (`NodeInfo::dns_attest`).
     pub dns_probes: Arc<crate::dns_probe::NsProbes>,
+    /// Pending ACME DNS-01 challenge TXT values for zones Seer itself answers
+    /// (the deploy zone, `api.{platform}`) — written on the leader at issuance,
+    /// replicated to followers via `store_sync` so ANY advertised nameserver
+    /// node can answer Let's Encrypt's TXT query. See [`crate::acme::AcmeChallengeStore`].
+    pub acme_challenges: crate::acme::AcmeChallengeStore,
     /// Hive's own native Queue backend for the Vercel WDK `World` interface
     /// (managed-world service) -- no external queue dependency.
     pub world_queue: Arc<crate::world_queue::WorldQueue>,
@@ -564,6 +569,7 @@ impl CloudState {
             http: reqwest::Client::new(),
             dns_geo: crate::dns_geo::GeoCache::spawn(reqwest::Client::new()),
             dns_probes: Arc::new(crate::dns_probe::NsProbes::new()),
+            acme_challenges: crate::acme::AcmeChallengeStore::new(),
             world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),

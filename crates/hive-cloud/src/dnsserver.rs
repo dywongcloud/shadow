@@ -280,7 +280,7 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     let client_had_ecs = asker.subnet.is_some();
 
     // ---- look up matching records ----
-    let (answers, found_domain, proximity) = lookup(cloud, &qname, qtype, &asker);
+    let (answers, authority, found_domain, proximity) = lookup(cloud, &qname, qtype, &asker);
 
     DNS_STATS.queries.fetch_add(1, Ordering::Relaxed);
     match qtype {
@@ -322,11 +322,22 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     resp.extend_from_slice(&flags.to_be_bytes());
     resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
     resp.extend_from_slice(&(answers.len() as u16).to_be_bytes()); // ANCOUNT
-    resp.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    resp.extend_from_slice(&(authority.len() as u16).to_be_bytes()); // NSCOUNT
     resp.extend_from_slice(&arcount.to_be_bytes()); // ARCOUNT (the OPT RR, if any)
     resp.extend_from_slice(question);
     for (atype, ttl, rdata) in &answers {
         resp.extend_from_slice(&[0xC0, 0x0C]); // NAME → pointer to question (offset 12)
+        resp.extend_from_slice(&atype.to_be_bytes());
+        resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+        resp.extend_from_slice(&ttl.to_be_bytes());
+        resp.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        resp.extend_from_slice(rdata);
+    }
+    // AUTHORITY section (RFC 2308 negative caching): the owner is the ZONE
+    // APEX, not the qname — a compression pointer to the question would name
+    // the wrong owner, so the name is encoded explicitly.
+    for (owner, atype, ttl, rdata) in &authority {
+        resp.extend_from_slice(&encode_name(owner));
         resp.extend_from_slice(&atype.to_be_bytes());
         resp.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
         resp.extend_from_slice(&ttl.to_be_bytes());
@@ -340,21 +351,25 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     Some(resp)
 }
 
-/// Returns (answer RRs, whether the zone/domain is authoritative here, whether
-/// the answer was tailored to THIS client's location). The third value decides
-/// the ECS scope the caller echoes: a tailored answer must not be cached for
-/// clients it wasn't computed for.
+/// Returns (answer RRs, AUTHORITY RRs, whether the zone/domain is
+/// authoritative here, whether the answer was tailored to THIS client's
+/// location). The AUTHORITY slot carries `(owner name, type, ttl, rdata)` —
+/// unlike answers it cannot ride the question-name compression pointer,
+/// because a NODATA answer's SOA is owned by the zone APEX, not the qname
+/// (RFC 2308). The last value decides the ECS scope the caller echoes: a
+/// tailored answer must not be cached for clients it wasn't computed for.
+#[allow(clippy::type_complexity)]
 fn lookup(
     cloud: &Arc<CloudState>,
     qname: &str,
     qtype: u16,
     asker: &crate::dns_geo::Asker,
-) -> (Vec<(u16, u32, Vec<u8>)>, bool, bool) {
+) -> (Vec<(u16, u32, Vec<u8>)>, Vec<(String, u16, u32, Vec<u8>)>, bool, bool) {
     // ---- Plane A: dynamic, health-aware deploy zone (the Seer load balancer) ----
     // For any name in HIVE_DEPLOY_ZONE (apex or wildcard subdomain), A/AAAA resolve to
     // the public IPs of healthy nodes — bypassing static records entirely. We're
-    // authoritative for the whole zone (NOERROR, never NXDOMAIN), so other types fall to
-    // the clean insertion point below (ACME DNS-01 TXT / CAA land there in phase 2).
+    // authoritative for the whole zone (NOERROR, never NXDOMAIN); ACME DNS-01 TXT is
+    // answered from the replicated challenge store, everything else is no-data.
     if let Some(zone) = deploy_zone() {
         if qname == zone || qname.ends_with(&format!(".{zone}")) {
             match qtype {
@@ -364,7 +379,7 @@ fn lookup(
                     // reported unknown for now), then let `lb_records` stay pure.
                     let client = cloud.dns_geo.locate(asker.locate_addr());
                     let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
-                    return (rrs, true, tailored);
+                    return (rrs, Vec::new(), true, tailored);
                 }
                 // The zone's OWN apex records. An authoritative server that
                 // serves neither its SOA nor its NS is a half-configured
@@ -375,11 +390,23 @@ fn lookup(
                 // while the parent publishes one is flagged by validators.
                 // Only answered AT the apex; a subdomain keeps the no-data
                 // behavior below.
-                2 if qname == zone => return (apex_ns_rrs(cloud, false), true, false),
-                6 if qname == zone => return (apex_soa_rrs(cloud, false), true, false),
-                // FORWARD-COMPAT (phase 2): `_acme-challenge.<zone>` TXT for ACME DNS-01,
-                // and CAA, branch here. Phase 1 is authoritative no-data for them.
-                _ => return (Vec::new(), true, false),
+                2 if qname == zone => return (apex_ns_rrs(cloud, false), Vec::new(), true, false),
+                6 if qname == zone => return (apex_soa_rrs(cloud, false), Vec::new(), true, false),
+                // ACME DNS-01: TXT for `_acme-challenge.*` comes from the
+                // replicated challenge store (the leader's acme.rs writes it;
+                // Let's Encrypt may ask ANY advertised nameserver). Unknown or
+                // expired names keep the authoritative no-data answer, now
+                // with the negative-caching SOA. CAA remains on the
+                // fall-through (forward-compat).
+                16 if qname.starts_with("_acme-challenge.") => {
+                    let rrs = acme_txt_rrs(cloud, qname);
+                    let auth = if rrs.is_empty() { negative_soa(cloud, zone, false) } else { Vec::new() };
+                    return (rrs, auth, true, false);
+                }
+                // Authoritative NODATA — with the zone's SOA in AUTHORITY so
+                // resolvers can negative-cache (RFC 2308); without it every
+                // miss returns to us for its full lifetime.
+                _ => return (Vec::new(), negative_soa(cloud, zone, false), true, false),
             }
         }
     }
@@ -400,11 +427,20 @@ fn lookup(
                 1 | 28 => {
                     let client = cloud.dns_geo.locate(asker.locate_addr());
                     let (rrs, tailored) = lb_records(&cloud.registry.nodes(), qtype, client);
-                    return (rrs, true, tailored);
+                    return (rrs, Vec::new(), true, tailored);
                 }
-                2 if qname == zone => return (apex_ns_rrs(cloud, true), true, false),
-                6 if qname == zone => return (apex_soa_rrs(cloud, true), true, false),
-                _ => return (Vec::new(), true, false),
+                2 if qname == zone => return (apex_ns_rrs(cloud, true), Vec::new(), true, false),
+                6 if qname == zone => return (apex_soa_rrs(cloud, true), Vec::new(), true, false),
+                // Same ACME DNS-01 TXT path as the deploy zone above — this is
+                // what keeps the platform bundle's `api.{platform}` SAN
+                // renewable once the zone's NS moves off Vercel onto Seer.
+                16 if qname.starts_with("_acme-challenge.") => {
+                    let rrs = acme_txt_rrs(cloud, qname);
+                    let auth = if rrs.is_empty() { negative_soa(cloud, zone, true) } else { Vec::new() };
+                    return (rrs, auth, true, false);
+                }
+                // NODATA with the negative-caching SOA, as in the deploy zone.
+                _ => return (Vec::new(), negative_soa(cloud, zone, true), true, false),
             }
         }
     }
@@ -439,15 +475,20 @@ fn lookup(
                         if let Some(n) = nodes.iter().find(|n| n.name == owner && n.healthy) {
                             let rrs = node_addr_rrs(n, qtype);
                             if !rrs.is_empty() {
-                                return (rrs, true, false);
+                                return (rrs, Vec::new(), true, false);
                             }
                         }
                     }
                     let client = cloud.dns_geo.locate(asker.locate_addr());
                     let (rrs, tailored) = lb_records(&nodes, qtype, client);
-                    return (rrs, true, tailored);
+                    return (rrs, Vec::new(), true, tailored);
                 }
-                _ => return (Vec::new(), true, false),
+                // Same ACME DNS-01 TXT path as the delegated zones above, for
+                // when the apps zone itself is delegated here.
+                16 if qname.starts_with("_acme-challenge.") => {
+                    return (acme_txt_rrs(cloud, qname), Vec::new(), true, false)
+                }
+                _ => return (Vec::new(), Vec::new(), true, false),
             }
         }
     }
@@ -459,7 +500,7 @@ fn lookup(
         .filter(|d| qname == d.domain || qname.ends_with(&format!(".{}", d.domain)))
         .max_by_key(|d| d.domain.len())
     else {
-        return (Vec::new(), false, false);
+        return (Vec::new(), Vec::new(), false, false);
     };
 
     // The record name within the zone ("" = apex).
@@ -501,7 +542,7 @@ fn lookup(
         }
     }
     // Static records are the operator's own answer, identical for every client.
-    (out, true, false)
+    (out, Vec::new(), true, false)
 }
 
 /// Build the dynamic A (qtype 1) or AAAA (qtype 28) answer set for the deploy zone:
@@ -562,6 +603,23 @@ fn lb_records(nodes: &[NodeInfo], qtype: u16, client: Option<(f64, f64)>) -> (Ve
     // the address-family filter above — an empty set is not client-specific.
     let tailored = tailored && !out.is_empty();
     (out, tailored)
+}
+
+/// TTL for ACME DNS-01 TXT answers — mirrors the 60s TTL acme.rs asks Vercel
+/// for on the same records, and short like `DEPLOY_TTL` so a finished
+/// challenge drains from resolver caches quickly.
+const ACME_TXT_TTL: u32 = 60;
+
+/// TXT answer RRs for a `_acme-challenge.*` qname in a Seer-answered zone,
+/// straight from the replicated challenge store. Reuses the static-record TXT
+/// encoder — one wire encoding, never two.
+fn acme_txt_rrs(cloud: &Arc<CloudState>, qname: &str) -> Vec<(u16, u32, Vec<u8>)> {
+    cloud
+        .acme_challenges
+        .lookup(qname)
+        .iter()
+        .filter_map(|v| encode_rdata("TXT", v).map(|rd| (16u16, ACME_TXT_TTL, rd)))
+        .collect()
 }
 
 fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
@@ -639,6 +697,21 @@ fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Ve
         rdata.extend_from_slice(&v.to_be_bytes());
     }
     vec![(6u16, APEX_TTL, rdata)]
+}
+
+/// AUTHORITY-section SOA for an authoritative empty (NODATA) answer, per RFC
+/// 2308 — without it a resolver cannot negative-cache and every miss under
+/// the zone comes back to us for its full lifetime. Owner = the zone apex
+/// (why the AUTHORITY slot carries an explicit name). The record's TTL is
+/// published as the negative-cache TTL directly: RFC 2308 §5 defines the
+/// negTTL as min(SOA's own TTL, its MINIMUM field), and `NEGATIVE_TTL` is
+/// already the smaller. Empty when no eligible nameserver exists (same
+/// degenerate roster state in which the apex SOA itself is unanswerable).
+fn negative_soa(cloud: &Arc<CloudState>, zone: &str, require_api: bool) -> Vec<(String, u16, u32, Vec<u8>)> {
+    apex_soa_rrs(cloud, require_api)
+        .into_iter()
+        .map(|(t, _ttl, rd)| (zone.to_string(), t, NEGATIVE_TTL, rd))
+        .collect()
 }
 
 fn encode_name(name: &str) -> Vec<u8> {

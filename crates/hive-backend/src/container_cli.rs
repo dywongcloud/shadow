@@ -224,7 +224,30 @@ pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
 
 /// Is the given container CLI installed and responsive? (`bin --version`).
 pub async fn available(apple: bool) -> bool {
-    Command::new(bin(apple)).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status().await.map(|s| s.success()).unwrap_or(false)
+    // `--version` only proves the CLI binary exists; podman's client can still
+    // be unable to reach its service VM (witnessed: one malformed known_hosts
+    // line broke the socket, `--version` succeeded, and every volume op failed
+    // silently — turning an environmental fault into what looked like a data
+    // bug). A real round-trip (`volume ls`) is the honest availability signal.
+    let version_ok = Command::new(bin(apple))
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !version_ok {
+        return false;
+    }
+    Command::new(bin(apple))
+        .args(["volume", "ls"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Query a running container's assigned IPv4 address on a named network

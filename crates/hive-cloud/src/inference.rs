@@ -558,7 +558,23 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
     let need = vram_need_mb(model_bytes);
     let me = cloud.registry.nodes().into_iter().find(|n| n.is_self);
     let Some(me) = me else { return };
-    let pools = crate::gpu_pool::snapshot(cloud).await;
+    let mut pools = crate::gpu_pool::snapshot(cloud).await;
+    // Admission requires a dialable rpc address: plan_members counts a
+    // member's VRAM toward coverage, but the --rpc list below can only name
+    // members with a public IP — an address-less candidate admitted for its
+    // VRAM would let the plan claim coverage the launched server can never
+    // reach, failing the load with no honest placement error. Drop them
+    // BEFORE planning so a genuine shortfall parks the endpoint as failed.
+    let addressable: std::collections::HashSet<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.public_ip.is_some())
+        .map(|n| n.name)
+        .collect();
+    for p in &mut pools {
+        p.nodes.retain(|n| n.name == me.name || addressable.contains(&n.name));
+    }
     let rtts = member_rtts(cloud, &me, &pools).await;
     let members = match plan_members(need, &me, spec.pool, &pools, &rtts, max_member_rtt_ms()) {
         Ok(m) => m,

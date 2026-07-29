@@ -397,6 +397,28 @@ pub static REGISTRY: &[SyncedStore] = &[
             Some(1)
         },
     },
+    // ACME DNS-01 challenge TXT for Seer-answered (self-delegated) zones: the
+    // leader's acme.rs places challenges, but Let's Encrypt resolves the zone
+    // through ANY of the advertised nameserver nodes — replication is what lets
+    // every follower's Seer answer. Post-issuance cleanup empties the leader's
+    // map, which adoption declines per the registry-wide never-wipe rule; a
+    // follower's stale copy stops answering via the store's own lookup TTL
+    // instead (see `AcmeChallengeStore::lookup`).
+    SyncedStore {
+        name: "acme_challenges",
+        // BTreeMap-backed store → `enc` alone is already deterministic.
+        snapshot: |c| enc(&c.acme_challenges.snapshot()),
+        adopt: |c, b| {
+            let m: std::collections::BTreeMap<String, crate::acme::AcmeChallenge> =
+                serde_json::from_slice(b).ok()?;
+            if m.is_empty() {
+                return None;
+            }
+            let n = m.len();
+            c.acme_challenges.load(m);
+            Some(n)
+        },
+    },
 ];
 
 /// Rate-limit config wire shape — deliberately config-only (see the registry
