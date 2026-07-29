@@ -66,6 +66,13 @@ pub struct GpuPoolNode {
     pub gpu_model: Option<String>,
     pub vram_total_mb: u64,
     pub vram_free_mb: u64,
+    /// Measured RTT from the SERVING node to this member (registry health
+    /// probes; 0 = self). Region no longer implies locality — two "san-jose"
+    /// CVM nodes turned out to live in Ashburn, 65ms from the rest of their
+    /// region, which turned an intra-DC 11GB pooled-model load into ~2 hours.
+    /// Surfacing the real link cost here is what lets an operator see that
+    /// before a pool does.
+    pub latency_ms: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -131,6 +138,7 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
             gpu_model: n.gpu_model.clone(),
             vram_total_mb: n.gpu_vram_mb,
             vram_free_mb,
+            latency_ms: if n.is_self { 0 } else { n.latency_ms },
         });
     }
 

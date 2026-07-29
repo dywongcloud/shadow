@@ -107,7 +107,7 @@ export default function RegionsPage() {
       <Table>
         <thead>
           <tr>
-            <Th>Node</Th><Th>Region</Th><Th>Location</Th><Th>Continent</Th><Th>Role</Th><Th>Services</Th><Th>Seen</Th>
+            <Th>Node</Th><Th>Region</Th><Th>Location</Th><Th>Continent</Th><Th>RTT</Th><Th>Role</Th><Th>Services</Th><Th>Seen</Th>
           </tr>
         </thead>
         <tbody>
@@ -118,6 +118,14 @@ export default function RegionsPage() {
             const gpu = isGpuNode(n);
             const relay = hasRelay(n);
             const guardian = hasGuardian(n);
+            // Region no longer implies locality: two "san-jose" nodes turned
+            // out to live 65ms away in another datacenter, silently degrading
+            // every same-region decision (pooling, placement). A same-region
+            // peer with a cross-DC RTT gets flagged amber so that mislabel is
+            // visible here instead of discovered from a 2-hour model load.
+            const selfRegion = list.find((m) => m.is_self)?.region;
+            const rtt = n.is_self ? 0 : (n.latency_ms ?? 0);
+            const crossDcSameRegion = !n.is_self && n.region === selfRegion && rtt >= 20;
             return (
               <tr key={n.id}>
                 <Td className="font-medium">
@@ -129,6 +137,18 @@ export default function RegionsPage() {
                 <Td><Badge tone="blue">{n.region}</Badge></Td>
                 <Td className="text-secondary">{loc}</Td>
                 <Td className="text-secondary">{continent}</Td>
+                <Td className="font-mono text-xs">
+                  {n.is_self ? (
+                    <span className="text-muted">0ms</span>
+                  ) : (
+                    <span
+                      className={crossDcSameRegion ? "text-amber-500 dark:text-amber-400" : undefined}
+                      title={crossDcSameRegion ? "Same region label but cross-datacenter RTT — region may be mislabeled" : undefined}
+                    >
+                      {rtt}ms{crossDcSameRegion ? " ⚠" : ""}
+                    </span>
+                  )}
+                </Td>
                 <Td>{n.is_self ? <Badge tone="green">this node</Badge> : <Badge>peer</Badge>}</Td>
                 <Td>
                   <span className="inline-flex items-center gap-2">
