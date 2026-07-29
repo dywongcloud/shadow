@@ -2567,6 +2567,15 @@ async fn purge_project_source_dirs(project: &str) {
     }
 }
 
+/// Whether a `project_delete` caller has asserted SOME identity at all —
+/// verified claims (JWT or platform API key), or an explicit `x-hive-team`
+/// header. Pure core of the identity gate below, unit-testable without a
+/// `HeaderMap`/`CloudState`. A blank/whitespace-only team header counts as no
+/// identity (matches `resolve_tenant`'s own header-trimming behavior).
+fn has_explicit_caller_identity(claims_present: bool, team_header: Option<&str>) -> bool {
+    claims_present || team_header.map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 /// Delete an entire project: all its deployments + settings. By default this
 /// cascades across the mesh (removing the project from any peer node the
 /// placement scheduler put it on); `?cascade=false` deletes only on this node
@@ -2579,6 +2588,20 @@ async fn project_delete(
     Path(project): Path<String>,
     Query(q): Query<CascadeQ>,
 ) -> Result<Json<Value>, StatusCode> {
+    // A destructive, fleet-cascading operation must never authorize purely off
+    // resolve_tenant's dev-mode "personal" default: on an unenforced node, a
+    // caller presenting NO credential at all (no JWT, no API key, no explicit
+    // x-hive-team header) still resolves to team "personal" — the platform
+    // owner's own namespace on a single-tenant deployment — which trivially
+    // "owns" every project. That turns every unenforced node's admin port into
+    // an anonymous delete-any-project-by-name endpoint. Require the caller to
+    // have asserted SOME identity (verified claims, or an explicit team header)
+    // before even resolving a tenant to check ownership against — this is the
+    // one endpoint on this router where the implicit personal-mode default is
+    // not an acceptable substitute for real authorization.
+    if !has_explicit_caller_identity(claims.is_some(), headers.get("x-hive-team").and_then(|v| v.to_str().ok())) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     // Authorize against the local store if we have it, else against the gossiped
     // fleet — a project placed by the scheduler may live ONLY on a peer, so it's
@@ -4149,6 +4172,7 @@ async fn dns_stats(
     use std::sync::atomic::Ordering;
     let s = &crate::dnsserver::DNS_STATS;
     let (known, pending, unlocatable) = c.dns_geo.stats();
+    let verdicts = crate::dns_probe::validate_nameservers(&c.registry.nodes());
     let answers: std::collections::BTreeMap<String, u64> =
         crate::dnsserver::ANSWER_FIRST.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
     Ok(Json(json!({
@@ -4179,18 +4203,18 @@ async fn dns_stats(
         // it and from which regions, rather than having to infer it. `probes`
         // is this node's OWN raw evidence, which is what makes a disagreement
         // between vantages diagnosable instead of mysterious.
-        "nameservers": crate::dns_probe::validate_nameservers(&c.registry.nodes())
-            .into_iter()
+        "nameservers": verdicts
+            .iter()
             .map(|v| json!({
-                "node": v.node,
-                "region": v.region,
-                "ip4": v.ip4,
-                "ip6": v.ip6,
+                "node": v.node.clone(),
+                "region": v.region.clone(),
+                "ip4": v.ip4.clone(),
+                "ip6": v.ip6.clone(),
                 "declared": v.declared,
                 "validated": v.validated,
-                "reason": v.reason,
-                "attesters": v.attesters,
-                "attester_regions": v.attester_regions,
+                "reason": v.reason.clone(),
+                "attesters": v.attesters.clone(),
+                "attester_regions": v.attester_regions.clone(),
                 "required_regions": v.required_regions,
             }))
             .collect::<Vec<_>>(),
@@ -4208,8 +4232,19 @@ async fn dns_stats(
             "checked_ms": p.checked_ms,
         })).collect::<Vec<_>>(),
         "validation": {
-            "proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
-            "unproven": crate::vercel_dns::STATS.geo_ns_unproven.load(Ordering::Relaxed),
+            // Derived from the verdicts computed FRESH in this response, never
+            // the reconciler-written counters: those are stamped only inside
+            // the DNS reconcile loop, so on a non-leader node (or on the
+            // leader between passes / right after a restart) they lag and
+            // CONTRADICT the per-node verdicts in the same payload —
+            // live-witnessed as `proven: 0` above eight `validated: true`
+            // rows. The counters stay exported below as the reconciler's own
+            // last-pass view (`reconciler_last_pass_*`), clearly named so a
+            // stale number can no longer masquerade as live truth.
+            "proven": verdicts.iter().filter(|v| v.validated).count(),
+            "unproven": verdicts.iter().filter(|v| v.declared && !v.validated).count(),
+            "reconciler_last_pass_proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
+            "reconciler_last_pass_unproven": crate::vercel_dns::STATS.geo_ns_unproven.load(Ordering::Relaxed),
             "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
             "min_attester_regions": crate::dns_probe::MIN_ATTESTER_REGIONS,
             "failed_rounds_before_withdraw": crate::dns_probe::FAILED_ROUNDS_BEFORE_WITHDRAW,
@@ -9232,6 +9267,44 @@ mod identity_sync_tests {
         let (tenant2, _org2, is_owner2) = resolve_identity_sync(false, None, None, None, "user_x", false);
         assert!(!is_owner2);
         assert_eq!(tenant2, "personal", "unenforced personal-scope default is still literal \"personal\" (pre-existing dev behavior)");
+    }
+}
+
+#[cfg(test)]
+mod project_delete_identity_tests {
+    use super::has_explicit_caller_identity;
+
+    /// REGRESSION TEST for a real, found (not yet confirmed exploited — live
+    /// probing showed HIVE_JWT_SECRET/HIVE_PEER_TRUST both enforced on the
+    /// nodes checked) vulnerability shape: on an unenforced node,
+    /// `resolve_tenant` resolves a caller presenting NO credential at all to
+    /// team "personal" — the platform owner's own namespace on a
+    /// single-tenant deployment, which trivially "owns" every project. Before
+    /// this fix, `project_delete` would happily treat that as authorized and
+    /// cascade-delete the named project fleet-wide. This is the most likely
+    /// mechanism behind the 2026-07-28 incident where 6 projects (including a
+    /// production deployment, tokenhun) were deleted within 15 minutes with no
+    /// traceable authenticated action.
+    #[test]
+    fn a_caller_with_zero_credentials_has_no_identity() {
+        assert!(!has_explicit_caller_identity(false, None), "no JWT/API-key claims and no team header must never be treated as an identity");
+        assert!(!has_explicit_caller_identity(false, Some("")), "an empty team header is not an assertion of identity");
+        assert!(!has_explicit_caller_identity(false, Some("   ")), "a whitespace-only team header is not an assertion of identity");
+    }
+
+    #[test]
+    fn verified_claims_alone_are_a_valid_identity() {
+        // The normal authenticated path: dashboard JWT cookie or a platform
+        // API key, verified by require_auth before this handler ever runs.
+        assert!(has_explicit_caller_identity(true, None));
+    }
+
+    #[test]
+    fn an_explicit_team_header_is_a_valid_identity_even_unenforced() {
+        // Dev-mode callers that deliberately set x-hive-team keep working —
+        // this only closes the fully-implicit, zero-header default.
+        assert!(has_explicit_caller_identity(false, Some("personal")));
+        assert!(has_explicit_caller_identity(false, Some("acme")));
     }
 }
 

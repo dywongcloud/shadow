@@ -65,7 +65,15 @@ mapfile -t DEFAULT_HOSTS < <(
 
 HOSTS=("${@:-${DEFAULT_HOSTS[@]}}")
 
-ssh_opts=(-i "$PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=8)
+# One multiplexed TCP connection per host, reused by every ssh/rsync/scp step.
+# Without this the script opens 4+ rapid connections per host while background
+# automation holds its own — sshd's MaxStartups (10:30:100) then drops pre-auth
+# connections ("Connection closed by <ip> port 22"), which live-failed a whole
+# 12-host distribution pass at preflight while every host was actually fine.
+CTL_DIR="$(mktemp -d)"
+ssh_opts=(-i "$PEM" -o StrictHostKeyChecking=no -o ConnectTimeout=8 \
+  -o ControlMaster=auto -o "ControlPath=$CTL_DIR/%r@%h" -o ControlPersist=120)
+trap 'rm -rf "$CTL_DIR"' EXIT
 
 # Hosts that failed any step. The loop deliberately continues past a failure so
 # one bad node doesn't strand the rest, but the script MUST exit non-zero at the
@@ -90,6 +98,8 @@ sync_source() {
 
 preflight() {
   local host="$1"
+  # One retry after a short pause: a MaxStartups drop is momentary by nature.
+  ssh "${ssh_opts[@]}" "root@$host" true 2>/dev/null || sleep 5
   ssh "${ssh_opts[@]}" "root@$host" '
     command -v node >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: nodejs not installed"; exit 1; }
     command -v npm  >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: npm not installed"; exit 1; }
