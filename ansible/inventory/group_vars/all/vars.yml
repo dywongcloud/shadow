@@ -49,6 +49,9 @@ hive_apps_domain: "shadw.app"
 hive_deploy_zone: "deploy.{{ hive_apps_domain }}"
 hive_public_dashboard_url: "https://{{ hive_platform_domain }}"
 hive_dashboard_url: "http://localhost:3002"
+# The edge's dashboard reverse-proxy target — REQUIRED for apex/www to serve
+# the dashboard at all (see hive-node.service.j2's comment on the 404 class).
+hive_dashboard_upstream: "http://127.0.0.1:3002"
 hive_http_listen: "0.0.0.0:80"
 hive_https_listen: "0.0.0.0:443"
 hive_tls_addr: "127.0.0.1:8443"

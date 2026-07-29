@@ -12,6 +12,11 @@ Environment=HOME={{ ansible_env.HOME | default('/root') }}
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{{ ansible_env.HOME | default('/root') }}/.cargo/bin
 Environment=HIVE_PUBLIC_DASHBOARD_URL={{ hive_public_dashboard_url }}
 Environment=HIVE_DASHBOARD_URL={{ hive_dashboard_url }}
+# Without this the edge never reverse-proxies the dashboard hosts (apex/www)
+# to the local hive-ui, so the node 404s a share of round-robin page loads
+# while looking perfectly healthy — live-witnessed on 4 of 13 nodes as "a
+# third of dashboard loads dead-end". A reprovision must never recreate that.
+Environment=HIVE_DASHBOARD_UPSTREAM={{ hive_dashboard_upstream | default('http://127.0.0.1:3002') }}
 Environment=HIVE_APPS_DOMAIN={{ hive_apps_domain }}
 Environment=HIVE_PLATFORM_DOMAIN={{ hive_platform_domain }}
 Environment=HIVE_DEPLOY_ZONE={{ hive_deploy_zone }}
