@@ -351,6 +351,45 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   the reconciler publishes from, so the two can never disagree), and this
   node's own raw probe evidence.
 
+## DNS cutovers & ACME (reconciler invariants)
+
+- **A delegated name must never serve NEITHER addresses NOR delegation.**
+  Vercel forbids NS records coexisting with any other record on a name and
+  refuses NS creation while any child record exists (409
+  `record_conflicts`) — an orphaned `_acme-challenge.api` TXT vetoed the
+  entire `api.shadw.cloud` cutover and stranded it dark for 90 minutes
+  (2026-07-29). The rule is one-directional: child-record CREATES under an
+  existing delegation are permitted (inert/occluded), and an NS RRset
+  always grows by adding members, so a foreign NS target never blocks.
+  Every cutover/disengagement runs as a restore-on-failure transaction in
+  `vercel_dns::plan_writes`: the address set plus any squatter
+  (CNAME/ALIAS/stray TXT) is removed, the NS set created, and on any NS
+  failure everything is restored. Disengagement hoists NS deletes only for
+  names with no desired NS and symmetrically restores the delegation when
+  the flat-address creates all fail; a rotation on a still-delegated name
+  keeps creates-then-deletes order (replacement before removal).
+- **The ACME orphan sweeper runs every reconcile pass.** Issuance cleanup
+  races Vercel's eventually-consistent listing, so a finished order's TXT
+  can survive and then veto future delegations from under its parent name.
+  Any `_acme-challenge.*` TXT unknown to the in-flight challenge store and
+  provably older than 15 minutes is deleted; `created` is schema-nullable,
+  and unknown age means KEEP (deletes are forever). acme.rs's Vercel-side
+  TXT create is best-effort ONLY on a 409 under a LIVE delegation gauge
+  (`STATS.geo_delegation_records` / `STATS.api_delegation_records`), never
+  static zone config — below the capable-NS floor the flat set is
+  authoritative again and a swallowed failure fails orders opaquely.
+- **publishable() is damped in BOTH directions.** Withdrawal stays fast
+  (K=2 consecutive unhealthy passes); re-addition requires
+  `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive healthy passes — a
+  flapping node otherwise drives a create/delete treadmill against the
+  Vercel API (429s plus transient address-record loss) during every fleet
+  reconvergence.
+- **Let's Encrypt rate limits are incidents, not warn lines.** The
+  duplicate-certificate window (5 per 168h per exact identifier set)
+  closes a bundle's renewal — including the `acme-force-*` sentinel —
+  until it opens; a `rateLimited` issuance error opens a Major incident
+  naming the bundle and the window.
+
 ## Managed inference (serverless GPU pooling)
 
 - A project opts in with a `fluid.json` TOP-LEVEL block:
