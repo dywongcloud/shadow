@@ -110,32 +110,53 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 
 impl DnsApi for VercelApi {
     async fn list(&self, domain: &str) -> anyhow::Result<Vec<RecordView>> {
-        let resp = self
-            .http
-            .get(self.url("v4", &format!("domains/{domain}/records?limit=100")))
-            .bearer_auth(&self.token)
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            anyhow::bail!("vercel list {domain}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
-        }
-        let v: serde_json::Value = resp.json().await?;
-        Ok(v.get("records")
-            .and_then(|r| r.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|r| {
-                        Some(RecordView {
-                            id: r.get("id").or_else(|| r.get("uid"))?.as_str()?.to_string(),
-                            name: r.get("name")?.as_str()?.to_string(),
-                            rtype: r.get("type")?.as_str()?.to_string(),
-                            value: r.get("value")?.as_str()?.to_string(),
+        // The zone exceeds one page (100): a truncated listing makes every
+        // record past page 1 look missing, so the diff re-creates it forever —
+        // a sustained 429 storm that starves real creates. Follow
+        // `pagination.next` (a timestamp cursor passed back as `until`) to
+        // exhaustion; a partial read is worse than a failed one.
+        let mut out: Vec<RecordView> = Vec::new();
+        let mut until: Option<u64> = None;
+        for _ in 0..50 {
+            let mut rest = format!("domains/{domain}/records?limit=100");
+            if let Some(u) = until {
+                rest.push_str(&format!("&until={u}"));
+            }
+            let resp = self
+                .http
+                .get(self.url("v4", &rest))
+                .bearer_auth(&self.token)
+                .send()
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                anyhow::bail!("vercel list {domain}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
+            }
+            let v: serde_json::Value = resp.json().await?;
+            let page: Vec<RecordView> = v
+                .get("records")
+                .and_then(|r| r.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| {
+                            Some(RecordView {
+                                id: r.get("id").or_else(|| r.get("uid"))?.as_str()?.to_string(),
+                                name: r.get("name")?.as_str()?.to_string(),
+                                rtype: r.get("type")?.as_str()?.to_string(),
+                                value: r.get("value")?.as_str()?.to_string(),
+                            })
                         })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let empty = page.is_empty();
+            out.extend(page);
+            until = v.get("pagination").and_then(|p| p.get("next")).and_then(|n| n.as_u64());
+            if empty || until.is_none() {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     async fn create(&self, domain: &str, rec: &DesiredRecord) -> anyhow::Result<String> {

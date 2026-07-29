@@ -15,10 +15,13 @@ const PRECACHE = [
   "/shadw-logo-dark.png",
 ];
 
+/* No skipWaiting: app code is network-first above, so a waiting SW is harmless
+ * to live tabs and instant takeover buys nothing — while takeover mid-session
+ * fires controllerchange in EVERY open tab, which is the raw material of the
+ * mobile reload-loop incident. The updated SW activates when the last tab
+ * closes. */
 self.addEventListener("install", (event) => {
-  event.waitUntil(
-    caches.open(STATIC_CACHE).then((c) => c.addAll(PRECACHE)).then(() => self.skipWaiting())
-  );
+  event.waitUntil(caches.open(STATIC_CACHE).then((c) => c.addAll(PRECACHE)));
 });
 
 self.addEventListener("activate", (event) => {

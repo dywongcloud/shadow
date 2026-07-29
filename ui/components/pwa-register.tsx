@@ -12,22 +12,40 @@ export function PwaRegister() {
     // UPDATED service worker took over (e.g. after a deploy) — reload ONCE so the
     // page runs the fresh build instead of stale cached code. Skip on the very
     // first install (no prior controller) to avoid an unnecessary reload.
+    //
+    // The reload is LATCHED via sessionStorage: at most 2 SW-driven reloads per
+    // minute per tab. The sw.js no longer calls skipWaiting, so takeover while
+    // a tab is open should not happen at all — this latch is the backstop that
+    // turns any residual repeated-takeover pathology (the mobile flicker class)
+    // into a page that simply keeps running the older build until the next
+    // natural navigation, instead of reloading forever.
     const hadController = !!navigator.serviceWorker.controller;
     let refreshing = false;
     const onControllerChange = () => {
       if (refreshing || !hadController) return;
       refreshing = true;
+      try {
+        const raw = sessionStorage.getItem("shadw-sw-reloads");
+        const now = Date.now();
+        const hits = (raw ? (JSON.parse(raw) as number[]) : []).filter((t) => now - t < 60_000);
+        if (hits.length >= 2) return; // latched: ride the current build
+        hits.push(now);
+        sessionStorage.setItem("shadw-sw-reloads", JSON.stringify(hits));
+      } catch {
+        /* storage unavailable (private mode) — reload unlatched, worst case matches old behavior */
+      }
       window.location.reload();
     };
     navigator.serviceWorker.addEventListener("controllerchange", onControllerChange);
 
+    // No per-mount reg.update(): forcing an update check on EVERY page load
+    // turned each navigation into a chance to discover a new SW mid-session,
+    // accelerating reload churn during deploys. The browser's own registration
+    // update checks (navigation heuristics + 24h cap) are enough.
     const register = () => {
-      navigator.serviceWorker
-        .register("/sw.js")
-        .then((reg) => reg.update().catch(() => {})) // proactively check for a newer SW
-        .catch(() => {
-          /* registration is best-effort */
-        });
+      navigator.serviceWorker.register("/sw.js").catch(() => {
+        /* registration is best-effort */
+      });
     };
     if (document.readyState === "complete") register();
     else window.addEventListener("load", register, { once: true });
