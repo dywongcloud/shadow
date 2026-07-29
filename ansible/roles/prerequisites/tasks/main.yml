@@ -122,6 +122,55 @@
     name: nodejs
     state: present
 
+# Node >= 22.5 floor: the @workflow/web console server build (dashboard /wfc)
+# requires node:sqlite, which dnf's nodejs (20 on TencentOS) does not have —
+# a v20 node 500s every console request with ERR_UNKNOWN_BUILTIN_MODULE
+# (live-witnessed fleet-wide 2026-07-29 on the six TencentOS/CVM nodes, fixed
+# by hand with exactly this tarball). deploy-ui-fleet.sh's preflight floors
+# this too, but a reprovisioned node would serve the broken console BEFORE
+# the next UI deploy, so the floor belongs in provisioning. Idempotent: the
+# check skips entirely when the installed node already has node:sqlite.
+- name: Check whether the installed node has node:sqlite (>= 22.5)
+  ansible.builtin.command: node -e "require('node:sqlite')"
+  register: hive_node_sqlite_check
+  failed_when: false
+  changed_when: false
+
+- name: Install Node v22.23.2 from the official tarball (sha256-verified) when node:sqlite is missing
+  when: hive_node_sqlite_check.rc != 0
+  block:
+    - name: Download node v22.23.2 tarball with checksum
+      ansible.builtin.get_url:
+        url: "https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz"
+        dest: /tmp/node-v22.23.2-linux-x64.tar.xz
+        checksum: "sha256:d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307"
+
+    - name: Extract node v22.23.2 into /usr/local
+      ansible.builtin.unarchive:
+        src: /tmp/node-v22.23.2-linux-x64.tar.xz
+        dest: /usr/local
+        remote_src: true
+        creates: /usr/local/node-v22.23.2-linux-x64/bin/node
+
+    - name: Symlink node/npm/npx into /usr/local/bin (precedes /usr/bin in default PATH and hive-ui's Environment PATH)
+      ansible.builtin.file:
+        src: "/usr/local/node-v22.23.2-linux-x64/bin/{{ item }}"
+        dest: "/usr/local/bin/{{ item }}"
+        state: link
+        force: true
+      loop:
+        - node
+        - npm
+        - npx
+
+    - name: Remove the tarball
+      ansible.builtin.file:
+        path: /tmp/node-v22.23.2-linux-x64.tar.xz
+        state: absent
+
+    - name: Verify node:sqlite is now loadable
+      ansible.builtin.command: /usr/local/bin/node -e "require('node:sqlite')"
+
 - name: podman socket enabled (git.rs / sandboxes_platform.rs shell out to podman directly, not via the socket, but keep it available for tooling)
   ansible.builtin.systemd:
     name: podman.socket
