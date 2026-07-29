@@ -1,7 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { SignedIn } from "@clerk/nextjs";
+import { useSettledAuth } from "@/lib/auth-settle";
 import { TopNav } from "@/components/topnav";
 import { Footer } from "@/components/footer";
 import { ZkPreviewAuth } from "@/components/zk-preview-auth";
@@ -30,17 +30,32 @@ const CommandBar = dynamic(() => import("@/components/command-bar").then((m) => 
 //   • after login → dashboard, the navbar was missing until reload
 //   • after logout → landing, the navbar lingered above the landing's own navbar
 // `app/page.tsx` (a client component) already flips Landing↔Dashboard reactively
-// with the same `<SignedIn>/<SignedOut>`; rendering the chrome from a client tree
-// makes it react identically. In local (no-Clerk) mode the chrome always shows.
+// from the same signal; rendering the chrome from a client tree makes it react
+// identically. In local (no-Clerk) mode the chrome always shows.
+//
+// GUARDED, not raw `<SignedIn>`: the chrome renders from `useSettledAuth()` —
+// the SAME shared committed/debounced/flip-bounded auth view the home route's
+// landing↔dashboard flip uses (see lib/auth-settle.ts) — so the whole page
+// (chrome + body) always flips as ONE unit driven by ONE guarded signal, and a
+// flapping Clerk auth state (the mobile/ITP handshake failure) can neither
+// thrash the nav/footer nor storm-mount the pollers living down here
+// (PendingBuildsProvider, SessionToken, GitOps). Committed transitions still
+// happen (login/logout reactivity this file's history depends on — navbar
+// appears after login, disappears after logout, without a hard refresh); they
+// are just debounced and bounded instead of tracking every oscillation.
 const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 
 export function ChromeTop() {
   if (!clerkEnabled) return <TopNav />;
-  return (
-    <SignedIn>
-      <TopNav />
-    </SignedIn>
-  );
+  // Split subtree so `useSettledAuth` (needs ClerkProvider) never runs in
+  // local/no-Clerk mode — the same split the old `<SignedIn>` gave for free.
+  return <GuardedChromeTop />;
+}
+
+function GuardedChromeTop() {
+  const view = useSettledAuth();
+  if (view !== "in") return null;
+  return <TopNav />;
 }
 
 export function ChromeBottom() {
@@ -54,14 +69,23 @@ export function ChromeBottom() {
       </>
     );
   }
+  return <GuardedChromeBottom />;
+}
+
+function GuardedChromeBottom() {
+  const view = useSettledAuth();
+  // Everything here (incl. the SessionToken cookie-mint keeper and the
+  // PendingBuildsProvider poller) mounts only once auth has SETTLED signed-in —
+  // an oscillating signal can no longer mount/unmount these on every flap.
+  if (view !== "in") return null;
   return (
-    <SignedIn>
+    <>
       <Footer />
       <GitOps />
       <CommandBar />
       <ZkPreviewAuth />
       <PendingBuildsProvider />
       <SessionToken />
-    </SignedIn>
+    </>
   );
 }

@@ -24,6 +24,34 @@ function zoneRewrites() {
   return out;
 }
 
+// Clerk frontend-API origin, derived from the publishable key (the key's
+// payload IS the frontend host, base64 with a trailing '$'). This keeps the
+// CSP below in lockstep with whichever Clerk instance is configured:
+//  - pk_test_… decodes to <slug>.clerk.accounts.dev (third-party dev instance)
+//  - pk_live_… decodes to clerk.<our-domain> (first-party production instance)
+// On a LIVE key the `*.clerk.accounts.dev` wildcard is dropped entirely — any
+// stranger can mint a dev instance under that wildcard, so in production it is
+// an open exfiltration destination, not a convenience.
+function clerkFrontendOrigin() {
+  const pk = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "";
+  const m = /^pk_(test|live)_([A-Za-z0-9+/=]+)$/.exec(pk);
+  if (!m) return null;
+  try {
+    const host = Buffer.from(m[2], "base64").toString("utf8").replace(/\$$/, "").trim();
+    // Hostname shape only — never let a malformed env value inject CSP tokens.
+    if (/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/i.test(host)) return `https://${host}`;
+  } catch {
+    /* fall through to null */
+  }
+  return null;
+}
+const CLERK_CSP_ORIGINS = (() => {
+  const derived = clerkFrontendOrigin();
+  const live = (process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY || "").startsWith("pk_live_");
+  if (live && derived) return derived;
+  return [...new Set([derived, "https://*.clerk.accounts.dev"].filter(Boolean))].join(" ");
+})();
+
 const nextConfig = {
   // Production hardening (Next.js production checklist).
   poweredByHeader: false,
@@ -162,12 +190,12 @@ const nextConfig = {
     // close clickjacking, base-href hijack and cross-origin form posting).
     const CSP_ENFORCED = [
       "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      `script-src 'self' 'unsafe-inline' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      "connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud",
-      "frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud`,
+      `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",
       "base-uri 'self'",
@@ -181,12 +209,12 @@ const nextConfig = {
     // `'unsafe-inline'` can be dropped from the enforcing policy above.
     const CSP_REPORT_ONLY = [
       "default-src 'self'",
-      "script-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      `script-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
-      "connect-src 'self' https://*.clerk.accounts.dev https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud",
-      "frame-src 'self' https://*.clerk.accounts.dev https://challenges.cloudflare.com",
+      `connect-src 'self' ${CLERK_CSP_ORIGINS} https://clerk-telemetry.com https://api.shadw.cloud https://*.shadw.cloud`,
+      `frame-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "worker-src 'self' blob:",
       "object-src 'none'",
       "base-uri 'self'",

@@ -112,9 +112,13 @@ const clerkEnabled = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 // app's callback URLs. This lets login work both locally and on the public
 // platform domain. Override/extend via NEXT_PUBLIC_ALLOWED_ORIGINS
 // (comma-separated); the defaults cover the common local ports + shadw.cloud.
+// `www.shadw.cloud` serves the SAME app (live-verified: it answers 200 with
+// the dashboard, no redirect to the apex), so it must be allow-listed too —
+// otherwise Clerk refuses every redirect_url on the www origin and a sign-in
+// there bounces back to where it started.
 const allowedRedirectOrigins = (
   process.env.NEXT_PUBLIC_ALLOWED_ORIGINS ||
-  "http://localhost:3000,http://localhost:3002,https://shadw.cloud"
+  "http://localhost:3000,http://localhost:3002,https://shadw.cloud,https://www.shadw.cloud"
 )
   .split(",")
   .map((s) => s.trim())

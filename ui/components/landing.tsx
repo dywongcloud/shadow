@@ -47,15 +47,37 @@ function GlowRing({
   );
 }
 
+// Whether the intro already played during THIS page load. Module scope — reset
+// only by a real navigation/reload, never by a React remount. The landing↔
+// dashboard flip is decided by CLIENT auth state (see home-client.tsx), so
+// <Landing> can unmount and REMOUNT within a single page load — and does so
+// repeatedly when Clerk's auth state cannot settle (the mobile split-brain
+// cookie state). Replaying a 2.75s full-screen black overlay plus a
+// documentElement scroll-lock on every remount amplified that thrash into the
+// reported "flickers endlessly"; this flag makes the intro strictly
+// once-per-page-load. The server never sets it (only the client effect does),
+// so SSR always renders the overlay and hydration stays consistent.
+let introPlayed = false;
+
 /** Intro loading animation (reference video 1): a full-screen black overlay with
  *  the shadw ghost logo centered inside the rotating GlowRing. ~2s of spin, then
- *  the overlay fades to reveal the hero. Plays on EVERY page load (matching the
- *  video); skipped only for prefers-reduced-motion. Rendered from first paint
- *  (SSR) so there's no pre-hydration flash of the hero. All layout is inline
- *  styles — deterministic, no class-generation dependency. */
+ *  the overlay fades to reveal the hero. Plays once per PAGE LOAD (a client-side
+ *  remount of <Landing> — e.g. an auth-state flip — must NOT replay it); skipped
+ *  entirely for prefers-reduced-motion. Rendered from first paint (SSR) so
+ *  there's no pre-hydration flash of the hero. All layout is inline styles —
+ *  deterministic, no class-generation dependency. */
 function IntroLoader() {
-  const [phase, setPhase] = useState<"show" | "fade" | "done">("show");
+  // On a remount after the intro already ran this page load, start (and stay)
+  // done — no overlay frame at all. On the hydration mount `introPlayed` is
+  // still false on both server and client, so SSR and the first client render
+  // agree on "show".
+  const [phase, setPhase] = useState<"show" | "fade" | "done">(() => (introPlayed ? "done" : "show"));
   useEffect(() => {
+    if (introPlayed) {
+      setPhase("done"); // no-op when the initializer already started at "done"
+      return;
+    }
+    introPlayed = true;
     if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
       setPhase("done");
       return;
@@ -134,7 +156,7 @@ function IntroLoader() {
 export function Landing() {
   return (
     <MarketingShell>
-      {/* Intro loading animation (once per session): ring + logo, then fade. */}
+      {/* Intro loading animation (once per page load): ring + logo, then fade. */}
       <IntroLoader />
       {/* ---------------- Hero ---------------- */}
       <section className="relative overflow-hidden">

@@ -55,6 +55,16 @@ const bypass = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== 
 // personal settings, team settings + org management, project settings, project
 // deployments, the network tab, and billing/admin. Stale views here are unsafe.
 const NO_STORE = [
+  // The home route: page.tsx keeps it `force-dynamic` and its body flips
+  // landing↔dashboard on CLIENT auth state. It was previously in PUBLIC_PAGES
+  // (`public, s-maxage=3600, stale-while-revalidate=86400`) — which let any
+  // shared cache hold a per-request-rendered document for an hour and let the
+  // browser serve it stale for a DAY with no `Vary: Cookie`, so post-redeploy
+  // (or mid sign-in/sign-out) mobile browsers could keep re-serving a stale
+  // shell referencing dead content-hashed chunks — the same class the
+  // /workflows entry below documents. The service worker's "network-first"
+  // navigation fetch honors this HTTP cache too, so `public` here defeated it.
+  /^\/$/,
   /^\/account(\/|$)/,
   /^\/settings(\/|$)/,
   /^\/teams(\/|$)/,
@@ -71,10 +81,12 @@ const NO_STORE = [
 ];
 
 // Public marketing / docs / status pages — shared (CDN) + browser cacheable.
+// Deliberately NOT here: "/" (force-dynamic auth flip — see NO_STORE) and
+// /sign-in|/sign-up (auth surfaces; Clerk's middleware/handshake acts
+// per-request around them, and a shared cache must never hold their
+// responses — they fall through to the `private` default below).
 const PUBLIC_PAGES = [
-  /^\/$/,
   /^\/(product|solutions|features|pricing|blog|case-studies|contact|privacy|docs|status)(\/|$)/,
-  /^\/sign-(in|up)(\/|$)/,
 ];
 
 /**

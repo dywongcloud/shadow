@@ -50,9 +50,23 @@ function teamHeaders(): Record<string, string> {
  *  MUST treat `null` as "no valid session for this tenant exists" — never
  *  proceed as if the switch succeeded (that's what let a team-switch UI action
  *  broadcast `hive-team-changed` while the browser kept sending the OLD
- *  tenant's cookie, rendering that tenant's data under the new view). */
+ *  tenant's cookie, rendering that tenant's data under the new view).
+ *
+ *  Every call — automatic (the `ensureSessionMinted` gate, the 401/403
+ *  re-mint) or explicit (team switch, the periodic re-mint intervals) — funnels
+ *  through this ONE chokepoint, so `noteMintOutcome` sees every outcome and the
+ *  failure budget below can never be bypassed by a caller minting directly.
+ *  Explicit calls are never BLOCKED by that budget (a user action deserves a
+ *  real attempt, and a success is how a degraded session recovers); only the
+ *  automatic paths consult it before firing. */
 export async function mintSessionToken(team?: string): Promise<string | null> {
   if (typeof window === "undefined") return null;
+  const granted = await mintOnce(team);
+  noteMintOutcome(granted);
+  return granted;
+}
+
+async function mintOnce(team?: string): Promise<string | null> {
   const t = team ?? currentTeam();
   try {
     const r = await fetch("/api/token", {
@@ -153,18 +167,76 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   // retry and propagates, so this cannot loop per-request. The cooldown keeps a
   // PERSISTENTLY-403 endpoint on a 3-4s poll from turning every cycle into an
   // /api/token round trip: one automatic re-mint per window is plenty (a
-  // successful mint fixes every subsequent request anyway).
+  // successful mint fixes every subsequent request anyway). This is an
+  // AUTOMATIC mint path, so it also respects the shared failure budget: while
+  // minting is in backoff or suspended (`failed`), re-minting here cannot
+  // succeed any harder than it just did, so the response propagates as-is.
   if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && CLERK_ON) {
     const now = Date.now();
+    if (mintState === "failed" || now < mintNextAutoAttemptAt) return r;
     if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;
     lastAutoMintAt = now;
-    await mintSessionToken();
+    const granted = await mintSessionToken();
+    if (granted === null) return r; // re-mint failed — a retry would just re-fail
     return once();
   }
   return r;
 }
 let lastAutoMintAt = 0;
 const AUTO_MINT_COOLDOWN_MS = 30_000;
+
+// ---- Session-mint failure budget ------------------------------------------
+// On a browser where the session can never persist (iOS/WebKit ITP blocking or
+// purging the cookies Clerk's dev-instance handshake depends on, an unreachable
+// backend, a UI server missing HIVE_INTERNAL_TOKEN), EVERY mint fails — and the
+// pre-budget code re-fired a mint for every poll tick forever (witnessed live:
+// ~24 POST /api/token per minute from the dashboard's four pollers, unbounded).
+// Automatic mints now carry a consecutive-failure budget with escalating
+// backoff; after MINT_MAX_CONSECUTIVE_FAILURES the mint enters an explicit
+// terminal "failed" state and automatic paths stop retrying an unsatisfiable
+// condition — requests simply proceed unauthenticated, exactly what they
+// already did per-failure, minus the doomed /api/token round trip. The state is
+// NOT permanent: any EXPLICIT mint (team switch, sign-in identity sync, the
+// 4/50-minute re-mint intervals) still fires, and one success fully resets the
+// budget. `sessionMintStatus()` + the `hive-session-mint-degraded` event let
+// UI render the degraded state honestly instead of pretending auth is coming.
+const MINT_MAX_CONSECUTIVE_FAILURES = 4;
+const MINT_BACKOFF_MS = [2_000, 8_000, 30_000]; // after failure 1, 2, 3+
+export type SessionMintState = "unattempted" | "ok" | "backoff" | "failed";
+let mintState: SessionMintState = "unattempted";
+let mintConsecutiveFailures = 0;
+let mintNextAutoAttemptAt = 0; // epoch ms; automatic mints before this are skipped
+
+/** Honest, renderable mint state: `failed` = automatic re-mints suspended after
+ *  repeated failures (session cannot persist in this browser); reads degrade to
+ *  unauthenticated rather than silently retrying forever. */
+export function sessionMintStatus(): { state: SessionMintState; failures: number } {
+  return { state: mintState, failures: mintConsecutiveFailures };
+}
+
+function noteMintOutcome(granted: string | null): void {
+  if (granted !== null) {
+    // Any success — automatic or explicit — fully recovers the budget.
+    mintConsecutiveFailures = 0;
+    mintNextAutoAttemptAt = 0;
+    mintState = "ok";
+    return;
+  }
+  mintConsecutiveFailures += 1;
+  if (mintConsecutiveFailures >= MINT_MAX_CONSECUTIVE_FAILURES) {
+    if (mintState !== "failed") {
+      console.warn(
+        `hive: session mint failed ${mintConsecutiveFailures}x in a row — suspending automatic re-mints (requests continue unauthenticated); a team switch, sign-in, or periodic re-mint can still recover`,
+      );
+      window.dispatchEvent(new Event("hive-session-mint-degraded"));
+    }
+    mintState = "failed";
+  } else {
+    mintState = "backoff";
+    mintNextAutoAttemptAt =
+      Date.now() + MINT_BACKOFF_MS[Math.min(mintConsecutiveFailures - 1, MINT_BACKOFF_MS.length - 1)];
+  }
+}
 
 /**
  * Closes the mount-time race between `SessionToken`'s cookie mint and every
@@ -189,16 +261,30 @@ const AUTO_MINT_COOLDOWN_MS = 30_000;
  * resolution (an already-settled promise). Resets to `null` on a failed mint so
  * a LATER caller (the next poll tick) can retry instead of wedging the gate shut
  * forever on one bad attempt.
+ *
+ * BOUNDED retry (the opposite failure): that reset-on-failure is what let a
+ * browser where minting can NEVER succeed (mobile ITP purging the Clerk
+ * session, dead backend) re-fire a doomed /api/token POST on every poll tick,
+ * forever. Retries now go through the failure budget above: while in backoff
+ * (or after the budget is exhausted → terminal `failed`) the gate resolves
+ * immediately WITHOUT minting and the request proceeds unauthenticated — the
+ * same outcome a failed mint already produced, minus the retry storm. The
+ * original race-fix property is intact: whenever a mint is permitted, every
+ * caller still awaits the ONE shared in-flight attempt before its first
+ * request, and the first caller after a backoff window expires re-arms it.
  */
 let sessionMintPromise: Promise<void> | null = null;
 export function ensureSessionMinted(): Promise<void> {
   if (typeof window === "undefined" || !CLERK_ON) return Promise.resolve();
-  if (!sessionMintPromise) {
-    sessionMintPromise = mintSessionToken().then(
-      (granted) => { if (granted === null) sessionMintPromise = null; },
-      () => { sessionMintPromise = null; },
-    );
+  if (sessionMintPromise) return sessionMintPromise; // in-flight or settled-ok: share it
+  if (mintState === "ok") return Promise.resolve(); // an explicit mint already succeeded
+  if (mintState === "failed" || Date.now() < mintNextAutoAttemptAt) {
+    return Promise.resolve(); // budget exhausted / backing off: degrade, don't re-fire
   }
+  sessionMintPromise = mintSessionToken().then(
+    (granted) => { if (granted === null) sessionMintPromise = null; },
+    () => { sessionMintPromise = null; },
+  );
   return sessionMintPromise;
 }
 
