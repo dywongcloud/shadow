@@ -180,7 +180,20 @@ const clerk = clerkMiddleware(async (auth, req) => {
     // that never returns a byte. Passing `unauthenticatedUrl` skips
     // `isPageRequest()` entirely and always takes the safe `redirect()`
     // path, for every request shape.
-    await auth.protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(req.url)}`, req.url).toString() });
+    // Build the sign-in return URL from the PUBLIC origin, never req.url.
+    // Under self-hosted `next start -p 3002` behind hive-node's reverse proxy,
+    // req.url's host is the loopback upstream (localhost:3002/127.0.0.1:3002)
+    // — live-captured on a real phone-shaped request as
+    // `redirect_url=https%3A%2F%2Flocalhost%3A3002%2Fprojects`, an unreachable
+    // return address that bounces the sign-in round-trip back to itself. The
+    // hive-node proxy always stamps x-forwarded-host/-proto with the real
+    // public origin (main.rs dashboard_proxy); trust those, fall back to
+    // req.url only for direct (un-proxied, dev) access.
+    const fwdHost = req.headers.get("x-forwarded-host");
+    const fwdProto = req.headers.get("x-forwarded-proto") || "https";
+    const publicBase = fwdHost ? `${fwdProto}://${fwdHost}` : req.url;
+    const returnTo = new URL(req.nextUrl.pathname + req.nextUrl.search, publicBase).toString();
+    await auth.protect({ unauthenticatedUrl: new URL(`/sign-in?redirect_url=${encodeURIComponent(returnTo)}`, publicBase).toString() });
   }
   return withCache(req, NextResponse.next());
 });
