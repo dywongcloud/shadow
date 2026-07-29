@@ -36,3 +36,6 @@ ansible/.vault_pass
 # agentplug-runner per-repo KV scratch (native spool host runtime state,
 # regenerated on daemon boot) -- transient tooling state, never repo content.
 .agentplug-kv/
+# agentplug-runner single-shot dispatch scratch (used when the shared
+# daemon is wedged; pure runtime state, regenerated per dispatch).
+.agentplug/
