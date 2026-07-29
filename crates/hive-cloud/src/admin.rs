@@ -4161,9 +4161,10 @@ async fn inference_endpoints(
 
 /// Geo-DNS observability (operator): live Seer query counters, the
 /// tailored-vs-generic split that actually tells you whether proximity routing
-/// is working, GeoCache hit/pending/unlocatable, the delegation record count
-/// the DNS reconciler published, and the per-node histogram of which address
-/// each answer handed out first.
+/// is working, the local geo table's identity and hit rate (plus the optional
+/// remote fallback's memo state and its on-disk persistence counters), the
+/// delegation record count the DNS reconciler published, and the per-node
+/// histogram of which address each answer handed out first.
 async fn dns_stats(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -4171,7 +4172,9 @@ async fn dns_stats(
     require_operator(claims.as_ref().map(|e| &e.0))?;
     use std::sync::atomic::Ordering;
     let s = &crate::dnsserver::DNS_STATS;
-    let (known, pending, unlocatable) = c.dns_geo.stats();
+    let geo = c.dns_geo.stats();
+    let (table_source, table_v4, table_v6) = crate::geoip::table_info();
+    let (loaded_at_boot, cache_writes) = c.dns_geo.persist_stats();
     let verdicts = crate::dns_probe::validate_nameservers(&c.registry.nodes());
     let answers: std::collections::BTreeMap<String, u64> =
         crate::dnsserver::ANSWER_FIRST.lock().iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -4191,9 +4194,27 @@ async fn dns_stats(
             "tailored": s.tailored.load(Ordering::Relaxed),
             "generic": s.generic.load(Ordering::Relaxed),
             "with_ecs": s.with_ecs.load(Ordering::Relaxed),
-            "cache_known": known,
-            "cache_pending": pending,
-            "cache_unlocatable": unlocatable,
+            // The local prefix table: which copy is loaded and how big it is.
+            // `source: "none"` means it failed validation and every answer here
+            // is generic — the one state worth alerting on.
+            "table_source": table_source,
+            "table_rows_v4": table_v4,
+            "table_rows_v6": table_v6,
+            "local_hits": geo.local_hits,
+            "local_misses": geo.local_misses,
+            // The optional remote fallback. Disabled unless an operator set
+            // HIVE_DNS_GEO_ENDPOINT, in which case these count its memo.
+            "remote_enabled": geo.remote_enabled,
+            "remote_known": geo.remote_known,
+            "remote_pending": geo.remote_pending,
+            "remote_unlocatable": geo.remote_unlocatable,
+            // Durability of the remote memo: how many prefixes came back off
+            // disk at boot (0 after a first-ever boot OR a wiped/corrupt file —
+            // the signal that this node is re-warming from scratch) and how
+            // many debounced saves have run since.
+            "cache_loaded_at_boot": loaded_at_boot,
+            "cache_writes": cache_writes,
+            "cache_file": crate::dns_geo::cache_path().display().to_string(),
         },
         "delegation_records": crate::vercel_dns::STATS.geo_delegation_records.load(Ordering::Relaxed),
         // Prove-before-advertise, made visible. `nameservers` is the SAME

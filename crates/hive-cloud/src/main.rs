@@ -20,6 +20,7 @@ mod dns;
 mod dns_geo;
 mod dns_probe;
 mod dnsserver;
+mod geoip;
 mod docstore;
 mod edge;
 mod enterprise;
@@ -428,6 +429,10 @@ async fn main() -> anyhow::Result<()> {
         // off-host probes of its peers, refreshed every round (same post-boot
         // fill-in pattern as `relay_url`/`guardian_iroh_addr`).
         dns_attest: Vec::new(),
+        // A MEASUREMENT, not intent: `false` until the dashboard probe loop
+        // (spawned below, post-registry) sees the local upstream answer within
+        // budget. Same fill-in pattern as `dns_attest`.
+        dashboard: false,
         // Boot value; the gossip loop refreshes this every round from the
         // cluster's observed-owner epoch (registry.set_self_cp_epoch).
         cp_epoch: 1,
@@ -538,6 +543,11 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!("shutdown signal → flushing platform state");
             persist::flush_blocking();
+            // Same reason, different file: the geo cache's saver is debounced,
+            // so a clean restart would otherwise drop whatever was learned
+            // inside the last window and de-tailor those prefixes on the way
+            // back up. Cheap (one small sidecar) and best-effort.
+            flush_cloud.dns_geo.flush_blocking();
             std::process::exit(0);
         });
     }
@@ -840,6 +850,38 @@ async fn main() -> anyhow::Result<()> {
     // gossips the ones that actually answer, so the reconciler below can
     // publish an NS only for a node proven reachable from off its own host.
     dns_probe::spawn_ns_prober(cloud.clone());
+
+    // Dashboard capability prober: measure THIS node's own dashboard upstream
+    // and gossip the verdict (`NodeInfo::dashboard`), so the DNS reconciler can
+    // keep slow-SSR nodes out of the apex/`www` A-set (see
+    // `vercel_dns::desired_platform`). The budget bounds the first-paint SSR a
+    // published node may impose on a first visit; a node with no upstream
+    // configured simply never claims the capability.
+    {
+        let cloud = cloud.clone();
+        let upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
+            .ok()
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty());
+        let budget_ms: u64 =
+            std::env::var("HIVE_DASHBOARD_PROBE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        tokio::spawn(async move {
+            let Some(up) = upstream else { return };
+            loop {
+                let ok = match tokio::time::timeout(
+                    std::time::Duration::from_millis(budget_ms),
+                    cloud.http.get(format!("{up}/")).send(),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => resp.status().is_success() || resp.status().is_redirection(),
+                    _ => false, // slow (over budget), connection refused, or error
+                };
+                cloud.registry.set_self_dashboard(ok);
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
 
     // Vercel DNS reconciler (ngrok retirement): leader-elected loop publishing
     // healthy node IPs to api.{platform}/*.{apps} via the Vercel API. No-op in

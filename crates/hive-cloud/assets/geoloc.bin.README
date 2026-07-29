@@ -1,0 +1,36 @@
+geoloc.bin — local IP-prefix → coordinate table for Seer's geo-DNS
+==================================================================
+
+Consumed by  crates/hive-cloud/src/geoip.rs  (include_bytes!, zero-copy).
+Produced by  scripts/gen-geo-table.py       (not part of the build).
+
+Regenerate:
+
+    curl -sO https://download.db-ip.com/free/dbip-city-lite-YYYY-MM.csv.gz
+    scripts/gen-geo-table.py dbip-city-lite-YYYY-MM.csv.gz \
+        crates/hive-cloud/assets/geoloc.bin
+
+Current contents
+----------------
+source snapshot : dbip-city-lite-2026-07 (8 053 351 ranges, city precision)
+fold tolerance  : 800 km
+rows            : 804 441 IPv4 (/0-aligned run table) + 81 040 IPv6 (/32 keys)
+size            : 5 312 918 bytes (32-byte header + 6 bytes/row)
+
+Attribution (required by the source licence)
+--------------------------------------------
+IP geolocation data by DB-IP (https://db-ip.com), "IP to City Lite" database,
+licensed under Creative Commons Attribution 4.0 International (CC-BY-4.0):
+https://creativecommons.org/licenses/by/4.0/
+
+CC-BY explicitly permits the redistribution this file performs. MaxMind's
+GeoLite2 is technically equivalent but its licence does not, which is why it is
+not the input.
+
+Why this is committed rather than downloaded
+--------------------------------------------
+The whole point is that geolocating a DNS client requires no third-party call at
+run time. A build step that fetched the CSV would move that dependency from the
+data path to the build path instead of deleting it, and a node that fetched it
+at boot would still be a node that fails to route well when a free service is
+unreachable. Committed, the table works on a node with no egress at all.

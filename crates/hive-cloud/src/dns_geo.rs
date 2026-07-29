@@ -12,20 +12,36 @@
 //!
 //! Two deliberate design constraints:
 //!
-//! * **Nothing blocks the query.** A geo lookup is a network call, and a DNS
-//!   response budget is milliseconds. An unknown subnet is answered from the
-//!   existing health-ordered set *immediately* and resolved in the background,
-//!   so proximity is an optimisation that arrives shortly after, never a stall.
+//! * **Nothing blocks the query.** A DNS response budget is milliseconds, so
+//!   locating a client must never wait on I/O. The primary source is a local
+//!   prefix table ([`crate::geoip`]) — a binary search over static bytes, no
+//!   network, safe to run inline. Only the OPTIONAL remote fallback is a network
+//!   call, and it stays on a background worker: an address the table cannot
+//!   place is answered from the existing health-ordered set *immediately* and
+//!   resolved later, never waited on.
 //! * **The answer says how specific it is.** A proximity answer is only valid
 //!   for the subnet it was computed for, so the response echoes the ECS option
 //!   with a SCOPE PREFIX-LENGTH; a generic answer echoes scope 0. Without that,
 //!   a resolver caches one client's nearest-node answer and serves it to
 //!   everyone behind it.
+//!
+//! The remote-memo cache those constraints imply is **durable**
+//! ([`GeoCache::spawn`] loads it, a debounced background writer saves it).
+//! Purely in-memory, every restart — a roll, a crash loop, a `systemctl
+//! restart` — emptied it and sent EVERY remotely-located client prefix back
+//! through the generic answer until its background lookup completed again.
+//! Live-witnessed: an already-tailored prefix (scope /24, correct nearest node
+//! first) flipped to scope 0 with generic ordering immediately after a restart
+//! and only re-warmed ~30s later. Across a rolling fleet update that
+//! de-tailors those prefixes for a window; a crash-looping node never tailors
+//! them at all.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use hive_edge::{haversine_km, NodeInfo};
+use serde::{Deserialize, Serialize};
 
 /// EDNS0 option code for Client Subnet (RFC 7871 §6).
 const OPT_CODE_ECS: u16 = 8;
@@ -324,26 +340,141 @@ enum Entry {
     Unlocatable,
 }
 
-/// Subnet → location cache, filled by a background worker so no DNS query ever
-/// waits on an HTTP geo lookup.
-pub struct GeoCache {
-    entries: parking_lot::RwLock<std::collections::HashMap<IpAddr, Entry>>,
-    queue: tokio::sync::mpsc::UnboundedSender<IpAddr>,
+/// A cache entry plus WHEN it was learned. The timestamp is what makes expiry
+/// (below) and reload-side pruning possible at all; without it a restored file
+/// would be indistinguishable from a fresh lookup no matter how old it was.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    entry: Entry,
+    at_ms: u64,
 }
 
-/// Upper bound on cached subnets. A DNS server is an open surface — without a
-/// cap, arbitrary queries grow this map for as long as the process runs.
+/// How long each kind of entry stays valid. Geolocation data DOES go stale
+/// (prefixes get reassigned between regions, new allocations move), so entries
+/// age out — but the three kinds age at deliberately different rates:
+///
+/// * **Known — 30 days.** A prefix→city mapping changes on the timescale of
+///   registry reallocation, not hours, and the answer it feeds is "which of ~10
+///   nodes is nearest", a decision that survives being a few hundred km wrong.
+///   Expiring aggressively would buy accuracy nobody can measure while
+///   re-spending the paced lookup budget (1 per 1.5s) on prefixes we already
+///   know — the exact cost this cache exists to avoid.
+/// * **Unlocatable — 6 hours.** A negative is as likely to be a rate-limited or
+///   timed-out lookup as a genuinely unplaceable prefix, and a long-lived
+///   negative pins that prefix to generic answers. Short TTL = the mistake
+///   self-corrects.
+/// * **Pending — 60s.** Pending means "a lookup is in flight". If the worker
+///   died, or the process was killed mid-lookup, a Pending entry with nothing
+///   behind it would pin that prefix generic FOREVER (the pre-existing
+///   `contains_key` check returned early for it on every later query). Ageing it
+///   out re-queues instead. This is also why Pending is never persisted.
+const KNOWN_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const UNLOCATABLE_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+const PENDING_TTL_MS: u64 = 60_000;
+
+impl Slot {
+    fn ttl_ms(&self) -> u64 {
+        match self.entry {
+            Entry::Known(..) => KNOWN_TTL_MS,
+            Entry::Unlocatable => UNLOCATABLE_TTL_MS,
+            Entry::Pending => PENDING_TTL_MS,
+        }
+    }
+    fn is_fresh(&self, now_ms: u64) -> bool {
+        now_ms.saturating_sub(self.at_ms) < self.ttl_ms()
+    }
+}
+
+/// Subnet → location resolver.
+///
+/// Two tiers, in this order:
+///
+/// 1. **The local table** ([`crate::geoip`]) — a committed prefix→coordinate
+///    blob embedded in the binary. Answers in a few hundred nanoseconds with no
+///    network, no rate limit, and nothing about the client leaving the node.
+///    This is the whole path in the default configuration.
+/// 2. **An optional remote endpoint** (`HIVE_DNS_GEO_ENDPOINT`) for the prefixes
+///    the table cannot place. OFF unless configured: the point of the table is
+///    that a production data path owes nothing to a third party. When it IS
+///    configured it keeps the original shape — queued to a paced background
+///    worker, results memoised here — so it can never stall a response.
+///
+/// The memo map exists only for tier 2. Tier-1 hits are deliberately NOT cached:
+/// re-running the binary search costs less than the write lock would, and
+/// filling a capped map with entries that are free to recompute would evict the
+/// remote answers that actually cost something.
+///
+/// The tier-2 memo is DURABLE: loaded from `$HIVE_DATA/dns_geo.json` at boot
+/// and saved by a debounced background writer (see the module doc), so a
+/// restart does not throw remotely-learned answers away.
+pub struct GeoCache {
+    entries: parking_lot::RwLock<std::collections::HashMap<IpAddr, Slot>>,
+    queue: tokio::sync::mpsc::UnboundedSender<IpAddr>,
+    /// Prefixes answered from the local table vs. handed to the remote path.
+    /// Reported by `GET /v1/dns/stats`: without the split there is no way to see
+    /// whether the table is carrying the traffic or quietly missing everything.
+    local_hits: AtomicU64,
+    local_misses: AtomicU64,
+    /// Bumped whenever a DURABLE entry changes (the background worker resolving
+    /// a lookup — the only writer of Known/Unlocatable). The saver compares it
+    /// against `saved` and skips the write entirely when nothing moved.
+    dirty: AtomicU64,
+    saved: AtomicU64,
+    /// How many entries came back off disk at boot, and how many durable writes
+    /// have happened. Both surfaced by `GET /v1/dns/stats`: "did the cache
+    /// survive the restart" is otherwise unanswerable without a live dig.
+    loaded_at_boot: AtomicU64,
+    writes: AtomicU64,
+    /// Serializes file writes so the debounced saver and a shutdown
+    /// `flush_blocking()` can never interleave two temp-file+rename sequences.
+    file_lock: std::sync::Mutex<()>,
+}
+
+/// Upper bound on memoised remote lookups. A DNS server is an open surface —
+/// without a cap, arbitrary queries grow this map for as long as the process
+/// runs. It is enforced on LOAD as well as at runtime, so no on-disk file
+/// (older build with a larger cap, hand-edited, corrupted-by-append) can reload
+/// past it.
 const MAX_ENTRIES: usize = 8192;
 
+/// The remote endpoint, or `None` when nobody configured one (the default).
+/// Read per call rather than cached in a static: it is only consulted on a local
+/// miss, which is rare, and a plain env read there beats another global.
+fn remote_endpoint() -> Option<String> {
+    std::env::var("HIVE_DNS_GEO_ENDPOINT").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 impl GeoCache {
-    /// Create the cache and spawn its lookup worker.
+    /// Create the cache and spawn the OPTIONAL remote-lookup worker.
     ///
-    /// `http` is the platform's shared client. Lookups are PACED because the geo
-    /// service rate-limits per source IP, and getting blocked there would take
-    /// proximity down fleet-wide rather than degrade it.
+    /// `http` is the platform's shared client. The worker idles forever unless
+    /// `HIVE_DNS_GEO_ENDPOINT` is set, because nothing queues to it otherwise.
+    /// Lookups are PACED: a remote geo service rate-limits per source IP, and
+    /// getting blocked there would take proximity down fleet-wide rather than
+    /// degrade it.
+    ///
+    /// The prior memo contents are loaded from disk FIRST, synchronously: this
+    /// runs once at `CloudState::new` and reads one small file, and doing it
+    /// before the server can take a query is the whole point — the first query
+    /// for a previously-known prefix must already be tailored.
     pub fn spawn(http: reqwest::Client) -> Arc<Self> {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<IpAddr>();
-        let cache = Arc::new(Self { entries: Default::default(), queue: tx });
+        let restored = load_from_disk();
+        let n_restored = restored.len();
+        if n_restored > 0 {
+            tracing::info!(entries = n_restored, path = %cache_path().display(), "dns_geo: restored subnet→location cache from disk");
+        }
+        let cache = Arc::new(Self {
+            entries: parking_lot::RwLock::new(restored),
+            queue: tx,
+            local_hits: AtomicU64::new(0),
+            local_misses: AtomicU64::new(0),
+            dirty: AtomicU64::new(0),
+            saved: AtomicU64::new(0),
+            loaded_at_boot: AtomicU64::new(n_restored as u64),
+            writes: AtomicU64::new(0),
+            file_lock: std::sync::Mutex::new(()),
+        });
         let weak = Arc::downgrade(&cache);
         tokio::spawn(async move {
             let pace = std::time::Duration::from_millis(
@@ -352,57 +483,145 @@ impl GeoCache {
             while let Some(net) = rx.recv().await {
                 let Some(cache) = weak.upgrade() else { return };
                 let located = lookup_geo(&http, net).await;
+                let now = hive_core::now_ms();
                 // The write guard is scoped to this block DELIBERATELY: a
                 // `parking_lot` guard is not `Send`, so leaving it merely
                 // `drop()`ed before the await below still makes the whole task
                 // future non-Send and `tokio::spawn` rejects it.
                 {
                     let mut w = cache.entries.write();
-                    w.insert(
-                        net,
-                        match located {
-                            Some((lat, lon)) => Entry::Known(lat, lon),
-                            None => Entry::Unlocatable,
+                    let prev = w.get(&net).copied();
+                    let entry = match located {
+                        Some((lat, lon)) => Entry::Known(lat, lon),
+                        // A FAILED lookup is not proof the prefix is
+                        // unplaceable — the service rate-limits and times out.
+                        // Never downgrade a location we already hold; only a
+                        // prefix with no known fix becomes a negative.
+                        None => match prev {
+                            Some(Slot { entry: Entry::Known(lat, lon), .. }) => Entry::Known(lat, lon),
+                            _ => Entry::Unlocatable,
                         },
-                    );
+                    };
+                    w.insert(net, Slot { entry, at_ms: now });
                 }
+                cache.dirty.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(pace).await;
             }
         });
+        // Debounced saver. Deliberately a SEPARATE task on a timer rather than a
+        // write per learned entry: the DNS hot path must never touch the disk,
+        // and lookups arrive one per `pace` (1.5s), so a per-entry write would
+        // rewrite the file every 1.5s for hours during a cold warm-up. Ticking
+        // and writing only when the dirty counter moved coalesces a burst into
+        // one write; the interval bounds what an unclean kill can lose to a
+        // handful of prefixes, each of which simply re-looks-up.
+        if let Some(interval) = save_interval() {
+            let weak = Arc::downgrade(&cache);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let Some(cache) = weak.upgrade() else { return };
+                    let target = cache.dirty.load(Ordering::Relaxed);
+                    if target == cache.saved.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    let rows = cache.disk_rows();
+                    let arc = cache.clone();
+                    // spawn_blocking: the write ends in an fsync, which must not
+                    // sit on an async worker thread.
+                    let done = tokio::task::spawn_blocking(move || arc.write_rows(rows)).await;
+                    match done {
+                        Ok(Ok(())) => {
+                            cache.saved.store(target, Ordering::Relaxed);
+                            cache.writes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // Leave `saved` behind `dirty` so the next tick retries.
+                        Ok(Err(e)) => tracing::warn!(error = %e, "dns_geo: cache save failed; retrying on next tick"),
+                        Err(e) => tracing::warn!(error = %e, "dns_geo: cache save task failed"),
+                    }
+                }
+            });
+        }
         cache
     }
 
-    /// The client's location if already known. Never blocks: an unknown subnet
-    /// is queued for background resolution and reported as unknown for now, so
-    /// this query is answered generically and later ones benefit.
+    /// The client's location. Never blocks, and no disk I/O happens here —
+    /// persistence is entirely the background writer's job.
+    ///
+    /// Order matters and is the whole design: the local table first (in-process,
+    /// no I/O, answers the FIRST query for a prefix as well as the thousandth),
+    /// then the memo of previous remote answers, and only then — if an operator
+    /// configured a remote endpoint at all — a queued background lookup that
+    /// this query does not wait for.
     pub fn locate(&self, ip: IpAddr) -> Option<(f64, f64)> {
         if unlocatable(ip) {
             return None;
         }
         let net = network_key(ip);
-        if let Some(e) = self.entries.read().get(&net).copied() {
-            return match e {
-                Entry::Known(lat, lon) => Some((lat, lon)),
-                _ => None,
-            };
+        if let Some(loc) = crate::geoip::locate(net) {
+            self.local_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(loc);
         }
+        self.local_misses.fetch_add(1, Ordering::Relaxed);
+        let now = hive_core::now_ms();
+        // Fast path: a fresh memo entry answers under the read lock alone.
+        if let Some(s) = self.entries.read().get(&net).copied() {
+            if s.is_fresh(now) {
+                return match s.entry {
+                    Entry::Known(lat, lon) => Some((lat, lon)),
+                    _ => None,
+                };
+            }
+        }
+        // Nothing further to try when there is no remote endpoint: the local
+        // table IS the answer, and the miss is honest ("this prefix is not
+        // placeable"), so the query gets the generic health-ordered set. Not
+        // recording anything here keeps the map exclusively about remote work.
+        if remote_endpoint().is_none() {
+            return None;
+        }
+        // Unknown, or expired → (re)queue a lookup under the write lock so
+        // exactly one caller queues it.
         let mut w = self.entries.write();
-        if w.len() >= MAX_ENTRIES {
-            // Full: drop the entries that carry no location before refusing to
-            // learn anything new, so a burst of unlocatable traffic can't
-            // permanently freeze the cache against real clients.
-            w.retain(|_, v| matches!(v, Entry::Known(..)));
+        let existing = w.get(&net).copied();
+        if let Some(s) = existing {
+            if s.is_fresh(now) {
+                // Raced another caller who just refreshed it.
+                return match s.entry {
+                    Entry::Known(lat, lon) => Some((lat, lon)),
+                    _ => None,
+                };
+            }
+        }
+        if existing.is_none() && w.len() >= MAX_ENTRIES {
+            // Full: drop expired entries, then the ones carrying no location,
+            // before refusing to learn anything new — a burst of unlocatable
+            // traffic must not permanently freeze the cache against real clients.
+            w.retain(|_, v| v.is_fresh(now));
+            if w.len() >= MAX_ENTRIES {
+                w.retain(|_, v| matches!(v.entry, Entry::Known(..)));
+            }
             if w.len() >= MAX_ENTRIES {
                 return None;
             }
         }
-        if w.contains_key(&net) {
-            return None; // raced another caller
-        }
-        w.insert(net, Entry::Pending);
+        // Serve-stale-while-revalidate: an expired Known keeps its coordinates
+        // (only the timestamp moves, so the refresh is queued exactly once)
+        // rather than reverting to Pending. Expiry must never itself cause the
+        // de-tailoring blip this whole module is about.
+        let served = match existing {
+            Some(Slot { entry: Entry::Known(lat, lon), .. }) => {
+                w.insert(net, Slot { entry: Entry::Known(lat, lon), at_ms: now });
+                Some((lat, lon))
+            }
+            _ => {
+                w.insert(net, Slot { entry: Entry::Pending, at_ms: now });
+                None
+            }
+        };
         drop(w);
         let _ = self.queue.send(net);
-        None
+        served
     }
 
     /// The client networks this node has actually LOCATED — real observed
@@ -416,38 +635,269 @@ impl GeoCache {
     pub fn known_networks(&self) -> Vec<IpAddr> {
         let r = self.entries.read();
         let mut v: Vec<IpAddr> =
-            r.iter().filter(|(_, e)| matches!(e, Entry::Known(..))).map(|(k, _)| *k).collect();
+            r.iter().filter(|(_, e)| matches!(e.entry, Entry::Known(..))).map(|(k, _)| *k).collect();
         v.sort();
         v
     }
 
-    /// (known, pending, unlocatable) — surfaced by the DNS stats endpoint so the
-    /// hit rate is observable rather than guessed at.
-    pub fn stats(&self) -> (usize, usize, usize) {
+    /// What the DNS stats endpoint reports. Split by TIER on purpose: "the
+    /// table answered it" and "a remote service answered it" are different
+    /// facts, and collapsing them would hide a table that has silently stopped
+    /// covering real traffic.
+    pub fn stats(&self) -> GeoStats {
         let r = self.entries.read();
-        let mut k = 0;
-        let mut p = 0;
-        let mut u = 0;
+        let mut s = GeoStats {
+            local_hits: self.local_hits.load(Ordering::Relaxed),
+            local_misses: self.local_misses.load(Ordering::Relaxed),
+            remote_enabled: remote_endpoint().is_some(),
+            ..Default::default()
+        };
         for v in r.values() {
-            match v {
-                Entry::Known(..) => k += 1,
-                Entry::Pending => p += 1,
-                Entry::Unlocatable => u += 1,
+            match v.entry {
+                Entry::Known(..) => s.remote_known += 1,
+                Entry::Pending => s.remote_pending += 1,
+                Entry::Unlocatable => s.remote_unlocatable += 1,
             }
         }
-        (k, p, u)
+        s
+    }
+
+    /// (entries restored from disk at boot, durable writes since boot) — the
+    /// operator's answer to "did the cache actually survive the restart?".
+    pub fn persist_stats(&self) -> (u64, u64) {
+        (self.loaded_at_boot.load(Ordering::Relaxed), self.writes.load(Ordering::Relaxed))
+    }
+
+    /// Write the cache NOW, synchronously (graceful shutdown). Called next to
+    /// `persist::flush_blocking` on SIGTERM so a clean `systemctl restart` loses
+    /// nothing from the debounce window. Best-effort by construction: a cache is
+    /// never worth failing a shutdown over.
+    pub fn flush_blocking(&self) {
+        if save_interval().is_none() {
+            return;
+        }
+        let target = self.dirty.load(Ordering::Relaxed);
+        if target == self.saved.load(Ordering::Relaxed) {
+            return;
+        }
+        let rows = self.disk_rows();
+        match self.write_rows(rows) {
+            Ok(()) => {
+                self.saved.store(target, Ordering::Relaxed);
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(error = %e, "dns_geo: shutdown cache flush failed"),
+        }
+    }
+
+    /// Snapshot the durable half of the map. Pending is deliberately excluded:
+    /// it describes an in-flight lookup on a process that is about to not exist,
+    /// and restoring one would suppress the re-queue for its whole TTL.
+    fn disk_rows(&self) -> Vec<DiskEntry> {
+        let r = self.entries.read();
+        r.iter()
+            .filter_map(|(net, slot)| match slot.entry {
+                Entry::Pending => None,
+                Entry::Known(lat, lon) => {
+                    Some(DiskEntry { n: net.to_string(), lat: Some(lat), lon: Some(lon), t: slot.at_ms })
+                }
+                Entry::Unlocatable => Some(DiskEntry { n: net.to_string(), lat: None, lon: None, t: slot.at_ms }),
+            })
+            .take(MAX_ENTRIES)
+            .collect()
+    }
+
+    /// Atomic temp-file + fsync + rename, the same durability shape every other
+    /// sidecar under the data dir uses (`persist::save`, `save_peer_iroh`).
+    fn write_rows(&self, entries: Vec<DiskEntry>) -> std::io::Result<()> {
+        let _g = self.file_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = crate::persist::data_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(CACHE_FILE);
+        let tmp = dir.join(format!("{CACHE_FILE}.tmp"));
+        let file = DiskFile { v: FORMAT_VERSION, saved_ms: hive_core::now_ms(), entries };
+        let json = serde_json::to_string(&file).unwrap_or_else(|_| "{}".into());
+        {
+            let f = std::fs::File::create(&tmp)?;
+            use std::io::Write;
+            let mut w = std::io::BufWriter::new(&f);
+            w.write_all(json.as_bytes())?;
+            w.flush()?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
     }
 }
 
-/// Geolocate one subnet. Uses the SAME service the node already uses to locate
-/// itself at boot (`ip-api.com`), queried for a specific address rather than
-/// "my own IP". `HIVE_DNS_GEO_ENDPOINT` overrides it for an operator who wants a
-/// self-hosted database instead of a third party.
+// ---------------------------------------------------------------------------
+// On-disk form.
+//
+// WHERE: `$HIVE_DATA/dns_geo.json` — the platform's established data dir
+// (`persist::data_dir()`), as its own small sidecar file exactly like
+// `peer_iroh.json` / `peer_guardian_addr.json`. Deliberately NOT a field on
+// `PlatformSnapshot`: that snapshot is the platform's operational record and
+// every write of it re-serializes the ENTIRE state (deployments, builds, logs,
+// metrics) and fsyncs it, plus partitions per-tenant namespace docs and
+// replicates into GuardianDB. A geolocation cache is node-local derived data
+// shaped by whichever clients happen to query THIS node — it must not ride the
+// platform-state write path, and it must not replicate across the mesh.
+//
+// SHAPE: one row per prefix — the masked network key as a plain string, lat/lon
+// (absent = the lookup ran and could not place it), and the learn time. ~55
+// bytes per entry, so a full 8192-entry cache is well under a megabyte.
+// ---------------------------------------------------------------------------
+
+const CACHE_FILE: &str = "dns_geo.json";
+/// Bumped only if the row shape changes incompatibly; a file carrying anything
+/// else is ignored wholesale rather than half-interpreted.
+const FORMAT_VERSION: u32 = 1;
+/// Refuse to read a file larger than this. The cap above bounds what this
+/// process writes, but nothing bounds what it might FIND on disk — reading an
+/// arbitrarily large file into a String at boot is how a corrupt sidecar turns
+/// into an OOM before the node ever serves a query.
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize)]
+struct DiskEntry {
+    /// Masked network key (/24 or /48), e.g. "203.0.113.0".
+    n: String,
+    /// Absent on both = Unlocatable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lat: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lon: Option<f64>,
+    /// When this entry was learned (ms epoch) — the expiry input.
+    t: u64,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct DiskFile {
+    #[serde(default)]
+    v: u32,
+    #[serde(default)]
+    saved_ms: u64,
+    #[serde(default)]
+    entries: Vec<DiskEntry>,
+}
+
+pub(crate) fn cache_path() -> std::path::PathBuf {
+    crate::persist::data_dir().join(CACHE_FILE)
+}
+
+/// Debounce interval for the background saver. `HIVE_DNS_GEO_SAVE_MS=0` turns
+/// persistence off entirely (no load, no save) for an operator who wants this
+/// node's DNS path to touch no disk at all.
+///
+/// 10s by default: lookups are paced at one per 1.5s, so a tick that fires only
+/// when something changed folds a warm-up burst into one write, while bounding
+/// an unclean-kill loss to a few prefixes — each of which costs a single generic
+/// answer and re-looks-up by itself.
+fn save_interval() -> Option<std::time::Duration> {
+    let ms = std::env::var("HIVE_DNS_GEO_SAVE_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(10_000);
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
+/// Load the persisted cache. EVERY failure mode — missing, unreadable,
+/// oversized, malformed, wrong version, garbage rows — degrades to an empty
+/// cache and a log line. A geolocation cache is an optimisation; refusing to
+/// boot (or panicking) because of one would turn a corrupt scratch file into a
+/// DNS outage for the whole delegated zone.
+fn load_from_disk() -> std::collections::HashMap<IpAddr, Slot> {
+    let empty = std::collections::HashMap::new();
+    if save_interval().is_none() {
+        return empty;
+    }
+    let path = cache_path();
+    // Absent is the normal first-boot case, not an error worth logging.
+    let Ok(meta) = std::fs::metadata(&path) else { return empty };
+    if meta.len() > MAX_FILE_BYTES {
+        tracing::warn!(bytes = meta.len(), path = %path.display(), "dns_geo: cache file too large; ignoring");
+        return empty;
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "dns_geo: cache file unreadable; starting empty");
+            return empty;
+        }
+    };
+    let file: DiskFile = match serde_json::from_str(&raw) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "dns_geo: cache file corrupt; starting empty");
+            return empty;
+        }
+    };
+    if file.v != FORMAT_VERSION {
+        tracing::warn!(found = file.v, want = FORMAT_VERSION, "dns_geo: cache file version mismatch; starting empty");
+        return empty;
+    }
+    let now = hive_core::now_ms();
+    let mut rows: Vec<(IpAddr, Slot)> = file
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let ip: IpAddr = e.n.parse().ok()?;
+            // Re-mask on the way in: a foreign or hand-edited file must not be
+            // able to seed a full host address as a key, which would never be
+            // hit by `locate` (it always looks up the masked key) and would
+            // just consume cap.
+            let net = network_key(ip);
+            let entry = match (e.lat, e.lon) {
+                (Some(lat), Some(lon))
+                    if lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) =>
+                {
+                    Entry::Known(lat, lon)
+                }
+                // Missing/garbage coordinates read as the negative entry, never
+                // as a bogus location that would then steer real clients.
+                _ => Entry::Unlocatable,
+            };
+            // Clamp a future timestamp (clock skew, hand-edit) to now, so no
+            // entry can make itself immortal by claiming to be from 2099.
+            let slot = Slot { entry, at_ms: e.t.min(now) };
+            slot.is_fresh(now).then_some((net, slot))
+        })
+        .collect();
+    // Newest first, then insert under the cap: whatever the file holds, the
+    // in-memory map starts within MAX_ENTRIES and keeps the freshest rows.
+    rows.sort_by(|a, b| b.1.at_ms.cmp(&a.1.at_ms));
+    let mut out = std::collections::HashMap::with_capacity(rows.len().min(MAX_ENTRIES));
+    for (net, slot) in rows {
+        if out.len() >= MAX_ENTRIES {
+            break;
+        }
+        out.entry(net).or_insert(slot); // duplicate keys: newest wins
+    }
+    out
+}
+
+/// Counters behind `GET /v1/dns/stats`'s `geo` block.
+#[derive(Default, Clone, Copy, Debug)]
+pub struct GeoStats {
+    /// Prefixes the local table placed — in the default configuration, all of
+    /// them.
+    pub local_hits: u64,
+    /// Prefixes it could not place (an explicit hole, or space newer than the
+    /// table). These are the only ones the remote path ever sees.
+    pub local_misses: u64,
+    /// Whether `HIVE_DNS_GEO_ENDPOINT` is configured at all.
+    pub remote_enabled: bool,
+    pub remote_known: usize,
+    pub remote_pending: usize,
+    pub remote_unlocatable: usize,
+}
+
+/// Geolocate one subnet through the OPTIONAL remote endpoint.
+///
+/// `HIVE_DNS_GEO_ENDPOINT` is now the only way this runs: there is no default
+/// third party any more. It stays supported for an operator running their own
+/// geolocation service (or who wants a commercial database's coverage on the
+/// prefixes the shipped table misses) — the URL shape is unchanged,
+/// `<endpoint>/<ip>?fields=status,lat,lon` returning ip-api's JSON.
 async fn lookup_geo(http: &reqwest::Client, net: IpAddr) -> Option<(f64, f64)> {
-    let base = std::env::var("HIVE_DNS_GEO_ENDPOINT")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "http://ip-api.com/json".to_string());
+    let base = remote_endpoint()?;
     // A /24's first address is reserved, so ask about a host inside it.
     let probe = match net {
         IpAddr::V4(a) => {

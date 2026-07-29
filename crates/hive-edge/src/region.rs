@@ -90,6 +90,19 @@ pub struct NodeInfo {
     /// safe, because it WITHHOLDS advertisement rather than granting it.
     #[serde(default)]
     pub dns_attest: Vec<String>,
+    /// This node currently serves the platform DASHBOARD acceptably: its local
+    /// dashboard upstream (`HIVE_DASHBOARD_UPSTREAM`, the node's own `:3002`)
+    /// answered a live probe within budget. Gossiped so the DNS reconciler can
+    /// gate the apex/`www` A-set on nodes that will actually render the
+    /// dashboard promptly — a node whose SSR takes seconds (witnessed:
+    /// sao-paulo at 4–6s) otherwise degrades ~1/N of all first visits merely
+    /// by being healthy. A MEASUREMENT, not boot intent: refreshed by a probe
+    /// loop, `false` while the upstream is down/slow/absent. `serde(default)`
+    /// = pre-upgrade peers read `false`, and the reconciler falls back to the
+    /// full set while fewer than two nodes claim it (same floor discipline as
+    /// the NS set), so a part-rolled fleet behaves exactly as before.
+    #[serde(default)]
+    pub dashboard: bool,
     /// Control-plane ownership epoch as witnessed by this node (monotonic; bumps
     /// on every owner promotion/failover). Gossiped so the whole fleet converges
     /// on the highest epoch — the fencing token that lets a node reject admin
@@ -323,6 +336,17 @@ impl NodeRegistry {
         }
     }
 
+    /// Publish whether this node's LOCAL dashboard upstream currently answers
+    /// within budget (see `NodeInfo::dashboard`). Mirrors `set_self_relay_url`:
+    /// idempotent, safe every probe round, picked up by the next gossip
+    /// broadcast.
+    pub fn set_self_dashboard(&self, ok: bool) {
+        let mut me = self.me.write();
+        if me.dashboard != ok {
+            me.dashboard = ok;
+        }
+    }
+
     /// Update this node's gossiped control-plane epoch (see
     /// `NodeInfo.cp_epoch`) — refreshed each gossip round from the cluster's
     /// observed-owner tracker.
@@ -530,6 +554,7 @@ mod tests {
             dns_ns: None,
             dns_api: false,
             dns_attest: Vec::new(),
+            dashboard: false,
             cp_epoch: 0,
             last_seen_ms: now_ms(),
             is_self: false,

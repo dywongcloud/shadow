@@ -216,6 +216,11 @@ pub struct PublishNode {
     /// the registry so the per-region names can be derived from the same
     /// health-damped set every other record already comes from.
     pub region: String,
+    /// This node's local dashboard upstream answers within budget (gossiped
+    /// `NodeInfo::dashboard`, a live measurement) — gates the apex/`www`
+    /// A-set so slow-SSR nodes don't degrade first visits. See
+    /// `desired_platform`.
+    pub dashboard: bool,
 }
 
 /// Desired records for the APPS zone (`*.{apps}` + apex), TTL 60.
@@ -528,11 +533,7 @@ pub fn desired_platform(
     // flat A/AAAA set is withheld: address records at a zone cut are occluded
     // by the delegation anyway, and publishing both makes the diff fight
     // itself every pass.
-    let mut names: Vec<&str> = if delegate_api { vec!["admin", "webhook", "sms"] } else { vec!["api", "admin", "webhook", "sms"] };
-    if dashboard {
-        names.push("");
-        names.push("www");
-    }
+    let names: Vec<&str> = if delegate_api { vec!["admin", "webhook", "sms"] } else { vec!["api", "admin", "webhook", "sms"] };
     for name in names {
         for n in nodes {
             if let Some(ip) = &n.ip4 {
@@ -540,6 +541,29 @@ pub fn desired_platform(
             }
             if let Some(ip) = &n.ip6 {
                 out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+            }
+        }
+    }
+    if dashboard {
+        // Apex + `www` land a browser's FIRST paint, so they are gated on the
+        // gossiped live-measured dashboard capability: a healthy node whose
+        // local dashboard SSR runs seconds slow (witnessed: sao-paulo at 4–6s)
+        // degrades ~1/N of all first visits merely by being in this set. Floor
+        // discipline mirrors the NS set: below two capable nodes the gate
+        // falls back to every publishable node — a part-rolled or
+        // probe-degraded fleet serves exactly as before rather than collapsing
+        // the apex onto one node (or zero).
+        let capable: Vec<&PublishNode> = nodes.iter().filter(|n| n.dashboard).collect();
+        let apex_set: Vec<&PublishNode> =
+            if capable.len() >= 2 { capable } else { nodes.iter().collect() };
+        for name in ["", "www"] {
+            for n in &apex_set {
+                if let Some(ip) = &n.ip4 {
+                    out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                }
+                if let Some(ip) = &n.ip6 {
+                    out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                }
             }
         }
     }
@@ -711,6 +735,8 @@ pub struct NodeView {
     /// Currently PROVEN to serve DNS from off its own host, per
     /// `dns_probe::validate_nameservers` over the gossiped peer attestations.
     pub dns_validated: bool,
+    /// Gossiped `NodeInfo::dashboard` — see `PublishNode::dashboard`.
+    pub dashboard: bool,
 }
 
 /// The publishable node set with flap damping: a node stays published while its
@@ -736,6 +762,7 @@ pub fn publishable(nodes: &[NodeView], streaks: &mut HashMap<String, u32>) -> Ve
                 dns_ns: n.dns_ns,
                 dns_api: n.dns_api,
                 dns_validated: n.dns_validated,
+                dashboard: n.dashboard,
             });
         }
     }
@@ -936,6 +963,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     dns_ns: n.dns_ns.is_some(),
                     dns_api: n.dns_api,
                     dns_validated: proven.contains(n.name.as_str()),
+                    dashboard: n.dashboard,
                     name: n.name.clone(),
                     healthy: n.healthy,
                     ip4: n.public_ip.clone(),
@@ -1235,6 +1263,7 @@ mod tests {
         let mut streaks = HashMap::new();
         let view = |healthy| {
             vec![NodeView {
+                dashboard: false,
                 dns_ns: false,
                 dns_api: false,
                 dns_validated: false,
@@ -1263,6 +1292,7 @@ mod tests {
             dns_ns: false,
             dns_api: false,
             dns_validated: false,
+            dashboard: false,
             name: "nat-node".into(),
             healthy: true,
             ip4: None,
@@ -1278,6 +1308,7 @@ mod tests {
             dns_ns: false,
             dns_api: false,
             dns_validated: false,
+            dashboard: false,
             name: "n1".into(),
             ip4: Some("1.1.1.1".into()),
             ip6: Some("::1".into()),

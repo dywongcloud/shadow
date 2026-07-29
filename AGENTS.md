@@ -285,12 +285,36 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   implementation is how the diagnostic and the decision quietly diverge.
 - **Two tailoring inputs, one rule.** `dns_geo.rs` locates the client by EDNS
   Client Subnet when the resolver sends one, else by the query's source
-  address. `GeoCache` **never blocks the DNS loop**: an unseen prefix is
-  answered generically and queued for a background lookup, so the FIRST query
-  for a prefix is generic (ECS scope 0) and later ones are tailored (scope =
-  the responding prefix length). That is the designed contract, not a bug —
-  a tailored answer must carry a non-zero scope so recursives cannot reuse it
-  for clients it wasn't computed for.
+  address. `GeoCache` **never blocks the DNS loop**, and the primary geo source
+  is LOCAL: `geoip.rs` binary-searches a committed prefix→coordinate table
+  (`crates/hive-cloud/assets/geoloc.bin`, `include_bytes!`, ~178 ns/lookup,
+  5.3 MB of demand-paged `.rodata`, zero heap), so the FIRST query for a prefix
+  is already tailored and no third party sees a client prefix. A tailored answer
+  must carry a non-zero ECS scope (= the responding prefix length) so recursives
+  cannot reuse it for clients it wasn't computed for; a generic answer echoes
+  scope 0.
+- **The remote geo endpoint is OFF by default and must stay optional.**
+  `HIVE_DNS_GEO_ENDPOINT` is now the only way any geolocation HTTP call happens
+  — there is no default third-party service left on the DNS data path. Set, it
+  covers only prefixes the local table misses, still on the paced background
+  worker (generic answer now, memoised answer later). Never re-introduce a
+  default endpoint: the table is what makes a node with no egress route
+  correctly. Refresh the table with `scripts/gen-geo-table.py` (DB-IP City Lite,
+  CC-BY-4.0) and commit the blob; it is an input, not a build artifact.
+- **The GeoCache remote memo is durable, and only the background half touches
+  disk.** Entries persist to `$HIVE_DATA/dns_geo.json` (its own sidecar, NOT
+  part of `PlatformSnapshot` — node-local derived data must not ride the
+  platform-state write path or replicate across the mesh) so a restart does not
+  re-generic every remotely-located prefix; a previously-known prefix is
+  tailored on the FIRST query after boot. Writes happen on a debounced
+  background tick (`HIVE_DNS_GEO_SAVE_MS`, default 10s, `0` disables
+  persistence entirely) plus a `flush_blocking()` on SIGTERM next to
+  `persist::flush_blocking` — never on the DNS hot path. Entries age out
+  (Known 30d, Unlocatable 6h, Pending 60s), an expired Known is SERVED while
+  its refresh is queued (expiry must not cause the de-tailoring blip
+  persistence exists to remove), a failed refresh never downgrades a location
+  already held, and `MAX_ENTRIES` (8192) is enforced on LOAD as well as at
+  runtime so no on-disk file can reload past the cap.
 - **Health beats proximity, always.** `lb_records` filters to healthy nodes
   with a public address of the requested family BEFORE proximity ordering, so
   the nearest-but-dead node is never returned.
@@ -302,22 +326,30 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   only meaningful once the zone is delegated here.
 - **Env that matters:** `HIVE_DNS_ADDR` (bind; `0.0.0.0:53` in prod),
   `HIVE_DEPLOY_ZONE` (the delegated geo zone), `HIVE_DNS_SERVE_APPS`,
-  `HIVE_DNS_GEO_ENDPOINT` (geo lookup override), `HIVE_DNS_PROBE_SECS` /
-  `HIVE_DNS_PROBE_TIMEOUT_MS` (nameserver prover cadence + per-query budget).
-  **Gotcha that cost real
+  `HIVE_DNS_GEO_TABLE` (path to a replacement geo table; falls back to the
+  embedded one if missing/corrupt), `HIVE_DNS_GEO_ENDPOINT` (optional remote
+  lookup for table misses; unset = no third-party call at all),
+  `HIVE_DNS_GEO_SAVE_MS` (geo cache debounce; `0` = no persistence),
+  `HIVE_DNS_PROBE_SECS` / `HIVE_DNS_PROBE_TIMEOUT_MS` (nameserver prover
+  cadence + per-query budget). **Gotcha that cost real
   debugging time:** a systemd DROP-IN (`hive-node.service.d/seer.conf`) can
   override the main unit's value — the unit file read correct while the RUNNING
   process had a typo'd zone, silently keying the entire geo path on a domain
   nobody owns. Verify with `/proc/<pid>/environ`, never the unit file.
 - **Failure modes:** Seer down → delegated names go dark (hence the ≥2-NS
-  rule); geo endpoint down → generic answers, never an outage; unknown subnet →
-  generic answer plus a queued lookup. `GET /v1/dns/stats` (operator) exposes
-  query counts, the tailored-vs-generic split, GeoCache hit/pending, published
-  delegation-record count, which node each answer handed out first, the
-  per-node nameserver VERDICT (declared / validated / attesters / attester
-  regions / reason — the same `validate_nameservers` call the reconciler
-  publishes from, so the two can never disagree), and this node's own raw
-  probe evidence.
+  rule); geo table corrupt or a prefix it cannot place → generic answers, never
+  an outage; remote endpoint (if configured) down → generic answer plus a
+  queued lookup that fails harmlessly;
+  corrupt/unreadable/oversized/wrong-version geo cache file → empty cache and a
+  WARN, never a boot failure. `GET /v1/dns/stats` (operator) exposes query
+  counts, the tailored-vs-generic split, the loaded table's source + row counts
+  + local hit/miss, the remote memo's known/pending/unlocatable plus
+  `cache_loaded_at_boot`/`cache_writes` (the answer to "did the cache survive
+  the restart"), published delegation-record count, which node each answer
+  handed out first, the per-node nameserver VERDICT (declared / validated /
+  attesters / attester regions / reason — the same `validate_nameservers` call
+  the reconciler publishes from, so the two can never disagree), and this
+  node's own raw probe evidence.
 
 ## Managed inference (serverless GPU pooling)
 
