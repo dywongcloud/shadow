@@ -83,8 +83,49 @@ trap 'rm -rf "$CTL_DIR"' EXIT
 failed=()
 
 ARTIFACT="$(mktemp -d)/next-build.tar.gz"
+ARTIFACT_WF="$(mktemp -d)/wfconsole-build.tar.gz"
 BUILD_HOST=""
 CANON_BUILD_ID=""
+CANON_WF_MD5=""
+
+# The patched @workflow/web console build is RUNTIME state, not .next content:
+# app/wf-console/[[...slug]]/route.ts loads node_modules/@workflow/web/build
+# dynamically (webpackIgnore), and the rsync excludes node_modules. The
+# patch (ui/scripts/patch-wf-console.mjs) only runs inside `npm run build` —
+# which ONLY the build host executes; a follower that merely runs `npm ci`
+# gets the PRISTINE upstream build and its console is broken in exactly the
+# way .next per-node builds were broken before the single-artifact mandate:
+# live-witnessed 2026-07-29 — server-build md5 34b96b59 (patched, with
+# __hive_rpc_guard) on the build host vs 5c748068 (pristine) on every
+# follower, "No routes matched location /wfc", and the user-facing
+# "Something went wrong. Go to dashboard" error screen. So the patched
+# console build ships as a second artifact, overlaid onto every follower
+# post-`npm ci` and marker-verified there — one patch run, one artifact.
+wf_console_package() {
+  # $1 = remote command prefix host. Packages + marker-verifies on the build host.
+  ssh "${ssh_opts[@]}" "root@$1" '
+    set -e
+    cd /root/hive/ui
+    grep -rl "__hive_rpc_guard" node_modules/@workflow/web/build/server/assets/ >/dev/null \
+      || { echo "WF CONSOLE PATCH MISSING on build host (patch-wf-console.mjs did not land)"; exit 1; }
+    tar -C node_modules/@workflow/web -czf /root/hive/ui/wfconsole-artifact.tar.gz build
+    md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js | md5sum | cut -d" " -f1
+  '
+}
+
+wf_console_overlay() {
+  # $1 = follower host. Extracts the shipped build over the pristine npm-ci
+  # tree and verifies the patch marker landed — never trust the overlay silently.
+  ssh "${ssh_opts[@]}" "root@$1" '
+    set -e
+    cd /root/hive/ui
+    tar -C node_modules/@workflow/web -xzf wfconsole-artifact.tar.gz
+    rm -f wfconsole-artifact.tar.gz
+    grep -rl "__hive_rpc_guard" node_modules/@workflow/web/build/server/assets/ >/dev/null \
+      || { echo "WF CONSOLE PATCH MISSING after overlay"; exit 1; }
+    md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js | md5sum | cut -d" " -f1
+  '
+}
 
 sync_source() {
   local host="$1"
@@ -103,6 +144,16 @@ preflight() {
   ssh "${ssh_opts[@]}" "root@$host" '
     command -v node >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: nodejs not installed"; exit 1; }
     command -v npm  >/dev/null 2>&1 || { echo "PREFLIGHT FAIL: npm not installed"; exit 1; }
+    # The @workflow/web 4.1.13 console server build requires node:sqlite
+    # (Node >= 22.5). A v20 node passes the plain checks above and then serves
+    # every /wfc request as a 500 (ERR_UNKNOWN_BUILTIN_MODULE, live-witnessed
+    # on the TencentOS nodes) — fail LOUD here instead of deploying a broken
+    # console onto it. (Quoting: this block is single-quoted locally, so the
+    # -e argument rides bare double quotes with escaped INNER doubles —
+    # single quotes would terminate the local block, and \" for the OUTER
+    # pair produces a literal quote character that leaves the parens bare.)
+    node -e "require(\"node:sqlite\")" 2>/dev/null \
+      || { echo "PREFLIGHT FAIL: node $(node --version) lacks node:sqlite (need >= 22.5)"; exit 1; }
     [ -f /etc/systemd/system/hive-ui.service ] || { echo "PREFLIGHT FAIL: hive-ui.service unit missing"; exit 1; }
     echo "  node $(node --version), npm $(npm --version), unit present"
   '
@@ -133,9 +184,12 @@ for host in "${HOSTS[@]}"; do
     '; then
     BUILD_HOST="$host"
     CANON_BUILD_ID="$(ssh "${ssh_opts[@]}" "root@$host" 'cat /root/hive/ui/.next/BUILD_ID')"
-    echo "==> $host: canonical build $CANON_BUILD_ID; pulling artifact"
+    echo "==> $host: canonical build $CANON_BUILD_ID; pulling artifacts"
+    CANON_WF_MD5="$(wf_console_package "$host")"
+    echo "==> $host: canonical wf-console build $CANON_WF_MD5"
     scp -q "${ssh_opts[@]}" "root@$host:/root/hive/ui/.next-artifact.tar.gz" "$ARTIFACT"
-    ssh "${ssh_opts[@]}" "root@$host" 'rm -f /root/hive/ui/.next-artifact.tar.gz'
+    scp -q "${ssh_opts[@]}" "root@$host:/root/hive/ui/wfconsole-artifact.tar.gz" "$ARTIFACT_WF"
+    ssh "${ssh_opts[@]}" "root@$host" 'rm -f /root/hive/ui/.next-artifact.tar.gz /root/hive/ui/wfconsole-artifact.tar.gz'
     break
   else
     echo "==> $host: FAILED to build; trying the next host as build host"
@@ -155,9 +209,12 @@ for host in "${HOSTS[@]}"; do
   if ! sync_source "$host"; then
     echo "==> $host: FAILED (rsync)"; failed+=("$host"); echo; continue
   fi
-  echo "==> $host: pushing canonical artifact $CANON_BUILD_ID"
+  echo "==> $host: pushing canonical artifacts ($CANON_BUILD_ID, wf-console $CANON_WF_MD5)"
   if ! scp -q "${ssh_opts[@]}" "$ARTIFACT" "root@$host:/root/hive/ui/.next-artifact.tar.gz"; then
     echo "==> $host: FAILED (artifact push)"; failed+=("$host"); echo; continue
+  fi
+  if ! scp -q "${ssh_opts[@]}" "$ARTIFACT_WF" "root@$host:/root/hive/ui/wfconsole-artifact.tar.gz"; then
+    echo "==> $host: FAILED (wf-console artifact push)"; failed+=("$host"); echo; continue
   fi
   if ! ssh "${ssh_opts[@]}" "root@$host" '
       set -e
@@ -171,6 +228,14 @@ for host in "${HOSTS[@]}"; do
       [ -d .next ] && mv .next .next.old
       mv .next.new .next
       echo "build id: $(cat .next/BUILD_ID)"
+      # The patched @workflow/web console build overlays the pristine npm-ci
+      # tree — the route loads it from node_modules at REQUEST time, so it
+      # must land BEFORE the restart below.
+      tar -C node_modules/@workflow/web -xzf wfconsole-artifact.tar.gz
+      rm -f wfconsole-artifact.tar.gz
+      grep -rl "__hive_rpc_guard" node_modules/@workflow/web/build/server/assets/ >/dev/null \
+        || { echo "WF CONSOLE PATCH MISSING after overlay"; exit 1; }
+      md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js | md5sum | cut -d" " -f1
       systemctl restart hive-ui
       sleep 2
       systemctl is-active hive-ui
@@ -182,7 +247,11 @@ for host in "${HOSTS[@]}"; do
   if [ "$got" != "$CANON_BUILD_ID" ]; then
     echo "==> $host: FAILED (BUILD_ID $got != canonical $CANON_BUILD_ID)"; failed+=("$host"); echo; continue
   fi
-  echo "==> $host: done ($got)"
+  got_wf="$(ssh "${ssh_opts[@]}" "root@$host" 'cd /root/hive/ui && md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js | md5sum | cut -d" " -f1' 2>/dev/null || echo none)"
+  if [ "$got_wf" != "$CANON_WF_MD5" ]; then
+    echo "==> $host: FAILED (wf-console md5 $got_wf != canonical $CANON_WF_MD5)"; failed+=("$host"); echo; continue
+  fi
+  echo "==> $host: done ($got, wf-console $got_wf)"
   echo
 done
 rm -f "$ARTIFACT"
