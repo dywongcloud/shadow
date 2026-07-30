@@ -1,6 +1,24 @@
 ---
 # Configure GRUB + module loading and (optionally) reboot into the PVM kernel.
 
+# `pvm_kernel_release` is normally set by 30-host-kernel.yml from the kernel it
+# just built. That file is skipped whenever the host already carries a working
+# PVM kernel (--skip-tags host_kernel, or a node provisioned out-of-band), which
+# left every task below referencing an undefined variable and failed the whole
+# run at the last step -- after the expensive guest-kernel build had already
+# succeeded. Fall back to the RUNNING kernel so a partial/resumed run completes
+# instead of stranding the node mid-provision.
+- name: Read the running kernel release (fallback when the host-kernel build was skipped)
+  ansible.builtin.command: uname -r
+  register: _running_kernel_for_boot
+  changed_when: false
+  when: pvm_kernel_release is not defined
+
+- name: Default pvm_kernel_release to the running kernel
+  ansible.builtin.set_fact:
+    pvm_kernel_release: "{{ _running_kernel_for_boot.stdout }}"
+  when: pvm_kernel_release is not defined
+
 - name: Read current PVM kernel boot args
   ansible.builtin.command: "grubby --info=/boot/vmlinuz-{{ pvm_kernel_release }}"
   register: _grubinfo

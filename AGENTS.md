@@ -446,11 +446,15 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
 - Fleet has two glibc groups needing separate native builds — **2.38**: bkk,
   hk, AND all five GPU/CVM nodes (fc-sanjose-gpu-1/2/3, fc-sanjose-cvm-1/2 —
   TencentOS);
-  **2.39**: va/va2/va3/sj/sj2. The GPU nodes LOOK like the San Jose 2.39 group
-  by region and were once rolled a 2.39 binary on that assumption — instant
-  fleet-wide crash-loop on that node (`GLIBC_2.39 not found`, restart counter
-  120+) until the `.old` binary was restored. Membership is by OS image, not
-  region. Always sha256-verify + `.old`-backup a binary before swapping.
+  **2.39**: va/va2/va3/sj/sj2/sp/fr. The GPU nodes LOOK like the San Jose 2.39
+  group by region and were once rolled a 2.39 binary on that assumption —
+  instant fleet-wide crash-loop on that node (`GLIBC_2.39 not found`, restart
+  counter 120+) until the `.old` binary was restored. Membership is by OS
+  image, not region. Always sha256-verify + `.old`-backup a binary before
+  swapping. Do not hand-maintain this list from memory —
+  `scripts/audit-runtime-versions.sh` prints each node's live glibc alongside
+  its runtime versions, and is the check to run before ANY binary rollout
+  (it is how sp/fr were found missing from this very list).
   Detail: `recall("fleet-glibc-groups")`.
 - The dashboard's `/ops/*` proxy forwards every admin request to the CURRENT
   control-plane leader, not the node running the dashboard process — verify
@@ -465,5 +469,21 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   systemd `hive-ui`) are deployed independently — a backend-only fleet
   rollout does NOT ship a `ui/` change. Use `scripts/deploy-ui-fleet.sh`
   for any `ui/`-touching change. Detail: `recall("ui-deploy-gap-incident")`.
+- **Third-party runtime versions drift silently and are a real CVE surface.**
+  Nothing in the platform pins or audits `firecracker`/`crun`/`runsc`, so
+  nodes provisioned at different times sit on different versions
+  indefinitely. Witnessed 2026-07-31: firecracker ranged v1.13.0 → v1.17.0-dev
+  fleet-wide, leaving bkk/hk/va/va2 inside the affected range for
+  CVE-2026-5747 (virtio-pci OOB write, **guest→host RCE** — the escape a
+  multi-tenant host most needs to not have) and CVE-2026-1386 (jailer symlink
+  → arbitrary host file overwrite). Audit with a one-liner across the fleet
+  (`firecracker --version`, `crun --version`, `runsc --version`) whenever a
+  runtime CVE lands, and re-check after ANY node bring-up — a freshly
+  provisioned node inherits whatever version its role happened to fetch that
+  day, which is how the spread opened in the first place. Verify a claimed
+  CVE's affected RANGE before upgrading: the same audit showed crun 1.17/1.27
+  fleet-wide against a 1.19–1.26 advisory, i.e. no exposure and no upgrade
+  warranted — patching on the advisory's headline alone would have been pure
+  churn.
 
 @.gm/next-step.md

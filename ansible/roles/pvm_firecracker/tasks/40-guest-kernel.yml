@@ -14,9 +14,27 @@
     single_branch: true
     force: false
 
-- name: Download the canonical PVM guest kernel config
+# Fetched on the CONTROL host, then pushed -- not pulled by the target.
+# Some fleet networks cannot reach raw.githubusercontent.com at all: the TLS
+# handshake is reset mid-ClientHello (witnessed on fc-frankfurt, a Tencent
+# range whose egress backhauls through infrastructure that resets on SNI).
+# A target-side get_url there fails every run and the node can never be
+# provisioned, even though the control host has perfectly good connectivity.
+# `force: false` additionally makes a re-run cheap and keeps a hand-placed
+# config working offline.
+- name: Fetch the canonical PVM guest kernel config (on the control host)
   ansible.builtin.get_url:
     url: "{{ pvm_guest_config_url }}"
+    dest: "{{ pvm_guest_config_cache }}"
+    mode: "0644"
+    force: false
+  delegate_to: localhost
+  become: false
+  run_once: true
+
+- name: Push the guest kernel config to the target
+  ansible.builtin.copy:
+    src: "{{ pvm_guest_config_cache }}"
     dest: "{{ build_root }}/pvm-guest.config"
     mode: "0644"
 

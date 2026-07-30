@@ -24,6 +24,11 @@ pvm_patch_dir: "{{ build_root }}/pvm-patches"    # where the patch repo is clone
 # The guest config is still the vanilla virt-pvm base config -- the fallback
 # patch series changes runtime capability gating, not guest Kconfig options.
 pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
+# Control-host cache for the above. The config is fetched here once and PUSHED
+# to targets, because some fleet egress paths cannot reach
+# raw.githubusercontent.com at all (TLS reset mid-ClientHello) -- see
+# 40-guest-kernel.yml. Pre-place a file here to provision fully offline.
+pvm_guest_config_cache: "/tmp/pvm-guest-{{ pvm_base_branch }}.config"
 
 # Ubuntu rootfs published by the Firecracker CI (userland is PVM-independent).
 rootfs_squashfs_url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/x86_64/ubuntu-24.04.squashfs"
