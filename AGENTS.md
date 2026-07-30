@@ -228,6 +228,26 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
 - Health probes run over **iroh**, not HTTP, so a restrictive cloud security
   group that blocks 8786/8787 does NOT by itself make a node unhealthy — but it
   does stop HTTP admin dispatch, which pushes deploys onto the iroh path.
+- **A health verdict is per-OBSERVER, so peers legitimately disagree and a
+  probe-side fix only helps the node running it.** `spawn_health_loop` probes
+  from the node it runs on and writes that node's own registry, so "is X
+  healthy" has no single fleet answer — a rollout improving probe behaviour
+  changes the upgraded node's view of everyone else, and nothing about how
+  anyone else sees IT. Two operational consequences. (1) Diagnose from several
+  vantages before believing any one node: measured live 2026-07-31, one peer
+  reported fc-virginia-2 unhealthy while three others reported it healthy, and
+  the single dissenting reading was the wrong one. (2) The verdict that
+  actually decides traffic is the **control-plane leader's**, because DNS and
+  placement are driven from there — a node every other peer can see is still
+  effectively dark if the leader alone cannot probe it.
+- Cross-continent probes are genuinely slow, and a healthy one can far exceed
+  the default 2s `HIVE_HEALTH_TIMEOUT`: a real, SUCCESSFUL sj probe measured
+  7462ms. Treat a low timeout as a correctness knob, not just a latency one —
+  set too tight it manufactures unhealthy peers out of working links.
+- **Never trust a TCP port probe run from a laptop on the VPN.** It
+  SYN-proxies, so a closed port reads OPEN. Witnessed: a laptop reported
+  hk:3340 open while every fleet vantage correctly reported it unreachable.
+  Probe from a fleet node, always.
 
 ## Serverless GPU
 
