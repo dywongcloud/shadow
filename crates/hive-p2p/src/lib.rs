@@ -471,6 +471,16 @@ fn open_budget() -> Duration { env_ms("HIVE_P2P_OPEN_MS", 2_000) }
 /// dialed directly) can wedge every future dial to that peer forever once its
 /// cross-cloud QUIC path flaps.
 fn discovery_budget() -> Duration { env_ms("HIVE_P2P_DISCOVERY_MS", 4_000) }
+/// Worst-case time `acquire()` needs to run the cached-hint attempt AND the
+/// fresh-discovery fallback to completion: `connect_budget + discovery_budget`,
+/// plus slack. A caller wrapping `join_request`/`gossip_request` in its OWN
+/// `tokio::time::timeout` shorter than this drops the future mid-flight while
+/// `dial_fresh` is still pending — the fallback `discovery_budget` exists to
+/// recover a first-contact node's stale/private-IP cached hint (see
+/// `discovery_budget`'s doc comment) never gets to run, so a first-contact dial
+/// can never succeed no matter how long fresh discovery would have taken. Any
+/// such outer timeout MUST be at least this long.
+pub fn dial_fallback_ceiling() -> Duration { connect_budget() + discovery_budget() + Duration::from_secs(1) }
 /// First-byte / response-headers budget — post-send. Generous: the cell may be cold.
 fn firstbyte_budget() -> Duration { env_ms("HIVE_P2P_FIRSTBYTE_MS", 15_000) }
 /// Body inter-chunk IDLE budget — post-send. Not a wall-clock cap; reset per chunk

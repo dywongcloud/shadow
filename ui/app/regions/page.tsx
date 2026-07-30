@@ -39,6 +39,12 @@ function nodeColor(n: NodeInfo, i: number): string {
   return isGpuNode(n) ? GPU_COLOR : PALETTE[i % PALETTE.length];
 }
 
+// The backend's hardcoded fallback (region_id_from_geo, main.rs) when
+// boot-time geolocation fails (offline node) is the literal string "local" —
+// display-only relabel so an operator doesn't read that as a real region;
+// grouping/filtering/color-lookup below must keep comparing on the raw value.
+const displayRegion = (r: string) => (r === "local" ? "Unknown location" : r);
+
 export default function RegionsPage() {
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
   const list = nodes ?? [];
@@ -55,7 +61,7 @@ export default function RegionsPage() {
       id: n.id,
       lat: n.lat as number,
       lon: n.lon as number,
-      label: `${n.name} — ${n.city ?? n.region}`,
+      label: `${n.name} — ${n.city ?? displayRegion(n.region)}`,
       color: nodeColor(n, i),
       isGpu: isGpuNode(n),
       hasRelay: hasRelay(n),
@@ -72,7 +78,7 @@ export default function RegionsPage() {
 
       <div className="mb-5 flex flex-wrap gap-2">
         {regions.map((r) => (
-          <Badge key={r} tone="blue">◍ {r}</Badge>
+          <Badge key={r} tone="blue">◍ {displayRegion(r)}</Badge>
         ))}
         {!regions.length && <span className="text-sm text-muted">discovering…</span>}
       </div>
@@ -134,7 +140,7 @@ export default function RegionsPage() {
                     {n.name}
                   </span>
                 </Td>
-                <Td><Badge tone="blue">{n.region}</Badge></Td>
+                <Td><Badge tone="blue">{displayRegion(n.region)}</Badge></Td>
                 <Td className="text-secondary">{loc}</Td>
                 <Td className="text-secondary">{continent}</Td>
                 <Td className="font-mono text-xs">

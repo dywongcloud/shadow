@@ -1991,8 +1991,13 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 let pool = cloud.mesh.read().clone();
                 if let (Some(me_id), Some((node_id, addr)), Some(pool)) = (me_id, target, pool) {
                     let proof = crate::admin::hmac_sha256_hex(secret.as_bytes(), me_id.as_bytes());
+                    // MUST be >= hive_p2p::dial_fallback_ceiling(): a first-contact
+                    // peer's cached hint (private IPs from its gossiped addr_json) is
+                    // near-guaranteed to fail, so this join depends entirely on
+                    // `acquire`'s fresh-discovery fallback getting to run to
+                    // completion instead of being cancelled mid-flight.
                     let attempt = tokio::time::timeout(
-                        Duration::from_secs(5),
+                        hive_p2p::dial_fallback_ceiling(),
                         pool.join_request(&node_id, &addr, &me_bytes, &proof),
                     )
                     .await;

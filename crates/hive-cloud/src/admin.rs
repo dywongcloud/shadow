@@ -451,7 +451,15 @@ async fn whoami(
 /// regions in which P2P nodes report their longitude/latitude. Each region is
 /// auto-assigned to its real continent (from lat/lon), so a node in Los Angeles
 /// appears under "North America". No hard-coded region table.
-async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
+///
+/// `c.registry.nodes()` is node-LOCAL gossip state (see AGENTS.md's
+/// round-robin-reads-vs-leader-forwarded-writes note): a node with a poorer
+/// mesh view (e.g. one still converging, or isolated from part of the fleet)
+/// would otherwise answer this GET with an incomplete region list depending
+/// purely on which node round-robin DNS happened to route to. Proxy to the
+/// CP leader first (its view is the fleet's best-connected), falling back to
+/// the local view only if that proxy fails — never a silent empty catalog.
+fn build_region_catalog(c: &Arc<CloudState>) -> Value {
     use std::collections::BTreeMap;
     // continent -> (region id -> entry). Dedupe a region across co-located nodes,
     // counting how many nodes back it.
@@ -477,7 +485,17 @@ async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
         .into_iter()
         .map(|(continent, regions)| (continent, json!(regions.into_values().collect::<Vec<_>>())))
         .collect();
-    Json(json!(out))
+    json!(out)
+}
+
+async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
+    if !c.is_control_plane_leader() {
+        let leader = c.control_plane_leader();
+        if let Some(v) = fetch_from_host(&c, &leader, "/v1/regions/catalog", "").await {
+            return Json(v);
+        }
+    }
+    Json(build_region_catalog(&c))
 }
 
 async fn project_settings_get(

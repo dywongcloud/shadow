@@ -184,7 +184,18 @@ export function WfConsoleFrame({
         lastMirroredRef.current = mapped;
         // Raw replaceState (not the Next router): no page re-render, the
         // iframe keeps its state; deep links stay copy-pastable.
-        window.history.replaceState(window.history.state, "", mapped);
+        //
+        // Next's app-router monkey-patches window.history.replaceState
+        // globally (node_modules/next/dist/client/components/app-router.js)
+        // so ANY caller's replaceState — not just Next's own — dispatches
+        // ACTION_RESTORE and re-renders every usePathname()/useSearchParams()
+        // consumer app-wide (topnav's SectionTabs/ProjectWorkflowsCrumb among
+        // them) UNLESS the history-state object carries one of Next's own
+        // skip markers (`__NA`/`_N`). Every 300ms tick this ran unmarked, it
+        // was silently re-triggering that global router transition — the
+        // navbar flicker. `_N: true` opts this call out of the patch while
+        // still updating the visible URL for copy/paste deep links.
+        window.history.replaceState({ ...window.history.state, _N: true }, "", mapped);
       }
     }, URL_SYNC_INTERVAL_MS);
     return () => clearInterval(iv);

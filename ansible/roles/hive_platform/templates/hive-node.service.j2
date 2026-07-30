@@ -38,6 +38,12 @@ Environment=HIVE_BOOTSTRAP_PEERS={{ hive_bootstrap_peers }}
 {% if hive_fc_boot_args is defined %}
 Environment="HIVE_FC_BOOT_ARGS={{ hive_fc_boot_args }}"
 {% endif %}
+{% if hive_geo is defined and hive_geo %}
+# Pins lat/lon/city/country so the UI's displayed location doesn't depend on
+# ip-api.com's IP-block geolocation guess, which is wrong for some cloud
+# ranges (e.g. this host's real city, guessed as a different Bay Area city).
+Environment="HIVE_GEO={{ hive_geo }}"
+{% endif %}
 Environment=HIVE_OWNER_EMAIL={{ hive_owner_email }}
 Environment=HIVE_JWT_SECRET={{ vault_hive_jwt_secret }}
 Environment=HIVE_INTERNAL_TOKEN={{ vault_hive_internal_token }}
