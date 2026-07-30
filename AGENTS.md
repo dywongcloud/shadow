@@ -188,6 +188,25 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   vendor KVM (`KVM_INTEL`/`KVM_AMD`) must be off — PVM replaces them.
 - Verify functionally, not by device-node existence: open `/dev/kvm` and do a
   real `KVM_CREATE_VM` + `KVM_CREATE_VCPU`, then actually run a container.
+- **`KVM_CREATE_VM` succeeding does NOT mean microVMs work — booting one can
+  hard-reset the host.** Witnessed on fc-frankfurt (2026-07-31, kernel 7.1.5,
+  `kvm-pvm` loaded, `/dev/kvm` present): a real `KVM_CREATE_VM` +
+  `KVM_CREATE_VCPU` ioctl pair succeeded, and the role's own `/dev/kvm`
+  assertion passed — then the end-to-end Firecracker smoke test reset the
+  machine. `uptime` afterwards read 0 min, the prior boot's journal ended
+  mid-line with no oops and was flagged "corrupted or uncleanly shut down",
+  i.e. a triple-fault-shaped hard reset, not a clean panic (there is a
+  `panic=5` on the cmdline, so a real panic would have logged first). So the
+  ioctl check is necessary and still not sufficient; the microVM boot is a
+  SEPARATE gate, and on a host that fails it the reset takes the whole node
+  with every tenant on it.
+- Consequently `pvm_run_smoke_test` is genuinely dangerous on an unproven host
+  and must not be enabled against a node already carrying traffic — run it
+  during bring-up only, before the node joins the mesh. Note also that the
+  smoke test sits at the END of `pvm_firecracker`, so a crash there aborts the
+  play before `hive_platform` ever runs: the node is left with no hive-cloud
+  installed at all, looking "half-provisioned" for a reason unrelated to the
+  platform. `--skip-tags smoke_test` completes the rest.
 
 ## Bringing a node into the mesh
 
