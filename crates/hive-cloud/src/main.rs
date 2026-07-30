@@ -93,6 +93,27 @@ use hive_edge::{
 
 use state::CloudState;
 
+// Heap profiling, Linux only. jemalloc replaces the system allocator so a heap
+// profile can be taken from a LIVE node, which is the capability whose absence
+// left the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon before the kernel killed
+// it) permanently un-root-caused: nothing on the node could answer "which
+// allocation site is growing?".
+//
+// `prof:true` compiles the machinery in; `prof_active:false` leaves it OFF, so
+// the steady-state cost is jemalloc-vs-system-malloc and nothing more — no
+// sampling, no per-allocation bookkeeping. Sampling is enabled at runtime via
+// the admin endpoint (see `admin::heap_profile`), against the one node actually
+// misbehaving, with no rebuild and no restart. lg_prof_sample:19 = sample every
+// ~512KiB, the usual production-safe default.
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(target_os = "linux")]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\0";
+
 /// The public HTTPS listener's `axum_server::Handle`, set once at listener
 /// startup so the SIGTERM handler (defined earlier in `main`, run before the
 /// listener spawns in source order but racing it at runtime) can reach it

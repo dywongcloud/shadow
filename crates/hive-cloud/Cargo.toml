@@ -120,3 +120,18 @@ rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
 default = ["zkauth"]
 raft = ["dep:openraft"]
 zkauth = ["dep:hive-zkauth"]
+
+# Heap profiling, Linux-only (the fleet is Linux; macOS is dev-only and
+# jemalloc's profiling support is not available there).
+#
+# Why this is here at all: the 2026-07 OOM on fc-sanjose -- hive-cloud's own
+# RSS grew to ~12.9GB anon before the kernel killed it -- was never
+# root-caused, because the binary shipped with the system allocator and had no
+# way to answer "which allocation site is growing?" on a live node. Profiling
+# is compiled IN but INACTIVE (`prof_active:false`), so steady-state overhead
+# is nil; it is switched on at runtime against a node that is actually
+# climbing, with no rebuild and no restart.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", features = ["use_std"] }
+jemalloc_pprof = "0.7"

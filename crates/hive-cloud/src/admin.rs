@@ -50,6 +50,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
+        .route("/v1/debug/heap", get(heap_profile))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -4175,6 +4176,67 @@ async fn inference_endpoints(
         "local_servers": c.inference.statuses(),
         "node": c.node_name,
     })))
+}
+
+/// Live heap profile (operator). Answers "which allocation site is growing?"
+/// on a node that is ALREADY misbehaving, which is the question nothing on the
+/// fleet could answer during the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon
+/// before the kernel killed it, never root-caused).
+///
+/// `GET /v1/debug/heap` returns a pprof-format gzip profile
+/// (`go tool pprof <file>`, or upload to any pprof UI). Sampling is OFF at boot
+/// (`prof_active:false` in main.rs's malloc_conf) so there is no steady-state
+/// cost; this handler turns it on for the process on first call and leaves it
+/// on, since a leak hunt needs the allocations that happen AFTER activation.
+///
+/// Intended use is a diff, not a single dump: call once to start sampling,
+/// wait while RSS climbs, call again, and compare the two profiles — the growth
+/// is what identifies the leak, whereas one snapshot mostly shows normal
+/// steady-state usage. `?deactivate=1` turns sampling back off.
+///
+/// Linux-only: the fleet is Linux and jemalloc profiling is unavailable on
+/// macOS, where this returns 501 rather than failing the build.
+#[cfg(target_os = "linux")]
+async fn heap_profile(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+
+    let prof_ctl = jemalloc_pprof::PROF_CTL
+        .as_ref()
+        .ok_or((StatusCode::NOT_IMPLEMENTED, "jemalloc profiling not compiled in".to_string()))?;
+    let mut ctl = prof_ctl.lock().await;
+
+    if q.get("deactivate").is_some_and(|v| v == "1" || v == "true") {
+        ctl.deactivate().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("deactivate: {e}")))?;
+        return Ok(Json(json!({ "profiling_active": false })).into_response());
+    }
+    if !ctl.activated() {
+        ctl.activate().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("activate: {e}")))?;
+        tracing::warn!("heap profiling ACTIVATED via /v1/debug/heap — sampling every ~512KiB until deactivated");
+    }
+    let pprof = ctl
+        .dump_pprof()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dump_pprof: {e}")))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"heap.pb.gz\""),
+        ],
+        pprof,
+    )
+        .into_response())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn heap_profile(
+    axum::extract::Query(_q): axum::extract::Query<std::collections::HashMap<String, String>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Err((StatusCode::NOT_IMPLEMENTED, "heap profiling is Linux-only".to_string()))
 }
 
 /// Geo-DNS observability (operator): live Seer query counters, the
