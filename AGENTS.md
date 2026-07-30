@@ -462,6 +462,16 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
   existing test suite (`cargo test --workspace`) plus real, live execution
   (curl against a running node, SSH to a fleet node) — never a mock standing
   in for a real service.
+- **A local (macOS) `cargo check` does NOT compile `cfg(target_os = "linux")`
+  code — it silently skips it and still reports success.** Anything behind a
+  Linux `[target.'cfg(...)'.dependencies]` block or a `#[cfg(target_os =
+  "linux")]` item is therefore UNVERIFIED by a green local check, and the fleet
+  is entirely Linux, so that is production code proved by nothing. Witnessed
+  2026-07-31: a clean local check on the jemalloc heap-profiling work, then an
+  immediate `E0308` on the first real node build (the dependency resolved two
+  incompatible `pprof_util` versions). Build Linux-gated changes on an actual
+  node before believing them — the same discipline the no-mocks rule above
+  already demands, applied to the compiler.
 - Fleet has two glibc groups needing separate native builds — **2.38**: bkk,
   hk, AND all five GPU/CVM nodes (fc-sanjose-gpu-1/2/3, fc-sanjose-cvm-1/2 —
   TencentOS);

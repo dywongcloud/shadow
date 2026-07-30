@@ -131,7 +131,14 @@ zkauth = ["dep:hive-zkauth"]
 # is compiled IN but INACTIVE (`prof_active:false`), so steady-state overhead
 # is nil; it is switched on at runtime against a node that is actually
 # climbing, with no rebuild and no restart.
+#
+# Deliberately NOT using the `jemalloc_pprof` crate: 0.7.0 resolves two
+# incompatible `pprof_util` versions in one graph (0.7.0 for parse_jeheap,
+# 0.8.2 via its mappings dep) and fails to compile with a `Mapping` vs
+# `pprof_util::Mapping` type error. jemalloc's own `prof.dump` mallctl produces
+# the same information in jeprof's native format, analyzable with the `jeprof`
+# that ships alongside jemalloc, with one less dependency and no version-skew
+# risk in a crate we would only use for formatting.
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std"] }
-jemalloc_pprof = "0.7"

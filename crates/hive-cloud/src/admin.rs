@@ -4183,8 +4183,10 @@ async fn inference_endpoints(
 /// fleet could answer during the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon
 /// before the kernel killed it, never root-caused).
 ///
-/// `GET /v1/debug/heap` returns a pprof-format gzip profile
-/// (`go tool pprof <file>`, or upload to any pprof UI). Sampling is OFF at boot
+/// `GET /v1/debug/heap` returns a jemalloc heap profile in jeprof's native
+/// format — analyze with the `jeprof` that ships alongside jemalloc, e.g.
+/// `jeprof --show_bytes --pdf /path/to/hive-cloud heap.prof`, or diff two with
+/// `jeprof --base=first.prof <binary> second.prof`. Sampling is OFF at boot
 /// (`prof_active:false` in main.rs's malloc_conf) so there is no steady-state
 /// cost; this handler turns it on for the process on first call and leaves it
 /// on, since a leak hunt needs the allocations that happen AFTER activation.
@@ -4204,28 +4206,48 @@ async fn heap_profile(
     use axum::response::IntoResponse;
     require_operator(claims.as_ref().map(|e| &e.0))?;
 
-    let prof_ctl = jemalloc_pprof::PROF_CTL
-        .as_ref()
-        .ok_or((StatusCode::NOT_IMPLEMENTED, "jemalloc profiling not compiled in".to_string()))?;
-    let mut ctl = prof_ctl.lock().await;
+    let want_off = q.get("deactivate").is_some_and(|v| v == "1" || v == "true");
+    // `prof.active` is a bool mallctl; `prof.dump` takes a NUL-terminated path.
+    // Both are only present when the binary was built against a jemalloc with
+    // profiling enabled (see main.rs's malloc_conf) -- on a build without it,
+    // these return ENOENT, which is reported rather than silently ignored.
+    let set_active = |on: bool| -> Result<(), String> {
+        unsafe { tikv_jemalloc_ctl::raw::write(b"prof.active\0", on) }.map_err(|e| e.to_string())
+    };
 
-    if q.get("deactivate").is_some_and(|v| v == "1" || v == "true") {
-        ctl.deactivate().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("deactivate: {e}")))?;
+    if want_off {
+        set_active(false).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("prof.active=false: {e}")))?;
+        tracing::warn!("heap profiling DEACTIVATED via /v1/debug/heap");
         return Ok(Json(json!({ "profiling_active": false })).into_response());
     }
-    if !ctl.activated() {
-        ctl.activate().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("activate: {e}")))?;
-        tracing::warn!("heap profiling ACTIVATED via /v1/debug/heap — sampling every ~512KiB until deactivated");
+
+    let already = unsafe { tikv_jemalloc_ctl::raw::read::<bool>(b"prof.active\0") }.unwrap_or(false);
+    if !already {
+        set_active(true).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("prof.active=true: {e}")))?;
+        tracing::warn!(
+            "heap profiling ACTIVATED via /v1/debug/heap — sampling every ~512KiB until deactivated. \
+             Take a SECOND dump after RSS has grown; the diff is what identifies a leak."
+        );
     }
-    let pprof = ctl
-        .dump_pprof()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("dump_pprof: {e}")))?;
+
+    // Dump to a unique path so concurrent operator calls can't clobber each
+    // other, then read it back and delete it -- the profile is returned in the
+    // response body, never left on disk.
+    let path = format!("/tmp/hive-heap-{}-{}.prof", std::process::id(), now_ms());
+    let mut c_path = path.clone().into_bytes();
+    c_path.push(0);
+    unsafe { tikv_jemalloc_ctl::raw::write(b"prof.dump\0", c_path.as_ptr() as *const std::ffi::c_char) }
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("prof.dump: {e} (was profiling just enabled? a dump needs samples)")))?;
+    let body = std::fs::read(&path)
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("read {path}: {e}")))?;
+    let _ = std::fs::remove_file(&path);
+
     Ok((
         [
-            (axum::http::header::CONTENT_TYPE, "application/octet-stream"),
-            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"heap.pb.gz\""),
+            (axum::http::header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (axum::http::header::CONTENT_DISPOSITION, "attachment; filename=\"heap.prof\""),
         ],
-        pprof,
+        body,
     )
         .into_response())
 }
