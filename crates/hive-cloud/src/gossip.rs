@@ -877,8 +877,24 @@ pub async fn fetch(
             // fallback below would never run — so the node could never re-learn the
             // peer's new address. On timeout/error we drop the stale mapping and fall
             // through to HTTP, which re-learns the fresh addr.
+            //
+            // ...but that reasoning only holds when the HTTP fallback CAN run. `peer`
+            // is used verbatim as a URL prefix below, so a non-URL peer (notably the
+            // `seed:<64hex>` form used before a seed has gossiped a full NodeInfo) has
+            // no HTTP path at all. Capping those below `dial_fallback_ceiling` cancels
+            // `acquire`'s fresh-discovery fallback mid-flight — the same cancellation
+            // bug that made mesh join impossible for a new node — and leaves NO
+            // recovery path, since the HTTP branch cannot work either. So: keep the
+            // fast cap only where the fallback is real, and give the dial its full
+            // budget where iroh is the only way through.
+            let http_fallback_viable = peer.starts_with("http://") || peer.starts_with("https://");
+            let budget = if http_fallback_viable {
+                Duration::from_secs(3)
+            } else {
+                hive_p2p::dial_fallback_ceiling()
+            };
             let attempt = tokio::time::timeout(
-                Duration::from_secs(3),
+                budget,
                 pool.gossip_request(&node_id, &addr, method, path, body),
             )
             .await;
