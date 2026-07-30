@@ -2979,9 +2979,24 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 continue;
             }
             // Probe ALL targets concurrently — a dead/slow peer must not delay the rest.
+            //
+            // Budget is per-target, not fleet-wide. The fast `timeout` (2s) is the
+            // right STEADY-STATE check — "is the warm trunk still alive" — but it is
+            // shorter than `connect_budget` alone, so a target needing a fresh dial
+            // gets cancelled before it can even finish connecting, and `probe`'s own
+            // trunk eviction (whose stated purpose is "let the next dial resolve the
+            // peer's CURRENT addr via discovery") could never actually deliver that:
+            // every subsequent attempt was cancelled at the same 2s. A peer whose
+            // cached address went stale (restart with new socket addrs, NAT rebind)
+            // therefore stayed unhealthy PERMANENTLY — and unhealthy nodes are
+            // dropped from client DNS and placement, so this silently shrank the
+            // fleet. Once a target is already failing, give it the full
+            // dial_fallback_ceiling so discovery gets a genuine chance to recover it.
             let results = futures::future::join_all(targets.into_iter().map(|(name, id, addr)| {
                 let cloud = cloud.clone();
-                async move { (name, gossip::probe(&cloud, &id, &addr, timeout).await) }
+                let failing = *misses.get(&name).unwrap_or(&0) >= threshold;
+                let budget = if failing { hive_p2p::dial_fallback_ceiling() } else { timeout };
+                async move { (name, gossip::probe(&cloud, &id, &addr, budget).await) }
             }))
             .await;
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
