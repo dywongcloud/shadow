@@ -28,6 +28,7 @@
     depth: 1
     single_branch: true
     force: false
+    update: "{{ pvm_git_update | bool }}"
 
 # A gnu-target build has no matching seccomp JSON, so Firecracker's build.rs
 # falls back to an empty filter automatically (no libseccomp at runtime).

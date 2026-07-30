@@ -15,6 +15,7 @@
     depth: 1
     single_branch: true
     force: false
+    update: "{{ pvm_git_update | bool }}"
 
 - name: Clone the PVM patch repo (patches/ only)
   ansible.builtin.git:
@@ -24,6 +25,7 @@
     depth: 1
     single_branch: true
     force: false
+    update: "{{ pvm_git_update | bool }}"
 
 - name: Set host_kernel_tree fact
   ansible.builtin.set_fact:

@@ -13,6 +13,7 @@
     depth: 1
     single_branch: true
     force: false
+    update: "{{ pvm_git_update | bool }}"
 
 # Fetched on the CONTROL host, then pushed -- not pulled by the target.
 # Some fleet networks cannot reach raw.githubusercontent.com at all: the TLS

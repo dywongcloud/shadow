@@ -24,6 +24,22 @@ pvm_patch_dir: "{{ build_root }}/pvm-patches"    # where the patch repo is clone
 # The guest config is still the vanilla virt-pvm base config -- the fallback
 # patch series changes runtime capability gating, not guest Kconfig options.
 pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
+# Whether the role's git clones re-contact their remotes on every run.
+#
+# Default false, for two reasons. (1) Reproducibility: every ref this role
+# clones is a pin (a branch name that is expected not to move under a given
+# provisioning run), and a build whose source can silently change between runs
+# is not reproducible. (2) Reachability: ansible's git module runs `ls-remote`
+# on EVERY run even when the destination already exists and `force: false`, so
+# a host that cannot reach github.com fails provisioning at a clone step whose
+# work is already done. fc-frankfurt cannot reliably reach github.com (TLS
+# reset mid-handshake on that egress path), and this single behaviour blocked
+# its provisioning repeatedly, each time after minutes of unrelated work had
+# already succeeded.
+#
+# Set true when you deliberately want to pull upstream movement:
+#   ansible-playbook ... -e '{"pvm_git_update": true}'
+pvm_git_update: false
 # Control-host cache for the above. The config is fetched here once and PUSHED
 # to targets, because some fleet egress paths cannot reach
 # raw.githubusercontent.com at all (TLS reset mid-ClientHello) -- see
