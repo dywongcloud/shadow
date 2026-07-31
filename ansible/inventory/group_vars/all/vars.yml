@@ -80,3 +80,26 @@ hive_owner_email: "ops@{{ hive_platform_domain }}"
 
 # ---------- RUST_LOG ----------
 hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"
+
+# ---------- Health probing ----------
+# The code defaults (HIVE_HEALTH_TIMEOUT=2, HIVE_HEALTH_INTERVAL=5) are too
+# tight for this fleet's real geography and caused a production outage on
+# 2026-07-31. hive-p2p's connect_budget is 5s, so a 2s probe timeout cancels
+# any peer needing a FRESH dial before it can even connect -- that peer can
+# never be re-probed successfully and flaps unhealthy. On the control-plane
+# LEADER that flapping is customer-visible: unhealthy nodes are filtered out of
+# client DNS (lb_records' health gate) and out of placement, so deployments on
+# them surface as "not found", and the resulting DNS create/retry churn drove
+# the Vercel API into sustained 429 rate limiting (159 429s in 30 minutes).
+#
+# Measured cross-continent probe latencies from fc-sanjose: fc-saopaulo 798ms,
+# fc-virginia 315ms, fc-lax 4330ms. Raising the timeout to 10s took the
+# leader's unhealthy set from 5-7 nodes flapping every few seconds to a stable
+# 0, and restored 4 nodes (frankfurt/bkk/hk/saopaulo) to the shadw.app
+# round-robin.
+#
+# Interval must stay GREATER than the timeout: the loop join_all's every target
+# per tick, so a timeout longer than the interval makes probe rounds overlap.
+hive_health_timeout: 10
+hive_health_interval: 15
+hive_health_fail_threshold: 2

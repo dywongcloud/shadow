@@ -44,6 +44,15 @@ Environment="HIVE_FC_BOOT_ARGS={{ hive_fc_boot_args }}"
 # ranges (e.g. this host's real city, guessed as a different Bay Area city).
 Environment="HIVE_GEO={{ hive_geo }}"
 {% endif %}
+# Health probing. The code defaults (2s timeout / 5s interval) are below
+# hive-p2p's 5s connect_budget, so any peer needing a fresh dial is cancelled
+# before it can connect and flaps unhealthy -- on the leader that removes live
+# nodes from client DNS and placement ("not found") and drives the Vercel DNS
+# API into 429 rate limiting. See group_vars/all/vars.yml for the measured
+# numbers behind these values. Interval must stay > timeout.
+Environment=HIVE_HEALTH_TIMEOUT={{ hive_health_timeout | default(10) }}
+Environment=HIVE_HEALTH_INTERVAL={{ hive_health_interval | default(15) }}
+Environment=HIVE_HEALTH_FAIL_THRESHOLD={{ hive_health_fail_threshold | default(2) }}
 Environment=HIVE_OWNER_EMAIL={{ hive_owner_email }}
 Environment=HIVE_JWT_SECRET={{ vault_hive_jwt_secret }}
 Environment=HIVE_INTERNAL_TOKEN={{ vault_hive_internal_token }}
