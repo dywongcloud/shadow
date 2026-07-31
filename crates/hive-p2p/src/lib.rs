@@ -86,6 +86,32 @@ fn max_inbound_conns() -> usize {
 /// ALPN identifying the Hive function-tunnel protocol over iroh.
 pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
 
+/// ALPN for browser-tab peers (`crates/hive-browser`) — a dedicated, low-trust
+/// surface, structurally disjoint from [`HIVE_ALPN`]'s gossip/join/raw modes.
+/// Must match `hive_browser::BROWSER_ALPN` byte-for-byte; duplicated rather
+/// than shared via a common crate because `hive-browser` is wasm32-only and
+/// excluded from this workspace (see its own Cargo.toml comment). Connections
+/// on this ALPN never reach the mode-byte dispatch below — see
+/// `serve_browser_conn`, which has no gossip/join/raw arms at all.
+pub const BROWSER_ALPN: &[u8] = b"hive/browser/0";
+
+/// Cap on a single browser-echo request frame — mirrors `hive-browser`'s own
+/// `MAX_FRAME`, the memory-safety line for a fleet node serving untrusted
+/// browser-peer traffic.
+const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
+
+/// Concurrently-served `hive/browser/0` connections — SEPARATE from
+/// [`max_inbound_conns`]'s fleet-trunk budget on purpose (gap-fleet-accept-loop-not-router):
+/// an admitted-but-flooding browser peer must not exhaust the pool fleet-trunk
+/// (`HIVE_ALPN`) connections rely on. Lower default than the trunk budget —
+/// browsers are numerous, low-trust, and each one is cheap to refuse.
+fn max_browser_conns() -> usize {
+    std::env::var("HIVE_P2P_BROWSER_MAX_CONNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(128)
+}
+
 /// First byte on every hive-p2p bi stream selects how the owner handles it:
 /// a multiplexed `fluid-tunnel` session (HTTP request/response) or a raw byte
 /// splice for upgraded connections (WebSocket). This 1-byte mode lives at the
@@ -1484,7 +1510,11 @@ pub async fn bind_full(
         Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(iroh::endpoint::default_relay_mode())
     }
-    .alpns(vec![HIVE_ALPN.to_vec()])
+    // BROWSER_ALPN is accepted alongside the fleet trunk ALPN so a browser tab
+    // can dial in directly; `serve_tunnels_full` dispatches per-ALPN with its
+    // OWN connection budget (see `max_browser_conns`) before either one is
+    // ever handed a mode-byte stream.
+    .alpns(vec![HIVE_ALPN.to_vec(), BROWSER_ALPN.to_vec()])
     .transport_config(tc);
     // Self-hosted relays (HIVE_RELAY_URLS): when set, NAT-traversal + relayed data
     // paths transit OUR iroh-relay infra instead of n0's — applied in BOTH branches,
@@ -1748,17 +1778,61 @@ pub async fn serve_tunnels_full(
         0 => None,
         n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
     };
+    // SEPARATE budget for BROWSER_ALPN connections (gap-fleet-accept-loop-not-router):
+    // sharing `conn_limit` would let an admitted-but-flooding browser peer starve
+    // fleet-trunk (HIVE_ALPN) accepts on the exact same pool. Which budget a given
+    // `Incoming` draws from is decided BELOW, before the handshake even runs.
+    let browser_conn_limit = match max_browser_conns() {
+        0 => None,
+        n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
+    };
     while let Some(incoming) = ep.accept().await {
+        // Peek the proposed ALPN from the still-encrypted Initial packet
+        // BEFORE the handshake runs (`Incoming::decrypt()` is best-effort —
+        // "not guaranteed to succeed if the ClientHello spans multiple
+        // packets", noq-proto 1.1.1 — so a parse failure fails SAFE into the
+        // existing trunk budget below, never into a bypass of either budget).
+        // This is what makes the two budgets genuinely independent: if we
+        // instead learned the ALPN only after `incoming.await`, the permit
+        // gating that same await would already have to come from ONE shared
+        // pool, recreating the exact starvation this split exists to prevent.
+        let is_browser = incoming
+            .decrypt()
+            .and_then(|d| d.alpns())
+            .map(|alpns| {
+                alpns
+                    .filter_map(Result::ok)
+                    .any(|p| p.as_ref() == BROWSER_ALPN)
+            })
+            .unwrap_or(false);
         // Acquire BEFORE spawning: at the ceiling this awaits here, which stops
         // the accept loop rather than spawning an unbounded backlog of tasks all
         // waiting for the same permit — the latter would defeat the whole point.
-        let permit = match &conn_limit {
+        let sem = if is_browser { &browser_conn_limit } else { &conn_limit };
+        let permit = match sem {
             Some(sem) => match sem.clone().acquire_owned().await {
                 Ok(p) => Some(p),
                 Err(_) => return, // semaphore closed — shutting down
             },
             None => None,
         };
+        if is_browser {
+            tokio::spawn(async move {
+                let _permit = permit; // released when this connection's task ends
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                // Real ALPN check, not just the pre-handshake peek above: a
+                // client that OFFERED both ALPNs but negotiated HIVE_ALPN (the
+                // endpoint's `.alpns()` order decides ALPN preference) must
+                // never fall through to the no-mode-byte browser echo path.
+                if conn.alpn() == BROWSER_ALPN {
+                    serve_browser_conn(conn).await;
+                }
+            });
+            continue;
+        }
         let local = local_http.clone();
         let trust = trust.clone();
         let gossip = gossip.clone();
@@ -1832,6 +1906,39 @@ pub async fn serve_tunnels_full(
                         }
                     }
                 });
+            }
+        });
+    }
+}
+
+/// Serves a single `hive/browser/0` connection: one connection → many bi
+/// streams, each a bare `[u32 len][bytes]` request echoed straight back — NO
+/// mode-byte selector, NO gossip/join/raw dispatch, NO trust-set check. This
+/// is deliberately the SAME minimal contract as `hive_browser::BrowserNode`'s
+/// own accept loop, so the identical browser-side `echoTo` call that already
+/// round-trips browser-to-browser works unchanged against a real fleet node.
+/// Bigger asks on this ALPN (real request routing, admission scopes) are
+/// `bn-impl-invoke-routing`/`bn-impl-mesh-admission`'s job, layered on top of
+/// this same accept path — never by adding a mode byte or reaching into the
+/// HIVE_ALPN dispatch above.
+async fn serve_browser_conn(conn: Connection) {
+    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+        tokio::spawn(async move {
+            let mut lenb = [0u8; 4];
+            if recv.read_exact(&mut lenb).await.is_err() {
+                return;
+            }
+            let len = u32::from_le_bytes(lenb) as usize;
+            if len > BROWSER_MAX_FRAME {
+                let _ = send.reset(2u32.into());
+                return;
+            }
+            let mut buf = vec![0u8; len];
+            if recv.read_exact(&mut buf).await.is_err() {
+                return;
+            }
+            if send.write_all(&lenb).await.is_ok() && send.write_all(&buf).await.is_ok() {
+                let _ = send.finish();
             }
         });
     }
