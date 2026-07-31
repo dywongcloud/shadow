@@ -36,6 +36,10 @@ export default function NetworkPage() {
           <div className="flex items-center gap-2 text-sm font-medium"><Network className="h-4 w-4" /> P2P Mesh</div>
           <div className="flex items-center gap-3 text-xs text-muted">
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#34c759]" /> node</span>
+            {/* Blue is the platform-wide "has a GPU" color (see GPU_COLOR in
+                region-map.tsx). Listed here because a diagram that renders some
+                cubes blue with no legend entry is just an unexplained color. */}
+            <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#3b82f6]" /> GPU</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#9ca3af]" /> unhealthy</span>
           </div>
         </div>
@@ -175,16 +179,42 @@ function MeshDiagram({ nodes }: { nodes: NodeInfo[] }) {
 
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="mx-auto block w-full" style={{ maxHeight: 540 }} preserveAspectRatio="xMidYMid meet">
-      {/* mesh wires — blue (light) / white (dark) */}
-      <g fill="none" className="stroke-[#2f7fea] dark:stroke-white" strokeWidth={1.1} strokeOpacity={0.55}>
+      {/*
+        Wire animation lives in an inline <style> rather than a Tailwind class or
+        styled-jsx: the keyframes have to travel with this SVG (it is the only
+        consumer), and `stroke-dashoffset` is not an animatable Tailwind utility.
+        The dash period is 6+6=12, so the offset animates by -24 — an exact
+        multiple — which is what makes the loop seamless instead of visibly
+        jumping on every restart. Motion is disabled under
+        `prefers-reduced-motion`, where a continuously-crawling full-mesh graph
+        is exactly the kind of thing that triggers discomfort.
+      */}
+      <style>{`
+        @keyframes hiveMeshFlow { to { stroke-dashoffset: -24; } }
+        .hive-mesh-wire {
+          stroke-dasharray: 6 6;
+          animation: hiveMeshFlow 1.8s linear infinite;
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .hive-mesh-wire { animation: none; }
+        }
+      `}</style>
+      {/* mesh wires — blue (light) / white (dark), dashed and flowing */}
+      <g fill="none" className="stroke-[#2f7fea] dark:stroke-white" strokeWidth={1.1} strokeOpacity={0.55} strokeLinecap="round">
         {edges.map((d, i) => (
-          <path key={i} d={d} />
+          // Negative, per-edge staggered delay: every wire starts mid-cycle at a
+          // different phase, so the mesh reads as many independent links rather
+          // than one rigid pulse marching in lockstep. Negative (not positive)
+          // so the stagger is already in effect on first paint — a positive
+          // delay would show every wire frozen at phase 0 for up to a full
+          // cycle before anything moved.
+          <path key={i} d={d} className="hive-mesh-wire" style={{ animationDelay: `${-((i * 0.13) % 1.8).toFixed(2)}s` }} />
         ))}
       </g>
       {/* nodes */}
       {nodes.map((node, i) => (
         <g key={node.id} transform={`translate(${pos[i].x.toFixed(1)} ${pos[i].y.toFixed(1)})`}>
-          <CubeIcon self={!!node.is_self} healthy={node.healthy !== false} />
+          <CubeIcon self={!!node.is_self} healthy={node.healthy !== false} gpu={(node.gpu_count ?? 0) > 0} />
           <text y={38} textAnchor="middle" style={{ fontSize: 13 }} className="fill-neutral-700 dark:fill-neutral-200">
             {node.name}
           </text>
@@ -194,16 +224,39 @@ function MeshDiagram({ nodes }: { nodes: NodeInfo[] }) {
   );
 }
 
-/** A 3D green isometric cube node icon (gray when unhealthy), centered at (0,0). */
-function CubeIcon({ self, healthy }: { self: boolean; healthy: boolean }) {
+/**
+ * A 3D isometric cube node icon, centered at (0,0): BLUE for a GPU-bearing node
+ * (`gpu_count > 0`), green otherwise, gray when unhealthy.
+ *
+ * Blue specifically, and not some other accent, because the platform already
+ * fixes blue as "this node has a GPU" fleet-wide — see `GPU_COLOR` in
+ * `components/region-map.tsx`, whose palette deliberately excludes blue so a
+ * non-GPU node can never land on it by round-robin chance. Reusing that exact
+ * hue here keeps one meaning for one color across the region map and this mesh
+ * diagram; picking an independent blue would let the two drift apart.
+ *
+ * Health still wins over capability: an unhealthy GPU node renders gray, since
+ * "can I use this node at all" is the more urgent signal than what it carries.
+ */
+function CubeIcon({ self, healthy, gpu }: { self: boolean; healthy: boolean; gpu?: boolean }) {
   const r = 18;
-  const top = healthy ? "#3ad15f" : "#b0b6bd";
-  const left = healthy ? "#23a64e" : "#8a9098";
-  const right = healthy ? "#178a3d" : "#6c727a";
+  // Face shades run light (top) → mid (left) → dark (right) to read as a lit
+  // solid; the blue triple mirrors the green's relative luminance steps so the
+  // two cube types look like the same object in two colors, not two shapes.
+  const top = !healthy ? "#b0b6bd" : gpu ? "#60a5fa" : "#3ad15f";
+  const left = !healthy ? "#8a9098" : gpu ? "#3b82f6" : "#23a64e";
+  const right = !healthy ? "#6c727a" : gpu ? "#1d4ed8" : "#178a3d";
   return (
     <g>
       {self && (
-        <circle r={r + 9} fill="none" className="stroke-[#34c759]" strokeOpacity={0.55} strokeWidth={1.5} strokeDasharray="3 3" />
+        <circle
+          r={r + 9}
+          fill="none"
+          stroke={gpu ? "#3b82f6" : "#34c759"}
+          strokeOpacity={0.55}
+          strokeWidth={1.5}
+          strokeDasharray="3 3"
+        />
       )}
       {/* top, left, right faces */}
       <path d={`M 0 ${-r} L ${r} ${-r / 2} L 0 0 L ${-r} ${-r / 2} Z`} fill={top} stroke={right} strokeWidth={0.8} />
