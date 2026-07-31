@@ -391,6 +391,13 @@ mod tests {
             cpu_cores: 4,
             mem_total_mb: mem,
             disk_total_gb: 50,
+            // Non-zero so these fixtures are ABOVE `disk_floor_gb()` and stay
+            // eligible: 0 means UNKNOWN (a pre-upgrade peer), not "full", and
+            // `capable()` deliberately admits unknown rather than excluding the
+            // fleet mid-rollout — a fixture at 0 would therefore exercise the
+            // unknown path, not the has-space path these placement tests mean.
+            disk_free_gb: 500,
+            gpu_free_mb: None,
             backend: backend.into(),
         }
     }

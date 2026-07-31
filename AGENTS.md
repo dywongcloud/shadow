@@ -560,6 +560,18 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   incompatible `pprof_util` versions). Build Linux-gated changes on an actual
   node before believing them — the same discipline the no-mocks rule above
   already demands, applied to the compiler.
+- **`cargo check` also does not build TEST targets — `#[cfg(test)]` code is
+  invisible to it on every platform.** Adding a field to a widely-constructed
+  struct therefore passes a green `cargo check --workspace` and then fails CI,
+  which runs `cargo test --workspace`. Witnessed 2026-07-31: two new
+  `NodeInfo` fields (`disk_free_gb`, `gpu_free_mb`) broke the struct literals
+  in `schedule.rs`/`dnsserver.rs` test modules with `E0063`, red across three
+  CI jobs, after a clean local check. Before pushing a change to any shared
+  struct, run `cargo test --workspace --no-run` — it compiles the test targets
+  without executing them, which is exactly the gap `check` leaves.
+  Corollary for the two new fields specifically: `0`/`None` mean UNKNOWN, so a
+  fixture left at 0 exercises the admit-unknown path, not the has-capacity
+  path — set a real value when the test means "this node has space".
 - Fleet has two glibc groups needing separate native builds — **2.38**: bkk,
   hk, AND all five GPU/CVM nodes (fc-sanjose-gpu-1/2/3, fc-sanjose-cvm-1/2 —
   TencentOS);

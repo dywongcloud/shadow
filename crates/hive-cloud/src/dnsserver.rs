@@ -762,6 +762,12 @@ mod tests {
             cpu_cores: 0,
             mem_total_mb: 0,
             disk_total_gb: 0,
+            // 0/None = UNKNOWN, which is correct for these fixtures: DNS
+            // load-balancing filters on health and public-address family only
+            // (`lb_records`), never on capacity, so leaving these unknown keeps
+            // the fixtures honest about what the code under test actually reads.
+            disk_free_gb: 0,
+            gpu_free_mb: None,
             backend: String::new(),
         }
     }
