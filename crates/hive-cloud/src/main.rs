@@ -722,6 +722,7 @@ async fn main() -> anyhow::Result<()> {
     spawn_cron_loop(cloud.clone());
     spawn_cluster_loop(cloud.clone());
     spawn_guardian_snapshot_loop(cloud.clone());
+    spawn_guardian_reap_loop(cloud.clone());
     spawn_lease_loop(cloud.clone());
 
     // Self-management GC: reap stale clone/build working dirs under /tmp/hive-deploys
@@ -1920,6 +1921,42 @@ fn spawn_guardian_snapshot_loop(cloud: Arc<CloudState>) {
         loop {
             let snap = crate::persist::capture(&cloud);
             crate::guardian::replicate(&snap);
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+/// Periodic reap of departed nodes' `node/<name>/snapshot` keys.
+///
+/// LEADER-ONLY, unlike the snapshot loop above: that one writes only this
+/// node's OWN key (every node must, hence every node runs it), while this one
+/// DELETES other nodes' keys from the replicated store — a fan-out mutation,
+/// which the platform's single-writer discipline routes through the
+/// control-plane leader. The leader check is re-evaluated every pass, not
+/// captured once, so leadership changing mid-run hands the job over correctly.
+///
+/// Fully inert until `HIVE_NODE_ROSTER` is configured — see
+/// `guardian::reap_departed_node_snapshots` for why an unset roster must mean
+/// "do nothing" and never "everything looks departed". `HIVE_REAP_SECS=0`
+/// disables the loop outright.
+fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
+    let secs = env_u64("HIVE_REAP_SECS", 6 * 60 * 60);
+    if secs == 0 {
+        return;
+    }
+    let interval = Duration::from_secs(secs);
+    tokio::spawn(async move {
+        // Deliberately long initial delay: at boot this node has not yet
+        // resynced the replicated doc, so an immediate pass would judge
+        // departure from an incomplete local view.
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        loop {
+            if cloud.is_control_plane_leader() {
+                let (reaped, withheld) = crate::guardian::reap_departed_node_snapshots().await;
+                if reaped > 0 {
+                    tracing::warn!(reaped, withheld, "guardian reap: retired departed node snapshot keys");
+                }
+            }
             tokio::time::sleep(interval).await;
         }
     });

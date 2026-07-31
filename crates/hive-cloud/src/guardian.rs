@@ -755,6 +755,135 @@ pub async fn keys() -> Vec<String> {
     }
 }
 
+/// Operator-declared roster of node NAMES that legitimately belong to this
+/// fleet (`HIVE_NODE_ROSTER`, comma-separated). Empty/unset returns `None`,
+/// which makes [`reap_departed_node_snapshots`] refuse to do anything at all.
+///
+/// This is deliberately a NAME list and deliberately its own variable:
+/// `HIVE_TRUSTED_NODE_IDS` carries 64-hex peer IDs, not names, so it cannot
+/// answer "is `node/fc-lax2/snapshot` a key for a node we still run".
+fn node_roster() -> Option<std::collections::HashSet<String>> {
+    let raw = std::env::var("HIVE_NODE_ROSTER").ok()?;
+    let set: std::collections::HashSet<String> =
+        raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    (!set.is_empty()).then_some(set)
+}
+
+/// Reap `node/<name>/snapshot` keys belonging to nodes that have left the fleet.
+///
+/// # The problem this solves
+///
+/// A doc entry (key + content hash) replicates independently of whether any
+/// peer can still serve that hash's BLOB. When a node leaves — renamed, retired,
+/// reprovisioned — its snapshot key lives on forever while its blob becomes
+/// permanently unfetchable, because the only node that ever held those bytes is
+/// gone. `kv_store`'s index sync then retries the fetch on EVERY pass, forever.
+/// Measured live 2026-07-31: ~35 warnings/minute on every one of 14 nodes, for
+/// `node/fc-lax2/snapshot`, `node/fc-cvm-sj-1/snapshot` and
+/// `node/fc-cvm-sj-2/snapshot` — none of which are in the fleet any more. That
+/// volume also MASKS the genuinely transient failures on live nodes' keys,
+/// which is the worse half of the cost.
+///
+/// # Why age comes from the entry head, not the snapshot
+///
+/// The obvious age source — the snapshot's own `saved_ms` — is unreadable by
+/// construction here: the blob cannot be fetched, which is the entire reason
+/// the key is a candidate. [`namespace_heads`] returns iroh-docs'
+/// `Entry::timestamp()` WITHOUT reading any value bytes, so it works precisely
+/// where a content read cannot.
+///
+/// # Refusal conditions (all mirror `gc_rootfs_images`'s blast-radius rules)
+///
+/// Deleting from the replicated store is irreversible and fans out to every
+/// peer, so this refuses rather than guesses:
+/// * no `HIVE_NODE_ROSTER` configured → refuse entirely (fail closed — an
+///   unset roster makes EVERY node look departed, the exact shape of the
+///   empty-keep-set bug that would have deleted every live deployment's disk);
+/// * more than `HIVE_REAP_MAX_FRACTION` of node keys look reapable → refuse,
+///   because that means the roster is wrong, not that the fleet vanished;
+/// * this node's own key is never a candidate, whatever the roster says.
+///
+/// Leader-only by caller contract: this is a replicated-store MUTATION, and the
+/// platform's single-writer discipline for those routes them through the
+/// control-plane leader.
+pub async fn reap_departed_node_snapshots() -> (usize, usize) {
+    let Some(roster) = node_roster() else {
+        tracing::debug!("guardian reap: HIVE_NODE_ROSTER unset — refusing (fail closed)");
+        return (0, 0);
+    };
+    let min_age_days: u64 = std::env::var("HIVE_REAP_MIN_AGE_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(30);
+    let max_fraction: f64 = std::env::var("HIVE_REAP_MAX_FRACTION")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|f| *f > 0.0 && *f <= 1.0)
+        .unwrap_or(0.34);
+
+    let me = NODE_NAME.get().cloned().unwrap_or_default();
+    let heads = namespace_heads().await;
+    let Some(entries) = heads.get(KV_NAMESPACE) else { return (0, 0) };
+
+    // iroh-docs stamps entries in MICROseconds; `now_ms` is milliseconds.
+    let now_us = hive_core::now_ms().saturating_mul(1000);
+    let min_age_us = min_age_days.saturating_mul(24 * 60 * 60 * 1000 * 1000);
+
+    let mut node_keys = 0usize;
+    let mut candidates: Vec<String> = Vec::new();
+    let mut withheld_young = 0usize;
+    for e in entries {
+        let Some(name) = e.key.strip_prefix("node/").and_then(|r| r.strip_suffix("/snapshot")) else {
+            continue;
+        };
+        node_keys += 1;
+        if name == me || roster.contains(name) {
+            continue;
+        }
+        if now_us.saturating_sub(e.timestamp) < min_age_us {
+            withheld_young += 1;
+            continue;
+        }
+        candidates.push(e.key.clone());
+    }
+
+    if node_keys > 0 {
+        let frac = candidates.len() as f64 / node_keys as f64;
+        if frac > max_fraction {
+            tracing::error!(
+                candidates = candidates.len(),
+                node_keys,
+                fraction = frac,
+                max_fraction,
+                "guardian reap: REFUSING — too large a share of node snapshot keys look departed, \
+                 which means HIVE_NODE_ROSTER is wrong, not that the fleet left. \
+                 Raise HIVE_REAP_MAX_FRACTION to override."
+            );
+            return (0, candidates.len());
+        }
+    }
+
+    let mut reaped = 0usize;
+    for key in &candidates {
+        delete(key).await;
+        reaped += 1;
+        tracing::warn!(%key, "guardian reap: deleted departed node's snapshot key");
+    }
+    // Report BOTH halves: a reap that withheld everything must be
+    // distinguishable from one with nothing to do (the same "ineffective vs
+    // exhausted" lesson `ensure_disk_headroom` learned the hard way).
+    if reaped > 0 || withheld_young > 0 {
+        tracing::info!(
+            reaped,
+            withheld_young,
+            node_keys,
+            min_age_days,
+            "guardian reap pass complete"
+        );
+    }
+    (reaped, withheld_young)
+}
+
 /// design-head-cid-exchange-rpc's data source: per-namespace HEAD map for
 /// this node's local GuardianDB replica — a (key, content-hash, timestamp)
 /// triple for every live entry, WITHOUT ever reading a value's bytes (see

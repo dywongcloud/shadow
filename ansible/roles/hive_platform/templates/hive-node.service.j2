@@ -44,6 +44,14 @@ Environment="HIVE_FC_BOOT_ARGS={{ hive_fc_boot_args }}"
 # ranges (e.g. this host's real city, guessed as a different Bay Area city).
 Environment="HIVE_GEO={{ hive_geo }}"
 {% endif %}
+# Operator-declared roster of node NAMES in this fleet, derived from the
+# inventory itself so it cannot drift from the hosts we actually run. It is the
+# allowlist for the departed-node guardian reaper: a node/<name>/snapshot key
+# whose name is NOT here, and whose entry is older than HIVE_REAP_MIN_AGE_DAYS,
+# is a key no peer can ever serve a blob for (the writing node is gone) and is
+# retired. Unset => the reaper refuses entirely rather than treating every node
+# as departed, so removing this line is safe, not destructive.
+Environment=HIVE_NODE_ROSTER={{ groups['platform'] | map('extract', hostvars, 'hive_name') | select('defined') | join(',') }}
 # Health probing. The code defaults (2s timeout / 5s interval) are below
 # hive-p2p's 5s connect_budget, so any peer needing a fresh dial is cancelled
 # before it can connect and flaps unhealthy -- on the leader that removes live
