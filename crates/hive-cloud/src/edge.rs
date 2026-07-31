@@ -962,8 +962,15 @@ fn deployment_not_found(region: &str) -> Response {
     // Link straight to the error's own doc page, not the docs root — the visitor
     // is here because of this specific error, so the "learn more" target should be
     // the page that explains it (and its Related section fans out from there).
-    let docs = std::env::var("HIVE_DASHBOARD_URL")
+    //
+    // PUBLIC origin first: this screen is only ever served to an external visitor,
+    // and every node's HIVE_DASHBOARD_URL is the local-dev http://localhost:3002
+    // (the same trap dashboard_origin/derive_dashboard exist for) — witnessed live
+    // on the deployed fleet handing out a localhost Learn-more link.
+    let docs = std::env::var("HIVE_PUBLIC_DASHBOARD_URL")
         .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| std::env::var("HIVE_DASHBOARD_URL").ok().filter(|v| !v.trim().is_empty()))
         .map(|d| format!("{}/docs/errors/deployment-not-found", d.trim_end_matches('/')))
         .unwrap_or_else(|| "/docs/errors/deployment-not-found".into());
     let html = format!(
