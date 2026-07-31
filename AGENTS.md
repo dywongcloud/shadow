@@ -28,6 +28,29 @@ history).
   anti-entropy loop. New cross-node RPC paths go through `gossip::dispatch`'s
   existing match-arm pattern. Detail: `recall("relay-antientropy")` /
   `crates/hive-cloud/src/main.rs` (`spawn_anti_entropy_loop`), `crates/hive-edge`.
+- **`PeerPool` keys trunks by ENDPOINT ID, never by the caller's label.**
+  `acquire` parses the canonical id out of `addr_json` (which it must parse to
+  dial anyway) and keys on that, with an alias map so name-only callers still
+  resolve. This is load-bearing: the DATA plane passes node NAMES
+  (`NodeInfo.id` = `args.name`) while the CONTROL plane passes 64-hex
+  `peer_id`s, so a label-keyed pool held TWO QUIC connections to every peer —
+  double handshakes, `relay_stats()` double-counting, the trunk warmer warming
+  only the name-keyed half (leaving the control-plane trunk permanently cold),
+  and `close_peer(eid)` unable to evict the edge's name-keyed trunk.
+- **UDP over the mesh is RELIABLE and ORDERED, not datagram semantics — a
+  deliberate tradeoff, not an oversight.** `read_raw_datagram` /
+  `write_raw_datagram` carry each UDP payload as a `[u32 len][bytes]` frame on
+  ONE QUIC bi stream (`RAW_MAX_DATAGRAM` = 65507). Boundaries and the size cap
+  are preserved correctly, and the cancellation handling is deliberate:
+  `read_raw_datagram` is NOT cancel-safe, so the inbound side gets its own task
+  rather than a `select!` arm. The cost is real and worth knowing before
+  putting latency-sensitive traffic on it: a lost packet now head-of-line-blocks
+  every subsequent packet instead of being dropped, trading packet loss for
+  unbounded latency — the opposite of what game or DNS traffic wants. iroh's
+  own guidance for this case is stream-per-item aborted with `reset`/`stop`,
+  and `Connection::send_datagram` does exist. Switching would mean giving up
+  the single-stream framing (and its ordering guarantee, which the current
+  consumers may rely on), so it needs a measurement first, not a rewrite.
 
 ## Round-robin reads vs leader-forwarded writes
 
