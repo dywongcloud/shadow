@@ -959,10 +959,13 @@ fn deployment_not_found(region: &str) -> Response {
         hive_core::now_ms(),
         &u[8..20],
     );
+    // Link straight to the error's own doc page, not the docs root — the visitor
+    // is here because of this specific error, so the "learn more" target should be
+    // the page that explains it (and its Related section fans out from there).
     let docs = std::env::var("HIVE_DASHBOARD_URL")
         .ok()
-        .map(|d| format!("{}/docs", d.trim_end_matches('/')))
-        .unwrap_or_else(|| "/docs".into());
+        .map(|d| format!("{}/docs/errors/deployment-not-found", d.trim_end_matches('/')))
+        .unwrap_or_else(|| "/docs/errors/deployment-not-found".into());
     let html = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404: NOT_FOUND</title>
 <style>

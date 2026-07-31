@@ -37,6 +37,14 @@ const NAV: { group: string; items: NavItem[] }[] = [
       { label: "Self-hosting", href: "/docs/getting-started#self-hosting", badge: "Ops" },
     ],
   },
+  {
+    group: "Errors",
+    items: [
+      // The edge's own 404 screen links here (edge.rs deployment_not_found),
+      // so this page must stay public and its path stable.
+      { label: "DEPLOYMENT_NOT_FOUND", href: "/docs/errors/deployment-not-found" },
+    ],
+  },
 ];
 
 export default function DocsLayout({ children }: { children: React.ReactNode }) {
