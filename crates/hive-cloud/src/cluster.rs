@@ -270,6 +270,7 @@ mod tests {
             cpu_cores: 1,
             mem_total_mb: 1024,
             disk_total_gb: 10,
+            disk_free_gb: 0,
             backend: "mock".into(),
         }
     }

@@ -476,6 +476,11 @@ async fn main() -> anyhow::Result<()> {
         cpu_cores: cap.0,
         mem_total_mb: cap.1,
         disk_total_gb: cap.2,
+        // Seeded here so the very first gossip round already carries a real
+        // figure; `spawn_disk_refresh` keeps it current from then on. Without a
+        // boot seed a node advertises 0 ("unknown") for its first interval,
+        // which placement must not mistake for "full".
+        disk_free_gb: crate::resources::disk_free_gb(),
         backend: backend_name.clone(),
         gpu_count: gpus.0,
         gpu_model: gpus.1.clone(),
@@ -856,6 +861,7 @@ async fn main() -> anyhow::Result<()> {
     // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
     spawn_anti_entropy_loop(cloud.clone());
     spawn_geo_refresh(cloud.registry.clone());
+    spawn_disk_refresh(cloud.registry.clone());
     spawn_memory_pressure_alarm();
 
     // Billing meter loop: periodically converts measured fleet compute usage into
@@ -1643,6 +1649,34 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
 /// half of a "fix", not this row's ask. Only writes when the position moved
 /// MATERIALLY (`HIVE_GEO_REFRESH_MIN_KM`, default 50km — a routine BGP reroute
 /// within the same city must not spuriously churn the registry every tick).
+/// Keep this node's gossiped free-disk figure current.
+///
+/// Placement reads `NodeInfo::disk_free_gb` to refuse a node with no headroom.
+/// A boot-time-only value would be worse than useless there: it goes stale in
+/// exactly the direction that matters (a node fills up, keeps advertising the
+/// space it had at boot, and keeps winning deployments it cannot host). That is
+/// the shape that took fc-sanjose to 0 bytes free and 9 dead deployments on
+/// 2026-07-31.
+///
+/// Cheap by construction: one `statvfs`-class read per tick, no CPU sampling.
+/// `HIVE_DISK_REFRESH_SECS` (default 30) tunes it; 0 disables.
+fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>) {
+    let interval = Duration::from_secs(env_u64("HIVE_DISK_REFRESH_SECS", 30));
+    if interval.is_zero() {
+        return;
+    }
+    crate::supervise::spawn_supervised("disk-refresh", move || {
+        let registry = registry.clone();
+        async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                crate::supervise::beat("disk-refresh");
+                registry.set_self_disk_free(crate::resources::disk_free_gb());
+            }
+        }
+    });
+}
+
 fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
     // `--region` pinned explicitly (not "auto") means the operator already
     // decided the identity; still worth refreshing lat/lon for DNS-nearest

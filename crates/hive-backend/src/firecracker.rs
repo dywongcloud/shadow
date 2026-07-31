@@ -166,6 +166,134 @@ impl FirecrackerBackend {
     /// cells, nor in `containers` for host-podman cells) and whose dir hasn't been
     /// modified in the last 5 minutes (so an in-flight provision is safe). Frees
     /// orphaned overlay disk. Best-effort.
+    /// Reclaim per-deployment data images in `rootfs_dir` that no live
+    /// deployment references.
+    ///
+    /// `gc_orphans` below only ever walked `run_dir` (ephemeral per-cell run
+    /// dirs). The PERSISTENT `<image>.data.ext4` files this backend writes in
+    /// `deliver_build` were structurally invisible to it — no age, no reference
+    /// check, nothing — and no other code path deletes them either
+    /// (`terminate` removes only `cell.root`; there is no delete method on the
+    /// backend trait at all). So every redeploy left its predecessor's whole
+    /// multi-GiB image behind, forever.
+    ///
+    /// Measured consequence on fc-sanjose, 2026-07-31: 370 images, 627 GiB
+    /// apparent on a 493 GiB disk, dating back five weeks. The node reached 0
+    /// bytes free and took 9 customer deployments down — and because the
+    /// headroom check ran `gc_orphans` and freed nothing, it reported "after
+    /// GC", which read as "nothing left to reclaim" when in fact the GC could
+    /// not see the 325 GiB sitting next to it.
+    ///
+    /// `keep` is the set of image stems still referenced. Anything else is
+    /// removed once older than `grace` — the age guard matters because an image
+    /// is written by `deliver_build` BEFORE the deployment that references it
+    /// finishes registering, and reaping that window would delete a build in
+    /// flight.
+    pub async fn gc_rootfs_images(
+        rootfs_dir: &std::path::Path,
+        keep: &std::collections::HashSet<String>,
+        grace: Duration,
+    ) -> (usize, u64) {
+        let now = std::time::SystemTime::now();
+        let mut removed = 0usize;
+        let mut bytes = 0u64;
+
+        // Collect first, decide second — the blast-radius check below has to see
+        // the whole picture before a single file is unlinked.
+        let mut candidates: Vec<(std::path::PathBuf, String, u64)> = Vec::new();
+        let mut total_images = 0usize;
+        let mut entries = match tokio::fs::read_dir(rootfs_dir).await {
+            Ok(d) => d,
+            Err(_) => return (0, 0),
+        };
+        while let Ok(Some(e)) = entries.next_entry().await {
+            let name = e.file_name().to_string_lossy().to_string();
+            // Only this backend's own per-deployment data images. Never touch
+            // the shared base rootfs/kernel artifacts sitting in the same dir.
+            let Some(stem) = name.strip_suffix(".data.ext4") else { continue };
+            total_images += 1;
+            // Match BOTH the literal stem and the prefix-stripped form.
+            //
+            // `deliver_build` names images `dpl-{bid}` where `bid` is ALREADY
+            // `dpl-<hash>`, so every file on disk is `dpl-dpl-<hash>.data.ext4`
+            // — a real double-prefix bug (git.rs's `format!("dpl-{}", bid)`).
+            // A caller that builds `keep` from deployment ids the obvious way
+            // produces `dpl-<hash>`, which matches NOTHING on disk, and this GC
+            // would then delete every live deployment's data disk. Measured on
+            // fc-sanjose while writing this: 0 of 369 stems matched raw
+            // deployment ids, 328 of 369 matched once the extra prefix was
+            // stripped. Accepting both forms makes that class of caller bug
+            // unable to cause data loss, instead of relying on every caller
+            // knowing about the naming quirk.
+            let alt = stem.strip_prefix("dpl-").unwrap_or(stem);
+            if keep.contains(stem) || keep.contains(alt) {
+                continue;
+            }
+            let Ok(md) = e.metadata().await else { continue };
+            let recent = md
+                .modified()
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|age| age < grace)
+                .unwrap_or(true); // unknown mtime => treat as recent, never reap
+            if recent {
+                continue;
+            }
+            candidates.push((e.path(), stem.to_string(), md.len()));
+        }
+
+        // BLAST-RADIUS GUARD. An empty or wrongly-namespaced `keep` set makes
+        // every image on disk look orphaned, and this function would then delete
+        // every live deployment's data disk — unrecoverable. No legitimate
+        // reclaim pass ever needs to remove most of the fleet's images at once,
+        // so refuse rather than proceed, and say why. `HIVE_GC_MAX_REAP_FRACTION`
+        // relaxes it for a deliberate bulk cleanup.
+        let max_fraction = std::env::var("HIVE_GC_MAX_REAP_FRACTION")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|f| *f > 0.0 && *f <= 1.0)
+            .unwrap_or(0.5);
+        if keep.is_empty() && total_images > 0 {
+            tracing::error!(
+                total_images,
+                "gc: REFUSING to reclaim — the keep-set is empty, which would delete every \
+                 deployment image on this node. This is a caller bug, not an empty disk."
+            );
+            return (0, 0);
+        }
+        if total_images > 0 {
+            let frac = candidates.len() as f64 / total_images as f64;
+            if frac > max_fraction {
+                tracing::error!(
+                    candidates = candidates.len(),
+                    total_images,
+                    fraction = frac,
+                    max_fraction,
+                    "gc: REFUSING to reclaim — too large a share of images look orphaned, which \
+                     usually means the keep-set was built in the wrong namespace (see the \
+                     dpl-dpl- double-prefix note). Raise HIVE_GC_MAX_REAP_FRACTION to override."
+                );
+                return (0, 0);
+            }
+        }
+
+        for (path, stem, sz) in candidates {
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                removed += 1;
+                bytes += sz;
+                tracing::info!(image = %stem, mib = sz / (1024 * 1024), "gc: reclaimed orphaned deployment image");
+            }
+        }
+        if removed > 0 {
+            tracing::warn!(
+                images = removed,
+                mib = bytes / (1024 * 1024),
+                "gc: reclaimed orphaned deployment images from rootfs dir"
+            );
+        }
+        (removed, bytes)
+    }
+
     async fn gc_orphans(
         run_dir: &std::path::Path,
         procs: &Arc<Mutex<HashMap<CellId, Child>>>,
@@ -242,20 +370,38 @@ impl FirecrackerBackend {
     /// silent half-boot) if still below the floor. Each microVM overlay is multi-GB,
     /// so booting into a near-full disk is what corrupted SJ's state (the outage).
     async fn ensure_disk_headroom(&self) -> anyhow::Result<()> {
-        // Floor: a microVM overlay pair (rootfs + data) plus slack. ~3 GiB.
-        const FLOOR_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+        // Floor: a microVM overlay pair (rootfs + data) plus slack. ~3 GiB by
+        // default; `HIVE_DISK_FLOOR_MIB` tunes it. It was a hardcoded const,
+        // which meant a fleet with larger images had no way to raise it without
+        // a rebuild.
+        let floor_bytes: u64 = std::env::var("HIVE_DISK_FLOOR_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|mib| mib * 1024 * 1024)
+            .unwrap_or(3 * 1024 * 1024 * 1024);
         let base = if self.cfg.run_dir.exists() { self.cfg.run_dir.as_path() } else { std::path::Path::new("/") };
-        if Self::disk_free_bytes(base) >= FLOOR_BYTES {
+        let before = Self::disk_free_bytes(base);
+        if before >= floor_bytes {
             return Ok(());
         }
-        tracing::warn!("disk below floor before provision — running orphan GC");
+        tracing::warn!(
+            free_mib = before / (1024 * 1024),
+            floor_mib = floor_bytes / (1024 * 1024),
+            "disk below floor before provision — running orphan GC"
+        );
         Self::gc_orphans(&self.cfg.run_dir, &self.procs, &self.containers).await;
         let free = Self::disk_free_bytes(base);
+        // Report what the GC actually accomplished. The old message ended at
+        // "after GC", which read as "nothing left to reclaim" even when the GC
+        // had freed literally zero bytes because it could not see the images
+        // filling the disk (see `gc_rootfs_images`). Naming the delta makes an
+        // ineffective GC visible instead of implying an exhausted one.
         anyhow::ensure!(
-            free >= FLOOR_BYTES,
-            "no capacity: host disk critically low ({} MiB free, need {} MiB) after GC",
+            free >= floor_bytes,
+            "no capacity: host disk critically low ({} MiB free, need {} MiB); GC reclaimed {} MiB",
             free / (1024 * 1024),
-            FLOOR_BYTES / (1024 * 1024)
+            floor_bytes / (1024 * 1024),
+            free.saturating_sub(before) / (1024 * 1024)
         );
         Ok(())
     }

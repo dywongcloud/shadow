@@ -136,6 +136,24 @@ pub struct NodeInfo {
     pub mem_total_mb: u64,
     #[serde(default)]
     pub disk_total_gb: u64,
+    /// LIVE free disk on this node's data volume, GiB — refreshed on a timer, not
+    /// a boot-time constant like `disk_total_gb` above.
+    ///
+    /// Exists because placement was disk-blind: `schedule.rs` filtered on health,
+    /// region and GPU but never on space, so it kept choosing a node that was
+    /// already full. Witnessed 2026-07-31 — fc-sanjose reached 100% (0 bytes
+    /// free) and took down 9 customer deployments with "host disk critically low
+    /// ... after GC", while fc-frankfurt and both CVM nodes sat below 10% used
+    /// with ~920 GiB free each. Capacity in this fleet is also wildly
+    /// heterogeneous (493 GiB to 1000 GiB), so a percentage alone is not enough
+    /// to compare nodes; the absolute figure is what admission needs.
+    ///
+    /// `0` means "not reported" (a peer running an older build, or a probe that
+    /// failed) and MUST be read as unknown rather than as a full disk — treating
+    /// unknown as full would exclude every pre-upgrade peer from placement during
+    /// a rollout.
+    #[serde(default)]
+    pub disk_free_gb: u64,
     /// Isolation backend this node runs: "firecracker" (real microVMs) or "mock"
     /// (sandboxed child processes — local/dev). The placement scheduler only
     /// auto-targets firecracker nodes; mock/local nodes host only when a region is
@@ -375,6 +393,17 @@ impl NodeRegistry {
         }
     }
 
+    /// Refresh this node's LIVE free-disk figure so placement can see it.
+    ///
+    /// Deliberately separate from the boot-time capacity fields: free space is
+    /// the only capacity number that moves on its own between restarts, and it
+    /// is the one placement was missing when a full node kept winning
+    /// deployments.
+    pub fn set_self_disk_free(&self, disk_free_gb: u64) {
+        let mut me = self.me.write();
+        me.disk_free_gb = disk_free_gb;
+    }
+
     /// Record a peer's measured latency + health (from probing).
     pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
         if let Some(p) = self.peers.write().get_mut(id) {
@@ -567,6 +596,7 @@ mod tests {
             cpu_cores: 0,
             mem_total_mb: 0,
             disk_total_gb: 0,
+            disk_free_gb: 0,
             backend: String::new(),
         }
     }

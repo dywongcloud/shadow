@@ -102,6 +102,19 @@ pub fn place_for_project(
     place(cloud, regions, is_container, stateful, needs_gpu)
 }
 
+/// Minimum free disk (GiB) a node must report to be eligible for new placement.
+///
+/// Sized above hive-backend's per-cold-start `FLOOR_BYTES` (3 GiB) on purpose:
+/// admitting a node with barely one deployment's worth of space just defers the
+/// failure to the cold start, which then reports it as the customer's problem.
+/// `HIVE_PLACEMENT_DISK_FLOOR_GB` tunes it per fleet.
+fn disk_floor_gb() -> u64 {
+    std::env::var("HIVE_PLACEMENT_DISK_FLOOR_GB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(20)
+}
+
 /// Choose placement targets. See module docs for the policy. `is_container` routes
 /// CONTAINER deployments (`__container__`/podman) to container-CAPABLE nodes (the
 /// mock/podman backend) — Firecracker nodes can't run them, so placing a container
@@ -171,6 +184,33 @@ pub fn place(
     // Non-container functions still want a Firecracker microVM node.
     let capable = |n: &NodeInfo| -> bool {
         if needs_gpu && n.gpu_count == 0 {
+            return false;
+        }
+        // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
+        // filtered on health/region/GPU and then sorted by deployment COUNT, a
+        // metric that says nothing about space. So the node with the most free
+        // capacity and the node with none scored identically, and a full node
+        // kept winning. Witnessed 2026-07-31 — fc-sanjose hit 0 bytes free and
+        // took 9 customer deployments down ("host disk critically low ... after
+        // GC") while fc-frankfurt and both CVM nodes sat under 10% used with
+        // ~920 GiB free each.
+        //
+        // A HARD filter, not another term in the score, because disk is not like
+        // CPU or memory: it does not drain on its own once a deployment lands,
+        // so a node that is out of space is out until something is deleted. A
+        // weighted score would still let it win when peers look busy.
+        //
+        // The floor is deliberately larger than the per-cold-start requirement
+        // (`FLOOR_BYTES`, 3 GiB in hive-backend): placement must leave room for
+        // the deployment it is about to create PLUS the next one, or it just
+        // hands the node to the very check that will reject it.
+        //
+        // `disk_free_gb == 0` means UNKNOWN, not full — a pre-upgrade peer does
+        // not report it. Excluding those would empty the candidate set during a
+        // rollout, so unknown is admitted and only a positive, genuinely-low
+        // reading rejects.
+        let floor_gb = disk_floor_gb();
+        if n.disk_free_gb > 0 && n.disk_free_gb < floor_gb {
             return false;
         }
         if is_container {
@@ -248,7 +288,10 @@ pub fn place(
                 continue;
             }
             let mut pool = if eligibles.is_empty() { cands } else { eligibles };
-            pool.sort_by_key(|n| load_of(&n.name));
+            // Order by load, then by MOST free disk. The disk term is what
+            // actively drains a filling node instead of merely refusing it
+            // once it is already over the floor (Reverse => larger first).
+            pool.sort_by_key(|n| (load_of(&n.name), std::cmp::Reverse(n.disk_free_gb)));
             // Prefer the COORDINATOR itself when it's a valid candidate for this
             // region: a local build has full log fidelity and zero cross-node
             // dispatch/mirror dependency, whereas dispatching to a remote node

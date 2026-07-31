@@ -105,3 +105,14 @@ pub async fn live() -> LiveUsage {
         net_tx_bytes,
     }
 }
+
+/// Free space on this host's largest data volume, GiB.
+///
+/// Split out of `live()` because placement needs this figure on a cheap,
+/// frequent cadence and must not pay `live()`'s mandatory
+/// `MINIMUM_CPU_UPDATE_INTERVAL` sleep (it samples CPU twice) just to read a
+/// disk number.
+pub fn disk_free_gb() -> u64 {
+    let disks = Disks::new_with_refreshed_list();
+    disks.list().iter().map(|d| d.available_space()).max().unwrap_or(0) / 1024 / 1024 / 1024
+}
