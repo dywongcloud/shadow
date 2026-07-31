@@ -456,6 +456,27 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
 - Rebuild constraint from the node half: fc-sanjose-gpu-2 runs driver
   570.211.01 — any llama.cpp rebuild must stay on CUDA 12.x, not 13.x.
 
+## Tenant volume isolation (verified, keep it this way)
+
+- **A project name can never become a host path, and that is load-bearing.**
+  Podman reads `-v <a>:<b>` as a BIND MOUNT whenever `<a>` looks like a path, so
+  any code that interpolates a tenant-controlled string into the left side of
+  that pair is one bad name away from mounting host `/` into a hostile
+  container. This platform is safe by construction rather than by luck:
+  `container_volume_cfg` builds `hive-vol-{sanitize_tag(project)}`,
+  `sanitize_tag` maps every character outside `[a-z0-9._-]` to `-` and trims
+  leading/trailing `.`/`-`/`_`, and the `hive-vol-` prefix is prepended AFTER
+  sanitization — so the left side is always a named volume, never a path, even
+  for a project called `/`, `..`, or `../../etc`. `volpath` is a platform
+  constant, not tenant config. Verified empirically 2026-07-31: 9 running
+  containers across 5 nodes, **zero** host bind mounts.
+- **Any future storage feature must preserve that invariant.** Snapshot,
+  quota, restore and dataset-name paths all take tenant-supplied identifiers;
+  each is the same footgun. Validate at the boundary and construct the final
+  name from a platform-controlled template — never pass a tenant string
+  through to a mount/dataset argument, and never accept one that has already
+  been concatenated upstream.
+
 ## Storage capacity & placement
 
 - **Placement must consider free disk, and disk is a HARD filter, not a score
