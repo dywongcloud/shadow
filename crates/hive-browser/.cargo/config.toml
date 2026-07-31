@@ -1,0 +1,9 @@
+# Default this crate's builds to wasm32 so a bare `cargo build` here does the
+# right thing, and hand getrandom 0.3 its wasm backend (required alongside the
+# `getrandom = { features = ["wasm_js"] }` dep — the feature alone is inert
+# without this cfg).
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

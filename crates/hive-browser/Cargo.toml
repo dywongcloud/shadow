@@ -1,0 +1,55 @@
+[package]
+name = "hive-browser"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# NOT a workspace member (see the root Cargo.toml `exclude`). This crate targets
+# wasm32-unknown-unknown ONLY and pulls wasm-exclusive deps (getrandom/wasm_js,
+# ws_stream_wasm via iroh's browser transport) that do not compile for the host.
+# Leaving it in the workspace would break `cargo build`/`cargo test --workspace`
+# and every CI job, since those default to the host target. Build it explicitly:
+#   cd crates/hive-browser && cargo build --target wasm32-unknown-unknown --release
+# then wasm-bindgen the artifact (see build.sh).
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# iroh's browser build: default-features=false ALSO drops tls-ring and cfg's out
+# the N0/Minimal endpoint presets (they are gated on `with_crypto_provider`), so
+# the docs' bare `default-features = false` line silently produces an endpoint
+# that cannot construct a crypto provider. The examples' recipe re-adds tls-ring.
+iroh = { version = "=1.0.2", default-features = false, features = ["tls-ring"] }
+
+# getrandom 0.3 with the wasm_js backend so `SecretKey::generate()` and QUIC have
+# entropy in the browser. The `--cfg getrandom_backend="wasm_js"` rustflag in
+# .cargo/config.toml is required alongside this feature (0.3.x refuses to pick a
+# wasm backend without it).
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
+# Pinned EXACTLY to the workspace-resolved wasm-bindgen so the CLI (build.sh
+# installs the same version) matches the macro-generated glue byte-for-byte; a
+# mismatch is a hard runtime error ("invalid schema version").
+wasm-bindgen = "=0.2.125"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = ["console", "Window"] }
+
+# n0-future::task::spawn instead of tokio::spawn — there is no tokio reactor on
+# wasm; iroh itself uses this shim. tokio is sync-only here (full/net pull mio,
+# which does not build for wasm32).
+n0-future = "0.3"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+url = "2"
+tracing = "0.1"
+tracing-wasm = "0.2"
+console_error_panic_hook = "0.1"
+
+[profile.release]
+opt-level = "s"
+lto = true

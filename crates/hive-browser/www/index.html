@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>hive-browser node</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body { font-family: ui-monospace, monospace; background: #0b0d10; color: #d7dce1; margin: 0; padding: 2rem; }
+  h1 { font-size: 1.1rem; color: #7fd1ff; }
+  .row { margin: 0.4rem 0; }
+  .k { color: #7c8a99; display: inline-block; width: 9rem; }
+  .v { color: #b8f4c0; }
+  .err { color: #ff8080; white-space: pre-wrap; }
+  input, button { font-family: inherit; background: #14181d; color: #d7dce1; border: 1px solid #2a323b; padding: 0.35rem 0.5rem; }
+  button { cursor: pointer; }
+</style>
+</head>
+<body>
+<h1>SHADW browser node — networking scaffold (bn-impl-crate-scaffold)</h1>
+<div class="row"><span class="k">status</span><span class="v" id="s-status">booting…</span></div>
+<div class="row"><span class="k">node id</span><span class="v" id="s-id">—</span></div>
+<div class="row"><span class="k">relay</span><span class="v" id="s-relay">—</span></div>
+<div class="row"><span class="k">addr_json</span><span class="v" id="s-addr" style="word-break:break-all;">—</span></div>
+<div class="row"><span class="k">served count</span><span class="v" id="s-served">0</span></div>
+<div class="row err" id="s-err"></div>
+
+<div class="row" style="margin-top:1rem;">
+  <input id="peer-addr" placeholder="peer addr_json to echo-dial" size="60">
+  <input id="peer-msg" placeholder="message" value="hello from browser">
+  <button id="echo-btn">echoTo</button>
+  <span class="v" id="echo-result"></span>
+</div>
+
+<script type="module">
+  import init, { BrowserNode } from './pkg/hive_browser.js';
+
+  const $ = (id) => document.getElementById(id);
+  const setErr = (e) => { $('s-err').textContent = String(e && e.stack || e); };
+
+  // Exposed for the gm browser verb to poll/drive from outside the module scope.
+  window.__hiveBrowserReady = false;
+  window.__hiveBrowserNode = null;
+  window.__hiveBrowserError = null;
+
+  async function boot() {
+    await init();
+
+    const params = new URLSearchParams(location.search);
+    const relay = params.get('relay') || 'wss://127.0.0.1:3341';
+    const discovery = params.get('discovery') || '';
+
+    // Persist identity across reloads: seed lives in localStorage keyed by the
+    // relay (dev-only storage; the real scheme per the proposal wraps this with
+    // a non-extractable WebCrypto key in IndexedDB — this page is the
+    // networking-scaffold witness, key-persistence is its own PRD row).
+    const KEY = 'hive-browser-seed-v1';
+    let seed = localStorage.getItem(KEY) || '';
+
+    $('s-status').textContent = `connecting to ${relay}…`;
+    try {
+      const node = await BrowserNode.boot(relay, discovery || null, seed || null);
+      window.__hiveBrowserNode = node;
+
+      if (!seed) {
+        // We didn't have a persisted seed; the node generated one internally.
+        // (Full rotation/persist flow is bn-impl-key-persistence; this proves
+        // the boot path works end to end.)
+        localStorage.setItem(KEY, ''); // placeholder marker; real seed export is a follow-up API
+      }
+
+      $('s-status').textContent = 'online';
+      $('s-id').textContent = node.nodeId();
+      $('s-relay').textContent = relay;
+      $('s-addr').textContent = node.addrJson();
+      window.__hiveBrowserReady = true;
+
+      setInterval(() => {
+        $('s-served').textContent = String(node.servedCount());
+      }, 500);
+
+      $('echo-btn').onclick = async () => {
+        try {
+          const addr = $('peer-addr').value.trim();
+          const msg = $('peer-msg').value;
+          const reply = await node.echoTo(addr, msg);
+          $('echo-result').textContent = `reply: ${reply}`;
+        } catch (e) {
+          $('echo-result').textContent = '';
+          setErr(e);
+        }
+      };
+    } catch (e) {
+      $('s-status').textContent = 'FAILED';
+      window.__hiveBrowserError = String(e && e.stack || e);
+      setErr(e);
+    }
+  }
+
+  boot();
+</script>
+</body>
+</html>
