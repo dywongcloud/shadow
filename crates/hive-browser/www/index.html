@@ -33,6 +33,7 @@
 
 <script type="module">
   import init, { BrowserNode } from './pkg/hive_browser.js';
+  import { loadOrCreateSeed } from './identity.js';
 
   const $ = (id) => document.getElementById(id);
   const setErr = (e) => { $('s-err').textContent = String(e && e.stack || e); };
@@ -41,6 +42,7 @@
   window.__hiveBrowserReady = false;
   window.__hiveBrowserNode = null;
   window.__hiveBrowserError = null;
+  window.__hiveIdentityCreated = null;
 
   async function boot() {
     await init();
@@ -49,24 +51,26 @@
     const relay = params.get('relay') || 'wss://127.0.0.1:3341';
     const discovery = params.get('discovery') || '';
 
-    // Persist identity across reloads: seed lives in localStorage keyed by the
-    // relay (dev-only storage; the real scheme per the proposal wraps this with
-    // a non-extractable WebCrypto key in IndexedDB — this page is the
-    // networking-scaffold witness, key-persistence is its own PRD row).
-    const KEY = 'hive-browser-seed-v1';
-    let seed = localStorage.getItem(KEY) || '';
-
     $('s-status').textContent = `connecting to ${relay}…`;
     try {
-      const node = await BrowserNode.boot(relay, discovery || null, seed || null);
-      window.__hiveBrowserNode = node;
+      // Identity persistence (bn-impl-key-persistence): if IndexedDB already
+      // holds a wrapped seed, decrypt and reuse it — same EndpointId every
+      // reload. Otherwise mint a throwaway node ONLY to get a fresh seed from
+      // the wasm module (SecretKey::generate() lives there, not in JS), wrap
+      // and persist it via WebCrypto, then boot the REAL node from that seed
+      // so the id reported below is the persisted one from the very first use.
+      const scratch = await BrowserNode.boot(relay, null, null);
+      const { seedHex, created } = await loadOrCreateSeed(scratch.secretHex());
+      window.__hiveIdentityCreated = created;
 
-      if (!seed) {
-        // We didn't have a persisted seed; the node generated one internally.
-        // (Full rotation/persist flow is bn-impl-key-persistence; this proves
-        // the boot path works end to end.)
-        localStorage.setItem(KEY, ''); // placeholder marker; real seed export is a follow-up API
+      let node;
+      if (created) {
+        node = scratch; // already booted from exactly the seed we just persisted
+      } else {
+        scratch.free(); // discard the throwaway endpoint explicitly, don't wait on GC
+        node = await BrowserNode.boot(relay, discovery || null, seedHex);
       }
+      window.__hiveBrowserNode = node;
 
       $('s-status').textContent = 'online';
       $('s-id').textContent = node.nodeId();

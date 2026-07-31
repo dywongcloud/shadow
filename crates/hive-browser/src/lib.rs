@@ -121,6 +121,18 @@ impl BrowserNode {
         self.ep.id().to_string()
     }
 
+    /// The raw 32-byte ed25519 seed, as 64 hex chars — the ONLY way key
+    /// material leaves this module. Per `docs/browser-node-proposal.md` §2.2,
+    /// this exists solely so the caller can wrap it with a non-extractable
+    /// WebCrypto key before it ever touches durable storage; the wasm module
+    /// itself never persists anything. JS strings cannot be zeroed after use
+    /// (no mutable-buffer access), so the caller must encrypt this value
+    /// immediately on receipt and never log or store it bare.
+    #[wasm_bindgen(js_name = secretHex)]
+    pub fn secret_hex(&self) -> String {
+        bytes_to_hex(&self.ep.secret_key().to_bytes())
+    }
+
     /// Serialized `EndpointAddr` (id + relay/transport hints) a peer needs to
     /// dial this browser node.
     #[wasm_bindgen(js_name = addrJson)]
@@ -248,6 +260,11 @@ fn spawn_accept_loop(ep: Endpoint, served: Arc<std::sync::atomic::AtomicU64>) {
             });
         }
     });
+}
+
+/// Render bytes as lowercase hex.
+fn bytes_to_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 /// Parse 64 hex chars into 32 bytes; `None` on any malformed input.
