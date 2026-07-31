@@ -68,7 +68,19 @@ pub async fn probe(cloud: &Arc<CloudState>, node_id: &str, addr: &str, timeout: 
 /// the registry (e.g. a bootstrap seed never gossiped as a full `NodeInfo`).
 fn relay_hinted_addr(cloud: &Arc<CloudState>, node_id: &str, addr_json: &str) -> String {
     let nodes = cloud.registry.nodes();
-    let Some(target) = nodes.iter().find(|n| n.peer_id.as_deref() == Some(node_id)) else {
+    // Match on endpoint id OR node name. `node_id` here is whatever the caller had:
+    // `request_to`'s callers pass a 64-hex `peer_id`, but `fetch` pulls its tuple
+    // from `peer_iroh`, whose entries for peers learned over the HTTP `/v1/nodes`
+    // path hold the node NAME (`ps.id`). A name can never equal a hex endpoint id,
+    // so the old peer_id-only match ALWAYS missed on that path and returned
+    // `addr_json` untouched — meaning relay-hint steering silently did nothing for
+    // every peer learned that way, while appearing to work because the other
+    // caller set passed ids. Accepting both makes the hint apply wherever the
+    // caller's label actually identifies a real registry node.
+    let Some(target) = nodes
+        .iter()
+        .find(|n| n.peer_id.as_deref() == Some(node_id) || n.id == node_id)
+    else {
         return addr_json.to_string();
     };
     let me = cloud.registry.me();

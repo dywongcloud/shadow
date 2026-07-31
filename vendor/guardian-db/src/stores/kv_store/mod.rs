@@ -554,15 +554,22 @@ impl KeyValueStore for GuardianDBKeyValue {
             .docs
             .get_many(&self.doc_handle, Query::single_latest_per_key().build())
             .await?;
-        Ok(entries
-            .iter()
-            .filter(|e| e.content_len() != 0) // skip deletion markers
-            .map(|e| EntryHead {
+        let mut heads = Vec::with_capacity(entries.len());
+        for e in entries.iter().filter(|e| e.content_len() != 0) {
+            let hash = e.content_hash().to_hex();
+            // Metadata-only presence check — still no value bytes transferred,
+            // preserving this method's whole point while making the answer
+            // useful for detecting content divergence rather than only entry
+            // divergence.
+            let content_local = self.client.has_blob_local(&hash).await;
+            heads.push(EntryHead {
                 key: String::from_utf8_lossy(e.key()).to_string(),
-                hash: e.content_hash().to_hex(),
+                hash,
                 timestamp: e.timestamp(),
-            })
-            .collect())
+                content_local: Some(content_local),
+            });
+        }
+        Ok(heads)
     }
 
     /// Real targeted reconciliation: `iroh_docs::api::Doc::start_sync` against

@@ -364,15 +364,31 @@ impl BlobStore {
             }
         }
 
-        debug!("GC: {} hashes protected by tags", protected_hashes.len());
-
-        // NOTE: The 0.94.0 API manages GC automatically via FsStore.
-        // Manual GC is not exposed directly in the new API.
-        // GC runs periodically in the background.
-
-        debug!("GC is managed automatically by FsStore");
-
-        Ok(0) // Returns 0 since GC is automatic.
+        // NO GARBAGE COLLECTOR IS RUNNING. This used to claim "GC is managed
+        // automatically by FsStore … GC runs periodically in the background",
+        // which is false and was actively misleading: in iroh-blobs 0.103 GC is
+        // OPT-IN (`Options::new` sets `gc: None`), and this crate constructs its
+        // store with a plain `FsStore::load`, which takes exactly those defaults.
+        // So nothing ever reclaims an unreferenced blob — the store grows
+        // monotonically — and every `doc_*`/`pin-*` tag counted above is
+        // protecting against a collector that does not exist. `delete_document`'s
+        // promise that "the physical blob will be removed by GC" never happens.
+        //
+        // Returning the protected count instead of a bare 0 keeps this honest and
+        // useful: it reports what WOULD be protected, so an operator can see the
+        // tag set is sane before anyone enables collection.
+        //
+        // BEFORE TURNING GC ON, read this: `Docs::persistent(..).spawn(..)` is
+        // called WITHOUT `.protect_handler(..)`, so iroh-docs' `protect_cb` is
+        // `None` and its content-protection task no-ops. Enabling GC without also
+        // wiring that handler would delete live document content. The two must
+        // land together, never separately.
+        let protected = protected_hashes.len() as u64;
+        debug!(
+            "GC: {} hashes protected by tags; no collector configured (iroh-blobs gc is opt-in and off)",
+            protected
+        );
+        Ok(protected)
     }
 
     /// Returns true if the BlobStore supports P2P download.

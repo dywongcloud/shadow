@@ -689,6 +689,21 @@ pub struct EntryHead {
     pub hash: String,
     /// Entry timestamp (iroh-docs' internal microsecond clock).
     pub timestamp: u64,
+    /// Whether the reporting node actually holds this entry's CONTENT locally.
+    ///
+    /// Without this, two nodes agreeing on every `(key → hash)` were declared
+    /// CONVERGED even when one of them could not read a single byte of that
+    /// hash — because a doc entry replicates independently of its blob, and
+    /// iroh-docs stops retrying a fetch for good once the supplying peer goes
+    /// away. Anti-entropy was structurally unable to see the most common real
+    /// divergence on this fleet.
+    ///
+    /// `None` means UNKNOWN, not "missing": a pre-upgrade peer omits the field
+    /// entirely, and treating that silence as absence would make every node
+    /// mid-rollout look empty. Same failure direction as `disk_free_gb == 0`
+    /// elsewhere in the platform — unknown must never be read as a deficit.
+    #[serde(default)]
+    pub content_local: Option<bool>,
 }
 
 /// Outcome of a targeted [`KeyValueStore::sync_with_peer`] reconciliation

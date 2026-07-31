@@ -1287,6 +1287,82 @@ impl IrohBackend {
     ///
     /// # Arguments
     /// * `hash_str` - BLAKE3 hash in hexadecimal format
+    /// Whether this node holds the CONTENT for `hash` locally — a metadata-only
+    /// check (`blobs().has`), reading no value bytes and touching no network.
+    ///
+    /// Exists so `entry_heads` can report content availability alongside each
+    /// entry without giving up its defining property of transferring nothing.
+    pub async fn has_blob_local(&self, hash_str: &str) -> bool {
+        let Ok(hash) = Self::parse_hash(hash_str) else {
+            return false;
+        };
+        let store_guard = self.store.read().await;
+        match store_guard.as_ref() {
+            Some(StoreType::Fs(store)) => store.blobs().has(hash).await.unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// Pull a blob this node is missing from the peers it is currently connected
+    /// to, using iroh-blobs' verified downloader.
+    ///
+    /// Providers are the live connection pool rather than a doc-supplied provider
+    /// list on purpose: by the time a blob is discovered missing, the peer that
+    /// originally supplied its entry may be long gone — that is the failure this
+    /// exists to survive. Any connected peer holding the bytes will do, and since
+    /// iroh-blobs verifies the BLAKE3 tree on arrival, asking a broader set costs
+    /// nothing in safety: a peer cannot answer with content that does not hash to
+    /// the requested id.
+    ///
+    /// Best-effort by design. An error here means "still missing", which the
+    /// caller surfaces exactly as it did before this path existed.
+    async fn fetch_blob_from_peers(&self, hash: IrohHash) -> Result<()> {
+        use futures::StreamExt;
+
+        let endpoint_arc = self.get_endpoint().await?;
+        let endpoint_lock = endpoint_arc.read().await;
+        let endpoint = endpoint_lock.as_ref().ok_or_else(|| {
+            GuardianError::Other("Endpoint not available for P2P blob fetch".to_string())
+        })?;
+
+        let providers: Vec<NodeId> = {
+            let pool = self.connection_pool.read().await;
+            pool.values().map(|c| c.node_id).collect()
+        };
+        if providers.is_empty() {
+            return Err(GuardianError::Other(
+                "no connected peers to fetch missing blob from".to_string(),
+            ));
+        }
+
+        let store_guard = self.store.read().await;
+        let Some(StoreType::Fs(store)) = store_guard.as_ref() else {
+            return Err(GuardianError::Other(
+                "Iroh store not initialized".to_string(),
+            ));
+        };
+
+        let downloader = store.downloader(endpoint);
+        let mut stream = downloader
+            .download(hash, providers)
+            .stream()
+            .await
+            .map_err(|e| GuardianError::Other(format!("P2P blob fetch failed to start: {e}")))?;
+        while let Some(item) = stream.next().await {
+            match &item {
+                iroh_blobs::api::downloader::DownloadProgressItem::Error(e) => {
+                    return Err(GuardianError::Other(format!("P2P blob fetch error: {e}")));
+                }
+                iroh_blobs::api::downloader::DownloadProgressItem::DownloadError => {
+                    return Err(GuardianError::Other("P2P blob fetch failed".to_string()));
+                }
+                _ => {}
+            }
+        }
+        info!("recovered missing blob {} from a connected peer", hash.to_hex());
+        Ok(())
+    }
+
     pub async fn cat(&self, hash_str: &str) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
         let start = Instant::now();
 
@@ -1323,30 +1399,68 @@ impl IrohBackend {
 
         // Fetch the content from the store.
         let buffer_vec = {
-            let store_guard = self.store.read().await;
-            let buffer_bytes: bytes::Bytes = match store_guard.as_ref() {
-                Some(StoreType::Fs(store)) => {
-                    // API 0.94.0: use a direct reader to get the data.
-                    let mut reader = store.reader(hash);
-
-                    // Read all the content using read_to_end() with a buffer.
-                    let mut buffer = Vec::new();
-                    reader
-                        .read_to_end(&mut buffer)
-                        .await
-                        .map_err(Self::map_iroh_error)?;
-
-                    Bytes::from(buffer)
+            let local = {
+                let store_guard = self.store.read().await;
+                match store_guard.as_ref() {
+                    Some(StoreType::Fs(store)) => {
+                        let mut reader = store.reader(hash);
+                        let mut buffer = Vec::new();
+                        match reader.read_to_end(&mut buffer).await {
+                            Ok(_) => Some(Bytes::from(buffer)),
+                            // Local miss. Do NOT fail yet — fall through to a P2P
+                            // fetch below. This is the whole availability fix:
+                            // previously `cat` was local-only, so a doc entry whose
+                            // blob this node never pulled was permanently unreadable
+                            // here even though peers were holding the bytes.
+                            Err(_) => None,
+                        }
+                    }
+                    None => {
+                        return Err(GuardianError::Other(
+                            "Iroh store not initialized".to_string(),
+                        ));
+                    }
                 }
+            }; // store lock released before any network work
+
+            match local {
+                Some(b) => b.to_vec(),
                 None => {
-                    return Err(GuardianError::Other(
-                        "Iroh store not initialized".to_string(),
-                    ));
+                    // A doc ENTRY replicates independently of whether any peer can
+                    // still serve its BLOB, and iroh-docs' own retry gives up for
+                    // good once the supplying peer goes away (its provider set is
+                    // only the peers that delivered the entry, retried solely on a
+                    // neighbour's ContentReady announcement). So a blob that was
+                    // never pulled before its writer departed is unreachable
+                    // forever, which is what produced fleet-wide
+                    // "entries could not be read from iroh-docs" warnings on every
+                    // node. Ask the peers we are actually connected to; content is
+                    // BLAKE3-verified on arrival, so a wrong or hostile answer
+                    // cannot be accepted as this hash.
+                    debug!(
+                        "Content {} missing locally — attempting P2P fetch from connected peers",
+                        hash_str
+                    );
+                    self.fetch_blob_from_peers(hash).await?;
+                    let store_guard = self.store.read().await;
+                    match store_guard.as_ref() {
+                        Some(StoreType::Fs(store)) => {
+                            let mut reader = store.reader(hash);
+                            let mut buffer = Vec::new();
+                            reader
+                                .read_to_end(&mut buffer)
+                                .await
+                                .map_err(Self::map_iroh_error)?;
+                            buffer
+                        }
+                        None => {
+                            return Err(GuardianError::Other(
+                                "Iroh store not initialized".to_string(),
+                            ));
+                        }
+                    }
                 }
-            };
-
-            // Convert from bytes::Bytes to Vec<u8>.
-            buffer_bytes.to_vec()
+            }
         };
 
         // Add the retrieved data to the cache for future lookups.

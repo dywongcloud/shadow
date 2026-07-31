@@ -228,6 +228,12 @@ impl IrohClient {
     /// # Ok(())
     /// # }
     /// ```
+    /// Metadata-only local-presence check for a blob (no bytes read, no network).
+    /// Used by `entry_heads` to attach a content-availability bit to each entry.
+    pub async fn has_blob_local(&self, hash: &str) -> bool {
+        self.backend.has_blob_local(hash).await
+    }
+
     pub async fn cat_bytes(&self, hash: &str) -> Result<Vec<u8>> {
         let mut reader = self.backend.cat(hash).await?;
         let mut data = Vec::new();

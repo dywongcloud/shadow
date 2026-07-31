@@ -25,9 +25,22 @@ use tokio::sync::Mutex;
 // Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
 pub use iroh::Endpoint;
 
-/// QUIC keep-alive for trunked connections — keeps an idle-but-warm connection
-/// from being reaped (and re-dialed) under bursty load. Below iroh's idle timeout.
-const KEEPALIVE: Duration = Duration::from_secs(15);
+/// Connection-level QUIC idle timeout for trunked connections.
+///
+/// This deliberately does NOT set a keep-alive interval. `QuicTransportConfig`'s
+/// builder already installs iroh's own tuned values — a 5s `keep_alive_interval`
+/// AND a 5s `default_path_keep_alive_interval` against a 15s path idle timeout —
+/// which are what actually hold a multipath connection's paths open. The previous
+/// code here set `keep_alive_interval(15s)`, described as "keeps an idle-but-warm
+/// connection from being reaped … below iroh's idle timeout". Both halves of that
+/// were wrong: it did not ADD a keep-alive (one already existed), it TRIPLED
+/// iroh's interval to exactly the path idle timeout, and "iroh's idle timeout"
+/// conflated the 30s connection timeout with the 15s PATH timeout. It stayed
+/// harmless only because the separate per-path keep-alive was left untouched and
+/// was silently doing the real work. Overriding a transport parameter the
+/// upstream tuned for its own hole-punching needs a measured reason; there was
+/// none, so the override is gone and iroh's defaults stand.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// ALPN identifying the Hive function-tunnel protocol over iroh.
 pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
@@ -620,7 +633,32 @@ struct Trunk {
 /// lifecycle is pooled.
 pub struct PeerPool {
     ep: Endpoint,
+    /// Live trunks keyed by CANONICAL ENDPOINT ID (`EndpointAddr::id`, 64-hex) —
+    /// never by whatever label a caller happened to pass.
+    ///
+    /// This used to be keyed by the caller's `node_id` argument, which sounds
+    /// harmless until you notice the two planes of this platform disagree about
+    /// what a peer is called. The DATA plane passes node NAMES (`NodeInfo.id`,
+    /// which `main.rs` sets to `args.name`; see `edge.rs`'s candidates and the
+    /// trunk warmer), while the CONTROL plane passes 64-hex endpoint ids
+    /// (`NodeInfo.peer_id`; see `gossip::request_to`, `admin::fetch_from_host`,
+    /// `peer_iroh`). Same peer, two keys, so the pool held TWO QUIC connections
+    /// to every node — double handshakes and holepunches, `relay_stats()`
+    /// double-counting every peer, the trunk warmer warming only the name-keyed
+    /// half (leaving the control-plane trunk that gossip, health probes,
+    /// anti-entropy, ACME and db_replicate all ride permanently cold), and
+    /// `close_peer(eid)` from `gossip::probe` unable to evict the edge's
+    /// name-keyed trunk after a peer restarted.
+    ///
+    /// Keying by the id parsed out of `addr_json` — which `acquire` must parse
+    /// anyway in order to dial — makes the two planes converge by construction
+    /// rather than by every caller remembering to agree.
     trunks: Mutex<HashMap<String, Trunk>>,
+    /// Caller label (node name OR endpoint id) → canonical endpoint id, learned
+    /// on each successful `acquire`. Exists so the label-taking diagnostics
+    /// (`close_peer`, `sever_peer`) still work for callers that only know a name,
+    /// without reintroducing a second keyspace for the trunks themselves.
+    aliases: Mutex<HashMap<String, String>>,
     opened: AtomicU64,
     reused: AtomicU64,
     timeouts: Arc<TimeoutCounters>,
@@ -632,6 +670,7 @@ impl PeerPool {
         Arc::new(PeerPool {
             ep,
             trunks: Mutex::new(HashMap::new()),
+            aliases: Mutex::new(HashMap::new()),
             opened: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             timeouts: Arc::new(TimeoutCounters::default()),
@@ -693,15 +732,22 @@ impl PeerPool {
     /// (possibly slow, holepunching) `connect`, so a slow first-contact to one peer
     /// can't serialize requests to the others.
     async fn acquire(&self, node_id: &str, addr_json: &str) -> Result<Connection> {
+        // Parse FIRST: the canonical endpoint id is the trunk key (see `trunks`),
+        // and it is only knowable from the address. `node_id` is retained purely
+        // as a human-facing label for logs, metrics and the alias map.
+        let addr: EndpointAddr = serde_json::from_str(addr_json)?;
+        let id = addr.id;
+        let key = id.to_string();
+
         // Fast path: reuse a still-live trunk.
         {
             let map = self.trunks.lock().await;
-            if let Some(t) = map.get(node_id) {
+            if let Some(t) = map.get(&key) {
                 if t.conn.close_reason().is_none() {
                     let conn = t.conn.clone();
                     drop(map);
                     self.reused.fetch_add(1, Ordering::Relaxed);
-                    tracing::debug!(node_id, "trunk reused");
+                    tracing::debug!(node_id, key = %key, "trunk reused");
                     return Ok(conn);
                 }
             }
@@ -710,8 +756,6 @@ impl PeerPool {
         // Slow path: dial OUTSIDE the lock, BOUNDED by the connect budget (#H4).
         // A holepunch that never completes would otherwise hang here forever and —
         // since edge.rs walks candidates sequentially — block the whole queue.
-        let addr: EndpointAddr = serde_json::from_str(addr_json)?;
-        let id = addr.id;
         let budget = connect_budget();
         let conn = match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
             Ok(Ok(c)) => c,
@@ -723,7 +767,7 @@ impl PeerPool {
                 // give up on the peer yet: fall back to fresh discovery below. Log it —
                 // previously this branch discarded the error with zero tracing, which is
                 // exactly how the hk↔sj mesh-flap went unnoticed in production.
-                self.evict(node_id).await;
+                self.evict(&key).await;
                 tracing::warn!(node_id, err = %e, "p2p connect error using cached hint; retrying via fresh discovery");
                 self.dial_fresh(node_id, id).await?
             }
@@ -733,7 +777,7 @@ impl PeerPool {
                 // real shot — the hint's direct addrs/relay may simply be stale, not the
                 // peer itself.
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
-                self.evict(node_id).await; // stale trunk (if any) is definitely dead
+                self.evict(&key).await; // stale trunk (if any) is definitely dead
                 tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p connect timeout using cached hint; retrying via fresh discovery");
                 self.dial_fresh(node_id, id).await?
             }
@@ -743,10 +787,15 @@ impl PeerPool {
         // that's fine — last insert wins and the extra connection drops (closes).
         {
             let mut map = self.trunks.lock().await;
-            map.insert(node_id.to_string(), Trunk { conn: conn.clone() });
+            map.insert(key.clone(), Trunk { conn: conn.clone() });
+        }
+        // Remember how this caller referred to the peer so the label-taking
+        // helpers can find the trunk without a second keyspace.
+        if node_id != key {
+            self.aliases.lock().await.insert(node_id.to_string(), key.clone());
         }
         self.opened.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(node_id, "trunk opened");
+        tracing::info!(node_id, key = %key, "trunk opened");
         Ok(conn)
     }
 
@@ -782,9 +831,22 @@ impl PeerPool {
         }
     }
 
-    /// Drop the cached trunk for a peer so the next request re-dials.
+    /// Close and drop the cached trunk for a peer so the next request re-dials.
+    ///
+    /// CLOSES, not just removes. Removing the map entry is not enough to tear the
+    /// connection down: `acquire` hands out `conn.clone()`, and every live
+    /// `SendStream`/`RecvStream` holds its own reference, so the handle dropped
+    /// here is usually NOT the last one. The connection would instead close later,
+    /// implicitly, carrying no close code and no reason — which is precisely the
+    /// "dropping a `Connection` implicitly calls close" hazard iroh's own QUIC
+    /// guide tells embedders to manage explicitly, and it matters most here, on
+    /// the timeout path, where the peer deserves to learn immediately that we
+    /// consider this trunk dead. `close_peer` below already did this correctly;
+    /// eviction simply never got the same treatment.
     async fn evict(&self, node_id: &str) {
-        self.trunks.lock().await.remove(node_id);
+        if let Some(t) = self.trunks.lock().await.remove(node_id) {
+            t.conn.close(0u32.into(), b"evicted by pool");
+        }
     }
 
     /// Cross-node gateway-side call: send ONE HTTP request over a NEW bi stream on
@@ -1226,10 +1288,27 @@ impl PeerPool {
         }
     }
 
-    /// Test/diagnostic helper: close + drop a peer's trunk so the next request
-    /// re-dials a fresh connection.
+    /// Resolve a caller-supplied label (node NAME or endpoint id) to the canonical
+    /// trunk key. An endpoint id maps to itself; a name resolves through the alias
+    /// map learned at `acquire` time. Falls back to the label itself so a lookup
+    /// for a peer we have never dialed simply misses instead of erroring.
+    async fn canonical_key(&self, label: &str) -> String {
+        if self.trunks.lock().await.contains_key(label) {
+            return label.to_string();
+        }
+        self.aliases.lock().await.get(label).cloned().unwrap_or_else(|| label.to_string())
+    }
+
+    /// Close + drop a peer's trunk so the next request re-dials a fresh connection.
+    ///
+    /// Accepts either a node name or an endpoint id: `gossip::probe`'s recovery
+    /// path calls this with an endpoint id while the edge knows peers by name, and
+    /// before the pool keyed canonically an eid-keyed close could not evict the
+    /// name-keyed trunk at all — so a restarted peer's stale edge trunk survived
+    /// the very eviction meant to clear it.
     pub async fn close_peer(&self, node_id: &str) {
-        if let Some(t) = self.trunks.lock().await.remove(node_id) {
+        let key = self.canonical_key(node_id).await;
+        if let Some(t) = self.trunks.lock().await.remove(&key) {
             t.conn.close(0u32.into(), b"closed by pool");
         }
     }
@@ -1240,8 +1319,9 @@ impl PeerPool {
     /// `close_reason()` or an `open_bi()` failure — and re-dial. Returns whether a
     /// trunk was cached, and (for assertions) whether that handle now reports closed.
     pub async fn sever_peer(&self, node_id: &str) -> bool {
+        let key = self.canonical_key(node_id).await;
         let map = self.trunks.lock().await;
-        match map.get(node_id) {
+        match map.get(&key) {
             Some(t) => {
                 t.conn.close(0u32.into(), b"severed by test");
                 // Same Arc-backed connection state, so the cached clone observes it.
@@ -1346,8 +1426,11 @@ pub async fn bind_full(
     discovery_urls: &[String],
     n0_discovery: bool,
 ) -> Result<Endpoint> {
+    // Only the connection-level idle timeout is set; keep-alive intervals are
+    // left at iroh's tuned defaults. See `IDLE_TIMEOUT`'s doc comment for why the
+    // previous keep-alive override was removed rather than adjusted.
     let tc = QuicTransportConfig::builder()
-        .keep_alive_interval(KEEPALIVE)
+        .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30s is a valid QUIC idle timeout")))
         .build();
     let mut builder = if n0_discovery {
         // n0 discovery (pkarr/DNS) + n0's relays (unless HIVE_RELAY_URLS overrides below).

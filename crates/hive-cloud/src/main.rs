@@ -591,6 +591,30 @@ async fn main() -> anyhow::Result<()> {
             // inside the last window and de-tailor those prefixes on the way
             // back up. Cheap (one small sidecar) and best-effort.
             flush_cloud.dns_geo.flush_blocking();
+            // Tell every peer we are going away, instead of letting them find out.
+            //
+            // Without this, `exit(0)` below tears the process down with no QUIC
+            // CONNECTION_CLOSE on the wire, so each peer keeps a trunk it believes
+            // is live until its own idle timeout expires — and on restart this node
+            // usually comes back with different socket addrs, so those trunks are
+            // not merely idle but WRONG. That is the already-documented "after a
+            // peer restarts with new socket addrs, the stale QUIC trunk lingers
+            // until idle-timeout (~tens of seconds)" behaviour in gossip.rs: a
+            // symptom that was recorded without its cause. `close()` collapses that
+            // window to one round trip. iroh's own guidance is explicit that
+            // `Endpoint::close()` must be awaited to completion rather than left to
+            // process teardown; it is bounded here so a wedged relay can never turn
+            // a clean restart into a hung one.
+            // Bound to its own statement so the lock guard is dropped BEFORE the
+            // await below — holding it across an await makes this future non-Send.
+            let endpoint = flush_cloud.iroh.read().clone();
+            if let Some(ep) = endpoint {
+                let budget = Duration::from_secs(env_u64("HIVE_ENDPOINT_CLOSE_SECS", 3));
+                match tokio::time::timeout(budget, ep.close()).await {
+                    Ok(()) => tracing::info!("iroh endpoint closed cleanly — peers notified"),
+                    Err(_) => tracing::warn!(?budget, "iroh endpoint close timed out; exiting anyway"),
+                }
+            }
             std::process::exit(0);
         });
     }
@@ -2565,12 +2589,21 @@ fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
                 None => continue, // iroh transport not bound yet
             };
             // Every healthy peer with a known iroh address → ensure a live trunk.
+            // Label peers by their ENDPOINT ID where one is known, falling back to
+            // the name. The pool keys trunks canonically by the id parsed out of
+            // the address, so this no longer decides WHICH trunk gets warmed — but
+            // it keeps the warmer's logs and the alias map speaking the same
+            // identifier the control plane uses, rather than the name-only view
+            // that previously left the control-plane trunk permanently cold.
             let peers: Vec<(String, String)> = cloud
                 .registry
                 .nodes()
                 .into_iter()
                 .filter(|n| !n.is_self && n.healthy)
-                .filter_map(|n| n.iroh_addr.map(|a| (n.id, a)))
+                .filter_map(|n| {
+                    let label = n.peer_id.clone().unwrap_or_else(|| n.id.clone());
+                    n.iroh_addr.map(|a| (label, a))
+                })
                 .collect();
             if peers.is_empty() {
                 continue;
@@ -2719,10 +2752,40 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
             .get(ns)
             .map(|v| v.iter().map(|h| (h.key.as_str(), h.hash.as_str())).collect())
             .unwrap_or_default();
+        // Entries whose (key -> hash) disagree: classic entry-level divergence.
         let diverged = remote_heads.iter().filter(|h| local_by_key.get(h.key.as_str()) != Some(&h.hash.as_str())).count();
-        if diverged == 0 {
+        // CONTENT-level divergence: the hashes agree, but one of us cannot
+        // actually read the bytes. This is invisible to the entry comparison
+        // above, and it is the divergence this fleet actually suffers from —
+        // a doc entry replicates independently of its blob, and iroh-docs stops
+        // retrying for good once the supplying peer departs. Counting it is what
+        // stops "heads already match" from being reported over a node that holds
+        // nothing but hashes.
+        let local_missing: std::collections::HashSet<&str> = local
+            .get(ns)
+            .map(|v| {
+                v.iter()
+                    // `None` = UNKNOWN (pre-upgrade peer), never counted as missing.
+                    .filter(|h| h.content_local == Some(false))
+                    .map(|h| h.hash.as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Only worth reporting when the PEER claims to hold what we lack — that
+        // is a gap a reconcile can actually close.
+        let recoverable = remote_heads
+            .iter()
+            .filter(|h| h.content_local == Some(true) && local_missing.contains(h.hash.as_str()))
+            .count();
+        if diverged == 0 && recoverable == 0 {
             tracing::debug!(namespace = %ns, peer = %peer.name, "anti-entropy: heads already match");
             continue;
+        }
+        if diverged == 0 {
+            tracing::info!(
+                namespace = %ns, peer = %peer.name, recoverable,
+                "anti-entropy: entries match but CONTENT is missing locally; peer holds it — reconciling"
+            );
         }
         let Some(guardian_addr) = peer.guardian_iroh_addr.clone() else {
             tracing::warn!(
