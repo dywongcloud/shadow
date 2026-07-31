@@ -189,6 +189,32 @@ pub fn snapshot_image(
     Ok(outcome)
 }
 
+/// Count existing snapshots under `dest_dir`. The storage broker's quota
+/// check needs this number BEFORE deciding whether a create may proceed —
+/// exposed here rather than left for each caller to re-derive the
+/// `*.snap.ext4` naming convention itself, the same reasoning
+/// `list_snapshots` below follows.
+pub fn count_snapshots(dest_dir: &Path) -> usize {
+    list_snapshots(dest_dir).len()
+}
+
+/// List existing snapshot ids under `dest_dir` (order unspecified — sort if a
+/// caller needs one). Missing/unreadable directory reads as "no snapshots
+/// yet", not an error: a project that has never snapshotted has no directory
+/// at all until its first `snapshot_image` call creates it.
+pub fn list_snapshots(dest_dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dest_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name.strip_suffix(".snap.ext4").map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Delete a snapshot. Same id validation as creation — a delete path that
 /// accepts `../..` is a worse bug than a create path that does.
 pub fn delete_snapshot(dest_dir: &Path, snap_id: &str) -> anyhow::Result<bool> {

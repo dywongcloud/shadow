@@ -508,6 +508,55 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 _ => Vec::new(),
             }
         }
+        // Storage broker: snapshot LIST for a deployment hosted on THIS node
+        // (proxied here by `storage_api::list_snapshots` when the requesting
+        // node doesn't host the deployment itself — see storage_api.rs's
+        // module doc on why this is per-node, not leader-forwarded).
+        p if method == hive_p2p::GOSSIP_GET
+            && p.split('?').next().unwrap_or(p).contains("/deployments/")
+            && p.split('?').next().unwrap_or(p).contains("/snapshots") =>
+        {
+            let (project, deployment_id, _) = snapshot_path_parts(p);
+            match crate::storage_api::list_snapshots(
+                State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path((project, deployment_id)),
+            )
+            .await
+            {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
+        // Storage broker: snapshot CREATE (no trailing id segment) and DELETE
+        // (with one) both ride GOSSIP_POST — see `snapshot_path_parts`'s doc
+        // comment for why. One consolidated arm, same style as the sandboxes
+        // GET arm above, rather than N ordered prefix checks.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.split('?').next().unwrap_or(p).contains("/deployments/")
+            && p.split('?').next().unwrap_or(p).contains("/snapshots") =>
+        {
+            let (project, deployment_id, snapshot_id) = snapshot_path_parts(p);
+            let state = State(cloud.clone());
+            let hdrs = team_headers(p);
+            let clm = team_claims(p);
+            match snapshot_id {
+                None => {
+                    let req: crate::storage_api::CreateReq = match serde_json::from_slice(body) {
+                        Ok(b) => b,
+                        Err(_) => return Vec::new(),
+                    };
+                    match crate::storage_api::create_snapshot(state, hdrs, clm, axum::extract::Path((project, deployment_id)), axum::Json(req)).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+                Some(snap_id) => {
+                    match crate::storage_api::delete_snapshot(state, hdrs, clm, axum::extract::Path((project, deployment_id, snap_id))).await {
+                        Ok(j) => jb(j),
+                        Err(_) => Vec::new(),
+                    }
+                }
+            }
+        }
         // Run operations (console 3-dots) forwarded to the project's HOST node
         // over the mesh: the host runs the world write locally (env decrypts
         // here). `local:true` in the body prevents a re-forward loop. Match
@@ -717,6 +766,26 @@ fn sandbox_path_project_and_segs(path: &str) -> (&str, Vec<&str>) {
     let tail = it.next().unwrap_or("");
     let segs = tail.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     (project, segs)
+}
+
+/// Splits a dispatched
+/// `/v1/projects/<project>/deployments/<deployment_id>/snapshots[/<snapshot_id>]`
+/// path (query string already ignored) into (project, deployment_id, optional
+/// snapshot_id). Mirrors `sandbox_path_project_and_segs`'s segment-shape
+/// approach: `storage_api`'s create (no trailing id) and delete (with one)
+/// both ride `GOSSIP_POST` — the mesh transport has no DELETE verb — so this
+/// is how the single consolidated dispatch arm below tells them apart.
+fn snapshot_path_parts(path: &str) -> (String, String, Option<String>) {
+    let p = path.split('?').next().unwrap_or(path);
+    let rest = p.trim_start_matches("/v1/projects/");
+    let mut it = rest.splitn(2, "/deployments/");
+    let project = it.next().unwrap_or("").to_string();
+    let tail = it.next().unwrap_or("");
+    let mut it2 = tail.splitn(2, "/snapshots");
+    let deployment_id = it2.next().unwrap_or("").to_string();
+    let snap = it2.next().unwrap_or("").trim_start_matches('/');
+    let snapshot_id = if snap.is_empty() { None } else { Some(snap.to_string()) };
+    (project, deployment_id, snapshot_id)
 }
 
 /// Build a verified-claims extension for a mesh-internal admin call. The iroh

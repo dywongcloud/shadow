@@ -247,6 +247,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::microfrontends_api::routes())
         // ---- Platform-native Sandboxes (isolated on-demand Linux environments) ----
         .merge(crate::sandboxes_api::routes())
+        // ---- Storage broker: Firecracker cell data-image snapshots ----
+        .merge(crate::storage_api::routes())
         .with_state(cloud.clone());
     // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
@@ -2381,6 +2383,48 @@ async fn post_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -
     None
 }
 
+/// DELETE (no body) to a host node by NAME — same two-tier HTTP-then-mesh
+/// shape as `post_to_host`. `hive_p2p` defines only GOSSIP_GET/GOSSIP_POST
+/// (no delete-shaped verb), so the mesh fallback rides GOSSIP_POST like every
+/// other delete-shaped mutation already dispatched over the mesh (e.g. the
+/// `/v1/projects/*/delete` arm in `gossip::dispatch`) — the receiving arm
+/// tells create from delete by PATH SHAPE (a trailing snapshot-id segment),
+/// not by verb. Used by `storage_api`'s snapshot delete to reach a
+/// deployment's actual hosting node.
+pub(crate) async fn delete_to_host(c: &Arc<CloudState>, node: &str, path: &str, team: &str) -> Option<Value> {
+    let admin = c.node_admins.read().get(node).cloned();
+    if let Some(admin) = admin {
+        if let Ok(r) = c
+            .http
+            .delete(format!("{admin}{path}"))
+            .header("x-hive-team", team)
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                if let Ok(v) = r.json::<Value>().await {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    let target = c
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.name == node)
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    if let Some((id, addr)) = target {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let p = format!("{path}{sep}{}", mesh_team_qs(team));
+        if let Some(b) = crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &[], 20).await {
+            return serde_json::from_slice(&b).ok();
+        }
+    }
+    None
+}
+
 /// PUT (with a JSON body) to a host node by NAME: HTTP admin PUT if we know
 /// its URL — matching the real route's registered verb, since unlike
 /// `/promote` the `/network` route is only registered as `put(...)` and a
@@ -2957,7 +3001,7 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
 // and fetch over whichever transport works: HTTP admin if known, else the iroh mesh.
 
 /// Host node NAME for deployment `id` (no HTTP-admin requirement).
-fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
+pub(crate) fn host_node_for_deployment(c: &Arc<CloudState>, id: &str) -> Option<String> {
     c.peer_deployments
         .read()
         .iter()

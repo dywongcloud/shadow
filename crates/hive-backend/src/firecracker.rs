@@ -424,6 +424,51 @@ impl FirecrackerBackend {
         self.cfg.rootfs_dir.join(format!("{}.data.ext4", sanitize_image(image)))
     }
 
+    /// Locate a deployment's data image on disk for the storage broker
+    /// (`storage_broker`/`hive_backend::snapshot` callers), accounting for
+    /// the historical `dpl-dpl-` double-prefix documented on
+    /// [`Self::gc_rootfs_images`]: `deliver_build` writes images keyed by
+    /// `dpl-{bid}` where `bid` is already `dpl-<hash>`, so what's actually on
+    /// disk today is double-prefixed. Tries that as-written form first (what
+    /// exists today), then the bare id as a forward-compatible fallback if
+    /// that naming bug is ever fixed at the write site — the exact same
+    /// both-forms tolerance `gc_rootfs_images` already needed, kept in one
+    /// place rather than re-derived per caller. `None` when neither file
+    /// exists: a caller must never guess a path that might not be real.
+    pub fn locate_data_image(&self, deployment_id: &str) -> Option<PathBuf> {
+        let doubled = self.data_image_for(&format!("dpl-{deployment_id}"));
+        if doubled.is_file() {
+            return Some(doubled);
+        }
+        let bare = self.data_image_for(deployment_id);
+        if bare.is_file() {
+            return Some(bare);
+        }
+        None
+    }
+
+    /// Directory a deployment's snapshots are stored under — sibling to the
+    /// data images themselves, namespaced by id so `snapshot::snapshot_image`
+    /// / `count_snapshots` / `list_snapshots` never need to see any OTHER
+    /// deployment's snapshots to do their job.
+    ///
+    /// The id is embedded inside a longer `snaps-<id>` component rather than
+    /// used bare, on purpose: `sanitize_image` passes `.` through unchanged
+    /// (it only rewrites `/` and other non-`[A-Za-z0-9.-]` characters), so a
+    /// bare sanitized `deployment_id` of exactly `".."` would still BE `".."`
+    /// — a real directory-traversal component escaping this dir entirely.
+    /// `rootfs_for`/`data_image_for` are already safe from this because they
+    /// always suffix `.ext4`/`.data.ext4` (so `".."` becomes the harmless
+    /// filename `"...ext4"`, never a standalone `..` component); this method
+    /// didn't have a suffix and needs the same embedding to get the same
+    /// guarantee. In practice every caller of this method (`storage_api`)
+    /// already requires `deployment_id` to match a real, internally-generated
+    /// id before ever reaching here — this is defense in depth for whatever
+    /// calls it next, not the only gate.
+    pub fn snapshot_dir(&self, deployment_id: &str) -> PathBuf {
+        self.cfg.rootfs_dir.join("snapshots").join(format!("snaps-{}", sanitize_image(deployment_id)))
+    }
+
     /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) can
     /// reach the internet. Run once per process; failures are non-fatal (cells
     /// just won't get egress).

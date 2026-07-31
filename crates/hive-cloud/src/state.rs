@@ -289,6 +289,14 @@ pub struct CloudState {
     /// honestly reporting "simulated" on mock/dev nodes otherwise (never a
     /// silent downgrade to a different, undisclosed isolation technology).
     pub sandboxes: Arc<crate::sandboxes_platform::PlatformSandboxProvider>,
+    /// The CONCRETE Firecracker backend, when this node's isolation backend is
+    /// real Firecracker (not mock) — `None` on a mock/dev node. Kept as its
+    /// own field, a sibling clone of the Arc `sandboxes` also holds
+    /// (constructed together in `new()`, never re-derived), because
+    /// `storage_api`'s snapshot routes need Firecracker-specific methods
+    /// (`locate_data_image`, `snapshot_dir`) that the generic `CellBackend`
+    /// trait object `gw` was built with does not expose.
+    pub firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
 
@@ -617,7 +625,11 @@ impl CloudState {
             notifications: crate::notifications::NotificationStore::new(),
             push: crate::push::PushStore::new(),
             enterprise: Arc::new(crate::enterprise::EnterpriseStore::new()),
-            sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(region_for_sandboxes, firecracker)),
+            sandboxes: Arc::new(crate::sandboxes_platform::PlatformSandboxProvider::new(
+                region_for_sandboxes,
+                firecracker.clone(),
+            )),
+            firecracker,
             owner_email,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),
