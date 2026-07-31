@@ -18,10 +18,14 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Build sources per glibc group. Group membership is by OS IMAGE, not region:
 # 2.38 = bkk, hk, and ALL FIVE GPU/CVM San Jose nodes (TencentOS); 2.39 = the
-# Rocky nodes (va, va2, va3, sj, sj2, sao-paulo).
+# Rocky nodes (va, va2, va3, sj, sj2, sao-paulo, frankfurt).
+#
+# Do NOT hand-maintain these lists from memory: scripts/audit-runtime-versions.sh
+# prints every node's live glibc and is the check to run before ANY roll — it is
+# how frankfurt was found missing from TGT239 (2026-07-31, silently never rolled).
 SRC239=43.166.206.175  # va
 SRC238=43.152.247.70   # bkk
-TGT239="170.106.158.151 170.106.40.67 43.172.25.45 43.173.78.95 43.166.76.159"
+TGT239="170.106.158.151 170.106.40.67 43.172.25.45 43.173.78.95 43.166.76.159 162.62.83.144"
 TGT238="43.128.46.225 43.166.223.197 43.166.233.114 43.153.106.173 170.106.155.130 162.62.83.91"
 
 BIN_PATH=/root/hive/target/release/hive-cloud
