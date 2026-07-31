@@ -1857,6 +1857,19 @@ where
     let _ = send.write_all(&(resp.len() as u32).to_be_bytes()).await;
     let _ = send.write_all(&resp).await;
     let _ = send.flush().await;
+    // Signal end-of-stream EXPLICITLY rather than leaving it to `Drop`.
+    //
+    // `shutdown()` and not `finish()`: this handler is generic over
+    // `W: AsyncWrite + Unpin`, not a concrete `noq::SendStream`, so `finish()`
+    // isn't in scope — but they are the same operation here. noq implements
+    // `poll_shutdown` for `SendStream` as `Poll::Ready(self.get_mut().finish())`
+    // (noq-1.1.0/src/send_stream.rs:345), so tokio's `shutdown()` performs the
+    // real QUIC FIN. Dropping the stream would also finish it, which is why this
+    // worked before; iroh's QUIC guide is explicit that embedders should manage
+    // stream closure rather than depend on drop semantics, and stating it here
+    // means a future refactor that holds the stream longer can't silently delay
+    // the peer's end-of-response.
+    let _ = send.shutdown().await;
 }
 
 /// Test/diagnostic helper (#H4): accept P2P connections + bi streams but NEVER
@@ -1942,6 +1955,7 @@ async fn serve_gossip<R, W>(
                     tracing::warn!(peer = %remote_id, %path, %signer, "REJECTED gossip (signature valid but signer is not a trusted fleet member)");
                     let _ = send.write_all(&0u32.to_be_bytes()).await;
                     let _ = send.flush().await;
+                    let _ = send.shutdown().await;
                     return;
                 } else {
                     if mode == VerifyMode::Log {
@@ -1957,6 +1971,7 @@ async fn serve_gossip<R, W>(
                     // Explicit empty response: the peer sees a clean failure, not a hang.
                     let _ = send.write_all(&0u32.to_be_bytes()).await;
                     let _ = send.flush().await;
+                    let _ = send.shutdown().await;
                     return;
                 }
                 if mode == VerifyMode::Log {
@@ -1971,6 +1986,7 @@ async fn serve_gossip<R, W>(
             tracing::warn!(peer = %remote_id, %path, "REJECTED unsigned gossip (enforce mode)");
             let _ = send.write_all(&0u32.to_be_bytes()).await;
             let _ = send.flush().await;
+            let _ = send.shutdown().await;
             return;
         }
     }
@@ -1979,6 +1995,11 @@ async fn serve_gossip<R, W>(
     let _ = send.write_all(&len).await;
     let _ = send.write_all(&resp).await;
     let _ = send.flush().await;
+    // Explicit end-of-stream on every exit from this handler, including the
+    // three rejection paths above — see `serve_join` for why `shutdown()` is
+    // the right call on a generic `AsyncWrite` and why relying on `Drop` (which
+    // does work today) is not good enough.
+    let _ = send.shutdown().await;
 }
 
 /// Splice a raw P2P stream to a fresh TCP connection to `local_http`, copying
