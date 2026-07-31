@@ -16,6 +16,7 @@
 pub mod container_cli;
 pub mod firecracker;
 pub mod mock;
+pub mod snapshot;
 
 use async_trait::async_trait;
 use hive_core::{BuildJob, BuildResult, CellId, LogLine, ResourceSpec};
