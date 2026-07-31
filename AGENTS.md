@@ -285,43 +285,19 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   refuses to publish below **two** nameservers — a one-NS zone is a single
   point of failure for every name under it.
 - **Advertise only what peers have PROVEN, never what a node claims.**
-  `NodeInfo::dns_ns` (set at boot ONLY for a real public `:53` bind — the dev
-  default `127.0.0.1:5354` must never be advertised) is a necessary condition
-  and never a sufficient one: it is read out of the node's own env and says
-  nothing about reachability. Publishing on it alone put two dead nameservers
-  into the live delegation — `ns-fc-hongkong` unreachable (inbound `:53`
-  dropped upstream of the host, invisible from on it) and `ns-fc-sanjose-cvm-2`
-  answering authoritatively with ZERO records. `dns_probe` closes it: EVERY
-  node (not leader-only — the value is independent vantages) queries every
-  peer's public `:53` over the public internet, requires `NOERROR` + `AA` +
-  ≥1 address record, and gossips the passers as `NodeInfo::dns_attest`.
-  `validate_nameservers` then admits a node only while attested from
-  **two distinct REGIONS** (a same-datacenter peer is exactly the vantage most
-  likely to sit inside whatever still permits the traffic), degrading to one
-  only when the fleet has no second region. Never self-attest. Withdrawal is
-  damped by 2 consecutive failed rounds, same K as host-health damping.
-  Because "responds" is not the bar, the probe also asks on behalf of a
-  ROTATING sample of the real client subnets `GeoCache` has located — the
-  cvm-2 defect is client-location specific (measured live: 8 records for one
-  client, 0 for another), so a probe that only asks on its own behalf is blind
-  to the whole class. It samples; it does not prove-for-all-clients.
-- **Below two PROVEN nameservers the reconciler HOLDS, it does not withdraw.**
-  `desired_geo_delegation` returns no records AND no managed names, so the diff
-  never treats the delegation as its own and an already-published NS set is
-  left exactly as it is — deleting every NS would turn a degraded delegation
-  into a blackholed zone. The hold is loud: `geo_delegation_holds` counts it,
-  every pass logs it, and the transition INTO the hold opens an incident (edge
-  triggered — `incidents::open` does not dedup).
-- **Rollout property to expect:** attestations arrive empty from pre-upgrade
-  peers, which withholds advertisement rather than granting it. A fleet where
-  too few nodes run the prover therefore HOLDS the existing delegation until
-  two regions' worth of provers are up — that is the designed direction of
-  failure, not a regression.
-- `hive-cloud --dns-probe <ip>[,<ip>…]` runs the SAME probe from any host
-  (laptop, bastion, peer) and exits non-zero on failure —
-  `HIVE_DEPLOY_ZONE` picks the zone, `HIVE_DNS_PROBE_SUBNETS` adds client
-  subnets. Answering "is this nameserver serving?" with a second
-  implementation is how the diagnostic and the decision quietly diverge.
+  `NodeInfo::dns_ns` is necessary and never sufficient — it is read from the
+  node's own env and says nothing about reachability. Trusting it alone put two
+  DEAD nameservers into the live delegation. `dns_probe` (every node, not
+  leader-only) proves reachability from independent vantages and gossips
+  passers as `NodeInfo::dns_attest`; `validate_nameservers` admits a node only
+  while attested from two distinct REGIONS, never self-attesting. Below two
+  PROVEN nameservers the reconciler **HOLDS rather than withdraws** — deleting
+  every NS would turn a degraded delegation into a blackholed zone — and the
+  hold opens an incident. Expect a rollout to HOLD until two regions' worth of
+  provers are up: that is the designed direction of failure, not a regression.
+  Full mechanics (the exact probe bar, the rotating client-subnet sample and
+  why "responds" isn't it, the damping K, the `--dns-probe` diagnostic):
+  `recall("Geo-DNS Seer nameserver attestation")`.
 - **Two tailoring inputs, one rule.** `dns_geo.rs` locates the client by EDNS
   Client Subnet when the resolver sends one, else by the query's source
   address. `GeoCache` **never blocks the DNS loop**, and the primary geo source
