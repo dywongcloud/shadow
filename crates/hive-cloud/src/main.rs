@@ -481,6 +481,7 @@ async fn main() -> anyhow::Result<()> {
         // boot seed a node advertises 0 ("unknown") for its first interval,
         // which placement must not mistake for "full".
         disk_free_gb: crate::resources::disk_free_gb(),
+        gpu_free_mb: crate::resources::measured_gpu_free_mb(),
         backend: backend_name.clone(),
         gpu_count: gpus.0,
         gpu_model: gpus.1.clone(),
@@ -1672,6 +1673,7 @@ fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>) {
                 tokio::time::sleep(interval).await;
                 crate::supervise::beat("disk-refresh");
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
+                registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
             }
         }
     });

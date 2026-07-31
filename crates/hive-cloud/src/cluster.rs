@@ -271,6 +271,7 @@ mod tests {
             mem_total_mb: 1024,
             disk_total_gb: 10,
             disk_free_gb: 0,
+            gpu_free_mb: None,
             backend: "mock".into(),
         }
     }

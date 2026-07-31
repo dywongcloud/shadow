@@ -116,3 +116,41 @@ pub fn disk_free_gb() -> u64 {
     let disks = Disks::new_with_refreshed_list();
     disks.list().iter().map(|d| d.available_space()).max().unwrap_or(0) / 1024 / 1024 / 1024
 }
+
+/// MEASURED free VRAM on this host, MiB — summed across every GPU, straight
+/// from the driver.
+///
+/// The GPU pool previously derived free VRAM purely by arithmetic:
+/// `total - (per_instance_reserve * live_gpu_instances)`. That drifts from
+/// reality in BOTH directions, and was measured doing so on 2026-07-31:
+/// fc-sanjose-gpu-1 was reported as having 30 GiB reserved while `nvidia-smi`
+/// showed 105 MiB actually in use per card (phantom reservations from instance
+/// counts that no longer reflect live processes), and fc-sanjose-gpu-2's real
+/// `llama-server` VRAM was invisible to the accounting entirely because
+/// inference endpoints are not serverless function instances. Pooling decisions
+/// — "does this model fit on the coordinator, or do we need `--rpc` members?" —
+/// were therefore being made against a number that matched neither the hardware
+/// nor the workload.
+///
+/// Returns `None` when there is no usable `nvidia-smi` (non-GPU host, or the
+/// query failed), so callers can fall back to the reservation estimate rather
+/// than treating an absent probe as "zero free".
+pub fn measured_gpu_free_mb() -> Option<u64> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut total = 0u64;
+    let mut seen = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if let Ok(mb) = line.parse::<u64>() {
+            total += mb;
+            seen = true;
+        }
+    }
+    seen.then_some(total)
+}

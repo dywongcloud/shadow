@@ -154,6 +154,22 @@ pub struct NodeInfo {
     /// a rollout.
     #[serde(default)]
     pub disk_free_gb: u64,
+    /// MEASURED free VRAM across this node's GPUs, MiB (driver-reported), or
+    /// `None` on a host with no usable `nvidia-smi`.
+    ///
+    /// The GPU pool otherwise infers free VRAM arithmetically from a count of
+    /// live serverless GPU instances, which drifts from the hardware in both
+    /// directions: measured 2026-07-31, fc-sanjose-gpu-1 was reported with
+    /// 30 GiB reserved while its cards held 105 MiB each, and
+    /// fc-sanjose-gpu-2's real `llama-server` allocation was invisible because
+    /// an inference endpoint is not a serverless function instance. Fit
+    /// decisions ("does this model need `--rpc` members?") were being made
+    /// against a number matching neither the hardware nor the workload.
+    ///
+    /// `None` = not reported (pre-upgrade peer or no probe); callers fall back
+    /// to the reservation estimate rather than reading it as zero free.
+    #[serde(default)]
+    pub gpu_free_mb: Option<u64>,
     /// Isolation backend this node runs: "firecracker" (real microVMs) or "mock"
     /// (sandboxed child processes — local/dev). The placement scheduler only
     /// auto-targets firecracker nodes; mock/local nodes host only when a region is
@@ -404,6 +420,12 @@ impl NodeRegistry {
         me.disk_free_gb = disk_free_gb;
     }
 
+    /// Refresh this node's MEASURED free-VRAM figure (driver-reported).
+    pub fn set_self_gpu_free(&self, gpu_free_mb: Option<u64>) {
+        let mut me = self.me.write();
+        me.gpu_free_mb = gpu_free_mb;
+    }
+
     /// Record a peer's measured latency + health (from probing).
     pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
         if let Some(p) = self.peers.write().get_mut(id) {
@@ -597,6 +619,7 @@ mod tests {
             mem_total_mb: 0,
             disk_total_gb: 0,
             disk_free_gb: 0,
+            gpu_free_mb: None,
             backend: String::new(),
         }
     }

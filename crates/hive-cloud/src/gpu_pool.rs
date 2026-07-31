@@ -132,7 +132,28 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
     for n in &gpu_nodes {
         let live = live_by_node.get(&n.name).copied().unwrap_or(0);
         let reserved_mb = per_instance_reserve_mb(n).saturating_mul(live).min(n.gpu_vram_mb);
-        let vram_free_mb = n.gpu_vram_mb.saturating_sub(reserved_mb);
+        let estimated_free_mb = n.gpu_vram_mb.saturating_sub(reserved_mb);
+        // Prefer what the DRIVER reports over what the instance count implies.
+        //
+        // The reservation estimate drifts from the hardware in both directions,
+        // measured live 2026-07-31: fc-sanjose-gpu-1 was reported with 30 GiB
+        // reserved (2 phantom instances) while nvidia-smi showed 105 MiB per
+        // card actually in use, and fc-sanjose-gpu-2's real llama-server
+        // allocation was invisible entirely, because an inference endpoint is
+        // not a serverless function instance and so is never counted. Fit
+        // decisions — whether a model needs `--rpc` members at all — were being
+        // made against a number matching neither the hardware nor the workload.
+        //
+        // Take the MINIMUM of the two rather than the measurement alone: a
+        // reservation the driver has not yet materialised (an instance mid
+        // cold-start, before CUDA has allocated) is real pending demand, and
+        // trusting the momentarily-empty card would let two workloads both be
+        // told they fit. `None` (no probe / pre-upgrade peer) falls back to the
+        // estimate unchanged, so a part-rolled fleet behaves exactly as before.
+        let vram_free_mb = match n.gpu_free_mb {
+            Some(measured) => measured.min(estimated_free_mb),
+            None => estimated_free_mb,
+        };
         by_region.entry(n.region.clone()).or_default().push(GpuPoolNode {
             name: n.name.clone(),
             gpu_model: n.gpu_model.clone(),
