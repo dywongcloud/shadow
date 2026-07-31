@@ -1,0 +1,26 @@
+{
+  "what": "Live sandbox-substrate benchmark for the browser-node edge-function runtime (bn-research-js-sandbox-choice measurement half)",
+  "when": "2026-07-31",
+  "browser": "Chrome 150.0.0.0 macOS, gm browser verb, page served from 127.0.0.1:3777",
+  "method": "scratchpad/sandbox-bench/index.html - sandboxed iframe (allow-scripts, NO allow-same-origin, srcdoc guest, postMessage protocol) vs quickjs-emscripten@0.31.0 (esm.sh)",
+  "iframe": {
+    "boot_ms": 122.9,
+    "invoke_rt_p50_ms": 0.2,
+    "invoke_rt_p95_ms": 6.8,
+    "loop5m_ms": 56.2,
+    "payload100k_rt_ms": 1.9,
+    "isolation_witnessed": "origin=null (opaque), parent DOM + localStorage + document.cookie all blocked:SecurityError",
+    "not_measured": "infinite-loop termination (needs iframe.remove() or worker-in-iframe; no in-place interrupt exists), no memory cap exists"
+  },
+  "quickjs": {
+    "wasm_init_ms_once_per_page": 996.5,
+    "ctx_boot_ms_per_function": 1.8,
+    "eval_p50_ms": 0.0,
+    "eval_p95_ms": 0.1,
+    "loop5m_ms": 657.1,
+    "infinite_loop_contained": true,
+    "containment_ms": 1.2,
+    "oom_contained_by_setMemoryLimit_32MB": true
+  },
+  "reading": "QuickJS is the only substrate with witnessed hard limits (interrupt + memory cap) - required for hostile multi-tenant functions; per-instance boot is 68x cheaper than iframe (1.8ms vs 122.9ms) once the one-time wasm init is paid. Iframe V8 is 11.7x faster on compute (56.2 vs 657.1ms) with native web APIs but offers no in-place interrupt and no memory cap - only whole-iframe teardown. Suggests: QuickJS primary for untrusted functions, iframe as opt-in fast lane for first-party/trusted code. Final call belongs to bn-synthesis-proposal merged with the workflow's published-source research."
+}
