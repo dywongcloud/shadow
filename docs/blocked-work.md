@@ -73,6 +73,30 @@ Verify the shoomoo Telegram agent actually responds - cannot until the deep reco
 
 Cannot witness a mesh rejoin that has not happened - same physical-access gap.
 
+## pvm-switcher-real-guest-transition-crashes-host
+
+**Blocked by:** owner decision (2026-07-31, "stop crash-testing, write it up") + needs a kernel engineer, not an agent, on hand-written host↔guest transition assembly
+
+CRITICAL, decisive finding, full writeup in `docs/pvm-upstream-report.md` §8: the PVM 7.1 kernel on fc-frankfurt (162.62.83.144) is functionally KVM-capable (`KVM_CREATE_VM`/`KVM_CREATE_VCPU` succeed, real containers run) but booting a real Firecracker microVM crashes the ENTIRE HOST — reproduced 3 times on 2026-07-31 (04:29:54, 06:45:05, 06:46:50; all three vmcores ~1.4GiB preserved under `/var/crash/` on that host, do not delete). Root-caused to `switcher_return_from_guest+0x18/0x74` (`entry_64_switcher.S:80`) faulting on the self-correcting `int3` landing pad inside `FILL_RETURN_BUFFER` — RIP reaching a byte that should never actually execute means `%rsp`/control-flow was already wrong on entry, most likely a stack-alignment bug in the vmexit→`switcher_return_from_guest` handoff. `RBP` in the crash dump looks like a kernel text address, not a real frame pointer — possibly the smoking gun. Owner explicitly declined further live crash-testing given the risk (each attempt resets the whole host); the standing mitigation is `HIVE_FORCE_MOCK=1` now applied via systemd drop-in on fc-frankfurt (`/etc/systemd/system/hive-node.service.d/pvm-crash-force-mock.conf`, live-verified: `isolation backend: MockBackend (HIVE_FORCE_MOCK=1)`, healthy, 14/14 mesh peers visible post-restart) — this makes the platform's own backend auto-select structurally incapable of choosing the crash-prone backend, not merely relying on nothing being scheduled there. Six other real PVM-port bugs found and fixed/worked-around along the way are documented in the same report and were resolved normally (not blocked) since they didn't need further live risk to close out.
+
+## shadow-node-verification-matrix
+
+**Blocked by:** depends on pvm-switcher-real-guest-transition-crashes-host
+
+Final acceptance battery for the shadow node (162.62.83.144) included "firecracker-next --version + a real microVM booted to userspace" as a criterion — permanently blocked by the same crash bug until it's fixed by someone with real kernel-assembly judgment. Every OTHER criterion in the original row (PVM kernel/cmdline/module, podman runc+runsc containers, fail2ban+lockdown, region/glibc determination, hardware inventory) was independently verified live and is genuinely done — only the firecracker-next boot criterion is what's blocked.
+
+## shadow-firecracker-next-install
+
+**Blocked by:** depends on pvm-switcher-real-guest-transition-crashes-host
+
+Installing firecracker-next itself succeeded (build recipe documented in `docs/pvm-upstream-report.md` §4); the row's remaining acceptance criterion — "witness a REAL microVM boot end-to-end" — is exactly the action just vetoed. Re-open once the switcher bug is fixed upstream.
+
+## agentplug-browser-session-port-desync
+
+**Blocked by:** external; fix lives in AnEntrypoint/agentplug host source, not this repo
+
+HARNESS DEFECT: the agentplug browser session intermittently desyncs its CDP port tracking — session list reports the session alive on one port while the actual Chrome process listens on another; every eval then fails "host_browser_exec returned empty" until a session reset re-tracks. Recurred every ~2 dispatches in the affected session, with a second Chrome process spawning against the same locked user-data-dir mid-sequence. Root-cause lives in AnEntrypoint/agentplug's `crates/agentplug-host/src/browser.rs` session lifecycle (relaunch port re-registration, concurrent-Chrome profile lock handling) — a separate repo this session has no write access to. Witness-class evidence referenced from the original session's `.gm/exec-spool/out/browser-hit*.json` (that spool history did not survive into this repo's tracked state).
+
 ## residual-scan-consolidate-blocked-rows-deadlock
 
 **Blocked by:** external; rs-plugkit gate disagreement: residual-scan counts blockedBy rows; needs the scan to accept blocked-only pending sets or CONSOLIDATE to accept a fired-but-refused scan
