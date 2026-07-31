@@ -456,6 +456,76 @@ the PVM series itself and applies onto a **vanilla** tree — that repo's
 - Rebuild constraint from the node half: fc-sanjose-gpu-2 runs driver
   570.211.01 — any llama.cpp rebuild must stay on CUDA 12.x, not 13.x.
 
+## Storage capacity & placement
+
+- **Placement must consider free disk, and disk is a HARD filter, not a score
+  term.** `schedule.rs` filtered on health/region/GPU and then sorted by
+  deployment COUNT — a metric that says nothing about space — so a full node and
+  an empty one scored identically. Witnessed 2026-07-31: fc-sanjose reached 0
+  bytes free and took 9 customer deployments down while fc-frankfurt and both
+  CVM nodes sat under 10% used with ~920 GiB free each. `NodeInfo::disk_free_gb`
+  is gossiped and refreshed on a timer (`HIVE_DISK_REFRESH_SECS`); a
+  boot-time-only value would be worse than useless because it goes stale in
+  exactly the direction that matters. Unlike CPU/memory, disk does not drain on
+  its own once a deployment lands, so a weighted score would still let a full
+  node win — hence the hard floor (`HIVE_PLACEMENT_DISK_FLOOR_GB`), set ABOVE
+  the per-cold-start floor so admission does not simply defer the failure to the
+  cold start, which then blames the customer's app.
+- **`disk_free_gb == 0` / `gpu_free_mb == None` mean UNKNOWN, never "full".**
+  A pre-upgrade peer reports neither. Treating unknown as exhausted empties the
+  candidate set mid-rollout — the failure direction must always be "admit and
+  let the cold-start floor catch it", never "silently exclude the fleet".
+- **The per-deployment data images are named with a DOUBLE prefix, and it is a
+  real bug that is now load-bearing.** `deliver_build` names them `dpl-{bid}`
+  where `bid` is already `dpl-<hash>`, so every file is
+  `dpl-dpl-<hash>.data.ext4`. A GC whose keep-set is built from deployment ids
+  the obvious way matches NOTHING on disk: measured live, 0 of 369 stems matched
+  raw deployment ids while 328 of 369 matched after stripping the extra prefix.
+  Written naively, that GC deletes every live deployment's data disk.
+  `gc_rootfs_images` therefore matches both forms AND refuses outright when the
+  keep-set is empty or when more than `HIVE_GC_MAX_REAP_FRACTION` of images look
+  orphaned. **Any future reclaim path needs the same guard** — a blast-radius
+  check is the difference between a bug and an unrecoverable one.
+- **The GC could not see what was filling the disk.** `gc_orphans` walked only
+  `run_dir` (ephemeral per-cell dirs); the persistent `<image>.data.ext4` files
+  were invisible to it, and nothing else deletes them (`terminate` removes only
+  `cell.root`; the backend trait has no delete method at all). The headroom
+  error said "after GC", which reads as "nothing left to reclaim" when in fact
+  the GC had freed zero bytes while 325 GiB sat next to it — it now reports the
+  actual reclaimed delta, so an INEFFECTIVE GC is distinguishable from an
+  exhausted one.
+- **Storage growth here is a retention question, not only a leak.** Of 369
+  images on fc-sanjose only 41 (4.3 GB) were genuinely unreferenced; the other
+  328 are still named by live platform state, which never forgets a deployment.
+  Reclaiming beyond the orphan set is a policy decision (how many superseded
+  deployments per project to keep), not something a GC should do silently.
+- **Dedup/compression is NOT the lever here — measured, not assumed.** Sampling
+  two same-apparent-size images found only **1.3%** of 1 MiB blocks shared:
+  identical sizes, genuinely different content. ext4 has neither reflink nor
+  `FIDEDUPERANGE`, so dedup would also mean an XFS/btrfs migration per node.
+  Capacity-aware placement pays far more for far less risk. Re-measure before
+  anyone revives this.
+
+## GPU capacity accounting
+
+- **Free VRAM must come from the driver, not from arithmetic.** The pool derived
+  it as `total - (per_instance_reserve * live_gpu_instances)`, which drifted from
+  the hardware in BOTH directions on the same fleet: fc-sanjose-gpu-1 was
+  reported with 30 GiB reserved while `nvidia-smi` measured 59232 MiB actually
+  free (phantom reservations), and fc-sanjose-gpu-2's resident `llama-server` was
+  invisible entirely, because an inference endpoint is not a serverless function
+  instance and is never counted. `NodeInfo::gpu_free_mb` carries the measured
+  figure; the pool takes the MINIMUM of measured and estimated, so a reservation
+  the driver has not yet materialised (instance mid cold-start) still counts as
+  real pending demand.
+- **Do NOT add `--split-mode tensor` on these GPUs.** llama.cpp already pools all
+  local cards by default (`layer` split) — confirmed by measurement, VRAM spread
+  evenly across all four T4s. T4 is PCIe Gen3 with no NVLink, where published
+  numbers put 40-50% of inference time in transfer at TP=4, and llama.cpp's own
+  Turing P2P/tensor path has a live crash history. Cross-node pooling via `--rpc`
+  is correctly pipeline-parallel for the same reason: tensor parallelism needs an
+  AllReduce per layer and is unusable over a WAN/QUIC link.
+
 ## Deploys
 
 - `git push` auto-deploys through TWO independent triggers, never assume the
