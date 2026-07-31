@@ -42,6 +42,47 @@ pub use iroh::Endpoint;
 /// none, so the override is gone and iroh's defaults stand.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Concurrent inbound bi-streams a single peer connection may hold open.
+///
+/// Stated EXPLICITLY rather than inherited. The accept loop spawns one task per
+/// accepted stream, so this number is the real per-connection task ceiling — and
+/// it was previously whatever quinn happened to default to (100), a value this
+/// code never chose and no comment ever acknowledged. iroh's QUIC guide is
+/// direct about not accepting unbounded concurrent streams without resource
+/// limits; inheriting a library default silently is how you end up unable to say
+/// what your own limit is.
+///
+/// 256 to AGREE WITH `max_concurrency` (the per-session request bound passed
+/// into `serve_tunnels_full`, 256 in `main.rs`). One request rides one stream
+/// here, so the two are bounds on the same resource; leaving them at different
+/// values (100 vs 256) meant the request bound could never actually be reached
+/// and the effective limit was the accidental one. Enforced by QUIC flow control,
+/// so a peer at the ceiling is BACK-PRESSURED — it waits for a slot rather than
+/// having streams silently dropped.
+fn max_streams() -> u32 {
+    std::env::var("HIVE_P2P_MAX_STREAMS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(256)
+}
+
+/// Concurrently-served inbound CONNECTIONS per node.
+///
+/// The genuinely unbounded resource before this: `serve_tunnels_full` spawned a
+/// task per accepted connection with no ceiling at all, while streams at least
+/// had quinn's implicit per-connection cap. A 14-node fleet needs a handful of
+/// connections; 512 is far above any legitimate steady state, so this is a
+/// blast-radius backstop against connection floods, not a working limit anyone
+/// should reach. `0` disables the cap entirely for an operator who needs the old
+/// unbounded behaviour back.
+fn max_inbound_conns() -> usize {
+    std::env::var("HIVE_P2P_MAX_CONNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(512)
+}
+
 /// ALPN identifying the Hive function-tunnel protocol over iroh.
 pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
 
@@ -1426,11 +1467,14 @@ pub async fn bind_full(
     discovery_urls: &[String],
     n0_discovery: bool,
 ) -> Result<Endpoint> {
-    // Only the connection-level idle timeout is set; keep-alive intervals are
-    // left at iroh's tuned defaults. See `IDLE_TIMEOUT`'s doc comment for why the
-    // previous keep-alive override was removed rather than adjusted.
+    // Only the connection-level idle timeout and the concurrent-stream ceiling
+    // are set; keep-alive intervals are left at iroh's tuned defaults. See
+    // `IDLE_TIMEOUT`'s doc comment for why the previous keep-alive override was
+    // removed rather than adjusted, and `max_streams()` for why the stream cap
+    // is stated explicitly rather than inherited.
     let tc = QuicTransportConfig::builder()
         .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30s is a valid QUIC idle timeout")))
+        .max_concurrent_bidi_streams(iroh::endpoint::VarInt::from_u32(max_streams()))
         .build();
     let mut builder = if n0_discovery {
         // n0 discovery (pkarr/DNS) + n0's relays (unless HIVE_RELAY_URLS overrides below).
@@ -1696,13 +1740,32 @@ pub async fn serve_tunnels_full(
     join: Option<JoinHandler>,
     raw_resolver: Option<RawTargetResolver>,
 ) {
+    // Ceiling on concurrently-served inbound connections. Held for the LIFETIME
+    // of each connection's serving task (the permit moves into the spawn and
+    // drops when that task ends), so this bounds live connections rather than
+    // merely the accept rate. See `max_inbound_conns()`.
+    let conn_limit = match max_inbound_conns() {
+        0 => None,
+        n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
+    };
     while let Some(incoming) = ep.accept().await {
+        // Acquire BEFORE spawning: at the ceiling this awaits here, which stops
+        // the accept loop rather than spawning an unbounded backlog of tasks all
+        // waiting for the same permit — the latter would defeat the whole point.
+        let permit = match &conn_limit {
+            Some(sem) => match sem.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => return, // semaphore closed — shutting down
+            },
+            None => None,
+        };
         let local = local_http.clone();
         let trust = trust.clone();
         let gossip = gossip.clone();
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
         tokio::spawn(async move {
+            let _permit = permit; // released when this connection's task ends
             let conn = match incoming.await {
                 Ok(c) => c,
                 Err(_) => return,

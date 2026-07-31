@@ -376,7 +376,38 @@ async fn main() -> anyhow::Result<()> {
     let relay_bind: SocketAddr =
         SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), relay_port);
     let mut embedded_relay_cfg = iroh_relay::server::ServerConfig::default();
-    embedded_relay_cfg.relay = Some(iroh_relay::server::RelayConfig::new(relay_bind));
+    let mut relay_cfg = iroh_relay::server::RelayConfig::new(relay_bind);
+    // PER-CLIENT INGRESS RATE LIMIT. This relay is PUBLIC-FACING on :3340 on
+    // every node and previously ran with `Limits::default()`, i.e. none at all.
+    // n0's own guidance is blunt that a relay has finite bandwidth and finite
+    // connection slots, and the exposure is larger than it looks: browser/WASM
+    // iroh clients are relay-ONLY by compile-time construction (the IP transport
+    // is `#[cfg(not(wasm_browser))]`), so any browser-side traffic lands here
+    // rather than going direct.
+    //
+    // Sized as a per-client BACKSTOP, not a working limit: 16 MiB/s is far above
+    // what a relayed control-plane peer or tunnel actually pulls, so legitimate
+    // fleet traffic never touches it, while one abusive client can no longer
+    // saturate a node's relay. `HIVE_RELAY_CLIENT_BPS=0` disables it and restores
+    // the previous unlimited behaviour.
+    //
+    // Deliberately NOT setting `accept_conn_limit`/`accept_conn_burst`: iroh-relay
+    // 1.0.2 documents both as "Not currently implemented, setting this has no
+    // effect". Setting them would look like a connection cap while enforcing
+    // nothing — worse than leaving them alone, because a future reader would
+    // believe the cap exists.
+    let relay_bps = env_u64("HIVE_RELAY_CLIENT_BPS", 16 * 1024 * 1024);
+    if let Some(bps) = std::num::NonZeroU32::new(relay_bps.min(u32::MAX as u64) as u32) {
+        let mut rl = iroh_relay::server::ClientRateLimit::new(bps);
+        // Burst allowance so a legitimate short spike (a deploy artifact moving
+        // over a relayed trunk) is not clipped by the steady-state rate.
+        rl.max_burst_bytes = std::num::NonZeroU32::new(bps.get().saturating_mul(2));
+        relay_cfg.limits.client_rx = Some(rl);
+        tracing::info!(bytes_per_second = bps.get(), "embedded relay: per-client rate limit armed");
+    } else {
+        tracing::warn!("embedded relay: per-client rate limit DISABLED (HIVE_RELAY_CLIENT_BPS=0)");
+    }
+    embedded_relay_cfg.relay = Some(relay_cfg);
     embedded_relay_cfg.quic = None;
     embedded_relay_cfg.metrics_addr = None;
     let relay_server = match tokio::time::timeout(
