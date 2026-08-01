@@ -815,12 +815,70 @@ impl std::fmt::Display for BrowserInvokeError {
 
 impl std::error::Error for BrowserInvokeError {}
 
+/// Bounded, tenant-free observability for [`BrowserPool`] (bn-p2p-observability)
+/// — global aggregates only, same posture as hive-cloud's browser admission/
+/// presence counters (never per-endpoint, which would leak which specific
+/// browser peers are active). Latency is a running sum/count (avg on read)
+/// rather than a full histogram — proportionate to the existing simple-counter
+/// style elsewhere in this codebase, not a new dependency for percentiles.
+#[derive(Default)]
+struct BrowserPoolCounterCells {
+    dial_attempts_total: std::sync::atomic::AtomicU64,
+    dial_failures_total: std::sync::atomic::AtomicU64,
+    dial_latency_ms_sum: std::sync::atomic::AtomicU64,
+    dial_latency_samples: std::sync::atomic::AtomicU64,
+    invoke_attempts_total: std::sync::atomic::AtomicU64,
+    invoke_pre_send_failures_total: std::sync::atomic::AtomicU64,
+    invoke_post_send_failures_total: std::sync::atomic::AtomicU64,
+    invoke_successes_total: std::sync::atomic::AtomicU64,
+    invoke_latency_ms_sum: std::sync::atomic::AtomicU64,
+    invoke_latency_samples: std::sync::atomic::AtomicU64,
+    bytes_sent_total: std::sync::atomic::AtomicU64,
+    bytes_received_total: std::sync::atomic::AtomicU64,
+    /// A trunk closed and removed from the pool, whether by explicit
+    /// revocation (`close_endpoint`) or by `invoke`'s own redial-on-failure
+    /// path — the same proxy this codebase already uses elsewhere for "the
+    /// underlying connection had to be re-established" (relay switch, NAT
+    /// rebinding, a genuinely dead peer). iroh does not expose a distinct
+    /// path-migration event to hook here without new plumbing, so this is the
+    /// honest, already-available signal, not a stand-in pretending to be more.
+    trunk_evictions_total: std::sync::atomic::AtomicU64,
+    invoke_redials_total: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default, serde::Serialize)]
+pub struct BrowserPoolCounters {
+    pub dial_attempts_total: u64,
+    pub dial_failures_total: u64,
+    pub dial_avg_latency_ms: f64,
+    pub invoke_attempts_total: u64,
+    pub invoke_pre_send_failures_total: u64,
+    pub invoke_post_send_failures_total: u64,
+    pub invoke_successes_total: u64,
+    pub invoke_avg_latency_ms: f64,
+    pub bytes_sent_total: u64,
+    pub bytes_received_total: u64,
+    pub trunk_evictions_total: u64,
+    pub invoke_redials_total: u64,
+}
+
+fn avg_ms(sum: &std::sync::atomic::AtomicU64, samples: &std::sync::atomic::AtomicU64) -> f64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = samples.load(Relaxed);
+    if n == 0 {
+        0.0
+    } else {
+        sum.load(Relaxed) as f64 / n as f64
+    }
+}
+
 /// Native client for `hive/browser/0`. Browser trunks are kept separate from
 /// [`PeerPool`]: ALPN is negotiated per QUIC connection, so a fleet
 /// `hive/tunnel/0` trunk cannot carry browser streams.
 pub struct BrowserPool {
     ep: Endpoint,
     trunks: Mutex<HashMap<String, Connection>>,
+    counters: BrowserPoolCounterCells,
 }
 
 impl BrowserPool {
@@ -828,7 +886,27 @@ impl BrowserPool {
         Arc::new(Self {
             ep,
             trunks: Mutex::new(HashMap::new()),
+            counters: BrowserPoolCounterCells::default(),
         })
+    }
+
+    pub fn stats(&self) -> BrowserPoolCounters {
+        use std::sync::atomic::Ordering::Relaxed;
+        let c = &self.counters;
+        BrowserPoolCounters {
+            dial_attempts_total: c.dial_attempts_total.load(Relaxed),
+            dial_failures_total: c.dial_failures_total.load(Relaxed),
+            dial_avg_latency_ms: avg_ms(&c.dial_latency_ms_sum, &c.dial_latency_samples),
+            invoke_attempts_total: c.invoke_attempts_total.load(Relaxed),
+            invoke_pre_send_failures_total: c.invoke_pre_send_failures_total.load(Relaxed),
+            invoke_post_send_failures_total: c.invoke_post_send_failures_total.load(Relaxed),
+            invoke_successes_total: c.invoke_successes_total.load(Relaxed),
+            invoke_avg_latency_ms: avg_ms(&c.invoke_latency_ms_sum, &c.invoke_latency_samples),
+            bytes_sent_total: c.bytes_sent_total.load(Relaxed),
+            bytes_received_total: c.bytes_received_total.load(Relaxed),
+            trunk_evictions_total: c.trunk_evictions_total.load(Relaxed),
+            invoke_redials_total: c.invoke_redials_total.load(Relaxed),
+        }
     }
 
     async fn acquire(
@@ -853,10 +931,23 @@ impl BrowserPool {
                 }
             }
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        self.counters.dial_attempts_total.fetch_add(1, Relaxed);
+        let dial_t0 = std::time::Instant::now();
         let conn = tokio::time::timeout(connect_budget(), self.ep.connect(addr, BROWSER_ALPN))
             .await
-            .map_err(|_| BrowserInvokeError::new(false, "browser connect timed out"))?
-            .map_err(|e| BrowserInvokeError::new(false, e))?;
+            .map_err(|_| {
+                self.counters.dial_failures_total.fetch_add(1, Relaxed);
+                BrowserInvokeError::new(false, "browser connect timed out")
+            })?
+            .map_err(|e| {
+                self.counters.dial_failures_total.fetch_add(1, Relaxed);
+                BrowserInvokeError::new(false, e)
+            })?;
+        self.counters
+            .dial_latency_ms_sum
+            .fetch_add(dial_t0.elapsed().as_millis() as u64, Relaxed);
+        self.counters.dial_latency_samples.fetch_add(1, Relaxed);
         self.trunks.lock().await.insert(key, conn.clone());
         Ok(conn)
     }
@@ -864,6 +955,9 @@ impl BrowserPool {
     async fn evict(&self, endpoint_id: &str) {
         if let Some(conn) = self.trunks.lock().await.remove(endpoint_id) {
             conn.close(0u32.into(), b"browser trunk evicted");
+            self.counters
+                .trunk_evictions_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -884,6 +978,44 @@ impl BrowserPool {
         digest: &str,
         request_json: &str,
     ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.counters.invoke_attempts_total.fetch_add(1, Relaxed);
+        let invoke_t0 = std::time::Instant::now();
+        let result = self
+            .invoke_inner(endpoint_id, addr_json, digest, request_json)
+            .await;
+        self.counters
+            .invoke_latency_ms_sum
+            .fetch_add(invoke_t0.elapsed().as_millis() as u64, Relaxed);
+        self.counters.invoke_latency_samples.fetch_add(1, Relaxed);
+        match &result {
+            Ok(reply) => {
+                self.counters.invoke_successes_total.fetch_add(1, Relaxed);
+                self.counters
+                    .bytes_received_total
+                    .fetch_add(reply.len() as u64, Relaxed);
+            }
+            Err(error) if error.sent => {
+                self.counters
+                    .invoke_post_send_failures_total
+                    .fetch_add(1, Relaxed);
+            }
+            Err(_) => {
+                self.counters
+                    .invoke_pre_send_failures_total
+                    .fetch_add(1, Relaxed);
+            }
+        }
+        result
+    }
+
+    async fn invoke_inner(
+        &self,
+        endpoint_id: &str,
+        addr_json: &str,
+        digest: &str,
+        request_json: &str,
+    ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
         let payload =
             encode_invoke(digest, request_json).map_err(|e| BrowserInvokeError::new(false, e))?;
         let frame = encode_request(Op::Invoke, &payload);
@@ -897,6 +1029,11 @@ impl BrowserPool {
         let mut attempt = 0u8;
         let (mut send, mut recv) = loop {
             attempt += 1;
+            if attempt > 1 {
+                self.counters
+                    .invoke_redials_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let conn = match self.acquire(endpoint_id, addr_json).await {
                 Ok(conn) => conn,
                 Err(_error) if attempt < 2 => {
@@ -928,6 +1065,9 @@ impl BrowserPool {
         send.write_all(&frame)
             .await
             .map_err(|e| BrowserInvokeError::new(false, e))?;
+        self.counters
+            .bytes_sent_total
+            .fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
         send.finish()
             .map_err(|e| BrowserInvokeError::new(true, e))?;
 

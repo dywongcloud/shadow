@@ -94,6 +94,12 @@ pub struct BrowserPresenceCounters {
     pub upserts_total: u64,
     pub clears_total: u64,
     pub expirations_total: u64,
+    /// Live gauge (not cumulative): count of currently-active, non-expired
+    /// records grouped by `state` ("starting"/"online"/"degraded"/
+    /// "suspended") — a fleet-wide aggregate only, never per-tenant, so it
+    /// answers "how many browser peers are online right now" without naming
+    /// any of them.
+    pub by_state: BTreeMap<String, u64>,
 }
 
 #[derive(Default)]
@@ -118,10 +124,18 @@ impl BrowserPresenceStore {
 
     pub fn stats(&self) -> BrowserPresenceCounters {
         use std::sync::atomic::Ordering::Relaxed;
+        let now = hive_core::now_ms();
+        let mut by_state: BTreeMap<String, u64> = BTreeMap::new();
+        for record in self.inner.lock().active.values() {
+            if record.expires_ms > now {
+                *by_state.entry(record.state.clone()).or_insert(0) += 1;
+            }
+        }
         BrowserPresenceCounters {
             upserts_total: self.counters.upserts_total.load(Relaxed),
             clears_total: self.counters.clears_total.load(Relaxed),
             expirations_total: self.counters.expirations_total.load(Relaxed),
+            by_state,
         }
     }
 

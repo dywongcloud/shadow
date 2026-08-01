@@ -320,14 +320,19 @@ pub fn routes() -> Router<Arc<CloudState>> {
 }
 
 /// Bounded, tenant-free operational counters (bn-p2p-observability): global
-/// aggregates only across BOTH browser stores, never a per-tenant or
-/// per-endpoint breakdown, so this endpoint structurally cannot leak
-/// cardinality or identify any specific browser peer or its location.
+/// aggregates only across BOTH browser stores plus the BrowserPool's own
+/// dial/invoke/byte counters, never a per-tenant or per-endpoint breakdown,
+/// so this endpoint structurally cannot leak cardinality or identify any
+/// specific browser peer or its location. `pool` is `null` before the first
+/// browser-capable iroh endpoint binds (matches `cloud.browser_mesh`'s own
+/// `Option` — never fabricated zeros standing in for "not started yet").
 async fn browser_stats(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {
     crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    let pool_stats = cloud.browser_mesh.read().as_ref().map(|pool| pool.stats());
     Ok(Json(json!({
         "admissions": cloud.browser_admissions.stats(),
         "presence": cloud.browser_presence.stats(),
+        "pool": pool_stats,
     })))
 }
 
