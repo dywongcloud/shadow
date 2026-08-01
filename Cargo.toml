@@ -22,12 +22,18 @@ members = [
     "crates/hive-cloud",
     "crates/hive-wg",
     "crates/hive-zkauth",
+    "crates/hive-crsql",
 ]
 # vendor/guardian-db carries its own dev-dependencies and is consumed purely as
 # a path dependency (see crates/hive-cloud/Cargo.toml) -- excluding it lets its
 # own test suite run standalone (`cargo test --manifest-path vendor/guardian-db/Cargo.toml`)
 # instead of erroring on the nested-workspace conflict.
-exclude = ["vendor/guardian-db", "crates/hive-browser"]
+# vendor/cr-sqlite is NOT a Cargo path dependency at all -- it's built by its
+# own build.sh (own pinned nightly toolchain, see VENDOR.md) into a loadable
+# SQLite extension .dylib/.so, loaded at runtime by hive-crsql via rusqlite's
+# load_extension. Excluded so its nested core/rs/*/Cargo.toml files (several,
+# each its own crate) don't trip the same nested-workspace conflict.
+exclude = ["vendor/guardian-db", "crates/hive-browser", "vendor/cr-sqlite"]
 
 [workspace.package]
 version = "0.1.0"

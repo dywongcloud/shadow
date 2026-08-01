@@ -9,9 +9,25 @@ import { upsertPresence, clearPresence, type PresenceState } from "@/lib/run-nod
 const GEO_CONSENT_KEY = "hive_run_node_geo_consent"; // "granted" | "denied"
 const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
 const PRESENCE_REFRESH_MS = 45_000; // well inside the backend's 90s presence TTL
+// Re-derive the fix well before the browser's own 10-minute cache
+// (`maximumAge` below) goes stale, so a long-running tab's dot on the
+// constellation map tracks a laptop that changed networks instead of
+// freezing at wherever it was when the tab was first opened.
+const GEO_REFRESH_MS = 8 * 60_000;
 
 function quantize(v: number): number {
   return Math.round(v / GEO_QUANT_DEGREES) * GEO_QUANT_DEGREES;
+}
+
+// Surfaces fix age once it's well past a fresh reading, rather than trusting
+// the dot silently — `requestLocation`'s own retry (GEO_REFRESH_MS) keeps it
+// from ever running too far past this in practice, but a laptop that's been
+// asleep or a permission that started silently failing both leave `coords`
+// holding an old value with no other visible signal.
+function staleSuffix(locatedMs: number | null): string {
+  if (locatedMs === null) return "";
+  const ageMin = Math.floor((Date.now() - locatedMs) / 60_000);
+  return ageMin >= 15 ? ` · fix is ${ageMin}m old` : "";
 }
 
 function presenceState(lifecycle: string): PresenceState | null {
@@ -40,7 +56,81 @@ export default function RunNodePage() {
   });
   const [geoError, setGeoError] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
+  const [locatedMs, setLocatedMs] = useState<number | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const geoTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Ask the browser's Geolocation API for a fresh fix. Split from `decideGeo`
+  // so it can also run (a) on mount, when consent was already granted in a
+  // PRIOR session — restoring `geoDecision` from localStorage alone never
+  // called this, so a returning user's "waiting for a location fix" message
+  // never cleared until they hit Reset — and (b) on a recurring timer, so a
+  // long-lived tab's dot doesn't go stale.
+  const requestLocation = useRef(() => {
+    if (typeof navigator === "undefined" || !navigator.geolocation) {
+      setGeoError("This browser has no Geolocation API — location will show as unknown.");
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setGeoError(null);
+        // Quantized client-side too, before it ever leaves the tab — the
+        // server re-quantizes unconditionally regardless, but a client that
+        // never transmits a precise fix is a real (not merely cosmetic)
+        // privacy improvement against a network observer.
+        setCoords({ lat: quantize(pos.coords.latitude), lon: quantize(pos.coords.longitude) });
+        setLocatedMs(Date.now());
+      },
+      (err) => {
+        // PERMISSION_DENIED (code 1) is a hard, durable block — the OS/browser
+        // will refuse every future call identically until the user changes a
+        // site setting, so treating it as "granted but erroring" would retry
+        // forever against a wall. Revoke consent for real (and persist the
+        // revocation) so the UI matches what's actually happening, and stop
+        // publishing a location that's frozen at its last value.
+        if (err.code === err.PERMISSION_DENIED) {
+          localStorage.setItem(GEO_CONSENT_KEY, "denied");
+          setGeoDecision("denied");
+          setCoords(null);
+          setLocatedMs(null);
+          setGeoError("Location permission was denied in your browser — location sharing turned off. Re-enable it in your browser's site settings to share again.");
+          return;
+        }
+        // POSITION_UNAVAILABLE (2) / TIMEOUT (3) are transient — a GPS/Wi-Fi
+        // fix that failed once often succeeds on the next periodic retry, so
+        // consent and any already-published coords are left alone rather than
+        // flickering the satellite dot on and off the map.
+        setGeoError(
+          err.code === err.POSITION_UNAVAILABLE
+            ? "Location temporarily unavailable — will keep retrying."
+            : err.message || "Location request failed or was denied.",
+        );
+      },
+      { enableHighAccuracy: false, maximumAge: 10 * 60_000, timeout: 15_000 },
+    );
+  });
+
+  // Fire once whenever sharing is (or becomes) granted — covers both a fresh
+  // "Share" click and a returning tab whose consent was restored from
+  // localStorage — and keep re-firing on a timer while it stays granted so a
+  // long session's fix doesn't go stale.
+  useEffect(() => {
+    if (geoDecision !== "granted") {
+      if (geoTimer.current) {
+        clearInterval(geoTimer.current);
+        geoTimer.current = null;
+      }
+      return;
+    }
+    requestLocation.current();
+    geoTimer.current = setInterval(() => requestLocation.current(), GEO_REFRESH_MS);
+    return () => {
+      if (geoTimer.current) {
+        clearInterval(geoTimer.current);
+        geoTimer.current = null;
+      }
+    };
+  }, [geoDecision]);
 
   // Push a fresh presence record whenever there's something live to publish,
   // and keep it alive on an interval while the node is up — the presence TTL
@@ -78,24 +168,13 @@ export default function RunNodePage() {
     setGeoConsent(next);
     if (next === "denied") {
       setCoords(null);
+      setLocatedMs(null);
+      setGeoError(null);
       return;
     }
-    if (typeof navigator === "undefined" || !navigator.geolocation) {
-      setGeoError("This browser has no Geolocation API — location will show as unknown.");
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setGeoError(null);
-        // Quantized client-side too, before it ever leaves the tab — the
-        // server re-quantizes unconditionally regardless, but a client that
-        // never transmits a precise fix is a real (not merely cosmetic)
-        // privacy improvement against a network observer.
-        setCoords({ lat: quantize(pos.coords.latitude), lon: quantize(pos.coords.longitude) });
-      },
-      (err) => setGeoError(err.message || "Location request failed or was denied."),
-      { enableHighAccuracy: false, maximumAge: 10 * 60_000, timeout: 15_000 },
-    );
+    // The mount/consent-change effect above fires `requestLocation` whenever
+    // `geoDecision` becomes "granted", including this transition — no direct
+    // call needed here.
   }
 
   async function onStop() {
@@ -207,7 +286,7 @@ export default function RunNodePage() {
               <ShieldCheck className="h-3.5 w-3.5" />
               {geoDecision === "granted"
                 ? coords
-                  ? `Sharing ~(${coords.lat.toFixed(1)}, ${coords.lon.toFixed(1)})`
+                  ? `Sharing ~(${coords.lat.toFixed(1)}, ${coords.lon.toFixed(1)})${staleSuffix(locatedMs)}`
                   : "Sharing enabled — waiting for a location fix"
                 : "Location sharing declined"}
             </span>
@@ -216,6 +295,7 @@ export default function RunNodePage() {
                 localStorage.removeItem(GEO_CONSENT_KEY);
                 setGeoDecision("undecided");
                 setCoords(null);
+                setLocatedMs(null);
               }}
               className="text-link hover:underline"
             >
