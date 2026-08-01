@@ -59,6 +59,23 @@ export default function RunNodePage() {
   const [locatedMs, setLocatedMs] = useState<number | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const geoTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Focus restoration (bn-ui-accessibility): the "Don't share"/"Share" and
+  // "Reset" buttons each unmount the moment they're clicked (the whole block
+  // they're in swaps for a different one), which drops focus to <body> with
+  // no browser-default landing spot — silently stranding a keyboard/screen-
+  // reader user. Moved explicitly to the newly-mounted control that replaces
+  // the one just clicked.
+  const geoResetBtnRef = useRef<HTMLButtonElement>(null);
+  const geoShareBtnRef = useRef<HTMLButtonElement>(null);
+  const geoDecisionMounted = useRef(false);
+  useEffect(() => {
+    if (!geoDecisionMounted.current) {
+      geoDecisionMounted.current = true;
+      return;
+    }
+    if (geoDecision === "undecided") geoShareBtnRef.current?.focus();
+    else geoResetBtnRef.current?.focus();
+  }, [geoDecision]);
 
   // Ask the browser's Geolocation API for a fresh fix. Split from `decideGeo`
   // so it can also run (a) on mount, when consent was already granted in a
@@ -273,6 +290,7 @@ export default function RunNodePage() {
               Don&apos;t share
             </button>
             <button
+              ref={geoShareBtnRef}
               onClick={() => decideGeo("granted")}
               className="flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90"
             >
@@ -291,6 +309,7 @@ export default function RunNodePage() {
                 : "Location sharing declined"}
             </span>
             <button
+              ref={geoResetBtnRef}
               onClick={() => {
                 localStorage.removeItem(GEO_CONSENT_KEY);
                 setGeoDecision("undecided");
