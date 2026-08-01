@@ -188,6 +188,22 @@ const nextConfig = {
     // directives still deliver the high-value protections (connect-src bounds
     // exfiltration destinations; object-src/base-uri/form-action/frame-ancestors
     // close clickjacking, base-href hijack and cross-origin form posting).
+    // React/Next dev mode genuinely calls real eval() (Fast Refresh's module
+    // boundary rebinding, dev-only callstack reconstruction) — NOT a cosmetic
+    // nicety. Enforcing the production CSP (no 'unsafe-eval') in dev silently
+    // breaks it: React logs one easy-to-miss console.error
+    // ("eval() is not supported in this environment...") and then every
+    // client component's useEffect simply never runs — no crash, no visible
+    // error overlay, just a fully-rendered (SSR'd) page with zero
+    // interactivity. Live-witnessed 2026-08-01: with dev CSP == prod CSP,
+    // NotificationBell's poll, PwaRegister's service-worker registration, and
+    // useRunNode()'s SharedWorker construction ALL silently never fired
+    // (confirmed via a patched `window.SharedWorker` recording zero calls and
+    // zero `/cloud/*` network requests over a 12s window on a fully-rendered
+    // page) — this affects EVERY effect-driven feature in local dev, not
+    // just this one. 'unsafe-eval' is added ONLY when NODE_ENV !== production
+    // so the real production CSP is completely unchanged.
+    const devUnsafeEval = process.env.NODE_ENV !== "production" ? " 'unsafe-eval'" : "";
     const CSP_ENFORCED = [
       "default-src 'self'",
       // 'wasm-unsafe-eval' is required for WebAssembly.instantiateStreaming
@@ -196,7 +212,7 @@ const nextConfig = {
       // (arbitrary JS string eval), and does not weaken the policy against
       // JS-eval-based XSS. Without it every "Run a node" attempt fails with a
       // CSP violation the instant the wasm module tries to compile.
-      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
+      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'${devUnsafeEval} ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
@@ -215,7 +231,7 @@ const nextConfig = {
     // `'unsafe-inline'` can be dropped from the enforcing policy above.
     const CSP_REPORT_ONLY = [
       "default-src 'self'",
-      `script-src 'self' 'wasm-unsafe-eval' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
+      `script-src 'self' 'wasm-unsafe-eval'${devUnsafeEval} ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",

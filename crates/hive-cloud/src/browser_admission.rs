@@ -22,7 +22,6 @@ use crate::state::CloudState;
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
 
-const PROTOCOL_VERSION: u16 = hive_browser_proto::BROWSER_PROTOCOL_VERSION;
 const DEFAULT_LEASE_SECS: u64 = 120;
 const MIN_LEASE_SECS: u64 = 30;
 const MAX_LEASE_SECS: u64 = 300;
@@ -376,11 +375,28 @@ fn validate_request(
     claims: &crate::auth::Claims,
     request: &AdmissionRequest,
 ) -> Result<(String, u64), (StatusCode, String)> {
-    if request.protocol_version != PROTOCOL_VERSION {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "unsupported browser protocol version".into(),
-        ));
+    // Range check, not exact-match (bn-p2p-version-negotiation): the two
+    // failure directions need distinct client-facing signals. A durably
+    // outdated client (below the server's floor) needs a forced reload — no
+    // retry will ever succeed. A client ahead of THIS node (above its
+    // ceiling) is the normal mid-rollout shape when other fleet nodes have
+    // already rolled forward — transient, worth a bounded retry, never a
+    // reload prompt. The exact prefix strings are the wire contract the
+    // worker pattern-matches on; changing them is a breaking client change.
+    match hive_browser_proto::protocol_fit(request.protocol_version) {
+        hive_browser_proto::ProtocolFit::TooOld => {
+            return Err((
+                StatusCode::UPGRADE_REQUIRED,
+                "protocol_too_old: this browser bundle is outdated; reload to update".into(),
+            ));
+        }
+        hive_browser_proto::ProtocolFit::TooNew => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "protocol_too_new: this node hasn't rolled forward to your protocol version yet; retrying will reach an upgraded node".into(),
+            ));
+        }
+        hive_browser_proto::ProtocolFit::Supported => {}
     }
     if request.addr_json.len() > MAX_ADDR_JSON_BYTES {
         return Err((

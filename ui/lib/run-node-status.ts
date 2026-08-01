@@ -9,6 +9,12 @@
 export type NodeLifecycle = "stopped" | "starting" | "online" | "degraded" | "suspended" | "error";
 export type AdmissionState = "none" | "pending" | "granted" | "denied" | "revoked" | "expired";
 export type GeoConsent = "undecided" | "granted" | "denied";
+/** bn-p2p-version-negotiation: the two protocol-mismatch directions need
+ *  distinct UI treatment. "outdated" needs a forced reload (no retry will
+ *  ever succeed against a server that has moved its floor past this build);
+ *  "server_upgrading" is the normal mid-rollout shape (this node hasn't
+ *  caught up yet) and resolves itself on retry, never a reload prompt. */
+export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
 
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one
@@ -20,6 +26,7 @@ export interface RunNodeStatus {
   relay: string | null;
   admission: AdmissionState;
   geoConsent: GeoConsent;
+  protocolMismatch: ProtocolMismatch;
   lastError: string | null;
   updatedMs: number;
 }
@@ -32,6 +39,7 @@ export function initialRunNodeStatus(): RunNodeStatus {
     relay: null,
     admission: "none",
     geoConsent: "undecided",
+    protocolMismatch: "none",
     lastError: null,
     updatedMs: 0,
   };

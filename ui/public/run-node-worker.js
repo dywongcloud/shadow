@@ -35,9 +35,21 @@ let status = {
   relay: null,
   admission: "none",
   geoConsent: "undecided",
+  protocolMismatch: "none",
   lastError: null,
   updatedMs: Date.now(),
 };
+
+// bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
+// rejections with a stable marker (see crates/hive-cloud/src/browser_admission.rs
+// validate_request) so the two directions get distinct client treatment
+// instead of both looking like a generic admission failure.
+function classifyAdmissionError(message) {
+  if (typeof message !== "string") return "none";
+  if (message.startsWith("protocol_too_old")) return "outdated";
+  if (message.startsWith("protocol_too_new")) return "server_upgrading";
+  return "none";
+}
 
 function broadcast() {
   status = { ...status, version: status.version + 1, updatedMs: Date.now() };
@@ -92,11 +104,25 @@ function scheduleRenew(addrJson, endpointId) {
       // "online" — a background renewal tick must not un-suspend a node
       // whose tabs are all still hidden.
       const lifecycle = anyVisible() ? "online" : "suspended";
-      if (status.admission !== "granted" || status.lifecycle !== lifecycle) {
-        setStatus({ admission: "granted", lifecycle, lastError: null });
+      if (status.admission !== "granted" || status.lifecycle !== lifecycle || status.protocolMismatch !== "none") {
+        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
       }
     } catch (e) {
-      setStatus({ admission: "denied", lifecycle: "degraded", lastError: String((e && e.message) || e) });
+      const message = String((e && e.message) || e);
+      const mismatch = classifyAdmissionError(message);
+      if (mismatch === "outdated") {
+        // No retry will ever succeed against this server's floor — stop
+        // spending renewal cycles on a doomed request and let the UI prompt
+        // a reload instead of silently failing every 60s forever.
+        clearInterval(renewTimer);
+        renewTimer = null;
+        setStatus({ admission: "denied", lifecycle: "error", protocolMismatch: mismatch, lastError: message });
+        return;
+      }
+      // "server_upgrading" (transient) and any other failure keep retrying
+      // on the same schedule — the next tick may hit an already-upgraded
+      // node or a transient failure may simply clear.
+      setStatus({ admission: "denied", lifecycle: "degraded", protocolMismatch: mismatch, lastError: message });
     }
   }, RENEW_INTERVAL_MS);
 }
@@ -132,10 +158,16 @@ async function start(msg) {
     const addrJson = node.addrJson();
     setStatus({ endpointId, relay: msg.relay, lifecycle: anyVisible() ? "online" : "suspended" });
     await admitOnce(addrJson, endpointId);
-    setStatus({ admission: "granted", lastError: null });
+    setStatus({ admission: "granted", protocolMismatch: "none", lastError: null });
     scheduleRenew(addrJson, endpointId);
   } catch (e) {
-    setStatus({ lifecycle: "error", admission: "denied", lastError: String((e && e.message) || e) });
+    const message = String((e && e.message) || e);
+    setStatus({
+      lifecycle: "error",
+      admission: "denied",
+      protocolMismatch: classifyAdmissionError(message),
+      lastError: message,
+    });
     node = null;
   }
 }
@@ -196,7 +228,14 @@ async function stop() {
   }
   session = null;
   closing = false;
-  setStatus({ lifecycle: "stopped", admission: "none", endpointId: null, relay: null, lastError: null });
+  setStatus({
+    lifecycle: "stopped",
+    admission: "none",
+    protocolMismatch: "none",
+    endpointId: null,
+    relay: null,
+    lastError: null,
+  });
 }
 
 self.onconnect = (event) => {

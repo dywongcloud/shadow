@@ -241,11 +241,31 @@ export default function RunNodePage() {
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
         </dl>
-        {status.lastError && (
+        {status.protocolMismatch === "outdated" ? (
           <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{status.lastError}</span>
+            <div className="flex-1">
+              <div>This browser bundle is outdated and can no longer connect. Reload to update.</div>
+              <button
+                onClick={() => window.location.reload()}
+                className="mt-2 rounded-md bg-red-500 px-2.5 py-1 text-xs font-medium text-white hover:opacity-90"
+              >
+                Reload now
+              </button>
+            </div>
           </div>
+        ) : status.protocolMismatch === "server_upgrading" ? (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400" role="status">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>This node hasn&apos;t finished a rolling upgrade yet — retrying automatically, no action needed.</span>
+          </div>
+        ) : (
+          status.lastError && (
+            <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
+              <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>{status.lastError}</span>
+            </div>
+          )
         )}
         <div className="mt-4 flex gap-2">
           {status.lifecycle === "stopped" ? (

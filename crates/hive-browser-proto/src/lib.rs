@@ -34,7 +34,47 @@ pub const BROWSER_ALPN: &[u8] = b"hive/browser/0";
 
 /// Admission/control version paired with this ALPN generation. Keep it shared
 /// so the PWA and fleet reject skew explicitly instead of duplicating a number.
+/// This is the version THIS build's browser side speaks when making an
+/// admission request — always a single concrete number, never a range (a
+/// build can only ever emit one version of itself).
 pub const BROWSER_PROTOCOL_VERSION: u16 = 0;
+
+/// The range of client-declared `protocol_version` values THIS build's
+/// server side will admit (bn-p2p-version-negotiation). Both bounds equal
+/// [`BROWSER_PROTOCOL_VERSION`] today (no rolling-upgrade window open yet) —
+/// widen `..MAX` first on the server fleet during a real protocol bump, THEN
+/// ship the client change, so mid-rollout old clients keep working against
+/// new servers (server-ahead is normal; client-ahead of the whole fleet is
+/// the failure this range exists to reject explicitly rather than silently).
+pub const BROWSER_PROTOCOL_MIN: u16 = 0;
+pub const BROWSER_PROTOCOL_MAX: u16 = 0;
+
+/// Where a client-declared protocol version falls relative to what this
+/// server build accepts — three-way rather than boolean so a caller can
+/// surface "you are outdated, reload" (durable, needs a client fix) distinctly
+/// from "this server hasn't rolled forward yet" (transient, retry as-is).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ProtocolFit {
+    /// Below [`BROWSER_PROTOCOL_MIN`] — the client bundle is durably outdated;
+    /// no retry without a reload will ever succeed against this server.
+    TooOld,
+    /// Within `[BROWSER_PROTOCOL_MIN, BROWSER_PROTOCOL_MAX]` — accepted.
+    Supported,
+    /// Above [`BROWSER_PROTOCOL_MAX`] — the client is ahead of this specific
+    /// server node, which is normal mid-rollout (other nodes may already
+    /// accept it); transient, worth a bounded retry, never a forced reload.
+    TooNew,
+}
+
+pub const fn protocol_fit(client_version: u16) -> ProtocolFit {
+    if client_version < BROWSER_PROTOCOL_MIN {
+        ProtocolFit::TooOld
+    } else if client_version > BROWSER_PROTOCOL_MAX {
+        ProtocolFit::TooNew
+    } else {
+        ProtocolFit::Supported
+    }
+}
 
 /// Cap on a single request frame — the memory-safety line for any peer serving
 /// untrusted browser traffic. An unbounded read here is a DoS lever, so both
