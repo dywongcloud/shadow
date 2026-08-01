@@ -266,8 +266,15 @@ async function stop() {
   });
 }
 
-self.onconnect = (event) => {
-  const port = event.ports[0];
+// Shared by both execution contexts below: a SharedWorker hands this ONE real
+// MessagePort per connecting tab; a plain dedicated Worker (the Web Locks
+// fallback, bn-ui-sharedworker-owner) has no ports at all, only `self`'s own
+// postMessage/onmessage — but `self` in a DedicatedWorkerGlobalScope already
+// shapes-match everything this function actually calls (postMessage,
+// assignable onmessage), so passing `self` as `port` works unchanged and this
+// is the ENTIRE production BrowserNode-owning logic in both contexts, not a
+// reimplementation for the fallback path.
+function connectPort(port) {
   ports.push(port);
   port.onmessage = (e) => {
     const msg = e.data || {};
@@ -283,10 +290,26 @@ self.onconnect = (event) => {
       }
     }
   };
-  port.start();
+  // MessagePort.start() has no equivalent (and no need for one) on a
+  // DedicatedWorkerGlobalScope's `self` — messages already flow once
+  // onmessage is assigned.
+  if (typeof port.start === "function") port.start();
   try {
     port.postMessage({ type: "status", status });
   } catch {
     /* ignore */
   }
-};
+}
+
+if (typeof SharedWorkerGlobalScope !== "undefined" && self instanceof SharedWorkerGlobalScope) {
+  self.onconnect = (event) => connectPort(event.ports[0]);
+} else {
+  // Web Locks fallback (bn-ui-sharedworker-owner): this script was loaded as
+  // a plain dedicated Worker by a tab that lost SharedWorker feature
+  // detection (Safari private mode, an older engine, or an explicit
+  // capability failure) but won the navigator.locks single-owner election in
+  // ui/lib/use-run-node.ts. Exactly one "port" exists — `self` itself — so
+  // there is only ever one connectPort() call here, never a growing `ports`
+  // array the way a real SharedWorker accumulates one per tab.
+  connectPort(self);
+}
