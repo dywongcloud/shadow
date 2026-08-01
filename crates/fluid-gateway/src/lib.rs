@@ -2057,6 +2057,16 @@ fn base64_decode(text: &str) -> Option<Vec<u8>> {
 fn browser_response(bytes: &[u8]) -> Result<Response, String> {
     let envelope: BrowserHttpEnvelope =
         serde_json::from_slice(bytes).map_err(|e| format!("malformed browser response: {e}"))?;
+    // `StatusCode::from_u16` alone is NOT the 100..599 check this error message
+    // claims -- the `http` crate accepts any value up to 999 (reserved for
+    // extension codes), so a browser peer returning e.g. 999 sailed straight
+    // through to a real client with no error, verbatim, live-witnessed via
+    // `crates/hive-p2p/examples/fake_browser_peer.rs` returning
+    // `{"status":999,...}` and curl receiving a literal `HTTP/1.1 999 <none>`
+    // response. The explicit range bound is the actual enforcement point.
+    if !(100..=599).contains(&envelope.status) {
+        return Err("browser response status is outside 100..599".to_string());
+    }
     let status = StatusCode::from_u16(envelope.status)
         .map_err(|_| "browser response status is outside 100..599".to_string())?;
     let body = match envelope.body_base64 {
