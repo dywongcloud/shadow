@@ -16,6 +16,20 @@ export type GeoConsent = "undecided" | "granted" | "denied";
  *  caught up yet) and resolves itself on retry, never a reload prompt. */
 export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
 
+/** bn-p2p-version-negotiation (remaining scope, item 2/3: the host-operation
+ *  ABI): the {type:"...",...} postMessage contract between this page and the
+ *  SharedWorker had no version marker at all, so a stale-but-still-running
+ *  worker (a SharedWorker outlives any single tab's reload -- it only
+ *  restarts once every connecting tab has closed) paired with fresh page JS
+ *  had no way to detect the mismatch. Bump this whenever the message SHAPE
+ *  changes in a way an older worker/page can't safely interpret; keep the
+ *  literal number in sync with public/run-node-worker.js's own copy (same
+ *  cross-language-constant pattern as PROTOCOL_VERSION there, which mirrors
+ *  hive_browser_proto::BROWSER_PROTOCOL_VERSION -- a plain JS file served
+ *  from public/ can't import a TS module, so this can't be a single shared
+ *  export). */
+export const HOST_ABI_VERSION = 1;
+
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one
    *  already applied is stale (e.g. from a delayed duplicate) and must be
@@ -27,6 +41,13 @@ export interface RunNodeStatus {
   admission: AdmissionState;
   geoConsent: GeoConsent;
   protocolMismatch: ProtocolMismatch;
+  /** True when the connected SharedWorker's own reported abiVersion is older
+   *  than HOST_ABI_VERSION (or absent entirely, meaning a pre-versioning
+   *  worker) -- distinct from protocolMismatch, which is about this browser's
+   *  wire compatibility with the FLEET, not this tab's compatibility with its
+   *  own background worker. A plain page reload does NOT fix this (the
+   *  SharedWorker instance persists across it); every tab must close first. */
+  hostAbiStale: boolean;
   lastError: string | null;
   updatedMs: number;
 }
@@ -40,6 +61,7 @@ export function initialRunNodeStatus(): RunNodeStatus {
     admission: "none",
     geoConsent: "undecided",
     protocolMismatch: "none",
+    hostAbiStale: false,
     lastError: null,
     updatedMs: 0,
   };

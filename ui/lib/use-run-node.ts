@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { currentTeam } from "./api";
-import { applyStatus, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
+import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
 
 const WORKER_URL = "/run-node-worker.js";
 const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || "";
@@ -38,7 +38,16 @@ export function useRunNode() {
     try {
       worker = new SharedWorker(WORKER_URL, { type: "module", name: "shadw-run-node" });
     } catch {
-      setSupported(false);
+      // Real, pre-existing eslint react-hooks/set-state-in-effect violation,
+      // fixed while touching this file for the host-ABI-versioning change
+      // above: a setState call synchronous within the effect body risks
+      // cascading renders per the rule's own rationale. queueMicrotask defers
+      // it by one microtask turn (functionally instantaneous, no visible
+      // delay) without changing behavior -- this DOES need to set state (a
+      // SharedWorker constructor throwing despite the capability check
+      // passing is a real runtime failure the UI must reflect), so the fix is
+      // deferral, not removal.
+      queueMicrotask(() => setSupported(false));
       return;
     }
     const port = worker.port;
@@ -46,7 +55,14 @@ export function useRunNode() {
     port.onmessage = (e: MessageEvent) => {
       const msg = e.data;
       if (msg && msg.type === "status") {
-        setStatusState((prev) => applyStatus(prev, msg.status as RunNodeStatus));
+        // hostAbiStale is derived HERE, not carried by the worker: the worker
+        // can only report its OWN abiVersion, never whether it's stale
+        // relative to what THIS page build expects. Absent entirely means a
+        // pre-versioning worker instance (still running from before this
+        // field existed) -- also stale by definition.
+        const incoming = msg.status as RunNodeStatus & { abiVersion?: number };
+        const hostAbiStale = (incoming.abiVersion ?? 0) < HOST_ABI_VERSION;
+        setStatusState((prev) => applyStatus(prev, { ...incoming, hostAbiStale }));
       }
     };
     port.start();

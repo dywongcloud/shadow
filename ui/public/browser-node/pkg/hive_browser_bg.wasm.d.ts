@@ -20,6 +20,7 @@ export const browsernode_setAssetHandler: (a: number, b: any) => [number, number
 export const browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
 export const browsernode_statusJson: (a: number) => [number, number];
 export const on_load: () => void;
+export const wasmBundleVersion: () => number;
 export const __wbg_intounderlyingsource_free: (a: number, b: number) => void;
 export const intounderlyingsource_cancel: (a: number) => void;
 export const intounderlyingsource_pull: (a: number, b: any) => any;

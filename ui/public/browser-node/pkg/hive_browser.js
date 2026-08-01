@@ -435,6 +435,25 @@ export function blake3Hex(bytes) {
 export function on_load() {
     wasm.on_load();
 }
+
+/**
+ * bn-p2p-version-negotiation (remaining scope, item 3/3: the PWA wasm bundle
+ * itself). A service-worker-cached `hive_browser_bg.wasm` can go stale
+ * independently of the JS glue that loads it (the two are versioned/cached
+ * together as a pair by `ui/scripts/sync-browser-node.mjs`, but a partial or
+ * interrupted cache update could still leave a stale wasm binary paired with
+ * fresh `hive_browser.js`). `run-node-worker.js` calls this immediately after
+ * `await init()` succeeds — before constructing `BrowserNode` — and compares
+ * it against its own `WASM_BUNDLE_VERSION` copy (same cross-language-constant
+ * pattern as `PROTOCOL_VERSION`/`HOST_ABI_VERSION` there). Bump this whenever
+ * a change to this crate's wasm-exposed surface (BrowserNode's methods, the
+ * wire contract it implements) is not safely usable by an older worker.
+ * @returns {number}
+ */
+export function wasmBundleVersion() {
+    const ret = wasm.wasmBundleVersion();
+    return ret >>> 0;
+}
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,

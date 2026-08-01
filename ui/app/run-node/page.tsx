@@ -321,7 +321,15 @@ export default function RunNodePage() {
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
         </dl>
-        {status.protocolMismatch === "outdated" ? (
+        {status.hostAbiStale ? (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Your background node is running an outdated version. A page reload alone won&apos;t fix this — close
+              every SHADW tab, then reopen this page.
+            </span>
+          </div>
+        ) : status.protocolMismatch === "outdated" ? (
           <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <div className="flex-1">

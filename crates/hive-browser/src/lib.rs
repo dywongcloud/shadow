@@ -73,6 +73,22 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// bn-p2p-version-negotiation (remaining scope, item 3/3: the PWA wasm bundle
+/// itself). A service-worker-cached `hive_browser_bg.wasm` can go stale
+/// independently of the JS glue that loads it (the two are versioned/cached
+/// together as a pair by `ui/scripts/sync-browser-node.mjs`, but a partial or
+/// interrupted cache update could still leave a stale wasm binary paired with
+/// fresh `hive_browser.js`). `run-node-worker.js` calls this immediately after
+/// `await init()` succeeds — before constructing `BrowserNode` — and compares
+/// it against its own `WASM_BUNDLE_VERSION` copy (same cross-language-constant
+/// pattern as `PROTOCOL_VERSION`/`HOST_ABI_VERSION` there). Bump this whenever
+/// a change to this crate's wasm-exposed surface (BrowserNode's methods, the
+/// wire contract it implements) is not safely usable by an older worker.
+#[wasm_bindgen(js_name = wasmBundleVersion)]
+pub fn wasm_bundle_version() -> u32 {
+    1
+}
+
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
 /// loop for its lifetime; dropping it tears the endpoint down.
 #[wasm_bindgen]

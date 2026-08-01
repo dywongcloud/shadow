@@ -158,6 +158,21 @@ export function blake3Hex(bytes: Uint8Array): string;
 
 export function on_load(): void;
 
+/**
+ * bn-p2p-version-negotiation (remaining scope, item 3/3: the PWA wasm bundle
+ * itself). A service-worker-cached `hive_browser_bg.wasm` can go stale
+ * independently of the JS glue that loads it (the two are versioned/cached
+ * together as a pair by `ui/scripts/sync-browser-node.mjs`, but a partial or
+ * interrupted cache update could still leave a stale wasm binary paired with
+ * fresh `hive_browser.js`). `run-node-worker.js` calls this immediately after
+ * `await init()` succeeds — before constructing `BrowserNode` — and compares
+ * it against its own `WASM_BUNDLE_VERSION` copy (same cross-language-constant
+ * pattern as `PROTOCOL_VERSION`/`HOST_ABI_VERSION` there). Bump this whenever
+ * a change to this crate's wasm-exposed surface (BrowserNode's methods, the
+ * wire contract it implements) is not safely usable by an older worker.
+ */
+export function wasmBundleVersion(): number;
+
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
@@ -181,6 +196,7 @@ export interface InitOutput {
     readonly browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
     readonly browsernode_statusJson: (a: number) => [number, number];
     readonly on_load: () => void;
+    readonly wasmBundleVersion: () => number;
     readonly __wbg_intounderlyingsource_free: (a: number, b: number) => void;
     readonly intounderlyingsource_cancel: (a: number) => void;
     readonly intounderlyingsource_pull: (a: number, b: any) => any;

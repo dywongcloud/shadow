@@ -10,11 +10,25 @@
 // consent on the main thread and posts coordinates in only via the
 // `presence` control message; this worker never decides consent policy.
 
-import init, { BrowserNode } from "./browser-node/pkg/hive_browser.js";
+import init, { BrowserNode, wasmBundleVersion } from "./browser-node/pkg/hive_browser.js";
 import { loadOrCreateSeed } from "./browser-node/identity.js";
 
 const PROTOCOL_VERSION = 0; // must match hive_browser_proto::BROWSER_PROTOCOL_VERSION
 const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease window
+// bn-p2p-version-negotiation (host-operation ABI): must match
+// ui/lib/run-node-status.ts's HOST_ABI_VERSION -- lets a page detect it's
+// talking to a stale SharedWorker instance still running old code (which a
+// plain page reload does NOT replace; every connecting tab has to close
+// first). Fixed on the status object below, never patched, so it survives
+// every `{...status, ...patch}` spread in setStatus() untouched.
+const HOST_ABI_VERSION = 1;
+// bn-p2p-version-negotiation (PWA wasm bundle): must match
+// crates/hive-browser/src/lib.rs's wasm_bundle_version() return value --
+// checked live against the ACTUAL loaded module right after init() succeeds
+// (see start() below), not just trusted by filename/cache-key, so a stale
+// service-worker-cached .wasm paired with fresh JS glue is caught even
+// though the two are normally synced/cached together as a pair.
+const WASM_BUNDLE_VERSION = 1;
 
 const ports = [];
 // Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any
@@ -30,6 +44,7 @@ let session = null; // { deployment, fn, digest, scope, team, relay }
 
 let status = {
   version: 0,
+  abiVersion: HOST_ABI_VERSION,
   lifecycle: "stopped",
   endpointId: null,
   relay: null,
@@ -48,6 +63,10 @@ function classifyAdmissionError(message) {
   if (typeof message !== "string") return "none";
   if (message.startsWith("protocol_too_old")) return "outdated";
   if (message.startsWith("protocol_too_new")) return "server_upgrading";
+  // Same remedy as "outdated" (a reload re-fetches the wasm bundle fresh) --
+  // distinct root cause (a stale LOCAL cache, not the fleet's protocol
+  // floor), same UI treatment either way.
+  if (message.startsWith("wasm_bundle_stale")) return "outdated";
   return "none";
 }
 
@@ -140,6 +159,15 @@ async function start(msg) {
   setStatus({ lifecycle: "starting", lastError: null, admission: "pending" });
   try {
     await init();
+    // Check the ACTUAL loaded module's version, not just an assumption from
+    // the URL/cache key — catches a stale service-worker-cached .wasm binary
+    // paired with fresh JS glue, which a filename/URL check alone can't see.
+    const loadedWasmVersion = wasmBundleVersion();
+    if (loadedWasmVersion !== WASM_BUNDLE_VERSION) {
+      throw new Error(
+        `wasm_bundle_stale: loaded module reports version ${loadedWasmVersion}, this worker expects ${WASM_BUNDLE_VERSION} — reload to fetch the current bundle`,
+      );
+    }
     // Identity persistence (bn-impl-key-persistence): boot a throwaway node
     // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
     // the persisted seed so the reported id is stable across reloads.
