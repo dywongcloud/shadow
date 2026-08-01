@@ -225,8 +225,13 @@ impl ConditionValue {
         match self {
             ConditionValue::Text(t) => candidate == t,
             ConditionValue::Expr { pre, suf } => {
-                pre.as_deref().map(|p| candidate.starts_with(p)).unwrap_or(true)
-                    && suf.as_deref().map(|s| candidate.ends_with(s)).unwrap_or(true)
+                pre.as_deref()
+                    .map(|p| candidate.starts_with(p))
+                    .unwrap_or(true)
+                    && suf
+                        .as_deref()
+                        .map(|s| candidate.ends_with(s))
+                        .unwrap_or(true)
             }
         }
     }
@@ -281,7 +286,15 @@ fn eval_config_via_node(path: &Path) -> Option<VercelConfig> {
     // Candidate runners, in order of preference. `--experimental-strip-types`
     // lets modern Node import `.ts` directly; `tsx` is the common fallback.
     let attempts: &[(&str, Vec<&str>)] = &[
-        ("node", vec!["--experimental-strip-types", "--input-type=module", "-e", &script]),
+        (
+            "node",
+            vec![
+                "--experimental-strip-types",
+                "--input-type=module",
+                "-e",
+                &script,
+            ],
+        ),
         ("node", vec!["--input-type=module", "-e", &script]),
         ("npx", vec!["--yes", "tsx", "-e", &script]),
     ];
@@ -394,9 +407,10 @@ mod tests {
 
     #[test]
     fn condition_value_expr_matches() {
-        let v: VercelCondition =
-            serde_json::from_str(r#"{ "type":"header","key":"X","value":{"pre":"valid","suf":"value"} }"#)
-                .unwrap();
+        let v: VercelCondition = serde_json::from_str(
+            r#"{ "type":"header","key":"X","value":{"pre":"valid","suf":"value"} }"#,
+        )
+        .unwrap();
         let cv = v.value.unwrap();
         assert!(cv.matches("valid-some-value"));
         assert!(!cv.matches("invalid"));

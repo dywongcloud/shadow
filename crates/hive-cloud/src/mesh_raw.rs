@@ -46,7 +46,10 @@ pub fn resolver(cloud: Arc<CloudState>) -> RawTargetResolver {
 /// L7 gateway), enforced separately via `needs_raw_proxy`.
 fn proto_matches(spec: fluid_core::ServiceProtocol, proto: RawProto) -> bool {
     match proto {
-        RawProto::Tcp => matches!(spec, fluid_core::ServiceProtocol::Tcp | fluid_core::ServiceProtocol::Grpc),
+        RawProto::Tcp => matches!(
+            spec,
+            fluid_core::ServiceProtocol::Tcp | fluid_core::ServiceProtocol::Grpc
+        ),
         RawProto::Udp => spec == fluid_core::ServiceProtocol::Udp,
     }
 }
@@ -61,7 +64,8 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
     //    alias holder first, then newest ready).
     let recs = cloud.gw.deployment_records();
     let rec = if !t.deployment.is_empty() {
-        recs.into_iter().find(|r| r.id == t.deployment && r.state == fluid_core::DeployState::Ready)?
+        recs.into_iter()
+            .find(|r| r.id == t.deployment && r.state == fluid_core::DeployState::Ready)?
     } else {
         recs.into_iter()
             .filter(|r| {
@@ -71,15 +75,20 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
             })
             .max_by_key(|r| (r.production, r.created_at_ms))?
     };
-    let f = rec.manifest.functions.iter().find(|f| f.name == t.function)?;
+    let f = rec
+        .manifest
+        .functions
+        .iter()
+        .find(|f| f.name == t.function)?;
     // 2. Only splice into a DECLARED raw-protocol port of that function — the
     //    handshake must name a (container_port, protocol) the deployment
     //    actually published (the same specs `raw_ports::allocate_raw_ports`
     //    allocated public ports for), never an arbitrary local port.
-    let spec_idx = f
-        .ports
-        .iter()
-        .position(|s| s.container_port == t.port && s.protocol.needs_raw_proxy() && proto_matches(s.protocol, t.proto))?;
+    let spec_idx = f.ports.iter().position(|s| {
+        s.container_port == t.port
+            && s.protocol.needs_raw_proxy()
+            && proto_matches(s.protocol, t.proto)
+    })?;
     match t.proto {
         RawProto::Tcp => {
             // The leased endpoint below is the per-instance tunnel listener,
@@ -117,7 +126,10 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
             };
             // The lease rides as the guard so instance inflight accounting
             // covers the connection's whole lifetime (released on splice end).
-            Some(RawTargetConn { addr, guard: Some(Box::new(lease)) })
+            Some(RawTargetConn {
+                addr,
+                guard: Some(Box::new(lease)),
+            })
         }
         RawProto::Udp => {
             // The local UDP leg: the container publishes every declared UDP spec
@@ -143,7 +155,10 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
                 );
                 return None;
             };
-            Some(RawTargetConn { addr: format!("127.0.0.1:{host_port}"), guard: Some(Box::new(lease)) })
+            Some(RawTargetConn {
+                addr: format!("127.0.0.1:{host_port}"),
+                guard: Some(Box::new(lease)),
+            })
         }
     }
 }

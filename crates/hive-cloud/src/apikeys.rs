@@ -17,7 +17,11 @@ fn sha256_hex(s: &str) -> String {
 
 fn rand_token() -> String {
     // 256 bits of entropy, prefixed so it's recognizable + greppable in logs.
-    format!("hive_{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
+    format!(
+        "hive_{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,7 +61,9 @@ pub struct ApiKeyStore {
 
 impl ApiKeyStore {
     pub fn new() -> ApiKeyStore {
-        ApiKeyStore { keys: RwLock::new(Vec::new()) }
+        ApiKeyStore {
+            keys: RwLock::new(Vec::new()),
+        }
     }
 
     pub fn snapshot(&self) -> Vec<ApiKey> {
@@ -75,8 +81,16 @@ impl ApiKeyStore {
             name: name.to_string(),
             prefix: format!("{}…", &token[..token.len().min(12)]),
             hash: sha256_hex(&token),
-            team: if team.is_empty() { "personal".into() } else { team.to_string() },
-            role: if role.is_empty() { "member".into() } else { role.to_string() },
+            team: if team.is_empty() {
+                "personal".into()
+            } else {
+                team.to_string()
+            },
+            role: if role.is_empty() {
+                "member".into()
+            } else {
+                role.to_string()
+            },
             created_ms: now_ms(),
             last_used_ms: 0,
         };
@@ -94,7 +108,12 @@ impl ApiKeyStore {
     }
 
     pub fn list(&self, team: &str) -> Vec<ApiKey> {
-        self.keys.read().iter().filter(|k| k.team == team).cloned().collect()
+        self.keys
+            .read()
+            .iter()
+            .filter(|k| k.team == team)
+            .cloned()
+            .collect()
     }
 
     pub fn revoke(&self, id: &str, team: &str) -> bool {
@@ -160,8 +179,14 @@ mod tests_ext {
         let s = ApiKeyStore::new();
         let (key, _) = s.create("k", "t", "owner");
         let v = key.public();
-        assert!(v.get("hash").is_none(), "hash must not be in the public view");
-        assert!(v.get("token").is_none(), "token is never stored/returned here");
+        assert!(
+            v.get("hash").is_none(),
+            "hash must not be in the public view"
+        );
+        assert!(
+            v.get("token").is_none(),
+            "token is never stored/returned here"
+        );
         assert_eq!(v["team"], "t");
         assert!(v["prefix"].as_str().unwrap().starts_with("hive_"));
     }

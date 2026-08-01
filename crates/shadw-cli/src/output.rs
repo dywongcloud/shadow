@@ -11,7 +11,10 @@ pub struct Out {
 
 impl Out {
     pub fn value(&self, v: &Value) {
-        println!("{}", serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string())
+        );
     }
 
     /// Print a table from an array of objects, picking the given columns. Falls
@@ -49,8 +52,18 @@ impl Out {
                 .collect::<Vec<_>>()
                 .join("  ")
         };
-        println!("{}", line(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>()));
-        println!("{}", widths.iter().map(|w| "-".repeat(*w)).collect::<Vec<_>>().join("  "));
+        println!(
+            "{}",
+            line(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        );
+        println!(
+            "{}",
+            widths
+                .iter()
+                .map(|w| "-".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("  ")
+        );
         for row in &cells {
             println!("{}", line(row));
         }

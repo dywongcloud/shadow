@@ -116,7 +116,10 @@ impl WorkflowEngine {
             .get(def_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no such workflow '{def_id}'"))?;
-        let run_id = format!("wrun_{}", Uuid::new_v4().simple().to_string()[..26].to_uppercase());
+        let run_id = format!(
+            "wrun_{}",
+            Uuid::new_v4().simple().to_string()[..26].to_uppercase()
+        );
         let run = WorkflowRun {
             id: run_id.clone(),
             def_id: def.id.clone(),
@@ -170,7 +173,11 @@ impl WorkflowEngine {
             }
             let mut runs = engine.runs.write();
             if let Some(r) = runs.get_mut(&rid) {
-                r.status = if all_ok { RunStatus::Succeeded } else { RunStatus::Failed };
+                r.status = if all_ok {
+                    RunStatus::Succeeded
+                } else {
+                    RunStatus::Failed
+                };
                 r.finished_ms = Some(now_ms());
             }
         });
@@ -190,8 +197,16 @@ mod tests {
             name: "demo".into(),
             project: "demo-project".into(),
             steps: vec![
-                WorkflowStep { name: "a".into(), deployment: "d".into(), path: "/a".into() },
-                WorkflowStep { name: "b".into(), deployment: "d".into(), path: "/b".into() },
+                WorkflowStep {
+                    name: "a".into(),
+                    deployment: "d".into(),
+                    path: "/a".into(),
+                },
+                WorkflowStep {
+                    name: "b".into(),
+                    deployment: "d".into(),
+                    path: "/b".into(),
+                },
             ],
             graph: None,
         });

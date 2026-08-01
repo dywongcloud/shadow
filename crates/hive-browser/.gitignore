@@ -1,9 +1,12 @@
 target/
+node_modules/
 www/pkg/
 # The root .gitignore's `.gm/*` rule is anchored to the repo root (a gitignore
 # pattern containing a slash is relative to the file that declares it), so it
-# does NOT cover a nested .gm/ elsewhere in the tree. One landed here by
-# accident (a `cd` into www/ persisted across Bash calls and a spool-boot
-# command run from there registered this directory as its own gm project) and
-# got committed. Scoped rule so it can't recur silently in this crate.
+# does NOT cover nested tool state elsewhere in the tree. One `.gm/` landed
+# under www/ after a tool ran with that cwd and got committed; the browser verb
+# also creates `.agentplug/` there. These basename-only rules match at every
+# depth in this crate, so serving a different subdirectory cannot recur under a
+# new path.
 .gm/
+.agentplug/

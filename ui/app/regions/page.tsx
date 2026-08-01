@@ -2,9 +2,11 @@
 
 import { Cpu, Radio, Database } from "lucide-react";
 import { Card, Badge, PageHeader, Table, Th, Td } from "@/components/ui";
+import { useEffect, useState } from "react";
 import { usePoll, type NodeInfo } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { RegionMap, type MapMarker, PALETTE, GPU_COLOR } from "@/components/region-map";
+import { RegionMap, type MapMarker, type SatelliteMarker, PALETTE, GPU_COLOR } from "@/components/region-map";
+import type { BrowserPresence } from "@/lib/run-node-client";
 
 // Coarse continent classifier — mirrors hive_edge::continent_of so the UI labels
 // match what the backend assigns from a node's lat/lon.
@@ -47,7 +49,21 @@ const displayRegion = (r: string) => (r === "local" ? "Unknown location" : r);
 
 export default function RegionsPage() {
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 3000);
+  // Low-trust browser-node presence (constellation satellites) — a SEPARATE
+  // feed from `/v1/nodes`, never merged into the fleet marker list: browser
+  // peers must never be countable as fleet nodes anywhere in this view.
+  const { data: presenceFeed } = usePoll<{ presence: BrowserPresence[] }>("/v1/browser/presence", 8000);
   const list = nodes ?? [];
+  const presence = presenceFeed?.presence ?? [];
+  // "Now", as REACT STATE rather than a Date.now() read during render (which
+  // is impure and can produce hydration mismatches) — ticked on an interval,
+  // only ever mutated from that timer callback, never synchronously in an
+  // effect body.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
   const regions = Array.from(new Set(list.map((n) => n.region))).sort();
 
   // One colored marker per node, placed at its REAL reported coordinates. Nodes
@@ -72,6 +88,19 @@ export default function RegionsPage() {
   const colorByNode: Record<string, string> = {};
   list.forEach((n, i) => { colorByNode[n.id] = nodeColor(n, i); });
 
+  // Satellites: only records with a shared (non-null) location — a browser
+  // that declined location sharing still runs, it just never gets a dot.
+  const satellites: SatelliteMarker[] = presence
+    .filter((p) => typeof p.lat === "number" && typeof p.lon === "number")
+    .map((p) => ({
+      id: p.endpoint_id,
+      lat: p.lat as number,
+      lon: p.lon as number,
+      label: p.display_label,
+      state: p.state,
+      ageMs: p.located_ms ? now - p.located_ms : undefined,
+    }));
+
   return (
     <div>
       <PageHeader title="Regions" desc="Your nodes, meshed into one cloud — placed where they actually are" />
@@ -86,10 +115,13 @@ export default function RegionsPage() {
       {/* Live geographic map of the mesh. */}
       <Card className="mb-5 p-0">
         <div className="relative overflow-hidden rounded-xl bg-slate-50 dark:bg-[#070b14]">
-          <RegionMap markers={markers} autoColor />
+          <RegionMap markers={markers} satellites={satellites} autoColor />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
             {markers.length} node{markers.length === 1 ? "" : "s"} live on the mesh
+            {satellites.length > 0 && (
+              <span className="text-muted"> · {satellites.length} browser node{satellites.length === 1 ? "" : "s"}</span>
+            )}
           </div>
           {/* Legend: what a marker's color/badges mean, so the constellation
               reads as "which nodes provide which mesh services" at a glance. */}
@@ -105,6 +137,10 @@ export default function RegionsPage() {
             <span className="inline-flex items-center gap-1">
               <span className="h-1.5 w-1.5 rounded-full bg-amber-500" />
               GuardianDB
+            </span>
+            <span className="inline-flex items-center gap-1" title="Low-trust volunteer browser peers — never counted as fleet capacity">
+              <span className="h-1.5 w-1.5 rotate-45 bg-sky-400" />
+              Browser node
             </span>
           </div>
         </div>

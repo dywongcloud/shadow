@@ -120,7 +120,11 @@ impl WebhookStore {
     pub fn list(&self, project: Option<&str>) -> Vec<Webhook> {
         let h = self.hooks.read();
         match project {
-            Some(p) => h.iter().filter(|w| w.project == p || w.project == "*").cloned().collect(),
+            Some(p) => h
+                .iter()
+                .filter(|w| w.project == p || w.project == "*")
+                .cloned()
+                .collect(),
             None => h.clone(),
         }
     }
@@ -294,16 +298,29 @@ mod tests {
 
         // The record actually held in the store (== what gets persisted) must
         // NOT be the plaintext secret.
-        let stored = store.snapshot().into_iter().find(|w| w.id == created.id).unwrap();
-        assert_ne!(stored.secret, "whsec_realvalue123", "stored secret must be sealed, not plaintext");
-        assert!(stored.secret.starts_with("enc:v1:"), "stored secret must use the AEAD envelope");
+        let stored = store
+            .snapshot()
+            .into_iter()
+            .find(|w| w.id == created.id)
+            .unwrap();
+        assert_ne!(
+            stored.secret, "whsec_realvalue123",
+            "stored secret must be sealed, not plaintext"
+        );
+        assert!(
+            stored.secret.starts_with("enc:v1:"),
+            "stored secret must use the AEAD envelope"
+        );
 
         // The owner-facing decrypted view recovers the real value.
         assert_eq!(stored.clone().decrypted().secret, "whsec_realvalue123");
 
         // A legacy, already-plaintext record (persisted before this fix
         // shipped) must still decrypt correctly (passthrough, not garbled).
-        let legacy = Webhook { secret: "whsec_legacy_plaintext".into(), ..stored.clone() };
+        let legacy = Webhook {
+            secret: "whsec_legacy_plaintext".into(),
+            ..stored.clone()
+        };
         assert_eq!(legacy.decrypted().secret, "whsec_legacy_plaintext");
     }
 }

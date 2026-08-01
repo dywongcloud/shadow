@@ -18,7 +18,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use iroh::{endpoint::presets::N0, endpoint::Connection, endpoint::QuicTransportConfig, EndpointAddr};
+use iroh::{
+    endpoint::presets::N0, endpoint::Connection, endpoint::QuicTransportConfig, EndpointAddr,
+};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
@@ -88,17 +90,20 @@ pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
 
 /// ALPN for browser-tab peers (`crates/hive-browser`) — a dedicated, low-trust
 /// surface, structurally disjoint from [`HIVE_ALPN`]'s gossip/join/raw modes.
-/// Must match `hive_browser::BROWSER_ALPN` byte-for-byte; duplicated rather
-/// than shared via a common crate because `hive-browser` is wasm32-only and
-/// excluded from this workspace (see its own Cargo.toml comment). Connections
-/// on this ALPN never reach the mode-byte dispatch below — see
+/// Connections on this ALPN never reach the mode-byte dispatch below — see
 /// `serve_browser_conn`, which has no gossip/join/raw arms at all.
-pub const BROWSER_ALPN: &[u8] = b"hive/browser/0";
+///
+/// Re-exported from `hive-browser-proto` rather than declared here: the browser
+/// half of this protocol is a separate crate on a separate target, and the two
+/// used to hold identical constants in sync by comment alone. They no longer
+/// can drift. Kept `pub` at this path so existing `hive_p2p::BROWSER_ALPN`
+/// callers are unaffected.
+pub use hive_browser_proto::BROWSER_ALPN;
 
-/// Cap on a single browser-echo request frame — mirrors `hive-browser`'s own
-/// `MAX_FRAME`, the memory-safety line for a fleet node serving untrusted
-/// browser-peer traffic.
-const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
+use hive_browser_proto::{
+    check_len, encode_invoke, encode_reply, encode_request, reset as browser_reset, split_request,
+    Op, BROWSER_MAX_FRAME,
+};
 
 /// Concurrently-served `hive/browser/0` connections — SEPARATE from
 /// [`max_inbound_conns`]'s fleet-trunk budget on purpose (gap-fleet-accept-loop-not-router):
@@ -186,7 +191,12 @@ const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
 /// signature bound to the connection's remote identity (see [`STREAM_GOSSIP_SIGNED`]),
 /// `None` for legacy-unsigned requests (only admitted outside enforce mode).
 pub type GossipHandler = Arc<
-    dyn Fn(u8, String, Vec<u8>, Option<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+    dyn Fn(
+            u8,
+            String,
+            Vec<u8>,
+            Option<String>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
         + Send
         + Sync,
 >;
@@ -197,7 +207,20 @@ pub type GossipHandler = Arc<
 /// body claims), admits the id into the trust set on success, and returns the
 /// current node roster so the joiner learns the whole mesh in one round trip.
 pub type JoinHandler = Arc<
-    dyn Fn(String, Vec<u8>, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+    dyn Fn(
+            String,
+            Vec<u8>,
+            String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Re-checks a browser endpoint identity against the control-plane admission
+/// store before any hive/browser/0 stream is accepted. The handler may perform
+/// one leader fallback; false closes the connection without exposing an op.
+pub type BrowserAdmissionHandler = Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
         + Sync,
 >;
@@ -282,7 +305,10 @@ pub struct RawTargetConn {
 /// Provided by hive-cloud, which owns the deployment→container mapping this
 /// transport crate deliberately knows nothing about.
 pub type RawTargetResolver = Arc<
-    dyn Fn(RawTarget) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RawTargetConn>> + Send>>
+    dyn Fn(
+            RawTarget,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<RawTargetConn>> + Send>>
         + Send
         + Sync,
 >;
@@ -301,11 +327,18 @@ pub enum VerifyMode {
 /// Whether outbound gossip is signed (`HIVE_GOSSIP_SIGN=1`). Default OFF until the
 /// whole fleet runs a binary that understands [`STREAM_GOSSIP_SIGNED`].
 pub fn gossip_sign_enabled() -> bool {
-    std::env::var("HIVE_GOSSIP_SIGN").map(|v| v == "1" || v == "true").unwrap_or(false)
+    std::env::var("HIVE_GOSSIP_SIGN")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
 }
 
 pub fn verify_mode() -> VerifyMode {
-    match std::env::var("HIVE_GOSSIP_VERIFY").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+    match std::env::var("HIVE_GOSSIP_VERIFY")
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "off" => VerifyMode::Off,
         "enforce" | "strict" | "1" => VerifyMode::Enforce,
         _ => VerifyMode::Log,
@@ -315,7 +348,11 @@ pub fn verify_mode() -> VerifyMode {
 /// Max allowed clock skew / age for a signed gossip message (replay guard),
 /// env-tunable via `HIVE_GOSSIP_TS_WINDOW_SECS` (default 300).
 fn gossip_ts_window_ms() -> u64 {
-    std::env::var("HIVE_GOSSIP_TS_WINDOW_SECS").ok().and_then(|s| s.parse::<u64>().ok()).unwrap_or(300) * 1000
+    std::env::var("HIVE_GOSSIP_TS_WINDOW_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(300)
+        * 1000
 }
 
 /// Mesh-wide message-verification counters (surfaced via `/v1/relay` for
@@ -355,7 +392,8 @@ pub fn verify_stats() -> (u64, u64, u64, u64, u64, u64) {
 /// The domain-separated byte string an ed25519 gossip signature covers. Pure, so
 /// signer and verifier can't drift.
 fn gossip_sig_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u8> {
-    let mut m = Vec::with_capacity(GOSSIP_SIG_DOMAIN.len() + 1 + 8 + 8 + path.len() + body.len() + 8);
+    let mut m =
+        Vec::with_capacity(GOSSIP_SIG_DOMAIN.len() + 1 + 8 + 8 + path.len() + body.len() + 8);
     m.extend_from_slice(GOSSIP_SIG_DOMAIN);
     m.push(method);
     m.extend_from_slice(&(path.len() as u32).to_be_bytes());
@@ -368,7 +406,13 @@ fn gossip_sig_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u
 
 /// Sign a gossip request with this node's iroh identity key. Returns the 104-byte
 /// trailer `[32B signer pubkey][8B ts_ms][64B sig]` appended to the framed request.
-pub fn sign_gossip(secret: &iroh::SecretKey, method: u8, path: &str, body: &[u8], ts_ms: u64) -> [u8; 104] {
+pub fn sign_gossip(
+    secret: &iroh::SecretKey,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    ts_ms: u64,
+) -> [u8; 104] {
     let sig = secret.sign(&gossip_sig_preimage(method, path, body, ts_ms));
     let mut out = [0u8; 104];
     out[..32].copy_from_slice(secret.public().as_bytes());
@@ -404,7 +448,10 @@ pub fn verify_gossip(
         return Err("invalid signer key");
     };
     let sig = iroh::Signature::from_bytes(&sigb);
-    if signer.verify(&gossip_sig_preimage(method, path, body, ts), &sig).is_err() {
+    if signer
+        .verify(&gossip_sig_preimage(method, path, body, ts), &sig)
+        .is_err()
+    {
         VERIFY_STATS.bad_sig.fetch_add(1, Ordering::Relaxed);
         return Err("signature invalid");
     }
@@ -447,7 +494,10 @@ async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Vec<u8>>
 async fn read_frame_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> std::io::Result<Vec<u8>> {
     let n = read_u32(r).await?;
     if n > max {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
     }
     let mut v = vec![0u8; n];
     r.read_exact(&mut v).await?;
@@ -457,7 +507,9 @@ async fn read_frame_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> std::io:
 /// Read one datagram frame off a raw-target UDP mesh stream: `Ok(Some(bytes))`
 /// per datagram, `Ok(None)` on a clean end-of-stream. Exported so the edge-side
 /// UDP relay speaks byte-identical framing to the owner-side pump in this crate.
-pub async fn read_raw_datagram<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Option<Vec<u8>>> {
+pub async fn read_raw_datagram<R: AsyncRead + Unpin>(
+    r: &mut R,
+) -> std::io::Result<Option<Vec<u8>>> {
     match read_frame_max(r, RAW_MAX_DATAGRAM).await {
         Ok(d) => Ok(Some(d)),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
@@ -468,9 +520,15 @@ pub async fn read_raw_datagram<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Resu
 /// Write one datagram frame (`[u32 len][bytes]`, boundary-preserving) onto a
 /// raw-target UDP mesh stream. Oversized payloads are a framing error — they
 /// could never have arrived as one datagram.
-pub async fn write_raw_datagram<W: AsyncWrite + Unpin>(w: &mut W, datagram: &[u8]) -> std::io::Result<()> {
+pub async fn write_raw_datagram<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    datagram: &[u8],
+) -> std::io::Result<()> {
     if datagram.len() > RAW_MAX_DATAGRAM {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "datagram too large"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "datagram too large",
+        ));
     }
     w.write_all(&(datagram.len() as u32).to_be_bytes()).await?;
     w.write_all(datagram).await?;
@@ -488,7 +546,9 @@ pub fn addr_json(ep: &Endpoint) -> Option<String> {
 /// `addr_json` blob (a serialized `EndpointAddr` learned via gossip). Used to build
 /// the peer-trust allowlist (#20) from the fleet roster the node already knows.
 pub fn endpoint_id_from_addr_json(addr_json: &str) -> Option<String> {
-    serde_json::from_str::<EndpointAddr>(addr_json).ok().map(|a| a.id.to_string())
+    serde_json::from_str::<EndpointAddr>(addr_json)
+        .ok()
+        .map(|a| a.id.to_string())
 }
 
 /// Shared, gossip-updated set of trusted peer `EndpointId`s for P2P admission (#20).
@@ -531,13 +591,21 @@ pub struct PeerTimeout {
 /// Read a millisecond budget from env, falling back to `default_ms`. A value of 0
 /// (or unparseable) falls back to the default — we never allow an unbounded await.
 fn env_ms(key: &str, default_ms: u64) -> Duration {
-    let ms = std::env::var(key).ok().and_then(|s| s.parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default_ms);
+    let ms = std::env::var(key)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default_ms);
     Duration::from_millis(ms)
 }
 /// Connect (holepunch + handshake) budget — pre-send. Holepunch can be slow.
-fn connect_budget() -> Duration { env_ms("HIVE_P2P_CONNECT_MS", 5_000) }
+fn connect_budget() -> Duration {
+    env_ms("HIVE_P2P_CONNECT_MS", 5_000)
+}
 /// `open_bi` budget — pre-send. Cheap once the conn is live; a hang = half-dead trunk.
-fn open_budget() -> Duration { env_ms("HIVE_P2P_OPEN_MS", 2_000) }
+fn open_budget() -> Duration {
+    env_ms("HIVE_P2P_OPEN_MS", 2_000)
+}
 /// Discovery-fallback connect budget — used ONLY when a dial against the peer's
 /// cached hint (its direct addrs / relay_url, as last gossiped — see `acquire`)
 /// fails or times out. Deliberately a SEPARATE, smaller budget than
@@ -550,7 +618,9 @@ fn open_budget() -> Duration { env_ms("HIVE_P2P_OPEN_MS", 2_000) }
 /// (typical for a peer only ever learned second/third-hand via gossip, never
 /// dialed directly) can wedge every future dial to that peer forever once its
 /// cross-cloud QUIC path flaps.
-fn discovery_budget() -> Duration { env_ms("HIVE_P2P_DISCOVERY_MS", 4_000) }
+fn discovery_budget() -> Duration {
+    env_ms("HIVE_P2P_DISCOVERY_MS", 4_000)
+}
 /// Worst-case time `acquire()` needs to run the cached-hint attempt AND the
 /// fresh-discovery fallback to completion: `connect_budget + discovery_budget`,
 /// plus slack. A caller wrapping `join_request`/`gossip_request` in its OWN
@@ -560,12 +630,18 @@ fn discovery_budget() -> Duration { env_ms("HIVE_P2P_DISCOVERY_MS", 4_000) }
 /// `discovery_budget`'s doc comment) never gets to run, so a first-contact dial
 /// can never succeed no matter how long fresh discovery would have taken. Any
 /// such outer timeout MUST be at least this long.
-pub fn dial_fallback_ceiling() -> Duration { connect_budget() + discovery_budget() + Duration::from_secs(1) }
+pub fn dial_fallback_ceiling() -> Duration {
+    connect_budget() + discovery_budget() + Duration::from_secs(1)
+}
 /// First-byte / response-headers budget — post-send. Generous: the cell may be cold.
-fn firstbyte_budget() -> Duration { env_ms("HIVE_P2P_FIRSTBYTE_MS", 15_000) }
+fn firstbyte_budget() -> Duration {
+    env_ms("HIVE_P2P_FIRSTBYTE_MS", 15_000)
+}
 /// Body inter-chunk IDLE budget — post-send. Not a wall-clock cap; reset per chunk
 /// so SSE / long streams survive, only killed on inactivity.
-fn idle_budget() -> Duration { env_ms("HIVE_P2P_IDLE_MS", 45_000) }
+fn idle_budget() -> Duration {
+    env_ms("HIVE_P2P_IDLE_MS", 45_000)
+}
 
 const PHASE_CONNECT: usize = 0;
 const PHASE_OPEN: usize = 1;
@@ -585,7 +661,11 @@ pub struct DeadPeerTimeout {
 }
 impl std::fmt::Display for DeadPeerTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "p2p {} timeout to {} after {}ms (peer presumed dead)", self.phase, self.node_id, self.budget_ms)
+        write!(
+            f,
+            "p2p {} timeout to {} after {}ms (peer presumed dead)",
+            self.phase, self.node_id, self.budget_ms
+        )
     }
 }
 impl std::error::Error for DeadPeerTimeout {}
@@ -601,7 +681,11 @@ pub struct PostSendTimeout {
 }
 impl std::fmt::Display for PostSendTimeout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "p2p {} timeout to {} after {}ms (post-send; no retry)", self.phase, self.node_id, self.budget_ms)
+        write!(
+            f,
+            "p2p {} timeout to {} after {}ms (post-send; no retry)",
+            self.phase, self.node_id, self.budget_ms
+        )
     }
 }
 impl std::error::Error for PostSendTimeout {}
@@ -613,7 +697,11 @@ struct TimeoutCounters {
 }
 impl TimeoutCounters {
     async fn bump(&self, node_id: &str, phase: usize) {
-        self.map.lock().await.entry(node_id.to_string()).or_insert([0; 4])[phase] += 1;
+        self.map
+            .lock()
+            .await
+            .entry(node_id.to_string())
+            .or_insert([0; 4])[phase] += 1;
     }
     async fn snapshot(&self) -> Vec<PeerTimeout> {
         let m = self.map.lock().await;
@@ -621,7 +709,11 @@ impl TimeoutCounters {
         for (node, counts) in m.iter() {
             for (i, &c) in counts.iter().enumerate() {
                 if c > 0 {
-                    out.push(PeerTimeout { node_id: node.clone(), phase: PHASE_NAMES[i], count: c });
+                    out.push(PeerTimeout {
+                        node_id: node.clone(),
+                        phase: PHASE_NAMES[i],
+                        count: c,
+                    });
                 }
             }
         }
@@ -693,6 +785,167 @@ struct Trunk {
     conn: Connection,
 }
 
+/// Browser invocation failed before or after a complete request frame entered
+/// QUIC. Callers may safely fall back after `sent == false`; `sent == true`
+/// means the browser may already have executed the function.
+#[derive(Clone, Debug)]
+pub struct BrowserInvokeError {
+    pub sent: bool,
+    pub message: String,
+}
+
+impl BrowserInvokeError {
+    fn new(sent: bool, error: impl std::fmt::Display) -> Self {
+        Self {
+            sent,
+            message: error.to_string(),
+        }
+    }
+}
+
+impl std::fmt::Display for BrowserInvokeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "browser invoke failed (sent={}): {}",
+            self.sent, self.message
+        )
+    }
+}
+
+impl std::error::Error for BrowserInvokeError {}
+
+/// Native client for `hive/browser/0`. Browser trunks are kept separate from
+/// [`PeerPool`]: ALPN is negotiated per QUIC connection, so a fleet
+/// `hive/tunnel/0` trunk cannot carry browser streams.
+pub struct BrowserPool {
+    ep: Endpoint,
+    trunks: Mutex<HashMap<String, Connection>>,
+}
+
+impl BrowserPool {
+    pub fn new(ep: Endpoint) -> Arc<Self> {
+        Arc::new(Self {
+            ep,
+            trunks: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn acquire(
+        &self,
+        endpoint_id: &str,
+        addr_json: &str,
+    ) -> std::result::Result<Connection, BrowserInvokeError> {
+        let addr: EndpointAddr =
+            serde_json::from_str(addr_json).map_err(|e| BrowserInvokeError::new(false, e))?;
+        let key = addr.id.to_string();
+        if key != endpoint_id {
+            return Err(BrowserInvokeError::new(
+                false,
+                "browser address identity does not match serving target",
+            ));
+        }
+        {
+            let trunks = self.trunks.lock().await;
+            if let Some(conn) = trunks.get(&key) {
+                if conn.close_reason().is_none() {
+                    return Ok(conn.clone());
+                }
+            }
+        }
+        let conn = tokio::time::timeout(connect_budget(), self.ep.connect(addr, BROWSER_ALPN))
+            .await
+            .map_err(|_| BrowserInvokeError::new(false, "browser connect timed out"))?
+            .map_err(|e| BrowserInvokeError::new(false, e))?;
+        self.trunks.lock().await.insert(key, conn.clone());
+        Ok(conn)
+    }
+
+    async fn evict(&self, endpoint_id: &str) {
+        if let Some(conn) = self.trunks.lock().await.remove(endpoint_id) {
+            conn.close(0u32.into(), b"browser trunk evicted");
+        }
+    }
+
+    /// Close a revoked browser's pooled connection immediately. Future invokes
+    /// cannot reuse a capability-bearing connection after admission removal.
+    pub async fn close_endpoint(&self, endpoint_id: &str) {
+        self.evict(endpoint_id).await;
+    }
+
+    /// Invoke a digest-pinned browser artifact. Executable source is never sent:
+    /// the wire carries only `[digest][request JSON]` inside the shared protocol
+    /// frame. Every await is bounded and every reply length is checked before
+    /// allocation.
+    pub async fn invoke(
+        &self,
+        endpoint_id: &str,
+        addr_json: &str,
+        digest: &str,
+        request_json: &str,
+    ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
+        let payload =
+            encode_invoke(digest, request_json).map_err(|e| BrowserInvokeError::new(false, e))?;
+        let frame = encode_request(Op::Invoke, &payload);
+        if frame.len().saturating_sub(4) > BROWSER_MAX_FRAME {
+            return Err(BrowserInvokeError::new(
+                false,
+                "browser request frame too large",
+            ));
+        }
+
+        let mut attempt = 0u8;
+        let (mut send, mut recv) = loop {
+            attempt += 1;
+            let conn = match self.acquire(endpoint_id, addr_json).await {
+                Ok(conn) => conn,
+                Err(_error) if attempt < 2 => {
+                    self.evict(endpoint_id).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                Ok(Ok(streams)) => break streams,
+                Ok(Err(error)) if attempt < 2 => {
+                    self.evict(endpoint_id).await;
+                    tracing::debug!(endpoint_id, %error, "browser stream open failed; redialing");
+                }
+                Ok(Err(error)) => return Err(BrowserInvokeError::new(false, error)),
+                Err(_) if attempt < 2 => self.evict(endpoint_id).await,
+                Err(_) => {
+                    return Err(BrowserInvokeError::new(
+                        false,
+                        "browser stream open timed out",
+                    ))
+                }
+            }
+        };
+
+        // A short write cannot form a complete frame, so the browser cannot
+        // dispatch it. Once write_all succeeds the full frame may execute even
+        // if finish or the reply subsequently fails.
+        send.write_all(&frame)
+            .await
+            .map_err(|e| BrowserInvokeError::new(false, e))?;
+        send.finish()
+            .map_err(|e| BrowserInvokeError::new(true, e))?;
+
+        let mut len = [0u8; 4];
+        tokio::time::timeout(firstbyte_budget(), recv.read_exact(&mut len))
+            .await
+            .map_err(|_| BrowserInvokeError::new(true, "browser reply timed out"))?
+            .map_err(|e| BrowserInvokeError::new(true, e))?;
+        let n = check_len(len).map_err(|e| BrowserInvokeError::new(true, e))?;
+        let mut reply = vec![0u8; n];
+        tokio::time::timeout(idle_budget(), recv.read_exact(&mut reply))
+            .await
+            .map_err(|_| BrowserInvokeError::new(true, "browser reply body timed out"))?
+            .map_err(|e| BrowserInvokeError::new(true, e))?;
+        Ok(reply)
+    }
+}
+
 /// Connection pool + multiplexer for the cross-node mesh path. Keeps ONE persistent
 /// iroh QUIC connection per peer (`node_id`) and opens a NEW bi STREAM per request,
 /// instead of dialing a fresh connection (and paying a handshake / holepunch) each
@@ -746,7 +999,10 @@ impl PeerPool {
 
     /// `(opened, reused)` connection counters — for diagnostics and tests.
     pub fn stats(&self) -> (u64, u64) {
-        (self.opened.load(Ordering::Relaxed), self.reused.load(Ordering::Relaxed))
+        (
+            self.opened.load(Ordering::Relaxed),
+            self.reused.load(Ordering::Relaxed),
+        )
     }
 
     /// Proactively ensure a live trunk to `node_id` exists — dial (holepunch) if
@@ -845,7 +1101,11 @@ impl PeerPool {
                 // peer itself.
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
                 self.evict(&key).await; // stale trunk (if any) is definitely dead
-                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p connect timeout using cached hint; retrying via fresh discovery");
+                tracing::warn!(
+                    node_id,
+                    budget_ms = budget.as_millis() as u64,
+                    "p2p connect timeout using cached hint; retrying via fresh discovery"
+                );
                 self.dial_fresh(node_id, id).await?
             }
         };
@@ -859,7 +1119,10 @@ impl PeerPool {
         // Remember how this caller referred to the peer so the label-taking
         // helpers can find the trunk without a second keyspace.
         if node_id != key {
-            self.aliases.lock().await.insert(node_id.to_string(), key.clone());
+            self.aliases
+                .lock()
+                .await
+                .insert(node_id.to_string(), key.clone());
         }
         self.opened.fetch_add(1, Ordering::Relaxed);
         tracing::info!(node_id, key = %key, "trunk opened");
@@ -875,9 +1138,13 @@ impl PeerPool {
     /// for why iroh would otherwise never consult Discovery on its own here.
     async fn dial_fresh(&self, node_id: &str, id: iroh::EndpointId) -> Result<Connection> {
         let budget = discovery_budget();
-        match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await {
+        match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await
+        {
             Ok(Ok(c)) => {
-                tracing::info!(node_id, "p2p connect recovered via fresh discovery (cached hint was stale)");
+                tracing::info!(
+                    node_id,
+                    "p2p connect recovered via fresh discovery (cached hint was stale)"
+                );
                 Ok(c)
             }
             Ok(Err(e)) => {
@@ -888,7 +1155,11 @@ impl PeerPool {
             Err(_) => {
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
                 self.evict(node_id).await;
-                tracing::warn!(node_id, budget_ms = budget.as_millis() as u64, "p2p discovery-fallback connect timeout (giving up)");
+                tracing::warn!(
+                    node_id,
+                    budget_ms = budget.as_millis() as u64,
+                    "p2p discovery-fallback connect timeout (giving up)"
+                );
                 Err(anyhow::Error::new(DeadPeerTimeout {
                     node_id: node_id.to_string(),
                     phase: "connect",
@@ -952,7 +1223,11 @@ impl PeerPool {
                 budget_ms: idle_budget().as_millis() as u64,
             }));
         }
-        Ok(TunnelResp { status: s.status, headers: s.headers, body: buf })
+        Ok(TunnelResp {
+            status: s.status,
+            headers: s.headers,
+            body: buf,
+        })
     }
 
     /// Streaming variant of [`request`]: returns the response head plus a receiver
@@ -1136,24 +1411,25 @@ impl PeerPool {
                     return Err(e);
                 }
             };
-            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+            let (mut send, mut recv) =
+                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_OPEN).await;
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+                    Err(_) => {
+                        self.timeouts.bump(node_id, PHASE_OPEN).await;
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(self.dead_peer(node_id, "open", open_budget()));
                     }
-                    return Err(self.dead_peer(node_id, "open", open_budget()));
-                }
-            };
+                };
             send.write_all(&[STREAM_RAW_TARGET]).await?;
             send.write_all(&(hs.len() as u32).to_be_bytes()).await?;
             send.write_all(&hs).await?;
@@ -1190,11 +1466,16 @@ impl PeerPool {
                 RAW_TARGET_OK => return Ok(tokio::io::join(recv, send)),
                 RAW_TARGET_NOT_FOUND => anyhow::bail!(
                     "peer {node_id} has no local target for {}/{} port {} ({:?})",
-                    target.project, target.function, target.port, target.proto
+                    target.project,
+                    target.function,
+                    target.port,
+                    target.proto
                 ),
                 RAW_TARGET_CONNECT_FAILED => anyhow::bail!(
                     "peer {node_id} could not connect its local leg for {}/{} port {}",
-                    target.project, target.function, target.port
+                    target.project,
+                    target.function,
+                    target.port
                 ),
                 other => anyhow::bail!("peer {node_id} sent unknown raw-target status {other}"),
             }
@@ -1226,24 +1507,25 @@ impl PeerPool {
                     return Err(e);
                 }
             };
-            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+            let (mut send, mut recv) =
+                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_OPEN).await;
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+                    Err(_) => {
+                        self.timeouts.bump(node_id, PHASE_OPEN).await;
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(self.dead_peer(node_id, "open", open_budget()));
                     }
-                    return Err(self.dead_peer(node_id, "open", open_budget()));
-                }
-            };
+                };
             // SIGN outbound gossip (web3 trustlessness): receivers verify the
             // MESSAGE cryptographically, not just the QUIC transport. Env-gated
             // (`HIVE_GOSSIP_SIGN=1`) because an OLD receiver would misparse the new
@@ -1314,26 +1596,28 @@ impl PeerPool {
                     return Err(e);
                 }
             };
-            let (mut send, mut recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(pair)) => pair,
-                Ok(Err(e)) => {
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+            let (mut send, mut recv) =
+                match tokio::time::timeout(open_budget(), conn.open_bi()).await {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => {
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(e.into());
                     }
-                    return Err(e.into());
-                }
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_OPEN).await;
-                    self.evict(node_id).await;
-                    if attempt < 2 {
-                        continue;
+                    Err(_) => {
+                        self.timeouts.bump(node_id, PHASE_OPEN).await;
+                        self.evict(node_id).await;
+                        if attempt < 2 {
+                            continue;
+                        }
+                        return Err(self.dead_peer(node_id, "open", open_budget()));
                     }
-                    return Err(self.dead_peer(node_id, "open", open_budget()));
-                }
-            };
+                };
             send.write_all(&[STREAM_JOIN]).await?;
-            send.write_all(&(node_json.len() as u32).to_be_bytes()).await?;
+            send.write_all(&(node_json.len() as u32).to_be_bytes())
+                .await?;
             send.write_all(node_json).await?;
             send.write_all(&(proof.len() as u32).to_be_bytes()).await?;
             send.write_all(proof.as_bytes()).await?;
@@ -1363,7 +1647,12 @@ impl PeerPool {
         if self.trunks.lock().await.contains_key(label) {
             return label.to_string();
         }
-        self.aliases.lock().await.get(label).cloned().unwrap_or_else(|| label.to_string())
+        self.aliases
+            .lock()
+            .await
+            .get(label)
+            .cloned()
+            .unwrap_or_else(|| label.to_string())
     }
 
     /// Close + drop a peer's trunk so the next request re-dials a fresh connection.
@@ -1424,9 +1713,14 @@ fn parse_seed_addr(entry: &str) -> Option<EndpointAddr> {
     if entry.is_empty() {
         return None;
     }
-    let (left, relay) = entry.split_once('|').map(|(l, r)| (l, Some(r.trim()))).unwrap_or((entry, None));
-    let (id_str, addrs_str) =
-        left.split_once('@').map(|(i, a)| (i.trim(), Some(a.trim()))).unwrap_or((left.trim(), None));
+    let (left, relay) = entry
+        .split_once('|')
+        .map(|(l, r)| (l, Some(r.trim())))
+        .unwrap_or((entry, None));
+    let (id_str, addrs_str) = left
+        .split_once('@')
+        .map(|(i, a)| (i.trim(), Some(a.trim())))
+        .unwrap_or((left.trim(), None));
     let id: iroh::EndpointId = id_str.parse().ok()?;
     let mut taddrs: Vec<iroh::TransportAddr> = Vec::new();
     if let Some(addrs) = addrs_str {
@@ -1473,7 +1767,10 @@ pub async fn bind() -> Result<Endpoint> {
 /// discovery the `N0` preset already enables (forward-compat: that discovery's
 /// server is the n0 default today and can later point at the platform's own DNS via
 /// a custom `DnsAddressLookup`/`PkarrPublisher` at this same `address_lookup()` hook).
-pub async fn bind_with_key(key_path: Option<std::path::PathBuf>, seeds: &[SeedPeer]) -> Result<Endpoint> {
+pub async fn bind_with_key(
+    key_path: Option<std::path::PathBuf>,
+    seeds: &[SeedPeer],
+) -> Result<Endpoint> {
     bind_full(key_path, seeds, &[], true).await
 }
 
@@ -1499,7 +1796,11 @@ pub async fn bind_full(
     // removed rather than adjusted, and `max_streams()` for why the stream cap
     // is stated explicitly rather than inherited.
     let tc = QuicTransportConfig::builder()
-        .max_idle_timeout(Some(IDLE_TIMEOUT.try_into().expect("30s is a valid QUIC idle timeout")))
+        .max_idle_timeout(Some(
+            IDLE_TIMEOUT
+                .try_into()
+                .expect("30s is a valid QUIC idle timeout"),
+        ))
         .max_concurrent_bidi_streams(iroh::endpoint::VarInt::from_u32(max_streams()))
         .build();
     let mut builder = if n0_discovery {
@@ -1523,15 +1824,22 @@ pub async fn bind_full(
     if let Some(map) = relay_map_from_env() {
         let n = map.len();
         builder = builder.relay_mode(iroh::RelayMode::Custom(map));
-        tracing::info!(relays = n, "using self-hosted iroh relays (HIVE_RELAY_URLS)");
+        tracing::info!(
+            relays = n,
+            "using self-hosted iroh relays (HIVE_RELAY_URLS)"
+        );
     }
     if let Some(path) = key_path {
         builder = builder.secret_key(load_or_create_secret(&path));
     }
-    let seed_addrs: Vec<EndpointAddr> =
-        seeds.iter().filter_map(|s| serde_json::from_str::<EndpointAddr>(&s.addr_json).ok()).collect();
+    let seed_addrs: Vec<EndpointAddr> = seeds
+        .iter()
+        .filter_map(|s| serde_json::from_str::<EndpointAddr>(&s.addr_json).ok())
+        .collect();
     if !seed_addrs.is_empty() {
-        builder = builder.address_lookup(iroh::address_lookup::MemoryLookup::from_endpoint_info(seed_addrs));
+        builder = builder.address_lookup(iroh::address_lookup::MemoryLookup::from_endpoint_info(
+            seed_addrs,
+        ));
     }
     for raw in discovery_urls {
         let raw = raw.trim();
@@ -1544,7 +1852,9 @@ pub async fn bind_full(
                     .address_lookup(iroh::address_lookup::PkarrPublisher::builder(u.clone()))
                     .address_lookup(iroh::address_lookup::PkarrResolver::builder(u));
             }
-            Err(e) => tracing::warn!(url = raw, error = %e, "invalid HIVE_DISCOVERY_DNS entry; skipped"),
+            Err(e) => {
+                tracing::warn!(url = raw, error = %e, "invalid HIVE_DISCOVERY_DNS entry; skipped")
+            }
         }
     }
     let ep = builder.bind().await?;
@@ -1593,14 +1903,17 @@ fn relay_map_from_env() -> Option<iroh::RelayMap> {
 /// research notes on `insert_relay`/`remove_relay` for why the two compose
 /// rather than substitute for each other.
 pub fn with_relay_hint(addr_json: &str, relay_url: Option<&str>) -> String {
-    let Some(relay_url) = relay_url else { return addr_json.to_string() };
+    let Some(relay_url) = relay_url else {
+        return addr_json.to_string();
+    };
     let Ok(mut addr) = serde_json::from_str::<EndpointAddr>(addr_json) else {
         return addr_json.to_string();
     };
     let Ok(url) = relay_url.parse::<iroh::RelayUrl>() else {
         return addr_json.to_string();
     };
-    addr.addrs.retain(|a| !matches!(a, iroh::TransportAddr::Relay(_)));
+    addr.addrs
+        .retain(|a| !matches!(a, iroh::TransportAddr::Relay(_)));
     addr.addrs.insert(iroh::TransportAddr::Relay(url));
     serde_json::to_string(&addr).unwrap_or_else(|_| addr_json.to_string())
 }
@@ -1629,12 +1942,20 @@ impl RelaySet {
     /// tracker only ever manages URLs it itself inserts via [`sync`](Self::sync),
     /// never the endpoint's bind-time relay config.
     pub fn new(ep: Endpoint) -> Arc<RelaySet> {
-        Arc::new(RelaySet { ep, applied: Mutex::new(std::collections::HashSet::new()) })
+        Arc::new(RelaySet {
+            ep,
+            applied: Mutex::new(std::collections::HashSet::new()),
+        })
     }
 
     /// The URLs currently applied by THIS tracker (for diagnostics/tests).
     pub async fn applied(&self) -> Vec<String> {
-        self.applied.lock().await.iter().map(|u| u.to_string()).collect()
+        self.applied
+            .lock()
+            .await
+            .iter()
+            .map(|u| u.to_string())
+            .collect()
     }
 
     /// Reconcile the endpoint's live relay map to exactly `desired` (parsed from
@@ -1691,7 +2012,10 @@ fn load_or_create_secret(path: &std::path::Path) -> iroh::SecretKey {
         }
         tracing::info!(?path, "generated + persisted iroh identity");
     } else {
-        tracing::warn!(?path, "could not persist iroh key; identity will be ephemeral");
+        tracing::warn!(
+            ?path,
+            "could not persist iroh key; identity will be ephemeral"
+        );
     }
     sk
 }
@@ -1707,12 +2031,22 @@ pub async fn dial(ep: &Endpoint, addr: impl Into<EndpointAddr>) -> Result<P2pStr
     let conn = match tokio::time::timeout(connect_budget(), ep.connect(addr, HIVE_ALPN)).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("dial connect timeout after {}ms", connect_budget().as_millis())),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "dial connect timeout after {}ms",
+                connect_budget().as_millis()
+            ))
+        }
     };
     let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => return Err(e.into()),
-        Err(_) => return Err(anyhow::anyhow!("dial open_bi timeout after {}ms", open_budget().as_millis())),
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "dial open_bi timeout after {}ms",
+                open_budget().as_millis()
+            ))
+        }
     };
     send.write_all(&[STREAM_TUNNEL]).await?;
     send.flush().await?;
@@ -1752,7 +2086,17 @@ pub async fn serve_tunnels_with_join(
     gossip: Option<GossipHandler>,
     join: Option<JoinHandler>,
 ) {
-    serve_tunnels_full(ep, local_http, max_concurrency, trust, gossip, join, None).await
+    serve_tunnels_full(
+        ep,
+        local_http,
+        max_concurrency,
+        trust,
+        gossip,
+        join,
+        None,
+        None,
+    )
+    .await
 }
 
 /// [`serve_tunnels_with_join`] plus the generic raw-target surface: when a
@@ -1769,158 +2113,182 @@ pub async fn serve_tunnels_full(
     gossip: Option<GossipHandler>,
     join: Option<JoinHandler>,
     raw_resolver: Option<RawTargetResolver>,
+    browser_admission: Option<BrowserAdmissionHandler>,
 ) {
-    // Ceiling on concurrently-served inbound connections. Held for the LIFETIME
-    // of each connection's serving task (the permit moves into the spawn and
-    // drops when that task ends), so this bounds live connections rather than
-    // merely the accept rate. See `max_inbound_conns()`.
     let conn_limit = match max_inbound_conns() {
         0 => None,
         n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
     };
-    // SEPARATE budget for BROWSER_ALPN connections (gap-fleet-accept-loop-not-router):
-    // sharing `conn_limit` would let an admitted-but-flooding browser peer starve
-    // fleet-trunk (HIVE_ALPN) accepts on the exact same pool. Which budget a given
-    // `Incoming` draws from is decided BELOW, before the handshake even runs.
     let browser_conn_limit = match max_browser_conns() {
         0 => None,
         n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
     };
     while let Some(incoming) = ep.accept().await {
-        // Peek the proposed ALPN from the still-encrypted Initial packet
-        // BEFORE the handshake runs (`Incoming::decrypt()` is best-effort —
-        // "not guaranteed to succeed if the ClientHello spans multiple
-        // packets", noq-proto 1.1.1 — so a parse failure fails SAFE into the
-        // existing trunk budget below, never into a bypass of either budget).
-        // This is what makes the two budgets genuinely independent: if we
-        // instead learned the ALPN only after `incoming.await`, the permit
-        // gating that same await would already have to come from ONE shared
-        // pool, recreating the exact starvation this split exists to prevent.
-        let is_browser = incoming
+        // Unknown/fragmented ClientHello classification consumes the low-trust
+        // browser budget. Letting it consume the fleet budget would give a
+        // hostile client a deliberate route around browser isolation.
+        let proposed_browser = incoming
             .decrypt()
             .and_then(|d| d.alpns())
             .map(|alpns| {
                 alpns
                     .filter_map(Result::ok)
-                    .any(|p| p.as_ref() == BROWSER_ALPN)
+                    .any(|protocol| protocol.as_ref() == BROWSER_ALPN)
             })
-            .unwrap_or(false);
-        // Acquire BEFORE spawning: at the ceiling this awaits here, which stops
-        // the accept loop rather than spawning an unbounded backlog of tasks all
-        // waiting for the same permit — the latter would defeat the whole point.
-        let sem = if is_browser { &browser_conn_limit } else { &conn_limit };
+            .unwrap_or(true);
+        let sem = if proposed_browser {
+            &browser_conn_limit
+        } else {
+            &conn_limit
+        };
+        // Never await an exhausted semaphore in the single accept loop: doing
+        // so head-of-line blocks every later connection, including fleet trunks.
+        // Excess connections are rejected immediately; no waiter task or
+        // handshake queue can grow without bound.
         let permit = match sem {
-            Some(sem) => match sem.clone().acquire_owned().await {
-                Ok(p) => Some(p),
-                Err(_) => return, // semaphore closed — shutting down
+            Some(sem) => match sem.clone().try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(tokio::sync::TryAcquireError::NoPermits) => {
+                    tracing::warn!(
+                        class = if proposed_browser { "browser" } else { "fleet" },
+                        "P2P connection budget exhausted; rejecting connection"
+                    );
+                    continue;
+                }
+                Err(tokio::sync::TryAcquireError::Closed) => return,
             },
             None => None,
         };
-        if is_browser {
-            tokio::spawn(async move {
-                let _permit = permit; // released when this connection's task ends
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                // Real ALPN check, not just the pre-handshake peek above: a
-                // client that OFFERED both ALPNs but negotiated HIVE_ALPN (the
-                // endpoint's `.alpns()` order decides ALPN preference) must
-                // never fall through to the no-mode-byte browser echo path.
-                if conn.alpn() == BROWSER_ALPN {
-                    serve_browser_conn(conn).await;
-                }
-            });
-            continue;
-        }
         let local = local_http.clone();
         let trust = trust.clone();
         let gossip = gossip.clone();
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
+        let browser_admission = browser_admission.clone();
         tokio::spawn(async move {
-            let _permit = permit; // released when this connection's task ends
+            let _permit = permit;
             let conn = match incoming.await {
-                Ok(c) => c,
+                Ok(conn) => conn,
                 Err(_) => return,
             };
-            // The connection's cryptographic remote identity (ed25519, from the QUIC
-            // TLS handshake — unspoofable). Used for the optional #20 allowlist AND
-            // to bind signed-gossip messages to their sender (web3 verification).
-            let remote_id = conn.remote_id().to_string();
-            // #20 peer trust/attestation: when an allowlist is configured, only
-            // admit endpoints whose cryptographic iroh identity is trusted. With no
-            // join surface, dropping `conn` closes the QUIC connection (original
-            // behavior); with one, the connection survives so the peer can present
-            // its join proof — but every non-JOIN stream is refused until it does.
-            if let Some(trust) = &trust {
-                if !peer_trusted(trust, &remote_id) && join.is_none() {
-                    tracing::warn!(peer = %remote_id, "rejected untrusted P2P peer (#20 peer trust)");
+            if conn.alpn() == BROWSER_ALPN {
+                let remote_id = conn.remote_id().to_string();
+                let admitted = match browser_admission {
+                    Some(check) => check(remote_id.clone()).await,
+                    None => true,
+                };
+                if !admitted {
+                    tracing::warn!(peer = %remote_id, "rejected unadmitted browser peer");
+                    conn.close(
+                        browser_reset::FORBIDDEN.into(),
+                        b"browser admission required",
+                    );
                     return;
                 }
+                serve_browser_conn(conn).await;
+                return;
             }
-            // One inbound connection → many bi streams, each dispatched by mode.
-            // This already handles a pooled peer that multiplexes many requests
-            // over one connection (each request is a new stream here).
-            while let Ok((send, mut recv)) = conn.accept_bi().await {
-                let local = local.clone();
-                let gossip = gossip.clone();
-                let join = join.clone();
-                let raw_resolver = raw_resolver.clone();
-                let rid = remote_id.clone();
-                let trust = trust.clone();
-                tokio::spawn(async move {
-                    // Read the 1-byte mode selector that prefixes every stream.
-                    let mut mode = [0u8; 1];
-                    if recv.read_exact(&mut mode).await.is_err() {
-                        return;
+            if conn.alpn() == HIVE_ALPN {
+                serve_fleet_conn(
+                    conn,
+                    local,
+                    max_concurrency,
+                    trust,
+                    gossip,
+                    join,
+                    raw_resolver,
+                )
+                .await;
+            }
+        });
+    }
+}
+
+async fn serve_fleet_conn(
+    conn: Connection,
+    local: String,
+    max_concurrency: u32,
+    trust: Option<TrustSet>,
+    gossip: Option<GossipHandler>,
+    join: Option<JoinHandler>,
+    raw_resolver: Option<RawTargetResolver>,
+) {
+    let remote_id = conn.remote_id().to_string();
+    if let Some(trust) = &trust {
+        if !peer_trusted(trust, &remote_id) && join.is_none() {
+            tracing::warn!(peer = %remote_id, "rejected untrusted P2P peer (#20 peer trust)");
+            return;
+        }
+    }
+    while let Ok((send, mut recv)) = conn.accept_bi().await {
+        let local = local.clone();
+        let gossip = gossip.clone();
+        let join = join.clone();
+        let raw_resolver = raw_resolver.clone();
+        let rid = remote_id.clone();
+        let trust = trust.clone();
+        tokio::spawn(async move {
+            let mut mode = [0u8; 1];
+            if recv.read_exact(&mut mode).await.is_err() {
+                return;
+            }
+            let trusted = trust
+                .as_ref()
+                .map(|trust| peer_trusted(trust, &rid))
+                .unwrap_or(true);
+            if mode[0] == STREAM_JOIN {
+                if let Some(join) = join {
+                    serve_join(recv, send, join, rid).await;
+                }
+                return;
+            }
+            if !trusted {
+                tracing::warn!(peer = %rid, mode = mode[0], "dropped stream from untrusted peer (join required first)");
+                return;
+            }
+            match mode[0] {
+                STREAM_GOSSIP | STREAM_GOSSIP_SIGNED => {
+                    if let Some(gossip) = gossip {
+                        serve_gossip(
+                            recv,
+                            send,
+                            gossip,
+                            mode[0] == STREAM_GOSSIP_SIGNED,
+                            rid,
+                            trust,
+                        )
+                        .await;
                     }
-                    // Trust is re-read PER STREAM (not cached from accept time) so a
-                    // connection that joins mid-life is served immediately after.
-                    let trusted = trust.as_ref().map(|t| peer_trusted(t, &rid)).unwrap_or(true);
-                    if mode[0] == STREAM_JOIN {
-                        if let Some(j) = join {
-                            serve_join(recv, send, j, rid).await;
-                        }
-                        return;
-                    }
-                    if !trusted {
-                        tracing::warn!(peer = %rid, mode = mode[0], "dropped stream from untrusted peer (join required first)");
-                        return;
-                    }
-                    match mode[0] {
-                        STREAM_GOSSIP | STREAM_GOSSIP_SIGNED => {
-                            if let Some(h) = gossip {
-                                serve_gossip(recv, send, h, mode[0] == STREAM_GOSSIP_SIGNED, rid, trust).await;
-                            }
-                        }
-                        STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
-                        STREAM_RAW_TARGET => serve_raw_target(recv, send, raw_resolver).await,
-                        _ => {
-                            fluid_tunnel::TunnelServer::serve(
-                                tokio::io::join(recv, send),
-                                local,
-                                max_concurrency,
-                            )
-                            .await
-                        }
-                    }
-                });
+                }
+                STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
+                STREAM_RAW_TARGET => serve_raw_target(recv, send, raw_resolver).await,
+                _ => {
+                    fluid_tunnel::TunnelServer::serve(
+                        tokio::io::join(recv, send),
+                        local,
+                        max_concurrency,
+                    )
+                    .await
+                }
             }
         });
     }
 }
 
 /// Serves a single `hive/browser/0` connection: one connection → many bi
-/// streams, each a bare `[u32 len][bytes]` request echoed straight back — NO
-/// mode-byte selector, NO gossip/join/raw dispatch, NO trust-set check. This
-/// is deliberately the SAME minimal contract as `hive_browser::BrowserNode`'s
-/// own accept loop, so the identical browser-side `echoTo` call that already
-/// round-trips browser-to-browser works unchanged against a real fleet node.
-/// Bigger asks on this ALPN (real request routing, admission scopes) are
-/// `bn-impl-invoke-routing`/`bn-impl-mesh-admission`'s job, layered on top of
-/// this same accept path — never by adding a mode byte or reaching into the
-/// HIVE_ALPN dispatch above.
+/// streams, each an op-tagged `[u32 len][op][payload]` request — NO mode-byte
+/// selector, NO gossip/join/raw dispatch, NO trust-set check. This is
+/// deliberately the SAME contract as `hive_browser::BrowserNode`'s own accept
+/// loop (both sides read it out of `hive-browser-proto`), so the identical
+/// browser-side call that round-trips browser-to-browser works unchanged
+/// against a real fleet node. Bigger asks on this ALPN (real request routing,
+/// admission scopes) are `bn-impl-invoke-routing`/`bn-impl-mesh-admission`'s
+/// job, layered on top of this same accept path — never by adding a mode byte
+/// or reaching into the HIVE_ALPN dispatch above.
+///
+/// The reply carries NO op byte. Echoing the request frame back verbatim — as
+/// this did before the op byte existed — hands the caller the op byte as the
+/// first character of the reply body, which silently corrupts every echo.
 async fn serve_browser_conn(conn: Connection) {
     while let Ok((mut send, mut recv)) = conn.accept_bi().await {
         tokio::spawn(async move {
@@ -1928,17 +2296,39 @@ async fn serve_browser_conn(conn: Connection) {
             if recv.read_exact(&mut lenb).await.is_err() {
                 return;
             }
-            let len = u32::from_le_bytes(lenb) as usize;
-            if len > BROWSER_MAX_FRAME {
-                let _ = send.reset(2u32.into());
-                return;
-            }
+            let len = match check_len(lenb) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "browser stream refused");
+                    let _ = send.reset(e.reset_code().into());
+                    return;
+                }
+            };
             let mut buf = vec![0u8; len];
             if recv.read_exact(&mut buf).await.is_err() {
                 return;
             }
-            if send.write_all(&lenb).await.is_ok() && send.write_all(&buf).await.is_ok() {
-                let _ = send.finish();
+            let (op, payload) = match split_request(&buf) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "browser stream refused");
+                    let _ = send.reset(e.reset_code().into());
+                    return;
+                }
+            };
+            match op {
+                Op::Echo => {
+                    if send.write_all(&encode_reply(payload)).await.is_ok() {
+                        let _ = send.finish();
+                    }
+                }
+                // A fleet node has no browser function runtime or demand-side
+                // asset store to hand these to. Refuse LOUDLY with the shared
+                // "understood but unserved" code rather than replying empty.
+                Op::Invoke | Op::AssetGet => {
+                    tracing::debug!(?op, "browser op refused: no handler on a fleet node");
+                    let _ = send.reset(browser_reset::NO_HANDLER.into());
+                }
             }
         });
     }
@@ -2054,7 +2444,10 @@ async fn serve_gossip<R, W>(
                 // signature (rejected in Enforce, logged in Log mode). No
                 // trust set configured => unchanged behavior (today's
                 // default, tracked as a separate infra-level decision).
-                let trusted = trust.as_ref().map(|t| peer_trusted(t, &signer)).unwrap_or(true);
+                let trusted = trust
+                    .as_ref()
+                    .map(|t| peer_trusted(t, &signer))
+                    .unwrap_or(true);
                 if trusted {
                     verified_signer = Some(signer);
                 } else if mode == VerifyMode::Enforce {
@@ -2296,11 +2689,17 @@ mod trust_tests {
         for s in &seeds {
             assert_eq!(s.node_id, id, "node_id extracted");
             // addr_json round-trips to an EndpointAddr with the right id.
-            assert_eq!(super::endpoint_id_from_addr_json(&s.addr_json).as_deref(), Some(id));
+            assert_eq!(
+                super::endpoint_id_from_addr_json(&s.addr_json).as_deref(),
+                Some(id)
+            );
         }
         // The @addr entry carries the direct addresses; the bare entry doesn't.
         let with_addrs = &seeds[1].addr_json;
-        assert!(with_addrs.contains("1.2.3.4") && with_addrs.contains("5.6.7.8"), "direct addrs preserved: {with_addrs}");
+        assert!(
+            with_addrs.contains("1.2.3.4") && with_addrs.contains("5.6.7.8"),
+            "direct addrs preserved: {with_addrs}"
+        );
         assert!(super::parse_bootstrap_seeds("").is_empty());
     }
 

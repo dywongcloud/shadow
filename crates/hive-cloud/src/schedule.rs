@@ -77,7 +77,9 @@ pub fn place_for_project(
         let nodes = cloud.registry.nodes();
         if let Some(n) = nodes.iter().find(|n| n.name == holder) {
             let region_ok = regions.is_empty()
-                || regions.iter().any(|r| r.trim().eq_ignore_ascii_case(&n.region));
+                || regions
+                    .iter()
+                    .any(|r| r.trim().eq_ignore_ascii_case(&n.region));
             let reachable = n.name == cloud.node_name
                 || cloud.node_admins.read().contains_key(&n.name)
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
@@ -85,15 +87,27 @@ pub fn place_for_project(
             if n.healthy && region_ok && reachable && gpu_ok {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 let target = if n.name == cloud.node_name {
-                    Target { node: n.name.clone(), admin: None, iroh: None }
+                    Target {
+                        node: n.name.clone(),
+                        admin: None,
+                        iroh: None,
+                    }
                 } else if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
-                    Target { node: n.name.clone(), admin: Some(a), iroh: None }
+                    Target {
+                        node: n.name.clone(),
+                        admin: Some(a),
+                        iroh: None,
+                    }
                 } else {
                     let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
                         (Some(id), Some(addr)) => Some((id, addr)),
                         _ => None,
                     };
-                    Target { node: n.name.clone(), admin: None, iroh }
+                    Target {
+                        node: n.name.clone(),
+                        admin: None,
+                        iroh,
+                    }
                 };
                 return vec![target];
             }
@@ -159,16 +173,28 @@ pub fn place(
     // iroh (id, addr) when no HTTP path exists (NAT'd coordinator → FC over the mesh).
     let target_of = |n: &NodeInfo| -> Target {
         if n.name == me {
-            return Target { node: n.name.clone(), admin: None, iroh: None };
+            return Target {
+                node: n.name.clone(),
+                admin: None,
+                iroh: None,
+            };
         }
         if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
-            return Target { node: n.name.clone(), admin: Some(a), iroh: None };
+            return Target {
+                node: n.name.clone(),
+                admin: Some(a),
+                iroh: None,
+            };
         }
         let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
             (Some(id), Some(addr)) => Some((id, addr)),
             _ => None,
         };
-        Target { node: n.name.clone(), admin: None, iroh }
+        Target {
+            node: n.name.clone(),
+            admin: None,
+            iroh,
+        }
     };
     // A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it
     // over the iroh mesh (has a peer id + dialable address). The last case is what lets
@@ -287,7 +313,11 @@ pub fn place(
                 tracing::warn!(region = %region, "placement: no GPU-capable node in this region — not widening (gpu request)");
                 continue;
             }
-            let mut pool = if eligibles.is_empty() { cands } else { eligibles };
+            let mut pool = if eligibles.is_empty() {
+                cands
+            } else {
+                eligibles
+            };
             // Order by load, then by MOST free disk. The disk term is what
             // actively drains a filling node instead of merely refusing it
             // once it is already over the floor (Reverse => larger first).
@@ -304,7 +334,11 @@ pub fn place(
             // brand-new node became the sink for every build. Self only wins the
             // region it's actually IN; other regions still pick the least-loaded
             // node there.
-            let chosen = pool.iter().copied().find(|n| n.name == me).unwrap_or(pool[0]);
+            let chosen = pool
+                .iter()
+                .copied()
+                .find(|n| n.name == me)
+                .unwrap_or(pool[0]);
             if seen.insert(chosen.name.clone()) {
                 targets.push(target_of(chosen));
             }
@@ -320,7 +354,10 @@ pub fn place(
             (Some(a), Some(b)) => Some((a, b)),
             _ => None,
         });
-    let mut elig: Vec<&NodeInfo> = nodes.iter().filter(|n| capable(n) && reachable(n)).collect();
+    let mut elig: Vec<&NodeInfo> = nodes
+        .iter()
+        .filter(|n| capable(n) && reachable(n))
+        .collect();
     if elig.is_empty() {
         // Empty = "no target chosen". For an ordinary deployment the caller hosts
         // locally, which is the long-standing safe default. For a GPU request the
@@ -351,7 +388,11 @@ pub fn place(
     // mirror path. A local build has full log fidelity and no mesh dependency.
     // When `self` isn't eligible (e.g. a mock/LA coordinator), the nearest
     // eligible remote still wins.
-    let chosen = elig.iter().copied().find(|n| n.name == me).unwrap_or(elig[0]);
+    let chosen = elig
+        .iter()
+        .copied()
+        .find(|n| n.name == me)
+        .unwrap_or(elig[0]);
     vec![target_of(chosen)]
 }
 
@@ -360,7 +401,15 @@ mod tests {
     use super::*;
     use hive_edge::NodeInfo;
 
-    fn node(name: &str, region: &str, backend: &str, mem: u64, lat: f64, lon: f64, healthy: bool) -> NodeInfo {
+    fn node(
+        name: &str,
+        region: &str,
+        backend: &str,
+        mem: u64,
+        lat: f64,
+        lon: f64,
+        healthy: bool,
+    ) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
             gpu_model: None,
@@ -406,28 +455,54 @@ mod tests {
     // `admins` = nodes we have an HTTP admin URL for; a node is ALSO reachable if it has
     // an iroh address (peer_id + iroh_addr) — mirrors the real `reachable` so a NAT'd
     // coordinator can place on FC nodes over the mesh.
-    fn pick_with(nodes: &[NodeInfo], me: &str, regions: &[&str], admins: &std::collections::HashSet<String>) -> Vec<String> {
+    fn pick_with(
+        nodes: &[NodeInfo],
+        me: &str,
+        regions: &[&str],
+        admins: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
         let reachable = |n: &NodeInfo| {
-            n.name == me || admins.contains(&n.name) || (n.peer_id.is_some() && n.iroh_addr.is_some())
+            n.name == me
+                || admins.contains(&n.name)
+                || (n.peer_id.is_some() && n.iroh_addr.is_some())
         };
         let regions: Vec<String> = regions.iter().map(|r| r.to_lowercase()).collect();
         if !regions.is_empty() {
             let mut out = Vec::new();
             for r in &regions {
-                let cands: Vec<&NodeInfo> = nodes.iter().filter(|n| n.healthy && n.region == *r && reachable(n)).collect();
-                if cands.is_empty() { continue; }
+                let cands: Vec<&NodeInfo> = nodes
+                    .iter()
+                    .filter(|n| n.healthy && n.region == *r && reachable(n))
+                    .collect();
+                if cands.is_empty() {
+                    continue;
+                }
                 let elig: Vec<&NodeInfo> = cands.iter().copied().filter(|n| eligible(n)).collect();
                 let pool = if elig.is_empty() { cands } else { elig };
                 out.push(pool[0].name.clone());
             }
             return out;
         }
-        let self_geo = nodes.iter().find(|n| n.name == me).and_then(|n| Some((n.lat?, n.lon?)));
-        let mut elig: Vec<&NodeInfo> = nodes.iter().filter(|n| eligible(n) && reachable(n)).collect();
-        if elig.is_empty() { return vec![]; }
+        let self_geo = nodes
+            .iter()
+            .find(|n| n.name == me)
+            .and_then(|n| Some((n.lat?, n.lon?)));
+        let mut elig: Vec<&NodeInfo> = nodes
+            .iter()
+            .filter(|n| eligible(n) && reachable(n))
+            .collect();
+        if elig.is_empty() {
+            return vec![];
+        }
         elig.sort_by(|a, b| {
-            let da = match (self_geo, a.lat, a.lon) { (Some(s), Some(x), Some(y)) => haversine_km(s, (x, y)), _ => f64::MAX };
-            let db = match (self_geo, b.lat, b.lon) { (Some(s), Some(x), Some(y)) => haversine_km(s, (x, y)), _ => f64::MAX };
+            let da = match (self_geo, a.lat, a.lon) {
+                (Some(s), Some(x), Some(y)) => haversine_km(s, (x, y)),
+                _ => f64::MAX,
+            };
+            let db = match (self_geo, b.lat, b.lon) {
+                (Some(s), Some(x), Some(y)) => haversine_km(s, (x, y)),
+                _ => f64::MAX,
+            };
             da.partial_cmp(&db).unwrap()
         });
         vec![elig[0].name.clone()]
@@ -435,17 +510,44 @@ mod tests {
 
     // Back-compat wrapper: every non-self node has an HTTP admin URL.
     fn pick(nodes: &[NodeInfo], me: &str, regions: &[&str]) -> Vec<String> {
-        let admins: std::collections::HashSet<String> =
-            nodes.iter().filter(|n| n.name != me).map(|n| n.name.clone()).collect();
+        let admins: std::collections::HashSet<String> = nodes
+            .iter()
+            .filter(|n| n.name != me)
+            .map(|n| n.name.clone())
+            .collect();
         pick_with(nodes, me, regions, &admins)
     }
 
     fn mesh() -> Vec<NodeInfo> {
         vec![
             node("node-a", "los-angeles", "mock", 16000, 34.05, -118.24, true),
-            node("fc-sanjose", "san-jose", "firecracker", 63000, 37.35, -121.95, true),
-            node("fc-virginia", "virginia", "firecracker", 63000, 39.04, -77.48, true),
-            node("fc-bangkok", "bangkok", "firecracker", 96000, 13.75, 100.5, true),
+            node(
+                "fc-sanjose",
+                "san-jose",
+                "firecracker",
+                63000,
+                37.35,
+                -121.95,
+                true,
+            ),
+            node(
+                "fc-virginia",
+                "virginia",
+                "firecracker",
+                63000,
+                39.04,
+                -77.48,
+                true,
+            ),
+            node(
+                "fc-bangkok",
+                "bangkok",
+                "firecracker",
+                96000,
+                13.75,
+                100.5,
+                true,
+            ),
         ]
     }
 
@@ -492,7 +594,11 @@ mod tests {
         }
         let no_admins = std::collections::HashSet::new(); // no HTTP admin URLs at all
         let got = pick_with(&nodes, "node-a", &["virginia", "bangkok"], &no_admins);
-        assert_eq!(got, vec!["fc-virginia", "fc-bangkok"], "iroh-reachable FC nodes are placed, not stranded");
+        assert_eq!(
+            got,
+            vec!["fc-virginia", "fc-bangkok"],
+            "iroh-reachable FC nodes are placed, not stranded"
+        );
         // Without iroh AND without admins, those regions are unreachable → empty (caller
         // then hosts locally — the old, broken behavior we fixed).
         let plain = mesh();

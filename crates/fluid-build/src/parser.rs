@@ -30,7 +30,10 @@ pub struct BuildOutput {
 
 impl BuildOutput {
     pub fn serverless_count(&self) -> usize {
-        self.functions.iter().filter(|f| !f.config.is_edge()).count()
+        self.functions
+            .iter()
+            .filter(|f| !f.config.is_edge())
+            .count()
     }
     pub fn edge_count(&self) -> usize {
         self.functions.iter().filter(|f| f.config.is_edge()).count()
@@ -55,7 +58,12 @@ pub fn parse_build_output(repo: &Path) -> anyhow::Result<BuildOutput> {
     let functions = parse_functions(&root.join("functions"))?;
     let static_files = list_static(&root.join("static"));
 
-    Ok(BuildOutput { config, functions, static_files, root })
+    Ok(BuildOutput {
+        config,
+        functions,
+        static_files,
+        root,
+    })
 }
 
 fn parse_functions(dir: &Path) -> anyhow::Result<Vec<DeployedFunction>> {
@@ -69,7 +77,11 @@ fn parse_functions(dir: &Path) -> anyhow::Result<Vec<DeployedFunction>> {
 
 /// Recursively find `*.func` directories (functions can be nested, e.g.
 /// `api/users/[id].func`).
-fn collect_func_dirs(base: &Path, dir: &Path, out: &mut Vec<DeployedFunction>) -> anyhow::Result<()> {
+fn collect_func_dirs(
+    base: &Path,
+    dir: &Path,
+    out: &mut Vec<DeployedFunction>,
+) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -83,7 +95,12 @@ fn collect_func_dirs(base: &Path, dir: &Path, out: &mut Vec<DeployedFunction>) -
                 let config = parse_vc_config(&v)?;
                 let name = func_name(base, &path);
                 let prerender = read_prerender(base, &name);
-                out.push(DeployedFunction { name, dir: path, config, prerender });
+                out.push(DeployedFunction {
+                    name,
+                    dir: path,
+                    config,
+                    prerender,
+                });
             }
         } else {
             // Descend into ordinary directories that may contain nested funcs.
@@ -110,7 +127,9 @@ fn read_prerender(base: &Path, name: &str) -> Option<PrerenderConfig> {
 fn list_static(dir: &Path) -> Vec<String> {
     let mut out = Vec::new();
     fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -141,7 +160,9 @@ mod tests {
         let out = tmp.join(".vercel/output");
         let _ = fs::remove_dir_all(&tmp);
 
-        write(&out.join("config.json"), r#"{
+        write(
+            &out.join("config.json"),
+            r#"{
             "version": 3,
             "routes": [
                 { "handle": "filesystem" },
@@ -149,19 +170,32 @@ mod tests {
             ],
             "images": { "sizes": [640, 1080], "formats": ["image/avif"] },
             "crons": [{ "path": "/api/cron", "schedule": "0 0 * * *" }]
-        }"#);
+        }"#,
+        );
 
         // a serverless function
-        write(&out.join("functions/api/hello.func/.vc-config.json"), r#"{
+        write(
+            &out.join("functions/api/hello.func/.vc-config.json"),
+            r#"{
             "runtime": "nodejs20.x", "handler": "index.js", "memory": 1024, "maxDuration": 10
-        }"#);
-        write(&out.join("functions/api/hello.func/index.js"), "export default () => {}");
+        }"#,
+        );
+        write(
+            &out.join("functions/api/hello.func/index.js"),
+            "export default () => {}",
+        );
 
         // an edge middleware function
-        write(&out.join("functions/middleware.func/.vc-config.json"), r#"{
+        write(
+            &out.join("functions/middleware.func/.vc-config.json"),
+            r#"{
             "runtime": "edge", "entrypoint": "middleware.js"
-        }"#);
-        write(&out.join("functions/middleware.func/middleware.js"), "export default () => {}");
+        }"#,
+        );
+        write(
+            &out.join("functions/middleware.func/middleware.js"),
+            "export default () => {}",
+        );
 
         // static assets
         write(&out.join("static/index.html"), "<!doctype html>");

@@ -1,0 +1,11 @@
+{
+  "name": "@shadw/hive-browser",
+  "private": true,
+  "scripts": {
+    "build:runtime": "esbuild src-js/function-worker.js --bundle --format=iife --platform=browser --loader:.wasm=binary --define:import.meta.url='\"https://hive.invalid/function-worker.js\"'"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.8",
+    "quickjs-emscripten": "0.31.0"
+  }
+}

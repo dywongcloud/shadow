@@ -21,8 +21,8 @@ pub mod vercel_config;
 
 pub use build_output::{BuildOutputConfig, FunctionConfig, Route, BUILD_OUTPUT_VERSION};
 pub use framework::{
-    detect, detect_package_manager, package_manager, plan_build, BuildPlan, FrameworkPreset, PackageManagerDetection,
-    PackageManagerSource, Primitive, PRESETS,
+    detect, detect_package_manager, package_manager, plan_build, BuildPlan, FrameworkPreset,
+    PackageManagerDetection, PackageManagerSource, Primitive, PRESETS,
 };
 pub use nextjs::{detect_features, BuildFeatures};
 pub use parser::{has_build_output, parse_build_output, BuildOutput, DeployedFunction};
@@ -80,7 +80,9 @@ pub fn resolve(repo: &Path) -> anyhow::Result<Resolution> {
     if has_build_output(repo) {
         Ok(Resolution::Ready(parse_build_output(repo)?))
     } else {
-        Ok(Resolution::NeedsBuild(plan_build(repo, None, None, None, None)))
+        Ok(Resolution::NeedsBuild(plan_build(
+            repo, None, None, None, None,
+        )))
     }
 }
 
@@ -97,15 +99,29 @@ pub fn synthesize_config(primitive: Primitive) -> BuildOutputConfig {
         Primitive::Static => {
             // Serve files from the filesystem; SPA fallback to index.html.
             cfg.routes = vec![
-                Route { handle: Some("filesystem".into()), ..Default::default() },
-                Route { src: Some("/(.*)".into()), dest: Some("/index.html".into()), ..Default::default() },
+                Route {
+                    handle: Some("filesystem".into()),
+                    ..Default::default()
+                },
+                Route {
+                    src: Some("/(.*)".into()),
+                    dest: Some("/index.html".into()),
+                    ..Default::default()
+                },
             ];
         }
         Primitive::Serverless | Primitive::Hybrid => {
             // Static assets first, then everything else hits the function.
             cfg.routes = vec![
-                Route { handle: Some("filesystem".into()), ..Default::default() },
-                Route { src: Some("/(.*)".into()), dest: Some("/index".into()), ..Default::default() },
+                Route {
+                    handle: Some("filesystem".into()),
+                    ..Default::default()
+                },
+                Route {
+                    src: Some("/(.*)".into()),
+                    dest: Some("/index".into()),
+                    ..Default::default()
+                },
             ];
         }
     }
@@ -122,7 +138,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("an-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("package.json"), r#"{"dependencies":{"next":"14"}}"#).unwrap();
+        fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"next":"14"}}"#,
+        )
+        .unwrap();
 
         let a = analyze(&dir);
         assert_eq!(a.framework_slug, "nextjs");
@@ -136,6 +156,9 @@ mod tests {
     #[test]
     fn synthesize_static_has_spa_fallback() {
         let cfg = synthesize_config(Primitive::Static);
-        assert!(cfg.routes.iter().any(|r| r.dest.as_deref() == Some("/index.html")));
+        assert!(cfg
+            .routes
+            .iter()
+            .any(|r| r.dest.as_deref() == Some("/index.html")));
     }
 }

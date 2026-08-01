@@ -15,7 +15,11 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "shadw", version, about = "Command-line interface for the shadw peer-to-peer cloud")]
+#[command(
+    name = "shadw",
+    version,
+    about = "Command-line interface for the shadw peer-to-peer cloud"
+)]
 struct Cli {
     /// API base URL (env: SHADW_API_URL). Default http://127.0.0.1:8786.
     #[arg(long, global = true)]
@@ -222,7 +226,10 @@ enum DomCmd {
         zone: String,
     },
     /// Set the domain's nameservers.
-    Nameservers { domain: String, nameservers: Vec<String> },
+    Nameservers {
+        domain: String,
+        nameservers: Vec<String>,
+    },
     /// Reissue the managed SSL certificate.
     SslRenew { domain: String },
     /// DNS records.
@@ -291,12 +298,17 @@ enum HookCmd {
 #[derive(Subcommand)]
 enum TeamCmd {
     List,
-    Get { slug: String },
+    Get {
+        slug: String,
+    },
     /// Member management.
     #[command(subcommand)]
     Member(MemberCmd),
     /// Set a team's plan.
-    Plan { slug: String, plan: String },
+    Plan {
+        slug: String,
+        plan: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -307,7 +319,10 @@ enum MemberCmd {
         #[arg(long, default_value = "member")]
         role: String,
     },
-    Rm { slug: String, email: String },
+    Rm {
+        slug: String,
+        email: String,
+    },
 }
 
 // ---- keys ----
@@ -319,21 +334,29 @@ enum KeyCmd {
         #[arg(long, default_value = "owner")]
         role: String,
     },
-    Revoke { id: String },
+    Revoke {
+        id: String,
+    },
 }
 
 // ---- databases ----
 #[derive(Subcommand)]
 enum DbCmd {
     List,
-    Get { id: String },
+    Get {
+        id: String,
+    },
     Create {
         name: String,
         #[arg(long, default_value = "postgres")]
         engine: String,
     },
-    Delete { id: String },
-    Credentials { id: String },
+    Delete {
+        id: String,
+    },
+    Credentials {
+        id: String,
+    },
 }
 
 // ---- cron ----
@@ -345,7 +368,9 @@ enum CronCmd {
         schedule: String,
         url: String,
     },
-    Delete { id: String },
+    Delete {
+        id: String,
+    },
 }
 
 // ---- workflows ----
@@ -389,7 +414,9 @@ struct ApiArgs {
 async fn main() {
     let cli = Cli::parse();
     let out = Out { json: cli.json };
-    let explicit_token = cli.token.is_some() || std::env::var("SHADW_TOKEN").is_ok() || std::env::var("SHADW_API_KEY").is_ok();
+    let explicit_token = cli.token.is_some()
+        || std::env::var("SHADW_TOKEN").is_ok()
+        || std::env::var("SHADW_API_KEY").is_ok();
     let mut c = Client::resolve(cli.api.clone(), cli.token.clone(), cli.team.clone());
     // Mint-mode auto-login (config `internal_token`): transparently swap in a
     // fresh platform JWT so mutations pass the enforced ingress. No-op for the
@@ -416,11 +443,28 @@ async fn run(cli: Cli, c: &Client, out: Out) -> Result<()> {
             match d {
                 DepCmd::List => {
                     let v = c.get("/deployments").await?;
-                    out.table(&v, &[("id", "ID"), ("project", "PROJECT"), ("target", "ENV"), ("state", "STATE"), ("alias", "URL"), ("git.branch", "BRANCH")]);
+                    out.table(
+                        &v,
+                        &[
+                            ("id", "ID"),
+                            ("project", "PROJECT"),
+                            ("target", "ENV"),
+                            ("state", "STATE"),
+                            ("alias", "URL"),
+                            ("git.branch", "BRANCH"),
+                        ],
+                    );
                 }
-                DepCmd::Promote { id } => out.value(&c.post(&format!("/v1/deployments/{id}/promote"), json!({})).await?),
-                DepCmd::Delete { id } => out.value(&c.delete(&format!("/v1/deployments/{id}")).await?),
-                DepCmd::Resources { id } => out.value(&c.get(&format!("/v1/deployments/{id}/resources")).await?),
+                DepCmd::Promote { id } => out.value(
+                    &c.post(&format!("/v1/deployments/{id}/promote"), json!({}))
+                        .await?,
+                ),
+                DepCmd::Delete { id } => {
+                    out.value(&c.delete(&format!("/v1/deployments/{id}")).await?)
+                }
+                DepCmd::Resources { id } => {
+                    out.value(&c.get(&format!("/v1/deployments/{id}/resources")).await?)
+                }
             }
             Ok(())
         }
@@ -439,7 +483,13 @@ async fn run(cli: Cli, c: &Client, out: Out) -> Result<()> {
 
 async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
     match a {
-        AuthCmd::Login { token, api, team, email, internal_token } => {
+        AuthCmd::Login {
+            token,
+            api,
+            team,
+            email,
+            internal_token,
+        } => {
             let prev = client::load_config();
             let cfg = Config {
                 api: api.or_else(|| Some(c.api.clone())),
@@ -474,13 +524,19 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                     .get("/v1/apikeys")
                     .await
                     .ok()
-                    .and_then(|k| k.as_array().and_then(|a| a.first()).and_then(|k| k["team"].as_str().map(String::from)))
+                    .and_then(|k| {
+                        k.as_array()
+                            .and_then(|a| a.first())
+                            .and_then(|k| k["team"].as_str().map(String::from))
+                    })
                     .unwrap_or_else(|| "?".into()),
             };
             println!(
                 "Logged in to {} as {} (tenant: {}). Config saved to {}.",
                 cfg.api.as_deref().unwrap_or(""),
-                who["sub"].as_str().unwrap_or(cfg.email.as_deref().unwrap_or("?")),
+                who["sub"]
+                    .as_str()
+                    .unwrap_or(cfg.email.as_deref().unwrap_or("?")),
                 tenant,
                 client::config_path().display()
             );
@@ -489,7 +545,13 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
         AuthCmd::Whoami => {
             let cfg = client::load_config();
             println!("API:   {}", c.api);
-            println!("Token: {}", c.token.as_deref().map(mask).unwrap_or_else(|| "(none)".into()));
+            println!(
+                "Token: {}",
+                c.token
+                    .as_deref()
+                    .map(mask)
+                    .unwrap_or_else(|| "(none)".into())
+            );
             if let Some(t) = &c.team {
                 println!("Team:  {t}");
             }
@@ -500,11 +562,17 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 println!("Auth:  mint-mode (auto-refreshed platform JWT)");
             }
             let who = c.get("/v1/whoami").await?;
-            println!("Authenticated: {} (sub: {}, tenant: {})",
+            println!(
+                "Authenticated: {} (sub: {}, tenant: {})",
                 who["authenticated"].as_bool().unwrap_or(false),
                 who["sub"].as_str().unwrap_or("-"),
-                who["tenant"].as_str().unwrap_or("-"));
-            if let Some(admin) = c.token.as_deref().and_then(|t| client::jwt_claim_bool(t, "platform_admin")) {
+                who["tenant"].as_str().unwrap_or("-")
+            );
+            if let Some(admin) = c
+                .token
+                .as_deref()
+                .and_then(|t| client::jwt_claim_bool(t, "platform_admin"))
+            {
                 println!("Platform admin: {admin}");
             }
             // The key's own team, independent of whether this node bound an
@@ -518,14 +586,23 @@ async fn auth(a: AuthCmd, c: &Client, out: Out) -> Result<()> {
                 }
             }
             let auth = c.get("/v1/auth").await?;
-            println!("Auth enforced: {}", auth["enforced"].as_bool().unwrap_or(false));
+            println!(
+                "Auth enforced: {}",
+                auth["enforced"].as_bool().unwrap_or(false)
+            );
             Ok(())
         }
         AuthCmd::Token { sub, tenant, role } => {
             // Include the account email so the backend derives platform-operator
             // status from its own owner config (it never trusts a client claim).
             let email = client::load_config().email.unwrap_or_default();
-            out.value(&c.post("/v1/token", json!({ "sub": sub, "tenant": tenant, "role": role, "email": email })).await?);
+            out.value(
+                &c.post(
+                    "/v1/token",
+                    json!({ "sub": sub, "tenant": tenant, "role": role, "email": email }),
+                )
+                .await?,
+            );
             Ok(())
         }
         AuthCmd::Logout => {
@@ -554,7 +631,9 @@ fn build_deploy_body(
 ) -> Result<Value> {
     let mut env = serde_json::Map::new();
     for kv in env_pairs {
-        let (k, v) = kv.split_once('=').ok_or_else(|| anyhow!("invalid --env '{kv}', expected KEY=VALUE"))?;
+        let (k, v) = kv
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --env '{kv}', expected KEY=VALUE"))?;
         env.insert(k.to_string(), Value::String(v.to_string()));
     }
     let mut body = json!({ "repo_url": repo_url, "creator": "cli" });
@@ -580,13 +659,25 @@ fn build_deploy_body(
 }
 
 async fn deploy(a: DeployArgs, c: &Client, out: Out) -> Result<()> {
-    let body = build_deploy_body(&a.repo_url, &a.branch, &a.project, &a.root_dir, &a.target, a.no_cache, &a.env)?;
+    let body = build_deploy_body(
+        &a.repo_url,
+        &a.branch,
+        &a.project,
+        &a.root_dir,
+        &a.target,
+        a.no_cache,
+        &a.env,
+    )?;
     let res = c.post("/v1/git/deploy", body).await?;
     let build_id = res["build_id"].as_str().unwrap_or("").to_string();
     if out.json {
         out.value(&res);
     } else {
-        println!("Deploy started: build {} (project {})", build_id, res["project"].as_str().unwrap_or("?"));
+        println!(
+            "Deploy started: build {} (project {})",
+            build_id,
+            res["project"].as_str().unwrap_or("?")
+        );
         println!("Stream logs:  shadw build logs {build_id} --follow");
     }
     if a.follow && !build_id.is_empty() {
@@ -607,7 +698,10 @@ async fn follow_build(id: &str, follow: bool, c: &Client, out: Out) -> Result<()
         }
         if let Some(lines) = b["lines"].as_array() {
             for line in lines.iter().skip(shown) {
-                let text = line["line"].as_str().or_else(|| line.as_str()).unwrap_or("");
+                let text = line["line"]
+                    .as_str()
+                    .or_else(|| line.as_str())
+                    .unwrap_or("");
                 println!("{text}");
             }
             shown = lines.len();
@@ -629,33 +723,72 @@ async fn projects(p: ProjCmd, c: &Client, out: Out) -> Result<()> {
     match p {
         ProjCmd::List => {
             let v = c.get("/v1/gitops/projects").await?;
-            out.table(&v, &[("project", "PROJECT"), ("root_dir", "ROOT"), ("git.branch", "BRANCH"), ("production.alias", "PRODUCTION URL")]);
+            out.table(
+                &v,
+                &[
+                    ("project", "PROJECT"),
+                    ("root_dir", "ROOT"),
+                    ("git.branch", "BRANCH"),
+                    ("production.alias", "PRODUCTION URL"),
+                ],
+            );
         }
-        ProjCmd::Settings { project } => out.value(&c.get(&format!("/v1/projects/{project}/settings")).await?),
-        ProjCmd::Redeploy { project, target, no_cache } => {
+        ProjCmd::Settings { project } => {
+            out.value(&c.get(&format!("/v1/projects/{project}/settings")).await?)
+        }
+        ProjCmd::Redeploy {
+            project,
+            target,
+            no_cache,
+        } => {
             let mut body = json!({ "use_cache": !no_cache });
             if let Some(t) = target {
                 body["target"] = json!(t);
             }
-            out.value(&c.post(&format!("/v1/projects/{project}/redeploy"), body).await?);
+            out.value(
+                &c.post(&format!("/v1/projects/{project}/redeploy"), body)
+                    .await?,
+            );
         }
-        ProjCmd::Delete { project } => out.value(&c.delete(&format!("/v1/projects/{project}")).await?),
-        ProjCmd::Domain { project, domain } => {
-            out.value(&c.post(&format!("/v1/projects/{project}/domains"), json!({ "domain": domain })).await?)
+        ProjCmd::Delete { project } => {
+            out.value(&c.delete(&format!("/v1/projects/{project}")).await?)
         }
+        ProjCmd::Domain { project, domain } => out.value(
+            &c.post(
+                &format!("/v1/projects/{project}/domains"),
+                json!({ "domain": domain }),
+            )
+            .await?,
+        ),
         ProjCmd::Env(e) => match e {
             EnvCmd::List { project } => {
                 let s = c.get(&format!("/v1/projects/{project}/settings")).await?;
-                out.table(&s["env"], &[("key", "KEY"), ("target", "TARGET"), ("sensitive", "SENSITIVE")]);
+                out.table(
+                    &s["env"],
+                    &[
+                        ("key", "KEY"),
+                        ("target", "TARGET"),
+                        ("sensitive", "SENSITIVE"),
+                    ],
+                );
             }
-            EnvCmd::Set { project, key, value, target, sensitive } => out.value(
+            EnvCmd::Set {
+                project,
+                key,
+                value,
+                target,
+                sensitive,
+            } => out.value(
                 &c.post(
                     &format!("/v1/projects/{project}/env"),
                     json!({ "key": key, "value": value, "target": target, "sensitive": sensitive }),
                 )
                 .await?,
             ),
-            EnvCmd::Rm { project, key } => out.value(&c.delete(&format!("/v1/projects/{project}/env/{key}")).await?),
+            EnvCmd::Rm { project, key } => out.value(
+                &c.delete(&format!("/v1/projects/{project}/env/{key}"))
+                    .await?,
+            ),
         },
     }
     Ok(())
@@ -670,30 +803,84 @@ async fn domains(d: DomCmd, c: &Client, out: Out) -> Result<()> {
         DomCmd::Get { domain } => out.value(&c.get(&format!("/v1/domains/{domain}")).await?),
         DomCmd::Scan { domain } => out.value(&c.get(&format!("/v1/domains/{domain}/scan")).await?),
         DomCmd::Import { domain, zone } => {
-            let text = std::fs::read_to_string(&zone).map_err(|e| anyhow!("reading {zone}: {e}"))?;
-            out.value(&c.post(&format!("/v1/domains/{domain}/import"), json!({ "zone": text })).await?);
+            let text =
+                std::fs::read_to_string(&zone).map_err(|e| anyhow!("reading {zone}: {e}"))?;
+            out.value(
+                &c.post(
+                    &format!("/v1/domains/{domain}/import"),
+                    json!({ "zone": text }),
+                )
+                .await?,
+            );
         }
-        DomCmd::Nameservers { domain, nameservers } => {
-            out.value(&c.put(&format!("/v1/domains/{domain}/nameservers"), json!({ "nameservers": nameservers })).await?)
-        }
-        DomCmd::SslRenew { domain } => out.value(&c.post(&format!("/v1/domains/{domain}/ssl/renew"), json!({})).await?),
+        DomCmd::Nameservers {
+            domain,
+            nameservers,
+        } => out.value(
+            &c.put(
+                &format!("/v1/domains/{domain}/nameservers"),
+                json!({ "nameservers": nameservers }),
+            )
+            .await?,
+        ),
+        DomCmd::SslRenew { domain } => out.value(
+            &c.post(&format!("/v1/domains/{domain}/ssl/renew"), json!({}))
+                .await?,
+        ),
         DomCmd::Record(r) => match r {
             RecordCmd::List { domain } => {
                 let dv = c.get(&format!("/v1/domains/{domain}")).await?;
-                let recs = dv.get("domain").and_then(|d| d.get("records")).cloned().unwrap_or(dv["records"].clone());
-                out.table(&recs, &[("type", "TYPE"), ("name", "NAME"), ("value", "VALUE"), ("ttl", "TTL"), ("id", "ID")]);
+                let recs = dv
+                    .get("domain")
+                    .and_then(|d| d.get("records"))
+                    .cloned()
+                    .unwrap_or(dv["records"].clone());
+                out.table(
+                    &recs,
+                    &[
+                        ("type", "TYPE"),
+                        ("name", "NAME"),
+                        ("value", "VALUE"),
+                        ("ttl", "TTL"),
+                        ("id", "ID"),
+                    ],
+                );
             }
-            RecordCmd::Add { domain, kind, name, value, ttl, priority } => {
+            RecordCmd::Add {
+                domain,
+                kind,
+                name,
+                value,
+                ttl,
+                priority,
+            } => {
                 let mut body = json!({ "type": kind, "name": name, "value": value, "ttl": ttl });
                 if let Some(p) = priority {
                     body["priority"] = json!(p);
                 }
-                out.value(&c.post(&format!("/v1/domains/{domain}/records"), body).await?);
+                out.value(
+                    &c.post(&format!("/v1/domains/{domain}/records"), body)
+                        .await?,
+                );
             }
-            RecordCmd::Update { domain, id, kind, name, value, ttl } => out.value(
-                &c.put(&format!("/v1/domains/{domain}/records/{id}"), json!({ "type": kind, "name": name, "value": value, "ttl": ttl })).await?,
+            RecordCmd::Update {
+                domain,
+                id,
+                kind,
+                name,
+                value,
+                ttl,
+            } => out.value(
+                &c.put(
+                    &format!("/v1/domains/{domain}/records/{id}"),
+                    json!({ "type": kind, "name": name, "value": value, "ttl": ttl }),
+                )
+                .await?,
             ),
-            RecordCmd::Rm { domain, id } => out.value(&c.delete(&format!("/v1/domains/{domain}/records/{id}")).await?),
+            RecordCmd::Rm { domain, id } => out.value(
+                &c.delete(&format!("/v1/domains/{domain}/records/{id}"))
+                    .await?,
+            ),
         },
     }
     Ok(())
@@ -707,8 +894,19 @@ async fn webhooks(h: HookCmd, c: &Client, out: Out) -> Result<()> {
         }
         HookCmd::Events => out.value(&c.get("/v1/webhooks/events").await?),
         HookCmd::Deliveries => out.value(&c.get("/v1/webhooks/deliveries").await?),
-        HookCmd::Create { url, project, events } => {
-            let ev: Vec<String> = events.map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()).unwrap_or_default();
+        HookCmd::Create {
+            url,
+            project,
+            events,
+        } => {
+            let ev: Vec<String> = events
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
             let body = json!({ "url": url, "events": ev });
             let path = match project {
                 Some(p) => format!("/v1/projects/{p}/webhooks"),
@@ -729,12 +927,22 @@ async fn teams(t: TeamCmd, c: &Client, out: Out) -> Result<()> {
         }
         TeamCmd::Get { slug } => out.value(&c.get(&format!("/v1/teams/{slug}")).await?),
         TeamCmd::Member(m) => match m {
-            MemberCmd::Add { slug, email, role } => {
-                out.value(&c.post(&format!("/v1/teams/{slug}/members"), json!({ "email": email, "role": role })).await?)
-            }
-            MemberCmd::Rm { slug, email } => out.value(&c.delete(&format!("/v1/teams/{slug}/members/{email}")).await?),
+            MemberCmd::Add { slug, email, role } => out.value(
+                &c.post(
+                    &format!("/v1/teams/{slug}/members"),
+                    json!({ "email": email, "role": role }),
+                )
+                .await?,
+            ),
+            MemberCmd::Rm { slug, email } => out.value(
+                &c.delete(&format!("/v1/teams/{slug}/members/{email}"))
+                    .await?,
+            ),
         },
-        TeamCmd::Plan { slug, plan } => out.value(&c.put(&format!("/v1/teams/{slug}/plan"), json!({ "plan": plan })).await?),
+        TeamCmd::Plan { slug, plan } => out.value(
+            &c.put(&format!("/v1/teams/{slug}/plan"), json!({ "plan": plan }))
+                .await?,
+        ),
     }
     Ok(())
 }
@@ -743,13 +951,27 @@ async fn keys(k: KeyCmd, c: &Client, out: Out) -> Result<()> {
     match k {
         KeyCmd::List => {
             let v = c.get("/v1/apikeys").await?;
-            out.table(&v, &[("id", "ID"), ("name", "NAME"), ("prefix", "PREFIX"), ("team", "TEAM"), ("role", "ROLE")]);
+            out.table(
+                &v,
+                &[
+                    ("id", "ID"),
+                    ("name", "NAME"),
+                    ("prefix", "PREFIX"),
+                    ("team", "TEAM"),
+                    ("role", "ROLE"),
+                ],
+            );
         }
         KeyCmd::Create { name, role } => {
-            let v = c.post("/v1/apikeys", json!({ "name": name, "role": role })).await?;
+            let v = c
+                .post("/v1/apikeys", json!({ "name": name, "role": role }))
+                .await?;
             if !out.json {
                 if let Some(tok) = v["token"].as_str() {
-                    println!("Created key '{}'. Save this token now — it is shown only once:\n\n  {}\n", name, tok);
+                    println!(
+                        "Created key '{}'. Save this token now — it is shown only once:\n\n  {}\n",
+                        name, tok
+                    );
                     return Ok(());
                 }
             }
@@ -764,12 +986,25 @@ async fn databases(d: DbCmd, c: &Client, out: Out) -> Result<()> {
     match d {
         DbCmd::List => {
             let v = c.get("/v1/databases").await?;
-            out.table(&v, &[("id", "ID"), ("name", "NAME"), ("engine", "ENGINE"), ("status", "STATUS")]);
+            out.table(
+                &v,
+                &[
+                    ("id", "ID"),
+                    ("name", "NAME"),
+                    ("engine", "ENGINE"),
+                    ("status", "STATUS"),
+                ],
+            );
         }
         DbCmd::Get { id } => out.value(&c.get(&format!("/v1/databases/{id}")).await?),
-        DbCmd::Create { name, engine } => out.value(&c.post("/v1/databases", json!({ "name": name, "engine": engine })).await?),
+        DbCmd::Create { name, engine } => out.value(
+            &c.post("/v1/databases", json!({ "name": name, "engine": engine }))
+                .await?,
+        ),
         DbCmd::Delete { id } => out.value(&c.delete(&format!("/v1/databases/{id}")).await?),
-        DbCmd::Credentials { id } => out.value(&c.get(&format!("/v1/databases/{id}/credentials")).await?),
+        DbCmd::Credentials { id } => {
+            out.value(&c.get(&format!("/v1/databases/{id}/credentials")).await?)
+        }
     }
     Ok(())
 }
@@ -778,11 +1013,27 @@ async fn cron(cr: CronCmd, c: &Client, out: Out) -> Result<()> {
     match cr {
         CronCmd::List => {
             let v = c.get("/v1/cron").await?;
-            out.table(&v, &[("id", "ID"), ("name", "NAME"), ("schedule", "SCHEDULE"), ("url", "URL")]);
+            out.table(
+                &v,
+                &[
+                    ("id", "ID"),
+                    ("name", "NAME"),
+                    ("schedule", "SCHEDULE"),
+                    ("url", "URL"),
+                ],
+            );
         }
-        CronCmd::Add { name, schedule, url } => {
-            out.value(&c.post("/v1/cron", json!({ "name": name, "schedule": schedule, "url": url })).await?)
-        }
+        CronCmd::Add {
+            name,
+            schedule,
+            url,
+        } => out.value(
+            &c.post(
+                "/v1/cron",
+                json!({ "name": name, "schedule": schedule, "url": url }),
+            )
+            .await?,
+        ),
         CronCmd::Delete { id } => out.value(&c.delete(&format!("/v1/cron/{id}")).await?),
     }
     Ok(())
@@ -792,7 +1043,10 @@ async fn workflows(w: WfCmd, c: &Client, out: Out) -> Result<()> {
     match w {
         WfCmd::List => out.value(&c.get("/v1/workflows").await?),
         WfCmd::Runs => out.value(&c.get("/v1/workflows/runs").await?),
-        WfCmd::Run { id } => out.value(&c.post(&format!("/v1/workflows/{id}/run"), json!({})).await?),
+        WfCmd::Run { id } => out.value(
+            &c.post(&format!("/v1/workflows/{id}/run"), json!({}))
+                .await?,
+        ),
     }
     Ok(())
 }
@@ -806,7 +1060,15 @@ async fn observability(o: ObsCmd, c: &Client, out: Out) -> Result<()> {
         ObsCmd::Regions => out.value(&c.get("/v1/regions").await?),
         ObsCmd::Nodes => {
             let v = c.get("/v1/nodes").await?;
-            out.table(&v, &[("name", "NAME"), ("region", "REGION"), ("healthy", "HEALTHY"), ("public_url", "URL")]);
+            out.table(
+                &v,
+                &[
+                    ("name", "NAME"),
+                    ("region", "REGION"),
+                    ("healthy", "HEALTHY"),
+                    ("public_url", "URL"),
+                ],
+            );
         }
     }
     Ok(())
@@ -838,7 +1100,16 @@ mod tests {
 
     #[test]
     fn deploy_body_minimal_only_repo_and_creator() {
-        let b = build_deploy_body("https://github.com/a/b", &None, &None, &None, &None, false, &[]).unwrap();
+        let b = build_deploy_body(
+            "https://github.com/a/b",
+            &None,
+            &None,
+            &None,
+            &None,
+            false,
+            &[],
+        )
+        .unwrap();
         assert_eq!(b["repo_url"], "https://github.com/a/b");
         assert_eq!(b["creator"], "cli");
         // Optional fields are omitted when unset (so the server applies defaults).
@@ -873,7 +1144,16 @@ mod tests {
 
     #[test]
     fn deploy_body_rejects_malformed_env() {
-        let err = build_deploy_body("r", &None, &None, &None, &None, false, &["NOEQUALS".to_string()]).unwrap_err();
+        let err = build_deploy_body(
+            "r",
+            &None,
+            &None,
+            &None,
+            &None,
+            false,
+            &["NOEQUALS".to_string()],
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("KEY=VALUE"));
     }
 
@@ -883,7 +1163,7 @@ mod tests {
         assert!(m.starts_with("hive_12345"));
         assert!(m.ends_with("fXYZ"));
         assert!(!m.contains("67890abcde")); // middle is hidden
-        // Short tokens fully masked.
+                                            // Short tokens fully masked.
         assert_eq!(mask("short"), "****");
     }
 }

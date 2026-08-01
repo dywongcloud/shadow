@@ -85,7 +85,14 @@ impl RuntimeCache {
 
     /// Store a value with an optional TTL (seconds; 0 = no expiry) and tags.
     /// Enforces Vercel's item/tag limits; LRU-evicts when full.
-    pub fn set(&self, scope: &str, key: &str, value: Vec<u8>, ttl_secs: u64, tags: Vec<String>) -> Result<(), String> {
+    pub fn set(
+        &self,
+        scope: &str,
+        key: &str,
+        value: Vec<u8>,
+        ttl_secs: u64,
+        tags: Vec<String>,
+    ) -> Result<(), String> {
         use std::sync::atomic::Ordering;
         if value.len() > MAX_ITEM_BYTES {
             return Err(format!("item exceeds {MAX_ITEM_BYTES} bytes"));
@@ -94,27 +101,49 @@ impl RuntimeCache {
             return Err(format!("more than {MAX_TAGS_PER_ITEM} tags"));
         }
         if let Some(t) = tags.iter().find(|t| t.len() > MAX_TAG_LEN) {
-            return Err(format!("tag '{}' exceeds {MAX_TAG_LEN} bytes", &t[..t.len().min(32)]));
+            return Err(format!(
+                "tag '{}' exceeds {MAX_TAG_LEN} bytes",
+                &t[..t.len().min(32)]
+            ));
         }
         let now = now_ms();
-        let expires_ms = if ttl_secs == 0 { 0 } else { now + ttl_secs * 1000 };
+        let expires_ms = if ttl_secs == 0 {
+            0
+        } else {
+            now + ttl_secs * 1000
+        };
         let fk = Self::full_key(scope, key);
         let recency = self.tick.fetch_add(1, Ordering::Relaxed);
         let mut map = self.map.lock();
         // LRU eviction when at capacity (and inserting a new key).
         if map.len() >= self.max_entries && !map.contains_key(&fk) {
-            if let Some(victim) = map.iter().min_by_key(|(_, e)| e.recency).map(|(k, _)| k.clone()) {
+            if let Some(victim) = map
+                .iter()
+                .min_by_key(|(_, e)| e.recency)
+                .map(|(k, _)| k.clone())
+            {
                 map.remove(&victim);
             }
         }
-        map.insert(fk, Entry { value, expires_ms, tags, recency });
+        map.insert(
+            fk,
+            Entry {
+                value,
+                expires_ms,
+                tags,
+                recency,
+            },
+        );
         self.writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     /// Delete a single key. Returns true if it existed.
     pub fn delete(&self, scope: &str, key: &str) -> bool {
-        self.map.lock().remove(&Self::full_key(scope, key)).is_some()
+        self.map
+            .lock()
+            .remove(&Self::full_key(scope, key))
+            .is_some()
     }
 
     /// Invalidate every entry in `scope` carrying `tag` (Vercel `revalidateTag`).
@@ -171,7 +200,8 @@ mod tests {
     #[test]
     fn set_get_delete() {
         let c = RuntimeCache::new();
-        c.set("proj:production", "k", b"v".to_vec(), 60, vec!["t1".into()]).unwrap();
+        c.set("proj:production", "k", b"v".to_vec(), 60, vec!["t1".into()])
+            .unwrap();
         assert_eq!(c.get("proj:production", "k").as_deref(), Some(&b"v"[..]));
         // Scope isolation: same key, different env -> miss.
         assert!(c.get("proj:preview", "k").is_none());
@@ -192,9 +222,12 @@ mod tests {
     #[test]
     fn tag_revalidation() {
         let c = RuntimeCache::new();
-        c.set("s", "a", b"1".to_vec(), 60, vec!["blog".into()]).unwrap();
-        c.set("s", "b", b"2".to_vec(), 60, vec!["blog".into(), "x".into()]).unwrap();
-        c.set("s", "c", b"3".to_vec(), 60, vec!["other".into()]).unwrap();
+        c.set("s", "a", b"1".to_vec(), 60, vec!["blog".into()])
+            .unwrap();
+        c.set("s", "b", b"2".to_vec(), 60, vec!["blog".into(), "x".into()])
+            .unwrap();
+        c.set("s", "c", b"3".to_vec(), 60, vec!["other".into()])
+            .unwrap();
         let n = c.revalidate_tag("s", "blog");
         assert_eq!(n, 2);
         assert!(c.get("s", "a").is_none());
@@ -205,10 +238,20 @@ mod tests {
     #[test]
     fn enforces_limits() {
         let c = RuntimeCache::new();
-        assert!(c.set("s", "big", vec![0u8; MAX_ITEM_BYTES + 1], 0, vec![]).is_err());
+        assert!(c
+            .set("s", "big", vec![0u8; MAX_ITEM_BYTES + 1], 0, vec![])
+            .is_err());
         let too_many: Vec<String> = (0..MAX_TAGS_PER_ITEM + 1).map(|i| i.to_string()).collect();
         assert!(c.set("s", "k", b"v".to_vec(), 0, too_many).is_err());
-        assert!(c.set("s", "k", b"v".to_vec(), 0, vec!["x".repeat(MAX_TAG_LEN + 1)]).is_err());
+        assert!(c
+            .set(
+                "s",
+                "k",
+                b"v".to_vec(),
+                0,
+                vec!["x".repeat(MAX_TAG_LEN + 1)]
+            )
+            .is_err());
     }
 
     #[test]
@@ -227,8 +270,10 @@ mod tests {
     #[test]
     fn scope_purge() {
         let c = RuntimeCache::new();
-        c.set("p1:production", "k", b"v".to_vec(), 0, vec![]).unwrap();
-        c.set("p2:production", "k", b"v".to_vec(), 0, vec![]).unwrap();
+        c.set("p1:production", "k", b"v".to_vec(), 0, vec![])
+            .unwrap();
+        c.set("p2:production", "k", b"v".to_vec(), 0, vec![])
+            .unwrap();
         assert_eq!(c.purge_scope("p1:production"), 1);
         assert!(c.get("p1:production", "k").is_none());
         assert!(c.get("p2:production", "k").is_some());

@@ -41,7 +41,9 @@ impl Reply {
             Reply::Int(i) => serde_json::json!(i),
             Reply::Null => serde_json::Value::Null,
             Reply::Error(e) => serde_json::json!({ "error": e }),
-            Reply::Array(items) => serde_json::Value::Array(items.iter().map(|r| r.to_json()).collect()),
+            Reply::Array(items) => {
+                serde_json::Value::Array(items.iter().map(|r| r.to_json()).collect())
+            }
         }
     }
 }
@@ -62,7 +64,11 @@ pub fn encode_command(parts: &[String]) -> Vec<u8> {
 /// malicious/broken server can't stack-overflow us. `budget` is the CUMULATIVE
 /// bulk-string bytes remaining across the whole pipeline/command call (shared
 /// across recursive/sibling calls via the `&mut` — see [`REPLY_BYTE_BUDGET`]).
-pub async fn read_reply(r: &mut BufReader<TcpStream>, depth: u8, budget: &mut i64) -> Result<Reply> {
+pub async fn read_reply(
+    r: &mut BufReader<TcpStream>,
+    depth: u8,
+    budget: &mut i64,
+) -> Result<Reply> {
     if depth > 16 {
         bail!("RESP reply nested too deep");
     }
@@ -71,7 +77,10 @@ pub async fn read_reply(r: &mut BufReader<TcpStream>, depth: u8, budget: &mut i6
     match tag {
         "+" => Ok(Reply::Text(rest.to_string())),
         "-" => Ok(Reply::Error(rest.to_string())),
-        ":" => Ok(Reply::Int(rest.parse::<i64>().map_err(|_| anyhow!("bad RESP integer"))?)),
+        ":" => Ok(Reply::Int(
+            rest.parse::<i64>()
+                .map_err(|_| anyhow!("bad RESP integer"))?,
+        )),
         "$" => {
             let n: i64 = rest.parse().map_err(|_| anyhow!("bad RESP bulk length"))?;
             if n < 0 {
@@ -82,7 +91,10 @@ pub async fn read_reply(r: &mut BufReader<TcpStream>, depth: u8, budget: &mut i6
                 bail!("RESP bulk string too large ({n} bytes)");
             }
             if n > *budget {
-                bail!("cumulative reply size exceeds the {}MiB budget for this call", REPLY_BYTE_BUDGET / (1024 * 1024));
+                bail!(
+                    "cumulative reply size exceeds the {}MiB budget for this call",
+                    REPLY_BYTE_BUDGET / (1024 * 1024)
+                );
             }
             *budget -= n;
             let mut buf = vec![0u8; n as usize + 2]; // + trailing \r\n
@@ -135,18 +147,27 @@ async fn read_line(r: &mut BufReader<TcpStream>) -> Result<String> {
 /// One connection per REST call — correct-first; pooling is a later increment.
 pub async fn run_command(port: u16, password: &str, parts: &[String]) -> Result<Reply> {
     let replies = run_pipeline(port, password, std::slice::from_ref(&parts.to_vec())).await?;
-    replies.into_iter().next().ok_or_else(|| anyhow!("no reply"))
+    replies
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no reply"))
 }
 
 /// Run several commands on ONE connection (the `/pipeline` REST endpoint), in
 /// order, collecting one reply per command. Commands are written back-to-back
 /// then replies drained — true pipelining, not N round-trips.
-pub async fn run_pipeline(port: u16, password: &str, commands: &[Vec<String>]) -> Result<Vec<Reply>> {
+pub async fn run_pipeline(
+    port: u16,
+    password: &str,
+    commands: &[Vec<String>],
+) -> Result<Vec<Reply>> {
     let stream = TcpStream::connect(("127.0.0.1", port)).await?;
     let mut r = BufReader::new(stream);
     let mut budget = REPLY_BYTE_BUDGET;
     if !password.is_empty() {
-        r.get_mut().write_all(&encode_command(&["AUTH".into(), password.into()])).await?;
+        r.get_mut()
+            .write_all(&encode_command(&["AUTH".into(), password.into()]))
+            .await?;
         match read_reply(&mut r, 0, &mut budget).await? {
             Reply::Text(_) => {}
             Reply::Error(e) => bail!("redis AUTH failed: {e}"),
@@ -199,9 +220,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live redis on 127.0.0.1:56379 with --requirepass testpw (see doc comment)"]
     async fn redis_wire_round_trip_and_pipeline_ordering() {
-        let r = run_command(56379, "testpw", &["SET".into(), "k1".into(), "v1".into()]).await.unwrap();
+        let r = run_command(56379, "testpw", &["SET".into(), "k1".into(), "v1".into()])
+            .await
+            .unwrap();
         assert_eq!(r, Reply::Text("OK".into()));
-        let r = run_command(56379, "testpw", &["GET".into(), "k1".into()]).await.unwrap();
+        let r = run_command(56379, "testpw", &["GET".into(), "k1".into()])
+            .await
+            .unwrap();
         assert_eq!(r, Reply::Text("v1".into()));
 
         // True pipeline: replies must come back in the SAME order as commands.
@@ -212,16 +237,26 @@ mod tests {
             vec!["GET".into(), "b".into()],
         ];
         let replies = run_pipeline(56379, "testpw", &cmds).await.unwrap();
-        assert_eq!(replies[2], Reply::Text("1".into()), "reply order must match command order");
+        assert_eq!(
+            replies[2],
+            Reply::Text("1".into()),
+            "reply order must match command order"
+        );
         assert_eq!(replies[3], Reply::Text("2".into()));
 
         // Cumulative byte budget: N moderately-sized values must eventually trip
         // the budget even though each individual value is well under the 64MiB
         // per-bulk cap — proving the fix is a real cumulative check, not a no-op.
         let big = "x".repeat(2 * 1024 * 1024); // 2MiB
-        run_command(56379, "testpw", &["SET".into(), "big".into(), big]).await.unwrap();
-        let many_gets: Vec<Vec<String>> = (0..40).map(|_| vec!["GET".into(), "big".into()]).collect(); // 40 x 2MiB = 80MiB > 64MiB budget
+        run_command(56379, "testpw", &["SET".into(), "big".into(), big])
+            .await
+            .unwrap();
+        let many_gets: Vec<Vec<String>> =
+            (0..40).map(|_| vec!["GET".into(), "big".into()]).collect(); // 40 x 2MiB = 80MiB > 64MiB budget
         let err = run_pipeline(56379, "testpw", &many_gets).await.unwrap_err();
-        assert!(err.to_string().contains("budget"), "expected the cumulative byte budget to trip, got: {err}");
+        assert!(
+            err.to_string().contains("budget"),
+            "expected the cumulative byte budget to trip, got: {err}"
+        );
     }
 }

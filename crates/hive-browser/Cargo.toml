@@ -17,6 +17,13 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# The `hive/browser/0` wire contract, shared verbatim with the native fleet-side
+# implementation in `crates/hive-p2p`. Workspace exclusion (above) does NOT stop
+# a path dependency on a workspace member, so there is no reason to restate any
+# of these constants locally — the two implementations must agree byte-for-byte
+# and a comment asking future editors to keep them in sync already failed once.
+hive-browser-proto = { path = "../hive-browser-proto" }
+
 # iroh's browser build: default-features=false ALSO drops tls-ring and cfg's out
 # the N0/Minimal endpoint presets (they are gated on `with_crypto_provider`), so
 # the docs' bare `default-features = false` line silently produces an endpoint
@@ -46,6 +53,7 @@ tokio = { version = "1", default-features = false, features = ["sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
+blake3 = "1"
 tracing = "0.1"
 tracing-wasm = "0.2"
 console_error_panic_hook = "0.1"

@@ -29,13 +29,17 @@ pub struct ResponseCache {
 
 impl ResponseCache {
     pub fn new() -> ResponseCache {
-        ResponseCache { map: RwLock::new(HashMap::new()) }
+        ResponseCache {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 
     /// A fresh (within `ttl`) cached value for `key`, if any.
     pub fn get(&self, key: &str, ttl: Duration) -> Option<Value> {
         let map = self.map.read();
-        map.get(key).filter(|e| e.at.elapsed() < ttl).map(|e| e.value.clone())
+        map.get(key)
+            .filter(|e| e.at.elapsed() < ttl)
+            .map(|e| e.value.clone())
     }
 
     /// Store `value` under `key`. Opportunistically sheds entries older than
@@ -44,7 +48,13 @@ impl ResponseCache {
     /// a cache this short-lived has no business holding stale entries anyway.
     pub fn set(&self, key: String, value: Value) {
         let mut map = self.map.write();
-        map.insert(key, Entry { at: Instant::now(), value });
+        map.insert(
+            key,
+            Entry {
+                at: Instant::now(),
+                value,
+            },
+        );
         if map.len() > 4_000 {
             map.retain(|_, e| e.at.elapsed() < Duration::from_secs(60));
         }

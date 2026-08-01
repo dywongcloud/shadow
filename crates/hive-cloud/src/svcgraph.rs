@@ -173,8 +173,14 @@ pub fn build_graph(
 
     // Detect a bundled monolith: a single deployable running BOTH a frontend and a
     // backend (e.g. a Dockerfile CMD that concurrently starts React + Express).
-    let backend = BACKEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(_, t)| *t);
-    let frontend = FRONTEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(_, t)| *t);
+    let backend = BACKEND_DEPS
+        .iter()
+        .find(|(d, _)| has_any(&scan.deps, d))
+        .map(|(_, t)| *t);
+    let frontend = FRONTEND_DEPS
+        .iter()
+        .find(|(d, _)| has_any(&scan.deps, d))
+        .map(|(_, t)| *t);
     let bundled = backend.is_some() && frontend.is_some();
 
     let start_cmd = derive_start_cmd(scan);
@@ -191,7 +197,14 @@ pub fn build_graph(
             tech: fe.into(),
             group: group.clone(),
             detail: "UI bundled in the same container".into(),
-            source: format!("dep: {}", FRONTEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(d, _)| *d).unwrap_or("")),
+            source: format!(
+                "dep: {}",
+                FRONTEND_DEPS
+                    .iter()
+                    .find(|(d, _)| has_any(&scan.deps, d))
+                    .map(|(d, _)| *d)
+                    .unwrap_or("")
+            ),
             start_cmd: start_cmd.clone(),
         });
         nodes.push(SvcNode {
@@ -201,17 +214,35 @@ pub fn build_graph(
             tech: be.into(),
             group: group.clone(),
             detail: "API bundled in the same container".into(),
-            source: format!("dep: {}", BACKEND_DEPS.iter().find(|(d, _)| has_any(&scan.deps, d)).map(|(d, _)| *d).unwrap_or("")),
+            source: format!(
+                "dep: {}",
+                BACKEND_DEPS
+                    .iter()
+                    .find(|(d, _)| has_any(&scan.deps, d))
+                    .map(|(d, _)| *d)
+                    .unwrap_or("")
+            ),
             start_cmd: start_cmd.clone(),
         });
         // Frontend calls backend (same PID) — show the internal edge.
-        edges.push(SvcEdge { from: "app-frontend".into(), to: "app-backend".into(), label: "internal".into() });
-        edges.push(SvcEdge { from: "ingress".into(), to: "app-frontend".into(), label: "".into() });
+        edges.push(SvcEdge {
+            from: "app-frontend".into(),
+            to: "app-backend".into(),
+            label: "internal".into(),
+        });
+        edges.push(SvcEdge {
+            from: "ingress".into(),
+            to: "app-frontend".into(),
+            label: "".into(),
+        });
         app_ids.push("app-frontend".into());
         app_ids.push("app-backend".into());
     } else {
         // Single app node — labelled by its framework/runtime.
-        let (tech, kind) = if !scan.framework_name.is_empty() && scan.framework != "static" && scan.framework != "node" {
+        let (tech, kind) = if !scan.framework_name.is_empty()
+            && scan.framework != "static"
+            && scan.framework != "node"
+        {
             (scan.framework_name.clone(), "app")
         } else if let Some(be) = backend {
             (be.to_string(), "backend")
@@ -231,10 +262,18 @@ pub fn build_graph(
             tech,
             group: group.clone(),
             detail: scan.readme.clone(),
-            source: if !scan.framework.is_empty() { format!("framework: {}", scan.framework) } else { "manifest".into() },
+            source: if !scan.framework.is_empty() {
+                format!("framework: {}", scan.framework)
+            } else {
+                "manifest".into()
+            },
             start_cmd: start_cmd.clone(),
         });
-        edges.push(SvcEdge { from: "ingress".into(), to: "app".into(), label: "".into() });
+        edges.push(SvcEdge {
+            from: "ingress".into(),
+            to: "app".into(),
+            label: "".into(),
+        });
         app_ids.push("app".into());
     }
 
@@ -253,14 +292,22 @@ pub fn build_graph(
         });
         // A consumed package is used by the primary app node.
         if let Some(app) = app_ids.first() {
-            edges.push(SvcEdge { from: app.clone(), to: id, label: "uses".into() });
+            edges.push(SvcEdge {
+                from: app.clone(),
+                to: id,
+                label: "uses".into(),
+            });
         }
     }
 
     // Databases/caches — ONLY when a client dep OR a connection env var proves use.
     // Dedup by kind so `pg` + `DATABASE_URL` don't draw two Postgres nodes.
     let mut seen_db: BTreeSet<&str> = BTreeSet::new();
-    let mut add_db = |kind: &'static str, tech: &str, source: String, nodes: &mut Vec<SvcNode>, edges: &mut Vec<SvcEdge>| {
+    let mut add_db = |kind: &'static str,
+                      tech: &str,
+                      source: String,
+                      nodes: &mut Vec<SvcNode>,
+                      edges: &mut Vec<SvcEdge>| {
         if !seen_db.insert(kind) {
             return;
         }
@@ -277,7 +324,11 @@ pub fn build_graph(
         });
         // All app nodes depend on the datastore.
         for app in &app_ids {
-            edges.push(SvcEdge { from: app.clone(), to: id.clone(), label: "".into() });
+            edges.push(SvcEdge {
+                from: app.clone(),
+                to: id.clone(),
+                label: "".into(),
+            });
         }
     };
     for (dep, kind, tech) in DB_DEPS {
@@ -304,7 +355,15 @@ pub fn build_graph(
 }
 
 fn slug(s: &str) -> String {
-    s.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 fn derive_start_cmd(scan: &Scan) -> Option<String> {
@@ -315,7 +374,9 @@ fn derive_start_cmd(scan: &Scan) -> Option<String> {
             return Some(strip_dockerfile_instruction_prefix(dockerfile_cmd));
         }
     }
-    scan.run_cmds.first().map(|c| strip_dockerfile_instruction_prefix(c))
+    scan.run_cmds
+        .first()
+        .map(|c| strip_dockerfile_instruction_prefix(c))
 }
 
 fn strip_dockerfile_instruction_prefix(c: &str) -> String {
@@ -347,7 +408,10 @@ fn readme_oneliner(text: &str) -> String {
         if l.is_empty() || l.starts_with("![") || l.starts_with("<") || l.starts_with("[!") {
             continue;
         }
-        let clean: String = l.chars().filter(|c| *c != '`' && *c != '*' && *c != '_').collect();
+        let clean: String = l
+            .chars()
+            .filter(|c| *c != '`' && *c != '*' && *c != '_')
+            .collect();
         let clean = clean.trim();
         if clean.len() >= 3 {
             return clean.chars().take(140).collect();
@@ -358,7 +422,12 @@ fn readme_oneliner(text: &str) -> String {
 
 /// Scan the checked-out build dir for service-graph signals. Bounded + best-effort:
 /// any read failure just yields fewer signals, never an error.
-pub fn scan_dir(build_dir: &Path, framework: &str, framework_name: &str, is_container: bool) -> Scan {
+pub fn scan_dir(
+    build_dir: &Path,
+    framework: &str,
+    framework_name: &str,
+    is_container: bool,
+) -> Scan {
     let mut scan = Scan {
         framework: framework.to_string(),
         framework_name: framework_name.to_string(),
@@ -386,7 +455,10 @@ pub fn scan_dir(build_dir: &Path, framework: &str, framework_name: &str, is_cont
             scan.has_dockerfile = true;
             for line in s.lines() {
                 let u = line.trim();
-                if u.starts_with("CMD ") || u.starts_with("ENTRYPOINT ") || u.starts_with("RUN ") && u.contains("concurrently") {
+                if u.starts_with("CMD ")
+                    || u.starts_with("ENTRYPOINT ")
+                    || u.starts_with("RUN ") && u.contains("concurrently")
+                {
                     scan.run_cmds.push(u.to_string());
                 }
             }
@@ -405,17 +477,28 @@ pub fn scan_dir(build_dir: &Path, framework: &str, framework_name: &str, is_cont
                     continue;
                 }
                 let pkgjson = p.join("package.json");
-                let Ok(s) = std::fs::read_to_string(&pkgjson) else { continue };
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else { continue };
+                let Ok(s) = std::fs::read_to_string(&pkgjson) else {
+                    continue;
+                };
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) else {
+                    continue;
+                };
                 let fallback = e.file_name().to_string_lossy().into_owned();
-                let name = v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string()).unwrap_or(fallback);
+                let name = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or(fallback);
                 // Fold the sub-package's deps into the consumed set (they run in-app).
                 deps_from_pkg(&v, &mut scan.deps);
                 // Guess the package's tech from its own deps.
                 let mut sub = BTreeSet::new();
                 deps_from_pkg(&v, &mut sub);
-                let tech = FRONTEND_DEPS.iter().chain(BACKEND_DEPS.iter())
-                    .find(|(d, _)| sub.contains(*d)).map(|(_, t)| t.to_string())
+                let tech = FRONTEND_DEPS
+                    .iter()
+                    .chain(BACKEND_DEPS.iter())
+                    .find(|(d, _)| sub.contains(*d))
+                    .map(|(_, t)| t.to_string())
                     .unwrap_or_else(|| "Package".into());
                 scan.packages.insert(name, tech);
             }
@@ -454,7 +537,9 @@ pub struct ServiceGraphStore {
 
 impl ServiceGraphStore {
     pub fn new() -> Self {
-        Self { map: RwLock::new(HashMap::new()) }
+        Self {
+            map: RwLock::new(HashMap::new()),
+        }
     }
     pub fn put(&self, g: ServiceGraph) {
         self.map.write().insert(g.deployment_id.clone(), g);
@@ -464,7 +549,12 @@ impl ServiceGraphStore {
     }
     /// Latest graph for a project (most recently generated).
     pub fn latest_for_project(&self, project: &str) -> Option<ServiceGraph> {
-        self.map.read().values().filter(|g| g.project == project).max_by_key(|g| g.generated_ms).cloned()
+        self.map
+            .read()
+            .values()
+            .filter(|g| g.project == project)
+            .max_by_key(|g| g.generated_ms)
+            .cloned()
     }
     pub fn snapshot(&self) -> Vec<ServiceGraph> {
         self.map.read().values().cloned().collect()
@@ -497,17 +587,34 @@ mod tests {
         let mut s = scan_with(&["react-scripts", "express", "pg"], "", "", true);
         s.has_dockerfile = true;
         let g = build_graph("outerbridge", "dpl-1", &s, &[]);
-        let fe = g.nodes.iter().find(|n| n.kind == "frontend").expect("frontend node");
-        let be = g.nodes.iter().find(|n| n.kind == "backend").expect("backend node");
+        let fe = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == "frontend")
+            .expect("frontend node");
+        let be = g
+            .nodes
+            .iter()
+            .find(|n| n.kind == "backend")
+            .expect("backend node");
         assert_eq!(fe.tech, "React");
         assert_eq!(be.tech, "Express");
         // Same PID/container → same group.
-        assert!(fe.group.is_some() && fe.group == be.group, "bundled → shared group");
+        assert!(
+            fe.group.is_some() && fe.group == be.group,
+            "bundled → shared group"
+        );
         // The pg dep → exactly one Postgres node.
         assert_eq!(g.nodes.iter().filter(|n| n.kind == "database").count(), 1);
-        assert!(g.nodes.iter().any(|n| n.kind == "database" && n.tech == "PostgreSQL"));
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| n.kind == "database" && n.tech == "PostgreSQL"));
         // Internal FE→BE edge exists.
-        assert!(g.edges.iter().any(|e| e.from == "app-frontend" && e.to == "app-backend"));
+        assert!(g
+            .edges
+            .iter()
+            .any(|e| e.from == "app-frontend" && e.to == "app-backend"));
     }
 
     #[test]
@@ -515,16 +622,31 @@ mod tests {
         // A plain Next.js app with NO db dep and NO db env → zero database nodes.
         let s = scan_with(&["next", "react"], "nextjs", "Next.js", false);
         let g = build_graph("blog", "dpl-2", &s, &["NEXT_PUBLIC_URL".into()]);
-        assert_eq!(g.nodes.iter().filter(|n| n.kind == "database").count(), 0, "no unused db node");
-        assert!(g.nodes.iter().any(|n| n.kind == "app" && n.tech == "Next.js"));
+        assert_eq!(
+            g.nodes.iter().filter(|n| n.kind == "database").count(),
+            0,
+            "no unused db node"
+        );
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| n.kind == "app" && n.tech == "Next.js"));
     }
 
     #[test]
     fn db_detected_from_env_var_alone() {
         // No client dep, but a DATABASE_URL env → still draw Postgres (it's consumed).
         let s = scan_with(&["next"], "nextjs", "Next.js", false);
-        let g = build_graph("app", "dpl-3", &s, &["DATABASE_URL".into(), "SECRET".into()]);
-        assert!(g.nodes.iter().any(|n| n.kind == "database" && n.tech == "PostgreSQL"));
+        let g = build_graph(
+            "app",
+            "dpl-3",
+            &s,
+            &["DATABASE_URL".into(), "SECRET".into()],
+        );
+        assert!(g
+            .nodes
+            .iter()
+            .any(|n| n.kind == "database" && n.tech == "PostgreSQL"));
         // env keys are recorded by NAME only.
         assert!(g.env_keys.contains(&"DATABASE_URL".to_string()));
     }
@@ -550,6 +672,9 @@ mod tests {
     fn readme_oneliner_strips_markdown() {
         assert_eq!(readme_oneliner("# My App\n\nDescription here"), "My App");
         assert_eq!(readme_oneliner("![badge](x)\n# Real Title"), "Real Title");
-        assert_eq!(readme_oneliner("**Bold Intro** to the app"), "Bold Intro to the app");
+        assert_eq!(
+            readme_oneliner("**Bold Intro** to the app"),
+            "Bold Intro to the app"
+        );
     }
 }

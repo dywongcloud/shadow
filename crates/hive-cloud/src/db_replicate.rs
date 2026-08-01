@@ -34,13 +34,25 @@ use crate::state::CloudState;
 /// or an iroh (id, addr) route. `None` when the node is unreachable.
 fn target_for(cloud: &Arc<CloudState>, n: &NodeInfo) -> Option<Target> {
     if n.name == cloud.node_name {
-        return Some(Target { node: n.name.clone(), admin: None, iroh: None });
+        return Some(Target {
+            node: n.name.clone(),
+            admin: None,
+            iroh: None,
+        });
     }
     if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
-        return Some(Target { node: n.name.clone(), admin: Some(a), iroh: None });
+        return Some(Target {
+            node: n.name.clone(),
+            admin: Some(a),
+            iroh: None,
+        });
     }
     match (n.peer_id.clone(), n.iroh_addr.clone()) {
-        (Some(id), Some(addr)) => Some(Target { node: n.name.clone(), admin: None, iroh: Some((id, addr)) }),
+        (Some(id), Some(addr)) => Some(Target {
+            node: n.name.clone(),
+            admin: None,
+            iroh: Some((id, addr)),
+        }),
         _ => None,
     }
 }
@@ -95,9 +107,17 @@ async fn send_replica_rpc(cloud: &Arc<CloudState>, t: &Target, op: &str, db: &Da
             .map(|r| r.status().is_success())
             .unwrap_or(false)
     } else if let Some((id, addr)) = &t.iroh {
-        crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, "/v1/databases/replica", &body, 15)
-            .await
-            .is_some()
+        crate::gossip::request_to(
+            cloud,
+            id,
+            addr,
+            hive_p2p::GOSSIP_POST,
+            "/v1/databases/replica",
+            &body,
+            15,
+        )
+        .await
+        .is_some()
     } else {
         false
     }
@@ -167,7 +187,10 @@ fn mirror_targets(cloud: &Arc<CloudState>, team: &str, raw_name: &str) -> Vec<Ta
             && db_storage_name(d) == Some(raw_name)
     });
     match db {
-        Some(d) => replica_targets(cloud, &d).into_iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).collect(),
+        Some(d) => replica_targets(cloud, &d)
+            .into_iter()
+            .filter(|t| t.admin.is_some() || t.iroh.is_some())
+            .collect(),
         None => Vec::new(),
     }
 }
@@ -249,7 +272,11 @@ fn send_mirrored(
         for t in targets {
             let ok = if let Some(admin) = &t.admin {
                 let url = format!("{admin}{rel_path}");
-                let rb = if method == "PUT" { cloud.http.put(&url) } else { cloud.http.post(&url) };
+                let rb = if method == "PUT" {
+                    cloud.http.put(&url)
+                } else {
+                    cloud.http.post(&url)
+                };
                 // Short-lived signed proof of tenant identity for the receiving node's
                 // write_scope() to verify — mirrors mesh_team_qs's iroh-path token so a
                 // client-forged x-hive-mirror/x-hive-team pair can never redirect a write
@@ -271,9 +298,14 @@ fn send_mirrored(
                 // Over the mesh: encode team + mirror flag in the query; the gossip
                 // dispatch reconstructs the storage write on the replica.
                 let sep = if rel_path.contains('?') { '&' } else { '?' };
-                let p = format!("{rel_path}{sep}mirror=1&{}", crate::admin::mesh_team_qs(&team));
+                let p = format!(
+                    "{rel_path}{sep}mirror=1&{}",
+                    crate::admin::mesh_team_qs(&team)
+                );
                 // Bumped from 10s for fresh-discovery fallback headroom (see admin.rs::fetch_from_host).
-                crate::gossip::request_to(&cloud, id, addr, hive_p2p::GOSSIP_POST, &p, &body, 15).await.is_some()
+                crate::gossip::request_to(&cloud, id, addr, hive_p2p::GOSSIP_POST, &p, &body, 15)
+                    .await
+                    .is_some()
             } else {
                 false
             };

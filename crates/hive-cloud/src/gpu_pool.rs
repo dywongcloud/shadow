@@ -96,15 +96,23 @@ fn per_instance_reserve_mb(n: &hive_edge::NodeInfo) -> u64 {
 /// Sum of `instances` across every `gpu: true` function pool in `stats` — the
 /// live count of GPU-holding instances the reporting node currently has warm.
 fn live_gpu_instances(stats: &[fluid_compute::FunctionStats]) -> u64 {
-    stats.iter().filter(|s| s.gpu).map(|s| s.instances as u64).sum()
+    stats
+        .iter()
+        .filter(|s| s.gpu)
+        .map(|s| s.instances as u64)
+        .sum()
 }
 
 /// Build the current GPU pool snapshot, one entry per region that has at
 /// least one healthy GPU node. See module doc for the fan-out + allocate/
 /// release rationale.
 pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
-    let gpu_nodes: Vec<hive_edge::NodeInfo> =
-        cloud.registry.nodes().into_iter().filter(|n| n.healthy && n.gpu_count > 0).collect();
+    let gpu_nodes: Vec<hive_edge::NodeInfo> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.healthy && n.gpu_count > 0)
+        .collect();
 
     // Per-node live GPU-instance count: self from the in-process pool
     // directly (no network hop needed for our own state), every other GPU
@@ -112,9 +120,15 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
     // fleet-wide total like `fleet_function_stats` does, because free VRAM
     // needs the PER-NODE breakdown, not just a sum.
     let mut live_by_node: HashMap<String, u64> = HashMap::new();
-    live_by_node.insert(cloud.node_name.clone(), live_gpu_instances(&cloud.fluid.stats()));
-    let peer_names: Vec<String> =
-        gpu_nodes.iter().filter(|n| n.name != cloud.node_name).map(|n| n.name.clone()).collect();
+    live_by_node.insert(
+        cloud.node_name.clone(),
+        live_gpu_instances(&cloud.fluid.stats()),
+    );
+    let peer_names: Vec<String> = gpu_nodes
+        .iter()
+        .filter(|n| n.name != cloud.node_name)
+        .map(|n| n.name.clone())
+        .collect();
     let fetched = futures::future::join_all(peer_names.iter().map(|name| async move {
         let v = crate::admin::fetch_from_host(cloud, name, "/v1/functions?local=true", "").await;
         (name.clone(), v)
@@ -131,7 +145,9 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
     let mut by_region: HashMap<String, Vec<GpuPoolNode>> = HashMap::new();
     for n in &gpu_nodes {
         let live = live_by_node.get(&n.name).copied().unwrap_or(0);
-        let reserved_mb = per_instance_reserve_mb(n).saturating_mul(live).min(n.gpu_vram_mb);
+        let reserved_mb = per_instance_reserve_mb(n)
+            .saturating_mul(live)
+            .min(n.gpu_vram_mb);
         let estimated_free_mb = n.gpu_vram_mb.saturating_sub(reserved_mb);
         // Prefer what the DRIVER reports over what the instance count implies.
         //
@@ -154,13 +170,16 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
             Some(measured) => measured.min(estimated_free_mb),
             None => estimated_free_mb,
         };
-        by_region.entry(n.region.clone()).or_default().push(GpuPoolNode {
-            name: n.name.clone(),
-            gpu_model: n.gpu_model.clone(),
-            vram_total_mb: n.gpu_vram_mb,
-            vram_free_mb,
-            latency_ms: if n.is_self { 0 } else { n.latency_ms },
-        });
+        by_region
+            .entry(n.region.clone())
+            .or_default()
+            .push(GpuPoolNode {
+                name: n.name.clone(),
+                gpu_model: n.gpu_model.clone(),
+                vram_total_mb: n.gpu_vram_mb,
+                vram_free_mb,
+                latency_ms: if n.is_self { 0 } else { n.latency_ms },
+            });
     }
 
     let mut regions: Vec<GpuPoolRegion> = by_region
@@ -169,7 +188,12 @@ pub async fn snapshot(cloud: &Arc<CloudState>) -> Vec<GpuPoolRegion> {
             nodes.sort_by(|a, b| a.name.cmp(&b.name));
             let pool_vram_total_mb = nodes.iter().map(|n| n.vram_total_mb).sum();
             let pool_vram_free_mb = nodes.iter().map(|n| n.vram_free_mb).sum();
-            GpuPoolRegion { region, nodes, pool_vram_total_mb, pool_vram_free_mb }
+            GpuPoolRegion {
+                region,
+                nodes,
+                pool_vram_total_mb,
+                pool_vram_free_mb,
+            }
         })
         .collect();
     regions.sort_by(|a, b| a.region.cmp(&b.region));

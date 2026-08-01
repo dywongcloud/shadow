@@ -1009,8 +1009,10 @@ dependencies = [
 name = "hive-browser"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "console_error_panic_hook",
  "getrandom 0.3.4",
+ "hive-browser-proto",
  "iroh",
  "js-sys",
  "n0-future",
@@ -1024,6 +1026,10 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
 ]
+
+[[package]]
+name = "hive-browser-proto"
+version = "0.1.0"
 
 [[package]]
 name = "http"

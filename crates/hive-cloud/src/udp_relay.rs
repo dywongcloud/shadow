@@ -363,7 +363,11 @@ async fn open_upstream(cloud: &Arc<CloudState>, route: &UdpRoute) -> Option<Upst
     None
 }
 
-async fn local_upstream(cloud: &Arc<CloudState>, target: RawTarget, route: &UdpRoute) -> Option<Upstream> {
+async fn local_upstream(
+    cloud: &Arc<CloudState>,
+    target: RawTarget,
+    route: &UdpRoute,
+) -> Option<Upstream> {
     let conn = crate::mesh_raw::resolve(cloud, target).await?;
     tracing::debug!(port = route.public_port, backend = %conn.addr, "udp relay: local leg resolved");
     Some(Upstream::Local(conn))
@@ -376,12 +380,24 @@ async fn mesh_upstream(
     route: &UdpRoute,
 ) -> Option<Upstream> {
     let Some(pool) = cloud.mesh.read().clone() else {
-        tracing::warn!(port = route.public_port, "udp relay: mesh transport not bound; cannot forward to owner");
+        tracing::warn!(
+            port = route.public_port,
+            "udp relay: mesh transport not bound; cannot forward to owner"
+        );
         return None;
     };
-    let addr = cloud.registry.nodes().into_iter().find(|n| n.id == node).and_then(|n| n.iroh_addr);
+    let addr = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .find(|n| n.id == node)
+        .and_then(|n| n.iroh_addr);
     let Some(addr) = addr else {
-        tracing::warn!(port = route.public_port, node, "udp relay: owner node has no iroh address");
+        tracing::warn!(
+            port = route.public_port,
+            node,
+            "udp relay: owner node has no iroh address"
+        );
         return None;
     };
     match pool.open_raw_to_port(node, &addr, target).await {
@@ -394,7 +410,10 @@ async fn mesh_upstream(
             // handling as ws_proxy / the TCP raw proxy: stop ranking the node.
             if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
                 cloud.registry.set_health(node, u64::MAX, false);
-                tracing::warn!(node, "udp relay: peer marked unhealthy after connect/open timeout");
+                tracing::warn!(
+                    node,
+                    "udp relay: peer marked unhealthy after connect/open timeout"
+                );
             }
             tracing::warn!(port = route.public_port, node, error = %e, "udp relay: mesh leg failed");
             None

@@ -70,22 +70,43 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
 
     // ---- routes-manifest.json: redirects / rewrites / headers ----
     if let Some(rm) = read_json(&repo.join(".next/routes-manifest.json")) {
-        for r in rm.get("redirects").and_then(|v| v.as_array()).into_iter().flatten() {
-            if let (Some(src), Some(dst)) = (r.get("source").and_then(|v| v.as_str()), r.get("destination").and_then(|v| v.as_str())) {
-                let permanent = r.get("permanent").and_then(|v| v.as_bool()).unwrap_or(false);
+        for r in rm
+            .get("redirects")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(src), Some(dst)) = (
+                r.get("source").and_then(|v| v.as_str()),
+                r.get("destination").and_then(|v| v.as_str()),
+            ) {
+                let permanent = r
+                    .get("permanent")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let status = r
                     .get("statusCode")
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u16)
                     .unwrap_or(if permanent { 308 } else { 307 });
-                f.redirects.push(FeatureRedirect { source: src.to_string(), destination: dst.to_string(), status });
+                f.redirects.push(FeatureRedirect {
+                    source: src.to_string(),
+                    destination: dst.to_string(),
+                    status,
+                });
             }
         }
         // rewrites is either an array or { beforeFiles, afterFiles, fallback }.
         let collect_rewrites = |arr: &serde_json::Value, out: &mut Vec<FeatureRewrite>| {
             for r in arr.as_array().into_iter().flatten() {
-                if let (Some(src), Some(dst)) = (r.get("source").and_then(|v| v.as_str()), r.get("destination").and_then(|v| v.as_str())) {
-                    out.push(FeatureRewrite { source: src.to_string(), destination: dst.to_string() });
+                if let (Some(src), Some(dst)) = (
+                    r.get("source").and_then(|v| v.as_str()),
+                    r.get("destination").and_then(|v| v.as_str()),
+                ) {
+                    out.push(FeatureRewrite {
+                        source: src.to_string(),
+                        destination: dst.to_string(),
+                    });
                 }
             }
         };
@@ -108,8 +129,17 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
             // Usually keyed by "/"; collect matchers across entries.
             let mut matcher = Vec::new();
             for entry in mw.values() {
-                for m in entry.get("matchers").and_then(|v| v.as_array()).into_iter().flatten() {
-                    if let Some(rx) = m.get("originalSource").and_then(|v| v.as_str()).or_else(|| m.get("regexp").and_then(|v| v.as_str())) {
+                for m in entry
+                    .get("matchers")
+                    .and_then(|v| v.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(rx) = m
+                        .get("originalSource")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| m.get("regexp").and_then(|v| v.as_str()))
+                    {
                         matcher.push(rx.to_string());
                     }
                 }
@@ -117,7 +147,10 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
             if matcher.is_empty() {
                 matcher.push("/:path*".into());
             }
-            f.middleware = Some(FeatureMiddleware { matcher, runtime: "edge".into() });
+            f.middleware = Some(FeatureMiddleware {
+                matcher,
+                runtime: "edge".into(),
+            });
         }
         if let Some(funcs) = mm.get("functions").and_then(|v| v.as_object()) {
             for name in funcs.keys() {
@@ -169,20 +202,38 @@ pub fn detect_features(repo: &Path) -> BuildFeatures {
 pub fn from_build_output(repo: &Path) -> Option<BuildFeatures> {
     let cfg = read_json(&repo.join(".vercel/output/config.json"))?;
     let mut f = BuildFeatures::default();
-    for route in cfg.get("routes").and_then(|v| v.as_array()).into_iter().flatten() {
+    for route in cfg
+        .get("routes")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
         let src = route.get("src").and_then(|v| v.as_str());
         let dst = route.get("dest").and_then(|v| v.as_str());
-        let status = route.get("status").and_then(|v| v.as_u64()).map(|n| n as u16);
+        let status = route
+            .get("status")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as u16);
         if let Some(mw) = route.get("middlewarePath").and_then(|v| v.as_str()) {
             let _ = mw;
-            f.middleware.get_or_insert(FeatureMiddleware { matcher: vec!["/:path*".into()], runtime: "edge".into() });
+            f.middleware.get_or_insert(FeatureMiddleware {
+                matcher: vec!["/:path*".into()],
+                runtime: "edge".into(),
+            });
         }
         match (src, dst, status) {
             (Some(s), Some(d), Some(code)) if (300..400).contains(&code) => {
-                f.redirects.push(FeatureRedirect { source: s.to_string(), destination: d.to_string(), status: code });
+                f.redirects.push(FeatureRedirect {
+                    source: s.to_string(),
+                    destination: d.to_string(),
+                    status: code,
+                });
             }
             (Some(s), Some(d), _) if s != d && route.get("handle").is_none() => {
-                f.rewrites.push(FeatureRewrite { source: s.to_string(), destination: d.to_string() });
+                f.rewrites.push(FeatureRewrite {
+                    source: s.to_string(),
+                    destination: d.to_string(),
+                });
             }
             _ => {}
         }

@@ -107,7 +107,9 @@ pub(crate) fn try_decrypt(s: &str) -> Option<String> {
     nonce.copy_from_slice(nonce_b);
     for opener in std::iter::once(key()).chain(legacy_openers()) {
         let mut buf = ct.to_vec();
-        if let Ok(pt) = opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf) {
+        if let Ok(pt) =
+            opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+        {
             return Some(String::from_utf8_lossy(pt).into_owned());
         }
     }
@@ -125,14 +127,18 @@ pub(crate) fn try_decrypt(s: &str) -> Option<String> {
 /// loud line an operator can act on.
 pub(crate) fn audit_at_rest() {
     let dir = crate::persist::data_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     let (mut sealed, mut broken) = (0usize, 0usize);
     for e in entries.flatten() {
         let path = e.path();
         if path.extension().and_then(|x| x.to_str()) != Some("json") {
             continue;
         }
-        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
         for (i, _) in raw.match_indices(PREFIX) {
             // The sealed token runs to the next non-base64 character.
             let tail = &raw[i..];
@@ -169,7 +175,11 @@ fn legacy_openers() -> impl Iterator<Item = &'static LessSafeKey> {
         .get_or_init(|| {
             legacy_keys()
                 .iter()
-                .filter_map(|k| UnboundKey::new(&CHACHA20_POLY1305, k).ok().map(LessSafeKey::new))
+                .filter_map(|k| {
+                    UnboundKey::new(&CHACHA20_POLY1305, k)
+                        .ok()
+                        .map(LessSafeKey::new)
+                })
                 .collect()
         })
         .iter()
@@ -272,7 +282,9 @@ pub fn decrypt(s: &str) -> String {
     // `enc:v1:…` ciphertext as if it were the secret.
     for opener in std::iter::once(key()).chain(legacy_openers()) {
         let mut buf = ct.to_vec();
-        if let Ok(pt) = opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf) {
+        if let Ok(pt) =
+            opener.open_in_place(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+        {
             return String::from_utf8_lossy(pt).into_owned();
         }
     }

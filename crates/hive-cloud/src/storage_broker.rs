@@ -92,7 +92,10 @@ pub fn authorize_create(
     }
     let limit = snapshot_quota();
     if existing_count >= limit {
-        return Err(BrokerError::QuotaExceeded { limit, have: existing_count });
+        return Err(BrokerError::QuotaExceeded {
+            limit,
+            have: existing_count,
+        });
     }
     Ok(())
 }
@@ -131,6 +134,7 @@ fn snapshot_id_is_safe(s: &str) -> bool {
         && s.len() <= 128
         && s != ".."
         && !s.starts_with('.')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
         && !s.contains("..")
 }

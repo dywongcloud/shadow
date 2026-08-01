@@ -1,0 +1,18 @@
+[package]
+name = "hive-browser-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# ZERO dependencies, deliberately and permanently.
+#
+# This crate is the single definition of the `hive/browser/0` wire contract and
+# is compiled for BOTH targets: natively as a workspace member (hive-p2p) and
+# for wasm32-unknown-unknown by `crates/hive-browser`, which is EXCLUDED from
+# this workspace. A workspace-excluded crate can still path-depend on a member,
+# so exclusion never justified duplicating the contract — but that only holds
+# while this crate stays target-agnostic. Adding a dependency here risks pulling
+# something that does not build for wasm32 and silently re-splitting the two
+# implementations, which is the exact failure this crate exists to prevent.
+[dependencies]

@@ -94,6 +94,23 @@ fn enc_sorted<T: serde::Serialize>(v: Vec<T>) -> Vec<u8> {
 
 pub static REGISTRY: &[SyncedStore] = &[
     SyncedStore {
+        name: "browser_admissions",
+        // Unlike durable business stores, an empty active set is authoritative:
+        // tombstones + the monotonic version prove it is a revocation, not a
+        // boot-time read failure. Adoption also reconciles Gateway and BrowserPool.
+        snapshot: crate::browser_admission::snapshot_bytes,
+        adopt: crate::browser_admission::adopt_snapshot,
+    },
+    SyncedStore {
+        name: "browser_presence",
+        // Same authoritative-empty shape as browser_admissions, for the same
+        // reason: a leader whose last browser peer just disconnected must be
+        // able to replicate "zero satellites now", not be mistaken for a
+        // follower that hasn't synced yet.
+        snapshot: crate::browser_presence::snapshot_bytes,
+        adopt: crate::browser_presence::adopt_snapshot,
+    },
+    SyncedStore {
         name: "teams",
         // HashMap<String, Team> → sorted BTreeMap for deterministic bytes.
         snapshot: |c| {
@@ -102,7 +119,8 @@ pub static REGISTRY: &[SyncedStore] = &[
             enc(&m)
         },
         adopt: |c, b| {
-            let m: std::collections::BTreeMap<String, crate::teams::Team> = serde_json::from_slice(b).ok()?;
+            let m: std::collections::BTreeMap<String, crate::teams::Team> =
+                serde_json::from_slice(b).ok()?;
             if m.is_empty() {
                 return None;
             }
@@ -222,7 +240,8 @@ pub static REGISTRY: &[SyncedStore] = &[
         name: "integrations",
         snapshot: |c| enc_sorted(c.integrations.snapshot()),
         adopt: |c, b| {
-            let v: Vec<crate::integrations::IntegrationResource> = serde_json::from_slice(b).ok()?;
+            let v: Vec<crate::integrations::IntegrationResource> =
+                serde_json::from_slice(b).ok()?;
             if v.is_empty() {
                 return None;
             }
@@ -389,7 +408,11 @@ pub static REGISTRY: &[SyncedStore] = &[
         name: "ratelimit",
         snapshot: |c| {
             let s = c.ratelimit.stats();
-            enc(&RateLimitConfig { enabled: s.enabled, limit: s.limit, window_ms: s.window_ms })
+            enc(&RateLimitConfig {
+                enabled: s.enabled,
+                limit: s.limit,
+                window_ms: s.window_ms,
+            })
         },
         adopt: |c, b| {
             let cfg: RateLimitConfig = serde_json::from_slice(b).ok()?;

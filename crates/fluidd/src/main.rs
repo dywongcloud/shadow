@@ -22,7 +22,10 @@ enum Backend {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "fluidd", about = "Fluid compute serving daemon (gateway + pool)")]
+#[command(
+    name = "fluidd",
+    about = "Fluid compute serving daemon (gateway + pool)"
+)]
 struct Args {
     /// Public address (user traffic).
     #[arg(long, default_value = "127.0.0.1:8787")]

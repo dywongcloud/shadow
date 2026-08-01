@@ -6,7 +6,7 @@
 //! this team" to an edge node WITHOUT revealing who they are or sending a
 //! replayable token — and the node can still rate-limit via the nullifier.
 
-use hive_zkauth::{NullifierSet, Role, Roster, SecretKey, prove};
+use hive_zkauth::{prove, NullifierSet, Role, Roster, SecretKey};
 
 fn main() {
     // --- Team sets up a public roster (only public keys are shared) ---
@@ -26,11 +26,19 @@ fn main() {
     let request = b"GET / (preview access)";
 
     println!("Team roster: 1 owner, 2 admins, 1 member");
-    println!("Admin ring size (role >= Admin): {}\n", team.ring(Role::Admin).len());
+    println!(
+        "Admin ring size (role >= Admin): {}\n",
+        team.ring(Role::Admin).len()
+    );
 
     // --- admin_b proves Admin access, anonymously ---
-    let proof = team.prove_membership(&admin_b, Role::Admin, scope, request).unwrap();
-    println!("admin_b produced a {}-byte anonymous proof", proof.to_bytes().len());
+    let proof = team
+        .prove_membership(&admin_b, Role::Admin, scope, request)
+        .unwrap();
+    println!(
+        "admin_b produced a {}-byte anonymous proof",
+        proof.to_bytes().len()
+    );
     println!("  nullifier: {}", hex(&proof.nullifier()));
 
     // --- the edge node verifies, learning only "an admin signed" ---
@@ -52,12 +60,22 @@ fn main() {
 
     // --- nullifier-based replay protection (no identity revealed) ---
     let mut spent = NullifierSet::new();
-    println!("first redemption of admin_b's proof:  {}", spent.redeem(&proof));
-    let proof2 = team.prove_membership(&admin_b, Role::Admin, scope, b"GET /again").unwrap();
-    println!("second proof, same admin + scope:      {} (rejected: reuse)", spent.redeem(&proof2));
+    println!(
+        "first redemption of admin_b's proof:  {}",
+        spent.redeem(&proof)
+    );
+    let proof2 = team
+        .prove_membership(&admin_b, Role::Admin, scope, b"GET /again")
+        .unwrap();
+    println!(
+        "second proof, same admin + scope:      {} (rejected: reuse)",
+        spent.redeem(&proof2)
+    );
 
     // --- cross-scope unlinkability ---
-    let other = team.prove_membership(&admin_b, Role::Admin, b"deployment:other", request).unwrap();
+    let other = team
+        .prove_membership(&admin_b, Role::Admin, b"deployment:other", request)
+        .unwrap();
     println!(
         "same admin, different scope -> different nullifier: {}",
         proof.nullifier() != other.nullifier()

@@ -1,0 +1,41 @@
+<!doctype html>
+<meta charset="utf-8">
+<script>
+(() => {
+  const nonce = crypto.randomUUID();
+  let port;
+  let worker;
+
+  function transferables(value, out = []) {
+    if (value instanceof ArrayBuffer) out.push(value);
+    else if (ArrayBuffer.isView(value)) out.push(value.buffer);
+    else if (value && typeof value === "object") {
+      for (const item of Object.values(value)) transferables(item, out);
+    }
+    return [...new Set(out)];
+  }
+
+  addEventListener("message", event => {
+    if (event.source !== parent || event.data?.kind !== "boot" || event.data.nonce !== nonce) return;
+    if (port || event.ports.length !== 1) return;
+    port = event.ports[0];
+    const workerUrl = URL.createObjectURL(new Blob([event.data.workerSource], { type: "text/javascript" }));
+    worker = new Worker(workerUrl);
+    URL.revokeObjectURL(workerUrl);
+    worker.onmessage = ({ data }) => port.postMessage(data, { transfer: transferables(data) });
+    worker.onerror = event => port.postMessage({ kind: "fatal", error: event.message || "worker error" });
+    port.onmessage = ({ data }) => {
+      if (data.kind === "close") {
+        worker.terminate();
+        port.close();
+        return;
+      }
+      worker.postMessage(data, { transfer: transferables(data) });
+    };
+    port.start();
+    worker.postMessage({ kind: "boot", ...event.data.artifact });
+  }, { once: true });
+
+  parent.postMessage({ kind: "frameReady", nonce }, "*");
+})();
+</script>

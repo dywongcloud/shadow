@@ -26,8 +26,8 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
     use hive_core::{
-        now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, ExecRequest, FunctionLaunch, LogLine,
-        LogStream, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
+        now_ms, AgentEvent, AgentRequest, BuildJob, BuildResult, ExecRequest, FunctionLaunch,
+        LogLine, LogStream, CELL_AGENT_PORT, CELL_FUNCTION_PORT, CELL_GUEST_CID,
     };
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpStream;
@@ -36,11 +36,12 @@ mod linux {
     use std::process::{Command, Stdio};
     use std::time::Duration;
 
-
     /// Live exec child PIDs, keyed by `ExecRequest.id`, so a `KillExec` arriving
     /// on a SEPARATE connection can signal a command started on another
     /// connection/thread. Guest-process-global (single agent process per cell).
-    static EXEC_REGISTRY: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> = std::sync::OnceLock::new();
+    static EXEC_REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    > = std::sync::OnceLock::new();
     fn exec_registry() -> &'static std::sync::Mutex<std::collections::HashMap<String, u32>> {
         EXEC_REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
     }
@@ -143,7 +144,8 @@ mod linux {
             CELL_GUEST_CID, CELL_AGENT_PORT
         );
         loop {
-            let conn_fd = unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            let conn_fd =
+                unsafe { libc::accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
             if conn_fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -223,7 +225,11 @@ mod linux {
             Err(e) => {
                 let _ = send(
                     stream,
-                    &AgentEvent::ExecOutput { id: id.clone(), stream: LogStream::System, line: format!("exec failed: {e}") },
+                    &AgentEvent::ExecOutput {
+                        id: id.clone(),
+                        stream: LogStream::System,
+                        line: format!("exec failed: {e}"),
+                    },
                 );
                 None
             }
@@ -256,7 +262,9 @@ mod linux {
         if req.sudo {
             // Only ever honored if `sudo` actually exists in this guest image;
             // otherwise fail loudly rather than silently running unprivileged.
-            let sudo_path = ["/usr/bin/sudo", "/bin/sudo"].iter().find(|p| std::path::Path::new(p).exists());
+            let sudo_path = ["/usr/bin/sudo", "/bin/sudo"]
+                .iter()
+                .find(|p| std::path::Path::new(p).exists());
             match sudo_path {
                 Some(sudo) => {
                     let mut wrapped = Command::new(sudo);
@@ -288,11 +296,18 @@ mod linux {
             }
         }
 
-        let cwd = if req.cwd.is_empty() { "/build" } else { req.cwd.as_str() };
+        let cwd = if req.cwd.is_empty() {
+            "/build"
+        } else {
+            req.cwd.as_str()
+        };
         let _ = std::fs::create_dir_all(cwd);
         cmd.current_dir(cwd)
             .env_clear()
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
             .env("HOME", "/root")
             .envs(req.env.iter())
             .stdin(Stdio::null())
@@ -300,7 +315,10 @@ mod linux {
             .stderr(Stdio::piped());
 
         let mut child = cmd.spawn()?;
-        exec_registry().lock().unwrap().insert(req.id.clone(), child.id());
+        exec_registry()
+            .lock()
+            .unwrap()
+            .insert(req.id.clone(), child.id());
 
         // Two reader threads (stdout/stderr) so neither pipe's backpressure can
         // stall the other — both feed the SAME connection, guarded by a mutex
@@ -308,10 +326,22 @@ mod linux {
         let write_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let mut handles = Vec::new();
         if let Some(out) = child.stdout.take() {
-            handles.push(spawn_reader(out, stream.try_clone()?, req.id.clone(), LogStream::Stdout, write_lock.clone()));
+            handles.push(spawn_reader(
+                out,
+                stream.try_clone()?,
+                req.id.clone(),
+                LogStream::Stdout,
+                write_lock.clone(),
+            ));
         }
         if let Some(err) = child.stderr.take() {
-            handles.push(spawn_reader(err, stream.try_clone()?, req.id.clone(), LogStream::Stderr, write_lock.clone()));
+            handles.push(spawn_reader(
+                err,
+                stream.try_clone()?,
+                req.id.clone(),
+                LogStream::Stderr,
+                write_lock.clone(),
+            ));
         }
         for h in handles {
             let _ = h.join();
@@ -335,7 +365,16 @@ mod linux {
                     Err(_) => break,
                 };
                 let _guard = write_lock.lock().unwrap();
-                if send(&mut stream, &AgentEvent::ExecOutput { id: id.clone(), stream: which, line }).is_err() {
+                if send(
+                    &mut stream,
+                    &AgentEvent::ExecOutput {
+                        id: id.clone(),
+                        stream: which,
+                        line,
+                    },
+                )
+                .is_err()
+                {
                     break;
                 }
             }
@@ -367,13 +406,19 @@ mod linux {
                 "empty start_cmd",
             ));
         }
-        let workdir = launch.workdir.clone().unwrap_or_else(|| "/build".to_string());
+        let workdir = launch
+            .workdir
+            .clone()
+            .unwrap_or_else(|| "/build".to_string());
         let _ = std::fs::create_dir_all(&workdir);
 
         let mut cmd = Command::new(&launch.start_cmd[0]);
         cmd.args(&launch.start_cmd[1..])
             .current_dir(&workdir)
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
             .env("HOME", "/root")
             .env("PORT", launch.port.to_string())
             .envs(launch.env.iter())
@@ -386,7 +431,10 @@ mod linux {
         // into blind 500s. /dev/console lands in the host-side per-cell
         // console.log next to the kernel boot lines. Best-effort: a rootfs
         // without /dev/console just keeps the old (silent) behavior.
-        if let Ok(con) = std::fs::OpenOptions::new().append(true).open("/dev/console") {
+        if let Ok(con) = std::fs::OpenOptions::new()
+            .append(true)
+            .open("/dev/console")
+        {
             if let Ok(con2) = con.try_clone() {
                 cmd.stdout(Stdio::from(con));
                 cmd.stderr(Stdio::from(con2));
@@ -404,7 +452,11 @@ mod linux {
         // time) needs NO runtime env var at all — `bun run <entry>` auto-loads it, so
         // the Bun path here correctly does nothing. Opt-out via HIVE_COMPILE_CACHE=0.
         // Never fails boot: a missing/invalid/unwritable cache just means recompiling.
-        let cc_off = launch.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
+        let cc_off = launch
+            .env
+            .get("HIVE_COMPILE_CACHE")
+            .map(|v| v == "0" || v == "false")
+            .unwrap_or(false);
         if !cc_off && launch.runtime.uses_v8_compile_cache() {
             let cache_dir = format!("{}/.hive-compile-cache", workdir.trim_end_matches('/'));
             if std::fs::create_dir_all(&cache_dir).is_ok() {
@@ -439,7 +491,10 @@ mod linux {
         // tunnel connection multiplexes many requests onto 127.0.0.1:<fport>.
         let max_conc = launch.max_concurrency.max(1);
         std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
                 Ok(rt) => rt,
                 Err(e) => {
                     eprintln!("tunnel runtime build failed: {e}");
@@ -533,13 +588,17 @@ mod linux {
             },
         )?;
         let frame = read_frame(stream)?;
-        if let Ok(AgentRequest::CacheData { tar }) = serde_json::from_slice::<AgentRequest>(&frame) {
+        if let Ok(AgentRequest::CacheData { tar }) = serde_json::from_slice::<AgentRequest>(&frame)
+        {
             if !tar.is_empty() {
                 std::fs::write("/tmp/cache_in.tgz", &tar)?;
                 let _ = Command::new("tar")
                     .args(["xzf", "/tmp/cache_in.tgz", "-C", "/build"])
                     .status();
-                sys(stream, format!("build cache restored [{key}] ({} bytes)", tar.len()))?;
+                sys(
+                    stream,
+                    format!("build cache restored [{key}] ({} bytes)", tar.len()),
+                )?;
             } else {
                 sys(stream, format!("build cache miss [{key}]"))?;
             }
@@ -592,7 +651,10 @@ mod linux {
             .arg(format!("{step} 2>&1"))
             .current_dir("/build")
             .env_clear()
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
             .env("HOME", "/root")
             .envs(job.env.iter())
             .stdin(Stdio::null())

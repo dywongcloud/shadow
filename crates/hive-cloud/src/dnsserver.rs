@@ -64,8 +64,9 @@ pub static DNS_STATS: DnsStats = DnsStats {
 /// Which node each answer actually handed out first — the histogram that shows
 /// whether traffic is really being spread by proximity or collapsing onto one
 /// node. Keyed by the first A/AAAA address in the answer.
-pub static ANSWER_FIRST: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<String, u64>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+pub static ANSWER_FIRST: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
 /// Render an A/AAAA rdata blob back to a printable address for the answer
 /// histogram (nothing else needs this — the wire format is built, not parsed).
@@ -84,7 +85,9 @@ fn rdata_ip(atype: u16, rdata: &[u8]) -> Option<String> {
 /// Whether this server answers the customer-facing apps zone. Off by default:
 /// the zone is Vercel-served until an operator delegates it here.
 fn serve_apps_zone() -> bool {
-    std::env::var("HIVE_DNS_SERVE_APPS").map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false)
+    std::env::var("HIVE_DNS_SERVE_APPS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 /// The node currently serving `label` in the apps zone, if any — local aliases
@@ -97,7 +100,14 @@ fn apps_host_owner(cloud: &Arc<CloudState>, label: &str) -> Option<String> {
         return None;
     }
     let norm = |h: &str| {
-        h.split(':').next().unwrap_or(h).split('.').next().unwrap_or(h).trim().to_ascii_lowercase()
+        h.split(':')
+            .next()
+            .unwrap_or(h)
+            .split('.')
+            .next()
+            .unwrap_or(h)
+            .trim()
+            .to_ascii_lowercase()
     };
     if cloud.gw.served_hosts().iter().any(|h| norm(h) == label) {
         return Some(cloud.node_name.clone());
@@ -118,14 +128,22 @@ fn node_addr_rrs(n: &NodeInfo, qtype: u16) -> Vec<(u16, u32, Vec<u8>)> {
     let mut out = Vec::new();
     match qtype {
         1 => {
-            if let Some(ip) = n.public_ip.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()) {
+            if let Some(ip) = n
+                .public_ip
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv4Addr>().ok())
+            {
                 if !ip.is_unspecified() && !ip.is_loopback() {
                     out.push((1u16, DEPLOY_TTL, ip.octets().to_vec()));
                 }
             }
         }
         28 => {
-            if let Some(ip) = n.public_ip6.as_deref().and_then(|s| s.parse::<Ipv6Addr>().ok()) {
+            if let Some(ip) = n
+                .public_ip6
+                .as_deref()
+                .and_then(|s| s.parse::<Ipv6Addr>().ok())
+            {
                 if !ip.is_unspecified() && !ip.is_loopback() {
                     out.push((28u16, DEPLOY_TTL, ip.octets().to_vec()));
                 }
@@ -197,7 +215,9 @@ pub async fn serve(cloud: Arc<CloudState>, addr: SocketAddr) -> std::io::Result<
 async fn serve_tcp(cloud: Arc<CloudState>, listener: TcpListener) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     loop {
-        let Ok((mut stream, peer)) = listener.accept().await else { continue };
+        let Ok((mut stream, peer)) = listener.accept().await else {
+            continue;
+        };
         let cloud = cloud.clone();
         tokio::spawn(async move {
             // One query per accept is sufficient for our resolvers; keep it simple.
@@ -310,8 +330,12 @@ fn handle_query(cloud: &Arc<CloudState>, q: &[u8], src: std::net::IpAddr) -> Opt
     // EDNS to a response the requester didn't opt into). SCOPE PREFIX-LENGTH is
     // the asker's prefix when the answer really is client-specific, else 0 so a
     // resolver may share the generic answer with everyone behind it.
-    let opt_rr = client_had_ecs
-        .then(|| crate::dns_geo::encode_opt_rr(asker.subnet, if proximity { asker.scope_prefix() } else { 0 }));
+    let opt_rr = client_had_ecs.then(|| {
+        crate::dns_geo::encode_opt_rr(
+            asker.subnet,
+            if proximity { asker.scope_prefix() } else { 0 },
+        )
+    });
     let arcount: u16 = opt_rr.is_some() as u16;
 
     let mut resp = Vec::with_capacity(64);
@@ -364,7 +388,12 @@ fn lookup(
     qname: &str,
     qtype: u16,
     asker: &crate::dns_geo::Asker,
-) -> (Vec<(u16, u32, Vec<u8>)>, Vec<(String, u16, u32, Vec<u8>)>, bool, bool) {
+) -> (
+    Vec<(u16, u32, Vec<u8>)>,
+    Vec<(String, u16, u32, Vec<u8>)>,
+    bool,
+    bool,
+) {
     // ---- Plane A: dynamic, health-aware deploy zone (the Seer load balancer) ----
     // For any name in HIVE_DEPLOY_ZONE (apex or wildcard subdomain), A/AAAA resolve to
     // the public IPs of healthy nodes — bypassing static records entirely. We're
@@ -400,7 +429,11 @@ fn lookup(
                 // fall-through (forward-compat).
                 16 if qname.starts_with("_acme-challenge.") => {
                     let rrs = acme_txt_rrs(cloud, qname);
-                    let auth = if rrs.is_empty() { negative_soa(cloud, zone, false) } else { Vec::new() };
+                    let auth = if rrs.is_empty() {
+                        negative_soa(cloud, zone, false)
+                    } else {
+                        Vec::new()
+                    };
                     return (rrs, auth, true, false);
                 }
                 // Authoritative NODATA — with the zone's SOA in AUTHORITY so
@@ -436,7 +469,11 @@ fn lookup(
                 // renewable once the zone's NS moves off Vercel onto Seer.
                 16 if qname.starts_with("_acme-challenge.") => {
                     let rrs = acme_txt_rrs(cloud, qname);
-                    let auth = if rrs.is_empty() { negative_soa(cloud, zone, true) } else { Vec::new() };
+                    let auth = if rrs.is_empty() {
+                        negative_soa(cloud, zone, true)
+                    } else {
+                        Vec::new()
+                    };
                     return (rrs, auth, true, false);
                 }
                 // NODATA with the negative-caching SOA, as in the deploy zone.
@@ -507,7 +544,9 @@ fn lookup(
     let rec_name = if qname == zone.domain {
         String::new()
     } else {
-        qname.trim_end_matches(&format!(".{}", zone.domain)).to_string()
+        qname
+            .trim_end_matches(&format!(".{}", zone.domain))
+            .to_string()
     };
 
     let want = match qtype {
@@ -554,7 +593,11 @@ fn lookup(
 /// `client` is the asker's location when already known — resolved by the CALLER
 /// so this stays a pure function of (registry, qtype, client location) and can be
 /// exercised directly without a `CloudState`.
-fn lb_records(nodes: &[NodeInfo], qtype: u16, client: Option<(f64, f64)>) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
+fn lb_records(
+    nodes: &[NodeInfo],
+    qtype: u16,
+    client: Option<(f64, f64)>,
+) -> (Vec<(u16, u32, Vec<u8>)>, bool) {
     // Serveable = healthy AND actually reachable in the requested address
     // family. Both filters must run BEFORE proximity ordering, not after:
     // proximity truncates to the nearest N, so a nearby node with no public
@@ -582,14 +625,22 @@ fn lb_records(nodes: &[NodeInfo], qtype: u16, client: Option<(f64, f64)>) -> (Ve
     for n in healthy {
         match qtype {
             1 => {
-                if let Some(ip) = n.public_ip.as_deref().and_then(|s| s.parse::<Ipv4Addr>().ok()) {
+                if let Some(ip) = n
+                    .public_ip
+                    .as_deref()
+                    .and_then(|s| s.parse::<Ipv4Addr>().ok())
+                {
                     if !ip.is_unspecified() && !ip.is_loopback() {
                         out.push((1u16, DEPLOY_TTL, ip.octets().to_vec()));
                     }
                 }
             }
             28 => {
-                if let Some(ip) = n.public_ip6.as_deref().and_then(|s| s.parse::<Ipv6Addr>().ok()) {
+                if let Some(ip) = n
+                    .public_ip6
+                    .as_deref()
+                    .and_then(|s| s.parse::<Ipv6Addr>().ok())
+                {
                     if !ip.is_unspecified() && !ip.is_loopback() {
                         out.push((28u16, DEPLOY_TTL, ip.octets().to_vec()));
                     }
@@ -624,8 +675,14 @@ fn acme_txt_rrs(cloud: &Arc<CloudState>, qname: &str) -> Vec<(u16, u32, Vec<u8>)
 
 fn encode_rdata(kind: &str, value: &str) -> Option<Vec<u8>> {
     match kind {
-        "A" => value.parse::<Ipv4Addr>().ok().map(|ip| ip.octets().to_vec()),
-        "AAAA" => value.parse::<Ipv6Addr>().ok().map(|ip| ip.octets().to_vec()),
+        "A" => value
+            .parse::<Ipv4Addr>()
+            .ok()
+            .map(|ip| ip.octets().to_vec()),
+        "AAAA" => value
+            .parse::<Ipv6Addr>()
+            .ok()
+            .map(|ip| ip.octets().to_vec()),
         "CNAME" => Some(encode_name(value)),
         "TXT" => {
             let bytes = value.as_bytes();
@@ -665,7 +722,9 @@ fn apex_ns_names(cloud: &Arc<CloudState>, require_api: bool) -> Vec<String> {
         .registry
         .nodes()
         .into_iter()
-        .filter(|n| n.healthy && n.dns_ns.is_some() && (n.public_ip.is_some() || n.public_ip6.is_some()))
+        .filter(|n| {
+            n.healthy && n.dns_ns.is_some() && (n.public_ip.is_some() || n.public_ip6.is_some())
+        })
         .filter(|n| !require_api || n.dns_api)
         .map(|n| format!("{}.{}", crate::vercel_dns::ns_label(&n.name), apps))
         .collect();
@@ -675,7 +734,10 @@ fn apex_ns_names(cloud: &Arc<CloudState>, require_api: bool) -> Vec<String> {
 }
 
 fn apex_ns_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Vec<u8>)> {
-    apex_ns_names(cloud, require_api).into_iter().map(|n| (2u16, APEX_TTL, encode_name(&n))).collect()
+    apex_ns_names(cloud, require_api)
+        .into_iter()
+        .map(|n| (2u16, APEX_TTL, encode_name(&n)))
+        .collect()
 }
 
 /// The zone's SOA. MNAME is the lexically-first nameserver (stable across
@@ -691,7 +753,8 @@ fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Ve
     let mut rdata = encode_name(primary);
     rdata.extend_from_slice(&encode_name(&format!("hostmaster.{apps}")));
     let serial: u32 = names.iter().fold(0u32, |acc, n| {
-        n.bytes().fold(acc, |a, b| a.wrapping_mul(31).wrapping_add(b as u32))
+        n.bytes()
+            .fold(acc, |a, b| a.wrapping_mul(31).wrapping_add(b as u32))
     });
     for v in [serial, 7200u32, 3600u32, 1_209_600u32, NEGATIVE_TTL] {
         rdata.extend_from_slice(&v.to_be_bytes());
@@ -707,7 +770,11 @@ fn apex_soa_rrs(cloud: &Arc<CloudState>, require_api: bool) -> Vec<(u16, u32, Ve
 /// negTTL as min(SOA's own TTL, its MINIMUM field), and `NEGATIVE_TTL` is
 /// already the smaller. Empty when no eligible nameserver exists (same
 /// degenerate roster state in which the apex SOA itself is unanswerable).
-fn negative_soa(cloud: &Arc<CloudState>, zone: &str, require_api: bool) -> Vec<(String, u16, u32, Vec<u8>)> {
+fn negative_soa(
+    cloud: &Arc<CloudState>,
+    zone: &str,
+    require_api: bool,
+) -> Vec<(String, u16, u32, Vec<u8>)> {
     apex_soa_rrs(cloud, require_api)
         .into_iter()
         .map(|(t, _ttl, rd)| (zone.to_string(), t, NEGATIVE_TTL, rd))
@@ -716,7 +783,11 @@ fn negative_soa(cloud: &Arc<CloudState>, zone: &str, require_api: bool) -> Vec<(
 
 fn encode_name(name: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    for label in name.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+    for label in name
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|l| !l.is_empty())
+    {
         let b = label.as_bytes();
         out.push(b.len().min(63) as u8);
         out.extend_from_slice(&b[..b.len().min(63)]);
@@ -731,7 +802,13 @@ mod tests {
     use hive_core::now_ms;
 
     /// Minimal NodeInfo for the load-balancer tests.
-    fn ni(name: &str, healthy: bool, ip4: Option<&str>, ip6: Option<&str>, latency: u64) -> NodeInfo {
+    fn ni(
+        name: &str,
+        healthy: bool,
+        ip4: Option<&str>,
+        ip6: Option<&str>,
+        latency: u64,
+    ) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
             gpu_model: None,
@@ -793,9 +870,15 @@ mod tests {
         let up = vec![ni("n1", true, Some("198.51.100.7"), None, 0)];
         assert_eq!(lb_records(&up, 1, None).0.len(), 1);
         let down = vec![ni("n1", false, Some("198.51.100.7"), None, 0)];
-        assert!(lb_records(&down, 1, None).0.is_empty(), "unhealthy node excluded");
+        assert!(
+            lb_records(&down, 1, None).0.is_empty(),
+            "unhealthy node excluded"
+        );
         let natd = vec![ni("n1", true, None, None, 0)];
-        assert!(lb_records(&natd, 1, None).0.is_empty(), "NAT'd node (no public IP) excluded");
+        assert!(
+            lb_records(&natd, 1, None).0.is_empty(),
+            "NAT'd node (no public IP) excluded"
+        );
     }
 
     #[test]
@@ -808,7 +891,10 @@ mod tests {
         let (aaaa, _) = lb_records(&nodes, 28, None);
         assert_eq!(aaaa.len(), 1, "only the node with a real public IPv6");
         assert_eq!(aaaa[0].0, 28, "AAAA record");
-        assert_eq!(aaaa[0].2, "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec());
+        assert_eq!(
+            aaaa[0].2,
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec()
+        );
         // And A still works for the v4 nodes.
         assert_eq!(lb_records(&nodes, 1, None).0.len(), 2);
     }
@@ -822,7 +908,15 @@ mod tests {
         ];
         let (a, _) = lb_records(&nodes, 1, None);
         let ips: Vec<Vec<u8>> = a.iter().map(|r| r.2.clone()).collect();
-        assert_eq!(ips[0], Ipv4Addr::new(203, 0, 113, 1).octets().to_vec(), "nearest first");
-        assert_eq!(ips[2], Ipv4Addr::new(203, 0, 113, 3).octets().to_vec(), "farthest last");
+        assert_eq!(
+            ips[0],
+            Ipv4Addr::new(203, 0, 113, 1).octets().to_vec(),
+            "nearest first"
+        );
+        assert_eq!(
+            ips[2],
+            Ipv4Addr::new(203, 0, 113, 3).octets().to_vec(),
+            "farthest last"
+        );
     }
 }

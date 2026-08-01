@@ -58,7 +58,12 @@ struct Instance {
 /// Is this instance due for recycling? Pure (testable) policy over the signal-free
 /// inputs we DO have: lifetime request count and wall-clock age. (Heap-growth /
 /// GC-pause recycling needs a runtime-emitted signal — left as a hook.)
-fn instance_recyclable(requests_served: u64, age_ms: u64, max_requests: u64, max_age_ms: u64) -> bool {
+fn instance_recyclable(
+    requests_served: u64,
+    age_ms: u64,
+    max_requests: u64,
+    max_age_ms: u64,
+) -> bool {
     (max_requests > 0 && requests_served >= max_requests)
         || (max_age_ms > 0 && requests_served > 0 && age_ms >= max_age_ms)
 }
@@ -284,7 +289,9 @@ fn max_concurrent_cold_starts() -> usize {
             }
         }
     }
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
     (cores / 2).clamp(4, 32)
 }
 
@@ -398,7 +405,11 @@ pub fn aimd_step(cpu_pct: f32, current: u32, max: u32) -> u32 {
 
 /// Normalize an owner slug: empty => "personal" (matches the control layer).
 fn norm_tenant(t: String) -> String {
-    if t.trim().is_empty() { "personal".into() } else { t }
+    if t.trim().is_empty() {
+        "personal".into()
+    } else {
+        t
+    }
 }
 
 impl Fluid {
@@ -419,12 +430,23 @@ impl Fluid {
     /// Register (or replace) a function pool owned by `tenant` (empty =>
     /// "personal"). Does not provision yet; the autoscaler will bring up
     /// `min_instances`.
-    pub fn register(&self, key: String, cfg: FunctionConfig, image: String, workdir: String, tenant: String) {
+    pub fn register(
+        &self,
+        key: String,
+        cfg: FunctionConfig,
+        image: String,
+        workdir: String,
+        tenant: String,
+    ) {
         let tenant = norm_tenant(tenant);
         // Runtime-aware initial safe-concurrency baseline (#5). `None` when it equals
         // the configured max (i.e. no reduction) so the common case is unchanged.
         let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
-        let safe_concurrency = if rec < cfg.max_concurrency { Some(rec) } else { None };
+        let safe_concurrency = if rec < cfg.max_concurrency {
+            Some(rec)
+        } else {
+            None
+        };
         let mut reg = self.registry.lock();
         // Re-registering a key (a redeploy, or a boot restore over a live pool)
         // installs a fresh pool whose `instances` is empty. Anything the OLD pool
@@ -504,7 +526,11 @@ impl Fluid {
     /// `register` does. No-op if the pool isn't registered.
     pub fn update_config(&self, key: &str, cfg: FunctionConfig) {
         let rec = recommended_safe_concurrency(&cfg.runtime, cfg.max_concurrency);
-        let safe_concurrency = if rec < cfg.max_concurrency { Some(rec) } else { None };
+        let safe_concurrency = if rec < cfg.max_concurrency {
+            Some(rec)
+        } else {
+            None
+        };
         if let Some(p) = self.registry.lock().get_mut(key) {
             p.cfg = cfg;
             p.safe_concurrency = safe_concurrency;
@@ -533,7 +559,11 @@ impl Fluid {
 
     /// Make a built deployment available to the cells that will serve it (see
     /// [`hive_backend::CellBackend::deliver_build`]). No-op for same-host backends.
-    pub async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+    pub async fn deliver_build(
+        &self,
+        image: &str,
+        build_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
         self.backend.deliver_build(image, build_dir).await
     }
 
@@ -541,12 +571,20 @@ impl Fluid {
     /// across all of its function pools.
     pub fn tenant_live_instances(&self, tenant: &str) -> u32 {
         let t = norm_tenant(tenant.to_string());
-        self.registry.lock().values().filter(|p| p.tenant == t).map(|p| p.live_count()).sum()
+        self.registry
+            .lock()
+            .values()
+            .filter(|p| p.tenant == t)
+            .map(|p| p.live_count())
+            .sum()
     }
 
     /// Max invocation duration configured for a function (seconds).
     pub fn max_duration_secs(&self, key: &str) -> Option<u64> {
-        self.registry.lock().get(key).map(|p| p.cfg.max_duration_secs)
+        self.registry
+            .lock()
+            .get(key)
+            .map(|p| p.cfg.max_duration_secs)
     }
 
     pub fn stats(&self) -> Vec<FunctionStats> {
@@ -571,7 +609,8 @@ impl Fluid {
                 // Active CPU pricing (Vercel convention): bill active processing
                 // time + provisioned memory GB-hrs, not idle instance wall-time.
                 let active_cpu_ms = p.served_ms_sum;
-                let memory_gb_hrs = (p.cfg.memory_mib as f64 / 1024.0) * (fluid_ms as f64 / 3_600_000.0);
+                let memory_gb_hrs =
+                    (p.cfg.memory_mib as f64 / 1024.0) * (fluid_ms as f64 / 3_600_000.0);
                 // Active-CPU billing only charges processing time, so on top of the
                 // multiplexing win it saves the idle keep-warm portion of fluid_ms.
                 let active_cpu_savings_pct = if fluid_ms > 0 {
@@ -597,7 +636,11 @@ impl Fluid {
                     active_cpu_ms,
                     memory_gb_hrs,
                     active_cpu_savings_pct,
-                    safe_concurrency: p.cfg.max_concurrency.min(p.safe_concurrency.unwrap_or(u32::MAX)).max(1),
+                    safe_concurrency: p
+                        .cfg
+                        .max_concurrency
+                        .min(p.safe_concurrency.unwrap_or(u32::MAX))
+                        .max(1),
                     nack_total: p.nack_concurrency + p.nack_quota,
                     nack_concurrency: p.nack_concurrency,
                     nack_quota: p.nack_quota,
@@ -676,8 +719,8 @@ impl Fluid {
         // Coalesce window: how long a request waits for an in-flight cold start
         // (singleflight) before it's allowed to launch its own. Bounded so a slow
         // startup never blocks scale-out beyond this; capped by the lease timeout.
-        let coalesce_until = tokio::time::Instant::now()
-            + Duration::from_millis(800).min(self.cfg.lease_timeout);
+        let coalesce_until =
+            tokio::time::Instant::now() + Duration::from_millis(800).min(self.cfg.lease_timeout);
         let mut counted_dedupe = false;
         loop {
             let coalesce = tokio::time::Instant::now() < coalesce_until;
@@ -762,7 +805,10 @@ impl Fluid {
         // the pressure hook for CPU-heavy / lagging functions so we scale out sooner).
         let (max_c, max_instances) = match reg.get(key) {
             Some(p) => (
-                p.cfg.max_concurrency.min(p.safe_concurrency.unwrap_or(u32::MAX)).max(1),
+                p.cfg
+                    .max_concurrency
+                    .min(p.safe_concurrency.unwrap_or(u32::MAX))
+                    .max(1),
                 p.cfg.max_instances,
             ),
             None => return Ok(LeaseDecision::NotFound),
@@ -804,7 +850,11 @@ impl Fluid {
         // can't starve another off a shared node.
         if self.cfg.max_instances_per_tenant > 0 {
             let tenant = reg.get(key).expect("present").tenant.clone();
-            let tenant_live: u32 = reg.values().filter(|p| p.tenant == tenant).map(|p| p.live_count()).sum();
+            let tenant_live: u32 = reg
+                .values()
+                .filter(|p| p.tenant == tenant)
+                .map(|p| p.live_count())
+                .sum();
             if tenant_live >= self.cfg.max_instances_per_tenant {
                 reg.get_mut(key).expect("present").nack_quota += 1;
                 return Ok(LeaseDecision::Saturated(NackReason::TenantQuota));
@@ -859,13 +909,18 @@ impl Fluid {
         r
     }
 
-    async fn cold_start_inner(self: &Arc<Self>, key: &str) -> anyhow::Result<(CellId, CellEndpoint)> {
+    async fn cold_start_inner(
+        self: &Arc<Self>,
+        key: &str,
+    ) -> anyhow::Result<(CellId, CellEndpoint)> {
         // Bound concurrent provisioning so a burst can't saturate the host. Held
         // for the whole provision+start; dropped when this fn returns.
         let _permit = self.cold_start_sem.clone().acquire_owned().await;
         let (image, launch, mem, vcpus, tenant) = {
             let reg = self.registry.lock();
-            let pool = reg.get(key).ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
+            let pool = reg
+                .get(key)
+                .ok_or_else(|| anyhow::anyhow!("no such function '{key}'"))?;
             let port = free_port()?;
             // CONTAINER functions publish every declared UDP port spec on its own
             // loopback host port (`-p 127.0.0.1:<host>:<container>/udp`) so the
@@ -873,10 +928,15 @@ impl Fluid {
             // tunnel. Host ports are probed as real UDP binds; a failed probe
             // skips that spec LOUDLY (the app's other ports still serve) rather
             // than failing the whole cold start over an auxiliary publish.
-            let udp_ports: Vec<hive_core::UdpPublish> =
-                if pool.cfg.start_cmd.first().map(String::as_str) == Some("__container__") {
-                    let mut seen = std::collections::BTreeSet::new();
-                    pool.cfg
+            let udp_ports: Vec<hive_core::UdpPublish> = if pool
+                .cfg
+                .start_cmd
+                .first()
+                .map(String::as_str)
+                == Some("__container__")
+            {
+                let mut seen = std::collections::BTreeSet::new();
+                pool.cfg
                         .ports
                         .iter()
                         .filter(|s| s.protocol == fluid_core::ServiceProtocol::Udp && seen.insert(s.container_port))
@@ -888,9 +948,9 @@ impl Fluid {
                             }
                         })
                         .collect()
-                } else {
-                    Vec::new()
-                };
+            } else {
+                Vec::new()
+            };
             let launch = FunctionLaunch {
                 start_cmd: pool.cfg.start_cmd.clone(),
                 env: pool.cfg.env.clone(),
@@ -916,37 +976,50 @@ impl Fluid {
                 // GPUs through (CDI) when set.
                 gpu: pool.cfg.gpu,
             };
-            (pool.image.clone(), launch, pool.cfg.memory_mib, pool.cfg.vcpus, pool.tenant.clone())
+            (
+                pool.image.clone(),
+                launch,
+                pool.cfg.memory_mib,
+                pool.cfg.vcpus,
+                pool.tenant.clone(),
+            )
         };
 
         // A CONTAINER deployment (`["__container__", image, port]`) is run via host
         // podman by the backend (mock OR firecracker), not as a microVM/process —
         // surface that on the CellSpec so the backend skips booting a microVM.
-        let container = if launch.start_cmd.first().map(String::as_str) == Some("__container__") {
-            Some(hive_backend::ContainerSpec {
-                image: launch.start_cmd.get(1).cloned().unwrap_or_default(),
-                // Single TCP entry (the common shape): container port from
-                // start_cmd[2], host port = the launch's assigned free port —
-                // same (container, host) pairing the backends build from
-                // `func.start_cmd`/`func.port` in their podman paths.
-                ports: {
-                    let mut ports = vec![hive_backend::ContainerPort::tcp(
-                        launch.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080),
-                        launch.port,
-                    )];
-                    // Declared UDP specs publish alongside the primary TCP port
-                    // (same mapping the backends emit from `launch.udp_ports`).
-                    ports.extend(launch.udp_ports.iter().map(|u| hive_backend::ContainerPort {
-                        container_port: u.container_port,
-                        host_port: u.host_port,
-                        protocol: hive_backend::ContainerProtocol::Udp,
-                    }));
-                    ports
-                },
-            })
-        } else {
-            None
-        };
+        let container =
+            if launch.start_cmd.first().map(String::as_str) == Some("__container__") {
+                Some(hive_backend::ContainerSpec {
+                    image: launch.start_cmd.get(1).cloned().unwrap_or_default(),
+                    // Single TCP entry (the common shape): container port from
+                    // start_cmd[2], host port = the launch's assigned free port —
+                    // same (container, host) pairing the backends build from
+                    // `func.start_cmd`/`func.port` in their podman paths.
+                    ports: {
+                        let mut ports = vec![hive_backend::ContainerPort::tcp(
+                            launch
+                                .start_cmd
+                                .get(2)
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(8080),
+                            launch.port,
+                        )];
+                        // Declared UDP specs publish alongside the primary TCP port
+                        // (same mapping the backends emit from `launch.udp_ports`).
+                        ports.extend(launch.udp_ports.iter().map(|u| {
+                            hive_backend::ContainerPort {
+                                container_port: u.container_port,
+                                host_port: u.host_port,
+                                protocol: hive_backend::ContainerProtocol::Udp,
+                            }
+                        }));
+                        ports
+                    },
+                })
+            } else {
+                None
+            };
 
         let spec = CellSpec {
             id: CellId::new(),
@@ -1170,7 +1243,8 @@ impl Fluid {
                         }
                         continue;
                     }
-                    let idle = inst.inflight == 0 && now.saturating_sub(inst.last_active_ms) > ttl_ms;
+                    let idle =
+                        inst.inflight == 0 && now.saturating_sub(inst.last_active_ms) > ttl_ms;
                     if idle && live_after > pool.cfg.min_instances {
                         inst.draining = true;
                         live_after -= 1;
@@ -1285,7 +1359,11 @@ impl Fluid {
                 pool.last_cpu_pct = max_cpu;
                 // `None` means "no dynamic cap" (full max); only store Some when we've
                 // actually backed off below max.
-                pool.safe_concurrency = if next >= pool.cfg.max_concurrency { None } else { Some(next) };
+                pool.safe_concurrency = if next >= pool.cfg.max_concurrency {
+                    None
+                } else {
+                    Some(next)
+                };
                 if next < current {
                     debug!(func = %key, cpu = max_cpu, ceiling = next, "AIMD backoff (CPU pressure)");
                 }
@@ -1309,7 +1387,10 @@ pub enum NackReason {
 }
 
 enum LeaseDecision {
-    Ready { cell_id: CellId, endpoint: CellEndpoint },
+    Ready {
+        cell_id: CellId,
+        endpoint: CellEndpoint,
+    },
     ColdStart,
     /// Singleflight: a cold start is already in flight for this pool, so this request
     /// should briefly WAIT for it (and reuse it) instead of launching a duplicate —
@@ -1398,11 +1479,30 @@ mod tests {
     struct StubBackend;
     #[async_trait::async_trait]
     impl hive_backend::CellBackend for StubBackend {
-        fn name(&self) -> &'static str { "stub" }
-        async fn provision(&self, _: &CellSpec) -> anyhow::Result<CellHandle> { anyhow::bail!("stub") }
-        async fn run_build(&self, _: &CellHandle, _: &BuildJob, _: tokio::sync::mpsc::UnboundedSender<LogLine>) -> anyhow::Result<BuildResult> { anyhow::bail!("stub") }
-        async fn start_function(&self, _: &CellHandle, _: &hive_backend::FunctionLaunch) -> anyhow::Result<CellEndpoint> { anyhow::bail!("stub") }
-        async fn terminate(&self, _: &CellHandle) -> anyhow::Result<()> { Ok(()) }
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        async fn provision(&self, _: &CellSpec) -> anyhow::Result<CellHandle> {
+            anyhow::bail!("stub")
+        }
+        async fn run_build(
+            &self,
+            _: &CellHandle,
+            _: &BuildJob,
+            _: tokio::sync::mpsc::UnboundedSender<LogLine>,
+        ) -> anyhow::Result<BuildResult> {
+            anyhow::bail!("stub")
+        }
+        async fn start_function(
+            &self,
+            _: &CellHandle,
+            _: &hive_backend::FunctionLaunch,
+        ) -> anyhow::Result<CellEndpoint> {
+            anyhow::bail!("stub")
+        }
+        async fn terminate(&self, _: &CellHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -1432,28 +1532,60 @@ mod tests {
 
         std::env::set_var("HIVE_MAX_COLD_STARTS", "not-a-number");
         let n = max_concurrent_cold_starts();
-        assert!((4..=32).contains(&n), "must stay within the [4,32] host-scaled bounds, got {n}");
+        assert!(
+            (4..=32).contains(&n),
+            "must stay within the [4,32] host-scaled bounds, got {n}"
+        );
 
         std::env::set_var("HIVE_MAX_COLD_STARTS", "0");
         let n = max_concurrent_cold_starts();
-        assert!((4..=32).contains(&n), "zero override must be rejected (would deadlock every cold start), got {n}");
+        assert!(
+            (4..=32).contains(&n),
+            "zero override must be rejected (would deadlock every cold start), got {n}"
+        );
 
         std::env::remove_var("HIVE_MAX_COLD_STARTS");
         let n = max_concurrent_cold_starts();
-        assert!((4..=32).contains(&n), "no override must also stay within the host-scaled bounds, got {n}");
+        assert!(
+            (4..=32).contains(&n),
+            "no override must also stay within the host-scaled bounds, got {n}"
+        );
     }
 
     // A backend that reports a fixed CPU% — drives the adapt_concurrency() loop
     // end-to-end without spinning a real process.
-    struct CpuBackend { cpu: f32 }
+    struct CpuBackend {
+        cpu: f32,
+    }
     #[async_trait::async_trait]
     impl hive_backend::CellBackend for CpuBackend {
-        fn name(&self) -> &'static str { "cpu-stub" }
-        async fn provision(&self, _: &CellSpec) -> anyhow::Result<CellHandle> { anyhow::bail!("unused") }
-        async fn run_build(&self, _: &CellHandle, _: &BuildJob, _: tokio::sync::mpsc::UnboundedSender<LogLine>) -> anyhow::Result<BuildResult> { anyhow::bail!("unused") }
-        async fn start_function(&self, _: &CellHandle, _: &hive_backend::FunctionLaunch) -> anyhow::Result<CellEndpoint> { anyhow::bail!("unused") }
-        async fn terminate(&self, _: &CellHandle) -> anyhow::Result<()> { Ok(()) }
-        async fn cpu_percent(&self, _: &CellHandle) -> Option<f32> { Some(self.cpu) }
+        fn name(&self) -> &'static str {
+            "cpu-stub"
+        }
+        async fn provision(&self, _: &CellSpec) -> anyhow::Result<CellHandle> {
+            anyhow::bail!("unused")
+        }
+        async fn run_build(
+            &self,
+            _: &CellHandle,
+            _: &BuildJob,
+            _: tokio::sync::mpsc::UnboundedSender<LogLine>,
+        ) -> anyhow::Result<BuildResult> {
+            anyhow::bail!("unused")
+        }
+        async fn start_function(
+            &self,
+            _: &CellHandle,
+            _: &hive_backend::FunctionLaunch,
+        ) -> anyhow::Result<CellEndpoint> {
+            anyhow::bail!("unused")
+        }
+        async fn terminate(&self, _: &CellHandle) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn cpu_percent(&self, _: &CellHandle) -> Option<f32> {
+            Some(self.cpu)
+        }
     }
 
     fn fake_instance(id: &str) -> Instance {
@@ -1462,7 +1594,12 @@ mod tests {
             handle: CellHandle {
                 id: CellId::from(id.to_string()),
                 image: "img".into(),
-                resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
+                resources: ResourceSpec {
+                    vcpus: 1,
+                    mem_mib: 64,
+                    disk_mib: 64,
+                    timeout_secs: 0,
+                },
                 root: std::path::PathBuf::from("/tmp"),
                 endpoint: None,
             },
@@ -1479,39 +1616,86 @@ mod tests {
     #[tokio::test]
     async fn adapt_concurrency_throttles_under_real_cpu_and_recovers() {
         // High-CPU backend → adapt_concurrency must back the ceiling off below max.
-        let f = Fluid::start(Arc::new(CpuBackend { cpu: 95.0 }), FluidConfig {
-            autoscaler_interval: Duration::from_secs(3600), // we drive reconcile manually
-            ..Default::default()
-        });
+        let f = Fluid::start(
+            Arc::new(CpuBackend { cpu: 95.0 }),
+            FluidConfig {
+                autoscaler_interval: Duration::from_secs(3600), // we drive reconcile manually
+                ..Default::default()
+            },
+        );
         let key = "dpl/api";
-        f.register(key.into(), FunctionConfig { max_concurrency: 16, ..Default::default() }, "img".into(), ".".into(), "t".into());
+        f.register(
+            key.into(),
+            FunctionConfig {
+                max_concurrency: 16,
+                ..Default::default()
+            },
+            "img".into(),
+            ".".into(),
+            "t".into(),
+        );
         // Place a live instance so there's something to sample.
-        f.registry.lock().get_mut(key).unwrap().instances.push(fake_instance("c1"));
+        f.registry
+            .lock()
+            .get_mut(key)
+            .unwrap()
+            .instances
+            .push(fake_instance("c1"));
 
         // One AIMD step at 95% CPU: 16 -> 8.
         f.adapt_concurrency().await;
         {
             let reg = f.registry.lock();
             let p = reg.get(key).unwrap();
-            assert_eq!(p.safe_concurrency, Some(8), "CPU pressure halves the ceiling");
+            assert_eq!(
+                p.safe_concurrency,
+                Some(8),
+                "CPU pressure halves the ceiling"
+            );
             assert!((p.last_cpu_pct - 95.0).abs() < 0.01, "cpu sample recorded");
         }
         // A second step keeps backing off: 8 -> 4.
         f.adapt_concurrency().await;
-        assert_eq!(f.registry.lock().get(key).unwrap().safe_concurrency, Some(4));
+        assert_eq!(
+            f.registry.lock().get(key).unwrap().safe_concurrency,
+            Some(4)
+        );
 
         // Now swap to an idle (low-CPU) backend and confirm recovery climbs back to
         // None (full max). Build a fresh Fluid since the backend is fixed at start.
-        let f2 = Fluid::start(Arc::new(CpuBackend { cpu: 5.0 }), FluidConfig {
-            autoscaler_interval: Duration::from_secs(3600),
-            ..Default::default()
-        });
-        f2.register(key.into(), FunctionConfig { max_concurrency: 4, ..Default::default() }, "img".into(), ".".into(), "t".into());
-        f2.registry.lock().get_mut(key).unwrap().instances.push(fake_instance("c1"));
+        let f2 = Fluid::start(
+            Arc::new(CpuBackend { cpu: 5.0 }),
+            FluidConfig {
+                autoscaler_interval: Duration::from_secs(3600),
+                ..Default::default()
+            },
+        );
+        f2.register(
+            key.into(),
+            FunctionConfig {
+                max_concurrency: 4,
+                ..Default::default()
+            },
+            "img".into(),
+            ".".into(),
+            "t".into(),
+        );
+        f2.registry
+            .lock()
+            .get_mut(key)
+            .unwrap()
+            .instances
+            .push(fake_instance("c1"));
         // Seed a throttled ceiling, then let low CPU recover it.
         f2.set_safe_concurrency(key, Some(1));
-        for _ in 0..6 { f2.adapt_concurrency().await; }
-        assert_eq!(f2.registry.lock().get(key).unwrap().safe_concurrency, None, "low CPU recovers to full max");
+        for _ in 0..6 {
+            f2.adapt_concurrency().await;
+        }
+        assert_eq!(
+            f2.registry.lock().get(key).unwrap().safe_concurrency,
+            None,
+            "low CPU recovers to full max"
+        );
     }
 
     #[test]
@@ -1523,21 +1707,32 @@ mod tests {
         for _ in 0..40 {
             c = aimd_step(5.0, c, max); // low CPU every tick
         }
-        assert_eq!(c, max, "I/O-bound (low CPU) climbs to and holds full concurrency");
+        assert_eq!(
+            c, max,
+            "I/O-bound (low CPU) climbs to and holds full concurrency"
+        );
     }
 
     fn fluid(max_per_tenant: u32) -> Arc<Fluid> {
         // autoscaler_interval huge so reconcile never fires mid-test.
-        Fluid::start(Arc::new(StubBackend), FluidConfig {
-            autoscaler_interval: Duration::from_secs(3600),
-            lease_timeout: Duration::from_millis(40),
-            max_instances_per_tenant: max_per_tenant,
-            ..Default::default()
-        })
+        Fluid::start(
+            Arc::new(StubBackend),
+            FluidConfig {
+                autoscaler_interval: Duration::from_secs(3600),
+                lease_timeout: Duration::from_millis(40),
+                max_instances_per_tenant: max_per_tenant,
+                ..Default::default()
+            },
+        )
     }
 
     fn fcfg(max_concurrency: u32, max_instances: u32) -> FunctionConfig {
-        FunctionConfig { max_concurrency, max_instances, min_instances: 0, ..Default::default() }
+        FunctionConfig {
+            max_concurrency,
+            max_instances,
+            min_instances: 0,
+            ..Default::default()
+        }
     }
 
     fn add_instance(f: &Fluid, key: &str, inflight: u32, draining: bool) -> CellId {
@@ -1547,13 +1742,23 @@ mod tests {
         p.instances.push(Instance {
             cell_id: id.clone(),
             handle: CellHandle {
-                id: id.clone(), image: "i".into(),
-                resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
-                root: std::path::PathBuf::from("/tmp"), endpoint: None,
+                id: id.clone(),
+                image: "i".into(),
+                resources: ResourceSpec {
+                    vcpus: 1,
+                    mem_mib: 64,
+                    disk_mib: 64,
+                    timeout_secs: 0,
+                },
+                root: std::path::PathBuf::from("/tmp"),
+                endpoint: None,
             },
             endpoint: CellEndpoint::Tcp("127.0.0.1:1".into()),
             udp_ports: Vec::new(),
-            inflight, started_at_ms: now_ms(), last_active_ms: now_ms(), draining,
+            inflight,
+            started_at_ms: now_ms(),
+            last_active_ms: now_ms(),
+            draining,
             requests_served: 0,
         });
         id
@@ -1585,7 +1790,7 @@ mod tests {
         let f = fluid(0);
         f.register("k".into(), fcfg(20, 5), "i".into(), "/w".into(), "t".into());
         add_instance(&f, "k", 3, false); // 3 inflight, static ceiling 20 → would reuse
-        // Pressure monitor lowers the safe ceiling to 3 (CPU-heavy / event-loop lag):
+                                         // Pressure monitor lowers the safe ceiling to 3 (CPU-heavy / event-loop lag):
         f.set_safe_concurrency("k", Some(3));
         // Now the instance is AT the safe ceiling → scale out instead of piling on.
         assert!(matches!(decision(&f, "k"), LeaseDecision::ColdStart));
@@ -1609,10 +1814,22 @@ mod tests {
     #[tokio::test]
     async fn nack_tenant_quota() {
         let f = fluid(1); // tenant may hold 1 live instance total
-        f.register("a".into(), fcfg(1, 5), "i".into(), "/w".into(), "team".into());
-        f.register("b".into(), fcfg(1, 5), "i".into(), "/w".into(), "team".into());
+        f.register(
+            "a".into(),
+            fcfg(1, 5),
+            "i".into(),
+            "/w".into(),
+            "team".into(),
+        );
+        f.register(
+            "b".into(),
+            fcfg(1, 5),
+            "i".into(),
+            "/w".into(),
+            "team".into(),
+        );
         add_instance(&f, "a", 1, false); // team now has 1 live instance (its quota)
-        // b wants to cold-start a 2nd instance for the same tenant → quota NACK
+                                         // b wants to cold-start a 2nd instance for the same tenant → quota NACK
         match decision(&f, "b") {
             LeaseDecision::Saturated(r) => assert_eq!(r, NackReason::TenantQuota),
             d => panic!("expected Saturated(TenantQuota), got {d:?}"),
@@ -1644,13 +1861,19 @@ mod tests {
         f.register("py".into(), c, "i".into(), "/w".into(), "t".into());
         // python's safe baseline is capped to 8 even though max_concurrency=50
         add_instance(&f, "py", 8, false); // at the safe ceiling
-        assert!(matches!(f.decide_lease("py", false).unwrap(), LeaseDecision::ColdStart));
+        assert!(matches!(
+            f.decide_lease("py", false).unwrap(),
+            LeaseDecision::ColdStart
+        ));
         // a node function with the same config keeps full concurrency (no cold start at 8)
         let mut c2 = fcfg(50, 5);
         c2.runtime = "node".into();
         f.register("nd".into(), c2, "i".into(), "/w".into(), "t".into());
         add_instance(&f, "nd", 8, false);
-        assert!(matches!(f.decide_lease("nd", false).unwrap(), LeaseDecision::Ready { .. }));
+        assert!(matches!(
+            f.decide_lease("nd", false).unwrap(),
+            LeaseDecision::Ready { .. }
+        ));
     }
 
     #[test]
@@ -1661,7 +1884,7 @@ mod tests {
         // age based (only once it has served ≥1 request)
         assert!(instance_recyclable(1, 3_600_000, 0, 3_600_000));
         assert!(!instance_recyclable(0, 3_600_000, 0, 3_600_000)); // fresh keep-warm, never served
-        // disabled (0 = unlimited)
+                                                                   // disabled (0 = unlimited)
         assert!(!instance_recyclable(1_000_000, 9_999_999, 0, 0));
     }
 
@@ -1672,9 +1895,15 @@ mod tests {
         // A cold start is already in flight (e.g. the first request, or keep-warm).
         f.registry.lock().get_mut("k").unwrap().provisioning = 1;
         // With coalescing, a concurrent request WAITS for it instead of booting another.
-        assert!(matches!(f.decide_lease("k", true).unwrap(), LeaseDecision::WaitForWarm));
+        assert!(matches!(
+            f.decide_lease("k", true).unwrap(),
+            LeaseDecision::WaitForWarm
+        ));
         // Once the coalesce window elapses (coalesce=false), it may scale out its own.
-        assert!(matches!(f.decide_lease("k", false).unwrap(), LeaseDecision::ColdStart));
+        assert!(matches!(
+            f.decide_lease("k", false).unwrap(),
+            LeaseDecision::ColdStart
+        ));
     }
 
     #[tokio::test]
@@ -1682,8 +1911,8 @@ mod tests {
         let f = fluid(0);
         f.register("k".into(), fcfg(10, 1), "i".into(), "/w".into(), "t".into());
         add_instance(&f, "k", 0, true); // draining, idle — must NOT be reused
-        // at max_instances (1, the draining one counts as live? live_count excludes
-        // draining) → it can cold-start a replacement rather than reuse the drainer.
+                                        // at max_instances (1, the draining one counts as live? live_count excludes
+                                        // draining) → it can cold-start a replacement rather than reuse the drainer.
         assert!(matches!(decision(&f, "k"), LeaseDecision::ColdStart));
     }
 

@@ -133,8 +133,18 @@ impl Bucket {
 /// then evict oldest entries past `max_buckets`. One call site per resolution
 /// in [`MetricsStore::record`], and the sole eviction policy for all three —
 /// changing retention only ever means changing the `MAX_*_BUCKETS` constant.
-fn accumulate_bucket(map: &mut BTreeMap<u64, Bucket>, t: u64, ev: &crate::state::Event, max_buckets: usize) {
-    map.entry(t).or_insert_with(|| Bucket { t_ms: t, ..Default::default() }).accumulate(ev);
+fn accumulate_bucket(
+    map: &mut BTreeMap<u64, Bucket>,
+    t: u64,
+    ev: &crate::state::Event,
+    max_buckets: usize,
+) {
+    map.entry(t)
+        .or_insert_with(|| Bucket {
+            t_ms: t,
+            ..Default::default()
+        })
+        .accumulate(ev);
     while map.len() > max_buckets {
         let oldest = *map.keys().next().unwrap();
         map.remove(&oldest);
@@ -143,13 +153,13 @@ fn accumulate_bucket(map: &mut BTreeMap<u64, Bucket>, t: u64, ev: &crate::state:
 
 #[derive(Default, Serialize, Deserialize)]
 struct TenantMetrics {
-    buckets: BTreeMap<u64, Bucket>,          // bucket start ms -> bucket (1 min, NOT persisted)
-    hour_buckets: BTreeMap<u64, Bucket>,     // bucket start ms -> bucket (1 hour, persisted)
-    day_buckets: BTreeMap<u64, Bucket>,      // bucket start ms -> bucket (1 day, persisted)
+    buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 min, NOT persisted)
+    hour_buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 hour, persisted)
+    day_buckets: BTreeMap<u64, Bucket>, // bucket start ms -> bucket (1 day, persisted)
     #[serde(skip)]
-    paths: HashMap<String, u64>,             // path -> count (rolling, "top paths")
+    paths: HashMap<String, u64>, // path -> count (rolling, "top paths")
     #[serde(skip)]
-    status_classes: HashMap<String, u64>,    // "2xx".."5xx" -> count
+    status_classes: HashMap<String, u64>, // "2xx".."5xx" -> count
 }
 
 pub struct MetricsStore {
@@ -170,7 +180,9 @@ pub struct RollupSnapshot {
 
 impl MetricsStore {
     pub fn new() -> MetricsStore {
-        MetricsStore { by_tenant: RwLock::new(HashMap::new()) }
+        MetricsStore {
+            by_tenant: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Snapshot the hour/day rollups for persistence (`persist.rs::capture`).
@@ -238,7 +250,12 @@ impl MetricsStore {
         let mut out: BTreeMap<u64, Bucket> = BTreeMap::new();
         let mut fold = |tm: &TenantMetrics| {
             for (t, bk) in pick(gran, tm) {
-                out.entry(*t).or_insert_with(|| Bucket { t_ms: *t, ..Default::default() }).add(bk);
+                out.entry(*t)
+                    .or_insert_with(|| Bucket {
+                        t_ms: *t,
+                        ..Default::default()
+                    })
+                    .add(bk);
             }
         };
         match tenant {
@@ -262,27 +279,42 @@ impl MetricsStore {
     /// passes `minutes=10080` for a 7-day span, bucketed hourly) — callers
     /// (`metrics_get`) are responsible for clamping it to
     /// `gran.max_span_minutes()` beforehand.
-    pub fn series(&self, gran: Granularity, minutes: usize, now_ms: u64, tenant: Option<&str>, project: Option<&str>) -> Vec<Bucket> {
+    pub fn series(
+        &self,
+        gran: Granularity,
+        minutes: usize,
+        now_ms: u64,
+        tenant: Option<&str>,
+        project: Option<&str>,
+    ) -> Vec<Bucket> {
         let bucket_ms = gran.bucket_ms();
         let start = now_ms.saturating_sub((minutes as u64) * BUCKET_MS);
         let merged = self.merged_buckets(gran, tenant);
         let first = (start / bucket_ms) * bucket_ms;
         let last = (now_ms / bucket_ms) * bucket_ms;
-        let mut out: Vec<Bucket> = Vec::with_capacity(((last.saturating_sub(first)) / bucket_ms + 1) as usize);
+        let mut out: Vec<Bucket> =
+            Vec::with_capacity(((last.saturating_sub(first)) / bucket_ms + 1) as usize);
         let mut t = first;
         while t <= last {
             match merged.get(&t) {
                 Some(bk) => {
                     if let Some(p) = project {
                         let reqs = bk.by_project.get(p).copied().unwrap_or(0);
-                        out.push(Bucket { t_ms: t, requests: reqs, ..Default::default() });
+                        out.push(Bucket {
+                            t_ms: t,
+                            requests: reqs,
+                            ..Default::default()
+                        });
                     } else {
                         let mut clone = bk.clone();
                         clone.by_project = HashMap::new();
                         out.push(clone);
                     }
                 }
-                None => out.push(Bucket { t_ms: t, ..Default::default() }),
+                None => out.push(Bucket {
+                    t_ms: t,
+                    ..Default::default()
+                }),
             }
             t += bucket_ms;
         }
@@ -292,7 +324,13 @@ impl MetricsStore {
     /// Per-project request totals over the last `minutes` at `gran` resolution,
     /// scoped to `tenant` (`None` = global), sorted desc. Same span-vs-gran
     /// contract as `series` (see its doc comment).
-    pub fn project_totals(&self, gran: Granularity, minutes: usize, now_ms: u64, tenant: Option<&str>) -> Vec<(String, u64)> {
+    pub fn project_totals(
+        &self,
+        gran: Granularity,
+        minutes: usize,
+        now_ms: u64,
+        tenant: Option<&str>,
+    ) -> Vec<(String, u64)> {
         let start = now_ms.saturating_sub((minutes as u64) * BUCKET_MS);
         let merged = self.merged_buckets(gran, tenant);
         let mut totals: HashMap<String, u64> = HashMap::new();
@@ -313,7 +351,10 @@ impl MetricsStore {
     pub fn status_distribution(&self, tenant: Option<&str>) -> HashMap<String, u64> {
         let map = self.by_tenant.read();
         match tenant {
-            Some(t) => map.get(t).map(|tm| tm.status_classes.clone()).unwrap_or_default(),
+            Some(t) => map
+                .get(t)
+                .map(|tm| tm.status_classes.clone())
+                .unwrap_or_default(),
             None => {
                 let mut out: HashMap<String, u64> = HashMap::new();
                 for tm in map.values() {
@@ -388,11 +429,26 @@ mod tests {
         m.record(&ev("b-proj", "/secret-b", 200), "team-b");
 
         // team-a sees ONLY its own paths + statuses + projects.
-        let a_paths: Vec<String> = m.top_paths(Some("team-a"), 10).into_iter().map(|(p, _)| p).collect();
+        let a_paths: Vec<String> = m
+            .top_paths(Some("team-a"), 10)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
         assert!(a_paths.contains(&"/a".to_string()));
-        assert!(!a_paths.contains(&"/secret-b".to_string()), "team-a must NOT see team-b paths");
-        let a_projects: Vec<String> = m.project_totals(Granularity::Minute, 60, 1_000_000, Some("team-a")).into_iter().map(|(p, _)| p).collect();
-        assert_eq!(a_projects, vec!["a-proj".to_string()], "team-a sees only its project");
+        assert!(
+            !a_paths.contains(&"/secret-b".to_string()),
+            "team-a must NOT see team-b paths"
+        );
+        let a_projects: Vec<String> = m
+            .project_totals(Granularity::Minute, 60, 1_000_000, Some("team-a"))
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(
+            a_projects,
+            vec!["a-proj".to_string()],
+            "team-a sees only its project"
+        );
         let a_series = m.series(Granularity::Minute, 60, 1_000_000, Some("team-a"), None);
         assert_eq!(a_series.iter().map(|b| b.requests).sum::<u64>(), 2);
         assert_eq!(a_series.iter().map(|b| b.errors).sum::<u64>(), 1);
@@ -416,18 +472,40 @@ mod tests {
         m.record(&ev("b-proj", "/secret-b", 200), "team-b");
 
         for gran in [Granularity::Hour, Granularity::Day] {
-            let a_series = m.series(gran, gran.max_span_minutes(), 1_000_000, Some("team-a"), None);
-            assert_eq!(a_series.iter().map(|b| b.requests).sum::<u64>(), 2, "{gran:?} team-a total");
-            assert_eq!(a_series.iter().map(|b| b.errors).sum::<u64>(), 1, "{gran:?} team-a errors");
+            let a_series = m.series(
+                gran,
+                gran.max_span_minutes(),
+                1_000_000,
+                Some("team-a"),
+                None,
+            );
+            assert_eq!(
+                a_series.iter().map(|b| b.requests).sum::<u64>(),
+                2,
+                "{gran:?} team-a total"
+            );
+            assert_eq!(
+                a_series.iter().map(|b| b.errors).sum::<u64>(),
+                1,
+                "{gran:?} team-a errors"
+            );
             let a_projects: Vec<String> = m
                 .project_totals(gran, gran.max_span_minutes(), 1_000_000, Some("team-a"))
                 .into_iter()
                 .map(|(p, _)| p)
                 .collect();
-            assert_eq!(a_projects, vec!["a-proj".to_string()], "{gran:?} team-a sees only its project");
+            assert_eq!(
+                a_projects,
+                vec!["a-proj".to_string()],
+                "{gran:?} team-a sees only its project"
+            );
 
             let g_series = m.series(gran, gran.max_span_minutes(), 1_000_000, None, None);
-            assert_eq!(g_series.iter().map(|b| b.requests).sum::<u64>(), 3, "{gran:?} global total");
+            assert_eq!(
+                g_series.iter().map(|b| b.requests).sum::<u64>(),
+                3,
+                "{gran:?} global total"
+            );
         }
     }
 
@@ -443,12 +521,25 @@ mod tests {
         let snap_bytes = serde_json::to_vec(&m.rollup_snapshot()).expect("snapshot serializes");
 
         let restored = MetricsStore::new();
-        let snap: RollupSnapshot = serde_json::from_slice(&snap_bytes).expect("snapshot deserializes");
+        let snap: RollupSnapshot =
+            serde_json::from_slice(&snap_bytes).expect("snapshot deserializes");
         restored.rollup_load(snap);
 
         for gran in [Granularity::Hour, Granularity::Day] {
-            let before = m.series(gran, gran.max_span_minutes(), 1_000_000, Some("team-a"), None);
-            let after = restored.series(gran, gran.max_span_minutes(), 1_000_000, Some("team-a"), None);
+            let before = m.series(
+                gran,
+                gran.max_span_minutes(),
+                1_000_000,
+                Some("team-a"),
+                None,
+            );
+            let after = restored.series(
+                gran,
+                gran.max_span_minutes(),
+                1_000_000,
+                Some("team-a"),
+                None,
+            );
             assert_eq!(
                 before.iter().map(|b| b.requests).sum::<u64>(),
                 after.iter().map(|b| b.requests).sum::<u64>(),
@@ -463,7 +554,17 @@ mod tests {
 
         // Minute buckets are intentionally NOT part of the snapshot — restored
         // store must start with zero minute-resolution history.
-        let restored_minute = restored.series(Granularity::Minute, MAX_BUCKETS, 1_000_000, Some("team-a"), None);
-        assert_eq!(restored_minute.iter().map(|b| b.requests).sum::<u64>(), 0, "minute buckets are not persisted");
+        let restored_minute = restored.series(
+            Granularity::Minute,
+            MAX_BUCKETS,
+            1_000_000,
+            Some("team-a"),
+            None,
+        );
+        assert_eq!(
+            restored_minute.iter().map(|b| b.requests).sum::<u64>(),
+            0,
+            "minute buckets are not persisted"
+        );
     }
 }

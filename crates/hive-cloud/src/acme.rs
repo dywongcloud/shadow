@@ -48,17 +48,24 @@ const NINETY_DAYS_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const RENEW_AFTER_MS: u64 = 60 * 24 * 60 * 60 * 1000; // 2/3 of validity
 
 fn staging() -> bool {
-    std::env::var("HIVE_ACME_STAGING").map(|v| v != "0" && v != "false").unwrap_or(true)
+    std::env::var("HIVE_ACME_STAGING")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true)
 }
 
 fn directory_url() -> &'static str {
-    if staging() { LetsEncrypt::Staging.url() } else { LetsEncrypt::Production.url() }
+    if staging() {
+        LetsEncrypt::Staging.url()
+    } else {
+        LetsEncrypt::Production.url()
+    }
 }
 
 // ---- SNI resolver (hot-swappable) ---------------------------------------------
 
 /// zone (registrable domain, e.g. `shadw.app`) → certified key.
-static CERTS: std::sync::OnceLock<ArcSwap<HashMap<String, Arc<CertifiedKey>>>> = std::sync::OnceLock::new();
+static CERTS: std::sync::OnceLock<ArcSwap<HashMap<String, Arc<CertifiedKey>>>> =
+    std::sync::OnceLock::new();
 
 fn certs() -> &'static ArcSwap<HashMap<String, Arc<CertifiedKey>>> {
     CERTS.get_or_init(|| ArcSwap::from_pointee(HashMap::new()))
@@ -167,7 +174,9 @@ pub struct AcmeChallengeStore {
 
 impl AcmeChallengeStore {
     pub fn new() -> Self {
-        Self { inner: parking_lot::RwLock::new(std::collections::BTreeMap::new()) }
+        Self {
+            inner: parking_lot::RwLock::new(std::collections::BTreeMap::new()),
+        }
     }
 
     fn norm(fqdn: &str) -> String {
@@ -181,9 +190,10 @@ impl AcmeChallengeStore {
         let now = hive_core::now_ms();
         let mut m = self.inner.write();
         m.retain(|_, e| now.saturating_sub(e.created_ms) < CHALLENGE_TTL_MS);
-        let e = m
-            .entry(Self::norm(fqdn))
-            .or_insert_with(|| AcmeChallenge { values: Vec::new(), created_ms: now });
+        let e = m.entry(Self::norm(fqdn)).or_insert_with(|| AcmeChallenge {
+            values: Vec::new(),
+            created_ms: now,
+        });
         e.created_ms = now;
         if !e.values.iter().any(|v| v == value) {
             e.values.push(value.to_string());
@@ -255,7 +265,10 @@ pub fn challenge_record_name(identifier: &str, zone: &str) -> String {
 async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
     for i in 0..24 {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        for doh in ["https://dns.google/resolve", "https://cloudflare-dns.com/dns-query"] {
+        for doh in [
+            "https://dns.google/resolve",
+            "https://cloudflare-dns.com/dns-query",
+        ] {
             let url = format!("{doh}?name={fqdn}&type=TXT");
             let resp = http
                 .get(&url)
@@ -267,7 +280,14 @@ async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
                     let found = v
                         .get("Answer")
                         .and_then(|a| a.as_array())
-                        .map(|arr| arr.iter().any(|rec| rec.get("data").and_then(|d| d.as_str()).map(|d| d.trim_matches('"') == value).unwrap_or(false)))
+                        .map(|arr| {
+                            arr.iter().any(|rec| {
+                                rec.get("data")
+                                    .and_then(|d| d.as_str())
+                                    .map(|d| d.trim_matches('"') == value)
+                                    .unwrap_or(false)
+                            })
+                        })
                         .unwrap_or(false);
                     if found {
                         return true;
@@ -286,7 +306,11 @@ async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
 /// `$HIVE_DATA/acme-account.json` (leader-local; a new leader creates its own).
 async fn account(http: &reqwest::Client) -> anyhow::Result<Account> {
     let _ = http; // account creation uses instant-acme's own hyper client
-    let path = crate::persist::data_dir().join(if staging() { "acme-account-staging.json" } else { "acme-account.json" });
+    let path = crate::persist::data_dir().join(if staging() {
+        "acme-account-staging.json"
+    } else {
+        "acme-account.json"
+    });
     if let Ok(s) = std::fs::read_to_string(&path) {
         if let Ok(creds) = serde_json::from_str::<AccountCredentials>(&s) {
             if let Ok(acct) = Account::builder()?.from_credentials(creds).await {
@@ -359,7 +383,18 @@ async fn issue(
             // stranding the api cutover) — that refusal must not kill the
             // renewal, because Seer is then the authority that matters. Any
             // other failure stays fatal.
-            if let Err(e) = api.create(zone, &DesiredRecord { name: rec_name.clone(), rtype: "TXT".into(), value: value.clone(), ttl: 60 }).await {
+            if let Err(e) = api
+                .create(
+                    zone,
+                    &DesiredRecord {
+                        name: rec_name.clone(),
+                        rtype: "TXT".into(),
+                        value: value.clone(),
+                        ttl: 60,
+                    },
+                )
+                .await
+            {
                 // The gate must be the LIVE delegation state, never static
                 // zone config: below the capable-NS floor the api delegation
                 // deliberately disengages back to the flat A set (Vercel
@@ -370,11 +405,20 @@ async fn issue(
                 // gauges every pass on this same node (the single designation
                 // leads ACME and DNS reconcile together).
                 let conflict = e.to_string().contains("409");
-                let under = |z: Option<&str>| z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}"))).unwrap_or(false);
+                let under = |z: Option<&str>| {
+                    z.map(|z| fqdn == z || fqdn.ends_with(&format!(".{z}")))
+                        .unwrap_or(false)
+                };
                 let delegated_live = (under(crate::dnsserver::deploy_zone())
-                    && crate::vercel_dns::STATS.geo_delegation_records.load(std::sync::atomic::Ordering::Relaxed) > 0)
+                    && crate::vercel_dns::STATS
+                        .geo_delegation_records
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0)
                     || (under(crate::dnsserver::api_zone())
-                        && crate::vercel_dns::STATS.api_delegation_records.load(std::sync::atomic::Ordering::Relaxed) > 0);
+                        && crate::vercel_dns::STATS
+                            .api_delegation_records
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                            > 0);
                 if conflict && delegated_live {
                     tracing::warn!(%fqdn, error = %e, "ACME dns-01 Vercel TXT refused under a live-Seer-delegated name — proceeding via the challenge store");
                 } else {
@@ -432,7 +476,12 @@ async fn issue(
     })
 }
 
-async fn cleanup_txt(api: &VercelApi, zone: &str, txts: &[(String, String)], challenges: &AcmeChallengeStore) {
+async fn cleanup_txt(
+    api: &VercelApi,
+    zone: &str,
+    txts: &[(String, String)],
+    challenges: &AcmeChallengeStore,
+) {
     if txts.is_empty() {
         return;
     }
@@ -442,7 +491,11 @@ async fn cleanup_txt(api: &VercelApi, zone: &str, txts: &[(String, String)], cha
     }
     if let Ok(records) = api.list(zone).await {
         for r in records {
-            if r.rtype == "TXT" && txts.iter().any(|(n, v)| *n == r.name && (*v == r.value || r.value.trim_matches('"') == *v)) {
+            if r.rtype == "TXT"
+                && txts.iter().any(|(n, v)| {
+                    *n == r.name && (*v == r.value || r.value.trim_matches('"') == *v)
+                })
+            {
                 let _ = api.delete(zone, &r.id).await;
             }
         }
@@ -452,11 +505,17 @@ async fn cleanup_txt(api: &VercelApi, zone: &str, txts: &[(String, String)], cha
 // ---- orchestration ---------------------------------------------------------------
 
 fn guardian_key(bundle: &str) -> String {
-    format!("tls/{}/{bundle}", if staging() { "staging" } else { "prod" })
+    format!(
+        "tls/{}/{bundle}",
+        if staging() { "staging" } else { "prod" }
+    )
 }
 
 fn cache_path(bundle: &str) -> std::path::PathBuf {
-    crate::persist::data_dir().join(format!("tls-{bundle}{}.json", if staging() { "-staging" } else { "" }))
+    crate::persist::data_dir().join(format!(
+        "tls-{bundle}{}.json",
+        if staging() { "-staging" } else { "" }
+    ))
 }
 
 fn load_bundle_local(bundle: &str) -> Option<CertBundle> {
@@ -473,7 +532,12 @@ fn store_bundle_local(bundle: &str, b: &CertBundle) {
 /// Leader loop: ensure both bundles exist and are fresh; re-issue at 2/3 of
 /// validity. Jittered check every ~6h (cheap no-op when fresh).
 pub fn spawn_acme(cloud: Arc<CloudState>) {
-    if cloud.ingress == "ngrok" && std::env::var("HIVE_ACME_FORCE").map(|v| v == "1").unwrap_or(false) == false {
+    if cloud.ingress == "ngrok"
+        && std::env::var("HIVE_ACME_FORCE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            == false
+    {
         return;
     }
     let Some(api) = VercelApi::from_env(cloud.http.clone()) else {
@@ -494,11 +558,16 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
             // as a deliberate LEGACY split-pin: when set it takes the pref slot
             // on the fallback path (health-gated, never a raw unguarded check —
             // an unguarded pin freezes ACME silently until certs expire).
-            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
+            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             let chain = crate::cluster::Cluster::owner_chain_from_env();
             let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
-            let leader =
-                crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &cloud.registry.nodes());
+            let leader = crate::cluster::Cluster::control_plane_owner(
+                &chain,
+                pref.as_deref(),
+                &cloud.registry.nodes(),
+            );
             if leader.as_deref() == Some(cloud.node_name.as_str()) {
                 for (bundle, names, zone) in bundles(&cloud) {
                     // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`
@@ -508,7 +577,8 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                     // local/guardian cache doesn't work because cert-sync pulls the old
                     // bundle back from a peer via mesh_fetch. `touch` it on the leader,
                     // restart, and the new SANs land in one pass.
-                    let force_path = crate::persist::data_dir().join(format!("acme-force-{bundle}"));
+                    let force_path =
+                        crate::persist::data_dir().join(format!("acme-force-{bundle}"));
                     let forced = std::fs::metadata(&force_path).is_ok();
                     // Fresh = young enough AND covering every wanted name. The
                     // coverage check is what makes a SAN ADDITION (a new region's
@@ -580,7 +650,7 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
     }
     tokio::spawn(async move {
         let mut installed: HashMap<String, u64> = HashMap::new(); // bundle -> issued_ms
-        // boot: local cache first (guardian may take a while to come online)
+                                                                  // boot: local cache first (guardian may take a while to come online)
         for (bundle, ..) in bundles(&cloud) {
             if let Some(b) = load_bundle_local(&bundle) {
                 if install_bundle(&b).is_ok() {
@@ -623,7 +693,9 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                                 // key_pem_enc is ciphertext under the WRITER's
                                 // per-node AEAD key. Named so the journal shows
                                 // why the newer guardian bundle didn't install.
-                                Err(e) => tracing::debug!(%bundle, newer_issued_ms = b.issued_ms, cur, "cert-sync: guardian replica newer but uninstallable here (foreign AEAD key?): {e}"),
+                                Err(e) => {
+                                    tracing::debug!(%bundle, newer_issued_ms = b.issued_ms, cur, "cert-sync: guardian replica newer but uninstallable here (foreign AEAD key?): {e}")
+                                }
                             }
                         }
                     }
@@ -632,7 +704,9 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                     match mesh_fetch(&cloud, &bundle).await {
                         Some(b) if b.issued_ms > cur => match install_bundle(&b) {
                             Ok(()) => candidate = Some(b),
-                            Err(e) => tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: mesh bundle failed to install: {e}"),
+                            Err(e) => {
+                                tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: mesh bundle failed to install: {e}")
+                            }
                         },
                         Some(b) => {
                             tracing::debug!(%bundle, mesh_issued_ms = b.issued_ms, cur, "cert-sync: mesh best is not newer than installed");
@@ -647,7 +721,9 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
                         if b.issued_ms > cur {
                             match install_bundle(&b) {
                                 Ok(()) => candidate = Some(b),
-                                Err(e) => tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: http bundle failed to install: {e}"),
+                                Err(e) => {
+                                    tracing::warn!(%bundle, issued_ms = b.issued_ms, "cert-sync: http bundle failed to install: {e}")
+                                }
                             }
                         }
                     }
@@ -660,7 +736,12 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
             }
             // Fast cadence until BOTH bundles are installed, then relax.
             let have_all = installed.len() >= bundles(&cloud).len();
-            tokio::time::sleep(std::time::Duration::from_secs(if have_all { 300 } else { 20 })).await;
+            tokio::time::sleep(std::time::Duration::from_secs(if have_all {
+                300
+            } else {
+                20
+            }))
+            .await;
         }
     });
 }
@@ -678,7 +759,9 @@ pub fn spawn_cert_sync(cloud: Arc<CloudState>) {
 /// bundle across all answers (same newest-wins rule as `mesh_fetch`).
 /// `HIVE_CERT_SYNC_URLS` (comma-separated) remains as an explicit override.
 async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle> {
-    let token = std::env::var("HIVE_INTERNAL_TOKEN").ok().filter(|t| !t.trim().is_empty())?;
+    let token = std::env::var("HIVE_INTERNAL_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())?;
     let api_host = format!("api.{}", cloud.platform_domain);
     let mut targets: Vec<(String, Option<std::net::SocketAddr>)> = Vec::new();
     if let Ok(urls) = std::env::var("HIVE_CERT_SYNC_URLS") {
@@ -703,8 +786,15 @@ async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         if let Some(addr) = pin {
             builder = builder.resolve(&api_host, addr);
         }
-        let Ok(client) = builder.build() else { continue };
-        let resp = match client.get(&url).header("x-hive-internal", &token).send().await {
+        let Ok(client) = builder.build() else {
+            continue;
+        };
+        let resp = match client
+            .get(&url)
+            .header("x-hive-internal", &token)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
                 tracing::debug!(%bundle, %url, ?pin, status = %r.status(), "cert-sync: http fallback non-success");
@@ -715,7 +805,9 @@ async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
                 continue;
             }
         };
-        let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+        let Ok(v) = resp.json::<serde_json::Value>().await else {
+            continue;
+        };
         let key_pem = v.get("key_pem").and_then(|k| k.as_str()).unwrap_or("");
         let chain = v.get("chain_pem").and_then(|c| c.as_str()).unwrap_or("");
         if key_pem.is_empty() || chain.is_empty() {
@@ -725,7 +817,10 @@ async fn http_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         if best.as_ref().map(|b| issued > b.issued_ms).unwrap_or(true) {
             tracing::info!(%bundle, %url, ?pin, issued_ms = issued, "cert-sync: http fallback fetched bundle");
             best = Some(CertBundle {
-                names: v.get("names").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default(),
+                names: v
+                    .get("names")
+                    .and_then(|n| serde_json::from_value(n.clone()).ok())
+                    .unwrap_or_default(),
                 chain_pem: chain.to_string(),
                 key_pem_enc: crate::secrets::encrypt(key_pem),
                 issued_ms: issued,
@@ -751,7 +846,9 @@ pub fn bundle_for_mesh(bundle: &str) -> Vec<u8> {
     if bundle != "apps" && bundle != "platform" && bundle != "db" {
         return Vec::new();
     }
-    let Some(b) = load_bundle_local(bundle) else { return Vec::new() };
+    let Some(b) = load_bundle_local(bundle) else {
+        return Vec::new();
+    };
     let key_pem = crate::secrets::decrypt(&b.key_pem_enc);
     serde_json::to_vec(&serde_json::json!({
         "names": b.names,
@@ -785,7 +882,9 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
         let path = format!("/v1/tls/bundle?name={bundle}");
         // Bumped from 10s: give `PeerPool::acquire`'s fresh-discovery fallback room
         // to resolve a stale/flapped hint instead of being cut off by this timeout.
-        if let Some(bytes) = crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &path, &[], 15).await {
+        if let Some(bytes) =
+            crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &path, &[], 15).await
+        {
             if bytes.is_empty() {
                 continue;
             }
@@ -798,7 +897,10 @@ async fn mesh_fetch(cloud: &Arc<CloudState>, bundle: &str) -> Option<CertBundle>
                 let issued = v.get("issued_ms").and_then(|i| i.as_u64()).unwrap_or(0);
                 if best.as_ref().map(|b| issued > b.issued_ms).unwrap_or(true) {
                     best = Some(CertBundle {
-                        names: v.get("names").and_then(|n| serde_json::from_value(n.clone()).ok()).unwrap_or_default(),
+                        names: v
+                            .get("names")
+                            .and_then(|n| serde_json::from_value(n.clone()).ok())
+                            .unwrap_or_default(),
                         chain_pem: chain.to_string(),
                         key_pem_enc: crate::secrets::encrypt(key_pem),
                         issued_ms: issued,
@@ -816,7 +918,10 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
     let mut v = vec![
         (
             "apps".to_string(),
-            vec![format!("*.{}", cloud.apps_domain), cloud.apps_domain.clone()],
+            vec![
+                format!("*.{}", cloud.apps_domain),
+                cloud.apps_domain.clone(),
+            ],
             cloud.apps_domain.clone(),
         ),
         (
@@ -862,7 +967,10 @@ fn bundles(cloud: &Arc<CloudState>) -> Vec<(String, Vec<String>, String)> {
         }
     }
     // relay/discovery terminate their own TLS (iroh) — only add on request.
-    if std::env::var("HIVE_ACME_PLATFORM_EXTRA").map(|x| x == "1").unwrap_or(false) {
+    if std::env::var("HIVE_ACME_PLATFORM_EXTRA")
+        .map(|x| x == "1")
+        .unwrap_or(false)
+    {
         v[1].1.push(format!("relay.{}", cloud.platform_domain));
         v[1].1.push(format!("discovery.{}", cloud.platform_domain));
     }
@@ -891,33 +999,61 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn acme_staging_live() {
-        assert!(staging(), "refusing: HIVE_ACME_STAGING must be 1 for the live test");
+        assert!(
+            staging(),
+            "refusing: HIVE_ACME_STAGING must be 1 for the live test"
+        );
         let http = reqwest::Client::new();
         let api = VercelApi::from_env(http.clone()).expect("VERCEL_API_TOKEN required");
         let apps = std::env::var("HIVE_APPS_DOMAIN").unwrap_or_else(|_| "shadw.app".into());
         let names = vec![format!("*.{apps}"), apps.clone()];
         let challenges = AcmeChallengeStore::new();
-        let bundle = issue(&http, &api, &names, &apps, &challenges).await.expect("staging issuance failed");
+        let bundle = issue(&http, &api, &names, &apps, &challenges)
+            .await
+            .expect("staging issuance failed");
         assert!(bundle.chain_pem.contains("BEGIN CERTIFICATE"));
-        assert!(bundle.key_pem_enc.starts_with("enc:v1:"), "key must be AEAD-encrypted");
+        assert!(
+            bundle.key_pem_enc.starts_with("enc:v1:"),
+            "key must be AEAD-encrypted"
+        );
         install_bundle(&bundle).expect("bundle must install into the SNI resolver");
         assert!(installed_zones().contains(&apps));
-        println!("STAGING CERT ISSUED for {names:?}: {} bytes chain, zones {:?}", bundle.chain_pem.len(), installed_zones());
+        println!(
+            "STAGING CERT ISSUED for {names:?}: {} bytes chain, zones {:?}",
+            bundle.chain_pem.len(),
+            installed_zones()
+        );
     }
 
     #[test]
     fn challenge_names_are_zone_relative() {
-        assert_eq!(challenge_record_name("shadw.app", "shadw.app"), "_acme-challenge");
-        assert_eq!(challenge_record_name("*.shadw.app", "shadw.app"), "_acme-challenge");
-        assert_eq!(challenge_record_name("api.shadw.cloud", "shadw.cloud"), "_acme-challenge.api");
-        assert_eq!(challenge_record_name("relay.shadw.cloud", "shadw.cloud"), "_acme-challenge.relay");
+        assert_eq!(
+            challenge_record_name("shadw.app", "shadw.app"),
+            "_acme-challenge"
+        );
+        assert_eq!(
+            challenge_record_name("*.shadw.app", "shadw.app"),
+            "_acme-challenge"
+        );
+        assert_eq!(
+            challenge_record_name("api.shadw.cloud", "shadw.cloud"),
+            "_acme-challenge.api"
+        );
+        assert_eq!(
+            challenge_record_name("relay.shadw.cloud", "shadw.cloud"),
+            "_acme-challenge.relay"
+        );
     }
 
     #[test]
     fn sni_zone_mapping_installs_wildcard_and_exact() {
         // install_bundle needs real key material — test the zone-derivation logic
         // via the names → zones expansion instead (pure part).
-        let names = vec!["*.shadw.app".to_string(), "shadw.app".to_string(), "api.shadw.cloud".to_string()];
+        let names = vec![
+            "*.shadw.app".to_string(),
+            "shadw.app".to_string(),
+            "api.shadw.cloud".to_string(),
+        ];
         let mut zones: Vec<String> = Vec::new();
         for name in &names {
             let zone = name.strip_prefix("*.").unwrap_or(name).to_string();

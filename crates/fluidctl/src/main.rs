@@ -37,9 +37,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Deploy { dir } => {
             let dir = std::fs::canonicalize(&dir)?;
             let manifest_path = dir.join("fluid.json");
-            let raw = std::fs::read_to_string(&manifest_path).map_err(|e| {
-                anyhow::anyhow!("reading {}: {e}", manifest_path.display())
-            })?;
+            let raw = std::fs::read_to_string(&manifest_path)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", manifest_path.display()))?;
             let manifest = Manifest::from_json(&raw)?;
             let req = DeployRequest {
                 root: dir.to_string_lossy().into_owned(),
@@ -59,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
             println!("deployed {} (project '{}')", info.id, info.project);
             println!("  functions: {}", info.functions.join(", "));
             println!("  alias:     {}", info.alias);
-            println!("  try:       curl -H 'Host: {}' http://127.0.0.1:8787/", info.alias);
+            println!(
+                "  try:       curl -H 'Host: {}' http://127.0.0.1:8787/",
+                info.alias
+            );
         }
         Cmd::Ls => {
             let list: Vec<DeploymentInfo> = http

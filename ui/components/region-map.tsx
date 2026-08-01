@@ -72,13 +72,79 @@ export const PALETTE = [
 const RELAY_BADGE_COLOR = "#a855f7";
 const GUARDIAN_BADGE_COLOR = "#f59e0b";
 
+/** A low-trust browser peer (bn-ui-constellation-satellites): rendered smaller
+ *  and with a visually distinct glyph from every trusted fleet marker above —
+ *  never a color from `PALETTE`/`GPU_COLOR`, so "satellite" reads unambiguously
+ *  at a glance and is never mistaken for platform infrastructure. Positioned
+ *  from a SEPARATE coarse presence feed (never `NodeInfo`) at a deliberately
+ *  coarser precision than fleet markers. */
+export interface SatelliteMarker {
+  id: string;
+  lat: number;
+  lon: number;
+  label?: string;
+  /** "starting" | "online" | "degraded" | "suspended" — drives dot color. */
+  state?: string;
+  /** ms since this presence was last refreshed, for an honest age readout. */
+  ageMs?: number;
+}
+
+const SATELLITE_ONLINE_COLOR = "#38bdf8"; // sky-400 — distinct from every fleet/badge color above
+const SATELLITE_DEGRADED_COLOR = "#94a3b8"; // slate-400 — visually recedes vs. a live fleet node
+
+function satelliteColor(state?: string): string {
+  return state === "degraded" || state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR;
+}
+
+/** Same co-location fan-out as fleet markers (see `RegionMap`'s `placed`
+ *  memo), factored out so satellites — quantized to a much coarser grid and
+ *  therefore far more likely to collide — get identical treatment without
+ *  being mixed into the fleet markers' own dedup pass. */
+function fanOutCollisions<T extends { x: number; y: number }>(points: T[], radius: number): T[] {
+  const groups = new Map<string, T[]>();
+  for (const p of points) {
+    const key = `${p.x.toFixed(1)}_${p.y.toFixed(1)}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
+  }
+  const out: T[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) {
+      out.push(group[0]);
+      continue;
+    }
+    group.forEach((p, i) => {
+      const angle = (2 * Math.PI * i) / group.length;
+      out.push({ ...p, x: p.x + radius * Math.cos(angle), y: p.y + radius * Math.sin(angle) });
+    });
+  }
+  return out;
+}
+
 /**
  * Inline equirectangular world map. Markers are placed at their ACTUAL lat/lon
  * (no hard-coded region table). Markers that land on the same spot — e.g. two
  * nodes running on the same machine, reporting identical coordinates — are fanned
  * out in a small ring and given distinct colors so each is individually visible.
  */
-export function RegionMap({ markers, autoColor = false }: { markers: MapMarker[]; autoColor?: boolean }) {
+/** Hard cap on rendered satellites — a real bound, not a silent one: beyond
+ *  this the map would spend more SVG nodes on browser peers than on the
+ *  entire rest of the constellation. Clustering the overflow into a single
+ *  "+N more" glyph per cell is real future work (bn-ui-constellation-
+ *  performance); today the overflow is simply not drawn, and the caller-
+ *  visible count (`placedSatellites.length` via the returned aria-label) is
+ *  always the true total, so a capped render is distinguishable from "there
+ *  are no more than this".*/
+const MAX_RENDERED_SATELLITES = 300;
+
+export function RegionMap({
+  markers,
+  satellites = [],
+  autoColor = false,
+}: {
+  markers: MapMarker[];
+  satellites?: SatelliteMarker[];
+  autoColor?: boolean;
+}) {
   const landDots = useMemo(() => {
     const out: Array<{ x: number; y: number }> = [];
     for (let r = 0; r < GH; r++) {
@@ -120,12 +186,25 @@ export function RegionMap({ markers, autoColor = false }: { markers: MapMarker[]
     return out;
   }, [markers, autoColor]);
 
+  const placedSatellites = useMemo(() => {
+    const proj = satellites
+      .filter((s) => Number.isFinite(s.lat) && Number.isFinite(s.lon))
+      .map((s) => {
+        const [x, y] = project(s.lon, s.lat);
+        return { ...s, x, y, color: satelliteColor(s.state) };
+      });
+    // A slightly larger fan-out radius than fleet markers: satellites are
+    // quantized to a much coarser grid (~55km cells), so real collisions —
+    // not just visual near-misses — are the common case, not the exception.
+    return fanOutCollisions(proj, 2.2).slice(0, MAX_RENDERED_SATELLITES);
+  }, [satellites]);
+
   return (
     <svg
       viewBox={`0 0 ${GW} ${GH}`}
       className="block w-full text-slate-300 dark:text-slate-700"
       role="img"
-      aria-label={`Region map — ${placed.length} node${placed.length === 1 ? "" : "s"}`}
+      aria-label={`Region map — ${placed.length} node${placed.length === 1 ? "" : "s"}, ${satellites.length} browser node${satellites.length === 1 ? "" : "s"}`}
     >
       {/* Land texture — follows the theme via currentColor. */}
       {landDots.map((d, i) => (
@@ -172,6 +251,27 @@ export function RegionMap({ markers, autoColor = false }: { markers: MapMarker[]
               <title>GuardianDB — {m.label || m.id}</title>
             </circle>
           )}
+        </g>
+      ))}
+      {/* Browser-node satellites — deliberately smaller, a diamond glyph (never
+          a circle, so it can never be mistaken for a trusted fleet marker even
+          at a glance), and animated only under prefers-reduced-motion:no-preference. */}
+      {placedSatellites.map((s, i) => (
+        <g key={`sat-${s.id}-${i}`} opacity={0.9}>
+          <circle cx={s.x} cy={s.y} r={1.1} fill={s.color} opacity={0.18} className="motion-safe:animate-pulse" />
+          <rect
+            x={s.x - 0.5}
+            y={s.y - 0.5}
+            width={1}
+            height={1}
+            fill={s.color}
+            stroke="#ffffff"
+            strokeWidth={0.12}
+            transform={`rotate(45 ${s.x} ${s.y})`}
+          />
+          <title>
+            {(s.label || s.id) + " · browser node (low-trust)" + (s.state ? ` · ${s.state}` : "")}
+          </title>
         </g>
       ))}
     </svg>

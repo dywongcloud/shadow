@@ -37,7 +37,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
-use crate::admin::{delete_to_host, fetch_from_host, host_node_for_deployment, post_body_to_host, require_project};
+use crate::admin::{
+    delete_to_host, fetch_from_host, host_node_for_deployment, post_body_to_host, require_project,
+};
 use crate::state::CloudState;
 
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
@@ -68,7 +70,9 @@ pub(crate) struct CreateReq {
 /// (see its own module doc on why: reflink needs a real block-backed ext4
 /// image, which only the Firecracker cell path creates). Say so plainly
 /// rather than silently no-op.
-fn require_firecracker(c: &Arc<CloudState>) -> Result<Arc<hive_backend::firecracker::FirecrackerBackend>, (StatusCode, String)> {
+fn require_firecracker(
+    c: &Arc<CloudState>,
+) -> Result<Arc<hive_backend::firecracker::FirecrackerBackend>, (StatusCode, String)> {
     c.firecracker.clone().ok_or((
         StatusCode::NOT_IMPLEMENTED,
         "this node has no Firecracker cell backend — snapshots are only available for Firecracker-backed deployments".into(),
@@ -88,7 +92,9 @@ fn broker_status(e: crate::storage_broker::BrokerError) -> (StatusCode, String) 
 /// placed and runs it) — the only case where the filesystem call below is
 /// even meaningful.
 fn hosted_here(c: &Arc<CloudState>, deployment_id: &str) -> bool {
-    c.gw.deployment_records().iter().any(|r| r.id == deployment_id)
+    c.gw.deployment_records()
+        .iter()
+        .any(|r| r.id == deployment_id)
 }
 
 pub(crate) async fn create_snapshot(
@@ -108,19 +114,27 @@ pub(crate) async fn create_snapshot(
         let body_v = json!({ "snapshot_id": body.snapshot_id, "quiesce": body.quiesce });
         return match post_body_to_host(&c, &node, &path, &t, &body_v).await {
             Some(v) => Ok(Json(v)),
-            None => Err((StatusCode::BAD_GATEWAY, format!("storage node {node} unreachable"))),
+            None => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("storage node {node} unreachable"),
+            )),
         };
     }
 
     let fc = require_firecracker(&c)?;
     let dir = fc.snapshot_dir(&deployment_id);
     let existing = hive_backend::snapshot::count_snapshots(&dir);
-    crate::storage_broker::authorize_create(&c, &t, &project, &body.snapshot_id, existing).map_err(broker_status)?;
+    crate::storage_broker::authorize_create(&c, &t, &project, &body.snapshot_id, existing)
+        .map_err(broker_status)?;
     let Some(image) = fc.locate_data_image(&deployment_id) else {
-        return Err((StatusCode::NOT_FOUND, "deployment has no data image on this node".into()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "deployment has no data image on this node".into(),
+        ));
     };
-    let outcome = hive_backend::snapshot::snapshot_image(&image, &dir, &body.snapshot_id, body.quiesce)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let outcome =
+        hive_backend::snapshot::snapshot_image(&image, &dir, &body.snapshot_id, body.quiesce)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(json!(outcome)))
 }
 
@@ -164,14 +178,19 @@ pub(crate) async fn delete_snapshot(
         let Some(node) = host_node_for_deployment(&c, &deployment_id) else {
             return Err((StatusCode::NOT_FOUND, "unknown deployment".into()));
         };
-        let path = format!("/v1/projects/{project}/deployments/{deployment_id}/snapshots/{snapshot_id}");
+        let path =
+            format!("/v1/projects/{project}/deployments/{deployment_id}/snapshots/{snapshot_id}");
         return match delete_to_host(&c, &node, &path, &t).await {
             Some(v) => Ok(Json(v)),
-            None => Err((StatusCode::BAD_GATEWAY, format!("storage node {node} unreachable"))),
+            None => Err((
+                StatusCode::BAD_GATEWAY,
+                format!("storage node {node} unreachable"),
+            )),
         };
     }
 
-    crate::storage_broker::authorize_delete(&c, &t, &project, &snapshot_id).map_err(broker_status)?;
+    crate::storage_broker::authorize_delete(&c, &t, &project, &snapshot_id)
+        .map_err(broker_status)?;
     let fc = require_firecracker(&c)?;
     let dir = fc.snapshot_dir(&deployment_id);
     let removed = hive_backend::snapshot::delete_snapshot(&dir, &snapshot_id)

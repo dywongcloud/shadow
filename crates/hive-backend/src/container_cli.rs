@@ -69,8 +69,16 @@ pub fn bin(apple: bool) -> &'static str {
 /// volume config), so checking bare presence would wrongly force EVERY deploy
 /// onto podman.
 pub fn needs_podman_networking(net: &serde_json::Value) -> bool {
-    let has_ip = net.get("ip").and_then(|v| v.as_str()).map(|s| !s.is_empty()).unwrap_or(false);
-    let has_hosts = net.get("hosts").and_then(|v| v.as_array()).map(|a| !a.is_empty()).unwrap_or(false);
+    let has_ip = net
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+    let has_hosts = net
+        .get("hosts")
+        .and_then(|v| v.as_array())
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
     has_ip || has_hosts
 }
 
@@ -166,7 +174,12 @@ pub async fn is_running(apple: bool, name: &str, path_env: &str) -> bool {
     if apple {
         // `container inspect` has no Go-template `-f` filter (podman-only) —
         // parse the JSON `status.state` field instead.
-        let Ok(out) = Command::new(bin(apple)).args(["inspect", name]).env("PATH", path_env).output().await else {
+        let Ok(out) = Command::new(bin(apple))
+            .args(["inspect", name])
+            .env("PATH", path_env)
+            .output()
+            .await
+        else {
             return false;
         };
         if !out.status.success() {
@@ -199,7 +212,12 @@ pub async fn is_running(apple: bool, name: &str, path_env: &str) -> bool {
 /// `configuration.name` JSON shapes behind one call so callers never touch
 /// either CLI's raw `--format`/`--filter` differences directly.
 pub async fn list_volume_names(apple: bool, path_env: &str) -> Vec<String> {
-    let Ok(out) = Command::new(bin(apple)).args(["volume", "ls", "--format", "json"]).env("PATH", path_env).output().await else {
+    let Ok(out) = Command::new(bin(apple))
+        .args(["volume", "ls", "--format", "json"])
+        .env("PATH", path_env)
+        .output()
+        .await
+    else {
         return Vec::new();
     };
     if !out.status.success() {
@@ -255,12 +273,25 @@ pub async fn available(apple: bool) -> bool {
 /// sibling-hosts workaround; podman's `--ip`/`--add-host` cover this natively
 /// and never need this). Returns the bare address (no `/prefix`).
 pub async fn assigned_ipv4(name: &str, path_env: &str) -> Option<String> {
-    let out = Command::new(bin(true)).args(["inspect", name]).env("PATH", path_env).output().await.ok()?;
+    let out = Command::new(bin(true))
+        .args(["inspect", name])
+        .env("PATH", path_env)
+        .output()
+        .await
+        .ok()?;
     if !out.status.success() {
         return None;
     }
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    let ip = v.as_array()?.first()?.get("status")?.get("networks")?.as_array()?.first()?.get("ipv4Address")?.as_str()?;
+    let ip = v
+        .as_array()?
+        .first()?
+        .get("status")?
+        .get("networks")?
+        .as_array()?
+        .first()?
+        .get("ipv4Address")?
+        .as_str()?;
     Some(ip.split('/').next().unwrap_or(ip).to_string())
 }
 
@@ -275,8 +306,16 @@ pub async fn inject_hosts(name: &str, path_env: &str, entries: &[(String, String
     if entries.is_empty() {
         return;
     }
-    let script = entries.iter().map(|(host, ip)| format!("echo '{ip} {host}' >> /etc/hosts")).collect::<Vec<_>>().join(" && ");
-    let _ = Command::new(bin(true)).args(["exec", name, "sh", "-c", &script]).env("PATH", path_env).output().await;
+    let script = entries
+        .iter()
+        .map(|(host, ip)| format!("echo '{ip} {host}' >> /etc/hosts"))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let _ = Command::new(bin(true))
+        .args(["exec", name, "sh", "-c", &script])
+        .env("PATH", path_env)
+        .output()
+        .await;
 }
 
 #[cfg(test)]
@@ -289,19 +328,34 @@ mod tests {
         // podman MUST carry `-v` so the container's anonymous volumes die with
         // it — omitting it leaked one podman lock per removed container until
         // the whole `num_locks` pool was gone and no container could start.
-        assert_eq!(rm_args(false, "hive-abc"), vec!["rm", "-f", "-v", "hive-abc"]);
+        assert_eq!(
+            rm_args(false, "hive-abc"),
+            vec!["rm", "-f", "-v", "hive-abc"]
+        );
     }
 
     #[test]
     fn logs_tail_args_use_the_right_flag_per_cli() {
-        assert_eq!(logs_tail_args(true, "hive-abc", 20), vec!["logs", "-n", "20", "hive-abc"]);
-        assert_eq!(logs_tail_args(false, "hive-abc", 20), vec!["logs", "--tail", "20", "hive-abc"]);
+        assert_eq!(
+            logs_tail_args(true, "hive-abc", 20),
+            vec!["logs", "-n", "20", "hive-abc"]
+        );
+        assert_eq!(
+            logs_tail_args(false, "hive-abc", 20),
+            vec!["logs", "--tail", "20", "hive-abc"]
+        );
     }
 
     #[test]
     fn pull_args_use_the_right_shape_per_cli() {
-        assert_eq!(pull_args(true, "alpine:latest"), vec!["image", "pull", "alpine:latest"]);
-        assert_eq!(pull_args(false, "alpine:latest"), vec!["pull", "alpine:latest"]);
+        assert_eq!(
+            pull_args(true, "alpine:latest"),
+            vec!["image", "pull", "alpine:latest"]
+        );
+        assert_eq!(
+            pull_args(false, "alpine:latest"),
+            vec!["pull", "alpine:latest"]
+        );
     }
 
     #[test]
@@ -312,12 +366,22 @@ mod tests {
 
     #[test]
     fn resource_flags_drop_podman_only_flags_on_apple() {
-        let limits = ContainerLimits { memory: Some("512m".into()), cpus: Some("1.0".into()), pids: Some(256) };
+        let limits = ContainerLimits {
+            memory: Some("512m".into()),
+            cpus: Some("1.0".into()),
+            pids: Some(256),
+        };
         let apple_flags = resource_flags(true, &limits);
         assert!(apple_flags.contains(&"--memory".to_string()));
         assert!(apple_flags.contains(&"--cpus".to_string()));
-        assert!(!apple_flags.contains(&"--pids-limit".to_string()), "container has no --pids-limit");
-        assert!(!apple_flags.contains(&"--security-opt".to_string()), "container has no --security-opt");
+        assert!(
+            !apple_flags.contains(&"--pids-limit".to_string()),
+            "container has no --pids-limit"
+        );
+        assert!(
+            !apple_flags.contains(&"--security-opt".to_string()),
+            "container has no --security-opt"
+        );
 
         let podman_flags = resource_flags(false, &limits);
         assert!(podman_flags.contains(&"--pids-limit".to_string()));
@@ -332,7 +396,11 @@ mod tests {
         // REJECTED by Apple's `container --cpus` ("Error: The value '2.0' is
         // invalid for '--cpus <cpus>'") — it only accepts a plain integer.
         for (input, expect_apple) in [("2.0", "2"), ("0.5", "1"), ("1", "1"), ("3.6", "4")] {
-            let limits = ContainerLimits { memory: None, cpus: Some(input.into()), pids: None };
+            let limits = ContainerLimits {
+                memory: None,
+                cpus: Some(input.into()),
+                pids: None,
+            };
             let apple = resource_flags(true, &limits);
             let i = apple.iter().position(|f| f == "--cpus").unwrap();
             assert_eq!(apple[i + 1], expect_apple, "input {input}");
@@ -370,15 +438,24 @@ mod tests {
             "net": "hive-net-app", "subnet": "10.10.5.0/24", "gw": "10.10.5.1",
             "ip": "10.10.5.11",
         });
-        assert!(needs_podman_networking(&compose_with_static_ip), "a static IP means real compose networking");
+        assert!(
+            needs_podman_networking(&compose_with_static_ip),
+            "a static IP means real compose networking"
+        );
 
         let compose_with_hosts = serde_json::json!({
             "net": "hive-net-app", "hosts": ["worker:10.10.5.12"],
         });
-        assert!(needs_podman_networking(&compose_with_hosts), "non-empty hosts means real compose networking");
+        assert!(
+            needs_podman_networking(&compose_with_hosts),
+            "non-empty hosts means real compose networking"
+        );
 
         let empty_hosts_array = serde_json::json!({ "net": "hive-net-app", "hosts": [] });
-        assert!(!needs_podman_networking(&empty_hosts_array), "an empty hosts array is not real compose networking");
+        assert!(
+            !needs_podman_networking(&empty_hosts_array),
+            "an empty hosts array is not real compose networking"
+        );
     }
 
     #[test]
@@ -391,7 +468,11 @@ mod tests {
         for (shape, expect) in [(podman_shape, "vol-a"), (apple_shape, "vol-b")] {
             let name = shape.as_array().unwrap()[0]
                 .get("Name")
-                .or_else(|| shape.as_array().unwrap()[0].get("configuration").and_then(|c| c.get("name")))
+                .or_else(|| {
+                    shape.as_array().unwrap()[0]
+                        .get("configuration")
+                        .and_then(|c| c.get("name"))
+                })
                 .or_else(|| shape.as_array().unwrap()[0].get("name"))
                 .and_then(|n| n.as_str());
             assert_eq!(name, Some(expect));

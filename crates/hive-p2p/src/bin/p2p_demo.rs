@@ -63,7 +63,9 @@ async fn main() -> Result<()> {
     let addr_b = ep_b.addr();
     println!("node B id: {node_b_id}");
     let max_conc = 100;
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, function, max_conc, None, None));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b, function, max_conc, None, None,
+    ));
 
     // ---- Node A (the gateway) dials B by endpoint id, over P2P ----
     let ep_a = hive_p2p::bind().await?;

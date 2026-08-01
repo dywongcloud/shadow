@@ -71,7 +71,9 @@ struct InstallationTokenResp {
 }
 
 fn app_id() -> Option<String> {
-    std::env::var("GITHUB_APP_ID").ok().filter(|s| !s.is_empty())
+    std::env::var("GITHUB_APP_ID")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Accepts the PEM either as real newlines (multi-line env value) or as a
@@ -80,13 +82,16 @@ fn app_id() -> Option<String> {
 /// ansible-vault scalar) — unescaped here so callers never have to care
 /// which form ops pasted it in.
 fn private_key_pem() -> Option<String> {
-    std::env::var("GITHUB_APP_PRIVATE_KEY").ok().filter(|s| !s.is_empty()).map(|raw| {
-        if raw.contains("\\n") && !raw.contains('\n') {
-            raw.replace("\\n", "\n")
-        } else {
-            raw
-        }
-    })
+    std::env::var("GITHUB_APP_PRIVATE_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(|raw| {
+            if raw.contains("\\n") && !raw.contains('\n') {
+                raw.replace("\\n", "\n")
+            } else {
+                raw
+            }
+        })
 }
 
 /// True when both `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` are set — the
@@ -105,7 +110,11 @@ fn signed_app_jwt() -> anyhow::Result<String> {
     let key = EncodingKey::from_rsa_pem(pem.as_bytes())
         .map_err(|e| anyhow::anyhow!("GITHUB_APP_PRIVATE_KEY is not a valid RSA PEM: {e}"))?;
     let now = chrono::Utc::now().timestamp();
-    let claims = AppClaims { iat: now - JWT_BACKDATE_SECS, exp: now + JWT_TTL_SECS, iss: id };
+    let claims = AppClaims {
+        iat: now - JWT_BACKDATE_SECS,
+        exp: now + JWT_TTL_SECS,
+        iss: id,
+    };
     let token = encode(&Header::new(Algorithm::RS256), &claims, &key)?;
     Ok(token)
 }
@@ -118,7 +127,11 @@ fn client() -> reqwest::Client {
 /// `Ok(None)` (not an error) when the App simply isn't installed on this
 /// repo — the normal "not applicable here" case, distinct from a transport/
 /// auth failure.
-async fn installation_id_for_repo(app_jwt: &str, owner: &str, repo: &str) -> anyhow::Result<Option<u64>> {
+async fn installation_id_for_repo(
+    app_jwt: &str,
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<Option<u64>> {
     let url = format!("{API_BASE}/repos/{owner}/{repo}/installation");
     let resp = client()
         .get(&url)
@@ -135,7 +148,9 @@ async fn installation_id_for_repo(app_jwt: &str, owner: &str, repo: &str) -> any
     }
     let status = resp.status();
     if !status.is_success() {
-        return Err(anyhow::anyhow!("installation lookup returned HTTP {status}"));
+        return Err(anyhow::anyhow!(
+            "installation lookup returned HTTP {status}"
+        ));
     }
     let body: InstallationLookup = resp
         .json()
@@ -162,7 +177,9 @@ async fn mint_installation_token(app_jwt: &str, installation_id: u64) -> anyhow:
         // Deliberately not including the response body: GitHub error bodies
         // are safe (no credential echo) but keeping this conservative costs
         // nothing and the status code alone is enough to diagnose from logs.
-        return Err(anyhow::anyhow!("installation-token mint returned HTTP {status}"));
+        return Err(anyhow::anyhow!(
+            "installation-token mint returned HTTP {status}"
+        ));
     }
     let body: InstallationTokenResp = resp
         .json()
@@ -177,7 +194,10 @@ async fn mint_installation_token(app_jwt: &str, installation_id: u64) -> anyhow:
 /// hard failure. Every other failure (bad credentials, malformed key, GitHub
 /// unreachable) is `Err` so the caller can log a reason without a token value
 /// ever entering the log.
-pub async fn installation_token_for_repo(owner: &str, repo: &str) -> anyhow::Result<Option<String>> {
+pub async fn installation_token_for_repo(
+    owner: &str,
+    repo: &str,
+) -> anyhow::Result<Option<String>> {
     let jwt = signed_app_jwt()?;
     let Some(installation_id) = installation_id_for_repo(&jwt, owner, repo).await? else {
         return Ok(None);

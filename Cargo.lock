@@ -2441,6 +2441,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "hive-browser-proto"
+version = "0.1.0"
+
+[[package]]
 name = "hive-cell-agent"
 version = "0.1.0"
 dependencies = [
@@ -2474,6 +2478,7 @@ dependencies = [
  "guardian-db",
  "hickory-resolver",
  "hive-backend",
+ "hive-browser-proto",
  "hive-controlplane",
  "hive-core",
  "hive-edge",
@@ -2566,6 +2571,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "fluid-tunnel",
+ "hive-browser-proto",
  "iroh",
  "serde",
  "serde_json",

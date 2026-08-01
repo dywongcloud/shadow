@@ -95,8 +95,16 @@ impl CellBackend for MockBackend {
         // subtree (`<root>/<tenant>/<cell-id>`), so one tenant's cells can never
         // see another's working files — the host-level analogue of the
         // per-microVM rootfs boundary. Empty tenant => "personal".
-        let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
-        let root = self.cfg.root.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
+        let tenant = if spec.tenant.trim().is_empty() {
+            "personal"
+        } else {
+            spec.tenant.as_str()
+        };
+        let root = self
+            .cfg
+            .root
+            .join(crate::sanitize_tenant(tenant))
+            .join(spec.id.as_str());
         tokio::fs::create_dir_all(&root).await?;
         // Simulate the cold-boot + image-load cost the warm pool exists to hide.
         tokio::time::sleep(self.cfg.provision_latency).await;
@@ -222,7 +230,11 @@ impl CellBackend for MockBackend {
         // `terminate` can clean it up reliably (kill_on_drop can't stop podman).
         if func.start_cmd[0] == "__container__" {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
-            let internal = func.start_cmd.get(2).cloned().unwrap_or_else(|| "8080".into());
+            let internal = func
+                .start_cmd
+                .get(2)
+                .cloned()
+                .unwrap_or_else(|| "8080".into());
             // Multi-service (compose) deploys: JSON network config in start_cmd[3] — a
             // DNS-less shared network with static IPs + sibling host entries.
             let net = func
@@ -230,7 +242,12 @@ impl CellBackend for MockBackend {
                 .get(3)
                 .filter(|s| !s.is_empty())
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
-            let name = format!("hive-{}", cell.id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+            let name = format!(
+                "hive-{}",
+                cell.id
+                    .as_str()
+                    .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+            );
             // A real multi-service (compose) deploy pins a static IP + sibling
             // `/etc/hosts` — podman-only (see `container_cli::needs_podman_networking`'s
             // doc: Apple's `container` tool has no static-IP flag, no
@@ -241,28 +258,50 @@ impl CellBackend for MockBackend {
             // single container, which still gets its own project-scoped
             // network purely for TENANT isolation, no static IP — is fully
             // Apple-`container`-eligible.
-            let apple = !net.as_ref().map(crate::container_cli::needs_podman_networking).unwrap_or(false) && crate::container_cli::is_apple_default();
+            let apple = !net
+                .as_ref()
+                .map(crate::container_cli::needs_podman_networking)
+                .unwrap_or(false)
+                && crate::container_cli::is_apple_default();
             let bin = if apple { "container" } else { "podman" };
             let path_env = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin";
-            let _ = std::process::Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).output();
+            let _ = std::process::Command::new(bin)
+                .args(crate::container_cli::rm_args(apple, &name))
+                .output();
             if let Some(n) = &net {
-                if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(netname) = n
+                    .get("net")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     let mut c = vec!["network".to_string(), "create".to_string()];
                     if !apple {
                         c.push("--disable-dns".to_string());
                     }
-                    if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    if let Some(s) = n
+                        .get("subnet")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         c.push("--subnet".into());
                         c.push(s.to_string());
                     }
                     if !apple {
-                        if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        if let Some(g) = n
+                            .get("gw")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
                             c.push("--gateway".into());
                             c.push(g.to_string());
                         }
                     }
                     c.push(netname.to_string());
-                    let _ = Command::new(bin).args(&c).env("PATH", path_env).output().await;
+                    let _ = Command::new(bin)
+                        .args(&c)
+                        .env("PATH", path_env)
+                        .output()
+                        .await;
                 }
             }
             let port = func.port;
@@ -270,15 +309,22 @@ impl CellBackend for MockBackend {
             // publish per `FunctionLaunch::udp_ports` entry — the loopback
             // datagram legs the UDP relay forwards to. Mirrors
             // `podman_run_container`'s emission for macOS dev parity.
-            let mut ports = vec![crate::ContainerPort::tcp(internal.parse().unwrap_or(8080), port)];
+            let mut ports = vec![crate::ContainerPort::tcp(
+                internal.parse().unwrap_or(8080),
+                port,
+            )];
             ports.extend(func.udp_ports.iter().map(|u| crate::ContainerPort {
                 container_port: u.container_port,
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
             let mut args: Vec<String> = vec![
-                "run".into(), "-d".into(), "--name".into(), name.clone(),
-                "-e".into(), format!("PORT={internal}"),
+                "run".into(),
+                "-d".into(),
+                "--name".into(),
+                name.clone(),
+                "-e".into(),
+                format!("PORT={internal}"),
             ];
             // Inject the project's env vars into the container runtime.
             for (k, v) in &func.env {
@@ -289,21 +335,40 @@ impl CellBackend for MockBackend {
             // named volume (≥1 GB) mounted so the container's data survives restarts.
             // Same behavior as `podman_run_container` (used by the Firecracker backend).
             if let Some((vname, vpath)) = net.as_ref().and_then(|n| {
-                let name = n.get("vol").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
-                let path = n.get("volpath").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/data");
+                let name = n
+                    .get("vol")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())?;
+                let path = n
+                    .get("volpath")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("/data");
                 Some((name.to_string(), path.to_string()))
             }) {
-                let _ = Command::new(bin).args(["volume", "create", &vname]).env("PATH", path_env).output().await;
+                let _ = Command::new(bin)
+                    .args(["volume", "create", &vname])
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
                 args.push("-e".into());
                 args.push(format!("HIVE_VOLUME={vpath}"));
                 args.push("-v".into());
                 args.push(format!("{vname}:{vpath}"));
             }
             if let Some(n) = &net {
-                if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(netname) = n
+                    .get("net")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     args.push("--network".into());
                     args.push(netname.to_string());
-                    if let Some(ip) = n.get("ip").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    if let Some(ip) = n
+                        .get("ip")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         args.push("--ip".into());
                         args.push(ip.to_string());
                     }
@@ -318,7 +383,10 @@ impl CellBackend for MockBackend {
             // Resource ceilings + privilege drop (DoS / escalation defense) — `run`
             // OPTIONS, so they precede the image name. Honors the deployment's
             // requested memory (else the generous env-tunable default).
-            args.extend(crate::container_cli::resource_flags(apple, &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids)));
+            args.extend(crate::container_cli::resource_flags(
+                apple,
+                &crate::ContainerLimits::for_container(func.memory_mib, func.cpus, func.pids),
+            ));
             // One `-p` per published port; UDP gets podman's literal `/udp`
             // suffix on the internal port, TCP (the default, and today's only
             // case) gets none — byte-identical to the pre-multi-port single
@@ -330,7 +398,10 @@ impl CellBackend for MockBackend {
                     crate::ContainerProtocol::Udp => "/udp",
                     crate::ContainerProtocol::Tcp => "",
                 };
-                args.push(format!("127.0.0.1:{}:{}{suffix}", p.host_port, p.container_port));
+                args.push(format!(
+                    "127.0.0.1:{}:{}{suffix}",
+                    p.host_port, p.container_port
+                ));
             }
             args.push(image.clone());
             let status = Command::new(bin)
@@ -342,15 +413,29 @@ impl CellBackend for MockBackend {
                 // Reclaim the podman lock a failed start may leak (see the same
                 // fix in lib.rs::podman_run_container — leaked `created` shells
                 // exhaust the 2048-lock pool → CAPACITY_EXHAUSTED fleet-wide).
-                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
-                anyhow::bail!("{bin} run failed: {}", String::from_utf8_lossy(&status.stderr).trim());
+                let _ = Command::new(bin)
+                    .args(crate::container_cli::rm_args(apple, &name))
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
+                anyhow::bail!(
+                    "{bin} run failed: {}",
+                    String::from_utf8_lossy(&status.stderr).trim()
+                );
             }
-            self.containers.lock().await.insert(cell.id.clone(), (name.clone(), apple));
+            self.containers
+                .lock()
+                .await
+                .insert(cell.id.clone(), (name.clone(), apple));
             let func_addr = format!("127.0.0.1:{port}");
             // Readiness failure must ALSO remove the container (else a crash-looping
             // image leaks a lock every keep-warm tick).
             if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
-                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+                let _ = Command::new(bin)
+                    .args(crate::container_cli::rm_args(apple, &name))
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
                 self.containers.lock().await.remove(&cell.id);
                 return Err(e);
             }
@@ -378,7 +463,10 @@ impl CellBackend for MockBackend {
                                     // raw connection to this same listener (magic-byte-gated,
                                     // see TunnelServer::serve_maybe_raw), byte-identical for
                                     // every ordinary framed request.
-                                    fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                                    fluid_tunnel::TunnelServer::serve_maybe_raw(
+                                        conn, local, max_conc,
+                                    )
+                                    .await;
                                 }
                             });
                         }
@@ -405,7 +493,9 @@ impl CellBackend for MockBackend {
         // networking. `"container run "` (not the bare word) avoids false
         // positives on unrelated start commands that happen to contain "container".
         let joined = func.start_cmd.join(" ");
-        let is_container = joined.contains("podman") || joined.contains("docker") || joined.contains("container run ");
+        let is_container = joined.contains("podman")
+            || joined.contains("docker")
+            || joined.contains("container run ");
         let ready_timeout = if is_container { 60 } else { 15 };
 
         let mut cmd = Command::new(&func.start_cmd[0]);
@@ -430,7 +520,11 @@ impl CellBackend for MockBackend {
         // runtime env var needed at all — so the Bun path here is correctly a
         // no-op, not a workaround. Opt-out via HIVE_COMPILE_CACHE=0. Mirrors the
         // microVM cell-agent.
-        let cc_off = func.env.get("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false);
+        let cc_off = func
+            .env
+            .get("HIVE_COMPILE_CACHE")
+            .map(|v| v == "0" || v == "false")
+            .unwrap_or(false);
         if !cc_off && func.runtime.uses_v8_compile_cache() {
             let cache_dir = workdir.join(".hive-compile-cache");
             if std::fs::create_dir_all(&cache_dir).is_ok() {
@@ -467,7 +561,8 @@ impl CellBackend for MockBackend {
                                 // serve_maybe_raw: lets edge.rs's local WS splice open a raw
                                 // connection to this same listener (magic-byte-gated), byte-
                                 // identical for every ordinary framed request.
-                                fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                                fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc)
+                                    .await;
                             }
                         });
                     }
@@ -488,7 +583,10 @@ impl CellBackend for MockBackend {
         // Remove any container bound to this cell.
         if let Some((name, apple)) = self.containers.lock().await.remove(&cell.id) {
             let bin = if apple { "container" } else { "podman" };
-            let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).output().await;
+            let _ = Command::new(bin)
+                .args(crate::container_cli::rm_args(apple, &name))
+                .output()
+                .await;
         }
         // Kill any function process bound to this cell.
         if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
@@ -706,7 +804,12 @@ mod tenant_tests {
         CellSpec {
             id: CellId::new(),
             image: "img".into(),
-            resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
+            resources: ResourceSpec {
+                vcpus: 1,
+                mem_mib: 64,
+                disk_mib: 64,
+                timeout_secs: 0,
+            },
             tenant: tenant.into(),
             container: None,
         }
@@ -728,10 +831,26 @@ mod tenant_tests {
         let b = be.provision(&spec("beta")).await.unwrap();
         let p = be.provision(&spec("")).await.unwrap();
 
-        assert!(a.root.starts_with(root.join("alpha")), "alpha cell not under its tenant dir: {:?}", a.root);
-        assert!(b.root.starts_with(root.join("beta")), "beta cell not under its tenant dir: {:?}", b.root);
-        assert!(p.root.starts_with(root.join("personal")), "empty tenant should map to personal: {:?}", p.root);
-        assert_ne!(a.root.parent(), b.root.parent(), "tenants must not share a cell parent dir");
+        assert!(
+            a.root.starts_with(root.join("alpha")),
+            "alpha cell not under its tenant dir: {:?}",
+            a.root
+        );
+        assert!(
+            b.root.starts_with(root.join("beta")),
+            "beta cell not under its tenant dir: {:?}",
+            b.root
+        );
+        assert!(
+            p.root.starts_with(root.join("personal")),
+            "empty tenant should map to personal: {:?}",
+            p.root
+        );
+        assert_ne!(
+            a.root.parent(),
+            b.root.parent(),
+            "tenants must not share a cell parent dir"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -745,7 +864,12 @@ mod tenant_tests {
         let handle = |id: &CellId| CellHandle {
             id: id.clone(),
             image: "x".into(),
-            resources: ResourceSpec { vcpus: 1, mem_mib: 64, disk_mib: 64, timeout_secs: 0 },
+            resources: ResourceSpec {
+                vcpus: 1,
+                mem_mib: 64,
+                disk_mib: 64,
+                timeout_secs: 0,
+            },
             root: std::env::temp_dir(),
             endpoint: None,
         };
@@ -753,17 +877,27 @@ mod tenant_tests {
         // Busy child: a shell spin loop pegs one core.
         let busy_id = CellId::new();
         let busy = Command::new("sh")
-            .arg("-c").arg("while :; do :; done")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .kill_on_drop(true).spawn().unwrap();
+            .arg("-c")
+            .arg("while :; do :; done")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
         be.funcs.lock().await.insert(busy_id.clone(), busy);
 
         // Idle child: sleeps, ~0 CPU.
         let idle_id = CellId::new();
         let idle = Command::new("sh")
-            .arg("-c").arg("sleep 30")
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
-            .kill_on_drop(true).spawn().unwrap();
+            .arg("-c")
+            .arg("sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
         be.funcs.lock().await.insert(idle_id.clone(), idle);
 
         // Prime the sampler (first sample is the baseline → 0), then measure.
@@ -776,9 +910,18 @@ mod tenant_tests {
         be.terminate(&handle(&busy_id)).await.unwrap();
         be.terminate(&handle(&idle_id)).await.unwrap();
 
-        assert!(busy_cpu > 40.0, "busy process should report high CPU, got {busy_cpu}");
-        assert!(idle_cpu >= 0.0 && idle_cpu < 25.0, "idle process should report low CPU, got {idle_cpu}");
-        assert!(busy_cpu > idle_cpu, "busy must exceed idle ({busy_cpu} vs {idle_cpu})");
+        assert!(
+            busy_cpu > 40.0,
+            "busy process should report high CPU, got {busy_cpu}"
+        );
+        assert!(
+            idle_cpu >= 0.0 && idle_cpu < 25.0,
+            "idle process should report low CPU, got {idle_cpu}"
+        );
+        assert!(
+            busy_cpu > idle_cpu,
+            "busy must exceed idle ({busy_cpu} vs {idle_cpu})"
+        );
     }
 
     /// A hostile tenant slug can't escape the cells root via path traversal.
@@ -792,7 +935,11 @@ mod tenant_tests {
             cache_root: root.join("cache"),
         });
         let h = be.provision(&spec("../../etc")).await.unwrap();
-        assert!(h.root.starts_with(&root), "tenant slug escaped the cells root: {:?}", h.root);
+        assert!(
+            h.root.starts_with(&root),
+            "tenant slug escaped the cells root: {:?}",
+            h.root
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

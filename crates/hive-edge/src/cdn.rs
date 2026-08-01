@@ -114,7 +114,9 @@ impl CdnCache {
         if status != 200 {
             return false;
         }
-        let Some((ttl, swr)) = cache_policy(headers) else { return false };
+        let Some((ttl, swr)) = cache_policy(headers) else {
+            return false;
+        };
         // Cacheable if fresh for a while OR usable as stale-while-revalidate.
         if ttl == 0 && swr == 0 {
             return false;
@@ -148,7 +150,11 @@ impl CdnCache {
         let m = self.misses.load(Ordering::Relaxed);
         let s = self.stale.load(Ordering::Relaxed);
         let total = h + m + s;
-        let ratio = if total > 0 { (h + s) as f64 / total as f64 } else { 0.0 };
+        let ratio = if total > 0 {
+            (h + s) as f64 / total as f64
+        } else {
+            0.0
+        };
         (h, m, s, self.map.lock().len(), ratio)
     }
 }
@@ -163,7 +169,11 @@ impl Default for CdnCache {
 /// precedence: `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control`.
 /// Returns None if not cacheable.
 pub fn cache_policy(headers: &[(String, String)]) -> Option<(u64, u64)> {
-    for name in ["vercel-cdn-cache-control", "cdn-cache-control", "cache-control"] {
+    for name in [
+        "vercel-cdn-cache-control",
+        "cdn-cache-control",
+        "cache-control",
+    ] {
         if let Some(v) = headers
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
@@ -225,7 +235,10 @@ mod tests {
         cdn.maybe_store(
             &k,
             200,
-            &[("cache-control".into(), "max-age=0, stale-while-revalidate=60".into())],
+            &[(
+                "cache-control".into(),
+                "max-age=0, stale-while-revalidate=60".into(),
+            )],
             b"body",
         );
         match cdn.lookup(&k) {
@@ -238,7 +251,12 @@ mod tests {
     fn no_store_not_cached() {
         let cdn = CdnCache::new();
         let k = CdnCache::key("app", "/api");
-        assert!(!cdn.maybe_store(&k, 200, &[("cache-control".into(), "no-store".into())], b"x"));
+        assert!(!cdn.maybe_store(
+            &k,
+            200,
+            &[("cache-control".into(), "no-store".into())],
+            b"x"
+        ));
         assert!(matches!(cdn.lookup(&k), Lookup::Miss));
     }
 }

@@ -65,7 +65,9 @@ pub struct IncidentStore {
 
 impl IncidentStore {
     pub fn new() -> IncidentStore {
-        IncidentStore { items: RwLock::new(Vec::new()) }
+        IncidentStore {
+            items: RwLock::new(Vec::new()),
+        }
     }
 
     pub fn list(&self) -> Vec<Incident> {
@@ -75,7 +77,11 @@ impl IncidentStore {
     }
 
     pub fn open_count(&self) -> usize {
-        self.items.read().iter().filter(|i| i.status != IncidentStatus::Resolved).count()
+        self.items
+            .read()
+            .iter()
+            .filter(|i| i.status != IncidentStatus::Resolved)
+            .count()
     }
 
     pub fn snapshot(&self) -> Vec<Incident> {
@@ -99,7 +105,11 @@ impl IncidentStore {
             updates: vec![IncidentUpdate {
                 ts_ms: now,
                 status: IncidentStatus::Investigating,
-                message: if req.message.is_empty() { "Incident opened.".into() } else { req.message },
+                message: if req.message.is_empty() {
+                    "Incident opened.".into()
+                } else {
+                    req.message
+                },
             }],
         };
         self.items.write().push(inc.clone());
@@ -112,7 +122,11 @@ impl IncidentStore {
         let inc = items.iter_mut().find(|i| i.id == id)?;
         inc.status = req.status;
         inc.updated_ms = now;
-        inc.updates.push(IncidentUpdate { ts_ms: now, status: req.status, message: req.message });
+        inc.updates.push(IncidentUpdate {
+            ts_ms: now,
+            status: req.status,
+            message: req.message,
+        });
         Some(inc.clone())
     }
 

@@ -44,8 +44,9 @@ struct Entry {
 }
 
 fn registry() -> &'static parking_lot::Mutex<std::collections::BTreeMap<&'static str, Arc<Entry>>> {
-    static R: std::sync::OnceLock<parking_lot::Mutex<std::collections::BTreeMap<&'static str, Arc<Entry>>>> =
-        std::sync::OnceLock::new();
+    static R: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::BTreeMap<&'static str, Arc<Entry>>>,
+    > = std::sync::OnceLock::new();
     R.get_or_init(Default::default)
 }
 
@@ -53,7 +54,12 @@ fn entry(name: &'static str) -> Arc<Entry> {
     registry()
         .lock()
         .entry(name)
-        .or_insert_with(|| Arc::new(Entry { restarts: AtomicU64::new(0), last_beat_ms: AtomicU64::new(0) }))
+        .or_insert_with(|| {
+            Arc::new(Entry {
+                restarts: AtomicU64::new(0),
+                last_beat_ms: AtomicU64::new(0),
+            })
+        })
         .clone()
 }
 
@@ -61,7 +67,9 @@ fn entry(name: &'static str) -> Arc<Entry> {
 /// body — a beat after the work would stall for the whole duration of a slow
 /// pass and read as dead.
 pub fn beat(name: &'static str) {
-    entry(name).last_beat_ms.store(hive_core::now_ms(), Ordering::Relaxed);
+    entry(name)
+        .last_beat_ms
+        .store(hive_core::now_ms(), Ordering::Relaxed);
 }
 
 /// Every supervised loop's health, for the admin surface.
@@ -111,13 +119,15 @@ pub struct MemoryPressure {
 }
 
 pub fn memory_pressure() -> MemoryPressure {
-    let rss_mb = std::fs::read_to_string("/proc/self/status").ok().and_then(|s| {
-        s.lines()
-            .find(|l| l.starts_with("VmRSS:"))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|kb| kb.parse::<u64>().ok())
-            .map(|kb| kb / 1024)
-    });
+    let rss_mb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map(|kb| kb / 1024)
+        });
     let cgroup_limit_mb = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
@@ -126,7 +136,11 @@ pub fn memory_pressure() -> MemoryPressure {
         (Some(r), Some(l)) if l > 0 => Some((r as f64 / l as f64) * 100.0),
         _ => None,
     };
-    MemoryPressure { rss_mb, cgroup_limit_mb, pct_of_limit }
+    MemoryPressure {
+        rss_mb,
+        cgroup_limit_mb,
+        pct_of_limit,
+    }
 }
 
 /// Spawn `make()`'s future and keep it alive: on panic OR return, log, back

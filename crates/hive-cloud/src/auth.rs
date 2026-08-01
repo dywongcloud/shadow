@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 pub struct Claims {
     pub sub: String,    // user id
     pub tenant: String, // org/team id (multi-tenancy)
-    pub role: String,   // TENANT-scoped role: owner | member | service (never a platform-operator signal)
-    pub exp: usize,     // expiry (unix seconds)
+    pub role: String, // TENANT-scoped role: owner | member | service (never a platform-operator signal)
+    pub exp: usize,   // expiry (unix seconds)
     pub iat: usize,
     /// Whether the subject is a genuine PLATFORM operator (the backend's own
     /// `HIVE_OWNER_EMAIL`), independent of `role`. `role: "owner"` only ever
@@ -35,7 +35,9 @@ pub struct Claims {
 }
 
 fn secret() -> Option<String> {
-    std::env::var("HIVE_JWT_SECRET").ok().filter(|s| !s.is_empty())
+    std::env::var("HIVE_JWT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 pub fn enforced() -> bool {
@@ -46,7 +48,13 @@ pub fn enforced() -> bool {
 /// must be independently derived by the caller (matching the backend's own
 /// `owner_email` against the verified account email) — never trust a
 /// client-supplied boolean for this field.
-pub fn issue(sub: &str, tenant: &str, role: &str, platform_admin: bool, ttl_secs: i64) -> anyhow::Result<String> {
+pub fn issue(
+    sub: &str,
+    tenant: &str,
+    role: &str,
+    platform_admin: bool,
+    ttl_secs: i64,
+) -> anyhow::Result<String> {
     let key = secret().ok_or_else(|| anyhow::anyhow!("HIVE_JWT_SECRET not set"))?;
     issue_with_secret(sub, tenant, role, platform_admin, ttl_secs, &key)
 }
@@ -54,7 +62,12 @@ pub fn issue(sub: &str, tenant: &str, role: &str, platform_admin: bool, ttl_secs
 /// `issue` with an explicit signing secret (no env read) — the deterministic core,
 /// used by `issue` and by tests that must not touch global process env.
 pub fn issue_with_secret(
-    sub: &str, tenant: &str, role: &str, platform_admin: bool, ttl_secs: i64, key: &str,
+    sub: &str,
+    tenant: &str,
+    role: &str,
+    platform_admin: bool,
+    ttl_secs: i64,
+    key: &str,
 ) -> anyhow::Result<String> {
     let now = chrono::Utc::now().timestamp() as usize;
     let claims = Claims {
@@ -65,7 +78,11 @@ pub fn issue_with_secret(
         exp: now + ttl_secs.max(1) as usize,
         platform_admin,
     };
-    let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(key.as_bytes()))?;
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(key.as_bytes()),
+    )?;
     Ok(token)
 }
 
@@ -100,10 +117,14 @@ pub fn extract_token(headers: &axum::http::HeaderMap) -> Option<String> {
         return Some(bearer);
     }
     // Parse the `hive_jwt` cookie out of the Cookie header.
-    let cookie = headers.get(axum::http::header::COOKIE).and_then(|v| v.to_str().ok())?;
+    let cookie = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())?;
     cookie.split(';').find_map(|kv| {
         let kv = kv.trim();
-        kv.strip_prefix("hive_jwt=").map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+        kv.strip_prefix("hive_jwt=")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
     })
 }
 
@@ -203,17 +224,26 @@ mod tests {
     fn extracts_bearer_then_cookie() {
         // Bearer present → used.
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer abc.def.ghi"));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer abc.def.ghi"),
+        );
         assert_eq!(extract_token(&h).as_deref(), Some("abc.def.ghi"));
 
         // No bearer, hive_jwt cookie among others → cookie value used.
         let mut h = HeaderMap::new();
-        h.insert(header::COOKIE, HeaderValue::from_static("foo=1; hive_jwt=tok123; bar=2"));
+        h.insert(
+            header::COOKIE,
+            HeaderValue::from_static("foo=1; hive_jwt=tok123; bar=2"),
+        );
         assert_eq!(extract_token(&h).as_deref(), Some("tok123"));
 
         // Bearer wins over cookie.
         let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, HeaderValue::from_static("Bearer BEAR"));
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer BEAR"),
+        );
         h.insert(header::COOKIE, HeaderValue::from_static("hive_jwt=COOK"));
         assert_eq!(extract_token(&h).as_deref(), Some("BEAR"));
 

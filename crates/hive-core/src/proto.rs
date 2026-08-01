@@ -194,7 +194,9 @@ impl Runtime {
         if start_cmd.first().map(String::as_str) == Some("__container__") {
             return Runtime::Container;
         }
-        let Some(first) = start_cmd.first() else { return Runtime::Command };
+        let Some(first) = start_cmd.first() else {
+            return Runtime::Command;
+        };
         let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
         match base {
             "bun" | "bunx" => Runtime::Bun,
@@ -209,7 +211,8 @@ impl Runtime {
     /// (build pipeline) and consumer (fluid-compute, backends, guest agent)
     /// should use instead of re-deriving it independently.
     pub fn resolve(config_runtime: &str, start_cmd: &[String]) -> Runtime {
-        Runtime::from_config_str(config_runtime).unwrap_or_else(|| Runtime::infer_from_argv(start_cmd))
+        Runtime::from_config_str(config_runtime)
+            .unwrap_or_else(|| Runtime::infer_from_argv(start_cmd))
     }
 
     /// Does this runtime use Node's V8 `NODE_COMPILE_CACHE` mechanism? Only
@@ -373,16 +376,29 @@ pub enum AgentEvent {
     FunctionError(String),
     /// Agent -> box daemon: please send the cached tarball for `key` (build
     /// cache restore). The box daemon replies with `AgentRequest::CacheData`.
-    CacheGet { key: String, paths: Vec<String> },
+    CacheGet {
+        key: String,
+        paths: Vec<String>,
+    },
     /// Agent -> box daemon: persist this cache tarball for `key` (build cache
     /// save, after a successful build).
-    CachePut { key: String, tar: Vec<u8> },
+    CachePut {
+        key: String,
+        tar: Vec<u8>,
+    },
     /// One line of an `Exec`'s stdout/stderr (`LogStream::System` unused here).
-    ExecOutput { id: String, stream: LogStream, line: String },
+    ExecOutput {
+        id: String,
+        stream: LogStream,
+        line: String,
+    },
     /// An `Exec` finished. `exit_code = None` means it was killed or the agent
     /// could not determine an exit status (e.g. sudo requested but
     /// unavailable) — the caller must NEVER treat `None` as success.
-    ExecDone { id: String, exit_code: Option<i32> },
+    ExecDone {
+        id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[cfg(test)]
@@ -397,8 +413,14 @@ mod runtime_tests {
         assert_eq!(Runtime::from_config_str("bun"), Some(Runtime::Bun));
         assert_eq!(Runtime::from_config_str("BUN"), Some(Runtime::Bun));
         assert_eq!(Runtime::from_config_str("python"), Some(Runtime::Python));
-        assert_eq!(Runtime::from_config_str("container"), Some(Runtime::Container));
-        assert_eq!(Runtime::from_config_str("firecracker"), Some(Runtime::Container));
+        assert_eq!(
+            Runtime::from_config_str("container"),
+            Some(Runtime::Container)
+        );
+        assert_eq!(
+            Runtime::from_config_str("firecracker"),
+            Some(Runtime::Container)
+        );
         // Legacy sentinels that must fall through to argv inference.
         assert_eq!(Runtime::from_config_str("auto"), None);
         assert_eq!(Runtime::from_config_str("command"), None);
@@ -408,23 +430,53 @@ mod runtime_tests {
 
     #[test]
     fn argv_inference_distinguishes_node_and_bun() {
-        assert_eq!(Runtime::infer_from_argv(&["node".into(), "server.js".into()]), Runtime::Node);
-        assert_eq!(Runtime::infer_from_argv(&["/usr/local/bin/node".into()]), Runtime::Node);
-        assert_eq!(Runtime::infer_from_argv(&["npm".into(), "start".into()]), Runtime::Node);
-        assert_eq!(Runtime::infer_from_argv(&["bun".into(), "run".into(), "server.js".into()]), Runtime::Bun);
-        assert_eq!(Runtime::infer_from_argv(&["bunx".into(), "next".into()]), Runtime::Bun);
-        assert_eq!(Runtime::infer_from_argv(&["python3".into(), "app.py".into()]), Runtime::Python);
-        assert_eq!(Runtime::infer_from_argv(&["__container__".into(), "img".into()]), Runtime::Container);
-        assert_eq!(Runtime::infer_from_argv(&["./my-binary".into()]), Runtime::Command);
+        assert_eq!(
+            Runtime::infer_from_argv(&["node".into(), "server.js".into()]),
+            Runtime::Node
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["/usr/local/bin/node".into()]),
+            Runtime::Node
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["npm".into(), "start".into()]),
+            Runtime::Node
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["bun".into(), "run".into(), "server.js".into()]),
+            Runtime::Bun
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["bunx".into(), "next".into()]),
+            Runtime::Bun
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["python3".into(), "app.py".into()]),
+            Runtime::Python
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["__container__".into(), "img".into()]),
+            Runtime::Container
+        );
+        assert_eq!(
+            Runtime::infer_from_argv(&["./my-binary".into()]),
+            Runtime::Command
+        );
         assert_eq!(Runtime::infer_from_argv(&[]), Runtime::Command);
     }
 
     #[test]
     fn resolve_prefers_explicit_config_over_argv_inference() {
         // Explicit "bun" wins even if argv looks like node (e.g. a proxy shim).
-        assert_eq!(Runtime::resolve("bun", &["node".into(), "server.js".into()]), Runtime::Bun);
+        assert_eq!(
+            Runtime::resolve("bun", &["node".into(), "server.js".into()]),
+            Runtime::Bun
+        );
         // "auto"/"command"/empty defer to argv.
-        assert_eq!(Runtime::resolve("auto", &["bun".into(), "server.js".into()]), Runtime::Bun);
+        assert_eq!(
+            Runtime::resolve("auto", &["bun".into(), "server.js".into()]),
+            Runtime::Bun
+        );
         assert_eq!(Runtime::resolve("command", &["node".into()]), Runtime::Node);
         assert_eq!(Runtime::resolve("", &["python3".into()]), Runtime::Python);
     }
@@ -435,7 +487,9 @@ mod runtime_tests {
         assert!(!Runtime::Bun.uses_v8_compile_cache());
         assert!(Runtime::Bun.uses_bun_bytecode_cache());
         assert!(!Runtime::Node.uses_bun_bytecode_cache());
-        assert!(!Runtime::Python.uses_v8_compile_cache() && !Runtime::Python.uses_bun_bytecode_cache());
+        assert!(
+            !Runtime::Python.uses_v8_compile_cache() && !Runtime::Python.uses_bun_bytecode_cache()
+        );
     }
 
     #[test]

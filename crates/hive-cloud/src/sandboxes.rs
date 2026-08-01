@@ -77,7 +77,13 @@ fn default_policy_mode() -> String {
 // only wires up (de)serialization, not `Default::default()`.
 impl Default for NetworkPolicy {
     fn default() -> Self {
-        NetworkPolicy { mode: default_policy_mode(), allowed_domains: vec![], allowed_subnets: vec![], denied_subnets: vec![], forward_proxy: None }
+        NetworkPolicy {
+            mode: default_policy_mode(),
+            allowed_domains: vec![],
+            allowed_subnets: vec![],
+            denied_subnets: vec![],
+            forward_proxy: None,
+        }
     }
 }
 
@@ -318,7 +324,9 @@ pub fn validate_runtime(runtime: &str) -> Result<(), SandboxError> {
     if RUNTIMES.contains(&runtime) {
         Ok(())
     } else {
-        Err(SandboxError::InvalidRuntime(format!("unsupported runtime '{runtime}' — must be one of {RUNTIMES:?}")))
+        Err(SandboxError::InvalidRuntime(format!(
+            "unsupported runtime '{runtime}' — must be one of {RUNTIMES:?}"
+        )))
     }
 }
 
@@ -328,11 +336,20 @@ pub fn validate_runtime(runtime: &str) -> Result<(), SandboxError> {
 pub fn validate_name(name: &str) -> Result<(), SandboxError> {
     let n = name.trim();
     if n.is_empty() || n.len() > 63 {
-        return Err(SandboxError::InvalidName("name must be 1-63 characters".into()));
+        return Err(SandboxError::InvalidName(
+            "name must be 1-63 characters".into(),
+        ));
     }
-    let ok = n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') && !n.starts_with('-') && !n.ends_with('-');
+    let ok = n
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !n.starts_with('-')
+        && !n.ends_with('-');
     if !ok {
-        return Err(SandboxError::InvalidName("name must be lowercase alphanumeric + hyphens, not starting/ending with a hyphen".into()));
+        return Err(SandboxError::InvalidName(
+            "name must be lowercase alphanumeric + hyphens, not starting/ending with a hyphen"
+                .into(),
+        ));
     }
     Ok(())
 }
@@ -343,10 +360,14 @@ pub fn validate_name(name: &str) -> Result<(), SandboxError> {
 /// bytes (the one byte that can desync argv parsing/exec syscalls).
 pub fn validate_argv(cmd: &str, args: &[String]) -> Result<(), SandboxError> {
     if cmd.trim().is_empty() {
-        return Err(SandboxError::InvalidArgv("command must not be empty".into()));
+        return Err(SandboxError::InvalidArgv(
+            "command must not be empty".into(),
+        ));
     }
     if cmd.contains('\0') || args.iter().any(|a| a.contains('\0')) {
-        return Err(SandboxError::InvalidArgv("command/args must not contain NUL bytes".into()));
+        return Err(SandboxError::InvalidArgv(
+            "command/args must not contain NUL bytes".into(),
+        ));
     }
     Ok(())
 }
@@ -356,19 +377,33 @@ pub fn validate_argv(cmd: &str, args: &[String]) -> Result<(), SandboxError> {
 /// caller (API, tests) shares one gate.
 pub fn validate_sudo(requested: bool, project_allows_sudo: bool) -> Result<(), SandboxError> {
     if requested && !project_allows_sudo {
-        return Err(SandboxError::Unauthorized("sudo is not enabled for this project — enable it in project settings first".into()));
+        return Err(SandboxError::Unauthorized(
+            "sudo is not enabled for this project — enable it in project settings first".into(),
+        ));
     }
     Ok(())
 }
 
 fn is_valid_domain(d: &str) -> bool {
     let d = d.trim();
-    !d.is_empty() && d.len() <= 253 && d.split('.').all(|l| !l.is_empty() && l.len() <= 63 && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !l.starts_with('-') && !l.ends_with('-'))
+    !d.is_empty()
+        && d.len() <= 253
+        && d.split('.').all(|l| {
+            !l.is_empty()
+                && l.len() <= 63
+                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                && !l.starts_with('-')
+                && !l.ends_with('-')
+        })
 }
 
 fn is_valid_cidr(s: &str) -> bool {
-    let Some((ip, mask)) = s.split_once('/') else { return false };
-    let Ok(bits): Result<u8, _> = mask.parse() else { return false };
+    let Some((ip, mask)) = s.split_once('/') else {
+        return false;
+    };
+    let Ok(bits): Result<u8, _> = mask.parse() else {
+        return false;
+    };
     if bits > 32 {
         return false;
     }
@@ -380,36 +415,57 @@ pub fn validate_network_policy(p: &NetworkPolicy) -> Result<(), SandboxError> {
         "allow-all" | "deny-all" => Ok(()),
         "allowlist" => {
             if p.allowed_domains.is_empty() && p.allowed_subnets.is_empty() {
-                return Err(SandboxError::InvalidNetworkPolicy("allowlist mode requires at least one allowed domain or subnet".into()));
+                return Err(SandboxError::InvalidNetworkPolicy(
+                    "allowlist mode requires at least one allowed domain or subnet".into(),
+                ));
             }
             for d in &p.allowed_domains {
                 if !is_valid_domain(d) {
-                    return Err(SandboxError::InvalidNetworkPolicy(format!("invalid domain '{d}'")));
+                    return Err(SandboxError::InvalidNetworkPolicy(format!(
+                        "invalid domain '{d}'"
+                    )));
                 }
             }
             for s in p.allowed_subnets.iter().chain(p.denied_subnets.iter()) {
                 if !is_valid_cidr(s) {
-                    return Err(SandboxError::InvalidNetworkPolicy(format!("invalid CIDR subnet '{s}'")));
+                    return Err(SandboxError::InvalidNetworkPolicy(format!(
+                        "invalid CIDR subnet '{s}'"
+                    )));
                 }
             }
             Ok(())
         }
-        other => Err(SandboxError::InvalidNetworkPolicy(format!("unknown network policy mode '{other}' — must be allow-all, deny-all, or allowlist"))),
+        other => Err(SandboxError::InvalidNetworkPolicy(format!(
+            "unknown network policy mode '{other}' — must be allow-all, deny-all, or allowlist"
+        ))),
     }
 }
 
-pub fn validate_mount(mount_path: &str, kind: &str, mode: &str, provider: &str) -> Result<(), SandboxError> {
+pub fn validate_mount(
+    mount_path: &str,
+    kind: &str,
+    mode: &str,
+    provider: &str,
+) -> Result<(), SandboxError> {
     if !mount_path.starts_with('/') || mount_path.contains("..") {
-        return Err(SandboxError::InvalidMount("mountPath must be an absolute path with no '..' segments".into()));
+        return Err(SandboxError::InvalidMount(
+            "mountPath must be an absolute path with no '..' segments".into(),
+        ));
     }
     if !matches!(kind, "drive" | "remote-fuse") {
-        return Err(SandboxError::InvalidMount(format!("mount type must be 'drive' or 'remote-fuse', got '{kind}'")));
+        return Err(SandboxError::InvalidMount(format!(
+            "mount type must be 'drive' or 'remote-fuse', got '{kind}'"
+        )));
     }
     if !matches!(mode, "read-only" | "read-write") {
-        return Err(SandboxError::InvalidMount(format!("mount mode must be 'read-only' or 'read-write', got '{mode}'")));
+        return Err(SandboxError::InvalidMount(format!(
+            "mount mode must be 'read-only' or 'read-write', got '{mode}'"
+        )));
     }
     if kind == "remote-fuse" && !matches!(provider, "s3" | "r2" | "gcs" | "custom") {
-        return Err(SandboxError::InvalidMount(format!("remote-fuse provider must be one of s3|r2|gcs|custom, got '{provider}'")));
+        return Err(SandboxError::InvalidMount(format!(
+            "remote-fuse provider must be one of s3|r2|gcs|custom, got '{provider}'"
+        )));
     }
     Ok(())
 }
@@ -464,7 +520,9 @@ pub struct SandboxQuota {
 
 pub fn check_quota(current: u32, max: u32, resource: &str) -> Result<(), SandboxError> {
     if max > 0 && current >= max {
-        return Err(SandboxError::QuotaExceeded(format!("{resource} limit reached ({current}/{max}) on this plan — upgrade to add more")));
+        return Err(SandboxError::QuotaExceeded(format!(
+            "{resource} limit reached ({current}/{max}) on this plan — upgrade to add more"
+        )));
     }
     Ok(())
 }
@@ -542,24 +600,95 @@ pub struct MountConfigInput {
 #[async_trait::async_trait]
 pub trait SandboxProvider: Send + Sync {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError>;
-    async fn create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError>;
-    async fn get_sandbox(&self, project_id: &str, id_or_name: &str) -> Result<SandboxRecord, SandboxError>;
-    async fn get_or_create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError>;
-    async fn stop_sandbox(&self, project_id: &str, id: &str) -> Result<SandboxRecord, SandboxError>;
+    async fn create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError>;
+    async fn get_sandbox(
+        &self,
+        project_id: &str,
+        id_or_name: &str,
+    ) -> Result<SandboxRecord, SandboxError>;
+    async fn get_or_create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError>;
+    async fn stop_sandbox(&self, project_id: &str, id: &str)
+        -> Result<SandboxRecord, SandboxError>;
     async fn delete_sandbox(&self, project_id: &str, id: &str) -> Result<(), SandboxError>;
-    async fn run_command(&self, project_id: &str, id: &str, input: RunCommandInput) -> Result<SandboxCommandRecord, SandboxError>;
-    async fn list_commands(&self, project_id: &str, id: &str) -> Result<Vec<SandboxCommandRecord>, SandboxError>;
-    async fn get_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError>;
-    async fn kill_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError>;
-    async fn write_files(&self, project_id: &str, id: &str, files: Vec<(String, Vec<u8>)>) -> Result<(), SandboxError>;
-    async fn read_file(&self, project_id: &str, id: &str, path: &str) -> Result<Vec<u8>, SandboxError>;
-    async fn create_snapshot(&self, project_id: &str, id: &str, input: CreateSnapshotInput) -> Result<SandboxSnapshotRecord, SandboxError>;
-    async fn list_snapshots(&self, project_id: &str, id: &str) -> Result<Vec<SandboxSnapshotRecord>, SandboxError>;
-    async fn delete_snapshot(&self, project_id: &str, snapshot_id: &str) -> Result<(), SandboxError>;
+    async fn run_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: RunCommandInput,
+    ) -> Result<SandboxCommandRecord, SandboxError>;
+    async fn list_commands(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxCommandRecord>, SandboxError>;
+    async fn get_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError>;
+    async fn kill_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError>;
+    async fn write_files(
+        &self,
+        project_id: &str,
+        id: &str,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), SandboxError>;
+    async fn read_file(
+        &self,
+        project_id: &str,
+        id: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, SandboxError>;
+    async fn create_snapshot(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: CreateSnapshotInput,
+    ) -> Result<SandboxSnapshotRecord, SandboxError>;
+    async fn list_snapshots(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxSnapshotRecord>, SandboxError>;
+    async fn delete_snapshot(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> Result<(), SandboxError>;
     async fn domain(&self, project_id: &str, id: &str, port: u16) -> Result<String, SandboxError>;
-    async fn update_network_policy(&self, project_id: &str, id: &str, policy: NetworkPolicy) -> Result<SandboxRecord, SandboxError>;
-    async fn mount_storage(&self, project_id: &str, id: &str, input: MountConfigInput) -> Result<SandboxMountRecord, SandboxError>;
-    async fn list_mounts(&self, project_id: &str, id: &str) -> Result<Vec<SandboxMountRecord>, SandboxError>;
+    async fn update_network_policy(
+        &self,
+        project_id: &str,
+        id: &str,
+        policy: NetworkPolicy,
+    ) -> Result<SandboxRecord, SandboxError>;
+    async fn mount_storage(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: MountConfigInput,
+    ) -> Result<SandboxMountRecord, SandboxError>;
+    async fn list_mounts(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxMountRecord>, SandboxError>;
     async fn delete_mount(&self, project_id: &str, mount_id: &str) -> Result<(), SandboxError>;
 }
 
@@ -601,9 +730,20 @@ impl MockSandboxProvider {
 #[async_trait::async_trait]
 impl SandboxProvider for MockSandboxProvider {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError> {
-        Ok(self.sandboxes.lock().iter().filter(|s| s.project_id == project_id && s.deleted_at.is_none()).cloned().collect())
+        Ok(self
+            .sandboxes
+            .lock()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.deleted_at.is_none())
+            .cloned()
+            .collect())
     }
-    async fn create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError> {
+    async fn create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError> {
         validate_name(&input.name)?;
         validate_runtime(&input.runtime)?;
         validate_network_policy(&input.network_policy)?;
@@ -628,7 +768,14 @@ impl SandboxProvider for MockSandboxProvider {
             ports: input.ports,
             exposed_domains: HashMap::new(),
             network_policy: input.network_policy,
-            env_refs: input.env.into_iter().map(|(k, v, _)| EnvRef { key: k, value_enc: v }).collect(),
+            env_refs: input
+                .env
+                .into_iter()
+                .map(|(k, v, _)| EnvRef {
+                    key: k,
+                    value_enc: v,
+                })
+                .collect(),
             tags: input.tags,
             current_snapshot_id: None,
             snapshot_expiration_ms: None,
@@ -649,23 +796,43 @@ impl SandboxProvider for MockSandboxProvider {
         self.sandboxes.lock().push(rec.clone());
         Ok(rec)
     }
-    async fn get_sandbox(&self, project_id: &str, id_or_name: &str) -> Result<SandboxRecord, SandboxError> {
+    async fn get_sandbox(
+        &self,
+        project_id: &str,
+        id_or_name: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
         self.sandboxes
             .lock()
             .iter()
-            .find(|s| s.project_id == project_id && s.deleted_at.is_none() && (s.id == id_or_name || s.name == id_or_name))
+            .find(|s| {
+                s.project_id == project_id
+                    && s.deleted_at.is_none()
+                    && (s.id == id_or_name || s.name == id_or_name)
+            })
             .cloned()
             .ok_or_else(|| SandboxError::NotFound(id_or_name.to_string()))
     }
-    async fn get_or_create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError> {
+    async fn get_or_create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError> {
         if let Ok(existing) = self.get_sandbox(project_id, &input.name).await {
             return Ok(existing);
         }
         self.create_sandbox(tenant_id, project_id, input).await
     }
-    async fn stop_sandbox(&self, project_id: &str, id: &str) -> Result<SandboxRecord, SandboxError> {
+    async fn stop_sandbox(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
         let mut m = self.sandboxes.lock();
-        let s = m.iter_mut().find(|s| s.project_id == project_id && s.id == id).ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
+        let s = m
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id)
+            .ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
         s.status = SandboxStatus::Stopped;
         s.last_stopped_at = Some(1);
         if s.persistent {
@@ -675,11 +842,19 @@ impl SandboxProvider for MockSandboxProvider {
     }
     async fn delete_sandbox(&self, project_id: &str, id: &str) -> Result<(), SandboxError> {
         let mut m = self.sandboxes.lock();
-        let s = m.iter_mut().find(|s| s.project_id == project_id && s.id == id).ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
+        let s = m
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id)
+            .ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
         s.deleted_at = Some(1);
         Ok(())
     }
-    async fn run_command(&self, project_id: &str, id: &str, input: RunCommandInput) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn run_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: RunCommandInput,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         validate_argv(&input.cmd, &input.args)?;
         self.get_sandbox(project_id, id).await?;
         let cid = self.next_id("cmd");
@@ -695,9 +870,16 @@ impl SandboxProvider for MockSandboxProvider {
             env_refs: vec![],
             sudo: input.sudo,
             detached: input.detached,
-            status: if input.detached { CommandStatus::Running } else { CommandStatus::Exited },
+            status: if input.detached {
+                CommandStatus::Running
+            } else {
+                CommandStatus::Exited
+            },
             exit_code: if input.detached { None } else { Some(0) },
-            stdout: vec![LogLine { ts_ms: 1, line: "mock output".into() }],
+            stdout: vec![LogLine {
+                ts_ms: 1,
+                line: "mock output".into(),
+            }],
             stderr: vec![],
             started_at: Some(1),
             finished_at: if input.detached { None } else { Some(2) },
@@ -707,10 +889,25 @@ impl SandboxProvider for MockSandboxProvider {
         self.commands.lock().push(rec.clone());
         Ok(rec)
     }
-    async fn list_commands(&self, project_id: &str, id: &str) -> Result<Vec<SandboxCommandRecord>, SandboxError> {
-        Ok(self.commands.lock().iter().filter(|c| c.project_id == project_id && c.sandbox_id == id).cloned().collect())
+    async fn list_commands(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxCommandRecord>, SandboxError> {
+        Ok(self
+            .commands
+            .lock()
+            .iter()
+            .filter(|c| c.project_id == project_id && c.sandbox_id == id)
+            .cloned()
+            .collect())
     }
-    async fn get_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn get_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         self.commands
             .lock()
             .iter()
@@ -718,7 +915,12 @@ impl SandboxProvider for MockSandboxProvider {
             .cloned()
             .ok_or_else(|| SandboxError::CommandNotFound(command_id.to_string()))
     }
-    async fn kill_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn kill_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         let mut m = self.commands.lock();
         let c = m
             .iter_mut()
@@ -728,13 +930,28 @@ impl SandboxProvider for MockSandboxProvider {
         c.finished_at = Some(3);
         Ok(c.clone())
     }
-    async fn write_files(&self, _project_id: &str, _id: &str, _files: Vec<(String, Vec<u8>)>) -> Result<(), SandboxError> {
+    async fn write_files(
+        &self,
+        _project_id: &str,
+        _id: &str,
+        _files: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), SandboxError> {
         Ok(())
     }
-    async fn read_file(&self, _project_id: &str, _id: &str, _path: &str) -> Result<Vec<u8>, SandboxError> {
+    async fn read_file(
+        &self,
+        _project_id: &str,
+        _id: &str,
+        _path: &str,
+    ) -> Result<Vec<u8>, SandboxError> {
         Ok(b"mock file contents".to_vec())
     }
-    async fn create_snapshot(&self, project_id: &str, id: &str, _input: CreateSnapshotInput) -> Result<SandboxSnapshotRecord, SandboxError> {
+    async fn create_snapshot(
+        &self,
+        project_id: &str,
+        id: &str,
+        _input: CreateSnapshotInput,
+    ) -> Result<SandboxSnapshotRecord, SandboxError> {
         self.get_sandbox(project_id, id).await?;
         let sid = self.next_id("snap");
         let rec = SandboxSnapshotRecord {
@@ -752,10 +969,24 @@ impl SandboxProvider for MockSandboxProvider {
         self.snapshots.lock().push(rec.clone());
         Ok(rec)
     }
-    async fn list_snapshots(&self, project_id: &str, id: &str) -> Result<Vec<SandboxSnapshotRecord>, SandboxError> {
-        Ok(self.snapshots.lock().iter().filter(|s| s.project_id == project_id && s.sandbox_id == id).cloned().collect())
+    async fn list_snapshots(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxSnapshotRecord>, SandboxError> {
+        Ok(self
+            .snapshots
+            .lock()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.sandbox_id == id)
+            .cloned()
+            .collect())
     }
-    async fn delete_snapshot(&self, project_id: &str, snapshot_id: &str) -> Result<(), SandboxError> {
+    async fn delete_snapshot(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> Result<(), SandboxError> {
         let mut m = self.snapshots.lock();
         let before = m.len();
         m.retain(|s| !(s.project_id == project_id && s.id == snapshot_id));
@@ -768,14 +999,27 @@ impl SandboxProvider for MockSandboxProvider {
         self.get_sandbox(project_id, id).await?;
         Ok(format!("http://mock.local:{port}"))
     }
-    async fn update_network_policy(&self, project_id: &str, id: &str, policy: NetworkPolicy) -> Result<SandboxRecord, SandboxError> {
+    async fn update_network_policy(
+        &self,
+        project_id: &str,
+        id: &str,
+        policy: NetworkPolicy,
+    ) -> Result<SandboxRecord, SandboxError> {
         validate_network_policy(&policy)?;
         let mut m = self.sandboxes.lock();
-        let s = m.iter_mut().find(|s| s.project_id == project_id && s.id == id).ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
+        let s = m
+            .iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id)
+            .ok_or_else(|| SandboxError::NotFound(id.to_string()))?;
         s.network_policy = policy;
         Ok(s.clone())
     }
-    async fn mount_storage(&self, project_id: &str, id: &str, input: MountConfigInput) -> Result<SandboxMountRecord, SandboxError> {
+    async fn mount_storage(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: MountConfigInput,
+    ) -> Result<SandboxMountRecord, SandboxError> {
         validate_mount(&input.mount_path, &input.kind, &input.mode, &input.provider)?;
         self.get_sandbox(project_id, id).await?;
         let mid = self.next_id("mnt");
@@ -797,8 +1041,18 @@ impl SandboxProvider for MockSandboxProvider {
         self.mounts.lock().push(rec.clone());
         Ok(rec)
     }
-    async fn list_mounts(&self, project_id: &str, id: &str) -> Result<Vec<SandboxMountRecord>, SandboxError> {
-        Ok(self.mounts.lock().iter().filter(|m| m.project_id == project_id && m.sandbox_id == id).cloned().collect())
+    async fn list_mounts(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxMountRecord>, SandboxError> {
+        Ok(self
+            .mounts
+            .lock()
+            .iter()
+            .filter(|m| m.project_id == project_id && m.sandbox_id == id)
+            .cloned()
+            .collect())
     }
     async fn delete_mount(&self, project_id: &str, mount_id: &str) -> Result<(), SandboxError> {
         let mut m = self.mounts.lock();
@@ -821,7 +1075,10 @@ mod tests {
             assert!(validate_runtime(r).is_ok());
         }
         assert!(validate_runtime("ruby3.2").is_err());
-        assert_eq!(validate_runtime("bogus").unwrap_err().code(), "SANDBOX_INVALID_RUNTIME");
+        assert_eq!(
+            validate_runtime("bogus").unwrap_err().code(),
+            "SANDBOX_INVALID_RUNTIME"
+        );
     }
 
     #[test]
@@ -846,15 +1103,31 @@ mod tests {
     fn sudo_requires_explicit_project_policy() {
         assert!(validate_sudo(false, false).is_ok());
         assert!(validate_sudo(true, true).is_ok());
-        assert_eq!(validate_sudo(true, false).unwrap_err().code(), "SANDBOX_UNAUTHORIZED");
+        assert_eq!(
+            validate_sudo(true, false).unwrap_err().code(),
+            "SANDBOX_UNAUTHORIZED"
+        );
     }
 
     #[test]
     fn network_policy_validation() {
-        assert!(validate_network_policy(&NetworkPolicy { mode: "allow-all".into(), ..Default::default() }).is_ok());
-        assert!(validate_network_policy(&NetworkPolicy { mode: "deny-all".into(), ..Default::default() }).is_ok());
+        assert!(validate_network_policy(&NetworkPolicy {
+            mode: "allow-all".into(),
+            ..Default::default()
+        })
+        .is_ok());
+        assert!(validate_network_policy(&NetworkPolicy {
+            mode: "deny-all".into(),
+            ..Default::default()
+        })
+        .is_ok());
         assert_eq!(
-            validate_network_policy(&NetworkPolicy { mode: "allowlist".into(), ..Default::default() }).unwrap_err().code(),
+            validate_network_policy(&NetworkPolicy {
+                mode: "allowlist".into(),
+                ..Default::default()
+            })
+            .unwrap_err()
+            .code(),
             "SANDBOX_INVALID_NETWORK_POLICY"
         );
         assert!(validate_network_policy(&NetworkPolicy {
@@ -875,7 +1148,11 @@ mod tests {
             ..Default::default()
         })
         .is_ok());
-        assert!(validate_network_policy(&NetworkPolicy { mode: "bogus".into(), ..Default::default() }).is_err());
+        assert!(validate_network_policy(&NetworkPolicy {
+            mode: "bogus".into(),
+            ..Default::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -895,7 +1172,10 @@ mod tests {
         let text = "Authorization: Bearer sk_live_abc123 request failed";
         let redacted = redact_secrets(text, &secrets);
         assert!(!redacted.contains("sk_live_abc123"));
-        assert!(!redacted.contains("sk_live_abc"), "shorter substring secret must not survive: {redacted}");
+        assert!(
+            !redacted.contains("sk_live_abc"),
+            "shorter substring secret must not survive: {redacted}"
+        );
         assert!(redacted.contains("[REDACTED]"));
     }
 
@@ -925,7 +1205,14 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_create_list_get_lifecycle() {
         let p = MockSandboxProvider::new();
-        let input = CreateSandboxInput { name: "test-1".into(), runtime: "node22".into(), vcpus: 1, memory_mb: 1024, timeout_ms: 60_000, ..Default::default() };
+        let input = CreateSandboxInput {
+            name: "test-1".into(),
+            runtime: "node22".into(),
+            vcpus: 1,
+            memory_mb: 1024,
+            timeout_ms: 60_000,
+            ..Default::default()
+        };
         let rec = p.create_sandbox("t1", "proj-a", input).await.unwrap();
         assert_eq!(rec.status, SandboxStatus::Running);
         let listed = p.list_sandboxes("proj-a").await.unwrap();
@@ -939,62 +1226,182 @@ mod tests {
     #[tokio::test]
     async fn mock_provider_persistent_stop_creates_snapshot_marker() {
         let p = MockSandboxProvider::new();
-        let input = CreateSandboxInput { name: "persist-1".into(), runtime: "node22".into(), persistent: true, ..Default::default() };
+        let input = CreateSandboxInput {
+            name: "persist-1".into(),
+            runtime: "node22".into(),
+            persistent: true,
+            ..Default::default()
+        };
         let rec = p.create_sandbox("t1", "proj-a", input).await.unwrap();
         let stopped = p.stop_sandbox("proj-a", &rec.id).await.unwrap();
         assert_eq!(stopped.status, SandboxStatus::Stopped);
-        assert!(stopped.current_snapshot_id.is_some(), "persistent sandbox must record snapshot/persistent state on stop");
+        assert!(
+            stopped.current_snapshot_id.is_some(),
+            "persistent sandbox must record snapshot/persistent state on stop"
+        );
     }
 
     #[tokio::test]
     async fn mock_provider_run_command_blocking_and_detached() {
         let p = MockSandboxProvider::new();
-        let rec = p.create_sandbox("t1", "proj-a", CreateSandboxInput { name: "cmd-1".into(), runtime: "node22".into(), ..Default::default() }).await.unwrap();
-        let blocking = p.run_command("proj-a", &rec.id, RunCommandInput { cmd: "node".into(), args: vec!["--version".into()], ..Default::default() }).await.unwrap();
+        let rec = p
+            .create_sandbox(
+                "t1",
+                "proj-a",
+                CreateSandboxInput {
+                    name: "cmd-1".into(),
+                    runtime: "node22".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let blocking = p
+            .run_command(
+                "proj-a",
+                &rec.id,
+                RunCommandInput {
+                    cmd: "node".into(),
+                    args: vec!["--version".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(blocking.status, CommandStatus::Exited);
         assert_eq!(blocking.exit_code, Some(0));
-        let detached = p.run_command("proj-a", &rec.id, RunCommandInput { cmd: "sleep".into(), args: vec!["100".into()], detached: true, ..Default::default() }).await.unwrap();
+        let detached = p
+            .run_command(
+                "proj-a",
+                &rec.id,
+                RunCommandInput {
+                    cmd: "sleep".into(),
+                    args: vec!["100".into()],
+                    detached: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         assert_eq!(detached.status, CommandStatus::Running);
         assert!(detached.exit_code.is_none());
-        let killed = p.kill_command("proj-a", &rec.id, &detached.id).await.unwrap();
+        let killed = p
+            .kill_command("proj-a", &rec.id, &detached.id)
+            .await
+            .unwrap();
         assert_eq!(killed.status, CommandStatus::Killed);
 
         let all = p.list_commands("proj-a", &rec.id).await.unwrap();
-        assert_eq!(all.len(), 2, "both the blocking and detached commands must be listed");
-        assert!(p.list_commands("proj-b", &rec.id).await.unwrap().is_empty(), "cross-project list must be empty, not error or leak");
+        assert_eq!(
+            all.len(),
+            2,
+            "both the blocking and detached commands must be listed"
+        );
+        assert!(
+            p.list_commands("proj-b", &rec.id).await.unwrap().is_empty(),
+            "cross-project list must be empty, not error or leak"
+        );
     }
 
     #[tokio::test]
     async fn mock_provider_snapshot_lifecycle() {
         let p = MockSandboxProvider::new();
-        let rec = p.create_sandbox("t1", "proj-a", CreateSandboxInput { name: "snap-1".into(), runtime: "node22".into(), ..Default::default() }).await.unwrap();
-        let snap = p.create_snapshot("proj-a", &rec.id, CreateSnapshotInput::default()).await.unwrap();
+        let rec = p
+            .create_sandbox(
+                "t1",
+                "proj-a",
+                CreateSandboxInput {
+                    name: "snap-1".into(),
+                    runtime: "node22".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let snap = p
+            .create_snapshot("proj-a", &rec.id, CreateSnapshotInput::default())
+            .await
+            .unwrap();
         assert_eq!(p.list_snapshots("proj-a", &rec.id).await.unwrap().len(), 1);
         p.delete_snapshot("proj-a", &snap.id).await.unwrap();
         assert_eq!(p.list_snapshots("proj-a", &rec.id).await.unwrap().len(), 0);
-        assert!(p.delete_snapshot("proj-a", &snap.id).await.is_err(), "deleting twice must error, not silently succeed");
+        assert!(
+            p.delete_snapshot("proj-a", &snap.id).await.is_err(),
+            "deleting twice must error, not silently succeed"
+        );
     }
 
     #[tokio::test]
     async fn mock_provider_domain_and_network_policy() {
         let p = MockSandboxProvider::new();
-        let rec = p.create_sandbox("t1", "proj-a", CreateSandboxInput { name: "net-1".into(), runtime: "node22".into(), ports: vec![3000], ..Default::default() }).await.unwrap();
+        let rec = p
+            .create_sandbox(
+                "t1",
+                "proj-a",
+                CreateSandboxInput {
+                    name: "net-1".into(),
+                    runtime: "node22".into(),
+                    ports: vec![3000],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let url = p.domain("proj-a", &rec.id, 3000).await.unwrap();
         assert!(url.contains("3000"));
         let updated = p
-            .update_network_policy("proj-a", &rec.id, NetworkPolicy { mode: "allowlist".into(), allowed_domains: vec!["api.example.com".into()], ..Default::default() })
+            .update_network_policy(
+                "proj-a",
+                &rec.id,
+                NetworkPolicy {
+                    mode: "allowlist".into(),
+                    allowed_domains: vec!["api.example.com".into()],
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(updated.network_policy.mode, "allowlist");
-        assert!(p.update_network_policy("proj-a", &rec.id, NetworkPolicy { mode: "bogus".into(), ..Default::default() }).await.is_err());
+        assert!(p
+            .update_network_policy(
+                "proj-a",
+                &rec.id,
+                NetworkPolicy {
+                    mode: "bogus".into(),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err());
     }
 
     #[tokio::test]
     async fn mock_provider_mount_lifecycle() {
         let p = MockSandboxProvider::new();
-        let rec = p.create_sandbox("t1", "proj-a", CreateSandboxInput { name: "mnt-1".into(), runtime: "node22".into(), ..Default::default() }).await.unwrap();
+        let rec = p
+            .create_sandbox(
+                "t1",
+                "proj-a",
+                CreateSandboxInput {
+                    name: "mnt-1".into(),
+                    runtime: "node22".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         let mount = p
-            .mount_storage("proj-a", &rec.id, MountConfigInput { mount_path: "/mnt/data".into(), kind: "remote-fuse".into(), mode: "read-only".into(), provider: "s3".into(), ..Default::default() })
+            .mount_storage(
+                "proj-a",
+                &rec.id,
+                MountConfigInput {
+                    mount_path: "/mnt/data".into(),
+                    kind: "remote-fuse".into(),
+                    mode: "read-only".into(),
+                    provider: "s3".into(),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(p.list_mounts("proj-a", &rec.id).await.unwrap().len(), 1);
@@ -1005,11 +1412,42 @@ mod tests {
     #[tokio::test]
     async fn tenant_and_project_authorization_boundaries() {
         let p = MockSandboxProvider::new();
-        let rec = p.create_sandbox("tenant-a", "proj-a", CreateSandboxInput { name: "authz-1".into(), runtime: "node22".into(), ..Default::default() }).await.unwrap();
+        let rec = p
+            .create_sandbox(
+                "tenant-a",
+                "proj-a",
+                CreateSandboxInput {
+                    name: "authz-1".into(),
+                    runtime: "node22".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
         // A different project can never see or act on this sandbox, even by exact id.
-        assert!(matches!(p.get_sandbox("proj-b", &rec.id).await, Err(SandboxError::NotFound(_))));
-        assert!(matches!(p.stop_sandbox("proj-b", &rec.id).await, Err(SandboxError::NotFound(_))));
-        assert!(matches!(p.delete_sandbox("proj-b", &rec.id).await, Err(SandboxError::NotFound(_))));
-        assert!(matches!(p.run_command("proj-b", &rec.id, RunCommandInput { cmd: "id".into(), ..Default::default() }).await, Err(SandboxError::NotFound(_))));
+        assert!(matches!(
+            p.get_sandbox("proj-b", &rec.id).await,
+            Err(SandboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            p.stop_sandbox("proj-b", &rec.id).await,
+            Err(SandboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            p.delete_sandbox("proj-b", &rec.id).await,
+            Err(SandboxError::NotFound(_))
+        ));
+        assert!(matches!(
+            p.run_command(
+                "proj-b",
+                &rec.id,
+                RunCommandInput {
+                    cmd: "id".into(),
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(SandboxError::NotFound(_))
+        ));
     }
 }

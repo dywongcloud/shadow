@@ -157,7 +157,9 @@ impl Hive {
             inner.jobs.insert(id.clone(), JobRecord::new(job));
             inner.queue.push_back(id.clone());
         }
-        self.logs.entry(id.clone()).or_insert_with(|| Arc::new(LogBus::new()));
+        self.logs
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(LogBus::new()));
         debug!(job = %id, "submitted");
         self.wake.notify_one();
         id
@@ -168,7 +170,10 @@ impl Hive {
     }
 
     /// Replay buffered logs + a live receiver for a job.
-    pub fn subscribe_logs(&self, id: &JobId) -> Option<(Vec<LogLine>, broadcast::Receiver<LogLine>)> {
+    pub fn subscribe_logs(
+        &self,
+        id: &JobId,
+    ) -> Option<(Vec<LogLine>, broadcast::Receiver<LogLine>)> {
         self.logs.get(id).map(|bus| bus.subscribe())
     }
 
@@ -253,7 +258,11 @@ impl Hive {
                 Self::assign(&mut inner, &job_id, &cell_id, false);
                 inner.running_builds += 1;
                 debug!(job = %job_id, cell = %cell_id, "scheduled (warm hit)");
-                return Decision::Run { job: job_id, cell: cell_id, warm: true };
+                return Decision::Run {
+                    job: job_id,
+                    cell: cell_id,
+                    warm: true,
+                };
             }
 
             // 2) Cold provision — reserve capacity on a box now, boot later.
@@ -279,7 +288,11 @@ impl Hive {
                 Self::assign(&mut inner, &job_id, &cell_id, true);
                 inner.running_builds += 1;
                 debug!(job = %job_id, cell = %cell_id, box = %box_id, "scheduled (cold provision)");
-                return Decision::Run { job: job_id, cell: cell_id, warm: false };
+                return Decision::Run {
+                    job: job_id,
+                    cell: cell_id,
+                    warm: false,
+                };
             }
             // else: this job can't be placed right now; try the next one.
         }
@@ -360,10 +373,7 @@ impl Hive {
                 }
                 None => return,
             };
-            let handle = inner
-                .cells
-                .get(&cell_id)
-                .and_then(|c| c.handle.clone());
+            let handle = inner.cells.get(&cell_id).and_then(|c| c.handle.clone());
             match handle {
                 Some(h) => (h, job_def, submitted_at),
                 None => {
@@ -601,7 +611,11 @@ impl Hive {
                         c.state = CellState::Warm;
                         c.became_warm_at_ms = Some(now_ms());
                     }
-                    inner.warm.entry(image.clone()).or_default().push_back(cell_id.clone());
+                    inner
+                        .warm
+                        .entry(image.clone())
+                        .or_default()
+                        .push_back(cell_id.clone());
                     if let Some(p) = inner.warm_pending.get_mut(&image) {
                         *p = p.saturating_sub(1);
                     }

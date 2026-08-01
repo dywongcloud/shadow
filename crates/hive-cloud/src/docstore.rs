@@ -32,7 +32,12 @@ impl DocStore {
     }
 
     pub fn list(&self, collection: &str) -> Vec<Doc> {
-        self.docs.read().iter().filter(|d| d.collection == collection).cloned().collect()
+        self.docs
+            .read()
+            .iter()
+            .filter(|d| d.collection == collection)
+            .cloned()
+            .collect()
     }
 
     pub fn all(&self) -> Vec<Doc> {
@@ -49,7 +54,12 @@ impl DocStore {
         v
     }
 
-    pub fn create(&self, collection: &str, tenant: &str, data: serde_json::Map<String, serde_json::Value>) -> Doc {
+    pub fn create(
+        &self,
+        collection: &str,
+        tenant: &str,
+        data: serde_json::Map<String, serde_json::Value>,
+    ) -> Doc {
         let now = now_ms();
         let doc = Doc {
             id: format!("doc_{}", &Uuid::new_v4().simple().to_string()[..16]),
@@ -64,7 +74,11 @@ impl DocStore {
     }
 
     /// Merge `patch` fields into the document with `id`. Returns the updated doc.
-    pub fn patch(&self, id: &str, patch: serde_json::Map<String, serde_json::Value>) -> Option<Doc> {
+    pub fn patch(
+        &self,
+        id: &str,
+        patch: serde_json::Map<String, serde_json::Value>,
+    ) -> Option<Doc> {
         let mut docs = self.docs.write();
         let d = docs.iter_mut().find(|d| d.id == id)?;
         for (k, v) in patch {

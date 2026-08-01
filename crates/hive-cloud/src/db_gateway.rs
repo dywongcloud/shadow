@@ -37,8 +37,14 @@ pub fn spawn(cloud: Arc<CloudState>) {
     if cloud.db_domain.is_empty() {
         return;
     }
-    let pg = std::env::var("HIVE_DB_PG_LISTEN").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0.0.0.0:5432".into());
-    let redis = std::env::var("HIVE_DB_REDIS_LISTEN").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "0.0.0.0:6379".into());
+    let pg = std::env::var("HIVE_DB_PG_LISTEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.0.0.0:5432".into());
+    let redis = std::env::var("HIVE_DB_REDIS_LISTEN")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "0.0.0.0:6379".into());
     spawn_listener(cloud.clone(), pg, Wire::Postgres);
     spawn_listener(cloud, redis, Wire::Redis);
 }
@@ -88,7 +94,12 @@ fn is_pg_ssl_request(pre: &[u8; 8]) -> bool {
     len == 8 && code == PG_SSL_REQUEST_CODE
 }
 
-async fn handle(cloud: Arc<CloudState>, mut stream: TcpStream, acceptor: TlsAcceptor, wire: Wire) -> anyhow::Result<()> {
+async fn handle(
+    cloud: Arc<CloudState>,
+    mut stream: TcpStream,
+    acceptor: TlsAcceptor,
+    wire: Wire,
+) -> anyhow::Result<()> {
     // Postgres SSL negotiation preamble (must precede the TLS handshake).
     if matches!(wire, Wire::Postgres) {
         let mut pre = [0u8; 8];
@@ -126,7 +137,9 @@ async fn handle(cloud: Arc<CloudState>, mut stream: TcpStream, acceptor: TlsAcce
         .connection
         .get("local_port")
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("db {} not locally hosted / not live (no local_port)", db.id))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("db {} not locally hosted / not live (no local_port)", db.id)
+        })?;
     let backend_addr = format!("127.0.0.1:{local_port}");
     let mut backend = TcpStream::connect(&backend_addr)
         .await

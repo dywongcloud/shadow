@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 fluid-tunnel = { workspace = true }
+# The `hive/browser/0` wire contract, shared verbatim with the wasm32-only
+# `crates/hive-browser` (which path-depends on this same crate despite being
+# workspace-excluded). Never re-declare its constants locally.
+hive-browser-proto = { path = "../hive-browser-proto" }
 tokio = { workspace = true }
 bytes = "1"
 anyhow = { workspace = true }

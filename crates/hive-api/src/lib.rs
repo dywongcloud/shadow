@@ -42,10 +42,7 @@ async fn status(State(hive): State<Arc<Hive>>) -> Json<ClusterStatus> {
     Json(hive.cluster_status())
 }
 
-async fn submit(
-    State(hive): State<Arc<Hive>>,
-    Json(job): Json<BuildJob>,
-) -> Json<SubmitResponse> {
+async fn submit(State(hive): State<Arc<Hive>>, Json(job): Json<BuildJob>) -> Json<SubmitResponse> {
     let job_id = hive.submit(job);
     Json(SubmitResponse { job_id })
 }
@@ -61,10 +58,7 @@ async fn get_job(
 
 /// Stream a job's logs as newline-delimited JSON (NDJSON): the buffered backlog
 /// first, then live lines, ending when the build completes.
-async fn stream_logs(
-    State(hive): State<Arc<Hive>>,
-    Path(id): Path<String>,
-) -> Response {
+async fn stream_logs(State(hive): State<Arc<Hive>>, Path(id): Path<String>) -> Response {
     let job_id = JobId::from(id);
     let Some((backlog, rx)) = hive.subscribe_logs(&job_id) else {
         return StatusCode::NOT_FOUND.into_response();

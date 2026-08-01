@@ -58,7 +58,11 @@ use crate::state::CloudState;
 /// Resolved world connection for a project: (rest_url, token, key_prefix).
 fn world_config(cloud: &Arc<CloudState>, project: &str) -> Option<(String, String, String)> {
     let env = cloud.projects.env_map(project);
-    let get = |k: &str| env.get(k).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let get = |k: &str| {
+        env.get(k)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
     let url = get("WORKFLOW_REDIS_REST_URL").or_else(|| get("UPSTASH_REDIS_REST_URL"))?;
     let token = get("WORKFLOW_REDIS_REST_TOKEN").or_else(|| get("UPSTASH_REDIS_REST_TOKEN"))?;
     let prefix = get("WORKFLOW_REDIS_KEY_PREFIX").unwrap_or_else(|| "owf".to_string());
@@ -85,7 +89,12 @@ async fn cmd(cloud: &Arc<CloudState>, url: &str, token: &str, parts: &[&str]) ->
 }
 
 /// A pipeline of commands → vector of `result` values (errors map to Null).
-async fn pipeline(cloud: &Arc<CloudState>, url: &str, token: &str, cmds: Vec<Vec<String>>) -> Vec<Value> {
+async fn pipeline(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    cmds: Vec<Vec<String>>,
+) -> Vec<Value> {
     let resp = cloud
         .http
         .post(format!("{url}/pipeline"))
@@ -94,10 +103,18 @@ async fn pipeline(cloud: &Arc<CloudState>, url: &str, token: &str, cmds: Vec<Vec
         .timeout(std::time::Duration::from_secs(12))
         .send()
         .await;
-    let Some(resp) = resp.ok() else { return Vec::new() };
-    let Some(v) = resp.json::<Value>().await.ok() else { return Vec::new() };
+    let Some(resp) = resp.ok() else {
+        return Vec::new();
+    };
+    let Some(v) = resp.json::<Value>().await.ok() else {
+        return Vec::new();
+    };
     v.as_array()
-        .map(|a| a.iter().map(|e| e.get("result").cloned().unwrap_or(Value::Null)).collect())
+        .map(|a| {
+            a.iter()
+                .map(|e| e.get("result").cloned().unwrap_or(Value::Null))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -178,12 +195,25 @@ fn cbor_to_json(v: serde_cbor::Value) -> Value {
 pub async fn list_runs(cloud: &Arc<CloudState>, project: &str, limit: usize) -> Option<Vec<Value>> {
     let (url, token, p) = world_config(cloud, project)?;
     let hi = limit.saturating_sub(1).to_string();
-    let ids = cmd(cloud, &url, &token, &[&format!("ZRANGE"), &format!("{p}:runs"), "0", &hi, "REV"]).await?;
-    let ids: Vec<String> = ids.as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+    let ids = cmd(
+        cloud,
+        &url,
+        &token,
+        &[&format!("ZRANGE"), &format!("{p}:runs"), "0", &hi, "REV"],
+    )
+    .await?;
+    let ids: Vec<String> = ids
+        .as_array()?
+        .iter()
+        .filter_map(|x| x.as_str().map(String::from))
+        .collect();
     if ids.is_empty() {
         return Some(Vec::new());
     }
-    let gets: Vec<Vec<String>> = ids.iter().map(|id| vec!["GET".into(), format!("{p}:run:{id}")]).collect();
+    let gets: Vec<Vec<String>> = ids
+        .iter()
+        .map(|id| vec!["GET".into(), format!("{p}:run:{id}")])
+        .collect();
     let blobs = pipeline(cloud, &url, &token, gets).await;
     let mut out = Vec::new();
     for b in blobs {
@@ -201,8 +231,16 @@ pub async fn list_runs(cloud: &Arc<CloudState>, project: &str, limit: usize) -> 
 /// the new runs/Gantt UI reads the WDK shape — neither crashes on a missing field.
 fn enrich_run(run: &mut Value, project: &str) {
     let Some(o) = run.as_object_mut() else { return };
-    let wf = o.get("workflowName").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let id = o.get("runId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let wf = o
+        .get("workflowName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let id = o
+        .get("runId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let started = secs_to_ms(o.get("startedAt").or_else(|| o.get("createdAt")));
     let finished = secs_to_ms(o.get("completedAt"));
     let status = map_status(o.get("status").and_then(|x| x.as_str()).unwrap_or(""));
@@ -212,7 +250,10 @@ fn enrich_run(run: &mut Value, project: &str) {
     o.insert("name".into(), json!(clean_name(&wf)));
     o.insert("status".into(), json!(status));
     o.insert("started_ms".into(), json!(started.unwrap_or(0)));
-    o.insert("finished_ms".into(), finished.map(|m| json!(m)).unwrap_or(Value::Null));
+    o.insert(
+        "finished_ms".into(),
+        finished.map(|m| json!(m)).unwrap_or(Value::Null),
+    );
     o.entry("steps").or_insert_with(|| json!([]));
 }
 
@@ -233,26 +274,51 @@ fn secs_to_ms(v: Option<&Value>) -> Option<u64> {
     if f <= 0.0 {
         return None;
     }
-    Some(if f > 1e12 { f as u64 } else { (f * 1000.0) as u64 })
+    Some(if f > 1e12 {
+        f as u64
+    } else {
+        (f * 1000.0) as u64
+    })
 }
 
 /// "workflow//./app/workflows/session//sessionWorkflow" → "sessionWorkflow".
 fn clean_name(n: &str) -> String {
-    n.split('/').filter(|s| !s.is_empty()).last().unwrap_or(n).to_string()
+    n.split('/')
+        .filter(|s| !s.is_empty())
+        .last()
+        .unwrap_or(n)
+        .to_string()
 }
 
 /// Full detail for one run: the run + its steps (for the Gantt) + its events.
 pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) -> Option<Value> {
     let (url, token, p) = world_config(cloud, project)?;
-    let run = cmd(cloud, &url, &token, &["GET", &format!("{p}:run:{run_id}")]).await.and_then(|v| decode_blob(&v));
+    let run = cmd(cloud, &url, &token, &["GET", &format!("{p}:run:{run_id}")])
+        .await
+        .and_then(|v| decode_blob(&v));
     // Steps (ordered by the index ZSET).
-    let step_ids = cmd(cloud, &url, &token, &["ZRANGE", &format!("{p}:steps:{run_id}"), "0", "-1"]).await;
+    let step_ids = cmd(
+        cloud,
+        &url,
+        &token,
+        &["ZRANGE", &format!("{p}:steps:{run_id}"), "0", "-1"],
+    )
+    .await;
     let step_ids: Vec<String> = step_ids
-        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
         .unwrap_or_default();
     let mut steps = Vec::new();
     if !step_ids.is_empty() {
-        let gets: Vec<Vec<String>> = step_ids.iter().map(|s| vec!["GET".into(), format!("{p}:step:{run_id}:{s}")]).collect();
+        let gets: Vec<Vec<String>> = step_ids
+            .iter()
+            .map(|s| vec!["GET".into(), format!("{p}:step:{run_id}:{s}")])
+            .collect();
         for b in pipeline(cloud, &url, &token, gets).await {
             if let Some(step) = decode_blob(&b) {
                 steps.push(step);
@@ -260,16 +326,31 @@ pub async fn run_detail(cloud: &Arc<CloudState>, project: &str, run_id: &str) ->
         }
     }
     // Events (append-ordered list + hash of payloads).
-    let ev_ids = cmd(cloud, &url, &token, &["LRANGE", &format!("{p}:events:{run_id}"), "0", "-1"]).await;
+    let ev_ids = cmd(
+        cloud,
+        &url,
+        &token,
+        &["LRANGE", &format!("{p}:events:{run_id}"), "0", "-1"],
+    )
+    .await;
     let ev_ids: Vec<String> = ev_ids
-        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
         .unwrap_or_default();
     let mut events = Vec::new();
     if !ev_ids.is_empty() {
         let mut hargs = vec!["HMGET".to_string(), format!("{p}:eventdata:{run_id}")];
         hargs.extend(ev_ids.iter().cloned());
         let hargs_ref: Vec<&str> = hargs.iter().map(|s| s.as_str()).collect();
-        if let Some(arr) = cmd(cloud, &url, &token, &hargs_ref).await.and_then(|v| v.as_array().cloned()) {
+        if let Some(arr) = cmd(cloud, &url, &token, &hargs_ref)
+            .await
+            .and_then(|v| v.as_array().cloned())
+        {
             for b in arr {
                 if let Some(ev) = decode_blob(&b) {
                     events.push(ev);
@@ -349,24 +430,53 @@ fn ulid() -> String {
 /// Acquire the app's per-run lock (`SET <p>:lock:run:<id> <tok> NX PX 15000`).
 /// Returns the token to release with, or None if held (contention with the
 /// app runtime — the caller retries a few times).
-async fn world_lock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<String> {
+async fn world_lock(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+) -> Option<String> {
     let key = format!("{p}:lock:run:{run_id}");
     let lock_tok = format!("hive-{}", ulid());
-    let res = cmd(cloud, url, token, &["SET", &key, &lock_tok, "NX", "PX", "15000"]).await?;
+    let res = cmd(
+        cloud,
+        url,
+        token,
+        &["SET", &key, &lock_tok, "NX", "PX", "15000"],
+    )
+    .await?;
     // Upstash returns "OK" on success, null when NX fails.
-    if res.as_str() == Some("OK") { Some(lock_tok) } else { None }
+    if res.as_str() == Some("OK") {
+        Some(lock_tok)
+    } else {
+        None
+    }
 }
 
 /// Release the lock only if we still hold it (Lua compare-and-delete — never
 /// delete a lock the app runtime re-acquired after ours expired).
-async fn world_unlock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, lock_tok: &str) {
+async fn world_unlock(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+    lock_tok: &str,
+) {
     let key = format!("{p}:lock:run:{run_id}");
     let script = "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end";
     let _ = cmd(cloud, url, token, &["EVAL", script, "1", &key, lock_tok]).await;
 }
 
 /// Take the run lock, retrying briefly if the app runtime holds it.
-async fn with_run_lock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<String> {
+async fn with_run_lock(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+) -> Option<String> {
     for _ in 0..8 {
         if let Some(t) = world_lock(cloud, url, token, p, run_id).await {
             return Some(t);
@@ -379,20 +489,59 @@ async fn with_run_lock(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str,
 /// Append one event: HSET the payload + RPUSH the id onto the run's event list
 /// + RPUSH the correlation index (exactly `@open-workflow/world-redis`
 /// `entities.js` appendEvent).
-async fn append_event(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, event: &Value) {
-    let event_id = event.get("eventId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+async fn append_event(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+    event: &Value,
+) {
+    let event_id = event
+        .get("eventId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     let blob = encode_blob(event);
-    let _ = cmd(cloud, url, token, &["HSET", &format!("{p}:eventdata:{run_id}"), &event_id, &blob]).await;
-    let _ = cmd(cloud, url, token, &["RPUSH", &format!("{p}:events:{run_id}"), &event_id]).await;
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &["HSET", &format!("{p}:eventdata:{run_id}"), &event_id, &blob],
+    )
+    .await;
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &["RPUSH", &format!("{p}:events:{run_id}"), &event_id],
+    )
+    .await;
     if let Some(cid) = event.get("correlationId").and_then(|v| v.as_str()) {
         if !cid.is_empty() {
-            let _ = cmd(cloud, url, token, &["RPUSH", &format!("{p}:corr:{cid}"), &format!("{run_id}|{event_id}")]).await;
+            let _ = cmd(
+                cloud,
+                url,
+                token,
+                &[
+                    "RPUSH",
+                    &format!("{p}:corr:{cid}"),
+                    &format!("{run_id}|{event_id}"),
+                ],
+            )
+            .await;
         }
     }
 }
 
 /// Build one event record with a fresh id + created timestamp.
-fn make_event(run_id: &str, event_type: &str, correlation_id: Option<&str>, event_data: Value, spec_version: i64) -> Value {
+fn make_event(
+    run_id: &str,
+    event_type: &str,
+    correlation_id: Option<&str>,
+    event_data: Value,
+    spec_version: i64,
+) -> Value {
     let now = hive_core::now_ms();
     let mut e = json!({
         "eventId": format!("evnt_{}", ulid()),
@@ -403,29 +552,86 @@ fn make_event(run_id: &str, event_type: &str, correlation_id: Option<&str>, even
         "eventData": event_data,
     });
     if let Some(cid) = correlation_id {
-        e.as_object_mut().unwrap().insert("correlationId".into(), json!(cid));
+        e.as_object_mut()
+            .unwrap()
+            .insert("correlationId".into(), json!(cid));
     }
     e
 }
 
 /// Read one run record (decoded JSON) or None.
-async fn get_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) -> Option<Value> {
-    cmd(cloud, url, token, &["GET", &format!("{p}:run:{run_id}")]).await.and_then(|v| decode_blob(&v))
+async fn get_run(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+) -> Option<Value> {
+    cmd(cloud, url, token, &["GET", &format!("{p}:run:{run_id}")])
+        .await
+        .and_then(|v| decode_blob(&v))
 }
 
 /// Persist a run record + maintain the `<p>:runs` and per-status ZSET indexes.
-async fn put_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run: &Value, prev_status: Option<&str>) {
-    let run_id = run.get("runId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let created = run.get("createdAt").and_then(|v| v.as_f64()).unwrap_or(hive_core::now_ms() as f64);
-    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("pending").to_string();
-    let _ = cmd(cloud, url, token, &["SET", &format!("{p}:run:{run_id}"), &encode_blob(run)]).await;
+async fn put_run(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run: &Value,
+    prev_status: Option<&str>,
+) {
+    let run_id = run
+        .get("runId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let created = run
+        .get("createdAt")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(hive_core::now_ms() as f64);
+    let status = run
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("pending")
+        .to_string();
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &["SET", &format!("{p}:run:{run_id}"), &encode_blob(run)],
+    )
+    .await;
     let score = format!("{}", created as i64);
-    let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:runs"), &score, &run_id]).await;
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &["ZADD", &format!("{p}:runs"), &score, &run_id],
+    )
+    .await;
     if prev_status != Some(status.as_str()) {
         if let Some(prev) = prev_status {
-            let _ = cmd(cloud, url, token, &["ZREM", &format!("{p}:runs:status:{prev}"), &run_id]).await;
+            let _ = cmd(
+                cloud,
+                url,
+                token,
+                &["ZREM", &format!("{p}:runs:status:{prev}"), &run_id],
+            )
+            .await;
         }
-        let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:runs:status:{status}"), &score, &run_id]).await;
+        let _ = cmd(
+            cloud,
+            url,
+            token,
+            &[
+                "ZADD",
+                &format!("{p}:runs:status:{status}"),
+                &score,
+                &run_id,
+            ],
+        )
+        .await;
     }
 }
 
@@ -453,36 +659,79 @@ async fn put_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run: 
 /// time, so no run could ever have progressed past this call even on a
 /// perfectly healthy tunnel — which is the real, deeper root cause of
 /// [`reconcile_orphan_jobs`]'s endless orphan/reschedule/poison churn.
-async fn enqueue_run(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, workflow_name: &str) {
+async fn enqueue_run(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+    workflow_name: &str,
+) {
     let queue_name = format!("__wkf_workflow_{}", clean_name(workflow_name));
     let msg_id = format!("msg_{}", ulid());
     let body = json!({ "runId": run_id });
     let body_b64 = encode_blob(&body);
     // owf:job:<id> HASH { queueName, body(base64 CBOR), attempt, route }
-    let _ = cmd(cloud, url, token, &[
-        "HSET", &format!("{p}:job:{msg_id}"),
-        "queueName", &queue_name,
-        "body", &body_b64,
-        "attempt", "1",
-        "route", "flow",
-    ]).await;
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &[
+            "HSET",
+            &format!("{p}:job:{msg_id}"),
+            "queueName",
+            &queue_name,
+            "body",
+            &body_b64,
+            "attempt",
+            "1",
+            "route",
+            "flow",
+        ],
+    )
+    .await;
     // owf:sched ZSET score=runAt(now) member=msgId
     let now = format!("{}", hive_core::now_ms());
-    let _ = cmd(cloud, url, token, &["ZADD", &format!("{p}:sched"), &now, &msg_id]).await;
+    let _ = cmd(
+        cloud,
+        url,
+        token,
+        &["ZADD", &format!("{p}:sched"), &now, &msg_id],
+    )
+    .await;
 }
 
 /// The four run operations, each returning the updated/ new run's id + a small
 /// summary the console renders. `op` ∈ cancel|reenqueue|wakeup|replay.
-pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &str, cancel_reason: Option<&str>) -> Result<Value, String> {
-    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
-    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
+pub async fn run_op(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    run_id: &str,
+    op: &str,
+    cancel_reason: Option<&str>,
+) -> Result<Value, String> {
+    let (url, token, p) = world_config(cloud, project)
+        .ok_or_else(|| "no world configured for project".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id)
+        .await
+        .ok_or_else(|| "run not found".to_string())?;
     let spec_version = run.get("specVersion").and_then(|v| v.as_i64()).unwrap_or(2);
-    let workflow_name = run.get("workflowName").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let workflow_name = run
+        .get("workflowName")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let status = run
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     match op {
         "cancel" => {
-            let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+            let lock = with_run_lock(cloud, &url, &token, &p, run_id)
+                .await
+                .ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
             let terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
             if !terminal {
                 let now = hive_core::now_ms();
@@ -494,21 +743,36 @@ pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &s
                     o.remove("output");
                     o.remove("error");
                 }
-                let data = cancel_reason.map(|r| json!({ "cancelReason": r })).unwrap_or(json!({}));
-                append_event(cloud, &url, &token, &p, run_id, &make_event(run_id, "run_cancelled", None, data, spec_version)).await;
+                let data = cancel_reason
+                    .map(|r| json!({ "cancelReason": r }))
+                    .unwrap_or(json!({}));
+                append_event(
+                    cloud,
+                    &url,
+                    &token,
+                    &p,
+                    run_id,
+                    &make_event(run_id, "run_cancelled", None, data, spec_version),
+                )
+                .await;
                 put_run(cloud, &url, &token, &p, &updated, Some(&status)).await;
                 terminal_cleanup(cloud, &url, &token, &p, run_id).await;
             }
             world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
-            Ok(json!({ "runId": run_id, "status": "cancelled", "op": "cancel", "alreadyTerminal": terminal }))
+            Ok(
+                json!({ "runId": run_id, "status": "cancelled", "op": "cancel", "alreadyTerminal": terminal }),
+            )
         }
         "reenqueue" => {
             enqueue_run(cloud, &url, &token, &p, run_id, &workflow_name).await;
             Ok(json!({ "runId": run_id, "op": "reenqueue", "enqueued": true }))
         }
         "wakeup" => {
-            let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
-            let stopped = complete_pending_waits(cloud, &url, &token, &p, run_id, spec_version).await;
+            let lock = with_run_lock(cloud, &url, &token, &p, run_id)
+                .await
+                .ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+            let stopped =
+                complete_pending_waits(cloud, &url, &token, &p, run_id, spec_version).await;
             world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
             if stopped > 0 {
                 enqueue_run(cloud, &url, &token, &p, run_id, &workflow_name).await;
@@ -518,7 +782,11 @@ pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &s
         "replay" => {
             // Clone the run from its ORIGINAL input bytes into a brand-new run.
             let input = run.get("input").cloned().unwrap_or(Value::Null);
-            let deployment_id = run.get("deploymentId").and_then(|v| v.as_str()).unwrap_or("dpl_redis_local").to_string();
+            let deployment_id = run
+                .get("deploymentId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("dpl_redis_local")
+                .to_string();
             let execution_context = run.get("executionContext").cloned().unwrap_or(json!({}));
             let new_id = format!("wrun_{}", ulid());
             let now = hive_core::now_ms();
@@ -535,7 +803,9 @@ pub async fn run_op(cloud: &Arc<CloudState>, project: &str, run_id: &str, op: &s
                 "updatedAt": now,
                 "replayedFromRunId": run_id,
             });
-            let lock = with_run_lock(cloud, &url, &token, &p, &new_id).await.ok_or_else(|| "could not lock the new run".to_string())?;
+            let lock = with_run_lock(cloud, &url, &token, &p, &new_id)
+                .await
+                .ok_or_else(|| "could not lock the new run".to_string())?;
             append_event(cloud, &url, &token, &p, &new_id,
                 &make_event(&new_id, "run_created", None, json!({
                     "deploymentId": deployment_id, "workflowName": workflow_name, "input": new_run["input"],
@@ -568,12 +838,21 @@ pub async fn append_run_event(
     event_data: Value,
     correlation_id: Option<&str>,
 ) -> Result<Value, String> {
-    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
-    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
+    let (url, token, p) = world_config(cloud, project)
+        .ok_or_else(|| "no world configured for project".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id)
+        .await
+        .ok_or_else(|| "run not found".to_string())?;
     let spec_version = run.get("specVersion").and_then(|v| v.as_i64()).unwrap_or(2);
-    let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+    let lock = with_run_lock(cloud, &url, &token, &p, run_id)
+        .await
+        .ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
     let event = make_event(run_id, event_type, correlation_id, event_data, spec_version);
-    let event_id = event.get("eventId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let event_id = event
+        .get("eventId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
     append_event(cloud, &url, &token, &p, run_id, &event).await;
     world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
     Ok(json!({ "runId": run_id, "eventId": event_id, "eventType": event_type, "op": "event" }))
@@ -594,11 +873,22 @@ pub async fn merge_run_attributes(
     run_id: &str,
     changes: &Value,
 ) -> Result<Value, String> {
-    let (url, token, p) = world_config(cloud, project).ok_or_else(|| "no world configured for project".to_string())?;
-    let changes_obj = changes.as_object().ok_or_else(|| "attributes must be a JSON object".to_string())?;
-    let run = get_run(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run not found".to_string())?;
-    let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let lock = with_run_lock(cloud, &url, &token, &p, run_id).await.ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
+    let (url, token, p) = world_config(cloud, project)
+        .ok_or_else(|| "no world configured for project".to_string())?;
+    let changes_obj = changes
+        .as_object()
+        .ok_or_else(|| "attributes must be a JSON object".to_string())?;
+    let run = get_run(cloud, &url, &token, &p, run_id)
+        .await
+        .ok_or_else(|| "run not found".to_string())?;
+    let status = run
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let lock = with_run_lock(cloud, &url, &token, &p, run_id)
+        .await
+        .ok_or_else(|| "run is busy (locked by the runtime); retry".to_string())?;
     let now = hive_core::now_ms();
     let mut updated = run.clone();
     if let Some(o) = updated.as_object_mut() {
@@ -615,17 +905,38 @@ pub async fn merge_run_attributes(
     }
     put_run(cloud, &url, &token, &p, &updated, Some(&status)).await;
     world_unlock(cloud, &url, &token, &p, run_id, &lock).await;
-    Ok(json!({ "runId": run_id, "attributes": updated.get("attributes").cloned().unwrap_or_else(|| json!({})), "op": "attributes" }))
+    Ok(
+        json!({ "runId": run_id, "attributes": updated.get("attributes").cloned().unwrap_or_else(|| json!({})), "op": "attributes" }),
+    )
 }
 
 /// Complete every pending wait (a `wait_created` with no matching
 /// `wait_completed` by correlationId) — the "cancel active sleeps" effect. Reads
 /// the event log, writes a `wait_completed` per pending wait + flips the wait
 /// entity to completed. Returns how many were stopped.
-async fn complete_pending_waits(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str, spec_version: i64) -> u64 {
-    let ev_ids = cmd(cloud, url, token, &["LRANGE", &format!("{p}:events:{run_id}"), "0", "-1"]).await;
+async fn complete_pending_waits(
+    cloud: &Arc<CloudState>,
+    url: &str,
+    token: &str,
+    p: &str,
+    run_id: &str,
+    spec_version: i64,
+) -> u64 {
+    let ev_ids = cmd(
+        cloud,
+        url,
+        token,
+        &["LRANGE", &format!("{p}:events:{run_id}"), "0", "-1"],
+    )
+    .await;
     let ev_ids: Vec<String> = ev_ids
-        .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+        })
         .unwrap_or_default();
     if ev_ids.is_empty() {
         return 0;
@@ -635,15 +946,28 @@ async fn complete_pending_waits(cloud: &Arc<CloudState>, url: &str, token: &str,
     let hargs_ref: Vec<&str> = hargs.iter().map(|s| s.as_str()).collect();
     let mut created: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(arr) = cmd(cloud, url, token, &hargs_ref).await.and_then(|v| v.as_array().cloned()) {
+    if let Some(arr) = cmd(cloud, url, token, &hargs_ref)
+        .await
+        .and_then(|v| v.as_array().cloned())
+    {
         for b in arr {
             if let Some(ev) = decode_blob(&b) {
                 let et = ev.get("eventType").and_then(|x| x.as_str()).unwrap_or("");
-                let cid = ev.get("correlationId").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                if cid.is_empty() { continue; }
+                let cid = ev
+                    .get("correlationId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if cid.is_empty() {
+                    continue;
+                }
                 match et {
-                    "wait_created" => { created.insert(cid, ev); }
-                    "wait_completed" => { completed.insert(cid); }
+                    "wait_created" => {
+                        created.insert(cid, ev);
+                    }
+                    "wait_completed" => {
+                        completed.insert(cid);
+                    }
                     _ => {}
                 }
             }
@@ -651,19 +975,56 @@ async fn complete_pending_waits(cloud: &Arc<CloudState>, url: &str, token: &str,
     }
     let mut stopped = 0u64;
     for (cid, ev) in created {
-        if completed.contains(&cid) { continue; }
-        let resume_at = ev.get("eventData").and_then(|d| d.get("resumeAt")).cloned().unwrap_or(json!(hive_core::now_ms()));
-        append_event(cloud, url, token, p, run_id,
-            &make_event(run_id, "wait_completed", Some(&cid), json!({ "resumeAt": resume_at }), spec_version)).await;
+        if completed.contains(&cid) {
+            continue;
+        }
+        let resume_at = ev
+            .get("eventData")
+            .and_then(|d| d.get("resumeAt"))
+            .cloned()
+            .unwrap_or(json!(hive_core::now_ms()));
+        append_event(
+            cloud,
+            url,
+            token,
+            p,
+            run_id,
+            &make_event(
+                run_id,
+                "wait_completed",
+                Some(&cid),
+                json!({ "resumeAt": resume_at }),
+                spec_version,
+            ),
+        )
+        .await;
         // Flip the wait entity to completed (best-effort; the event is the source of truth for replay).
-        if let Some(w) = cmd(cloud, url, token, &["GET", &format!("{p}:wait:{run_id}:{cid}")]).await.and_then(|v| decode_blob(&v)) {
+        if let Some(w) = cmd(
+            cloud,
+            url,
+            token,
+            &["GET", &format!("{p}:wait:{run_id}:{cid}")],
+        )
+        .await
+        .and_then(|v| decode_blob(&v))
+        {
             let mut w2 = w;
             if let Some(o) = w2.as_object_mut() {
                 o.insert("status".into(), json!("completed"));
                 o.insert("completedAt".into(), json!(hive_core::now_ms()));
                 o.insert("updatedAt".into(), json!(hive_core::now_ms()));
             }
-            let _ = cmd(cloud, url, token, &["SET", &format!("{p}:wait:{run_id}:{cid}"), &encode_blob(&w2)]).await;
+            let _ = cmd(
+                cloud,
+                url,
+                token,
+                &[
+                    "SET",
+                    &format!("{p}:wait:{run_id}:{cid}"),
+                    &encode_blob(&w2),
+                ],
+            )
+            .await;
         }
         stopped += 1;
     }
@@ -674,26 +1035,58 @@ async fn complete_pending_waits(cloud: &Arc<CloudState>, url: &str, token: &str,
 /// matching world-redis `terminalCleanup`. Best-effort.
 async fn terminal_cleanup(cloud: &Arc<CloudState>, url: &str, token: &str, p: &str, run_id: &str) {
     // hooks for this run
-    if let Some(ids) = cmd(cloud, url, token, &["ZRANGE", &format!("{p}:hooks:run:{run_id}"), "0", "-1"]).await.and_then(|v| v.as_array().cloned()) {
+    if let Some(ids) = cmd(
+        cloud,
+        url,
+        token,
+        &["ZRANGE", &format!("{p}:hooks:run:{run_id}"), "0", "-1"],
+    )
+    .await
+    .and_then(|v| v.as_array().cloned())
+    {
         for h in ids {
             if let Some(hid) = h.as_str() {
-                if let Some(hook) = cmd(cloud, url, token, &["GET", &format!("{p}:hook:{hid}")]).await.and_then(|v| decode_blob(&v)) {
+                if let Some(hook) = cmd(cloud, url, token, &["GET", &format!("{p}:hook:{hid}")])
+                    .await
+                    .and_then(|v| decode_blob(&v))
+                {
                     if let Some(tok) = hook.get("token").and_then(|t| t.as_str()) {
                         let sha = sha256_hex(tok);
-                        let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hooktoken:{sha}")]).await;
+                        let _ =
+                            cmd(cloud, url, token, &["DEL", &format!("{p}:hooktoken:{sha}")]).await;
                     }
                 }
                 let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hook:{hid}")]).await;
                 let _ = cmd(cloud, url, token, &["ZREM", &format!("{p}:hooks"), hid]).await;
             }
         }
-        let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:hooks:run:{run_id}")]).await;
+        let _ = cmd(
+            cloud,
+            url,
+            token,
+            &["DEL", &format!("{p}:hooks:run:{run_id}")],
+        )
+        .await;
     }
     // waits for this run
-    if let Some(ids) = cmd(cloud, url, token, &["ZRANGE", &format!("{p}:waits:{run_id}"), "0", "-1"]).await.and_then(|v| v.as_array().cloned()) {
+    if let Some(ids) = cmd(
+        cloud,
+        url,
+        token,
+        &["ZRANGE", &format!("{p}:waits:{run_id}"), "0", "-1"],
+    )
+    .await
+    .and_then(|v| v.as_array().cloned())
+    {
         for w in ids {
             if let Some(cid) = w.as_str() {
-                let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:wait:{run_id}:{cid}")]).await;
+                let _ = cmd(
+                    cloud,
+                    url,
+                    token,
+                    &["DEL", &format!("{p}:wait:{run_id}:{cid}")],
+                )
+                .await;
             }
         }
         let _ = cmd(cloud, url, token, &["DEL", &format!("{p}:waits:{run_id}")]).await;
@@ -715,7 +1108,12 @@ fn sha256_hex(s: &str) -> String {
 /// most recent `limit` runs (capped to bound the per-run event fan-out). Reads use
 /// the same LIST-index + HASH-payload pattern as [`run_detail`]. Returns None when
 /// no world is configured; Some(empty) when a world exists but has no hooks.
-pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&str>, limit: usize) -> Option<Vec<Value>> {
+pub async fn list_hooks(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    run_id: Option<&str>,
+    limit: usize,
+) -> Option<Vec<Value>> {
     let (url, token, p) = world_config(cloud, project)?;
     // Which runs to scan: the explicit one, else the most recent `limit` (bounded
     // to ~50 so a project with thousands of runs can't trigger a huge fan-out).
@@ -724,15 +1122,36 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
     } else {
         let cap = limit.clamp(1, 50);
         let hi = cap.saturating_sub(1).to_string();
-        let ids = cmd(cloud, &url, &token, &["ZRANGE", &format!("{p}:runs"), "0", &hi, "REV"]).await?;
-        ids.as_array()?.iter().filter_map(|x| x.as_str().map(String::from)).collect()
+        let ids = cmd(
+            cloud,
+            &url,
+            &token,
+            &["ZRANGE", &format!("{p}:runs"), "0", &hi, "REV"],
+        )
+        .await?;
+        ids.as_array()?
+            .iter()
+            .filter_map(|x| x.as_str().map(String::from))
+            .collect()
     };
     let mut out: Vec<Value> = Vec::new();
     for rid in run_ids {
         // Events for this run (append-ordered LIST + HASH of payloads) — mirror `run_detail`.
-        let ev_ids = cmd(cloud, &url, &token, &["LRANGE", &format!("{p}:events:{rid}"), "0", "-1"]).await;
+        let ev_ids = cmd(
+            cloud,
+            &url,
+            &token,
+            &["LRANGE", &format!("{p}:events:{rid}"), "0", "-1"],
+        )
+        .await;
         let ev_ids: Vec<String> = ev_ids
-            .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()))
+            .and_then(|v| {
+                v.as_array().map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+            })
             .unwrap_or_default();
         if ev_ids.is_empty() {
             continue;
@@ -741,7 +1160,10 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
         hargs.extend(ev_ids.iter().cloned());
         let hargs_ref: Vec<&str> = hargs.iter().map(|s| s.as_str()).collect();
         let mut events: Vec<Value> = Vec::new();
-        if let Some(arr) = cmd(cloud, &url, &token, &hargs_ref).await.and_then(|v| v.as_array().cloned()) {
+        if let Some(arr) = cmd(cloud, &url, &token, &hargs_ref)
+            .await
+            .and_then(|v| v.as_array().cloned())
+        {
             for b in arr {
                 if let Some(ev) = decode_blob(&b) {
                     events.push(ev);
@@ -751,10 +1173,21 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
         if events.is_empty() {
             continue;
         }
-        let etype = |e: &Value| e.get("eventType").and_then(|x| x.as_str()).unwrap_or("").to_string();
-        let corr = |e: &Value| e.get("correlationId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        let etype = |e: &Value| {
+            e.get("eventType")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let corr = |e: &Value| {
+            e.get("correlationId")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         // Count invocations (`hook_received`) per hookId within this run.
-        let mut invocations: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        let mut invocations: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
         for ev in &events {
             if etype(ev) == "hook_received" {
                 let cid = corr(ev);
@@ -775,10 +1208,14 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
                 if !c.is_empty() {
                     c
                 } else {
-                    dget("hookId").and_then(|x| x.as_str().map(String::from)).unwrap_or_default()
+                    dget("hookId")
+                        .and_then(|x| x.as_str().map(String::from))
+                        .unwrap_or_default()
                 }
             };
-            let token_val = dget("token").filter(|v| v.is_string()).unwrap_or(Value::Null);
+            let token_val = dget("token")
+                .filter(|v| v.is_string())
+                .unwrap_or(Value::Null);
             let metadata = dget("metadata").unwrap_or(Value::Null);
             let is_webhook = dget("isWebhook")
                 .and_then(|x| x.as_bool())
@@ -789,8 +1226,12 @@ pub async fn list_hooks(cloud: &Arc<CloudState>, project: &str, run_id: Option<&
             let inv_count = invocations.get(&hook_id).copied().unwrap_or(0);
             // Optional lifecycle state from later `hook_disposed` / `hook_conflict`.
             let matches_hook = |e: &Value| !hook_id.is_empty() && corr(e) == hook_id;
-            let disposed = events.iter().any(|e| etype(e) == "hook_disposed" && matches_hook(e));
-            let conflicted = events.iter().any(|e| etype(e) == "hook_conflict" && matches_hook(e));
+            let disposed = events
+                .iter()
+                .any(|e| etype(e) == "hook_disposed" && matches_hook(e));
+            let conflicted = events
+                .iter()
+                .any(|e| etype(e) == "hook_conflict" && matches_hook(e));
             let status = if conflicted {
                 "conflict"
             } else if disposed {
@@ -898,7 +1339,9 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
     // deliveries (witnessed: the same msg ids "rescheduled" 17-18x/20min).
     // Only an id orphaned on TWO consecutive passes (>=60s apart) is treated
     // as genuinely dropped.
-    static PREV_ORPHANS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>> = std::sync::OnceLock::new();
+    static PREV_ORPHANS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    > = std::sync::OnceLock::new();
     let mut scanned = 0usize;
     let mut rescheduled = 0usize;
     let mut delivered = 0usize;
@@ -910,20 +1353,42 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
         .filter(|p| has_world(cloud, p))
         .collect();
     for project in projects {
-        let Some((url, token, p)) = world_config(cloud, &project) else { continue };
+        let Some((url, token, p)) = world_config(cloud, &project) else {
+            continue;
+        };
         // Only the project's HOST node reconciles: every node CAN read the
         // world (env is gossiped), and duplicate ZADDs are idempotent, but one
         // writer keeps the reconcile log attributable and halves REST load.
         if cloud.gw.git_for_project(&project).is_none() {
             continue;
         }
-        let sched: std::collections::HashSet<String> = match cmd(cloud, &url, &token, &["ZRANGE", &format!("{p}:sched"), "0", "-1"]).await {
-            Some(Value::Array(a)) => a.into_iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        let sched: std::collections::HashSet<String> = match cmd(
+            cloud,
+            &url,
+            &token,
+            &["ZRANGE", &format!("{p}:sched"), "0", "-1"],
+        )
+        .await
+        {
+            Some(Value::Array(a)) => a
+                .into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect(),
             _ => continue, // world unreachable — do not guess
         };
-        let keys = match cmd(cloud, &url, &token, &["SCAN", "0", "MATCH", &format!("{p}:job:*"), "COUNT", "1000"]).await {
+        let keys = match cmd(
+            cloud,
+            &url,
+            &token,
+            &["SCAN", "0", "MATCH", &format!("{p}:job:*"), "COUNT", "1000"],
+        )
+        .await
+        {
             Some(Value::Array(a)) if a.len() == 2 => match &a[1] {
-                Value::Array(ks) => ks.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>(),
+                Value::Array(ks) => ks
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
                 _ => continue,
             },
             _ => continue,
@@ -936,7 +1401,9 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             let prev = prev_map.lock().get(&project).cloned().unwrap_or_default();
             for key in keys {
                 scanned += 1;
-                let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else { continue };
+                let Some(msg_id) = key.strip_prefix(&format!("{p}:job:")) else {
+                    continue;
+                };
                 // Real queue jobs only: `<p>:job:idem:*` are plain-string
                 // idempotency markers, not job hashes — never schedulable.
                 if !msg_id.starts_with("msg_") {
@@ -963,7 +1430,14 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             // Terminal-run GC: a job whose run already finished will never be
             // consumed by a delivery (the handler no-ops without deleting) —
             // delete it instead of rescheduling forever.
-            if let Some(body) = cmd(cloud, &url, &token, &["HGET", &format!("{p}:job:{msg_id}"), "body"]).await {
+            if let Some(body) = cmd(
+                cloud,
+                &url,
+                &token,
+                &["HGET", &format!("{p}:job:{msg_id}"), "body"],
+            )
+            .await
+            {
                 if let Some(decoded) = decode_blob(&body) {
                     let run_id = decoded
                         .get("runId")
@@ -974,7 +1448,13 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                         if let Some(run) = get_run(cloud, &url, &token, &p, run_id).await {
                             let status = run.get("status").and_then(|v| v.as_str()).unwrap_or("");
                             if matches!(status, "completed" | "failed" | "cancelled") {
-                                let _ = cmd(cloud, &url, &token, &["DEL", &format!("{p}:job:{msg_id}")]).await;
+                                let _ = cmd(
+                                    cloud,
+                                    &url,
+                                    &token,
+                                    &["DEL", &format!("{p}:job:{msg_id}")],
+                                )
+                                .await;
                                 tracing::info!(project = %project, msg_id = %msg_id, status, "world reconcile: GC'd job for terminal run");
                                 continue;
                             }
@@ -996,7 +1476,14 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
             }
             // Poison cap: a job this loop keeps having to rescue is not being
             // consumed by deliveries at all — stop churning it.
-            let n = match cmd(cloud, &url, &token, &["HINCRBY", &format!("{p}:job:{msg_id}"), "reconcile_n", "1"]).await {
+            let n = match cmd(
+                cloud,
+                &url,
+                &token,
+                &["HINCRBY", &format!("{p}:job:{msg_id}"), "reconcile_n", "1"],
+            )
+            .await
+            {
                 Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
                 Some(Value::String(s)) => s.parse().unwrap_or(0),
                 _ => 0,
@@ -1007,7 +1494,15 @@ pub async fn reconcile_orphan_jobs(cloud: &Arc<CloudState>) -> (usize, usize) {
                 continue;
             }
             let score = format!("{now}");
-            if cmd(cloud, &url, &token, &["ZADD", &format!("{p}:sched"), &score, &msg_id]).await.is_some() {
+            if cmd(
+                cloud,
+                &url,
+                &token,
+                &["ZADD", &format!("{p}:sched"), &score, &msg_id],
+            )
+            .await
+            .is_some()
+            {
                 rescheduled += 1;
                 tracing::info!(project = %project, msg_id = %msg_id, "world reconcile: rescheduled orphaned queue job");
             }
@@ -1042,7 +1537,11 @@ pub fn spawn_world_reconcile(cloud: Arc<CloudState>) {
                 crate::supervise::beat("world-reconcile");
                 let (scanned, fixed) = reconcile_orphan_jobs(&cloud).await;
                 if fixed > 0 {
-                    tracing::warn!(scanned, fixed, "world reconcile: recovered orphaned workflow queue jobs");
+                    tracing::warn!(
+                        scanned,
+                        fixed,
+                        "world reconcile: recovered orphaned workflow queue jobs"
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }

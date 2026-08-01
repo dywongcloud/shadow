@@ -77,7 +77,9 @@ pub struct TeamStore {
 
 impl TeamStore {
     pub fn new() -> TeamStore {
-        TeamStore { teams: RwLock::new(HashMap::new()) }
+        TeamStore {
+            teams: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Seed a default personal team owned by the platform owner if empty.
@@ -153,7 +155,13 @@ impl TeamStore {
     /// with its own uniqueness suffix, which `create`'s slugify(name) scheme can
     /// never reproduce). Returns `None` if that exact slug is already taken —
     /// callers must not silently collide with or overwrite an existing team.
-    pub fn create_with_slug(&self, slug: &str, name: &str, plan: &str, owner_email: &str) -> Option<Team> {
+    pub fn create_with_slug(
+        &self,
+        slug: &str,
+        name: &str,
+        plan: &str,
+        owner_email: &str,
+    ) -> Option<Team> {
         let mut m = self.teams.write();
         if m.contains_key(slug) {
             return None;

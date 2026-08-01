@@ -53,7 +53,8 @@ const KV_NAMESPACE: &str = "hive-state";
 
 /// Convenience alias for the native relational/SQL database this handle backs
 /// (see [`crate::relational`]) — `guardian_db::sql::open_sql`'s return type.
-pub(crate) type SqlDb = Arc<guardian_db::sql::Database<guardian_db::sql::GuardianRelationalStorage>>;
+pub(crate) type SqlDb =
+    Arc<guardian_db::sql::Database<guardian_db::sql::GuardianRelationalStorage>>;
 
 static SQL_HANDLE: OnceCell<SqlDb> = OnceCell::const_new();
 
@@ -163,7 +164,8 @@ static INIT_ATTEMPTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static INIT_INFLIGHT: std::sync::Mutex<Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> =
     std::sync::Mutex::new(None);
 
-fn inflight_slot() -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
+fn inflight_slot(
+) -> std::sync::MutexGuard<'static, Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>> {
     // A poisoned lock here must not take guardian down — the slot holds a
     // JoinHandle, and recovering it is strictly better than failing init.
     INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
@@ -188,7 +190,9 @@ async fn handle() -> anyhow::Result<&'static Handle> {
     if last_failed != 0 {
         let since = hive_core::now_ms().saturating_sub(last_failed);
         if since < INIT_RETRY_BACKOFF.as_millis() as u64 {
-            anyhow::bail!("guardian init failed {since}ms ago; backing off before the next attempt");
+            anyhow::bail!(
+                "guardian init failed {since}ms ago; backing off before the next attempt"
+            );
         }
     }
     let result = HANDLE
@@ -350,7 +354,10 @@ async fn init_handle() -> anyhow::Result<Handle> {
             }
         }
     }
-    tracing::info!(count = boot_seeded, "guardian init: seeded known peers pre-open (for automatic DocTicket exchange)");
+    tracing::info!(
+        count = boot_seeded,
+        "guardian init: seeded known peers pre-open (for automatic DocTicket exchange)"
+    );
 
     // The database must share the client's iroh backend (its endpoint,
     // blobs + docs stores) — pass it explicitly in the options.
@@ -381,7 +388,11 @@ async fn init_handle() -> anyhow::Result<Handle> {
     };
 
     tracing::info!(%node_id, dir = ?dir, "GuardianDB ready (iroh-docs KV 'hive-state', replicated)");
-    Ok(Handle { db, kv, client: seed_client })
+    Ok(Handle {
+        db,
+        kv,
+        client: seed_client,
+    })
 }
 
 /// Register a peer's iroh address AND mark it known, against a specific
@@ -469,7 +480,9 @@ pub fn init_background() {
     tokio::spawn(async move {
         match handle().await {
             Ok(h) => tracing::info!(keys = h.kv.all().len(), "GuardianDB online"),
-            Err(e) => tracing::warn!(error = %e, "GuardianDB init failed (snapshot kept on disk); will retry"),
+            Err(e) => {
+                tracing::warn!(error = %e, "GuardianDB init failed (snapshot kept on disk); will retry")
+            }
         }
     });
 }
@@ -526,7 +539,9 @@ pub fn replicate(snap: &PlatformSnapshot) {
     // content is safe.
     let mut to_put: Vec<(String, Vec<u8>)> = Vec::new();
     {
-        let mut guard = last_replica_hashes().lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = last_replica_hashes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut sig: u64 = 1469598103934665603; // FNV offset basis
         for (ns, json) in payloads {
             let key = format!("ns/{ns}/state");
@@ -571,11 +586,16 @@ pub fn replicate(snap: &PlatformSnapshot) {
     };
     // Callers include the runtime-less `hive-persister` OS thread — a bare
     // `tokio::spawn` would panic there and kill the persister (see RUNTIME).
-    match tokio::runtime::Handle::try_current().ok().or_else(|| RUNTIME.get().cloned()) {
+    match tokio::runtime::Handle::try_current()
+        .ok()
+        .or_else(|| RUNTIME.get().cloned())
+    {
         Some(rt) => {
             rt.spawn(task);
         }
-        None => tracing::debug!("no tokio runtime; guardian replication skipped (snapshot on disk only)"),
+        None => tracing::debug!(
+            "no tokio runtime; guardian replication skipped (snapshot on disk only)"
+        ),
     }
 }
 
@@ -614,15 +634,25 @@ pub async fn fetch_newest_peer_snapshot() -> Option<(String, PlatformSnapshot)> 
     let me = NODE_NAME.get()?.as_str();
     let mut best: Option<(String, PlatformSnapshot)> = None;
     for key in keys().await {
-        let Some(name) = key.strip_prefix("node/").and_then(|r| r.strip_suffix("/snapshot")) else {
+        let Some(name) = key
+            .strip_prefix("node/")
+            .and_then(|r| r.strip_suffix("/snapshot"))
+        else {
             continue;
         };
         if name == me {
             continue;
         }
-        let Some(bytes) = get(&key).await else { continue };
-        let Ok(snap) = serde_json::from_slice::<PlatformSnapshot>(&bytes) else { continue };
-        if best.as_ref().is_none_or(|(_, b)| snap.saved_ms > b.saved_ms) {
+        let Some(bytes) = get(&key).await else {
+            continue;
+        };
+        let Ok(snap) = serde_json::from_slice::<PlatformSnapshot>(&bytes) else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .is_none_or(|(_, b)| snap.saved_ms > b.saved_ms)
+        {
             best = Some((name.to_string(), snap));
         }
     }
@@ -665,7 +695,10 @@ fn strip_node_local(mut snap: PlatformSnapshot) -> PlatformSnapshot {
 /// guardian store has synced with a peer.
 /// Opt-out: `HIVE_GUARDIAN_RESTORE=0`.
 pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
-    if std::env::var("HIVE_GUARDIAN_RESTORE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+    if std::env::var("HIVE_GUARDIAN_RESTORE")
+        .map(|v| v == "0" || v == "false")
+        .unwrap_or(false)
+    {
         return;
     }
     tokio::spawn(async move {
@@ -676,7 +709,9 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
             // SHARED state if it beats whatever the local file has.
             for attempt in 1u32..=6 {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                let Some((peer, snap)) = fetch_newest_peer_snapshot().await else { continue };
+                let Some((peer, snap)) = fetch_newest_peer_snapshot().await else {
+                    continue;
+                };
                 let local = crate::persist::load();
                 if snap.saved_ms <= local.saved_ms {
                     tracing::debug!(peer = %peer, "guardian restore guard: peer snapshot not newer than local; keeping local");
@@ -699,7 +734,11 @@ pub fn spawn_restore_guard(cloud: Arc<crate::state::CloudState>) {
         };
         let local = crate::persist::load();
         if replica.saved_ms <= local.saved_ms {
-            tracing::debug!(replica_ms = replica.saved_ms, local_ms = local.saved_ms, "guardian restore guard: local snapshot is current");
+            tracing::debug!(
+                replica_ms = replica.saved_ms,
+                local_ms = local.saved_ms,
+                "guardian restore guard: local snapshot is current"
+            );
             return;
         }
         tracing::warn!(
@@ -764,8 +803,12 @@ pub async fn keys() -> Vec<String> {
 /// answer "is `node/fc-lax2/snapshot` a key for a node we still run".
 fn node_roster() -> Option<std::collections::HashSet<String>> {
     let raw = std::env::var("HIVE_NODE_ROSTER").ok()?;
-    let set: std::collections::HashSet<String> =
-        raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    let set: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
     (!set.is_empty()).then_some(set)
 }
 
@@ -823,7 +866,9 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
 
     let me = NODE_NAME.get().cloned().unwrap_or_default();
     let heads = namespace_heads().await;
-    let Some(entries) = heads.get(KV_NAMESPACE) else { return (0, 0) };
+    let Some(entries) = heads.get(KV_NAMESPACE) else {
+        return (0, 0);
+    };
 
     // iroh-docs stamps entries in MICROseconds; `now_ms` is milliseconds.
     let now_us = hive_core::now_ms().saturating_mul(1000);
@@ -833,7 +878,11 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
     let mut candidates: Vec<String> = Vec::new();
     let mut withheld_young = 0usize;
     for e in entries {
-        let Some(name) = e.key.strip_prefix("node/").and_then(|r| r.strip_suffix("/snapshot")) else {
+        let Some(name) = e
+            .key
+            .strip_prefix("node/")
+            .and_then(|r| r.strip_suffix("/snapshot"))
+        else {
             continue;
         };
         node_keys += 1;
@@ -895,7 +944,8 @@ pub async fn reap_departed_node_snapshots() -> (usize, usize) {
 /// Served over the mesh at `GET /v1/guardian/heads` (see `admin::guardian_heads`
 /// + `gossip::dispatch`) so a peer can diff against its own without pulling
 /// any content.
-pub async fn namespace_heads() -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
+pub async fn namespace_heads(
+) -> std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> {
     let mut out = std::collections::HashMap::new();
     if let Ok(h) = handle().await {
         match h.kv.entry_heads().await {
@@ -916,9 +966,11 @@ pub async fn namespace_heads() -> std::collections::HashMap<String, Vec<guardian
 /// doc comment for why that distinction is load-bearing. Returns the real
 /// entries pulled/pushed on success, or the failure reason on error (for
 /// implement-convergence-logging's warn-level path).
-pub async fn sync_with_peer(guardian_addr_json: &str) -> Result<guardian_db::traits::SyncOutcomeSummary, String> {
+pub async fn sync_with_peer(
+    guardian_addr_json: &str,
+) -> Result<guardian_db::traits::SyncOutcomeSummary, String> {
     let h = handle().await.map_err(|e| e.to_string())?;
-    let addr: iroh::EndpointAddr =
-        serde_json::from_str(guardian_addr_json).map_err(|e| format!("malformed guardian addr: {e}"))?;
+    let addr: iroh::EndpointAddr = serde_json::from_str(guardian_addr_json)
+        .map_err(|e| format!("malformed guardian addr: {e}"))?;
     h.kv.sync_with_peer(addr).await.map_err(|e| e.to_string())
 }

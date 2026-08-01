@@ -97,7 +97,9 @@ async fn spawn_ctx_echo() -> String {
                         .map(|l| l[l.find(':').unwrap() + 1..].trim().to_string())
                 };
                 let ctx = hval("x-ctx").unwrap_or_default();
-                let clen: usize = hval("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+                let clen: usize = hval("content-length")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
                 // Read the remaining body bytes.
                 let mut body = acc[head_end..].to_vec();
                 while body.len() < clen {
@@ -153,7 +155,12 @@ async fn concurrent_requests_do_not_leak_context() {
             let body = format!("body-{i}-").repeat((i % 37 + 1) as usize);
             let resp = tokio::time::timeout(
                 Duration::from_secs(15),
-                c.request("POST", &path, vec![("x-ctx".into(), ctx.clone())], body.as_bytes()),
+                c.request(
+                    "POST",
+                    &path,
+                    vec![("x-ctx".into(), ctx.clone())],
+                    body.as_bytes(),
+                ),
             )
             .await
             .expect("request timed out")
@@ -226,10 +233,21 @@ async fn tunnel_meters_bytes_in_and_out() {
         }
     }
     assert!(h.alive, "tunnel should be alive");
-    assert!(h.bytes_in >= 10_000, "bytes_in should reflect ~10x1000B request bodies, got {}", h.bytes_in);
-    assert!(h.bytes_out > 0, "bytes_out should be counted, got {}", h.bytes_out);
+    assert!(
+        h.bytes_in >= 10_000,
+        "bytes_in should reflect ~10x1000B request bodies, got {}",
+        h.bytes_in
+    );
+    assert!(
+        h.bytes_out > 0,
+        "bytes_out should be counted, got {}",
+        h.bytes_out
+    );
     // No backpressure under a fast local consumer.
-    assert_eq!(h.backpressure_events, 0, "no backpressure expected on a drained tunnel");
+    assert_eq!(
+        h.backpressure_events, 0,
+        "no backpressure expected on a drained tunnel"
+    );
 }
 
 #[tokio::test]

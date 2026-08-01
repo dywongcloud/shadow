@@ -126,8 +126,16 @@ struct Registry {
 /// The stable claim identity: same key ⇒ same public port, across redeploys.
 /// `\u{1f}` (ASCII unit separator) cannot appear in project/function names, so
 /// the key is collision-free without escaping.
-fn alloc_key(project: &str, function: &str, container_port: u16, protocol: ServiceProtocol) -> String {
-    format!("{project}\u{1f}{function}\u{1f}{container_port}\u{1f}{}", protocol.as_str())
+fn alloc_key(
+    project: &str,
+    function: &str,
+    container_port: u16,
+    protocol: ServiceProtocol,
+) -> String {
+    format!(
+        "{project}\u{1f}{function}\u{1f}{container_port}\u{1f}{}",
+        protocol.as_str()
+    )
 }
 
 fn file_path() -> PathBuf {
@@ -214,7 +222,9 @@ fn save(reg: &Registry) -> std::io::Result<()> {
     let dir = crate::persist::data_dir();
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join("raw_ports.json.tmp");
-    let file = RegistryFile { allocs: reg.by_key.values().cloned().collect() };
+    let file = RegistryFile {
+        allocs: reg.by_key.values().cloned().collect(),
+    };
     let json = serde_json::to_string_pretty(&file).unwrap_or_else(|_| "{}".into());
     {
         let f = std::fs::File::create(&tmp)?;
@@ -299,7 +309,11 @@ fn raw_targets(manifest: &Manifest) -> Vec<(usize, usize)> {
 /// the save fails mid-batch, every claim made by THIS call is rolled back and
 /// an error is returned — no partial multi-port deployment, no unclaimed port
 /// ever handed out.
-fn claim_local(project: &str, manifest: &Manifest, targets: &[(usize, usize)]) -> anyhow::Result<Vec<RawPortAllocation>> {
+fn claim_local(
+    project: &str,
+    manifest: &Manifest,
+    targets: &[(usize, usize)],
+) -> anyhow::Result<Vec<RawPortAllocation>> {
     let mut allocs: Vec<RawPortAllocation> = Vec::with_capacity(targets.len());
     let mut reg = lock();
     // Claims inserted by THIS call — the rollback set on any failure.
@@ -394,17 +408,21 @@ pub async fn allocate_raw_ports_coordinated(
         return Ok(ports);
     }
     let leader = cloud.control_plane_leader();
-    let peer = cloud
-        .registry
-        .nodes()
-        .into_iter()
-        .find(|n| n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some());
+    let peer = cloud.registry.nodes().into_iter().find(|n| {
+        n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some()
+    });
     let Some(peer) = peer else {
-        anyhow::bail!("raw-port allocation: control-plane leader ({leader}) has no reachable mesh address");
+        anyhow::bail!(
+            "raw-port allocation: control-plane leader ({leader}) has no reachable mesh address"
+        );
     };
-    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
-    let req_body = serde_json::to_vec(&serde_json::json!({ "project": project, "manifest": manifest }))
-        .unwrap_or_default();
+    let (peer_id, peer_addr) = (
+        peer.peer_id.clone().unwrap(),
+        peer.iroh_addr.clone().unwrap(),
+    );
+    let req_body =
+        serde_json::to_vec(&serde_json::json!({ "project": project, "manifest": manifest }))
+            .unwrap_or_default();
     let resp = crate::gossip::request_to(
         cloud,
         &peer_id,
@@ -415,15 +433,18 @@ pub async fn allocate_raw_ports_coordinated(
         15,
     )
     .await
-    .ok_or_else(|| anyhow::anyhow!("raw-port allocation: control-plane leader ({leader}) did not respond"))?;
+    .ok_or_else(|| {
+        anyhow::anyhow!("raw-port allocation: control-plane leader ({leader}) did not respond")
+    })?;
     #[derive(Deserialize)]
     struct Resp {
         #[serde(default)]
         allocs: Vec<RawPortAllocation>,
         error: Option<String>,
     }
-    let parsed: Resp = serde_json::from_slice(&resp)
-        .map_err(|e| anyhow::anyhow!("raw-port allocation: malformed response from leader ({leader}): {e}"))?;
+    let parsed: Resp = serde_json::from_slice(&resp).map_err(|e| {
+        anyhow::anyhow!("raw-port allocation: malformed response from leader ({leader}): {e}")
+    })?;
     if let Some(err) = parsed.error {
         anyhow::bail!("raw-port allocation refused by leader ({leader}): {err}");
     }
@@ -450,7 +471,10 @@ pub async fn allocate_raw_ports_coordinated(
 /// DIFFERENT node, working from its own copy) does that itself with the
 /// returned records, mirroring [`allocate_raw_ports_coordinated`]'s local
 /// (already-leader) branch.
-pub fn allocate_raw_ports_records(project: &str, manifest: &Manifest) -> anyhow::Result<Vec<RawPortAllocation>> {
+pub fn allocate_raw_ports_records(
+    project: &str,
+    manifest: &Manifest,
+) -> anyhow::Result<Vec<RawPortAllocation>> {
     let targets = raw_targets(manifest);
     if targets.is_empty() {
         return Ok(Vec::new());
@@ -476,20 +500,30 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
         return released;
     }
     let leader = cloud.control_plane_leader();
-    let peer = cloud
-        .registry
-        .nodes()
-        .into_iter()
-        .find(|n| n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some());
+    let peer = cloud.registry.nodes().into_iter().find(|n| {
+        n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some()
+    });
     let Some(peer) = peer else {
         tracing::warn!(project, leader = %leader, "raw-port release: control-plane leader has no reachable mesh address — leader-side claim may leak until the next release");
         return released;
     };
-    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
-    let req_body = serde_json::to_vec(&serde_json::json!({ "project": project })).unwrap_or_default();
-    if crate::gossip::request_to(cloud, &peer_id, &peer_addr, hive_p2p::GOSSIP_POST, "/v1/raw-ports/release", &req_body, 15)
-        .await
-        .is_none()
+    let (peer_id, peer_addr) = (
+        peer.peer_id.clone().unwrap(),
+        peer.iroh_addr.clone().unwrap(),
+    );
+    let req_body =
+        serde_json::to_vec(&serde_json::json!({ "project": project })).unwrap_or_default();
+    if crate::gossip::request_to(
+        cloud,
+        &peer_id,
+        &peer_addr,
+        hive_p2p::GOSSIP_POST,
+        "/v1/raw-ports/release",
+        &req_body,
+        15,
+    )
+    .await
+    .is_none()
     {
         tracing::warn!(project, leader = %leader, "raw-port release: forward to control-plane leader failed — leader-side claim may leak until the next release");
     }
@@ -501,8 +535,12 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
 /// deletion and last-deployment deletion; idempotent.
 pub fn release_raw_ports(project: &str) -> Vec<u16> {
     let mut reg = lock();
-    let doomed: Vec<String> =
-        reg.by_key.iter().filter(|(_, a)| a.project == project).map(|(k, _)| k.clone()).collect();
+    let doomed: Vec<String> = reg
+        .by_key
+        .iter()
+        .filter(|(_, a)| a.project == project)
+        .map(|(k, _)| k.clone())
+        .collect();
     if doomed.is_empty() {
         return Vec::new();
     }
@@ -552,18 +590,20 @@ pub fn adopt_record(rec: &fluid_core::DeployRecord) {
         .manifest
         .functions
         .iter()
-        .flat_map(|f| f.ports.iter().filter_map(move |spec| {
-            let public_port = spec.public_port?;
-            Some(RawPortAllocation {
-                project: rec.project.clone(),
-                function: f.name.clone(),
-                container_port: spec.container_port,
-                protocol: spec.protocol,
-                public_port,
-                label: spec.label.clone(),
-                allocated_ms: rec.created_at_ms,
+        .flat_map(|f| {
+            f.ports.iter().filter_map(move |spec| {
+                let public_port = spec.public_port?;
+                Some(RawPortAllocation {
+                    project: rec.project.clone(),
+                    function: f.name.clone(),
+                    container_port: spec.container_port,
+                    protocol: spec.protocol,
+                    public_port,
+                    label: spec.label.clone(),
+                    allocated_ms: rec.created_at_ms,
+                })
             })
-        }))
+        })
         .collect();
     adopt_allocations(&allocs);
 }
@@ -593,7 +633,11 @@ fn adopt_allocations(allocs: &[RawPortAllocation]) {
 /// most-authoritative source): which allocation (project / function /
 /// container port / protocol) does a public port belong to right now?
 pub fn lookup(public_port: u16) -> Option<RawPortAllocation> {
-    lock().by_key.values().find(|a| a.public_port == public_port).cloned()
+    lock()
+        .by_key
+        .values()
+        .find(|a| a.public_port == public_port)
+        .cloned()
 }
 
 /// Every UDP claim in this node's durable registry — the UDP relay's
@@ -601,5 +645,10 @@ pub fn lookup(public_port: u16) -> Option<RawPortAllocation> {
 /// allocator node knows a claim the moment it is made, before the stamped
 /// deployment record is Ready or has gossiped fleet-wide.
 pub fn udp_allocations() -> Vec<RawPortAllocation> {
-    lock().by_key.values().filter(|a| a.protocol == ServiceProtocol::Udp).cloned().collect()
+    lock()
+        .by_key
+        .values()
+        .filter(|a| a.protocol == ServiceProtocol::Udp)
+        .cloned()
+        .collect()
 }

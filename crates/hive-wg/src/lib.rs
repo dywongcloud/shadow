@@ -40,8 +40,13 @@ pub struct Keypair {
 
 /// Generate a fresh x25519 keypair using the Noise resolver.
 pub fn gen_keypair() -> Keypair {
-    let kp = Builder::new(PARAMS.parse().expect("params")).generate_keypair().expect("keypair");
-    Keypair { private: kp.private, public: kp.public }
+    let kp = Builder::new(PARAMS.parse().expect("params"))
+        .generate_keypair()
+        .expect("keypair");
+    Keypair {
+        private: kp.private,
+        public: kp.public,
+    }
 }
 
 /// A short-lived credential the KES hands to a connector. The private key never
@@ -69,7 +74,10 @@ pub struct Kes {
 
 impl Kes {
     pub fn new() -> Kes {
-        Kes { issued: Mutex::new(HashMap::new()), seq: Mutex::new(0) }
+        Kes {
+            issued: Mutex::new(HashMap::new()),
+            seq: Mutex::new(0),
+        }
     }
 
     /// Mint a new ephemeral peer valid for `ttl_secs`.
@@ -87,7 +95,13 @@ impl Kes {
             created_ms: now,
             expires_ms: now + ttl_secs * 1000,
         };
-        self.issued.lock().unwrap().insert(id, Issued { private: kp.private, lease: lease.clone() });
+        self.issued.lock().unwrap().insert(
+            id,
+            Issued {
+                private: kp.private,
+                lease: lease.clone(),
+            },
+        );
         lease
     }
 
@@ -109,7 +123,11 @@ impl Kes {
     }
 
     fn private_of(&self, id: &str) -> Option<Vec<u8>> {
-        self.issued.lock().unwrap().get(id).map(|i| i.private.clone())
+        self.issued
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|i| i.private.clone())
     }
 }
 
@@ -135,7 +153,12 @@ impl SecureLink {
     pub fn establish(target: &str) -> Result<SecureLink, String> {
         let responder_kp = gen_keypair();
         let initiator_kp = gen_keypair();
-        Self::build(target, &initiator_kp.private, &responder_kp.private, &responder_kp.public)
+        Self::build(
+            target,
+            &initiator_kp.private,
+            &responder_kp.private,
+            &responder_kp.public,
+        )
     }
 
     /// Establish using a KES-issued lease as the connector (initiator) identity.
@@ -147,11 +170,21 @@ impl SecureLink {
         let lease = kes.issue(ttl_secs);
         let init_priv = kes.private_of(&lease.id).ok_or("lease vanished")?;
         let responder_kp = gen_keypair();
-        let link = Self::build(target, &init_priv, &responder_kp.private, &responder_kp.public)?;
+        let link = Self::build(
+            target,
+            &init_priv,
+            &responder_kp.private,
+            &responder_kp.public,
+        )?;
         Ok((lease, link))
     }
 
-    fn build(target: &str, init_priv: &[u8], resp_priv: &[u8], resp_pub: &[u8]) -> Result<SecureLink, String> {
+    fn build(
+        target: &str,
+        init_priv: &[u8],
+        resp_priv: &[u8],
+        resp_pub: &[u8],
+    ) -> Result<SecureLink, String> {
         let psk = random_psk();
         let params = PARAMS.parse().map_err(|e| format!("params: {e}"))?;
         let mut initiator = Builder::new(params)
@@ -172,15 +205,31 @@ impl SecureLink {
         let mut tmp = vec![0u8; 1024];
 
         // -> e, es, s, ss
-        let n = initiator.write_message(&[], &mut b1).map_err(|e| format!("msg1 write: {e}"))?;
-        responder.read_message(&b1[..n], &mut tmp).map_err(|e| format!("msg1 read: {e}"))?;
+        let n = initiator
+            .write_message(&[], &mut b1)
+            .map_err(|e| format!("msg1 write: {e}"))?;
+        responder
+            .read_message(&b1[..n], &mut tmp)
+            .map_err(|e| format!("msg1 read: {e}"))?;
         // <- e, ee, se, psk
-        let n = responder.write_message(&[], &mut b2).map_err(|e| format!("msg2 write: {e}"))?;
-        initiator.read_message(&b2[..n], &mut tmp).map_err(|e| format!("msg2 read: {e}"))?;
+        let n = responder
+            .write_message(&[], &mut b2)
+            .map_err(|e| format!("msg2 write: {e}"))?;
+        initiator
+            .read_message(&b2[..n], &mut tmp)
+            .map_err(|e| format!("msg2 read: {e}"))?;
 
-        let initiator = initiator.into_transport_mode().map_err(|e| format!("init transport: {e}"))?;
-        let responder = responder.into_transport_mode().map_err(|e| format!("resp transport: {e}"))?;
-        Ok(SecureLink { initiator, responder, target: target.to_string() })
+        let initiator = initiator
+            .into_transport_mode()
+            .map_err(|e| format!("init transport: {e}"))?;
+        let responder = responder
+            .into_transport_mode()
+            .map_err(|e| format!("resp transport: {e}"))?;
+        Ok(SecureLink {
+            initiator,
+            responder,
+            target: target.to_string(),
+        })
     }
 
     /// Send `payload` through the tunnel (encrypted by the connector) and return
@@ -196,28 +245,40 @@ impl SecureLink {
     /// Encrypt a client→backend chunk (connector side).
     pub fn seal_c2s(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
         let mut ct = vec![0u8; plain.len() + 16];
-        let n = self.initiator.write_message(plain, &mut ct).map_err(|e| format!("seal c2s: {e}"))?;
+        let n = self
+            .initiator
+            .write_message(plain, &mut ct)
+            .map_err(|e| format!("seal c2s: {e}"))?;
         ct.truncate(n);
         Ok(ct)
     }
     /// Decrypt a client→backend chunk (gateway side).
     pub fn open_c2s(&mut self, ct: &[u8]) -> Result<Vec<u8>, String> {
         let mut pt = vec![0u8; ct.len()];
-        let n = self.responder.read_message(ct, &mut pt).map_err(|e| format!("open c2s: {e}"))?;
+        let n = self
+            .responder
+            .read_message(ct, &mut pt)
+            .map_err(|e| format!("open c2s: {e}"))?;
         pt.truncate(n);
         Ok(pt)
     }
     /// Encrypt a backend→client chunk (gateway side).
     pub fn seal_s2c(&mut self, plain: &[u8]) -> Result<Vec<u8>, String> {
         let mut ct = vec![0u8; plain.len() + 16];
-        let n = self.responder.write_message(plain, &mut ct).map_err(|e| format!("seal s2c: {e}"))?;
+        let n = self
+            .responder
+            .write_message(plain, &mut ct)
+            .map_err(|e| format!("seal s2c: {e}"))?;
         ct.truncate(n);
         Ok(ct)
     }
     /// Decrypt a backend→client chunk (connector side).
     pub fn open_s2c(&mut self, ct: &[u8]) -> Result<Vec<u8>, String> {
         let mut pt = vec![0u8; ct.len()];
-        let n = self.initiator.read_message(ct, &mut pt).map_err(|e| format!("open s2c: {e}"))?;
+        let n = self
+            .initiator
+            .read_message(ct, &mut pt)
+            .map_err(|e| format!("open s2c: {e}"))?;
         pt.truncate(n);
         Ok(pt)
     }
@@ -257,7 +318,8 @@ mod tests {
     #[test]
     fn kes_backed_link() {
         let kes = Kes::new();
-        let (lease, mut link) = SecureLink::establish_with_kes(&kes, "db.internal:6379", 30).expect("kes link");
+        let (lease, mut link) =
+            SecureLink::establish_with_kes(&kes, "db.internal:6379", 30).expect("kes link");
         assert!(lease.expires_ms > lease.created_ms);
         assert_eq!(link.roundtrip(b"PING").expect("roundtrip"), b"PING");
     }

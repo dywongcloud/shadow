@@ -164,7 +164,10 @@ impl Table {
         }
         let li = (cell as u32 / self.nlon) as f64;
         let lo = (cell as u32 % self.nlon) as f64;
-        Some((li * self.deg - 90.0 + self.deg / 2.0, lo * self.deg - 180.0 + self.deg / 2.0))
+        Some((
+            li * self.deg - 90.0 + self.deg / 2.0,
+            lo * self.deg - 180.0 + self.deg / 2.0,
+        ))
     }
 
     fn locate(&self, ip: IpAddr) -> Option<(f64, f64)> {

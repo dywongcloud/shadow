@@ -50,13 +50,22 @@ fn guardian_key(team: &str, id: &str) -> String {
 /// signal). Tolerant parse: a malformed/missing vercel.json is simply "not
 /// detected", never a build error.
 pub fn vercel_json_declares_workflow_worker(dir: &std::path::Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(dir.join("vercel.json")) else { return false };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
-    let Some(services) = v.get("experimentalServices").and_then(|s| s.as_object()) else { return false };
+    let Ok(text) = std::fs::read_to_string(dir.join("vercel.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    let Some(services) = v.get("experimentalServices").and_then(|s| s.as_object()) else {
+        return false;
+    };
     services.values().any(|svc| {
         svc.get("topics")
             .and_then(|t| t.as_array())
-            .map(|arr| arr.iter().any(|t| t.as_str().is_some_and(|s| s.starts_with("__wkf_"))))
+            .map(|arr| {
+                arr.iter()
+                    .any(|t| t.as_str().is_some_and(|s| s.starts_with("__wkf_")))
+            })
             .unwrap_or(false)
     })
 }
@@ -66,16 +75,31 @@ pub fn vercel_json_declares_workflow_worker(dir: &std::path::Path) -> bool {
 /// override or duplicate a tenant's own external connection), or fluid.json
 /// explicitly declares `{"workflow":{"world":"external"}}` (tolerant parse,
 /// same style as the existing container-override block).
-pub fn workflow_world_opted_out(cloud: &Arc<CloudState>, project: &str, dir: &std::path::Path) -> bool {
+pub fn workflow_world_opted_out(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    dir: &std::path::Path,
+) -> bool {
     let env = cloud.projects.env_map(project);
-    let byo = env.get("WORKFLOW_REDIS_REST_URL").is_some_and(|s| !s.trim().is_empty())
-        || env.get("UPSTASH_REDIS_REST_URL").is_some_and(|s| !s.trim().is_empty());
+    let byo = env
+        .get("WORKFLOW_REDIS_REST_URL")
+        .is_some_and(|s| !s.trim().is_empty())
+        || env
+            .get("UPSTASH_REDIS_REST_URL")
+            .is_some_and(|s| !s.trim().is_empty());
     if byo {
         return true;
     }
-    let Ok(text) = std::fs::read_to_string(dir.join("fluid.json")) else { return false };
-    let Ok(v) = serde_json::from_str::<Value>(&text) else { return false };
-    v.get("workflow").and_then(|w| w.get("world")).and_then(|w| w.as_str()) == Some("external")
+    let Ok(text) = std::fs::read_to_string(dir.join("fluid.json")) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    v.get("workflow")
+        .and_then(|w| w.get("world"))
+        .and_then(|w| w.as_str())
+        == Some("external")
 }
 
 /// Local working set (every node holds a copy once it learns of a job, but
@@ -90,7 +114,11 @@ pub struct WorldQueue {
 
 impl WorldQueue {
     pub fn new() -> Arc<WorldQueue> {
-        Arc::new(WorldQueue { pending: RwLock::new(BTreeMap::new()), delivered: RwLock::new(Vec::new()), dead: RwLock::new(Vec::new()) })
+        Arc::new(WorldQueue {
+            pending: RwLock::new(BTreeMap::new()),
+            delivered: RwLock::new(Vec::new()),
+            dead: RwLock::new(Vec::new()),
+        })
     }
 
     /// Enqueue locally and kick off the (best-effort, async) GuardianDB mirror
@@ -131,7 +159,11 @@ impl WorldQueue {
     fn take_due(&self) -> Vec<QueueJob> {
         let now = now_ms();
         let mut m = self.pending.write();
-        let due_ids: Vec<String> = m.iter().filter(|(_, j)| j.run_at_ms <= now).map(|(id, _)| id.clone()).collect();
+        let due_ids: Vec<String> = m
+            .iter()
+            .filter(|(_, j)| j.run_at_ms <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
         due_ids.into_iter().filter_map(|id| m.remove(&id)).collect()
     }
 
@@ -194,11 +226,20 @@ impl WorldQueue {
 /// dev) rather than stranding jobs undelivered.
 async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
     let mut candidates: Vec<String> = Vec::new();
-    if cloud.gw.list().iter().any(|d| crate::admin::record_tenant(&d.tenant) == team) {
+    if cloud
+        .gw
+        .list()
+        .iter()
+        .any(|d| crate::admin::record_tenant(&d.tenant) == team)
+    {
         candidates.push(cloud.node_name.clone());
     }
     for (node, deps) in cloud.peer_deployments.read().iter() {
-        if deps.iter().any(|d| crate::admin::record_tenant(&d.tenant) == team) && !candidates.contains(node) {
+        if deps
+            .iter()
+            .any(|d| crate::admin::record_tenant(&d.tenant) == team)
+            && !candidates.contains(node)
+        {
             candidates.push(node.clone());
         }
     }
@@ -206,7 +247,8 @@ async fn is_primary_for_team(cloud: &Arc<CloudState>, team: &str) -> bool {
         return true;
     }
     let nodes = cloud.registry.nodes();
-    crate::cluster::Cluster::elect_among(&candidates, &nodes).as_deref() == Some(cloud.node_name.as_str())
+    crate::cluster::Cluster::elect_among(&candidates, &nodes).as_deref()
+        == Some(cloud.node_name.as_str())
 }
 
 /// Pull every job mirrored in GuardianDB for tenants THIS node currently hosts
@@ -227,8 +269,12 @@ async fn sync_from_guardian(cloud: &Arc<CloudState>, queue: &Arc<WorldQueue>) {
         return;
     }
     for key in crate::guardian::keys().await {
-        let Some(rest) = key.strip_prefix("wqueue/pending/") else { continue };
-        let Some((team, _id)) = rest.split_once('/') else { continue };
+        let Some(rest) = key.strip_prefix("wqueue/pending/") else {
+            continue;
+        };
+        let Some((team, _id)) = rest.split_once('/') else {
+            continue;
+        };
         if !hosted_teams.contains(team) {
             continue;
         }
@@ -269,7 +315,8 @@ pub async fn run_delivery_loop(cloud: Arc<CloudState>, queue: Arc<WorldQueue>) {
                 req = req.header(k.as_str(), v.as_str());
             }
             req = req.header("x-hive-queue-attempt", (job.attempt + 1).to_string());
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(30), req.send()).await;
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(30), req.send()).await;
             let ok = matches!(&outcome, Ok(Ok(resp)) if resp.status().is_success());
             if ok {
                 queue.mark_delivered(&job.id);

@@ -36,7 +36,9 @@ async fn start_shim() -> (String, Arc<Mutex<Vec<Captured>>>) {
     let cap = captured.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let cap = cap.clone();
             tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -81,7 +83,12 @@ async fn start_shim() -> (String, Arc<Mutex<Vec<Captured>>>) {
                     }
                 }
                 let body = String::from_utf8_lossy(&body).to_string();
-                cap.lock().unwrap().push(Captured { method, path: path.clone(), headers, body });
+                cap.lock().unwrap().push(Captured {
+                    method,
+                    path: path.clone(),
+                    headers,
+                    body,
+                });
 
                 // Canned response: 404 for /v1/missing, else 200 JSON.
                 let (status, payload) = if path.starts_with("/v1/missing") {
@@ -117,19 +124,47 @@ fn shadw() -> Command {
 async fn get_sends_bearer_and_team_headers_and_parses_json() {
     let (url, cap) = start_shim().await;
     let out = shadw()
-        .args(["--api", &url, "--token", "hive_testkey", "--team", "acme", "--json", "obs", "overview"])
+        .args([
+            "--api",
+            &url,
+            "--token",
+            "hive_testkey",
+            "--team",
+            "acme",
+            "--json",
+            "obs",
+            "overview",
+        ])
         .output()
         .await
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("\"ok\""), "parsed+printed JSON body, got: {stdout}");
+    assert!(
+        stdout.contains("\"ok\""),
+        "parsed+printed JSON body, got: {stdout}"
+    );
 
     let reqs = cap.lock().unwrap().clone();
-    let r = reqs.iter().find(|r| r.path == "/v1/overview").expect("overview request hit the server");
+    let r = reqs
+        .iter()
+        .find(|r| r.path == "/v1/overview")
+        .expect("overview request hit the server");
     assert_eq!(r.method, "GET");
-    assert_eq!(r.header("authorization"), Some("Bearer hive_testkey"), "API key sent as bearer");
-    assert_eq!(r.header("x-hive-team"), Some("acme"), "team scoping header sent");
+    assert_eq!(
+        r.header("authorization"),
+        Some("Bearer hive_testkey"),
+        "API key sent as bearer"
+    );
+    assert_eq!(
+        r.header("x-hive-team"),
+        Some("acme"),
+        "team scoping header sent"
+    );
 }
 
 #[tokio::test]
@@ -137,18 +172,39 @@ async fn post_deploy_sends_json_body_with_fields_and_env() {
     let (url, cap) = start_shim().await;
     let out = shadw()
         .args([
-            "--api", &url, "--token", "hive_k",
-            "deploy", "https://github.com/a/b", "--branch", "main", "--target", "production", "--no-cache", "-e", "FOO=bar",
+            "--api",
+            &url,
+            "--token",
+            "hive_k",
+            "deploy",
+            "https://github.com/a/b",
+            "--branch",
+            "main",
+            "--target",
+            "production",
+            "--no-cache",
+            "-e",
+            "FOO=bar",
         ])
         .output()
         .await
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let reqs = cap.lock().unwrap().clone();
-    let r = reqs.iter().find(|r| r.path == "/v1/git/deploy").expect("deploy request hit the server");
+    let r = reqs
+        .iter()
+        .find(|r| r.path == "/v1/git/deploy")
+        .expect("deploy request hit the server");
     assert_eq!(r.method, "POST");
-    assert!(r.header("content-type").unwrap_or("").contains("application/json"));
+    assert!(r
+        .header("content-type")
+        .unwrap_or("")
+        .contains("application/json"));
     let body: serde_json::Value = serde_json::from_str(&r.body).expect("valid JSON body");
     assert_eq!(body["repo_url"], "https://github.com/a/b");
     assert_eq!(body["branch"], "main");
@@ -161,28 +217,50 @@ async fn post_deploy_sends_json_body_with_fields_and_env() {
 async fn non_2xx_is_a_clear_error_and_nonzero_exit() {
     let (url, cap) = start_shim().await;
     let out = shadw()
-        .args(["--api", &url, "--token", "hive_k", "api", "GET", "/v1/missing"])
+        .args([
+            "--api",
+            &url,
+            "--token",
+            "hive_k",
+            "api",
+            "GET",
+            "/v1/missing",
+        ])
         .output()
         .await
         .unwrap();
     assert!(!out.status.success(), "non-2xx must exit non-zero");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("HTTP 404"), "error names the status, got: {stderr}");
+    assert!(
+        stderr.contains("HTTP 404"),
+        "error names the status, got: {stderr}"
+    );
 
     let reqs = cap.lock().unwrap().clone();
-    assert!(reqs.iter().any(|r| r.path == "/v1/missing" && r.method == "GET"));
+    assert!(reqs
+        .iter()
+        .any(|r| r.path == "/v1/missing" && r.method == "GET"));
 }
 
 #[tokio::test]
 async fn delete_uses_delete_method() {
     let (url, cap) = start_shim().await;
     let out = shadw()
-        .args(["--api", &url, "--token", "hive_k", "keys", "revoke", "key_123"])
+        .args([
+            "--api", &url, "--token", "hive_k", "keys", "revoke", "key_123",
+        ])
         .output()
         .await
         .unwrap();
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let reqs = cap.lock().unwrap().clone();
-    let r = reqs.iter().find(|r| r.path == "/v1/apikeys/key_123").expect("revoke hit");
+    let r = reqs
+        .iter()
+        .find(|r| r.path == "/v1/apikeys/key_123")
+        .expect("revoke hit");
     assert_eq!(r.method, "DELETE");
 }

@@ -62,7 +62,9 @@ pub struct BuildStore {
 
 impl BuildStore {
     pub fn new() -> BuildStore {
-        BuildStore { map: Mutex::new(HashMap::new()) }
+        BuildStore {
+            map: Mutex::new(HashMap::new()),
+        }
     }
     pub fn get(&self, id: &str) -> Option<Build> {
         self.map.lock().get(id).cloned()
@@ -92,7 +94,10 @@ impl BuildStore {
             if matches!(b.state, DeployState::Queued | DeployState::Building) {
                 b.state = DeployState::Error;
                 b.finished_ms.get_or_insert_with(now_ms);
-                b.lines.push(LogLine { ts_ms: now_ms(), line: "build interrupted: node restarted while the build was in flight".into() });
+                b.lines.push(LogLine {
+                    ts_ms: now_ms(),
+                    line: "build interrupted: node restarted while the build was in flight".into(),
+                });
             }
             m.entry(b.id.clone()).or_insert(b);
         }
@@ -102,7 +107,10 @@ impl BuildStore {
     }
     fn log(&self, id: &str, line: impl Into<String>) {
         if let Some(b) = self.map.lock().get_mut(id) {
-            b.lines.push(LogLine { ts_ms: now_ms(), line: line.into() });
+            b.lines.push(LogLine {
+                ts_ms: now_ms(),
+                line: line.into(),
+            });
             // Cap per-build log retention: a chatty build could otherwise grow
             // an unbounded Vec<LogLine> that is then cloned into EVERY 120s
             // replicated platform snapshot (a real contributor to the fleet's
@@ -138,20 +146,36 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     let mut out: String = s
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     while out.contains("--") {
         out = out.replace("--", "-");
     }
-    let out = out.trim_matches(|c| c == '-' || c == '.' || c == '_').to_string();
-    if out.is_empty() { "app".into() } else { out }
+    let out = out
+        .trim_matches(|c| c == '-' || c == '.' || c == '_')
+        .to_string();
+    if out.is_empty() {
+        "app".into()
+    } else {
+        out
+    }
 }
 
 pub fn project_name_from_url(url: &str) -> String {
     // Container-image refs (`image://ns/name:tag`): the project is the image NAME —
     // drop the registry/namespace prefix AND the `:tag` (else "simplifi:latest"
     // slugs to the ugly "simplifi-latest" and every tag change forks the project).
-    let last = url.trim_end_matches('/').rsplit('/').next().unwrap_or("project");
+    let last = url
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("project");
     let last = if url.starts_with("image://") {
         last.split(':').next().unwrap_or(last)
     } else {
@@ -160,7 +184,13 @@ pub fn project_name_from_url(url: &str) -> String {
     last.trim_end_matches(".git")
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 
@@ -186,7 +216,10 @@ pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
                 return None;
             }
             // Only real checkouts (has a package.json or a container build file).
-            if !p.join("package.json").exists() && !p.join("Dockerfile").exists() && !p.join("Containerfile").exists() {
+            if !p.join("package.json").exists()
+                && !p.join("Dockerfile").exists()
+                && !p.join("Containerfile").exists()
+            {
                 return None;
             }
             let m = e.metadata().ok()?.modified().ok()?;
@@ -270,7 +303,10 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
 /// Start a build; returns its id immediately. The build runs in the background.
 pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
-    let project = req.project.clone().unwrap_or_else(|| project_name_from_url(&req.repo_url));
+    let project = req
+        .project
+        .clone()
+        .unwrap_or_else(|| project_name_from_url(&req.repo_url));
     cloud.builds.insert(Build {
         id: id.clone(),
         project: project.clone(),
@@ -334,7 +370,8 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
 /// `<project>.src.zip` OR a prior build checkout — i.e. a zip redeploy can rebuild
 /// here without re-fetching from a peer.
 pub(crate) fn has_local_source(project: &str) -> bool {
-    deploy_root().join(format!("{project}.src.zip")).is_file() || newest_deploy_dir(project).is_some()
+    deploy_root().join(format!("{project}.src.zip")).is_file()
+        || newest_deploy_dir(project).is_some()
 }
 
 /// Redeploy a project whose retained source lives on a SPECIFIC host node (not this
@@ -365,12 +402,27 @@ pub(crate) fn redeploy_on_host(
     });
     let bid = id.clone();
     tokio::spawn(async move {
-        cloud.builds.log(&bid, format!("Redeploy: dispatching to host node {}", host.node));
+        cloud.builds.log(
+            &bid,
+            format!("Redeploy: dispatching to host node {}", host.node),
+        );
         // Single pinned host = the deploy's one-and-only (primary) target — never
         // a secondary replica of a multi-region fanout.
-        let ok = fanout_remote(&cloud, &bid, &req, &project, std::slice::from_ref(&host), true).await;
+        let ok = fanout_remote(
+            &cloud,
+            &bid,
+            &req,
+            &project,
+            std::slice::from_ref(&host),
+            true,
+        )
+        .await;
         cloud.builds.update(&bid, |b| {
-            b.state = if ok { DeployState::Ready } else { DeployState::Error };
+            b.state = if ok {
+                DeployState::Ready
+            } else {
+                DeployState::Error
+            };
             b.finished_ms = Some(now_ms());
         });
         crate::persist::persist(&cloud);
@@ -409,7 +461,10 @@ async fn run_build(
             );
         }
         if !env.is_empty() {
-            log(format!("Set {} environment variable(s) for the project.", env.iter().filter(|(k, _)| !k.trim().is_empty()).count()));
+            log(format!(
+                "Set {} environment variable(s) for the project.",
+                env.iter().filter(|(k, _)| !k.trim().is_empty()).count()
+            ));
             crate::persist::persist(cloud);
         }
     }
@@ -418,10 +473,14 @@ async fn run_build(
     // FunctionSettings so this target builds with the user's configured framework/
     // commands + compute tier (not just auto-detect). Direct user deploys omit
     // these (the coordinator reads its own store).
-    if let Some(bc) = req.build_config.as_ref().and_then(|v| serde_json::from_value::<crate::project_settings::BuildConfig>(v.clone()).ok()) {
+    if let Some(bc) = req.build_config.as_ref().and_then(|v| {
+        serde_json::from_value::<crate::project_settings::BuildConfig>(v.clone()).ok()
+    }) {
         cloud.projects.set_build(&project, bc);
     }
-    if let Some(fs) = req.function_settings.as_ref().and_then(|v| serde_json::from_value::<crate::project_settings::FunctionSettings>(v.clone()).ok()) {
+    if let Some(fs) = req.function_settings.as_ref().and_then(|v| {
+        serde_json::from_value::<crate::project_settings::FunctionSettings>(v.clone()).ok()
+    }) {
         cloud.projects.set_functions(&project, fs);
     }
 
@@ -457,7 +516,14 @@ async fn run_build(
         // sub-builds skip both of this coordinator's gates.
         let known_container = req.image_ref.is_some();
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
-        let targets = crate::schedule::place_for_project(cloud, &project, &regions, known_container, known_container, needs_gpu);
+        let targets = crate::schedule::place_for_project(
+            cloud,
+            &project,
+            &regions,
+            known_container,
+            known_container,
+            needs_gpu,
+        );
         // A GPU deployment must NEVER fall through to this node when placement
         // found no GPU-capable target. Everywhere else an empty `targets` means
         // "host locally", which is the right default — but for a GPU request that
@@ -467,7 +533,12 @@ async fn run_build(
         // been marked unhealthy) and served 503 DEPLOYMENT_CIRCUIT_OPEN instead of
         // reporting the real reason. Fail loudly here, naming the actual cause.
         if needs_gpu && targets.is_empty() {
-            let gpu_nodes = cloud.registry.nodes().into_iter().filter(|n| n.gpu_count > 0).count();
+            let gpu_nodes = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| n.gpu_count > 0)
+                .count();
             let msg = format!(
                 // Assembled from single-line pieces on purpose: a `\`-continued
                 // Rust string literal keeps its source indentation, which shipped
@@ -487,10 +558,17 @@ async fn run_build(
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
         if regions.is_empty() && !targets.is_empty() {
-            let node_region: std::collections::HashMap<String, String> =
-                cloud.registry.nodes().into_iter().map(|n| (n.name, n.region)).collect();
-            let mut placed: Vec<String> =
-                targets.iter().filter_map(|t| node_region.get(&t.node).cloned()).filter(|r| !r.is_empty()).collect();
+            let node_region: std::collections::HashMap<String, String> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .map(|n| (n.name, n.region))
+                .collect();
+            let mut placed: Vec<String> = targets
+                .iter()
+                .filter_map(|t| node_region.get(&t.node).cloned())
+                .filter(|r| !r.is_empty())
+                .collect();
             placed.sort();
             placed.dedup();
             if !placed.is_empty() {
@@ -498,21 +576,32 @@ async fn run_build(
                 fs.regions = placed.clone();
                 cloud.projects.set_functions(&project, fs);
                 crate::persist::persist(cloud);
-                log(format!("Default region(s) set in Function Settings: {}", placed.join(", ")));
+                log(format!(
+                    "Default region(s) set in Function Settings: {}",
+                    placed.join(", ")
+                ));
             }
         }
         // A target is LOCAL only when it has neither an HTTP admin nor an iroh route
         // (iroh targets are remote FC nodes reached over the mesh).
-        let local_selected = targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none());
-        let remote: Vec<crate::schedule::Target> =
-            targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();
+        let local_selected = targets
+            .iter()
+            .any(|t| t.admin.is_none() && t.iroh.is_none());
+        let remote: Vec<crate::schedule::Target> = targets
+            .iter()
+            .filter(|t| t.admin.is_some() || t.iroh.is_some())
+            .cloned()
+            .collect();
 
         if !targets.is_empty() && !local_selected {
             // Pure remote placement: do NOT build/host locally. Dispatch to the
             // chosen region node(s), mirror their build into this build record,
             // then remove the project from any other node that still hosts it.
             let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
-            log(format!("Placement: region-aware scheduler → {}", names.join(", ")));
+            log(format!(
+                "Placement: region-aware scheduler → {}",
+                names.join(", ")
+            ));
             // `primary_first: true` — on this branch NO local target was selected,
             // so `remote` IS the entire placement in region order: remote[0] (the
             // first requested region's node, matching the region `schedule::place`'s
@@ -542,10 +631,17 @@ async fn run_build(
             if ok {
                 cleanup_non_targets(cloud, &project, &names).await;
             } else {
-                log("Build failed — keeping the existing deployment in place (no relocation).".into());
+                log(
+                    "Build failed — keeping the existing deployment in place (no relocation)."
+                        .into(),
+                );
             }
             cloud.builds.update(bid, |b| {
-                b.state = if ok { DeployState::Ready } else { DeployState::Error };
+                b.state = if ok {
+                    DeployState::Ready
+                } else {
+                    DeployState::Error
+                };
                 b.finished_ms = Some(now_ms());
             });
             crate::persist::persist(cloud);
@@ -553,7 +649,10 @@ async fn run_build(
         }
         if local_selected && !remote.is_empty() {
             let names: Vec<String> = remote.iter().map(|t| t.node.clone()).collect();
-            log(format!("Placement: hosting here + replicating to {} (multi-region)", names.join(", ")));
+            log(format!(
+                "Placement: hosting here + replicating to {} (multi-region)",
+                names.join(", ")
+            ));
         }
         // local_selected (host here, fanout extras at the tail) OR no eligible
         // target (empty → host locally as a safe fallback): fall through.
@@ -575,28 +674,55 @@ async fn run_build(
         // is pulled + turned into a container manifest in `produce_manifest`.
         tokio::fs::create_dir_all(&dir).await?;
         log(format!("Deploying prebuilt image: {image}"));
-        ("image".to_string(), String::new(), format!("Image: {image}"))
+        (
+            "image".to_string(),
+            String::new(),
+            format!("Image: {image}"),
+        )
     } else if let Some(zip_b64) = req.zip_b64.take() {
         // Drag-drop / zip upload: decode + extract instead of cloning, and synthesize
         // git-ish metadata so the rest of the pipeline is unchanged. `take()` drops the
         // base64 off the request so it's never logged/persisted past this point.
         let name = req.repo_url.trim_start_matches("upload://").to_string();
-        log(format!("Extracting uploaded archive: {}", if name.is_empty() { "archive.zip" } else { &name }));
+        log(format!(
+            "Extracting uploaded archive: {}",
+            if name.is_empty() {
+                "archive.zip"
+            } else {
+                &name
+            }
+        ));
         let t0 = now_ms();
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(zip_b64.as_bytes())
             .map_err(|e| anyhow::anyhow!("invalid upload encoding: {e}"))?;
         let files = extract_zip_into(&bytes, &dir).await?;
-        log(format!("Extracted {files} file(s) in {}ms", now_ms().saturating_sub(t0)));
+        log(format!(
+            "Extracted {files} file(s) in {}ms",
+            now_ms().saturating_sub(t0)
+        ));
         // Retain the ORIGINAL archive durably so a later Redeploy can rebuild this
         // zip-uploaded project from source. Stored as a FILE beside the checkouts —
         // `gc_build_dirs` only reaps directories, so this survives build-dir GC (and,
         // on a persistent /tmp, node restarts); the redeploy path re-extracts it.
         let retained = deploy_root().join(format!("{project}.src.zip"));
         if let Err(e) = tokio::fs::write(&retained, &bytes).await {
-            log(format!("(note) could not retain source archive for future redeploys: {e}"));
+            log(format!(
+                "(note) could not retain source archive for future redeploys: {e}"
+            ));
         }
-        ("upload".to_string(), String::new(), format!("Uploaded {}", if name.is_empty() { "archive.zip".into() } else { name }))
+        (
+            "upload".to_string(),
+            String::new(),
+            format!(
+                "Uploaded {}",
+                if name.is_empty() {
+                    "archive.zip".into()
+                } else {
+                    name
+                }
+            ),
+        )
     } else if req.repo_url.starts_with("upload://") {
         // REDEPLOY of a zip-uploaded project: no git remote to clone and the request
         // carries no fresh archive. Rebuild from RETAINED source on THIS node — the
@@ -609,18 +735,28 @@ async fn run_build(
         if retained.is_file() {
             log(format!(
                 "Redeploy: re-extracting retained source archive ({})",
-                if name.is_empty() { "archive.zip" } else { &name }
+                if name.is_empty() {
+                    "archive.zip"
+                } else {
+                    &name
+                }
             ));
             let bytes = tokio::fs::read(&retained).await?;
             let files = extract_zip_into(&bytes, &dir).await?;
-            log(format!("Extracted {files} file(s) in {}ms", now_ms().saturating_sub(t0)));
+            log(format!(
+                "Extracted {files} file(s) in {}ms",
+                now_ms().saturating_sub(t0)
+            ));
         } else if let Some(src) = newest_deploy_dir(&project) {
             log("Redeploy: reusing retained source from the prior build".to_string());
             let (s, d) = (src.clone(), dir.clone());
             tokio::task::spawn_blocking(move || copy_dir_into(&s, &d))
                 .await
                 .map_err(|e| anyhow::anyhow!("source copy task failed: {e}"))??;
-            log(format!("Prepared source in {}ms", now_ms().saturating_sub(t0)));
+            log(format!(
+                "Prepared source in {}ms",
+                now_ms().saturating_sub(t0)
+            ));
         } else {
             anyhow::bail!(
                 "no retained source found for this uploaded project — re-upload the archive to deploy again"
@@ -629,7 +765,14 @@ async fn run_build(
         (
             "upload".to_string(),
             String::new(),
-            format!("Redeploy of {}", if name.is_empty() { "uploaded archive".into() } else { name }),
+            format!(
+                "Redeploy of {}",
+                if name.is_empty() {
+                    "uploaded archive".into()
+                } else {
+                    name
+                }
+            ),
         )
     } else {
         // A PR opened from a FORK has its branch/commit only on the fork's own
@@ -639,13 +782,22 @@ async fn run_build(
         // `req.repo_url` as before. Project ownership/matching and every displayed
         // field (`Build.repo_url`, commit-status reporting below) stay on the BASE
         // repo — only the actual clone/fetch source changes here.
-        let clone_source_url = req.head_repo_url.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| req.repo_url.clone());
-        let short_repo = clone_source_url.trim_start_matches("https://").trim_end_matches(".git");
+        let clone_source_url = req
+            .head_repo_url
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| req.repo_url.clone());
+        let short_repo = clone_source_url
+            .trim_start_matches("https://")
+            .trim_end_matches(".git");
         let pinned_commit = req.commit.clone().filter(|s| !s.is_empty());
         log(format!(
             "Cloning {short_repo} (Branch: {}, Commit: {})",
             if branch.is_empty() { "main" } else { &branch },
-            pinned_commit.as_deref().map(|s| s.chars().take(7).collect::<String>()).unwrap_or_else(|| "HEAD".into())
+            pinned_commit
+                .as_deref()
+                .map(|s| s.chars().take(7).collect::<String>())
+                .unwrap_or_else(|| "HEAD".into())
         ));
         let t0 = now_ms();
         // Credential for a PRIVATE repo: the deploy request's `git_token` — either
@@ -694,8 +846,12 @@ async fn run_build(
         // specific commit to pin to), behavior is EXACTLY the prior shallow
         // branch-tip clone.
         let run_clone = |clone_url: String| {
-            let (dir, branch, token, commit) =
-                (dir.clone(), branch.clone(), git_token.clone(), pinned_commit.clone());
+            let (dir, branch, token, commit) = (
+                dir.clone(),
+                branch.clone(),
+                git_token.clone(),
+                pinned_commit.clone(),
+            );
             async move {
                 let scrub = |raw: &[u8]| {
                     let mut s = String::from_utf8_lossy(raw).trim().to_string();
@@ -708,17 +864,32 @@ async fn run_build(
                     // Fast path: fetch the exact commit directly into a fresh repo.
                     if tokio::fs::create_dir_all(&dir).await.is_ok() {
                         let mut init = Command::new("git");
-                        init.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                        init.env("GIT_TERMINAL_PROMPT", "0")
+                            .env("GIT_ASKPASS", "/bin/echo");
                         init.arg("init").arg("-q").arg(&dir);
-                        let init_ok = init.output().await.map(|o| o.status.success()).unwrap_or(false);
+                        let init_ok = init
+                            .output()
+                            .await
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
                         if init_ok {
                             let mut remote = Command::new("git");
-                            remote.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
-                            remote.arg("-C").arg(&dir).arg("remote").arg("add").arg("origin").arg(&clone_url);
+                            remote
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .env("GIT_ASKPASS", "/bin/echo");
+                            remote
+                                .arg("-C")
+                                .arg(&dir)
+                                .arg("remote")
+                                .arg("add")
+                                .arg("origin")
+                                .arg(&clone_url);
                             let _ = remote.output().await;
 
                             let mut fetch = Command::new("git");
-                            fetch.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                            fetch
+                                .env("GIT_TERMINAL_PROMPT", "0")
+                                .env("GIT_ASKPASS", "/bin/echo");
                             fetch
                                 .arg("-C")
                                 .arg(&dir)
@@ -768,7 +939,8 @@ async fn run_build(
                     // Fallback: full (unshallowed) clone of the branch, then pin via checkout.
                     let _ = tokio::fs::remove_dir_all(&dir).await;
                     let mut cmd = Command::new("git");
-                    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                    cmd.env("GIT_TERMINAL_PROMPT", "0")
+                        .env("GIT_ASKPASS", "/bin/echo");
                     cmd.arg("clone");
                     if !branch.is_empty() {
                         cmd.arg("--branch").arg(&branch);
@@ -797,7 +969,8 @@ async fn run_build(
                     // No specific commit to pin to: exactly the prior behavior — a
                     // shallow clone of the branch tip.
                     let mut cmd = Command::new("git");
-                    cmd.env("GIT_TERMINAL_PROMPT", "0").env("GIT_ASKPASS", "/bin/echo");
+                    cmd.env("GIT_TERMINAL_PROMPT", "0")
+                        .env("GIT_ASKPASS", "/bin/echo");
                     cmd.arg("clone").arg("--depth").arg("1");
                     if !branch.is_empty() {
                         cmd.arg("--branch").arg(&branch);
@@ -821,7 +994,9 @@ async fn run_build(
                 || s.contains("Repository not found")
         };
 
-        let first_url = tokenized_url.clone().unwrap_or_else(|| clone_source_url.clone());
+        let first_url = tokenized_url
+            .clone()
+            .unwrap_or_else(|| clone_source_url.clone());
         let used_token = tokenized_url.is_some();
         let (mut ok, mut stderr) = run_clone(first_url).await;
         // A stored token that is expired / lacks access must never break a repo that
@@ -857,11 +1032,20 @@ async fn run_build(
         // The token has done its job; drop it so no build/deploy record, gossip frame,
         // or displayed field constructed from `req` beyond this point can retain it.
         req.git_token = None;
-        log(format!("Cloning completed: {}ms", now_ms().saturating_sub(t0)));
-        let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"]).await.unwrap_or_default();
+        log(format!(
+            "Cloning completed: {}ms",
+            now_ms().saturating_sub(t0)
+        ));
+        let commit = run_git(&dir, &["rev-parse", "--short", "HEAD"])
+            .await
+            .unwrap_or_default();
         // Full SHA for GitHub commit-status reporting (the statuses API needs it).
-        let full_sha = run_git(&dir, &["rev-parse", "HEAD"]).await.unwrap_or_else(|| commit.clone());
-        let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"]).await.unwrap_or_default();
+        let full_sha = run_git(&dir, &["rev-parse", "HEAD"])
+            .await
+            .unwrap_or_else(|| commit.clone());
+        let commit_message = run_git(&dir, &["log", "-1", "--pretty=%s"])
+            .await
+            .unwrap_or_default();
         // Best-effort "pending" check on the commit (no-op without GITHUB_TOKEN).
         {
             let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
@@ -872,7 +1056,9 @@ async fn run_build(
         (commit, full_sha, commit_message)
     };
     let actual_branch = if branch.is_empty() {
-        run_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).await.unwrap_or_else(|| "main".into())
+        run_git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .unwrap_or_else(|| "main".into())
     } else {
         branch.clone()
     };
@@ -893,40 +1079,77 @@ async fn run_build(
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .or_else(|| Some(persisted_root.clone()).filter(|s| !s.trim().is_empty() && s != "./"));
-    let build_dir = match effective_root.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let build_dir = match effective_root
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(root) => {
             log(format!("Root directory: {root}"));
             dir.join(root)
         }
         None => dir.clone(),
     };
-    anyhow::ensure!(build_dir.exists(), "root directory '{}' not found in repo", effective_root.unwrap_or_default());
+    anyhow::ensure!(
+        build_dir.exists(),
+        "root directory '{}' not found in repo",
+        effective_root.unwrap_or_default()
+    );
 
     // ---- Ignored Build Step (vercel.json `ignoreCommand`) ----
     // Vercel semantics: run the command in the project root; exit 0 => skip this
     // build entirely (no new deployment — the prior one keeps serving), non-zero
     // => continue. Lets a repo short-circuit commits that don't need a rebuild.
     if let Some(vc) = fluid_build::load_vercel_config(&build_dir) {
-        if let Some(cmd) = vc.ignore_command.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        if let Some(cmd) = vc
+            .ignore_command
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
             log(format!("Running Ignored Build Step: {cmd}"));
-            if let Ok(st) = Command::new("sh").arg("-c").arg(&cmd).current_dir(&build_dir).status().await {
+            if let Ok(st) = Command::new("sh")
+                .arg("-c")
+                .arg(&cmd)
+                .current_dir(&build_dir)
+                .status()
+                .await
+            {
                 if st.success() {
-                    log("Ignored Build Step exited 0 — skipping this build (no changes to deploy).".into());
+                    log(
+                        "Ignored Build Step exited 0 — skipping this build (no changes to deploy)."
+                            .into(),
+                    );
                     cloud.builds.update(bid, |b| {
                         b.state = DeployState::Ready;
                         b.finished_ms = Some(now_ms());
                     });
                     return Ok(());
                 }
-                log(format!("Ignored Build Step exited {} — continuing build.", st.code().unwrap_or(-1)));
+                log(format!(
+                    "Ignored Build Step exited {} — continuing build.",
+                    st.code().unwrap_or(-1)
+                ));
             }
         }
         // devCommand / bunVersion are recorded for parity but not executed: the
         // platform has no local dev server and manages the runtime itself.
-        if let Some(dc) = vc.dev_command.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            log(format!("vercel.json devCommand: {dc} (informational — not executed)"));
+        if let Some(dc) = vc
+            .dev_command
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            log(format!(
+                "vercel.json devCommand: {dc} (informational — not executed)"
+            ));
         }
-        if let Some(bv) = vc.bun_version.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(bv) = vc
+            .bun_version
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             log(format!("vercel.json bunVersion: {bv} (informational)"));
         }
     }
@@ -958,7 +1181,10 @@ async fn run_build(
         Err(e) => {
             build_failed = true;
             log(format!("Build failed: {e}"));
-            log("Keeping the deployment — serving a build-status page so the project still exists.".into());
+            log(
+                "Keeping the deployment — serving a build-status page so the project still exists."
+                    .into(),
+            );
             let index = build_dir.join("index.html");
             let _ = tokio::fs::create_dir_all(&build_dir).await;
             let _ = tokio::fs::write(
@@ -979,15 +1205,29 @@ async fn run_build(
             manifest.redirects = feats
                 .redirects
                 .iter()
-                .map(|r| fluid_core::Redirect { source: r.source.clone(), destination: r.destination.clone(), status: r.status, has: vec![], missing: vec![] })
+                .map(|r| fluid_core::Redirect {
+                    source: r.source.clone(),
+                    destination: r.destination.clone(),
+                    status: r.status,
+                    has: vec![],
+                    missing: vec![],
+                })
                 .collect();
             manifest.rewrites = feats
                 .rewrites
                 .iter()
-                .map(|r| fluid_core::Rewrite { source: r.source.clone(), destination: r.destination.clone(), has: vec![], missing: vec![] })
+                .map(|r| fluid_core::Rewrite {
+                    source: r.source.clone(),
+                    destination: r.destination.clone(),
+                    has: vec![],
+                    missing: vec![],
+                })
                 .collect();
             if let Some(mw) = &feats.middleware {
-                manifest.middleware = Some(fluid_core::Middleware { matcher: mw.matcher.clone(), runtime: mw.runtime.clone() });
+                manifest.middleware = Some(fluid_core::Middleware {
+                    matcher: mw.matcher.clone(),
+                    runtime: mw.runtime.clone(),
+                });
             }
             // Mark edge-runtime functions so the service graph / overview can show them.
             if !feats.edge_functions.is_empty() {
@@ -1018,13 +1258,18 @@ async fn run_build(
             inference: Option<crate::project_settings::InferenceSpec>,
         }
         let spec = match tokio::fs::read_to_string(build_dir.join("fluid.json")).await {
-            Ok(txt) => serde_json::from_str::<InfWrap>(&txt).map(|w| w.inference).unwrap_or(None),
+            Ok(txt) => serde_json::from_str::<InfWrap>(&txt)
+                .map(|w| w.inference)
+                .unwrap_or(None),
             Err(_) => None,
         };
         let current = cloud.projects.get(&manifest.project).inference;
         if current != spec {
             if let Some(s) = &spec {
-                log(format!("Managed inference requested: model {} (pool: {}).", s.model, s.pool));
+                log(format!(
+                    "Managed inference requested: model {} (pool: {}).",
+                    s.model, s.pool
+                ));
             } else if current.is_some() {
                 log("Managed inference removed (no inference block in fluid.json).".into());
             }
@@ -1078,7 +1323,11 @@ async fn run_build(
     // page so the deployed URL returns 200 instead of 404.
     if manifest.functions.is_empty() {
         let static_dir = manifest.static_dir.clone().unwrap_or_else(|| ".".into());
-        let base = if static_dir == "." { build_dir.clone() } else { build_dir.join(&static_dir) };
+        let base = if static_dir == "." {
+            build_dir.clone()
+        } else {
+            build_dir.join(&static_dir)
+        };
         let index = base.join("index.html");
         if !index.exists() {
             let _ = tokio::fs::create_dir_all(&base).await;
@@ -1089,7 +1338,10 @@ async fn run_build(
     }
 
     log("Uploading build outputs…".into());
-    log(format!("Functions: {}, Static assets prepared.", manifest.functions.len()));
+    log(format!(
+        "Functions: {}, Static assets prepared.",
+        manifest.functions.len()
+    ));
 
     // ---- Classify production vs preview (Vercel's model) ----
     // A project's production branch is recorded on its first deploy (the imported
@@ -1109,7 +1361,11 @@ async fn run_build(
     };
     log(format!(
         "Target: {} (branch '{}' vs production branch '{}')",
-        if is_production { "Production" } else { "Preview" },
+        if is_production {
+            "Production"
+        } else {
+            "Preview"
+        },
         actual_branch,
         prod_branch
     ));
@@ -1121,10 +1377,20 @@ async fn run_build(
     {
         let rc_url = std::env::var("HIVE_RUNTIME_CACHE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8786/v1/runtime-cache".to_string());
-        let rc_scope = format!("{}:{}", project, if is_production { "production" } else { "preview" });
+        let rc_scope = format!(
+            "{}:{}",
+            project,
+            if is_production {
+                "production"
+            } else {
+                "preview"
+            }
+        );
         for f in manifest.functions.iter_mut() {
-            f.env.insert("HIVE_RUNTIME_CACHE_URL".into(), rc_url.clone());
-            f.env.insert("HIVE_RUNTIME_CACHE_SCOPE".into(), rc_scope.clone());
+            f.env
+                .insert("HIVE_RUNTIME_CACHE_URL".into(), rc_url.clone());
+            f.env
+                .insert("HIVE_RUNTIME_CACHE_SCOPE".into(), rc_scope.clone());
         }
     }
 
@@ -1228,7 +1494,9 @@ async fn run_build(
                 log("Delivered build output to a microVM image (Firecracker).".into());
                 manifest.image = Some(image);
             }
-            Err(e) => log(format!("WARN: could not deliver build to microVM ({e}); serving may fail.")),
+            Err(e) => log(format!(
+                "WARN: could not deliver build to microVM ({e}); serving may fail."
+            )),
         }
     }
 
@@ -1267,7 +1535,11 @@ async fn run_build(
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
         is_production,
-        if build_failed { DeployState::Error } else { DeployState::Ready },
+        if build_failed {
+            DeployState::Error
+        } else {
+            DeployState::Ready
+        },
         tenant,
     );
 
@@ -1306,7 +1578,9 @@ async fn run_build(
     // and render on the canvas. Best-effort: a non-WDK app simply has none.
     let ingested = ingest_workflow_manifest(cloud, &info.project, &build_dir).await;
     if ingested > 0 {
-        log(format!("Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."));
+        log(format!(
+            "Detected Vercel WDK: registered {ingested} workflow(s) for the Workflows tab."
+        ));
     }
 
     // Managed World auto-wiring: any project detected to use the Vercel
@@ -1334,17 +1608,39 @@ async fn run_build(
     // World package.
     {
         let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        if (ingested > 0 || py_wdk) && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir) {
+        if (ingested > 0 || py_wdk)
+            && !crate::world_queue::workflow_world_opted_out(cloud, &info.project, &build_dir)
+        {
             let queue_url = std::env::var("HIVE_QUEUE_ENDPOINT")
                 .unwrap_or_else(|_| "http://127.0.0.1:8786".to_string());
             let team = crate::admin::norm(&cloud.projects.team_of(&info.project)).to_string();
-            if let Ok(queue_token) = crate::auth::issue("world-queue-client", &team, "service", false, 365 * 24 * 3600) {
-                cloud.projects.put_env(&info.project, crate::project_settings::EnvVar {
-                    key: "HIVE_QUEUE_ENDPOINT".into(), value: queue_url, target: "all".into(), sensitive: false, updated_ms: now_ms(),
-                });
-                cloud.projects.put_env(&info.project, crate::project_settings::EnvVar {
-                    key: "HIVE_QUEUE_TOKEN".into(), value: queue_token, target: "all".into(), sensitive: true, updated_ms: now_ms(),
-                });
+            if let Ok(queue_token) = crate::auth::issue(
+                "world-queue-client",
+                &team,
+                "service",
+                false,
+                365 * 24 * 3600,
+            ) {
+                cloud.projects.put_env(
+                    &info.project,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_ENDPOINT".into(),
+                        value: queue_url,
+                        target: "all".into(),
+                        sensitive: false,
+                        updated_ms: now_ms(),
+                    },
+                );
+                cloud.projects.put_env(
+                    &info.project,
+                    crate::project_settings::EnvVar {
+                        key: "HIVE_QUEUE_TOKEN".into(),
+                        value: queue_token,
+                        target: "all".into(),
+                        sensitive: true,
+                        updated_ms: now_ms(),
+                    },
+                );
             }
             let req = crate::databases::ProvisionReq {
                 name: "workflow-storage".into(),
@@ -1356,12 +1652,19 @@ async fn run_build(
                 replicas: Vec::new(),
             };
             let cloud_ready = cloud.clone();
-            crate::databases::provision(cloud.databases.clone(), cloud.region.clone(), req, cloud.db_domain.clone(), cloud.node_name.clone(), move |d| {
-                if matches!(d.status, crate::databases::DbStatus::Ready) {
-                    crate::admin::apply_db_egress(&cloud_ready, &d);
-                }
-                crate::persist::persist(&cloud_ready);
-            });
+            crate::databases::provision(
+                cloud.databases.clone(),
+                cloud.region.clone(),
+                req,
+                cloud.db_domain.clone(),
+                cloud.node_name.clone(),
+                move |d| {
+                    if matches!(d.status, crate::databases::DbStatus::Ready) {
+                        crate::admin::apply_db_egress(&cloud_ready, &d);
+                    }
+                    crate::persist::persist(&cloud_ready);
+                },
+            );
             log(format!(
                 "Detected Vercel Workflow SDK ({}): auto-wired hive's managed World -- Queue (HIVE_QUEUE_ENDPOINT/_TOKEN) now, Storage (a provisioned Redis, UPSTASH_REDIS_REST_URL/_TOKEN) finishing in the background -- both active from the next deploy.",
                 if ingested > 0 { "JS/TS" } else { "Python" }
@@ -1370,12 +1673,19 @@ async fn run_build(
     }
 
     if build_failed {
-        log(format!("Deployment created (build failed). Aliased to {}", info.alias));
+        log(format!(
+            "Deployment created (build failed). Aliased to {}",
+            info.alias
+        ));
     } else {
         log(format!("Deployment ready. Aliased to {}", info.alias));
     }
     cloud.builds.update(bid, |b| {
-        b.state = if build_failed { DeployState::Error } else { DeployState::Ready };
+        b.state = if build_failed {
+            DeployState::Error
+        } else {
+            DeployState::Ready
+        };
         b.finished_ms = Some(now_ms());
         b.deployment_id = Some(info.id.to_string());
         b.alias = Some(info.alias.clone());
@@ -1406,8 +1716,13 @@ async fn run_build(
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let env_keys: Vec<String> =
-                cloud2.projects.get_masked(&proj).env.iter().map(|e| e.key.clone()).collect();
+            let env_keys: Vec<String> = cloud2
+                .projects
+                .get_masked(&proj)
+                .env
+                .iter()
+                .map(|e| e.key.clone())
+                .collect();
             let graph = crate::svcgraph::build_graph(&proj, &dep_id, &scan, &env_keys);
             let n = graph.nodes.len();
             cloud2.svcgraph.put(graph);
@@ -1416,12 +1731,24 @@ async fn run_build(
         });
     }
 
-    let ev = cloud.event(&cloud.region, "DEPLOY", &info.alias, "/", 200, "deploy", &format!("git {}", req.repo_url));
+    let ev = cloud.event(
+        &cloud.region,
+        "DEPLOY",
+        &info.alias,
+        "/",
+        200,
+        "deploy",
+        &format!("git {}", req.repo_url),
+    );
     cloud.record(ev);
     cloud.audit.record(
         &cloud.projects.team_of(&info.project),
         &req.creator.clone().unwrap_or_else(|| "you".into()),
-        if build_failed { "create_failed" } else { "create" },
+        if build_failed {
+            "create_failed"
+        } else {
+            "create"
+        },
         "deployment",
         &info.id.to_string(),
         &format!("{} → {}", info.project, info.alias),
@@ -1447,7 +1774,11 @@ async fn run_build(
     crate::webhooks::dispatch(
         &cloud.webhooks,
         &info.project,
-        if is_production { "deployment.promoted" } else { "deployment.ready" },
+        if is_production {
+            "deployment.promoted"
+        } else {
+            "deployment.ready"
+        },
         serde_json::json!({
             "id": info.id.to_string(),
             "project": info.project,
@@ -1471,9 +1802,15 @@ async fn run_build(
         // `schedule::place`'s `stateful` doc.
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
         let targets = crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu);
-        if targets.iter().any(|t| t.admin.is_none() && t.iroh.is_none()) {
-            let remote: Vec<crate::schedule::Target> =
-                targets.iter().filter(|t| t.admin.is_some() || t.iroh.is_some()).cloned().collect();
+        if targets
+            .iter()
+            .any(|t| t.admin.is_none() && t.iroh.is_none())
+        {
+            let remote: Vec<crate::schedule::Target> = targets
+                .iter()
+                .filter(|t| t.admin.is_some() || t.iroh.is_some())
+                .cloned()
+                .collect();
             if !remote.is_empty() {
                 // `primary_first: false` — THIS node hosted the build (it is the
                 // primary), so every remote here is an extra-region secondary.
@@ -1518,7 +1855,11 @@ async fn fanout_remote(
     let env = cloud.projects.env_map(project);
     // Forward the user's configured build settings + compute tier so the target
     // builds identically to the coordinator (not just from auto-detect).
-    let build_config = cloud.projects.get_if_set(project).map(|s| s.build).and_then(|b| serde_json::to_value(b).ok());
+    let build_config = cloud
+        .projects
+        .get_if_set(project)
+        .map(|s| s.build)
+        .and_then(|b| serde_json::to_value(b).ok());
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
     let mut all_ok = true;
     for (idx, t) in remote.iter().enumerate() {
@@ -1545,7 +1886,10 @@ async fn fanout_remote(
             // the SAME short-lived signed delegation token the iroh path uses
             // (`mesh_team_qs`) as a real Bearer credential so this HTTP fanout
             // authenticates identically to a normal request.
-            let mut rb = cloud.http.post(format!("{admin}/v1/git/deploy")).header("x-hive-team", team.clone());
+            let mut rb = cloud
+                .http
+                .post(format!("{admin}/v1/git/deploy"))
+                .header("x-hive-team", team.clone());
             if crate::auth::enforced() {
                 if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
                     rb = rb.bearer_auth(tok);
@@ -1553,21 +1897,44 @@ async fn fanout_remote(
             }
             match rb.json(&dreq).timeout(Duration::from_secs(15)).send().await {
                 Ok(r) => r.json::<serde_json::Value>().await.ok(),
-                Err(e) => { log(format!("✗ {}: dispatch failed: {e}", t.node)); all_ok = false; continue; }
+                Err(e) => {
+                    log(format!("✗ {}: dispatch failed: {e}", t.node));
+                    all_ok = false;
+                    continue;
+                }
             }
         } else if let Some((id, addr)) = &t.iroh {
             let body = serde_json::to_vec(&dreq).unwrap_or_default();
             let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
-            match crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, &path, &body, 20).await {
+            match crate::gossip::request_to(
+                cloud,
+                id,
+                addr,
+                hive_p2p::GOSSIP_POST,
+                &path,
+                &body,
+                20,
+            )
+            .await
+            {
                 Some(b) => serde_json::from_slice(&b).ok(),
-                None => { log(format!("✗ {}: iroh dispatch failed", t.node)); all_ok = false; continue; }
+                None => {
+                    log(format!("✗ {}: iroh dispatch failed", t.node));
+                    all_ok = false;
+                    continue;
+                }
             }
         } else {
             continue;
         };
-        let target_bid = resp_json.as_ref().and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from));
+        let target_bid = resp_json
+            .as_ref()
+            .and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from));
         let Some(target_bid) = target_bid else {
-            let err = resp_json.as_ref().and_then(|v| v.get("error").and_then(|x| x.as_str())).unwrap_or("no build id returned");
+            let err = resp_json
+                .as_ref()
+                .and_then(|v| v.get("error").and_then(|x| x.as_str()))
+                .unwrap_or("no build id returned");
             log(format!("✗ {}: {err}", t.node));
             all_ok = false;
             continue;
@@ -1592,8 +1959,15 @@ async fn fanout_remote(
             {
                 if let Ok(s) = v.json::<serde_json::Value>().await {
                     if let Some(rb) = s.get("build") {
-                        if let Ok(remote_bc) = serde_json::from_value::<crate::project_settings::BuildConfig>(rb.clone()) {
-                            let mut cur = cloud.projects.get_if_set(project).map(|s| s.build).unwrap_or_default();
+                        if let Ok(remote_bc) = serde_json::from_value::<
+                            crate::project_settings::BuildConfig,
+                        >(rb.clone())
+                        {
+                            let mut cur = cloud
+                                .projects
+                                .get_if_set(project)
+                                .map(|s| s.build)
+                                .unwrap_or_default();
                             let mut changed = false;
                             for (cf, rf) in [
                                 (&mut cur.framework, &remote_bc.framework),
@@ -1637,7 +2011,14 @@ async fn mirror_remote_build(
         tokio::time::sleep(Duration::from_millis(1500)).await;
         // Poll the target's build over the SAME transport we dispatched on.
         let v: Option<serde_json::Value> = if let Some(admin) = &target.admin {
-            match cloud.http.get(format!("{admin}/v1/builds/{target_bid}")).timeout(Duration::from_secs(8)).send().await.ok() {
+            match cloud
+                .http
+                .get(format!("{admin}/v1/builds/{target_bid}"))
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await
+                .ok()
+            {
                 Some(r) => r.json::<serde_json::Value>().await.ok(),
                 None => None,
             }
@@ -1647,9 +2028,17 @@ async fn mirror_remote_build(
             // the deploy in the first place — an iroh dial that has to fall back
             // through a relay can exceed it, and then every single poll returns
             // None while the remote build has actually already finished.
-            crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_GET, &format!("/v1/builds/{target_bid}"), &[], 20)
-                .await
-                .and_then(|b| serde_json::from_slice(&b).ok())
+            crate::gossip::request_to(
+                cloud,
+                id,
+                addr,
+                hive_p2p::GOSSIP_GET,
+                &format!("/v1/builds/{target_bid}"),
+                &[],
+                20,
+            )
+            .await
+            .and_then(|b| serde_json::from_slice(&b).ok())
         } else {
             None
         };
@@ -1717,7 +2106,9 @@ async fn mirror_remote_build(
             return false;
         }
         if now_ms() > deadline {
-            cloud.builds.log(bid, format!("✗ {node}: remote build timed out"));
+            cloud
+                .builds
+                .log(bid, format!("✗ {node}: remote build timed out"));
             return false;
         }
     }
@@ -1741,7 +2132,11 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
         });
         if hosts_locally {
             let removed = cloud.gw.remove_project(project).await;
-            tracing::info!(project, removed = removed.len(), "relocation: removed stale local copy from coordinator");
+            tracing::info!(
+                project,
+                removed = removed.len(),
+                "relocation: removed stale local copy from coordinator"
+            );
             crate::persist::persist(cloud);
         }
     }
@@ -1771,7 +2166,13 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
 /// ready" check on the commit/PR). No-op unless `GITHUB_TOKEN` is set in the
 /// node's environment and the repo is on github.com. All failures are swallowed
 /// so deploys never depend on GitHub being reachable.
-async fn report_github_status(repo_url: &str, sha: &str, state: &str, target_url: &str, description: &str) {
+async fn report_github_status(
+    repo_url: &str,
+    sha: &str,
+    state: &str,
+    target_url: &str,
+    description: &str,
+) {
     let token = match std::env::var("GITHUB_TOKEN") {
         Ok(t) if !t.is_empty() => t,
         _ => return,
@@ -1779,7 +2180,9 @@ async fn report_github_status(repo_url: &str, sha: &str, state: &str, target_url
     if sha.is_empty() {
         return;
     }
-    let Some((owner, repo)) = parse_owner_repo(repo_url) else { return };
+    let Some((owner, repo)) = parse_owner_repo(repo_url) else {
+        return;
+    };
     let url = format!("https://api.github.com/repos/{owner}/{repo}/statuses/{sha}");
     let mut body = serde_json::json!({
         "state": state, // pending | success | failure | error
@@ -1857,7 +2260,19 @@ async fn produce_manifest(
         // repo/fluid.json of its own to read.
         let mem_mib = image_memory.map(parse_mem_mib).unwrap_or(0);
         let cpus = image_cpus.map(parse_cpus_quota).unwrap_or(0.0);
-        return image_container_manifest(cloud, bid, project, image, image_port, image_protocol, mem_mib, cpus, image_pids, image_ports).await;
+        return image_container_manifest(
+            cloud,
+            bid,
+            project,
+            image,
+            image_port,
+            image_protocol,
+            mem_mib,
+            cpus,
+            image_pids,
+            image_ports,
+        )
+        .await;
     }
     // docker-compose / compose.yaml: a multi-service container deployment in ONE
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
@@ -1866,7 +2281,11 @@ async fn produce_manifest(
         return build_compose_manifest(cloud, bid, dir, project, commit, &compose_path).await;
     }
     if let Some(dockerfile) = container_build_file(dir) {
-        let fname = dockerfile.file_name().and_then(|s| s.to_str()).unwrap_or("Dockerfile").to_string();
+        let fname = dockerfile
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Dockerfile")
+            .to_string();
         log(format!("Detected {fname} — building container image."));
         let safe_project = sanitize_tag(project);
         let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
@@ -1901,21 +2320,25 @@ async fn produce_manifest(
         let mut build = Command::new(bin);
         // `-f` so the detected file (Dockerfile OR Containerfile) is used explicitly,
         // regardless of the builder's own default-file precedence.
-        build.arg("build").arg("-t").arg(&image).arg("-f").arg(&dockerfile);
+        build
+            .arg("build")
+            .arg("-t")
+            .arg(&image)
+            .arg("-f")
+            .arg(&dockerfile);
         // Resolve the container CLI on both Linux Firecracker hosts (/usr/bin,
         // podman) and macOS (/opt/homebrew/bin, either CLI) regardless of the
         // service's inherited PATH.
         let base_path = std::env::var("PATH").unwrap_or_default();
-        build.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"));
+        build.env(
+            "PATH",
+            format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"),
+        );
         // Pass project env as --build-arg so a Dockerfile `ARG`/`ENV` can use them.
         for (k, v) in cloud.projects.env_map(project) {
             build.arg("--build-arg").arg(format!("{k}={v}"));
         }
-        let out = build
-            .arg(".")
-            .current_dir(dir)
-            .output()
-            .await?;
+        let out = build.arg(".").current_dir(dir).output().await?;
         for line in String::from_utf8_lossy(&out.stderr)
             .lines()
             .chain(String::from_utf8_lossy(&out.stdout).lines())
@@ -1925,8 +2348,13 @@ async fn produce_manifest(
             log(format!("  {line}"));
         }
         anyhow::ensure!(out.status.success(), "{bin} build failed");
-        log(format!("Image built: {image} ({}ms), port {exposed} ({protocol})", now_ms().saturating_sub(t1)));
-        Ok(container_manifest(project, &image, exposed, &protocol, mem_mib, cpus, pids))
+        log(format!(
+            "Image built: {image} ({}ms), port {exposed} ({protocol})",
+            now_ms().saturating_sub(t1)
+        ));
+        Ok(container_manifest(
+            project, &image, exposed, &protocol, mem_mib, cpus, pids,
+        ))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         let mut m = Manifest::from_json(&s)?;
         if m.project.is_empty() {
@@ -1943,7 +2371,9 @@ async fn produce_manifest(
 /// — i.e. it's a package inside a monorepo workspace that must be installed from
 /// the workspace root?
 async fn uses_workspace_protocol(dir: &Path) -> bool {
-    let Ok(s) = tokio::fs::read_to_string(dir.join("package.json")).await else { return false };
+    let Ok(s) = tokio::fs::read_to_string(dir.join("package.json")).await else {
+        return false;
+    };
     s.contains("\"workspace:") || s.contains("workspace:*")
 }
 
@@ -1963,7 +2393,12 @@ async fn is_workspace_root(root: &Path) -> bool {
 /// `package-lock.json` (yarn/pnpm have their own lockfiles), and only when this
 /// is the project's first deployment (Task 1) or the build cache was explicitly
 /// disabled on a redeploy (Task 2). All other builds use `npm install` + cache.
-fn should_use_npm_ci(pm: &str, has_package_lock: bool, first_deploy: bool, use_cache: bool) -> bool {
+fn should_use_npm_ci(
+    pm: &str,
+    has_package_lock: bool,
+    first_deploy: bool,
+    use_cache: bool,
+) -> bool {
     pm == "npm" && has_package_lock && (first_deploy || !use_cache)
 }
 
@@ -2013,7 +2448,11 @@ async fn build_via_fdi(
         log("Detected vercel.json — applying configuration overrides.".into());
     }
     let vc_pick = |sel: fn(&fluid_build::VercelConfig) -> Option<&String>| {
-        vc.as_ref().and_then(sel).map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string)
+        vc.as_ref()
+            .and_then(sel)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
     };
     let inst = vc_pick(|c| c.install_command.as_ref()).or_else(|| pick(|b| &b.install_command));
     let bld = vc_pick(|c| c.build_command.as_ref()).or_else(|| pick(|b| &b.build_command));
@@ -2032,7 +2471,11 @@ async fn build_via_fdi(
     // Node exactly as before; a bun.lock alone must NEVER force the runtime).
     let runtime_override: Option<hive_core::Runtime> = vc_pick(|c| c.runtime.as_ref())
         .and_then(|s| hive_core::Runtime::from_config_str(&s))
-        .or_else(|| vc.as_ref().and_then(|c| c.bun_version.as_ref()).map(|_| hive_core::Runtime::Bun))
+        .or_else(|| {
+            vc.as_ref()
+                .and_then(|c| c.bun_version.as_ref())
+                .map(|_| hive_core::Runtime::Bun)
+        })
         .or_else(|| {
             bc.as_ref()
                 .map(|b| b.runtime.as_str())
@@ -2040,10 +2483,19 @@ async fn build_via_fdi(
                 .and_then(hive_core::Runtime::from_config_str)
         });
     if let Some(rt) = runtime_override {
-        log(format!("Explicit runtime: {} (vercel.json/project settings).", rt.as_str()));
+        log(format!(
+            "Explicit runtime: {} (vercel.json/project settings).",
+            rt.as_str()
+        ));
     }
 
-    let plan = fluid_build::plan_build(dir, fwo.as_deref(), inst.as_deref(), bld.as_deref(), outd.as_deref());
+    let plan = fluid_build::plan_build(
+        dir,
+        fwo.as_deref(),
+        inst.as_deref(),
+        bld.as_deref(),
+        outd.as_deref(),
+    );
 
     // Persist the auto-detected framework back into Project Settings so the
     // dashboard's Build settings reflect what was actually built (Issue #3). Only
@@ -2063,7 +2515,10 @@ async fn build_via_fdi(
                 nb.output_dir = plan.output_dir.clone();
             }
             cloud.projects.set_build(project, nb);
-            log(format!("Auto-detected framework: {} (saved to Build settings).", plan.framework.name));
+            log(format!(
+                "Auto-detected framework: {} (saved to Build settings).",
+                plan.framework.name
+            ));
         }
     }
 
@@ -2074,7 +2529,9 @@ async fn build_via_fdi(
     // configured output dir, else the repo root (where index.html lives).
     if plan.framework.slug == "static" {
         let sd = outd.clone().unwrap_or_else(|| ".".to_string());
-        log(format!("Static project (framework override) — skipping install/build; serving \"{sd}\" as-is."));
+        log(format!(
+            "Static project (framework override) — skipping install/build; serving \"{sd}\" as-is."
+        ));
         return Ok(static_manifest(project, &sd));
     }
 
@@ -2093,15 +2550,27 @@ async fn build_via_fdi(
     // to a pnpm/yarn workspace, so it installs THIS dir's package.json in place.
     let foreign_subdir = !is_monorepo && dir != repo_root && root_is_workspace;
     let pm_detection = fluid_build::detect_package_manager(install_dir);
-    let pm = if foreign_subdir { "npm" } else { pm_detection.manager };
+    let pm = if foreign_subdir {
+        "npm"
+    } else {
+        pm_detection.manager
+    };
 
     log(format!(
         "Detected framework: {} — primitive: {:?}, package manager: {} ({:?}){}",
         plan.framework.name,
         plan.framework.primitive,
         pm,
-        if foreign_subdir { fluid_build::PackageManagerSource::Default } else { pm_detection.source },
-        if is_monorepo { " (workspace monorepo — installing at root)" } else { "" }
+        if foreign_subdir {
+            fluid_build::PackageManagerSource::Default
+        } else {
+            pm_detection.source
+        },
+        if is_monorepo {
+            " (workspace monorepo — installing at root)"
+        } else {
+            ""
+        }
     ));
     // Package-manager choice never forces the RUNTIME (see `runtime_override`
     // above) — a bun.lock/packageManager:"bun" alone only picks `bun install`.
@@ -2122,8 +2591,16 @@ async fn build_via_fdi(
 
     // For a pnpm workspace, scope the install to just this package + its deps
     // (`--filter`) so we don't install the entire monorepo.
-    let rel = dir.strip_prefix(repo_root).ok().map(|p| p.to_string_lossy().replace('\\', "/")).unwrap_or_default();
-    let pnpm_filter = if is_monorepo && !rel.is_empty() { format!(" --filter \"{{./{rel}}}...\"") } else { String::new() };
+    let rel = dir
+        .strip_prefix(repo_root)
+        .ok()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default();
+    let pnpm_filter = if is_monorepo && !rel.is_empty() {
+        format!(" --filter \"{{./{rel}}}...\"")
+    } else {
+        String::new()
+    };
 
     // `npm ci` is the clean, lockfile-exact install. We use it ONLY for an npm
     // project with a committed package-lock.json (never yarn/pnpm — those have
@@ -2132,7 +2609,12 @@ async fn build_via_fdi(
     //   • the redeploy explicitly disabled the build cache (Task 2 — fresh install).
     // Every other build uses `npm install` + the warm node_modules cache (fast).
     // `npm ci` wipes node_modules, so it never benefits from a restored cache.
-    let use_npm_ci = should_use_npm_ci(pm, install_dir.join("package-lock.json").exists(), first_deploy, use_cache);
+    let use_npm_ci = should_use_npm_ci(
+        pm,
+        install_dir.join("package-lock.json").exists(),
+        first_deploy,
+        use_cache,
+    );
     // Install command: honor an explicit override, else the right command for the
     // detected package manager (pnpm/yarn via corepack so the binary is present).
     let install_cmd: String = corepack_wrap(&inst.unwrap_or_else(|| match pm {
@@ -2145,7 +2627,11 @@ async fn build_via_fdi(
     if use_npm_ci {
         log(format!(
             "Using `npm ci` (package-lock.json present, {}).",
-            if first_deploy { "first deployment" } else { "build cache disabled" }
+            if first_deploy {
+                "first deployment"
+            } else {
+                "build cache disabled"
+            }
         ));
     }
     // Build command. Framework presets give a RAW binary invocation, e.g.
@@ -2159,7 +2645,10 @@ async fn build_via_fdi(
     let build_cmd = corepack_wrap(&{
         let bc = plan.build_command.clone();
         let first = bc.split_whitespace().next().unwrap_or("");
-        let is_pm_invocation = matches!(first, "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx" | "corepack");
+        let is_pm_invocation = matches!(
+            first,
+            "npm" | "pnpm" | "yarn" | "bun" | "npx" | "bunx" | "corepack"
+        );
         if first == "npm" && pm != "npm" {
             bc.replacen("npm", pm, 1)
         } else if !bc.trim().is_empty() && !is_pm_invocation {
@@ -2176,7 +2665,9 @@ async fn build_via_fdi(
                 // what runtime that binary's own children use. Orthogonal to
                 // package-manager choice: a bun.lock with no explicit runtime
                 // override keeps today's plain `bunx {bc}`.
-                "bun" if runtime_override == Some(hive_core::Runtime::Bun) => format!("bunx --bun {bc}"),
+                "bun" if runtime_override == Some(hive_core::Runtime::Bun) => {
+                    format!("bunx --bun {bc}")
+                }
                 "bun" => format!("bunx {bc}"),
                 // npm: the raw binary resolves via node_modules/.bin on PATH.
                 _ => bc,
@@ -2202,7 +2693,11 @@ async fn build_via_fdi(
     // 1) Install dependencies at the install dir (root for monorepos). With a
     // restored node_modules this is a fast verify; otherwise a clean install.
     if has_pkg && !install_cmd.trim().is_empty() {
-        log(format!("Running \"{}\"{}", install_cmd, if is_monorepo { " (workspace root)" } else { "" }));
+        log(format!(
+            "Running \"{}\"{}",
+            install_cmd,
+            if is_monorepo { " (workspace root)" } else { "" }
+        ));
         run_streamed(install_dir, &install_cmd, cloud, bid, &proj_env)
             .await
             .map_err(|e| anyhow::anyhow!("install command failed: {e}"))?;
@@ -2222,12 +2717,13 @@ async fn build_via_fdi(
                 // adapter-node 1.x; kit ≥2 → latest), or modern adapter-node's
                 // `@sveltejs/kit@^2` peer dep clashes with an old kit and `npm`
                 // aborts (ERESOLVE). `--legacy-peer-deps` tolerates prereleases.
-                let kit_major = tokio::fs::read_to_string(dir.join("node_modules/@sveltejs/kit/package.json"))
-                    .await
-                    .ok()
-                    .and_then(|s| s.split("\"version\"").nth(1).map(|x| x.to_string()))
-                    .and_then(|x| x.split('"').nth(1).map(|v| v.to_string()))
-                    .and_then(|ver| ver.split('.').next().map(|m| m.to_string()));
+                let kit_major =
+                    tokio::fs::read_to_string(dir.join("node_modules/@sveltejs/kit/package.json"))
+                        .await
+                        .ok()
+                        .and_then(|s| s.split("\"version\"").nth(1).map(|x| x.to_string()))
+                        .and_then(|x| x.split('"').nth(1).map(|v| v.to_string()))
+                        .and_then(|ver| ver.split('.').next().map(|m| m.to_string()));
                 let spec = match kit_major.as_deref() {
                     Some("1") => "@sveltejs/adapter-node@^1",
                     _ => "@sveltejs/adapter-node",
@@ -2253,9 +2749,13 @@ async fn build_via_fdi(
     // server on $PORT (run later with `node …index.mjs`) — giving it Fluid compute.
     // Only synthesized when the user hasn't supplied their own open-next config.
     if plan.framework.slug == "opennext" {
-        let has_cfg = ["open-next.config.ts", "open-next.config.js", "open-next.config.mjs"]
-            .iter()
-            .any(|f| dir.join(f).exists());
+        let has_cfg = [
+            "open-next.config.ts",
+            "open-next.config.js",
+            "open-next.config.mjs",
+        ]
+        .iter()
+        .any(|f| dir.join(f).exists());
         if !has_cfg {
             let cfg = "// Auto-generated by OpenEdge: run OpenNext's server function as a\n\
                        // standalone Node HTTP server on $PORT so it runs on Fluid compute.\n\
@@ -2286,7 +2786,11 @@ async fn build_via_fdi(
     use fluid_build::Primitive;
     match plan.framework.primitive {
         Primitive::Static => {
-            let sd = if has_bo { ".vercel/output/static".to_string() } else { plan.output_dir.clone() };
+            let sd = if has_bo {
+                ".vercel/output/static".to_string()
+            } else {
+                plan.output_dir.clone()
+            };
             log(format!("Serving static assets from \"{sd}\"."));
             Ok(static_manifest(project, &sd))
         }
@@ -2296,11 +2800,16 @@ async fn build_via_fdi(
             // the Fluid `api` function and serve assets from the CDN, falling
             // through to the function on a miss (the CDN→origin model). This is what
             // gives OpenNext/vinext apps Fluid compute (warm pool + concurrency).
-            if let Some(m) = adapter_manifest(project, plan.framework.slug, dir, runtime_override).await {
+            if let Some(m) =
+                adapter_manifest(project, plan.framework.slug, dir, runtime_override).await
+            {
                 log(format!(
                     "{} adapter: server `{}`, assets from \"{}\" (CDN→origin fallthrough).",
                     plan.framework.name,
-                    m.functions.first().map(|f| f.start_cmd.join(" ")).unwrap_or_default(),
+                    m.functions
+                        .first()
+                        .map(|f| f.start_cmd.join(" "))
+                        .unwrap_or_default(),
                     m.static_dir.clone().unwrap_or_default(),
                 ));
                 return Ok(m);
@@ -2315,21 +2824,31 @@ async fn build_via_fdi(
             // matching Node's directory-resolution semantics (unverified).
             let start = if is_sveltekit && dir.join("build/index.js").exists() {
                 if runtime_override == Some(hive_core::Runtime::Bun) {
-                    vec!["bun".to_string(), "run".to_string(), "build/index.js".to_string()]
+                    vec![
+                        "bun".to_string(),
+                        "run".to_string(),
+                        "build/index.js".to_string(),
+                    ]
                 } else {
                     vec!["node".to_string(), "build".to_string()]
                 }
             } else {
                 detect_start_cmd(dir, runtime_override).await
             };
-            log(format!("Provisioning serverless server: `{}`.", start.join(" ")));
+            log(format!(
+                "Provisioning serverless server: `{}`.",
+                start.join(" ")
+            ));
             // Per-route bundle splitting (Issue: SHADOW_NEXT_PER_ROUTE) — DISCOVERY
             // ONLY for now. When enabled and this is a Next.js app, classify each
             // route from the .next manifests + file traces and write a per-route
             // build manifest. The serve path is UNCHANGED (still `next start`); the
             // runtime dispatcher consumes this manifest separately and falls back.
             let mut route_policies: Vec<fluid_core::RoutePolicy> = Vec::new();
-            if std::env::var("SHADOW_NEXT_PER_ROUTE").map(|v| v == "1" || v == "true").unwrap_or(false) {
+            if std::env::var("SHADOW_NEXT_PER_ROUTE")
+                .map(|v| v == "1" || v == "true")
+                .unwrap_or(false)
+            {
                 let next_dir = dir.join(".next");
                 if next_dir.exists() {
                     let prm = fluid_build::per_route::discover(&next_dir);
@@ -2341,11 +2860,15 @@ async fn build_via_fdi(
                     // into the manifest so the serve path can apply route-type-aware
                     // caching/retry. The `next start` fallback still serves every
                     // route; this only enriches responses, it doesn't change routing.
-                    route_policies = prm.routes.iter().map(|r| fluid_core::RoutePolicy {
-                        pattern: r.route.clone(),
-                        class: fluid_core::RouteClass::from_name(r.kind.class_name()),
-                        revalidate: r.revalidate,
-                    }).collect();
+                    route_policies = prm
+                        .routes
+                        .iter()
+                        .map(|r| fluid_core::RoutePolicy {
+                            pattern: r.route.clone(),
+                            class: fluid_core::RouteClass::from_name(r.kind.class_name()),
+                            revalidate: r.revalidate,
+                        })
+                        .collect();
                     if let Ok(js) = serde_json::to_string_pretty(&prm) {
                         let _ = tokio::fs::write(dir.join("shadow-per-route.json"), js).await;
                         log(format!("per-route: wrote shadow-per-route.json + {} route policies into the manifest (cache/retry wiring). Serving still uses `next start` (fallback).", route_policies.len()));
@@ -2379,10 +2902,15 @@ const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
 /// A relative `--require ./<file>` path so it resolves against the function's CWD
 /// on every backend (the FC microVM relocates the workdir to /build).
 async fn install_after_shim(dir: &Path, m: &mut Manifest) {
-    if tokio::fs::write(dir.join(AFTER_SHIM_FILE), AFTER_SHIM_JS).await.is_err() {
+    if tokio::fs::write(dir.join(AFTER_SHIM_FILE), AFTER_SHIM_JS)
+        .await
+        .is_err()
+    {
         return; // best-effort: a shim write failure must never fail the deploy
     }
-    let Some(f) = m.functions.first_mut() else { return };
+    let Some(f) = m.functions.first_mut() else {
+        return;
+    };
     let max_ms = (f.max_duration_secs.max(1) as u64).saturating_mul(1000);
     // Append to any NODE_OPTIONS the project already set, don't clobber it.
     let require = format!("--require ./{AFTER_SHIM_FILE}");
@@ -2395,15 +2923,24 @@ async fn install_after_shim(dir: &Path, m: &mut Manifest) {
             }
         })
         .or_insert(require);
-    f.env.entry("HIVE_AFTER_MAX_MS".to_string()).or_insert_with(|| max_ms.to_string());
+    f.env
+        .entry("HIVE_AFTER_MAX_MS".to_string())
+        .or_insert_with(|| max_ms.to_string());
 }
 
 fn static_manifest(project: &str, static_dir: &str) -> Manifest {
     Manifest {
         project: project.to_string(),
-        static_dir: Some(if static_dir.is_empty() { ".".into() } else { static_dir.to_string() }),
+        static_dir: Some(if static_dir.is_empty() {
+            ".".into()
+        } else {
+            static_dir.to_string()
+        }),
         functions: vec![],
-        routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
+        routes: vec![Route {
+            pattern: "/".into(),
+            target: RouteTarget::Static,
+        }],
         ..Default::default()
     }
 }
@@ -2461,10 +2998,17 @@ pub fn preferred_node_bin() -> Option<String> {
     if let Ok(rd) = std::fs::read_dir(&nvm) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if let Some(major) = name.trim_start_matches('v').split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+            if let Some(major) = name
+                .trim_start_matches('v')
+                .split('.')
+                .next()
+                .and_then(|s| s.parse::<u32>().ok())
+            {
                 if (20..=24).contains(&major) {
                     let bin = e.path().join("bin");
-                    if bin.join("node").exists() && best.as_ref().map(|(m, _)| major > *m).unwrap_or(true) {
+                    if bin.join("node").exists()
+                        && best.as_ref().map(|(m, _)| major > *m).unwrap_or(true)
+                    {
                         best = Some((major, bin));
                     }
                 }
@@ -2547,7 +3091,9 @@ pub fn warmup_bun_bin() -> Option<String> {
 
 async fn bun_version(bun_bin: &str) -> Option<String> {
     let out = Command::new(bun_bin).arg("--version").output().await.ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Extract an uploaded ZIP (raw bytes) into `dir` via the system `unzip`. Strips
@@ -2628,7 +3174,9 @@ async fn dir_stats(dir: &Path) -> (u64, u64) {
     let mut bytes = 0u64;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(mut rd) = tokio::fs::read_dir(&d).await else { continue };
+        let Ok(mut rd) = tokio::fs::read_dir(&d).await else {
+            continue;
+        };
         while let Ok(Some(e)) = rd.next_entry().await {
             match e.file_type().await {
                 Ok(ft) if ft.is_dir() => stack.push(e.path()),
@@ -2663,7 +3211,10 @@ async fn warmup_node_cache(
 ) {
     use std::process::Stdio;
     let log = |m: String| cloud.builds.log(bid, m);
-    if std::env::var("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+    if std::env::var("HIVE_COMPILE_CACHE")
+        .map(|v| v == "0" || v == "false")
+        .unwrap_or(false)
+    {
         return;
     }
     // Callers only invoke this for a function whose resolved runtime is Node
@@ -2706,13 +3257,25 @@ async fn warmup_node_cache(
     // HIVE_WARMUP_BUILD_PATH is set (FC nodes → /build), run the warm-up in a private
     // mount namespace with build_dir bind-mounted there so module paths match. On the
     // Mac/mock backend build_dir IS the run dir, so no remap is needed (env unset).
-    let remap = std::env::var("HIVE_WARMUP_BUILD_PATH").ok().filter(|p| p.starts_with('/'));
-    let remap = remap.as_deref().map(|t| t.trim_end_matches('/').to_string());
+    let remap = std::env::var("HIVE_WARMUP_BUILD_PATH")
+        .ok()
+        .filter(|p| p.starts_with('/'));
+    let remap = remap
+        .as_deref()
+        .map(|t| t.trim_end_matches('/').to_string());
     let (cc_dir, preload_arg): (String, String) = match &remap {
-        Some(t) => (format!("{t}/.hive-compile-cache"), format!("{t}/.hive-warmup-preload.cjs")),
-        None => (cache_dir.to_string_lossy().into_owned(), preload.to_string_lossy().into_owned()),
+        Some(t) => (
+            format!("{t}/.hive-compile-cache"),
+            format!("{t}/.hive-warmup-preload.cjs"),
+        ),
+        None => (
+            cache_dir.to_string_lossy().into_owned(),
+            preload.to_string_lossy().into_owned(),
+        ),
     };
-    log(format!("Compile-cache: warming V8 bytecode (booting `{cmd_str}`)…"));
+    log(format!(
+        "Compile-cache: warming V8 bytecode (booting `{cmd_str}`)…"
+    ));
     // `exec` so the child IS the server process (not a wrapping shell); PORT=0 binds an
     // ephemeral port (compilation happens during boot, before/around the listen).
     let mut command = match &remap {
@@ -2726,7 +3289,9 @@ async fn warmup_node_cache(
         }
         None => {
             let mut c = Command::new("/bin/sh");
-            c.arg("-c").arg(format!("exec {cmd_str}")).current_dir(build_dir);
+            c.arg("-c")
+                .arg(format!("exec {cmd_str}"))
+                .current_dir(build_dir);
             c
         }
     };
@@ -2760,7 +3325,11 @@ async fn warmup_node_cache(
                 tokio::time::sleep(Duration::from_millis(800)).await;
                 let exited = matches!(c.try_wait(), Ok(Some(_)));
                 let (_f, bytes) = dir_stats(&cache_dir).await;
-                if bytes > 0 && bytes == last { stable += 1 } else { stable = 0 }
+                if bytes > 0 && bytes == last {
+                    stable += 1
+                } else {
+                    stable = 0
+                }
                 last = bytes;
                 let elapsed = start.elapsed();
                 // Done when: the cache captured something and held steady ~2.4s; OR the
@@ -2775,7 +3344,9 @@ async fn warmup_node_cache(
             }
             let _ = c.start_kill();
         }
-        Err(e) => log(format!("WARN: compile-cache warm-up could not start ({e}); deploy continues uncached.")),
+        Err(e) => log(format!(
+            "WARN: compile-cache warm-up could not start ({e}); deploy continues uncached."
+        )),
     }
     let _ = tokio::fs::remove_file(&preload).await;
     let (files, bytes) = dir_stats(&cache_dir).await;
@@ -2832,10 +3403,18 @@ fn bun_bundle_entry(start_cmd: &[String]) -> Option<String> {
     }
 }
 
-async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc<CloudState>, bid: &str) -> Vec<String> {
+async fn warmup_bun_bytecode(
+    build_dir: &Path,
+    start_cmd: &[String],
+    cloud: &Arc<CloudState>,
+    bid: &str,
+) -> Vec<String> {
     let log = |m: String| cloud.builds.log(bid, m);
     let original = start_cmd.to_vec();
-    if std::env::var("HIVE_COMPILE_CACHE").map(|v| v == "0" || v == "false").unwrap_or(false) {
+    if std::env::var("HIVE_COMPILE_CACHE")
+        .map(|v| v == "0" || v == "false")
+        .unwrap_or(false)
+    {
         return original;
     }
     let Some(entry_arg) = bun_bundle_entry(start_cmd) else {
@@ -2851,7 +3430,9 @@ async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc
     };
     let entry_path = build_dir.join(&entry_arg);
     if !entry_path.is_file() {
-        log(format!("Bytecode-cache: skipped — entry `{entry_arg}` not found under the build output."));
+        log(format!(
+            "Bytecode-cache: skipped — entry `{entry_arg}` not found under the build output."
+        ));
         return original;
     }
     let Some(bun_bin) = warmup_bun_bin() else {
@@ -2862,7 +3443,9 @@ async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc
     if tokio::fs::create_dir_all(&outdir).await.is_err() {
         return original;
     }
-    log(format!("Bytecode-cache: bundling `{entry_arg}` with Bun's ahead-of-time bytecode cache…"));
+    log(format!(
+        "Bytecode-cache: bundling `{entry_arg}` with Bun's ahead-of-time bytecode cache…"
+    ));
     let out = Command::new(&bun_bin)
         .arg("build")
         .arg("--bytecode")
@@ -2875,19 +3458,30 @@ async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc
         .await;
     match out {
         Ok(o) if o.status.success() => {
-            let stem = Path::new(&entry_arg).file_stem().and_then(|s| s.to_str()).unwrap_or("server");
+            let stem = Path::new(&entry_arg)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("server");
             let bundled = outdir.join(format!("{stem}.js"));
             if !bundled.is_file() {
                 log("Bytecode-cache: bun build reported success but the expected output file was missing — using the original entry uncached.".into());
                 return original;
             }
-            let rel = bundled.strip_prefix(build_dir).unwrap_or(&bundled).to_string_lossy().into_owned();
+            let rel = bundled
+                .strip_prefix(build_dir)
+                .unwrap_or(&bundled)
+                .to_string_lossy()
+                .into_owned();
             let ver = bun_version(&bun_bin).await.unwrap_or_else(|| "?".into());
             log(format!("Bytecode-cache: bundled + precompiled `{entry_arg}` -> `{rel}` (bun {ver}, with external source map)."));
             vec!["bun".to_string(), "run".to_string(), rel]
         }
         Ok(o) => {
-            let stderr: String = String::from_utf8_lossy(&o.stderr).trim().chars().take(300).collect();
+            let stderr: String = String::from_utf8_lossy(&o.stderr)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
             log(format!("Bytecode-cache: bun build failed ({stderr}); using the original entry uncached — app still starts normally."));
             original
         }
@@ -2906,15 +3500,29 @@ async fn warmup_bun_bytecode(build_dir: &Path, start_cmd: &[String], cloud: &Arc
 /// engine so it shows up in the Workflows tab/table and renders on the canvas.
 /// Returns the number registered. Best-effort (a non-WDK app simply has none).
 async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &Path) -> usize {
-    let Some(path) = find_workflow_manifest(dir) else { return 0 };
-    let Ok(text) = tokio::fs::read_to_string(&path).await else { return 0 };
-    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else { return 0 };
-    let Some(workflows) = manifest.get("workflows").and_then(|v| v.as_object()) else { return 0 };
+    let Some(path) = find_workflow_manifest(dir) else {
+        return 0;
+    };
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return 0;
+    };
+    let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return 0;
+    };
+    let Some(workflows) = manifest.get("workflows").and_then(|v| v.as_object()) else {
+        return 0;
+    };
     let mut count = 0usize;
     for defs in workflows.values() {
-        let Some(defs) = defs.as_object() else { continue };
+        let Some(defs) = defs.as_object() else {
+            continue;
+        };
         for (name, wf) in defs {
-            let id = wf.get("workflowId").and_then(|v| v.as_str()).unwrap_or(name).to_string();
+            let id = wf
+                .get("workflowId")
+                .and_then(|v| v.as_str())
+                .unwrap_or(name)
+                .to_string();
             let graph = wf.get("graph").cloned();
             // Steps for the table = graph nodes minus the synthetic start/end markers.
             let steps: Vec<hive_edge::WorkflowStep> = graph
@@ -2925,7 +3533,11 @@ async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &
                     nodes
                         .iter()
                         .filter(|node| {
-                            let kind = node.get("data").and_then(|d| d.get("nodeKind")).and_then(|k| k.as_str()).unwrap_or("");
+                            let kind = node
+                                .get("data")
+                                .and_then(|d| d.get("nodeKind"))
+                                .and_then(|k| k.as_str())
+                                .unwrap_or("");
                             kind != "workflow_start" && kind != "workflow_end"
                         })
                         .map(|node| {
@@ -2936,7 +3548,11 @@ async fn ingest_workflow_manifest(cloud: &Arc<CloudState>, project: &str, dir: &
                                 .or_else(|| node.get("id").and_then(|i| i.as_str()))
                                 .unwrap_or("step")
                                 .to_string();
-                            hive_edge::WorkflowStep { name: label, deployment: project.to_string(), path: String::new() }
+                            hive_edge::WorkflowStep {
+                                name: label,
+                                deployment: project.to_string(),
+                                path: String::new(),
+                            }
                         })
                         .collect()
                 })
@@ -2970,7 +3586,16 @@ fn find_workflow_manifest(dir: &Path) -> Option<std::path::PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if matches!(name, "node_modules" | ".git" | ".next" | "dist" | "build" | ".svelte-kit" | ".vercel") {
+                if matches!(
+                    name,
+                    "node_modules"
+                        | ".git"
+                        | ".next"
+                        | "dist"
+                        | "build"
+                        | ".svelte-kit"
+                        | ".vercel"
+                ) {
                     continue;
                 }
                 if let Some(hit) = walk(&p, depth + 1) {
@@ -3044,14 +3669,20 @@ async fn run_streamed(
     let t1 = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            c1.builds.log(&b1, format!("  {}", crate::sandboxes::redact_secrets(&l, &s1)));
+            c1.builds.log(
+                &b1,
+                format!("  {}", crate::sandboxes::redact_secrets(&l, &s1)),
+            );
         }
     });
     let (c2, b2, s2) = (cloud.clone(), bid.to_string(), secret_values);
     let t2 = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(l)) = lines.next_line().await {
-            c2.builds.log(&b2, format!("  {}", crate::sandboxes::redact_secrets(&l, &s2)));
+            c2.builds.log(
+                &b2,
+                format!("  {}", crate::sandboxes::redact_secrets(&l, &s2)),
+            );
         }
     });
     let status = child.wait().await?;
@@ -3082,7 +3713,13 @@ async fn compute_cache_key(install_dir: &Path, pm: &str) -> Option<String> {
     let mut hasher = Sha256::new();
     hasher.update(pm.as_bytes());
     let mut found = false;
-    for name in ["pnpm-lock.yaml", "yarn.lock", "bun.lockb", "package-lock.json", "package.json"] {
+    for name in [
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "bun.lockb",
+        "package-lock.json",
+        "package.json",
+    ] {
         if let Ok(bytes) = tokio::fs::read(install_dir.join(name)).await {
             hasher.update(name.as_bytes());
             hasher.update(&bytes);
@@ -3116,7 +3753,10 @@ pub const ARTIFACT_SIG_HEADER: &str = "x-hive-artifact-sig";
 /// (already distributed fleet-wide) unless `HIVE_ARTIFACT_SECRET` overrides it.
 /// `None` => signing disabled (dev / single-node), like the JWT dev-open default.
 pub fn artifact_secret() -> Option<String> {
-    if let Some(s) = std::env::var("HIVE_ARTIFACT_SECRET").ok().filter(|s| !s.is_empty()) {
+    if let Some(s) = std::env::var("HIVE_ARTIFACT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
         return Some(s);
     }
     // Fall back to a key DERIVED from HIVE_JWT_SECRET (a single HMAC call
@@ -3126,7 +3766,9 @@ pub fn artifact_secret() -> Option<String> {
     // integrity signing) violates "one key, one purpose": compromise of one
     // subsystem's key material compromises the other. Set
     // HIVE_ARTIFACT_SECRET explicitly in production for full independence.
-    let root = std::env::var("HIVE_JWT_SECRET").ok().filter(|s| !s.is_empty())?;
+    let root = std::env::var("HIVE_JWT_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())?;
     Some(artifact_sig(&root, b"hive-artifact-signing-v1"))
 }
 
@@ -3142,24 +3784,35 @@ pub fn artifact_sha256(bytes: &[u8]) -> String {
 pub fn artifact_sig(secret: &str, bytes: &[u8]) -> String {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
     mac.update(bytes);
-    mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    mac.finalize()
+        .into_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
 }
 
 /// Constant-time verify of an HMAC artifact signature (#22).
 pub fn artifact_sig_valid(secret: &str, bytes: &[u8], sig_hex: &str) -> bool {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
-    let Some(expected) = hex_decode(sig_hex) else { return false };
-    let mut mac = <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
+    let Some(expected) = hex_decode(sig_hex) else {
+        return false;
+    };
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(secret.as_bytes()).expect("hmac accepts any key len");
     mac.update(bytes);
     mac.verify_slice(&expected).is_ok() // constant-time comparison
 }
@@ -3167,7 +3820,11 @@ pub fn artifact_sig_valid(secret: &str, bytes: &[u8], sig_hex: &str) -> bool {
 /// Verify a pulled artifact against the peer's integrity/authenticity headers (#22).
 /// Returns Ok(()) if the bytes are trustworthy, Err(reason) otherwise. `sha`/`sig`
 /// are the header values the peer sent (None if absent).
-fn verify_pulled_artifact(bytes: &[u8], sha: Option<&str>, sig: Option<&str>) -> Result<(), String> {
+fn verify_pulled_artifact(
+    bytes: &[u8],
+    sha: Option<&str>,
+    sig: Option<&str>,
+) -> Result<(), String> {
     // Content digest: if present, it MUST match (corruption guard).
     if let Some(sha) = sha {
         if !artifact_sha256(bytes).eq_ignore_ascii_case(sha) {
@@ -3194,12 +3851,28 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
     let peers = cloud.peers.read().clone();
     for peer in peers {
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
-        if let Ok(resp) = cloud.http.get(&url).timeout(Duration::from_secs(20)).send().await {
+        if let Ok(resp) = cloud
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(20))
+            .send()
+            .await
+        {
             if resp.status().is_success() {
-                let sha = resp.headers().get(ARTIFACT_SHA_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
-                let sig = resp.headers().get(ARTIFACT_SIG_HEADER).and_then(|v| v.to_str().ok()).map(String::from);
+                let sha = resp
+                    .headers()
+                    .get(ARTIFACT_SHA_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
+                let sig = resp
+                    .headers()
+                    .get(ARTIFACT_SIG_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from);
                 if let Ok(bytes) = resp.bytes().await {
-                    if let Err(reason) = verify_pulled_artifact(&bytes, sha.as_deref(), sig.as_deref()) {
+                    if let Err(reason) =
+                        verify_pulled_artifact(&bytes, sha.as_deref(), sig.as_deref())
+                    {
                         tracing::warn!(peer = %peer, key = %key, %reason, "rejected untrusted build artifact (#22)");
                         continue; // never write unverified bytes; try the next peer
                     }
@@ -3219,22 +3892,37 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
 async fn restore_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key: &str) -> bool {
     let tar = cache_root().join(format!("{key}.tar"));
     if !tar.exists() && try_peer_fetch(cloud, key, &tar).await {
-        cloud.builds.log(bid, format!("Pulled build cache from peer (key {key})."));
+        cloud
+            .builds
+            .log(bid, format!("Pulled build cache from peer (key {key})."));
     }
     if !tar.exists() {
-        cloud.builds.log(bid, "No build cache for these dependencies — installing fresh.");
+        cloud.builds.log(
+            bid,
+            "No build cache for these dependencies — installing fresh.",
+        );
         return false;
     }
-    let out = Command::new("tar").arg("-xf").arg(&tar).current_dir(install_dir).output().await;
+    let out = Command::new("tar")
+        .arg("-xf")
+        .arg(&tar)
+        .current_dir(install_dir)
+        .output()
+        .await;
     match out {
         Ok(o) if o.status.success() => {
-            cloud.builds.log(bid, format!("Restored build cache (key {key})."));
+            cloud
+                .builds
+                .log(bid, format!("Restored build cache (key {key})."));
             true
         }
         _ => {
             // Corrupt/incompatible archive → drop it and install clean.
             let _ = tokio::fs::remove_file(&tar).await;
-            cloud.builds.log(bid, "Build cache was unreadable — discarded; installing fresh.");
+            cloud.builds.log(
+                bid,
+                "Build cache was unreadable — discarded; installing fresh.",
+            );
             false
         }
     }
@@ -3255,11 +3943,19 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     // Include the framework's incremental cache too when it lives under the
     // install dir (e.g. node_modules/.cache); .next/cache lives in node_modules
     // for many setups but we keep this list conservative for portability.
-    let mut args: Vec<String> = vec!["-cf".into(), tmp.to_string_lossy().into_owned(), "node_modules".into()];
+    let mut args: Vec<String> = vec![
+        "-cf".into(),
+        tmp.to_string_lossy().into_owned(),
+        "node_modules".into(),
+    ];
     if install_dir.join(".next/cache").exists() {
         args.push(".next/cache".into());
     }
-    let out = Command::new("tar").args(&args).current_dir(install_dir).output().await;
+    let out = Command::new("tar")
+        .args(&args)
+        .current_dir(install_dir)
+        .output()
+        .await;
     if let Ok(o) = out {
         if o.status.success() && tokio::fs::rename(&tmp, &final_).await.is_ok() {
             cloud.builds.log(bid, "Saved build cache for next time.");
@@ -3287,8 +3983,15 @@ async fn parse_expose(path: &Path) -> Option<u16> {
     let mut env_port = None;
     for line in content.lines() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("EXPOSE ").or_else(|| l.strip_prefix("expose ")) {
-            if let Some(p) = rest.split_whitespace().next().and_then(|s| s.split('/').next()) {
+        if let Some(rest) = l
+            .strip_prefix("EXPOSE ")
+            .or_else(|| l.strip_prefix("expose "))
+        {
+            if let Some(p) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.split('/').next())
+            {
                 if let Ok(n) = p.parse::<u16>() {
                     return Some(n);
                 }
@@ -3325,9 +4028,10 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
                 key: c.key.clone(),
                 value: c.value.as_ref().map(|v| match v {
                     fluid_build::ConditionValue::Text(t) => CondValue::Text(t.clone()),
-                    fluid_build::ConditionValue::Expr { pre, suf } => {
-                        CondValue::Expr { pre: pre.clone(), suf: suf.clone() }
-                    }
+                    fluid_build::ConditionValue::Expr { pre, suf } => CondValue::Expr {
+                        pre: pre.clone(),
+                        suf: suf.clone(),
+                    },
                 }),
             })
             .collect()
@@ -3373,7 +4077,14 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
             .iter()
             .map(|h| HeaderRule {
                 source: h.source.clone(),
-                headers: h.headers.iter().map(|x| Header { key: x.key.clone(), value: x.value.clone() }).collect(),
+                headers: h
+                    .headers
+                    .iter()
+                    .map(|x| Header {
+                        key: x.key.clone(),
+                        value: x.value.clone(),
+                    })
+                    .collect(),
                 has: conv_conds(&h.has),
                 missing: conv_conds(&h.missing),
             })
@@ -3408,7 +4119,10 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
             local_patterns: img
                 .local_patterns
                 .iter()
-                .map(|p| LocalPattern { pathname: p.pathname.clone(), search: p.search.clone() })
+                .map(|p| LocalPattern {
+                    pathname: p.pathname.clone(),
+                    search: p.search.clone(),
+                })
                 .collect(),
             dangerously_allow_svg: img.dangerously_allow_svg,
             content_security_policy: img.content_security_policy.clone(),
@@ -3417,7 +4131,14 @@ fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &d
     }
 
     if !vc.crons.is_empty() {
-        m.crons = vc.crons.iter().map(|c| CronSpec { path: c.path.clone(), schedule: c.schedule.clone() }).collect();
+        m.crons = vc
+            .crons
+            .iter()
+            .map(|c| CronSpec {
+                path: c.path.clone(),
+                schedule: c.schedule.clone(),
+            })
+            .collect();
     }
 
     // Per-function overrides (glob → matched functions).
@@ -3582,7 +4303,15 @@ pub(crate) fn project_net(project: &str) -> (String, String, String) {
     )
 }
 
-fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str, memory_mib: u32, cpus: f64, pids: u32) -> Manifest {
+fn container_manifest(
+    project: &str,
+    image: &str,
+    internal: u16,
+    protocol: &str,
+    memory_mib: u32,
+    cpus: f64,
+    pids: u32,
+) -> Manifest {
     // `protocol` is a free-form string here (Railway-style `fluid.json` override for
     // the Dockerfile-build path, or an already-resolved wire string from an image
     // deploy) — parse it into the typed enum, falling back to the http default for
@@ -3599,7 +4328,12 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str,
             // Structured marker the backend recognizes: run this image as a
             // detached container, mapping the cell $PORT -> internal port.
             // start_cmd[3] = run-config JSON (here: the automatic persistent volume).
-            start_cmd: vec!["__container__".into(), image.to_string(), internal.to_string(), container_volume_cfg(project, None)],
+            start_cmd: vec![
+                "__container__".into(),
+                image.to_string(),
+                internal.to_string(),
+                container_volume_cfg(project, None),
+            ],
             env: Default::default(),
             vcpus: 1,
             // 0/0.0 = use the node's generous, env-tunable container defaults (a
@@ -3633,7 +4367,10 @@ fn container_manifest(project: &str, image: &str, internal: u16, protocol: &str,
         routes: if proto.needs_raw_proxy() {
             Vec::new()
         } else {
-            vec![Route { pattern: "/".into(), target: RouteTarget::Function("web".into()) }]
+            vec![Route {
+                pattern: "/".into(),
+                target: RouteTarget::Function("web".into()),
+            }]
         },
         ..Default::default()
     }
@@ -3660,7 +4397,8 @@ pub(crate) fn qualify_image_ref(image: &str) -> String {
         Some((first, _)) => {
             // Slash present: `first` is a registry host iff it looks like one
             // (dots, a port, or `localhost`); otherwise it's a Hub namespace.
-            let is_registry_host = first.contains('.') || first.contains(':') || first == "localhost";
+            let is_registry_host =
+                first.contains('.') || first.contains(':') || first == "localhost";
             if is_registry_host {
                 image.to_string()
             } else {
@@ -3712,10 +4450,17 @@ async fn image_container_manifest(
         .await?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("pull failed");
+        let msg = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("pull failed");
         anyhow::bail!("podman pull {image} failed: {}", msg.trim());
     }
-    log(format!("Pulled {image} in {}ms", now_ms().saturating_sub(t0)));
+    log(format!(
+        "Pulled {image} in {}ms",
+        now_ms().saturating_sub(t0)
+    ));
 
     // Port + protocol: explicit values win outright. Otherwise auto-detect from the
     // image's own `ExposedPorts` (falling back to 8080/http when nothing is exposed
@@ -3730,16 +4475,31 @@ async fn image_container_manifest(
         (Some(p), Some(proto)) => (p, proto),
         (Some(p), None) => (p, ServiceProtocol::Http),
         (None, protocol_override) => match detect_image_port(&path, image).await {
-            Some(spec) => (spec.container_port, protocol_override.unwrap_or(spec.protocol)),
+            Some(spec) => (
+                spec.container_port,
+                protocol_override.unwrap_or(spec.protocol),
+            ),
             None => (8080, protocol_override.unwrap_or_default()),
         },
     };
     log(format!(
         "Container port {port}/{protocol}{}. Attaching persistent volume (≥1 GB) at {}.",
-        if port_override.is_some() || protocol_override.is_some() { " (configured)" } else { " (from image ExposedPorts)" },
+        if port_override.is_some() || protocol_override.is_some() {
+            " (configured)"
+        } else {
+            " (from image ExposedPorts)"
+        },
         container_volume_path(),
     ));
-    let mut manifest = container_manifest(project, image, port, protocol.as_str(), memory_mib, cpus, pids);
+    let mut manifest = container_manifest(
+        project,
+        image,
+        port,
+        protocol.as_str(),
+        memory_mib,
+        cpus,
+        pids,
+    );
     // A full multi-port declaration REPLACES the single-port ports list built
     // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
     // above already reflect it, since callers pass the primary as `port`/
@@ -3751,7 +4511,11 @@ async fn image_container_manifest(
         log(format!(
             "Declared {} additional port(s): {}.",
             ports.len().saturating_sub(1),
-            ports.iter().map(|p| format!("{}/{}", p.container_port, p.protocol)).collect::<Vec<_>>().join(", ")
+            ports
+                .iter()
+                .map(|p| format!("{}/{}", p.container_port, p.protocol))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
         if let Some(f) = manifest.functions.first_mut() {
             // Keep `protocol` (drives needs_raw_proxy()/routing for the whole
@@ -3772,7 +4536,13 @@ async fn image_container_manifest(
 /// the selection order (prefers TCP, falls back to UDP-only images).
 async fn detect_image_port(path_env: &str, image: &str) -> Option<PortSpec> {
     let out = Command::new("podman")
-        .args(["image", "inspect", image, "--format", "{{json .Config.ExposedPorts}}"])
+        .args([
+            "image",
+            "inspect",
+            image,
+            "--format",
+            "{{json .Config.ExposedPorts}}",
+        ])
         .env("PATH", path_env)
         .output()
         .await
@@ -3798,7 +4568,9 @@ fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
     let mut udp_ports: Vec<u16> = Vec::new();
     for k in obj.keys() {
         let (num, proto) = k.split_once('/').unwrap_or((k.as_str(), "tcp"));
-        let Ok(port) = num.parse::<u16>() else { continue };
+        let Ok(port) = num.parse::<u16>() else {
+            continue;
+        };
         if proto.eq_ignore_ascii_case("udp") {
             udp_ports.push(port);
         } else {
@@ -3810,7 +4582,9 @@ fn parse_exposed_ports(json: &str) -> Option<PortSpec> {
         return Some(PortSpec::single(*p, ServiceProtocol::Http));
     }
     udp_ports.sort_unstable();
-    udp_ports.first().map(|p| PortSpec::single(*p, ServiceProtocol::Udp))
+    udp_ports
+        .first()
+        .map(|p| PortSpec::single(*p, ServiceProtocol::Udp))
 }
 
 /// Build a MULTI-service container manifest from a docker-compose / compose.yaml.
@@ -3834,10 +4608,18 @@ async fn build_compose_manifest(
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     let text = tokio::fs::read_to_string(compose_path).await?;
-    let services = crate::compose::parse_compose(&text).map_err(|e| anyhow::anyhow!("compose parse failed: {e}"))?;
-    let fname = compose_path.file_name().and_then(|s| s.to_str()).unwrap_or("compose.yaml");
+    let services = crate::compose::parse_compose(&text)
+        .map_err(|e| anyhow::anyhow!("compose parse failed: {e}"))?;
+    let fname = compose_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("compose.yaml");
     let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
-    log(format!("Detected {fname} — {} service(s): {}", services.len(), names.join(", ")));
+    log(format!(
+        "Detected {fname} — {} service(s): {}",
+        services.len(),
+        names.join(", ")
+    ));
 
     let safe_project = sanitize_tag(project);
     let net = format!("hive-net-{safe_project}");
@@ -3860,22 +4642,39 @@ async fn build_compose_manifest(
     let subnet = format!("10.{o2}.{o3}.0/24");
     let gw = format!("10.{o2}.{o3}.1");
     let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + i);
-    let hosts: Vec<String> = services.iter().enumerate().map(|(i, s)| format!("{}:{}", s.name, svc_ip(i))).collect();
+    let hosts: Vec<String> = services
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}:{}", s.name, svc_ip(i)))
+        .collect();
 
     let mut functions = Vec::new();
     let mut routes = Vec::new();
     for (idx, svc) in services.iter().enumerate() {
         let image = if let Some(b) = &svc.build {
             let ctx = dir.join(&b.context);
-            let image = format!("hive-{}-{}-{}", safe_project, sanitize_tag(&svc.name), short);
-            log(format!("Building service '{}' from {} …", svc.name, b.context));
+            let image = format!(
+                "hive-{}-{}-{}",
+                safe_project,
+                sanitize_tag(&svc.name),
+                short
+            );
+            log(format!(
+                "Building service '{}' from {} …",
+                svc.name, b.context
+            ));
             let mut build = Command::new("podman");
             build.arg("build").arg("-t").arg(&image);
             if let Some(df) = &b.dockerfile {
                 build.arg("-f").arg(ctx.join(df));
             }
             let base_path = std::env::var("PATH").unwrap_or_default();
-            build.env("PATH", format!("/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"));
+            build.env(
+                "PATH",
+                format!(
+                    "/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:{base_path}"
+                ),
+            );
             for (k, v) in &proj_env {
                 build.arg("--build-arg").arg(format!("{k}={v}"));
             }
@@ -3888,13 +4687,20 @@ async fn build_compose_manifest(
             {
                 log(format!("  [{}] {line}", svc.name));
             }
-            anyhow::ensure!(out.status.success(), "podman build failed for service '{}'", svc.name);
+            anyhow::ensure!(
+                out.status.success(),
+                "podman build failed for service '{}'",
+                svc.name
+            );
             image
         } else if let Some(img) = &svc.image {
             log(format!("Service '{}' uses prebuilt image {img}", svc.name));
             img.clone()
         } else {
-            anyhow::bail!("compose service '{}' has neither `build` nor `image`", svc.name);
+            anyhow::bail!(
+                "compose service '{}' has neither `build` nor `image`",
+                svc.name
+            );
         };
 
         // Service env wins; project env fills gaps.
@@ -3974,7 +4780,10 @@ async fn build_compose_manifest(
             ..Default::default()
         });
         if is_primary && !resolved_protocol.needs_raw_proxy() {
-            routes.push(Route { pattern: "/".into(), target: RouteTarget::Function(svc.name.clone()) });
+            routes.push(Route {
+                pattern: "/".into(),
+                target: RouteTarget::Function(svc.name.clone()),
+            });
         } else if is_primary {
             log(format!(
                 "Primary service '{}' is a raw {} service — no HTTP '/' route created (reachable through its allocated raw public port instead).",
@@ -3995,7 +4804,12 @@ async fn build_compose_manifest(
         "Compose deployment ready — public entrypoint: {} (services share network {net})",
         primary.as_deref().unwrap_or("(none)")
     ));
-    Ok(Manifest { project: project.to_string(), functions, routes, ..Default::default() })
+    Ok(Manifest {
+        project: project.to_string(),
+        functions,
+        routes,
+        ..Default::default()
+    })
 }
 
 /// Railway-style per-service overrides for a CONTAINER project, read from an optional
@@ -4042,7 +4856,11 @@ fn parse_mem_mib(s: &str) -> u32 {
     } else {
         (t.as_str(), 1.0) // bare number = MiB
     };
-    num.trim().parse::<f64>().ok().map(|v| (v * mult).round() as u32).unwrap_or(0)
+    num.trim()
+        .parse::<f64>()
+        .ok()
+        .map(|v| (v * mult).round() as u32)
+        .unwrap_or(0)
 }
 
 /// Parse a CPU quota string ("4", "2.0", "0.5") into a fractional vCPU count.
@@ -4064,7 +4882,9 @@ fn parse_container_override(fluid_json: &str) -> ContainerOverride {
         #[serde(default)]
         container: ContainerOverride,
     }
-    serde_json::from_str::<Wrap>(fluid_json).map(|w| w.container).unwrap_or_default()
+    serde_json::from_str::<Wrap>(fluid_json)
+        .map(|w| w.container)
+        .unwrap_or_default()
 }
 
 /// Build a manifest for a Next.js deployment adapter (OpenNext / vinext): the
@@ -4103,9 +4923,20 @@ async fn adapter_manifest(
                 let runner = if bun { "bun" } else { "node" };
                 vec![runner.into(), ".output/server/index.mjs".into()]
             } else if bun {
-                vec!["bunx".into(), "--bun".into(), "--no-install".into(), "vinext".into(), "start".into()]
+                vec![
+                    "bunx".into(),
+                    "--bun".into(),
+                    "--no-install".into(),
+                    "vinext".into(),
+                    "start".into(),
+                ]
             } else {
-                vec!["npx".into(), "--no-install".into(), "vinext".into(), "start".into()]
+                vec![
+                    "npx".into(),
+                    "--no-install".into(),
+                    "vinext".into(),
+                    "start".into(),
+                ]
             };
             (start, ".output/public")
         }
@@ -4114,7 +4945,9 @@ async fn adapter_manifest(
 
     let func = FunctionConfig {
         name: "api".into(),
-        runtime: runtime.map(|r| r.as_str().to_string()).unwrap_or_else(|| "auto".into()),
+        runtime: runtime
+            .map(|r| r.as_str().to_string())
+            .unwrap_or_else(|| "auto".into()),
         start_cmd,
         env: Default::default(),
         vcpus: 1,
@@ -4135,7 +4968,10 @@ async fn adapter_manifest(
             project: project.to_string(),
             static_dir: Some(assets_dir.to_string()),
             functions: vec![func],
-            routes: vec![Route { pattern: "/".into(), target: RouteTarget::Static }],
+            routes: vec![Route {
+                pattern: "/".into(),
+                target: RouteTarget::Static,
+            }],
             origin_function: Some("api".into()),
             ..Default::default()
         })
@@ -4144,19 +4980,28 @@ async fn adapter_manifest(
             project: project.to_string(),
             static_dir: None,
             functions: vec![func],
-            routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("api".into()) }],
+            routes: vec![Route {
+                pattern: "/".into(),
+                target: RouteTarget::Function("api".into()),
+            }],
             ..Default::default()
         })
     }
 }
 
-fn function_manifest(project: &str, start_cmd: Vec<String>, runtime: Option<hive_core::Runtime>) -> Manifest {
+fn function_manifest(
+    project: &str,
+    start_cmd: Vec<String>,
+    runtime: Option<hive_core::Runtime>,
+) -> Manifest {
     Manifest {
         project: project.to_string(),
         static_dir: None,
         functions: vec![FunctionConfig {
             name: "api".into(),
-            runtime: runtime.map(|r| r.as_str().to_string()).unwrap_or_else(|| "auto".into()),
+            runtime: runtime
+                .map(|r| r.as_str().to_string())
+                .unwrap_or_else(|| "auto".into()),
             start_cmd,
             env: Default::default(),
             vcpus: 1,
@@ -4168,7 +5013,10 @@ fn function_manifest(project: &str, start_cmd: Vec<String>, runtime: Option<hive
             max_duration_secs: 300,
             ..Default::default()
         }],
-        routes: vec![Route { pattern: "/".into(), target: RouteTarget::Function("api".into()) }],
+        routes: vec![Route {
+            pattern: "/".into(),
+            target: RouteTarget::Function("api".into()),
+        }],
         ..Default::default()
     }
 }
@@ -4313,7 +5161,9 @@ async fn register_building_placeholder(
     }
     let dir = deploy_root().join(format!("{project}-building-{}", now_ms()));
     tokio::fs::create_dir_all(&dir).await.ok()?;
-    tokio::fs::write(dir.join("index.html"), building_page(project)).await.ok()?;
+    tokio::fs::write(dir.join("index.html"), building_page(project))
+        .await
+        .ok()?;
     let info = cloud.gw.deploy_full(
         dir.to_string_lossy().into_owned(),
         static_manifest(project, "."),
@@ -4328,7 +5178,13 @@ async fn register_building_placeholder(
 }
 
 async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().await.ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -4361,23 +5217,23 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
     crate::supervise::spawn_supervised("git-poll-reconcile", move || {
         let cloud = cloud.clone();
         async move {
-        // Let the initial gossip / deployment-record sync settle so projects have
-        // a real deployed-commit baseline before the first poll (else a cold
-        // leader would treat every project as "unknown" at once).
-        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(90));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            crate::supervise::beat("git-poll-reconcile");
-            // LEADER ONLY: exactly one node polls + deploys, mirroring every other
-            // reconciler's control-plane gate — otherwise each node would start the
-            // same build for the same push.
-            if !cloud.is_control_plane_leader() {
-                continue;
+            // Let the initial gossip / deployment-record sync settle so projects have
+            // a real deployed-commit baseline before the first poll (else a cold
+            // leader would treat every project as "unknown" at once).
+            tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(90));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                crate::supervise::beat("git-poll-reconcile");
+                // LEADER ONLY: exactly one node polls + deploys, mirroring every other
+                // reconciler's control-plane gate — otherwise each node would start the
+                // same build for the same push.
+                if !cloud.is_control_plane_leader() {
+                    continue;
+                }
+                git_poll_cycle(&cloud).await;
             }
-            git_poll_cycle(&cloud).await;
-        }
         }
     });
 }
@@ -4403,7 +5259,11 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
         // own branch. Empty => nothing to poll.
         let branch = {
             let pb = cloud.projects.production_branch_of(&project);
-            if pb.is_empty() { src.branch.clone() } else { pb }
+            if pb.is_empty() {
+                src.branch.clone()
+            } else {
+                pb
+            }
         };
         if branch.is_empty() {
             continue;
@@ -4450,13 +5310,15 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
         // Record BEFORE enqueue so a slow build can't be re-enqueued next tick and
         // a real webhook + this poller can't double-fire (whoever deploys HEAD
         // first, the other sees deployed == HEAD and skips).
-        cloud.git_poll_seen.write().insert(project.clone(), head.clone());
+        cloud
+            .git_poll_seen
+            .write()
+            .insert(project.clone(), head.clone());
         if already_building {
             continue;
         }
 
-        let root_dir =
-            Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+        let root_dir = Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
         let req = GitDeployRequest {
             repo_url: src.repo_url.clone(),
             branch: Some(branch.clone()).filter(|b| !b.is_empty()),
@@ -4469,7 +5331,7 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
             target: None,     // branch-classified: production branch => production
             use_cache: true,
             root_dir,
-            env: None, // env comes from the project store on a push redeploy
+            env: None,        // env comes from the project store on a push redeploy
             no_fanout: false, // coordinator deploy: schedule + fanout to placement
             fanout_secondary: false,
             build_config: None,
@@ -4606,11 +5468,17 @@ mod tests {
     #[test]
     fn image_refs_are_fully_qualified_for_linux_podman() {
         // Short names get docker.io (Linux podman enforces qualification).
-        assert_eq!(qualify_image_ref("fruitbox12/simplifi:latest"), "docker.io/fruitbox12/simplifi:latest");
+        assert_eq!(
+            qualify_image_ref("fruitbox12/simplifi:latest"),
+            "docker.io/fruitbox12/simplifi:latest"
+        );
         assert_eq!(qualify_image_ref("nginx"), "docker.io/library/nginx");
         assert_eq!(qualify_image_ref("redis:7"), "docker.io/library/redis:7");
         // Already-qualified refs are untouched.
-        assert_eq!(qualify_image_ref("quay.io/org/img:tag"), "quay.io/org/img:tag");
+        assert_eq!(
+            qualify_image_ref("quay.io/org/img:tag"),
+            "quay.io/org/img:tag"
+        );
         assert_eq!(qualify_image_ref("ghcr.io/owner/app"), "ghcr.io/owner/app");
         assert_eq!(qualify_image_ref("localhost/hive-x"), "localhost/hive-x");
         assert_eq!(qualify_image_ref("registry:5000/x"), "registry:5000/x");
@@ -4618,9 +5486,15 @@ mod tests {
 
     #[test]
     fn exposed_ports_prefers_tcp_falls_back_to_udp() {
-        assert_eq!(parse_exposed_ports(r#"{"8080/tcp":{}}"#), Some(PortSpec::single(8080, ServiceProtocol::Http)));
+        assert_eq!(
+            parse_exposed_ports(r#"{"8080/tcp":{}}"#),
+            Some(PortSpec::single(8080, ServiceProtocol::Http))
+        );
         // Lowest tcp wins when multiple are exposed.
-        assert_eq!(parse_exposed_ports(r#"{"9090/tcp":{},"3000/tcp":{}}"#), Some(PortSpec::single(3000, ServiceProtocol::Http)));
+        assert_eq!(
+            parse_exposed_ports(r#"{"9090/tcp":{},"3000/tcp":{}}"#),
+            Some(PortSpec::single(3000, ServiceProtocol::Http))
+        );
         // A tcp port present alongside udp ones still wins (matches prior precedence).
         assert_eq!(
             parse_exposed_ports(r#"{"8080/tcp":{},"19132/udp":{}}"#),
@@ -4629,7 +5503,10 @@ mod tests {
         // UDP-only image (no tcp port at all, e.g. Minecraft Bedrock 19132/udp) is no
         // longer discarded — the lowest udp port is surfaced with protocol=udp instead
         // of forcing a blind fallback to the 8080/http default.
-        assert_eq!(parse_exposed_ports(r#"{"53/udp":{}}"#), Some(PortSpec::single(53, ServiceProtocol::Udp)));
+        assert_eq!(
+            parse_exposed_ports(r#"{"53/udp":{}}"#),
+            Some(PortSpec::single(53, ServiceProtocol::Udp))
+        );
         assert_eq!(
             parse_exposed_ports(r#"{"19133/udp":{},"19132/udp":{}}"#),
             Some(PortSpec::single(19132, ServiceProtocol::Udp))
@@ -4642,7 +5519,15 @@ mod tests {
     fn image_manifest_has_container_fn_and_volume() {
         // The prebuilt-image manifest runs the image as a container with a stable,
         // per-project persistent volume encoded in start_cmd[3].
-        let m = container_manifest("my-proj", "fruitbox12/simplifi:latest", 8080, "http", 0, 0.0, 0);
+        let m = container_manifest(
+            "my-proj",
+            "fruitbox12/simplifi:latest",
+            8080,
+            "http",
+            0,
+            0.0,
+            0,
+        );
         let f = &m.functions[0];
         assert_eq!(f.runtime, "container");
         assert_eq!(f.start_cmd[0], "__container__");
@@ -4661,15 +5546,26 @@ mod tests {
         assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
         // No server function yet → None even for opennext.
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(adapter_manifest("p", "opennext", &dir, None).await.is_none());
+        assert!(adapter_manifest("p", "opennext", &dir, None)
+            .await
+            .is_none());
         // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
-        std::fs::write(dir.join(".open-next/server-functions/default/index.mjs"), "//server").unwrap();
+        std::fs::write(
+            dir.join(".open-next/server-functions/default/index.mjs"),
+            "//server",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join(".open-next/assets")).unwrap();
-        let m = adapter_manifest("p", "opennext", &dir, None).await.expect("opennext manifest");
+        let m = adapter_manifest("p", "opennext", &dir, None)
+            .await
+            .expect("opennext manifest");
         assert_eq!(m.static_dir.as_deref(), Some(".open-next/assets"));
         assert_eq!(m.origin_function.as_deref(), Some("api"));
-        assert_eq!(m.functions[0].start_cmd, vec!["node", ".open-next/server-functions/default/index.mjs"]);
+        assert_eq!(
+            m.functions[0].start_cmd,
+            vec!["node", ".open-next/server-functions/default/index.mjs"]
+        );
         assert_eq!(m.functions[0].runtime, "auto");
         assert!(matches!(m.routes[0].target, RouteTarget::Static));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4680,10 +5576,19 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hive-on-bun-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
-        std::fs::write(dir.join(".open-next/server-functions/default/index.mjs"), "//server").unwrap();
+        std::fs::write(
+            dir.join(".open-next/server-functions/default/index.mjs"),
+            "//server",
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.join(".open-next/assets")).unwrap();
-        let m = adapter_manifest("p", "opennext", &dir, Some(hive_core::Runtime::Bun)).await.expect("opennext manifest");
-        assert_eq!(m.functions[0].start_cmd, vec!["bun", ".open-next/server-functions/default/index.mjs"]);
+        let m = adapter_manifest("p", "opennext", &dir, Some(hive_core::Runtime::Bun))
+            .await
+            .expect("opennext manifest");
+        assert_eq!(
+            m.functions[0].start_cmd,
+            vec!["bun", ".open-next/server-functions/default/index.mjs"]
+        );
         assert_eq!(m.functions[0].runtime, "bun");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4695,10 +5600,15 @@ mod tests {
         std::fs::create_dir_all(dir.join(".output/server")).unwrap();
         std::fs::write(dir.join(".output/server/index.mjs"), "//nitro").unwrap();
         std::fs::create_dir_all(dir.join(".output/public")).unwrap();
-        let m = adapter_manifest("p", "vinext", &dir, None).await.expect("vinext manifest");
+        let m = adapter_manifest("p", "vinext", &dir, None)
+            .await
+            .expect("vinext manifest");
         assert_eq!(m.static_dir.as_deref(), Some(".output/public"));
         assert_eq!(m.origin_function.as_deref(), Some("api"));
-        assert_eq!(m.functions[0].start_cmd, vec!["node", ".output/server/index.mjs"]);
+        assert_eq!(
+            m.functions[0].start_cmd,
+            vec!["node", ".output/server/index.mjs"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4707,8 +5617,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hive-vi-bun-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".output/public")).unwrap();
-        let m = adapter_manifest("p", "vinext", &dir, Some(hive_core::Runtime::Bun)).await.expect("vinext manifest");
-        assert_eq!(m.functions[0].start_cmd, vec!["bunx", "--bun", "--no-install", "vinext", "start"]);
+        let m = adapter_manifest("p", "vinext", &dir, Some(hive_core::Runtime::Bun))
+            .await
+            .expect("vinext manifest");
+        assert_eq!(
+            m.functions[0].start_cmd,
+            vec!["bunx", "--bun", "--no-install", "vinext", "start"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4722,18 +5637,27 @@ mod tests {
         // (`fluid_build::detect`) picks the opennext adapter, `vercel.json`'s
         // native `runtime` field resolves to Bun, and `adapter_manifest` emits
         // a `bun` start_cmd pointing at that exact file.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-next-ssr");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-next-ssr");
         assert!(dir.exists(), "fixture missing: {}", dir.display());
 
         let framework = fluid_build::detect(&dir);
         assert_eq!(framework.slug, "opennext");
 
         let vc = fluid_build::load_vercel_config(&dir).expect("vercel.json must parse");
-        let runtime = vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str);
+        let runtime = vc
+            .runtime
+            .as_deref()
+            .and_then(hive_core::Runtime::from_config_str);
         assert_eq!(runtime, Some(hive_core::Runtime::Bun));
 
-        let m = adapter_manifest("bun-next-ssr", framework.slug, &dir, runtime).await.expect("opennext manifest");
-        assert_eq!(m.functions[0].start_cmd, vec!["bun", ".open-next/server-functions/default/index.mjs"]);
+        let m = adapter_manifest("bun-next-ssr", framework.slug, &dir, runtime)
+            .await
+            .expect("opennext manifest");
+        assert_eq!(
+            m.functions[0].start_cmd,
+            vec!["bun", ".open-next/server-functions/default/index.mjs"]
+        );
         assert_eq!(m.functions[0].runtime, "bun");
         assert_eq!(m.static_dir.as_deref(), Some(".open-next/assets"));
     }
@@ -4751,15 +5675,22 @@ mod tests {
         // Edge Runtime regardless of the host process, so middleware behavior
         // is identical under Node and Bun by construction — this fixture and
         // its live verification are the proof, not an assumption.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-next-middleware");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/bun-next-middleware");
         assert!(dir.exists(), "fixture missing: {}", dir.display());
 
         let framework = fluid_build::detect(&dir);
-        assert_eq!(framework.slug, "nextjs", "must detect as plain Next.js (no OpenNext/vinext adapter here)");
+        assert_eq!(
+            framework.slug, "nextjs",
+            "must detect as plain Next.js (no OpenNext/vinext adapter here)"
+        );
         assert_eq!(framework.build_command, "next build");
 
         let vc = fluid_build::load_vercel_config(&dir).expect("vercel.json must parse");
-        let runtime = vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str);
+        let runtime = vc
+            .runtime
+            .as_deref()
+            .and_then(hive_core::Runtime::from_config_str);
         assert_eq!(runtime, Some(hive_core::Runtime::Bun));
 
         let pm = fluid_build::detect_package_manager(&dir);
@@ -4782,14 +5713,26 @@ mod tests {
         // `bun run --bun start` invocation) correctly imported and called
         // into the shared package under genuine Bun. This test proves the
         // PLATFORM's OWN monorepo-detection functions recognize this shape.
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-monorepo");
+        let repo_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-monorepo");
         let api_dir = repo_root.join("packages/api");
         assert!(api_dir.exists(), "fixture missing: {}", api_dir.display());
 
-        assert!(is_workspace_root(&repo_root).await, "root package.json has a \"workspaces\" field");
-        assert!(uses_workspace_protocol(&api_dir).await, "packages/api depends on shared via workspace:*");
-        let is_monorepo = api_dir != repo_root && uses_workspace_protocol(&api_dir).await && is_workspace_root(&repo_root).await;
-        assert!(is_monorepo, "must be recognized as a monorepo member, matching build_via_fdi's own condition");
+        assert!(
+            is_workspace_root(&repo_root).await,
+            "root package.json has a \"workspaces\" field"
+        );
+        assert!(
+            uses_workspace_protocol(&api_dir).await,
+            "packages/api depends on shared via workspace:*"
+        );
+        let is_monorepo = api_dir != repo_root
+            && uses_workspace_protocol(&api_dir).await
+            && is_workspace_root(&repo_root).await;
+        assert!(
+            is_monorepo,
+            "must be recognized as a monorepo member, matching build_via_fdi's own condition"
+        );
 
         // Package-manager detection at the ROOT (where a monorepo installs)
         // must pick bun via the root bun.lock.
@@ -4801,9 +5744,12 @@ mod tests {
         // independently of the monorepo-root package-manager detection —
         // runtime resolution and monorepo/install-dir resolution are
         // orthogonal concerns, exactly like runtime vs. package manager.
-        let vc = fluid_build::load_vercel_config(&api_dir).expect("packages/api/vercel.json must parse");
+        let vc =
+            fluid_build::load_vercel_config(&api_dir).expect("packages/api/vercel.json must parse");
         assert_eq!(
-            vc.runtime.as_deref().and_then(hive_core::Runtime::from_config_str),
+            vc.runtime
+                .as_deref()
+                .and_then(hive_core::Runtime::from_config_str),
             Some(hive_core::Runtime::Bun)
         );
 
@@ -4855,13 +5801,25 @@ mod tests {
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].protocol_or_http(), "grpc");
         assert!(m.functions[0].needs_raw_proxy());
-        assert_eq!(&m.functions[0].start_cmd[..3], &["__container__", "img:tag", "50051"]);
+        assert_eq!(
+            &m.functions[0].start_cmd[..3],
+            &["__container__", "img:tag", "50051"]
+        );
         // start_cmd[3] now carries the automatic persistent-volume run-config.
         let cfg: serde_json::Value = serde_json::from_str(&m.functions[0].start_cmd[3]).unwrap();
         assert_eq!(cfg["vol"], "hive-vol-proj");
-        assert_eq!(m.functions[0].memory_mib, 0, "0 = use the node's generous default (not 512m)");
-        assert_eq!(m.functions[0].cpus, 0.0, "0.0 = use the node's generous default");
-        assert_eq!(m.functions[0].pids, 0, "0 = use the node's generous default");
+        assert_eq!(
+            m.functions[0].memory_mib, 0,
+            "0 = use the node's generous default (not 512m)"
+        );
+        assert_eq!(
+            m.functions[0].cpus, 0.0,
+            "0.0 = use the node's generous default"
+        );
+        assert_eq!(
+            m.functions[0].pids, 0,
+            "0 = use the node's generous default"
+        );
     }
 
     #[test]
@@ -4892,8 +5850,16 @@ mod tests {
         assert_eq!(parse_cpus_quota("0.5"), 0.5);
         assert_eq!(parse_cpus_quota(""), 0.0);
         assert_eq!(parse_cpus_quota("garbage"), 0.0);
-        assert_eq!(parse_cpus_quota("-1"), 0.0, "a non-positive quota must not sneak through as a real override");
-        assert_eq!(parse_cpus_quota("0"), 0.0, "zero must not sneak through as a real override");
+        assert_eq!(
+            parse_cpus_quota("-1"),
+            0.0,
+            "a non-positive quota must not sneak through as a real override"
+        );
+        assert_eq!(
+            parse_cpus_quota("0"),
+            0.0,
+            "zero must not sneak through as a real override"
+        );
         let m = container_manifest("proj", "img:tag", 8080, "http", 0, 4.0, 2048);
         assert_eq!(m.functions[0].cpus, 4.0);
         assert_eq!(m.functions[0].pids, 2048);
@@ -4904,7 +5870,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hive-cf-port-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("Containerfile"), "FROM scratch\nEXPOSE 50051/tcp\n").unwrap();
+        std::fs::write(
+            dir.join("Containerfile"),
+            "FROM scratch\nEXPOSE 50051/tcp\n",
+        )
+        .unwrap();
         let cf = container_build_file(&dir).unwrap();
         assert_eq!(parse_expose(&cf).await, Some(50051));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4916,7 +5886,11 @@ mod tests {
         let d = artifact_sha256(a);
         assert_eq!(d.len(), 64, "sha256 hex is 64 chars");
         assert_eq!(artifact_sha256(a), d, "deterministic");
-        assert_ne!(artifact_sha256(b"tarball-bytes-v2"), d, "different bytes -> different digest");
+        assert_ne!(
+            artifact_sha256(b"tarball-bytes-v2"),
+            d,
+            "different bytes -> different digest"
+        );
     }
 
     #[test]
@@ -4924,9 +5898,16 @@ mod tests {
         let secret = "fleet-shared-secret";
         let bytes = b"node_modules tar payload";
         let sig = artifact_sig(secret, bytes);
-        assert!(artifact_sig_valid(secret, bytes, &sig), "valid signature verifies");
+        assert!(
+            artifact_sig_valid(secret, bytes, &sig),
+            "valid signature verifies"
+        );
         // Tampered payload fails.
-        assert!(!artifact_sig_valid(secret, b"node_modules tar payloaX", &sig));
+        assert!(!artifact_sig_valid(
+            secret,
+            b"node_modules tar payloaX",
+            &sig
+        ));
         // Wrong secret (a peer without the fleet secret) can't forge.
         assert!(!artifact_sig_valid("other-secret", bytes, &sig));
         // Garbage / odd-length hex is rejected, not panicked.
@@ -4944,17 +5925,35 @@ mod tests {
         // --- No secret configured (dev / single node) ---
         std::env::remove_var("HIVE_ARTIFACT_SECRET");
         std::env::remove_var("HIVE_JWT_SECRET");
-        assert!(verify_pulled_artifact(bytes, Some(&good_sha), None).is_ok(), "good digest accepted");
-        assert!(verify_pulled_artifact(bytes, Some("deadbeef"), None).is_err(), "corruption rejected");
-        assert!(verify_pulled_artifact(bytes, None, None).is_ok(), "legacy peer accepted in dev");
+        assert!(
+            verify_pulled_artifact(bytes, Some(&good_sha), None).is_ok(),
+            "good digest accepted"
+        );
+        assert!(
+            verify_pulled_artifact(bytes, Some("deadbeef"), None).is_err(),
+            "corruption rejected"
+        );
+        assert!(
+            verify_pulled_artifact(bytes, None, None).is_ok(),
+            "legacy peer accepted in dev"
+        );
 
         // --- Fleet secret configured (production) ---
         std::env::set_var("HIVE_ARTIFACT_SECRET", "s3cret");
         let sig = artifact_sig("s3cret", bytes);
-        assert!(verify_pulled_artifact(bytes, Some(&good_sha), Some(&sig)).is_ok(), "valid sha+sig accepted");
-        assert!(verify_pulled_artifact(bytes, Some(&good_sha), None).is_err(), "missing sig rejected when secret set");
+        assert!(
+            verify_pulled_artifact(bytes, Some(&good_sha), Some(&sig)).is_ok(),
+            "valid sha+sig accepted"
+        );
+        assert!(
+            verify_pulled_artifact(bytes, Some(&good_sha), None).is_err(),
+            "missing sig rejected when secret set"
+        );
         let forged = artifact_sig("wrong", bytes);
-        assert!(verify_pulled_artifact(bytes, Some(&good_sha), Some(&forged)).is_err(), "forged sig rejected");
+        assert!(
+            verify_pulled_artifact(bytes, Some(&good_sha), Some(&forged)).is_err(),
+            "forged sig rejected"
+        );
         std::env::remove_var("HIVE_ARTIFACT_SECRET");
 
         // REGRESSION: key separation (#73) — with no HIVE_ARTIFACT_SECRET but
@@ -4963,11 +5962,17 @@ mod tests {
         // unrelated HMAC purposes means compromising one compromises both).
         std::env::set_var("HIVE_JWT_SECRET", "jwt-root-secret");
         let derived = artifact_secret().expect("must derive a fallback key from HIVE_JWT_SECRET");
-        assert_ne!(derived, "jwt-root-secret", "must never reuse the raw JWT secret verbatim");
+        assert_ne!(
+            derived, "jwt-root-secret",
+            "must never reuse the raw JWT secret verbatim"
+        );
         // Deterministic (same root -> same derived key every time).
         assert_eq!(artifact_secret().as_deref(), Some(derived.as_str()));
         std::env::remove_var("HIVE_JWT_SECRET");
-        assert!(artifact_secret().is_none(), "no secret configured at all -> None");
+        assert!(
+            artifact_secret().is_none(),
+            "no secret configured at all -> None"
+        );
     }
 
     #[test]
@@ -4998,7 +6003,10 @@ mod tests {
         )
         .unwrap();
         let mut m = Manifest {
-            functions: vec![FunctionConfig { name: "api/hello".into(), ..Default::default() }],
+            functions: vec![FunctionConfig {
+                name: "api/hello".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         apply_vercel_config(&mut m, &vc, &|_| {});
@@ -5015,9 +6023,18 @@ mod tests {
 
     #[test]
     fn project_name_from_url_sanitizes() {
-        assert_eq!(project_name_from_url("https://github.com/vercel/next.js.git"), "next-js");
-        assert_eq!(project_name_from_url("https://github.com/Owner/My_Repo"), "my-repo");
-        assert_eq!(project_name_from_url("git@github.com:acme/cool-app.git"), "cool-app");
+        assert_eq!(
+            project_name_from_url("https://github.com/vercel/next.js.git"),
+            "next-js"
+        );
+        assert_eq!(
+            project_name_from_url("https://github.com/Owner/My_Repo"),
+            "my-repo"
+        );
+        assert_eq!(
+            project_name_from_url("git@github.com:acme/cool-app.git"),
+            "cool-app"
+        );
         assert_eq!(project_name_from_url("https://example.com/a/b/"), "b");
     }
 
@@ -5044,7 +6061,13 @@ mod tests {
         assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
         assert_eq!(sanitize_tag(""), "app");
         // Only [a-z0-9._-] survive.
-        assert!(sanitize_tag("Foo/Bar:Baz").chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'));
+        assert!(sanitize_tag("Foo/Bar:Baz")
+            .chars()
+            .all(|c| c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '.'
+                || c == '_'
+                || c == '-'));
     }
 
     #[test]
@@ -5061,7 +6084,10 @@ mod tests {
         // Real host lookup (Homebrew/~/.bun/bin/system) — may be Some or None
         // depending on the host, must not panic, and if Some must be executable.
         if let Some(bin) = warmup_bun_bin() {
-            assert!(std::path::Path::new(&bin).is_file(), "warmup_bun_bin returned a non-existent path: {bin}");
+            assert!(
+                std::path::Path::new(&bin).is_file(),
+                "warmup_bun_bin returned a non-existent path: {bin}"
+            );
         }
     }
 
@@ -5070,14 +6096,28 @@ mod tests {
         // This build host has a real `bun` installed — exercise the actual
         // subprocess call (no mocking) and confirm it parses a real version.
         let Some(bin) = which_bun() else { return }; // skip on a host with no bun
-        let v = bun_version(&bin).await.expect("bun --version must succeed on a real bun binary");
-        assert!(v.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false), "unexpected bun --version output: {v}");
+        let v = bun_version(&bin)
+            .await
+            .expect("bun --version must succeed on a real bun binary");
+        assert!(
+            v.chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false),
+            "unexpected bun --version output: {v}"
+        );
     }
 
     #[test]
     fn bun_bundle_entry_accepts_plain_bun_invocations() {
-        assert_eq!(bun_bundle_entry(&["bun".into(), "server.js".into()]), Some("server.js".into()));
-        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "server.js".into()]), Some("server.js".into()));
+        assert_eq!(
+            bun_bundle_entry(&["bun".into(), "server.js".into()]),
+            Some("server.js".into())
+        );
+        assert_eq!(
+            bun_bundle_entry(&["bun".into(), "run".into(), "server.js".into()]),
+            Some("server.js".into())
+        );
         assert_eq!(
             bun_bundle_entry(&["/usr/local/bin/bun".into(), "index.mjs".into()]),
             Some("index.mjs".into()),
@@ -5089,15 +6129,30 @@ mod tests {
     fn bun_bundle_entry_rejects_cli_wrapper_invocations() {
         // Vercel's own documented Next.js+Bun form — a CLI wrapper, not a
         // bundleable entry file. Must be explicitly rejected, not guessed at.
-        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "--bun".into(), "next".into(), "start".into()]), None);
-        assert_eq!(bun_bundle_entry(&["bunx".into(), "--bun".into(), "next".into(), "start".into()]), None);
+        assert_eq!(
+            bun_bundle_entry(&[
+                "bun".into(),
+                "run".into(),
+                "--bun".into(),
+                "next".into(),
+                "start".into()
+            ]),
+            None
+        );
+        assert_eq!(
+            bun_bundle_entry(&["bunx".into(), "--bun".into(), "next".into(), "start".into()]),
+            None
+        );
         assert_eq!(bun_bundle_entry(&["node".into(), "server.js".into()]), None);
         assert_eq!(bun_bundle_entry(&[]), None);
         // `detect_start_cmd`'s own package.json#scripts.start shape
         // (`["bun","run","--bun","start"]`) — a script-NAME, not a file path —
         // must also be rejected (there is nothing to bundle; "start" doesn't
         // resolve to a file on disk).
-        assert_eq!(bun_bundle_entry(&["bun".into(), "run".into(), "--bun".into(), "start".into()]), None);
+        assert_eq!(
+            bun_bundle_entry(&["bun".into(), "run".into(), "--bun".into(), "start".into()]),
+            None
+        );
     }
 
     #[tokio::test]
@@ -5113,10 +6168,17 @@ mod tests {
         // Verified live: `bun run start` on such a script reported
         // `process.versions.bun === null`; `bun run --bun start` reported the
         // real Bun version. `detect_start_cmd` must always include `--bun`.
-        let dir = std::env::temp_dir().join(format!("hive-detect-start-cmd-bun-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hive-detect-start-cmd-bun-test-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(&dir.join("package.json"), r#"{"scripts":{"start":"node server.js"}}"#).unwrap();
+        std::fs::write(
+            &dir.join("package.json"),
+            r#"{"scripts":{"start":"node server.js"}}"#,
+        )
+        .unwrap();
         let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
         assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
         // The Node path must stay byte-for-byte identical to before.
@@ -5130,7 +6192,8 @@ mod tests {
         // Runs the REAL `detect_start_cmd` against the checked-in
         // `examples/bun-express-api` fixture — the exact repo shape that
         // exposed the `--bun` bug above (manually verified live both ways).
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-express-api");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-express-api");
         assert!(dir.exists(), "fixture missing: {}", dir.display());
         let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
         assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
@@ -5138,7 +6201,8 @@ mod tests {
 
     #[tokio::test]
     async fn bun_hono_api_example_fixture_resolves_bun_start() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-hono-api");
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/bun-hono-api");
         assert!(dir.exists(), "fixture missing: {}", dir.display());
         let cmd = detect_start_cmd(&dir, Some(hive_core::Runtime::Bun)).await;
         assert_eq!(cmd, vec!["bun", "run", "--bun", "start"]);
@@ -5151,8 +6215,11 @@ mod tests {
         // and confirm the .jsc bytecode sidecar + .map source map land exactly
         // where `warmup_bun_bytecode`'s own success path expects them, using the
         // SAME `bun` binary resolution (`warmup_bun_bin`) the real code path uses.
-        let Some(bun_bin) = warmup_bun_bin() else { return }; // skip on a host with no bun
-        let dir = std::env::temp_dir().join(format!("hive-bun-bytecode-test-{}", std::process::id()));
+        let Some(bun_bin) = warmup_bun_bin() else {
+            return;
+        }; // skip on a host with no bun
+        let dir =
+            std::env::temp_dir().join(format!("hive-bun-bytecode-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
@@ -5172,10 +6239,20 @@ mod tests {
             .output()
             .await
             .expect("bun build must run");
-        assert!(out.status.success(), "bun build failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "bun build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(outdir.join("server.js").is_file(), "bundled entry missing");
-        assert!(outdir.join("server.js.jsc").is_file(), "bytecode sidecar missing — bytecode cache did not activate");
-        assert!(outdir.join("server.js.map").is_file(), "external source map missing");
+        assert!(
+            outdir.join("server.js.jsc").is_file(),
+            "bytecode sidecar missing — bytecode cache did not activate"
+        );
+        assert!(
+            outdir.join("server.js.map").is_file(),
+            "external source map missing"
+        );
         // `bun run` on the bundled file must actually execute correctly (the whole
         // point — a cache that produces an unrunnable artifact is worse than none).
         let run = tokio::process::Command::new(&bun_bin)
@@ -5192,7 +6269,10 @@ mod tests {
             // full HTTP round trip; kill it immediately after.
             let alive = child.try_wait().ok().flatten().is_none();
             let _ = child.start_kill();
-            assert!(alive, "bundled+bytecode-cached server crashed immediately on boot");
+            assert!(
+                alive,
+                "bundled+bytecode-cached server crashed immediately on boot"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5201,7 +6281,9 @@ mod tests {
     async fn cache_key_is_deterministic_and_content_sensitive() {
         let base = std::env::temp_dir().join(format!("oe-cachekey-{}", now_ms()));
         tokio::fs::create_dir_all(&base).await.unwrap();
-        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":1}").await.unwrap();
+        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":1}")
+            .await
+            .unwrap();
 
         let k1 = compute_cache_key(&base, "npm").await;
         let k2 = compute_cache_key(&base, "npm").await;
@@ -5213,7 +6295,9 @@ mod tests {
         assert_ne!(k1, k_pnpm);
 
         // Changed lockfile → different key.
-        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":2}").await.unwrap();
+        tokio::fs::write(base.join("package-lock.json"), b"{\"v\":2}")
+            .await
+            .unwrap();
         let k3 = compute_cache_key(&base, "npm").await;
         assert_ne!(k1, k3, "changed lockfile must change the key");
 
@@ -5267,7 +6351,10 @@ mod tests {
         // line: collect `env.values()` into the redaction list, then
         // `sandboxes::redact_secrets`.
         let mut env: std::collections::BTreeMap<String, String> = Default::default();
-        env.insert("DATABASE_URL".into(), "postgres://u:sup3rSecr3t@host/db".into());
+        env.insert(
+            "DATABASE_URL".into(),
+            "postgres://u:sup3rSecr3t@host/db".into(),
+        );
         env.insert("STRIPE_SECRET_KEY".into(), "sk_live_abc123xyz".into());
         env.insert("NODE_ENV".into(), "production".into());
 
@@ -5276,16 +6363,31 @@ mod tests {
         let line = "prebuild: DATABASE_URL=postgres://u:sup3rSecr3t@host/db STRIPE_SECRET_KEY=sk_live_abc123xyz NODE_ENV=production npm WARN deprecated left-pad@1.0.0";
         let redacted = crate::sandboxes::redact_secrets(line, &secret_values);
 
-        assert!(!redacted.contains("sup3rSecr3t"), "DB password must be redacted: {redacted}");
-        assert!(!redacted.contains("sk_live_abc123xyz"), "Stripe key must be redacted: {redacted}");
+        assert!(
+            !redacted.contains("sup3rSecr3t"),
+            "DB password must be redacted: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sk_live_abc123xyz"),
+            "Stripe key must be redacted: {redacted}"
+        );
         // Conservative-by-design: EVERY injected env value gets redacted, not
         // just ones that look like secrets (matching sandboxes_platform.rs's
         // identical "redact every value" convention) — so NODE_ENV's value
         // disappears too, a deliberate false-positive tradeoff.
-        assert!(!redacted.contains("=production"), "every injected value is redacted, including non-secret-looking ones: {redacted}");
-        assert!(redacted.contains("[REDACTED]"), "must show a redaction marker: {redacted}");
+        assert!(
+            !redacted.contains("=production"),
+            "every injected value is redacted, including non-secret-looking ones: {redacted}"
+        );
+        assert!(
+            redacted.contains("[REDACTED]"),
+            "must show a redaction marker: {redacted}"
+        );
         // Content that was NEVER an injected env value (ordinary build-tool
         // chatter) must survive untouched.
-        assert!(redacted.contains("npm WARN deprecated left-pad@1.0.0"), "unrelated log content must survive: {redacted}");
+        assert!(
+            redacted.contains("npm WARN deprecated left-pad@1.0.0"),
+            "unrelated log content must survive: {redacted}"
+        );
     }
 }

@@ -76,7 +76,15 @@ impl IdentityStore {
 
     /// Upsert a user, recording their active tenant and (optionally) an org
     /// membership.
-    pub fn upsert_user(&self, id: &str, email: &str, name: &str, image_url: &str, tenant: &str, org_slug: Option<&str>) {
+    pub fn upsert_user(
+        &self,
+        id: &str,
+        email: &str,
+        name: &str,
+        image_url: &str,
+        tenant: &str,
+        org_slug: Option<&str>,
+    ) {
         let now = now_ms();
         let mut m = self.users.write();
         let e = m.entry(id.to_string()).or_insert_with(|| UserRecord {

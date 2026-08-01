@@ -72,10 +72,28 @@ impl PlatformSandboxProvider {
         }
     }
 
-    pub fn snapshot(&self) -> (Vec<SandboxRecord>, Vec<SandboxCommandRecord>, Vec<SandboxSnapshotRecord>, Vec<SandboxMountRecord>) {
-        (self.sandboxes.read().clone(), self.commands.read().clone(), self.snapshots.read().clone(), self.mounts.read().clone())
+    pub fn snapshot(
+        &self,
+    ) -> (
+        Vec<SandboxRecord>,
+        Vec<SandboxCommandRecord>,
+        Vec<SandboxSnapshotRecord>,
+        Vec<SandboxMountRecord>,
+    ) {
+        (
+            self.sandboxes.read().clone(),
+            self.commands.read().clone(),
+            self.snapshots.read().clone(),
+            self.mounts.read().clone(),
+        )
     }
-    pub fn load(&self, s: Vec<SandboxRecord>, c: Vec<SandboxCommandRecord>, sn: Vec<SandboxSnapshotRecord>, m: Vec<SandboxMountRecord>) {
+    pub fn load(
+        &self,
+        s: Vec<SandboxRecord>,
+        c: Vec<SandboxCommandRecord>,
+        sn: Vec<SandboxSnapshotRecord>,
+        m: Vec<SandboxMountRecord>,
+    ) {
         *self.sandboxes.write() = s;
         *self.commands.write() = c;
         *self.snapshots.write() = sn;
@@ -90,10 +108,22 @@ impl PlatformSandboxProvider {
     }
 
     pub fn count_for_project(&self, project_id: &str) -> u32 {
-        self.sandboxes.read().iter().filter(|s| s.project_id == project_id && s.deleted_at.is_none()).count() as u32
+        self.sandboxes
+            .read()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.deleted_at.is_none())
+            .count() as u32
     }
     pub fn count_running_for_project(&self, project_id: &str) -> u32 {
-        self.sandboxes.read().iter().filter(|s| s.project_id == project_id && s.deleted_at.is_none() && s.status == SandboxStatus::Running).count() as u32
+        self.sandboxes
+            .read()
+            .iter()
+            .filter(|s| {
+                s.project_id == project_id
+                    && s.deleted_at.is_none()
+                    && s.status == SandboxStatus::Running
+            })
+            .count() as u32
     }
 
     /// Idle-timeout reap: mirrors `fluid_compute::reconcile()`'s idle/drain
@@ -104,7 +134,10 @@ impl PlatformSandboxProvider {
             .sandboxes
             .read()
             .iter()
-            .filter(|s| s.status == SandboxStatus::Running && s.timeout_expires_at.map(|t| now >= t).unwrap_or(false))
+            .filter(|s| {
+                s.status == SandboxStatus::Running
+                    && s.timeout_expires_at.map(|t| now >= t).unwrap_or(false)
+            })
             .map(|s| (s.project_id.clone(), s.id.clone()))
             .collect();
         for (project_id, id) in expired {
@@ -113,11 +146,22 @@ impl PlatformSandboxProvider {
     }
 
     fn secret_values(&self, sandbox: &SandboxRecord) -> Vec<String> {
-        sandbox.env_refs.iter().map(|e| crate::secrets::decrypt(&e.value_enc)).filter(|v| !v.is_empty()).collect()
+        sandbox
+            .env_refs
+            .iter()
+            .map(|e| crate::secrets::decrypt(&e.value_enc))
+            .filter(|v| !v.is_empty())
+            .collect()
     }
 
-    fn find_mut<'a>(v: &'a mut Vec<SandboxRecord>, project_id: &str, id: &str) -> Result<&'a mut SandboxRecord, SandboxError> {
-        v.iter_mut().find(|s| s.project_id == project_id && s.id == id && s.deleted_at.is_none()).ok_or_else(|| SandboxError::NotFound(id.to_string()))
+    fn find_mut<'a>(
+        v: &'a mut Vec<SandboxRecord>,
+        project_id: &str,
+        id: &str,
+    ) -> Result<&'a mut SandboxRecord, SandboxError> {
+        v.iter_mut()
+            .find(|s| s.project_id == project_id && s.id == id && s.deleted_at.is_none())
+            .ok_or_else(|| SandboxError::NotFound(id.to_string()))
     }
 
     /// Provision (or re-provision, if the cell was lost to a restart) the
@@ -129,7 +173,10 @@ impl PlatformSandboxProvider {
         let backend = self.backend.as_ref().ok_or_else(|| {
             SandboxError::EngineUnavailable("this node has no Firecracker isolation backend (Linux + /dev/kvm required) — sandboxes are simulated here".into())
         })?;
-        let image = sandbox.current_snapshot_id.clone().unwrap_or_else(|| runtime_image(&sandbox.runtime).to_string());
+        let image = sandbox
+            .current_snapshot_id
+            .clone()
+            .unwrap_or_else(|| runtime_image(&sandbox.runtime).to_string());
         let spec = CellSpec {
             id: cell_id_for(&sandbox.id),
             image,
@@ -142,11 +189,12 @@ impl PlatformSandboxProvider {
             tenant: sandbox.tenant_id.clone(),
             container: None,
         };
-        let handle = backend
-            .provision(&spec)
-            .await
-            .map_err(|e| SandboxError::EngineUnavailable(format!("failed to provision sandbox microVM: {e}")))?;
-        self.cells.write().insert(sandbox.id.clone(), handle.clone());
+        let handle = backend.provision(&spec).await.map_err(|e| {
+            SandboxError::EngineUnavailable(format!("failed to provision sandbox microVM: {e}"))
+        })?;
+        self.cells
+            .write()
+            .insert(sandbox.id.clone(), handle.clone());
         Ok(handle)
     }
 
@@ -161,20 +209,46 @@ impl PlatformSandboxProvider {
 #[async_trait::async_trait]
 impl SandboxProvider for PlatformSandboxProvider {
     async fn list_sandboxes(&self, project_id: &str) -> Result<Vec<SandboxRecord>, SandboxError> {
-        Ok(self.sandboxes.read().iter().filter(|s| s.project_id == project_id && s.deleted_at.is_none()).cloned().collect())
+        Ok(self
+            .sandboxes
+            .read()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.deleted_at.is_none())
+            .cloned()
+            .collect())
     }
 
-    async fn create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError> {
+    async fn create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError> {
         validate_name(&input.name)?;
         validate_runtime(&input.runtime)?;
         validate_network_policy(&input.network_policy)?;
-        if self.sandboxes.read().iter().any(|s| s.project_id == project_id && s.name == input.name && s.deleted_at.is_none()) {
-            return Err(SandboxError::AlreadyExists(format!("sandbox '{}' already exists in this project", input.name)));
+        if self
+            .sandboxes
+            .read()
+            .iter()
+            .any(|s| s.project_id == project_id && s.name == input.name && s.deleted_at.is_none())
+        {
+            return Err(SandboxError::AlreadyExists(format!(
+                "sandbox '{}' already exists in this project",
+                input.name
+            )));
         }
 
         let id = format!("sbx_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
         let now = hive_core::now_ms();
-        let env_refs: Vec<EnvRef> = input.env.into_iter().map(|(k, v, _sensitive)| EnvRef { key: k, value_enc: crate::secrets::encrypt(&v) }).collect();
+        let env_refs: Vec<EnvRef> = input
+            .env
+            .into_iter()
+            .map(|(k, v, _sensitive)| EnvRef {
+                key: k,
+                value_enc: crate::secrets::encrypt(&v),
+            })
+            .collect();
 
         let mut rec = SandboxRecord {
             id: id.clone(),
@@ -188,8 +262,16 @@ impl SandboxProvider for PlatformSandboxProvider {
             runtime: input.runtime,
             region: self.region.clone(),
             vcpus: input.vcpus.max(1),
-            memory_mb: if input.memory_mb > 0 { input.memory_mb } else { 1024 },
-            timeout_ms: if input.timeout_ms > 0 { input.timeout_ms } else { 5 * 60_000 },
+            memory_mb: if input.memory_mb > 0 {
+                input.memory_mb
+            } else {
+                1024
+            },
+            timeout_ms: if input.timeout_ms > 0 {
+                input.timeout_ms
+            } else {
+                5 * 60_000
+            },
             timeout_expires_at: None,
             persistent: input.persistent,
             ports: input.ports,
@@ -232,23 +314,40 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(rec)
     }
 
-    async fn get_sandbox(&self, project_id: &str, id_or_name: &str) -> Result<SandboxRecord, SandboxError> {
+    async fn get_sandbox(
+        &self,
+        project_id: &str,
+        id_or_name: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
         self.sandboxes
             .read()
             .iter()
-            .find(|s| s.project_id == project_id && s.deleted_at.is_none() && (s.id == id_or_name || s.name == id_or_name))
+            .find(|s| {
+                s.project_id == project_id
+                    && s.deleted_at.is_none()
+                    && (s.id == id_or_name || s.name == id_or_name)
+            })
             .cloned()
             .ok_or_else(|| SandboxError::NotFound(id_or_name.to_string()))
     }
 
-    async fn get_or_create_sandbox(&self, tenant_id: &str, project_id: &str, input: CreateSandboxInput) -> Result<SandboxRecord, SandboxError> {
+    async fn get_or_create_sandbox(
+        &self,
+        tenant_id: &str,
+        project_id: &str,
+        input: CreateSandboxInput,
+    ) -> Result<SandboxRecord, SandboxError> {
         if let Ok(existing) = self.get_sandbox(project_id, &input.name).await {
             return Ok(existing);
         }
         self.create_sandbox(tenant_id, project_id, input).await
     }
 
-    async fn stop_sandbox(&self, project_id: &str, id: &str) -> Result<SandboxRecord, SandboxError> {
+    async fn stop_sandbox(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<SandboxRecord, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
         // Persistent sandboxes snapshot BEFORE teardown — Firecracker's own
         // `/snapshot/create` API would be the natural fit here; this slice
@@ -256,7 +355,13 @@ impl SandboxProvider for PlatformSandboxProvider {
         // design (see `create_snapshot`) rather than a live memory/disk
         // snapshot, which is real future work (documented in the writeup).
         if sandbox.persistent && self.cells.read().contains_key(id) {
-            let _ = SandboxProvider::create_snapshot(self, project_id, id, CreateSnapshotInput::default()).await;
+            let _ = SandboxProvider::create_snapshot(
+                self,
+                project_id,
+                id,
+                CreateSnapshotInput::default(),
+            )
+            .await;
         }
         self.terminate_cell(id).await;
         let mut w = self.sandboxes.write();
@@ -265,7 +370,10 @@ impl SandboxProvider for PlatformSandboxProvider {
         rec.last_stopped_at = Some(hive_core::now_ms());
         rec.updated_at = hive_core::now_ms();
         if let Some(started) = rec.last_started_at {
-            rec.total_duration_ms += rec.last_stopped_at.unwrap_or(started).saturating_sub(started);
+            rec.total_duration_ms += rec
+                .last_stopped_at
+                .unwrap_or(started)
+                .saturating_sub(started);
         }
         Ok(rec.clone())
     }
@@ -279,16 +387,27 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(())
     }
 
-    async fn run_command(&self, project_id: &str, id: &str, input: RunCommandInput) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn run_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: RunCommandInput,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         validate_argv(&input.cmd, &input.args)?;
         let sandbox = self.get_sandbox(project_id, id).await?;
-        let backend = self.backend.as_ref().ok_or_else(|| SandboxError::EngineUnavailable("no Firecracker backend on this node".into()))?;
+        let backend = self.backend.as_ref().ok_or_else(|| {
+            SandboxError::EngineUnavailable("no Firecracker backend on this node".into())
+        })?;
         let handle = self.ensure_cell(&sandbox).await?;
         let secrets = self.secret_values(&sandbox);
         let cmd_id = format!("cmd_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
         let now = hive_core::now_ms();
 
-        let mut env = sandbox.env_refs.iter().map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc))).collect::<HashMap<_, _>>();
+        let mut env = sandbox
+            .env_refs
+            .iter()
+            .map(|e| (e.key.clone(), crate::secrets::decrypt(&e.value_enc)))
+            .collect::<HashMap<_, _>>();
         for (k, v) in &input.env {
             env.insert(k.clone(), v.clone());
         }
@@ -349,11 +468,26 @@ impl SandboxProvider for PlatformSandboxProvider {
         self.get_command(project_id, id, &cmd_id).await
     }
 
-    async fn list_commands(&self, project_id: &str, id: &str) -> Result<Vec<SandboxCommandRecord>, SandboxError> {
-        Ok(self.commands.read().iter().filter(|c| c.project_id == project_id && c.sandbox_id == id).cloned().collect())
+    async fn list_commands(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxCommandRecord>, SandboxError> {
+        Ok(self
+            .commands
+            .read()
+            .iter()
+            .filter(|c| c.project_id == project_id && c.sandbox_id == id)
+            .cloned()
+            .collect())
     }
 
-    async fn get_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn get_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         self.commands
             .read()
             .iter()
@@ -362,7 +496,12 @@ impl SandboxProvider for PlatformSandboxProvider {
             .ok_or_else(|| SandboxError::CommandNotFound(command_id.to_string()))
     }
 
-    async fn kill_command(&self, project_id: &str, id: &str, command_id: &str) -> Result<SandboxCommandRecord, SandboxError> {
+    async fn kill_command(
+        &self,
+        project_id: &str,
+        id: &str,
+        command_id: &str,
+    ) -> Result<SandboxCommandRecord, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
         let _ = sandbox; // (kept for the tenant/project-scoped lookup above)
         let handle = self.cells.read().get(id).cloned();
@@ -391,45 +530,113 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(rec.clone())
     }
 
-    async fn write_files(&self, project_id: &str, id: &str, files: Vec<(String, Vec<u8>)>) -> Result<(), SandboxError> {
+    async fn write_files(
+        &self,
+        project_id: &str,
+        id: &str,
+        files: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), SandboxError> {
         for (path, bytes) in files {
             if !path.starts_with('/') || path.contains("..") {
-                return Err(SandboxError::InvalidMount(format!("path '{path}' must be absolute with no '..' segments")));
+                return Err(SandboxError::InvalidMount(format!(
+                    "path '{path}' must be absolute with no '..' segments"
+                )));
             }
             // Base64 through argv (no shell) avoids ever putting file content on
             // a shell-interpreted command line — `sh -c` is never invoked here.
             use base64::Engine;
             let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-            let dir = std::path::Path::new(&path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+            let dir = std::path::Path::new(&path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
             if !dir.is_empty() {
-                self.run_command(project_id, id, RunCommandInput { cmd: "mkdir".into(), args: vec!["-p".into(), dir], ..Default::default() }).await?;
+                self.run_command(
+                    project_id,
+                    id,
+                    RunCommandInput {
+                        cmd: "mkdir".into(),
+                        args: vec!["-p".into(), dir],
+                        ..Default::default()
+                    },
+                )
+                .await?;
             }
             let write_cmd = format!("echo '{b64}' | base64 -d > '{path}'");
-            let res = self.run_command(project_id, id, RunCommandInput { cmd: "sh".into(), args: vec!["-c".into(), write_cmd], shell: false, ..Default::default() }).await?;
+            let res = self
+                .run_command(
+                    project_id,
+                    id,
+                    RunCommandInput {
+                        cmd: "sh".into(),
+                        args: vec!["-c".into(), write_cmd],
+                        shell: false,
+                        ..Default::default()
+                    },
+                )
+                .await?;
             if res.exit_code != Some(0) {
-                return Err(SandboxError::EngineUnavailable(format!("failed to write {path} (exit {:?})", res.exit_code)));
+                return Err(SandboxError::EngineUnavailable(format!(
+                    "failed to write {path} (exit {:?})",
+                    res.exit_code
+                )));
             }
         }
         Ok(())
     }
 
-    async fn read_file(&self, project_id: &str, id: &str, path: &str) -> Result<Vec<u8>, SandboxError> {
+    async fn read_file(
+        &self,
+        project_id: &str,
+        id: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, SandboxError> {
         if !path.starts_with('/') || path.contains("..") {
-            return Err(SandboxError::InvalidMount(format!("path '{path}' must be absolute with no '..' segments")));
+            return Err(SandboxError::InvalidMount(format!(
+                "path '{path}' must be absolute with no '..' segments"
+            )));
         }
-        let res = self.run_command(project_id, id, RunCommandInput { cmd: "base64".into(), args: vec![path.to_string()], ..Default::default() }).await?;
+        let res = self
+            .run_command(
+                project_id,
+                id,
+                RunCommandInput {
+                    cmd: "base64".into(),
+                    args: vec![path.to_string()],
+                    ..Default::default()
+                },
+            )
+            .await?;
         if res.exit_code != Some(0) {
-            return Err(SandboxError::NotFound(format!("file not found in sandbox: {path}")));
+            return Err(SandboxError::NotFound(format!(
+                "file not found in sandbox: {path}"
+            )));
         }
-        let text: String = res.stdout.iter().map(|l| l.line.clone()).collect::<Vec<_>>().join("");
+        let text: String = res
+            .stdout
+            .iter()
+            .map(|l| l.line.clone())
+            .collect::<Vec<_>>()
+            .join("");
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.decode(text.trim()).map_err(|e| SandboxError::EngineUnavailable(format!("could not decode file contents: {e}")))
+        base64::engine::general_purpose::STANDARD
+            .decode(text.trim())
+            .map_err(|e| {
+                SandboxError::EngineUnavailable(format!("could not decode file contents: {e}"))
+            })
     }
 
-    async fn create_snapshot(&self, project_id: &str, id: &str, input: CreateSnapshotInput) -> Result<SandboxSnapshotRecord, SandboxError> {
+    async fn create_snapshot(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: CreateSnapshotInput,
+    ) -> Result<SandboxSnapshotRecord, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
         if !self.cells.read().contains_key(id) {
-            return Err(SandboxError::EngineUnavailable("sandbox has no live microVM to snapshot".into()));
+            return Err(SandboxError::EngineUnavailable(
+                "sandbox has no live microVM to snapshot".into(),
+            ));
         }
         // NOTE (honest scope limit — see writeup): Firecracker natively
         // supports `/snapshot/create` (pause + dump memory/disk), which is NOT
@@ -460,7 +667,13 @@ impl SandboxProvider for PlatformSandboxProvider {
         }
         if let Some(keep) = input.keep_last.or(sandbox.keep_last_snapshots) {
             let stale: Vec<SandboxSnapshotRecord> = {
-                let mut mine: Vec<SandboxSnapshotRecord> = self.snapshots.read().iter().filter(|s| s.sandbox_id == id).cloned().collect();
+                let mut mine: Vec<SandboxSnapshotRecord> = self
+                    .snapshots
+                    .read()
+                    .iter()
+                    .filter(|s| s.sandbox_id == id)
+                    .cloned()
+                    .collect();
                 mine.sort_by_key(|s| std::cmp::Reverse(s.created_at));
                 mine.split_off(keep.max(1) as usize)
             };
@@ -471,11 +684,25 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(rec)
     }
 
-    async fn list_snapshots(&self, project_id: &str, id: &str) -> Result<Vec<SandboxSnapshotRecord>, SandboxError> {
-        Ok(self.snapshots.read().iter().filter(|s| s.project_id == project_id && s.sandbox_id == id).cloned().collect())
+    async fn list_snapshots(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxSnapshotRecord>, SandboxError> {
+        Ok(self
+            .snapshots
+            .read()
+            .iter()
+            .filter(|s| s.project_id == project_id && s.sandbox_id == id)
+            .cloned()
+            .collect())
     }
 
-    async fn delete_snapshot(&self, project_id: &str, snapshot_id: &str) -> Result<(), SandboxError> {
+    async fn delete_snapshot(
+        &self,
+        project_id: &str,
+        snapshot_id: &str,
+    ) -> Result<(), SandboxError> {
         let mut w = self.snapshots.write();
         let before = w.len();
         w.retain(|s| !(s.project_id == project_id && s.id == snapshot_id));
@@ -488,7 +715,9 @@ impl SandboxProvider for PlatformSandboxProvider {
     async fn domain(&self, project_id: &str, id: &str, port: u16) -> Result<String, SandboxError> {
         let sandbox = self.get_sandbox(project_id, id).await?;
         if !sandbox.ports.contains(&port) {
-            return Err(SandboxError::InvalidMount(format!("port {port} was not exposed at sandbox creation — add it to `ports` first")));
+            return Err(SandboxError::InvalidMount(format!(
+                "port {port} was not exposed at sandbox creation — add it to `ports` first"
+            )));
         }
         // NOTE (honest scope limit — see writeup): the microVM's egress/ingress
         // networking is per-cell (Firecracker TAP + NAT, see
@@ -496,11 +725,19 @@ impl SandboxProvider for PlatformSandboxProvider {
         // a host-side port-forward or edge route, which is not wired up in
         // this slice. This documents the intended URL shape so the UI/API
         // contract is stable once that plumbing lands.
-        let host = std::env::var("HIVE_PUBLIC_IP").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "127.0.0.1".to_string());
+        let host = std::env::var("HIVE_PUBLIC_IP")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
         Ok(format!("http://{host}:{port}"))
     }
 
-    async fn update_network_policy(&self, project_id: &str, id: &str, policy: NetworkPolicy) -> Result<SandboxRecord, SandboxError> {
+    async fn update_network_policy(
+        &self,
+        project_id: &str,
+        id: &str,
+        policy: NetworkPolicy,
+    ) -> Result<SandboxRecord, SandboxError> {
         validate_network_policy(&policy)?;
         let mut w = self.sandboxes.write();
         let rec = Self::find_mut(&mut w, project_id, id)?;
@@ -513,23 +750,38 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(rec.clone())
     }
 
-    async fn mount_storage(&self, project_id: &str, id: &str, input: MountConfigInput) -> Result<SandboxMountRecord, SandboxError> {
+    async fn mount_storage(
+        &self,
+        project_id: &str,
+        id: &str,
+        input: MountConfigInput,
+    ) -> Result<SandboxMountRecord, SandboxError> {
         validate_mount(&input.mount_path, &input.kind, &input.mode, &input.provider)?;
         let sandbox = self.get_sandbox(project_id, id).await?;
         let now = hive_core::now_ms();
         let mount_id = format!("mnt_{}", &uuid::Uuid::new_v4().simple().to_string()[..16]);
 
         let mut config_refs = HashMap::new();
-        for (k, v) in [("bucket", &input.bucket), ("region", &input.region), ("endpoint", &input.endpoint)] {
+        for (k, v) in [
+            ("bucket", &input.bucket),
+            ("region", &input.region),
+            ("endpoint", &input.endpoint),
+        ] {
             if !v.is_empty() {
                 config_refs.insert(k.to_string(), v.clone());
             }
         }
         if !input.access_key.is_empty() {
-            config_refs.insert("access_key_enc".into(), crate::secrets::encrypt(&input.access_key));
+            config_refs.insert(
+                "access_key_enc".into(),
+                crate::secrets::encrypt(&input.access_key),
+            );
         }
         if !input.secret_key.is_empty() {
-            config_refs.insert("secret_key_enc".into(), crate::secrets::encrypt(&input.secret_key));
+            config_refs.insert(
+                "secret_key_enc".into(),
+                crate::secrets::encrypt(&input.secret_key),
+            );
         }
         for (k, v) in &input.extra_args {
             config_refs.insert(format!("extra_{k}"), v.clone());
@@ -564,8 +816,18 @@ impl SandboxProvider for PlatformSandboxProvider {
         Ok(rec)
     }
 
-    async fn list_mounts(&self, project_id: &str, id: &str) -> Result<Vec<SandboxMountRecord>, SandboxError> {
-        Ok(self.mounts.read().iter().filter(|m| m.project_id == project_id && m.sandbox_id == id).cloned().collect())
+    async fn list_mounts(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<Vec<SandboxMountRecord>, SandboxError> {
+        Ok(self
+            .mounts
+            .read()
+            .iter()
+            .filter(|m| m.project_id == project_id && m.sandbox_id == id)
+            .cloned()
+            .collect())
     }
 
     async fn delete_mount(&self, project_id: &str, mount_id: &str) -> Result<(), SandboxError> {
@@ -607,8 +869,15 @@ async fn drain_exec_events(
                 total += redacted.len();
                 let mut w = commands.write();
                 if let Some(rec) = w.iter_mut().find(|c| c.id == cmd_id) {
-                    let target = if stream == LogStream::Stderr { &mut rec.stderr } else { &mut rec.stdout };
-                    target.push(LogLine { ts_ms: hive_core::now_ms(), line: redacted });
+                    let target = if stream == LogStream::Stderr {
+                        &mut rec.stderr
+                    } else {
+                        &mut rec.stdout
+                    };
+                    target.push(LogLine {
+                        ts_ms: hive_core::now_ms(),
+                        line: redacted,
+                    });
                     rec.updated_at = hive_core::now_ms();
                 }
             }

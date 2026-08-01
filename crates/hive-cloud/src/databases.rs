@@ -118,7 +118,11 @@ impl Database {
         let mut d = self.clone();
         for (k, v) in d.connection.iter_mut() {
             let kl = k.to_lowercase();
-            if kl.contains("password") || kl.contains("token") || kl.contains("secret") || kl.contains("url") {
+            if kl.contains("password")
+                || kl.contains("token")
+                || kl.contains("secret")
+                || kl.contains("url")
+            {
                 *v = mask(v);
             }
         }
@@ -150,9 +154,19 @@ impl BlobStore {
     fn bucket_dir(&self, bucket: &str) -> std::path::PathBuf {
         let safe: String = bucket
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
-        self.root.join(if safe.is_empty() { "_".to_string() } else { safe })
+        self.root.join(if safe.is_empty() {
+            "_".to_string()
+        } else {
+            safe
+        })
     }
     fn put(&self, bucket: &str, key: &str, data: &[u8]) {
         let dir = self.bucket_dir(bucket);
@@ -167,7 +181,11 @@ impl BlobStore {
         }
     }
     fn get(&self, bucket: &str, key: &str) -> Option<Vec<u8>> {
-        std::fs::read(self.bucket_dir(bucket).join(format!("{}.bin", hex_encode(key.as_bytes())))).ok()
+        std::fs::read(
+            self.bucket_dir(bucket)
+                .join(format!("{}.bin", hex_encode(key.as_bytes()))),
+        )
+        .ok()
     }
     fn list(&self, bucket: &str) -> Vec<String> {
         let mut out = Vec::new();
@@ -250,7 +268,9 @@ impl Broker {
             return s.clone();
         }
         let (tx, _rx) = tokio::sync::broadcast::channel(1024);
-        self.channels.write().insert(channel.to_string(), tx.clone());
+        self.channels
+            .write()
+            .insert(channel.to_string(), tx.clone());
         tx
     }
 }
@@ -290,7 +310,12 @@ impl DatabaseStore {
     /// Publish a message to a channel; returns the number of live subscribers
     /// that received it.
     pub fn publish(&self, channel: &str, msg: String) -> usize {
-        *self.broker.published.write().entry(channel.to_string()).or_insert(0) += 1;
+        *self
+            .broker
+            .published
+            .write()
+            .entry(channel.to_string())
+            .or_insert(0) += 1;
         let tx = self.broker.sender(channel);
         tx.send(msg).unwrap_or(0)
     }
@@ -300,10 +325,20 @@ impl DatabaseStore {
     }
     /// Live subscriber count for a channel.
     pub fn subscriber_count(&self, channel: &str) -> usize {
-        self.broker.channels.read().get(channel).map(|s| s.receiver_count()).unwrap_or(0)
+        self.broker
+            .channels
+            .read()
+            .get(channel)
+            .map(|s| s.receiver_count())
+            .unwrap_or(0)
     }
     pub fn published_count(&self, channel: &str) -> u64 {
-        self.broker.published.read().get(channel).copied().unwrap_or(0)
+        self.broker
+            .published
+            .read()
+            .get(channel)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn list(&self, project: Option<&str>) -> Vec<Database> {
@@ -316,7 +351,11 @@ impl DatabaseStore {
     }
 
     pub fn get(&self, id: &str) -> Option<Database> {
-        self.dbs.read().iter().find(|x| x.id == id).map(|x| x.masked())
+        self.dbs
+            .read()
+            .iter()
+            .find(|x| x.id == id)
+            .map(|x| x.masked())
     }
 
     /// UNMASKED lookup by the external DB-gateway hostname (`db_host`), for the SNI
@@ -324,7 +363,11 @@ impl DatabaseStore {
     /// Case-insensitive (SNI names arrive lowercased).
     pub fn by_db_host(&self, db_host: &str) -> Option<Database> {
         let h = db_host.trim().to_ascii_lowercase();
-        self.dbs.read().iter().find(|x| !x.db_host.is_empty() && x.db_host.eq_ignore_ascii_case(&h)).cloned()
+        self.dbs
+            .read()
+            .iter()
+            .find(|x| !x.db_host.is_empty() && x.db_host.eq_ignore_ascii_case(&h))
+            .cloned()
     }
 
     /// Unmasked connection (used by the "reveal credentials" endpoint).
@@ -378,14 +421,29 @@ impl DatabaseStore {
                 .items
                 .read()
                 .iter()
-                .map(|(idx, m)| (idx.clone(), m.iter().map(|(id, (v, meta))| (id.clone(), (v.clone(), meta.clone()))).collect()))
+                .map(|(idx, m)| {
+                    (
+                        idx.clone(),
+                        m.iter()
+                            .map(|(id, (v, meta))| (id.clone(), (v.clone(), meta.clone())))
+                            .collect(),
+                    )
+                })
                 .collect(),
         }
     }
 
     pub fn data_load(&self, snap: DataSnapshot) {
-        *self.queue.msgs.write() = snap.queues.into_iter().map(|(k, v)| (k, v.into_iter().collect())).collect();
-        *self.vector.items.write() = snap.vectors.into_iter().map(|(idx, m)| (idx, m.into_iter().collect())).collect();
+        *self.queue.msgs.write() = snap
+            .queues
+            .into_iter()
+            .map(|(k, v)| (k, v.into_iter().collect()))
+            .collect();
+        *self.vector.items.write() = snap
+            .vectors
+            .into_iter()
+            .map(|(idx, m)| (idx, m.into_iter().collect()))
+            .collect();
     }
 
     pub fn count(&self) -> usize {
@@ -444,7 +502,11 @@ impl DatabaseStore {
             .dbs
             .read()
             .iter()
-            .filter_map(|d| d.connection.get("local_port").or_else(|| d.connection.get("port")))
+            .filter_map(|d| {
+                d.connection
+                    .get("local_port")
+                    .or_else(|| d.connection.get("port"))
+            })
             .filter_map(|p| p.parse::<u32>().ok())
             .collect();
         loop {
@@ -475,7 +537,16 @@ impl DatabaseStore {
     /// container, plus the stored connection fields a re-create needs
     /// (kind, local host port, raw password). Internal-only — never serialized
     /// to a client.
-    pub(crate) fn containers_to_reconcile(&self) -> Vec<(String, DbKind, String, Option<String>, Option<String>, String)> {
+    pub(crate) fn containers_to_reconcile(
+        &self,
+    ) -> Vec<(
+        String,
+        DbKind,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+    )> {
         self.dbs
             .read()
             .iter()
@@ -486,7 +557,10 @@ impl DatabaseStore {
                     d.id.clone(),
                     d.kind,
                     c,
-                    d.connection.get("local_port").or_else(|| d.connection.get("port")).cloned(),
+                    d.connection
+                        .get("local_port")
+                        .or_else(|| d.connection.get("port"))
+                        .cloned(),
                     d.connection.get("password").cloned(),
                     d.project.clone(),
                 ))
@@ -520,17 +594,29 @@ impl DatabaseStore {
         self.queue.msgs.write().get_mut(queue)?.pop_front()
     }
     pub fn queue_depth(&self, queue: &str) -> usize {
-        self.queue.msgs.read().get(queue).map(|q| q.len()).unwrap_or(0)
+        self.queue
+            .msgs
+            .read()
+            .get(queue)
+            .map(|q| q.len())
+            .unwrap_or(0)
     }
 
     // ---- Vector ops ----
     pub fn vector_upsert(&self, index: &str, id: &str, v: Vec<f32>, meta: serde_json::Value) {
-        self.vector.items.write().entry(index.to_string()).or_default().insert(id.to_string(), (v, meta));
+        self.vector
+            .items
+            .write()
+            .entry(index.to_string())
+            .or_default()
+            .insert(id.to_string(), (v, meta));
     }
     /// Cosine-similarity top-k query.
     pub fn vector_query(&self, index: &str, q: &[f32], k: usize) -> Vec<serde_json::Value> {
         let items = self.vector.items.read();
-        let Some(idx) = items.get(index) else { return vec![] };
+        let Some(idx) = items.get(index) else {
+            return vec![];
+        };
         let mut scored: Vec<(f32, String, serde_json::Value)> = idx
             .iter()
             .map(|(id, (v, meta))| (cosine(q, v), id.clone(), meta.clone()))
@@ -608,21 +694,36 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
             let url = match net_host {
                 Some(h) => format!(
                     "postgres://{}:{}@{}:{}/{}?sslmode=disable",
-                    g("user"), g("password"), h, c.get("net_port").cloned().unwrap_or_else(|| "5432".into()), g("database")
+                    g("user"),
+                    g("password"),
+                    h,
+                    c.get("net_port").cloned().unwrap_or_else(|| "5432".into()),
+                    g("database")
                 ),
                 None => g("DATABASE_URL"),
             };
-            vec![("DATABASE_URL".into(), url), ("PRISMA_DATABASE_URL".into(), g("PRISMA_DATABASE_URL"))]
+            vec![
+                ("DATABASE_URL".into(), url),
+                ("PRISMA_DATABASE_URL".into(), g("PRISMA_DATABASE_URL")),
+            ]
         }
         DbKind::Redis => {
             let url = match net_host {
-                Some(h) => format!("redis://default:{}@{}:{}", g("password"), h, c.get("net_port").cloned().unwrap_or_else(|| "6379".into())),
+                Some(h) => format!(
+                    "redis://default:{}@{}:{}",
+                    g("password"),
+                    h,
+                    c.get("net_port").cloned().unwrap_or_else(|| "6379".into())
+                ),
                 None => g("REDIS_URL"),
             };
             vec![
                 ("REDIS_URL".into(), url),
                 ("UPSTASH_REDIS_REST_URL".into(), g("UPSTASH_REDIS_REST_URL")),
-                ("UPSTASH_REDIS_REST_TOKEN".into(), g("UPSTASH_REDIS_REST_TOKEN")),
+                (
+                    "UPSTASH_REDIS_REST_TOKEN".into(),
+                    g("UPSTASH_REDIS_REST_TOKEN"),
+                ),
             ]
         }
         DbKind::Blob => vec![
@@ -638,18 +739,30 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
         DbKind::Vector => vec![
             ("VECTOR_INDEX".into(), g("index")),
             ("VECTOR_TOKEN".into(), g("token")),
-            ("VECTOR_ENDPOINT".into(), format!("{base}/v1/storage/vector")),
+            (
+                "VECTOR_ENDPOINT".into(),
+                format!("{base}/v1/storage/vector"),
+            ),
         ],
         DbKind::Pubsub => vec![
             ("PUBSUB_TOPIC".into(), g("topic")),
             ("PUBSUB_TOKEN".into(), g("token")),
-            ("PUBSUB_PUBLISH_URL".into(), format!("{base}/v1/storage/pubsub/{}/publish", g("topic"))),
-            ("PUBSUB_SUBSCRIBE_WS".into(), format!("{base}/v1/ws/pubsub/{}", g("topic"))),
+            (
+                "PUBSUB_PUBLISH_URL".into(),
+                format!("{base}/v1/storage/pubsub/{}/publish", g("topic")),
+            ),
+            (
+                "PUBSUB_SUBSCRIBE_WS".into(),
+                format!("{base}/v1/ws/pubsub/{}", g("topic")),
+            ),
         ],
         DbKind::Realtime => vec![
             ("REALTIME_ROOM".into(), g("room")),
             ("REALTIME_TOKEN".into(), g("token")),
-            ("REALTIME_WS_URL".into(), format!("{base}/v1/ws/realtime/{}", g("room"))),
+            (
+                "REALTIME_WS_URL".into(),
+                format!("{base}/v1/ws/realtime/{}", g("room")),
+            ),
         ],
     };
     out.retain(|(_, v)| !v.is_empty());
@@ -661,7 +774,13 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
 pub fn env_prefix(name: &str) -> String {
     let p: String = name
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_uppercase() } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
         .collect();
     p.trim_matches('_').to_string()
 }
@@ -671,7 +790,11 @@ pub fn env_prefix(name: &str) -> String {
 /// preserving the node-local URL under `INTERNAL_*` (for on-node tooling) and the
 /// private `net_host`/`net_port` (for same-node app containers). No-op when the
 /// gateway is off (`db_host` empty) — the original 127.0.0.1 URLs stand.
-fn with_external_endpoint(mut conn: HashMap<String, String>, kind: DbKind, db_host: &str) -> HashMap<String, String> {
+fn with_external_endpoint(
+    mut conn: HashMap<String, String>,
+    kind: DbKind,
+    db_host: &str,
+) -> HashMap<String, String> {
     if db_host.is_empty() {
         return conn;
     }
@@ -685,13 +808,19 @@ fn with_external_endpoint(mut conn: HashMap<String, String>, kind: DbKind, db_ho
         DbKind::Postgres => {
             let user = conn.get("user").cloned().unwrap_or_default();
             let pw = conn.get("password").cloned().unwrap_or_default();
-            let dbname = conn.get("database").cloned().unwrap_or_else(|| "hive".into());
+            let dbname = conn
+                .get("database")
+                .cloned()
+                .unwrap_or_else(|| "hive".into());
             if let Some(internal) = conn.remove("DATABASE_URL") {
                 conn.insert("INTERNAL_DATABASE_URL".into(), internal);
             }
             // TLS-required so credentials never cross the wire in plaintext and the
             // gateway can route by SNI.
-            conn.insert("DATABASE_URL".into(), format!("postgres://{user}:{pw}@{db_host}:5432/{dbname}?sslmode=require"));
+            conn.insert(
+                "DATABASE_URL".into(),
+                format!("postgres://{user}:{pw}@{db_host}:5432/{dbname}?sslmode=require"),
+            );
             // SQL-over-HTTP (Neon-style) REST endpoint served by the same gateway
             // host: POST {"query","params"} with `Authorization: Bearer <password>`.
             conn.insert("SQL_HTTP_URL".into(), format!("https://{db_host}/sql"));
@@ -704,8 +833,14 @@ fn with_external_endpoint(mut conn: HashMap<String, String>, kind: DbKind, db_ho
                 conn.insert("INTERNAL_REDIS_URL".into(), internal);
             }
             // `rediss://` = TLS.
-            conn.insert("REDIS_URL".into(), format!("rediss://default:{pw}@{db_host}:6379"));
-            conn.insert("UPSTASH_REDIS_REST_URL".into(), format!("https://{db_host}"));
+            conn.insert(
+                "REDIS_URL".into(),
+                format!("rediss://default:{pw}@{db_host}:6379"),
+            );
+            conn.insert(
+                "UPSTASH_REDIS_REST_URL".into(),
+                format!("https://{db_host}"),
+            );
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), "6379".into());
         }
@@ -737,7 +872,11 @@ pub fn provision(
     // Hostname-safe slug from the id (`db_<hex>` -> `db-<12hex>`) — a valid single
     // DNS/SNI label. `db_host` is the external endpoint; empty when the gateway is off.
     let slug = format!("db-{}", &id[3..15.min(id.len())]);
-    let db_host = if db_domain.is_empty() { String::new() } else { format!("{slug}.{db_domain}") };
+    let db_host = if db_domain.is_empty() {
+        String::new()
+    } else {
+        format!("{slug}.{db_domain}")
+    };
     let db = Database {
         id: id.clone(),
         name: req.name.clone(),
@@ -746,13 +885,21 @@ pub fn provision(
         kind: req.kind,
         region: region.clone(),
         status: DbStatus::Provisioning,
-        provider: req.provider.clone().unwrap_or_else(|| req.kind.label().to_string()),
+        provider: req
+            .provider
+            .clone()
+            .unwrap_or_else(|| req.kind.label().to_string()),
         mode: "simulated".into(),
         created_ms: now_ms(),
         connection: HashMap::new(),
         container: None,
         note: String::new(),
-        replicas: req.replicas.iter().map(|r| r.trim().to_ascii_lowercase()).filter(|r| !r.is_empty() && *r != region).collect(),
+        replicas: req
+            .replicas
+            .iter()
+            .map(|r| r.trim().to_ascii_lowercase())
+            .filter(|r| !r.is_empty() && *r != region)
+            .collect(),
         role: "primary".into(),
         primary_node: String::new(),
         db_host: db_host.clone(),
@@ -834,7 +981,10 @@ async fn provision_backing(
             let topic = format!("topic-{}", &id[3..11.min(id.len())]);
             let mut c = HashMap::new();
             c.insert("provider".into(), "Hive Pub/Sub".into());
-            c.insert("publish_url".into(), format!("/v1/storage/pubsub/{topic}/publish"));
+            c.insert(
+                "publish_url".into(),
+                format!("/v1/storage/pubsub/{topic}/publish"),
+            );
             c.insert("subscribe_ws".into(), format!("/v1/ws/pubsub/{topic}"));
             c.insert("topic".into(), topic);
             c.insert("token".into(), token("psb"));
@@ -870,7 +1020,16 @@ async fn ensure_project_db_net(project: &str, id: &str) -> Option<(String, Strin
     let host: u32 = 200 + (fnv1a(id.as_bytes()) % 50);
     let ip = format!("{prefix}.{host}");
     let created = Command::new("podman")
-        .args(["network", "create", "--disable-dns", "--subnet", &subnet, "--gateway", &gw, &net])
+        .args([
+            "network",
+            "create",
+            "--disable-dns",
+            "--subnet",
+            &subnet,
+            "--gateway",
+            &gw,
+            &net,
+        ])
         .env("PATH", augmented_path())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -942,7 +1101,10 @@ async fn provision_postgres(
     let cname = format!("hive-db-{}", &id[3..11.min(id.len())]);
     let direct = format!("postgres://{user}:{password}@127.0.0.1:{port}/{dbname}?sslmode=disable");
     // Prisma-Postgres-style pooled/accelerated URL (over the same instance).
-    let pooled = format!("prisma+postgres://127.0.0.1:{port}/{dbname}?api_key={}", token("ppg"));
+    let pooled = format!(
+        "prisma+postgres://127.0.0.1:{port}/{dbname}?api_key={}",
+        token("ppg")
+    );
     let mut conn = HashMap::new();
     conn.insert("host".into(), "127.0.0.1".into());
     conn.insert("port".into(), port.to_string());
@@ -963,11 +1125,19 @@ async fn provision_postgres(
         // containers reach the DB by IP; ALSO publish on loopback for host tooling.
         let net = ensure_project_db_net(project, id).await;
         let mut args: Vec<String> = vec![
-            "run".into(), "-d".into(), "--name".into(), cname.clone(), "--replace".into(),
-            "-e".into(), format!("POSTGRES_PASSWORD={password}"),
-            "-e".into(), format!("POSTGRES_USER={user}"),
-            "-e".into(), format!("POSTGRES_DB={dbname}"),
-            "-p".into(), format!("127.0.0.1:{port}:5432"),
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            cname.clone(),
+            "--replace".into(),
+            "-e".into(),
+            format!("POSTGRES_PASSWORD={password}"),
+            "-e".into(),
+            format!("POSTGRES_USER={user}"),
+            "-e".into(),
+            format!("POSTGRES_DB={dbname}"),
+            "-p".into(),
+            format!("127.0.0.1:{port}:5432"),
         ];
         if let Some((netname, ip)) = &net {
             args.push("--network".into());
@@ -984,7 +1154,11 @@ async fn provision_postgres(
         args.push("docker.io/library/postgres:16-alpine".into());
         // Capture stderr (don't discard it) so a provision failure is diagnosable
         // instead of silently degrading to "simulated".
-        let out = Command::new("podman").args(&args).env("PATH", augmented_path()).output().await;
+        let out = Command::new("podman")
+            .args(&args)
+            .env("PATH", augmented_path())
+            .output()
+            .await;
         match out {
             Ok(o) if o.status.success() => {
                 // Confirm the published port actually accepts connections — a broken
@@ -996,8 +1170,12 @@ async fn provision_postgres(
                 }
                 return Ok(("live".into(), conn, Some(cname)));
             }
-            Ok(o) => tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "postgres provision failed — simulating"),
-            Err(e) => tracing::warn!(db = %id, error = %e, "postgres provision could not spawn podman — simulating"),
+            Ok(o) => {
+                tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "postgres provision failed — simulating")
+            }
+            Err(e) => {
+                tracing::warn!(db = %id, error = %e, "postgres provision could not spawn podman — simulating")
+            }
         }
     }
     // Fallback: record provisioned in simulated mode (no live engine available).
@@ -1019,14 +1197,22 @@ async fn provision_redis(
     conn.insert("password".into(), password.clone());
     conn.insert("REDIS_URL".into(), url);
     // Upstash-style REST surface.
-    conn.insert("UPSTASH_REDIS_REST_URL".into(), format!("http://127.0.0.1:{port}"));
+    conn.insert(
+        "UPSTASH_REDIS_REST_URL".into(),
+        format!("http://127.0.0.1:{port}"),
+    );
     conn.insert("UPSTASH_REDIS_REST_TOKEN".into(), token("redis"));
 
     if podman_available().await {
         let net = ensure_project_db_net(project, id).await;
         let mut args: Vec<String> = vec![
-            "run".into(), "-d".into(), "--name".into(), cname.clone(), "--replace".into(),
-            "-p".into(), format!("127.0.0.1:{port}:6379"),
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            cname.clone(),
+            "--replace".into(),
+            "-p".into(),
+            format!("127.0.0.1:{port}:6379"),
         ];
         if let Some((netname, ip)) = &net {
             args.push("--network".into());
@@ -1040,7 +1226,11 @@ async fn provision_redis(
         args.push("redis-server".into());
         args.push("--requirepass".into());
         args.push(password.clone());
-        let out = Command::new("podman").args(&args).env("PATH", augmented_path()).output().await;
+        let out = Command::new("podman")
+            .args(&args)
+            .env("PATH", augmented_path())
+            .output()
+            .await;
         match out {
             Ok(o) if o.status.success() => {
                 if !wait_tcp_ready(port).await {
@@ -1048,8 +1238,12 @@ async fn provision_redis(
                 }
                 return Ok(("live".into(), conn, Some(cname)));
             }
-            Ok(o) => tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "redis provision failed — simulating"),
-            Err(e) => tracing::warn!(db = %id, error = %e, "redis provision could not spawn podman — simulating"),
+            Ok(o) => {
+                tracing::warn!(db = %id, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "redis provision failed — simulating")
+            }
+            Err(e) => {
+                tracing::warn!(db = %id, error = %e, "redis provision could not spawn podman — simulating")
+            }
         }
     }
     Ok(("simulated".into(), conn, None))
@@ -1072,57 +1266,86 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
     crate::supervise::spawn_supervised("db-reconcile", move || {
         let cloud = cloud.clone();
         async move {
-        loop {
-            crate::supervise::beat("db-reconcile");
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            if !podman_available().await {
-                continue;
-            }
-            for (id, kind, cname, local_port, password, project) in cloud.databases.containers_to_reconcile() {
-                let inspect = Command::new("podman")
-                    .args(["inspect", &cname, "--format", "{{.State.Running}}"])
-                    .env("PATH", augmented_path())
-                    .output()
-                    .await;
-                match inspect {
-                    Ok(o) if o.status.success() => {
-                        if String::from_utf8_lossy(&o.stdout).trim() != "true" {
-                            match Command::new("podman").args(["start", &cname]).env("PATH", augmented_path()).output().await {
-                                Ok(s) if s.status.success() => {
-                                    tracing::info!(db = %id, container = %cname, "db-reconcile: restarted exited backing container");
+            loop {
+                crate::supervise::beat("db-reconcile");
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                if !podman_available().await {
+                    continue;
+                }
+                for (id, kind, cname, local_port, password, project) in
+                    cloud.databases.containers_to_reconcile()
+                {
+                    let inspect = Command::new("podman")
+                        .args(["inspect", &cname, "--format", "{{.State.Running}}"])
+                        .env("PATH", augmented_path())
+                        .output()
+                        .await;
+                    match inspect {
+                        Ok(o) if o.status.success() => {
+                            if String::from_utf8_lossy(&o.stdout).trim() != "true" {
+                                match Command::new("podman")
+                                    .args(["start", &cname])
+                                    .env("PATH", augmented_path())
+                                    .output()
+                                    .await
+                                {
+                                    Ok(s) if s.status.success() => {
+                                        tracing::info!(db = %id, container = %cname, "db-reconcile: restarted exited backing container");
+                                    }
+                                    Ok(s) => {
+                                        tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: start failed")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: start could not spawn podman")
+                                    }
                                 }
-                                Ok(s) => tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: start failed"),
-                                Err(e) => tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: start could not spawn podman"),
                             }
                         }
+                        // inspect failed -> container record is GONE (machine reset /
+                        // pruned). Rebuild what we safely can.
+                        _ => match (kind, local_port.as_deref(), password.as_deref()) {
+                            (DbKind::Redis, Some(port), Some(pw))
+                                if !port.is_empty() && !pw.is_empty() =>
+                            {
+                                let args = [
+                                    "run",
+                                    "-d",
+                                    "--name",
+                                    &cname,
+                                    "--replace",
+                                    "-p",
+                                    &format!("127.0.0.1:{port}:6379"),
+                                    "docker.io/library/redis:7-alpine",
+                                    "redis-server",
+                                    "--requirepass",
+                                    pw,
+                                ]
+                                .map(String::from)
+                                .to_vec();
+                                match Command::new("podman")
+                                    .args(&args)
+                                    .env("PATH", augmented_path())
+                                    .output()
+                                    .await
+                                {
+                                    Ok(s) if s.status.success() => {
+                                        tracing::warn!(db = %id, container = %cname, %project, %port, "db-reconcile: backing container was GONE — re-created empty Redis with the record's stored port/password (data lost, service restored)");
+                                    }
+                                    Ok(s) => {
+                                        tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: re-create failed")
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: re-create could not spawn podman")
+                                    }
+                                }
+                            }
+                            _ => {
+                                tracing::warn!(db = %id, container = %cname, %project, ?kind, "db-reconcile: backing container is GONE and this kind is not auto-rebuilt — the database is DOWN until re-provisioned");
+                            }
+                        },
                     }
-                    // inspect failed -> container record is GONE (machine reset /
-                    // pruned). Rebuild what we safely can.
-                    _ => match (kind, local_port.as_deref(), password.as_deref()) {
-                        (DbKind::Redis, Some(port), Some(pw)) if !port.is_empty() && !pw.is_empty() => {
-                            let args = [
-                                "run", "-d", "--name", &cname, "--replace",
-                                "-p", &format!("127.0.0.1:{port}:6379"),
-                                "docker.io/library/redis:7-alpine",
-                                "redis-server", "--requirepass", pw,
-                            ]
-                            .map(String::from)
-                            .to_vec();
-                            match Command::new("podman").args(&args).env("PATH", augmented_path()).output().await {
-                                Ok(s) if s.status.success() => {
-                                    tracing::warn!(db = %id, container = %cname, %project, %port, "db-reconcile: backing container was GONE — re-created empty Redis with the record's stored port/password (data lost, service restored)");
-                                }
-                                Ok(s) => tracing::warn!(db = %id, container = %cname, stderr = %String::from_utf8_lossy(&s.stderr).trim(), "db-reconcile: re-create failed"),
-                                Err(e) => tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: re-create could not spawn podman"),
-                            }
-                        }
-                        _ => {
-                            tracing::warn!(db = %id, container = %cname, %project, ?kind, "db-reconcile: backing container is GONE and this kind is not auto-rebuilt — the database is DOWN until re-provisioned");
-                        }
-                    },
                 }
             }
-        }
         }
     });
 }
@@ -1160,7 +1383,10 @@ mod tests {
             provider: kind.label().into(),
             mode: "live".into(),
             created_ms: 0,
-            connection: conn.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            connection: conn
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             container: None,
             note: String::new(),
             replicas: vec![],
@@ -1182,23 +1408,35 @@ mod tests {
                 ("user", "hive"),
                 ("password", "secret"),
                 ("database", "hive"),
-                ("DATABASE_URL", "postgres://hive:secret@127.0.0.1:54320/hive?sslmode=disable"),
+                (
+                    "DATABASE_URL",
+                    "postgres://hive:secret@127.0.0.1:54320/hive?sslmode=disable",
+                ),
                 ("net_host", "10.130.7.200"),
                 ("net_port", "5432"),
             ],
         );
         let ex = env_exports(&d, "https://api.shadw.cloud");
         let url = ex.iter().find(|(k, _)| k == "DATABASE_URL").unwrap();
-        assert_eq!(url.1, "postgres://hive:secret@10.130.7.200:5432/hive?sslmode=disable");
+        assert_eq!(
+            url.1,
+            "postgres://hive:secret@10.130.7.200:5432/hive?sslmode=disable"
+        );
     }
 
     #[test]
     fn native_kind_egress_is_absolute_api_url() {
-        let d = db(DbKind::Blob, "assets", &[("bucket", "hive-abc"), ("read_write_token", "blob_rw_x")]);
+        let d = db(
+            DbKind::Blob,
+            "assets",
+            &[("bucket", "hive-abc"), ("read_write_token", "blob_rw_x")],
+        );
         let ex = env_exports(&d, "https://api.shadw.cloud/");
         let endpoint = ex.iter().find(|(k, _)| k == "BLOB_ENDPOINT").unwrap();
         assert_eq!(endpoint.1, "https://api.shadw.cloud/v1/storage/blob");
-        assert!(ex.iter().any(|(k, v)| k == "BLOB_READ_WRITE_TOKEN" && v == "blob_rw_x"));
+        assert!(ex
+            .iter()
+            .any(|(k, v)| k == "BLOB_READ_WRITE_TOKEN" && v == "blob_rw_x"));
     }
 
     #[test]
@@ -1216,10 +1454,17 @@ mod tests {
         // broken "Up-but-dead" state (gateway sees connection-refused). next_port
         // must skip any port already assigned to a live DB.
         let s = DatabaseStore::new();
-        s.insert(db(DbKind::Postgres, "existing", &[("local_port", "54320"), ("port", "5432")]));
+        s.insert(db(
+            DbKind::Postgres,
+            "existing",
+            &[("local_port", "54320"), ("port", "5432")],
+        ));
         // Cursor is fresh (0), exactly as after a process restart.
         let p = s.next_port(54320);
-        assert_ne!(p, 54320, "must not collide with the port an existing DB already holds");
+        assert_ne!(
+            p, 54320,
+            "must not collide with the port an existing DB already holds"
+        );
         assert!(p > 54320);
         // A second allocation is distinct from both the first and the existing DB.
         let q = s.next_port(54320);
@@ -1232,7 +1477,12 @@ mod tests {
         let s = DatabaseStore::new();
         s.queue_push("acme::q1", "m1".into());
         s.queue_push("acme::q1", "m2".into());
-        s.vector_upsert("acme::idx", "v1", vec![1.0, 0.0], serde_json::json!({"t": "a"}));
+        s.vector_upsert(
+            "acme::idx",
+            "v1",
+            vec![1.0, 0.0],
+            serde_json::json!({"t": "a"}),
+        );
         let snap = s.data_snapshot();
         let s2 = DatabaseStore::new();
         s2.data_load(snap);
@@ -1265,14 +1515,30 @@ mod tests {
         let mut vdb = db(DbKind::Vector, "embeddings", &[("index", "index-xyz789ab")]);
         vdb.id = "db_vecdb000001".into();
         s.insert(vdb.clone());
-        s.vector_upsert("acme::index-xyz789ab", "v1", vec![1.0, 0.0], serde_json::json!({"pii": "user@example.com"}));
-        assert_eq!(s.vector_query("acme::index-xyz789ab", &[1.0, 0.0], 5).len(), 1);
+        s.vector_upsert(
+            "acme::index-xyz789ab",
+            "v1",
+            vec![1.0, 0.0],
+            serde_json::json!({"pii": "user@example.com"}),
+        );
+        assert_eq!(
+            s.vector_query("acme::index-xyz789ab", &[1.0, 0.0], 5).len(),
+            1
+        );
 
         // Blob-kind DB.
-        let mut bdb = db(DbKind::Blob, "uploads", &[("bucket", "hive-purge-test-bucket")]);
+        let mut bdb = db(
+            DbKind::Blob,
+            "uploads",
+            &[("bucket", "hive-purge-test-bucket")],
+        );
         bdb.id = "db_blobdb00001".into();
         s.insert(bdb.clone());
-        s.blob_put("hive-purge-test-bucket", "secret.txt", b"customer PII".to_vec());
+        s.blob_put(
+            "hive-purge-test-bucket",
+            "secret.txt",
+            b"customer PII".to_vec(),
+        );
         assert!(s.blob_get("hive-purge-test-bucket", "secret.txt").is_some());
 
         // Delete all three — must purge the real payload, not just the catalog row.
@@ -1281,9 +1547,20 @@ mod tests {
         s.remove_db_and_purge_data(&bdb.id, "acme");
 
         assert_eq!(s.count(), 0, "catalog entries must be gone");
-        assert_eq!(s.queue_depth("acme::queue-abc123de"), 0, "queue payload must be purged");
-        assert_eq!(s.vector_query("acme::index-xyz789ab", &[1.0, 0.0], 5).len(), 0, "vector payload (incl. PII in metadata) must be purged");
-        assert!(s.blob_get("hive-purge-test-bucket", "secret.txt").is_none(), "blob object must be purged");
+        assert_eq!(
+            s.queue_depth("acme::queue-abc123de"),
+            0,
+            "queue payload must be purged"
+        );
+        assert_eq!(
+            s.vector_query("acme::index-xyz789ab", &[1.0, 0.0], 5).len(),
+            0,
+            "vector payload (incl. PII in metadata) must be purged"
+        );
+        assert!(
+            s.blob_get("hive-purge-test-bucket", "secret.txt").is_none(),
+            "blob object must be purged"
+        );
 
         // Cleanup the real on-disk blob dir this test created.
         let _ = std::fs::remove_dir_all(s.blob.bucket_dir("hive-purge-test-bucket"));

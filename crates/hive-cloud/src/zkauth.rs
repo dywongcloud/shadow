@@ -97,7 +97,9 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
     if s.len() % 2 != 0 {
         return None;
     }
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok())
+        .collect()
 }
 fn arr32(v: &[u8]) -> Option<[u8; 32]> {
     if v.len() != 32 {
@@ -143,14 +145,20 @@ fn roster_of(team: &str, store: &Store) -> Roster {
     let mut r = Roster::new();
     if let Some(members) = store.teams.get(team) {
         for m in members {
-            if let Some(pk) = unhex(&m.pubkey).and_then(|b| arr32(&b)).and_then(|a| PublicKey::from_bytes(&a).ok()) {
+            if let Some(pk) = unhex(&m.pubkey)
+                .and_then(|b| arr32(&b))
+                .and_then(|a| PublicKey::from_bytes(&a).ok())
+            {
                 r.enroll(pk, parse_role(&m.role));
             }
         }
     }
     if let Some(members) = peer_cache().lock().unwrap().get(team) {
         for (pubkey, role) in members {
-            if let Some(pk) = unhex(pubkey).and_then(|b| arr32(&b)).and_then(|a| PublicKey::from_bytes(&a).ok()) {
+            if let Some(pk) = unhex(pubkey)
+                .and_then(|b| arr32(&b))
+                .and_then(|a| PublicKey::from_bytes(&a).ok())
+            {
                 r.enroll(pk, parse_role(role));
             }
         }
@@ -175,7 +183,10 @@ pub fn export_json() -> Value {
         .teams
         .iter()
         .map(|(t, ms)| {
-            let members: Vec<Value> = ms.iter().map(|m| json!({ "pubkey": m.pubkey, "role": m.role })).collect();
+            let members: Vec<Value> = ms
+                .iter()
+                .map(|m| json!({ "pubkey": m.pubkey, "role": m.role }))
+                .collect();
             (t.clone(), json!(members))
         })
         .collect();
@@ -194,11 +205,21 @@ pub fn ingest_peer_export(v: &Value) {
     };
     let mut pc = peer_cache().lock().unwrap();
     for (team, members) in teams {
-        let Some(arr) = members.as_array() else { continue };
+        let Some(arr) = members.as_array() else {
+            continue;
+        };
         let entry = pc.entry(team.clone()).or_default();
         for m in arr {
-            let pk = m.get("pubkey").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let role = m.get("role").and_then(|x| x.as_str()).unwrap_or("member").to_string();
+            let pk = m
+                .get("pubkey")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let role = m
+                .get("role")
+                .and_then(|x| x.as_str())
+                .unwrap_or("member")
+                .to_string();
             if !pk.is_empty() && !entry.iter().any(|(p, _)| p == &pk) {
                 entry.push((pk, role));
             }
@@ -315,7 +336,9 @@ fn verify_access(team: &str, project: &str, proof_hex: &str, message: &str) -> b
     };
     // Accept the current or previous bucket (clock skew / window edge).
     let now = bucket();
-    let Ok(m) = message.parse::<u64>() else { return false };
+    let Ok(m) = message.parse::<u64>() else {
+        return false;
+    };
     if m != now && m + 1 != now {
         return false;
     }
@@ -330,12 +353,19 @@ fn verify_access(team: &str, project: &str, proof_hex: &str, message: &str) -> b
 fn issue_cookie(project: &str) -> String {
     let exp = now_ms() + COOKIE_TTL_MS;
     let token = crate::secrets::encrypt(&format!("{project}|{exp}"));
-    format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}", COOKIE_TTL_MS / 1000)
+    format!(
+        "{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        COOKIE_TTL_MS / 1000
+    )
 }
 
 /// True if the request carries a valid, unexpired access cookie for `project`.
 pub fn cookie_access(project: &str, headers: &[(String, String)]) -> bool {
-    let Some(cookie_hdr) = headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cookie")).map(|(_, v)| v.clone()) else {
+    let Some(cookie_hdr) = headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+        .map(|(_, v)| v.clone())
+    else {
         return false;
     };
     for kv in cookie_hdr.split(';') {
@@ -367,7 +397,11 @@ fn query_param(query: &str, key: &str) -> Option<String> {
 /// host: verify the anonymous proof, set a short-lived access cookie, then redirect
 /// to `next` (default `/`) — completing the one-and-done unlock. `next` is forced
 /// to a same-site path (must start with a single `/`) to prevent open redirects.
-pub fn bootstrap(cloud: &std::sync::Arc<crate::state::CloudState>, host: &str, query: &str) -> Response {
+pub fn bootstrap(
+    cloud: &std::sync::Arc<crate::state::CloudState>,
+    host: &str,
+    query: &str,
+) -> Response {
     let Some(project) = cloud.gw.project_for_host(host) else {
         return (StatusCode::NOT_FOUND, "unknown deployment").into_response();
     };
@@ -434,7 +468,9 @@ pub(crate) async fn mint_rpc(team: &str, user_id: &str, project: &str) -> Json<V
 fn pctenc(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -448,13 +484,20 @@ fn pctenc(s: &str) -> String {
 /// the fleet (observed live: rings of 10, 22 and 26 members on different
 /// nodes). Minting where the proof will be VERIFIED makes the two rings the
 /// same object by construction, instead of depending on global convergence.
-async fn mint_on_owner(cloud: &Arc<crate::state::CloudState>, team: &str, req: &ProveReq) -> Option<Value> {
+async fn mint_on_owner(
+    cloud: &Arc<crate::state::CloudState>,
+    team: &str,
+    req: &ProveReq,
+) -> Option<Value> {
     let bare = req.host.split(':').next().unwrap_or(&req.host);
     let sub = bare.split('.').next().unwrap_or(bare).to_string();
     let node = {
         let routes = cloud.peer_routes.read();
         let rs = routes.get(&sub)?;
-        rs.iter().find(|r| r.healthy).or_else(|| rs.first()).map(|r| r.node_id.clone())?
+        rs.iter()
+            .find(|r| r.healthy)
+            .or_else(|| rs.first())
+            .map(|r| r.node_id.clone())?
     };
     let path = format!(
         "/v1/zkauth/mint?team={}&user={}&project={}",
@@ -505,14 +548,19 @@ fn internal_ok(headers: &HeaderMap) -> bool {
     }
 }
 
-async fn register(headers: HeaderMap, Json(req): Json<RegisterReq>) -> Result<Json<Value>, (StatusCode, String)> {
+async fn register(
+    headers: HeaderMap,
+    Json(req): Json<RegisterReq>,
+) -> Result<Json<Value>, (StatusCode, String)> {
     if !internal_ok(&headers) {
         return Err((StatusCode::FORBIDDEN, "enrollment is server-only".into()));
     }
     let team = team_of(&headers);
     let role = req.role.as_deref().map(parse_role).unwrap_or(Role::Member);
     let pk = ensure_member(&team, &req.user_id, role);
-    Ok(Json(json!({ "ok": true, "team": team, "public_key": hex(&pk.to_bytes()), "role": role_name(role) })))
+    Ok(Json(
+        json!({ "ok": true, "team": team, "public_key": hex(&pk.to_bytes()), "role": role_name(role) }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -543,12 +591,17 @@ async fn preview_proof(
         }
     }
     match mint(&team, &req.user_id, &req.project) {
-        Some((proof, message)) => Ok(Json(json!({ "proof": proof, "message": message, "team": team }))),
+        Some((proof, message)) => Ok(Json(
+            json!({ "proof": proof, "message": message, "team": team }),
+        )),
         // Enrollment is now unconditional, so this is no longer "we don't know
         // you" (which used to surface as a misleading 404) — reaching here means
         // proof construction itself failed, which is a server fault, not a
         // missing membership.
-        None => Err((StatusCode::INTERNAL_SERVER_ERROR, "could not construct a membership proof".into())),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not construct a membership proof".into(),
+        )),
     }
 }
 
@@ -558,7 +611,11 @@ async fn roster(headers: HeaderMap) -> Json<Value> {
     let members: Vec<Value> = s
         .teams
         .get(&team)
-        .map(|m| m.iter().map(|r| json!({ "user_id": r.user_id, "public_key": r.pubkey, "role": r.role })).collect())
+        .map(|m| {
+            m.iter()
+                .map(|r| json!({ "user_id": r.user_id, "public_key": r.pubkey, "role": r.role }))
+                .collect()
+        })
         .unwrap_or_default();
     Json(json!({ "team": team, "members": members }))
 }

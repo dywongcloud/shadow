@@ -16,7 +16,7 @@
 </style>
 </head>
 <body>
-<h1>SHADW browser node — networking scaffold (bn-impl-crate-scaffold)</h1>
+<h1>SHADW browser node — relay + sandboxed function runtime</h1>
 <div class="row"><span class="k">status</span><span class="v" id="s-status">booting…</span></div>
 <div class="row"><span class="k">node id</span><span class="v" id="s-id">—</span></div>
 <div class="row"><span class="k">relay</span><span class="v" id="s-relay">—</span></div>
@@ -32,22 +32,32 @@
 </div>
 
 <script type="module">
-  import init, { BrowserNode } from './pkg/hive_browser.js';
+  import init, { BrowserNode, blake3Hex } from './pkg/hive_browser.js';
+  import { BrowserFunctionRuntime } from './function-runtime.js';
+  import { BrowserAssetStore } from './asset-store.js';
+  import { BrowserNodeCompat } from './node-compat.js';
   import { loadOrCreateSeed } from './identity.js';
 
   const $ = (id) => document.getElementById(id);
   const setErr = (e) => { $('s-err').textContent = String(e && e.stack || e); };
+  const params = new URLSearchParams(location.search);
+  const harness = params.get('harness') === '1';
 
-  // Exposed for the gm browser verb to poll/drive from outside the module scope.
-  window.__hiveBrowserReady = false;
-  window.__hiveBrowserNode = null;
-  window.__hiveBrowserError = null;
-  window.__hiveIdentityCreated = null;
+  // The live node and grant/runtime authority are available only in the explicit
+  // development harness. Production ownership stays inside this module closure.
+  if (harness) {
+    window.__hiveBrowserReady = false;
+    window.__hiveBrowserNode = null;
+    window.__hiveFunctionRuntime = null;
+    window.__hiveAssetStore = null;
+    window.__hiveNodeCompat = null;
+    window.__hiveBrowserError = null;
+    window.__hiveIdentityCreated = null;
+  }
 
   async function boot() {
     await init();
 
-    const params = new URLSearchParams(location.search);
     const relay = params.get('relay') || 'wss://127.0.0.1:3341';
     const discovery = params.get('discovery') || '';
 
@@ -61,22 +71,46 @@
       // so the id reported below is the persisted one from the very first use.
       const scratch = await BrowserNode.boot(relay, null, null);
       const { seedHex, created } = await loadOrCreateSeed(scratch.secretHex());
-      window.__hiveIdentityCreated = created;
+      if (harness) window.__hiveIdentityCreated = created;
 
       let node;
       if (created) {
         node = scratch; // already booted from exactly the seed we just persisted
       } else {
-        scratch.free(); // discard the throwaway endpoint explicitly, don't wait on GC
+        await scratch.close(); // close relay/accept loop; free() alone cannot await QUIC drain
+        scratch.free();        // then release the wasm wrapper explicitly
         node = await BrowserNode.boot(relay, discovery || null, seedHex);
       }
-      window.__hiveBrowserNode = node;
+      const localDevelopment = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
+      const runtime = new BrowserFunctionRuntime({
+        development: localDevelopment && params.get('runtime-production') !== '1',
+        frameUrl: params.get('function-frame') || undefined,
+        blake3: blake3Hex,
+        ops: harness ? {
+          1: async value => value,
+          2: async value => new TextEncoder().encode(String(value)).buffer,
+        } : {},
+      });
+      runtime.attach(node);
+      const nodeCompat = new BrowserNodeCompat(runtime, { blake3: blake3Hex });
+      const assets = new BrowserAssetStore({ blake3: blake3Hex });
+      await assets.ready;
+      assets.attach(node);
+      if ('serviceWorker' in navigator) {
+        await navigator.serviceWorker.register('./asset-sw.js', { scope: './' });
+      }
+      if (harness) {
+        window.__hiveBrowserNode = node;
+        window.__hiveFunctionRuntime = runtime;
+        window.__hiveAssetStore = assets;
+        window.__hiveNodeCompat = nodeCompat;
+      }
 
       $('s-status').textContent = 'online';
       $('s-id').textContent = node.nodeId();
       $('s-relay').textContent = relay;
       $('s-addr').textContent = node.addrJson();
-      window.__hiveBrowserReady = true;
+      if (harness) window.__hiveBrowserReady = true;
 
       setInterval(() => {
         $('s-served').textContent = String(node.servedCount());
@@ -95,7 +129,7 @@
       };
     } catch (e) {
       $('s-status').textContent = 'FAILED';
-      window.__hiveBrowserError = String(e && e.stack || e);
+      if (harness) window.__hiveBrowserError = String(e && e.stack || e);
       setErr(e);
     }
   }

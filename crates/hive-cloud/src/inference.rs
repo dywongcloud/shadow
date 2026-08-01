@@ -73,8 +73,12 @@ pub fn port_for(project: &str) -> u16 {
 /// The GPU roster this module schedules over: healthy, GPU-carrying nodes,
 /// sorted by name for cross-node determinism.
 fn gpu_roster(cloud: &Arc<CloudState>) -> Vec<hive_edge::NodeInfo> {
-    let mut v: Vec<_> =
-        cloud.registry.nodes().into_iter().filter(|n| n.healthy && n.gpu_count > 0).collect();
+    let mut v: Vec<_> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.healthy && n.gpu_count > 0)
+        .collect();
     v.sort_by(|a, b| a.name.cmp(&b.name));
     v
 }
@@ -105,7 +109,9 @@ pub fn coordinator_for(cloud: &Arc<CloudState>, project: &str) -> Option<hive_ed
         .into_iter()
         .max_by(|a, b| a.1 .0.cmp(&b.1 .0).then(b.0.cmp(&a.0)))
         .map(|(k, v)| (k.clone(), v))?;
-    members.into_iter().max_by_key(|n| fnv(&format!("{project}|{}", n.name)))
+    members
+        .into_iter()
+        .max_by_key(|n| fnv(&format!("{project}|{}", n.name)))
 }
 
 /// Resolve a model ref to a fetchable URL: pass-through for http(s), else
@@ -118,7 +124,9 @@ pub fn model_url(model: &str) -> Option<String> {
     if parts.len() >= 3 && model.ends_with(".gguf") {
         let (org, repo) = (parts[0], parts[1]);
         let file = parts[2..].join("/");
-        return Some(format!("https://huggingface.co/{org}/{repo}/resolve/main/{file}"));
+        return Some(format!(
+            "https://huggingface.co/{org}/{repo}/resolve/main/{file}"
+        ));
     }
     None
 }
@@ -167,7 +175,12 @@ pub struct InferenceRuntime {
 
 impl InferenceRuntime {
     pub fn statuses(&self) -> Vec<EndpointStatus> {
-        let mut v: Vec<_> = self.servers.lock().values().map(|(_, s)| s.clone()).collect();
+        let mut v: Vec<_> = self
+            .servers
+            .lock()
+            .values()
+            .map(|(_, s)| s.clone())
+            .collect();
         v.sort_by(|a, b| a.project.cmp(&b.project));
         v
     }
@@ -176,8 +189,16 @@ impl InferenceRuntime {
 /// Transient-scope unit name for a project's inference server. Stable, so a
 /// teardown/restart can stop the right scope by name (see `reconcile_local`).
 fn scope_name(project: &str) -> String {
-    let safe: String =
-        project.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).collect();
+    let safe: String = project
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
     format!("hive-inference-{safe}")
 }
 
@@ -221,7 +242,9 @@ fn models_dir() -> std::path::PathBuf {
 async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> {
     let url = model_url(model).ok_or_else(|| format!("unresolvable model ref '{model}'"))?;
     let dir = models_dir();
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let path = dir.join(format!("hive-{:016x}.gguf", fnv(&url)));
     if let Ok(md) = tokio::fs::metadata(&path).await {
         if md.len() > 0 {
@@ -238,15 +261,22 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
     if !resp.status().is_success() {
         return Err(format!("model fetch {} -> {}", url, resp.status()));
     }
-    let mut f = tokio::fs::File::create(&tmp).await.map_err(|e| e.to_string())?;
+    let mut f = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| e.to_string())?;
     use tokio::io::AsyncWriteExt;
     while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
         f.write_all(&chunk).await.map_err(|e| e.to_string())?;
     }
     f.flush().await.map_err(|e| e.to_string())?;
     drop(f);
-    tokio::fs::rename(&tmp, &path).await.map_err(|e| e.to_string())?;
-    let size = tokio::fs::metadata(&path).await.map_err(|e| e.to_string())?.len();
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let size = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| e.to_string())?
+        .len();
     Ok((path, size))
 }
 
@@ -254,11 +284,17 @@ async fn ensure_model(model: &str) -> Result<(std::path::PathBuf, u64), String> 
 /// runs one TCP stream per member, so throughput is cwnd-limited by RTT — the
 /// live incident loaded 11GB at ~1.4MB/s over a 65ms "same-region" link.
 fn max_member_rtt_ms() -> u64 {
-    std::env::var("HIVE_INFERENCE_MAX_MEMBER_RTT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(20)
+    std::env::var("HIVE_INFERENCE_MAX_MEMBER_RTT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20)
 }
 
 fn load_timeout_secs() -> u64 {
-    std::env::var("HIVE_INFERENCE_LOAD_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(3600)
+    std::env::var("HIVE_INFERENCE_LOAD_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3600)
 }
 
 /// The parked status a load-timeout abort leaves behind. Matched EXACTLY by
@@ -365,7 +401,11 @@ fn plan_members(
         return Err("no pool data for coordinator region".into());
     };
     let rtt_of = |name: &str| rtts.get(name).copied().unwrap_or(RTT_UNKNOWN);
-    let mut others: Vec<_> = rp.nodes.iter().filter(|n| n.name != coordinator.name).collect();
+    let mut others: Vec<_> = rp
+        .nodes
+        .iter()
+        .filter(|n| n.name != coordinator.name)
+        .collect();
     // Free VRAM only breaks RTT ties; the name tiebreak keeps the plan
     // deterministic across ticks when both figures match.
     others.sort_by(|a, b| {
@@ -375,7 +415,9 @@ fn plan_members(
             .then(a.name.cmp(&b.name))
     });
     // Stable partition preserves the RTT order within each tier.
-    let (near, far): (Vec<_>, Vec<_>) = others.into_iter().partition(|n| rtt_of(&n.name) <= max_rtt_ms);
+    let (near, far): (Vec<_>, Vec<_>) = others
+        .into_iter()
+        .partition(|n| rtt_of(&n.name) <= max_rtt_ms);
     let mut covered = coord_free;
     let mut members = Vec::new();
     for n in near.iter().chain(far.iter()) {
@@ -410,7 +452,12 @@ fn plan_members(
 
 async fn health_ok(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
-    match reqwest::Client::new().get(&url).timeout(Duration::from_secs(3)).send().await {
+    match reqwest::Client::new()
+        .get(&url)
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+    {
         Ok(r) => r.status().is_success(),
         Err(_) => false,
     }
@@ -418,7 +465,11 @@ async fn health_ok(port: u16) -> bool {
 
 /// Reconcile ONE endpoint on its coordinator (this node). Ensures model +
 /// llama-server child; updates status in the runtime map.
-async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::project_settings::InferenceSpec) {
+async fn reconcile_local(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    spec: &crate::project_settings::InferenceSpec,
+) {
     let port = port_for(project);
     // A LIVE child is never relaunched, healthy or not: llama-server answers
     // /health with 503 for the entire multi-minute model load (tensor upload
@@ -527,18 +578,21 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
     let set_status = |cloud: &Arc<CloudState>, status: String, members: &[String]| {
         let mut servers = cloud.inference.servers.lock();
         let e = servers.entry(project.to_string()).or_insert_with(|| {
-            (None, EndpointStatus {
-                project: project.to_string(),
-                model: spec.model.clone(),
-                coordinator: cloud.node_name.clone(),
-                port,
-                pool: spec.pool,
-                rpc_members: Vec::new(),
-                status: "starting".into(),
-                unassigned_since_ms: 0,
-                load_started_ms: 0,
-                updated_ms: hive_core::now_ms(),
-            })
+            (
+                None,
+                EndpointStatus {
+                    project: project.to_string(),
+                    model: spec.model.clone(),
+                    coordinator: cloud.node_name.clone(),
+                    port,
+                    pool: spec.pool,
+                    rpc_members: Vec::new(),
+                    status: "starting".into(),
+                    unassigned_since_ms: 0,
+                    load_started_ms: 0,
+                    updated_ms: hive_core::now_ms(),
+                },
+            )
         });
         e.1.model = spec.model.clone();
         e.1.pool = spec.pool;
@@ -573,7 +627,8 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
         .map(|n| n.name)
         .collect();
     for p in &mut pools {
-        p.nodes.retain(|n| n.name == me.name || addressable.contains(&n.name));
+        p.nodes
+            .retain(|n| n.name == me.name || addressable.contains(&n.name));
     }
     let rtts = member_rtts(cloud, &me, &pools).await;
     let members = match plan_members(need, &me, spec.pool, &pools, &rtts, max_member_rtt_ms()) {
@@ -618,7 +673,9 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
     // scope under a dedicated slice accounts inference memory separately, so an
     // over-large model fails only its own endpoint (honest `failed` status)
     // and can never take hive-node down with it.
-    let use_scope = std::env::var("HIVE_INFERENCE_SCOPE").map(|v| v != "0").unwrap_or(true)
+    let use_scope = std::env::var("HIVE_INFERENCE_SCOPE")
+        .map(|v| v != "0")
+        .unwrap_or(true)
         && which_systemd_run().await;
     let mut cmd = if use_scope {
         let mut c = tokio::process::Command::new("systemd-run");
@@ -680,7 +737,10 @@ async fn reconcile_local(cloud: &Arc<CloudState>, project: &str, spec: &crate::p
 /// owns (coordinator role for spawn/kill, leader role for env injection).
 pub fn spawn_reconcile(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(
-        std::env::var("HIVE_INFERENCE_RECONCILE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(30),
+        std::env::var("HIVE_INFERENCE_RECONCILE_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
     );
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -750,7 +810,10 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
                         // the server keeps serving a project that moved away.
                         let unit = format!("{}.scope", scope_name(&p));
                         tokio::spawn(async move {
-                            let _ = tokio::process::Command::new("systemctl").args(["stop", &unit]).output().await;
+                            let _ = tokio::process::Command::new("systemctl")
+                                .args(["stop", &unit])
+                                .output()
+                                .await;
                         });
                         tracing::info!(project = %p, "inference: stopped endpoint (no longer desired/assigned here)");
                     }
@@ -763,18 +826,25 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
             // Leader slice: env injection for every inference project.
             if cloud.is_control_plane_leader() {
                 for (p, _spec) in &desired {
-                    let Some(coord) = coordinator_for(&cloud, p) else { continue };
-                    let Some(ip) = coord.public_ip.clone() else { continue };
+                    let Some(coord) = coordinator_for(&cloud, p) else {
+                        continue;
+                    };
+                    let Some(ip) = coord.public_ip.clone() else {
+                        continue;
+                    };
                     let url = format!("http://{ip}:{}/v1", port_for(p));
                     let current = cloud.projects.env_map(p).get("HIVE_INFERENCE_URL").cloned();
                     if current.as_deref() != Some(url.as_str()) {
-                        cloud.projects.put_env(p, crate::project_settings::EnvVar {
-                            key: "HIVE_INFERENCE_URL".into(),
-                            value: url.clone(),
-                            target: "all".into(),
-                            sensitive: false,
-                            updated_ms: hive_core::now_ms(),
-                        });
+                        cloud.projects.put_env(
+                            p,
+                            crate::project_settings::EnvVar {
+                                key: "HIVE_INFERENCE_URL".into(),
+                                value: url.clone(),
+                                target: "all".into(),
+                                sensitive: false,
+                                updated_ms: hive_core::now_ms(),
+                            },
+                        );
                         tracing::info!(project = %p, %url, "inference: injected HIVE_INFERENCE_URL");
                     }
                 }

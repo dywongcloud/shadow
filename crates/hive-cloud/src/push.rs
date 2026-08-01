@@ -132,7 +132,11 @@ impl PushStore {
     pub fn sms_key_override(&self) -> Option<String> {
         let s = self.inner.read();
         let k = s.sms_key_override.trim();
-        if k.is_empty() { None } else { Some(k.to_string()) }
+        if k.is_empty() {
+            None
+        } else {
+            Some(k.to_string())
+        }
     }
 
     /// Set (non-empty) or clear (empty) the operator Textbelt key.
@@ -151,7 +155,11 @@ impl PushStore {
                 return SubscribeResult::EndpointOwnedByOther;
             }
         } else {
-            let owned = s.subs.iter().filter(|x| x.user_id == sub.user_id && x.tenant == sub.tenant).count();
+            let owned = s
+                .subs
+                .iter()
+                .filter(|x| x.user_id == sub.user_id && x.tenant == sub.tenant)
+                .count();
             if owned >= MAX_SUBS_PER_USER_TENANT {
                 return SubscribeResult::CapReached;
             }
@@ -171,7 +179,8 @@ impl PushStore {
     pub fn remove_subscription(&self, endpoint: &str, user_id: Option<&str>) -> bool {
         let mut s = self.inner.write();
         let before = s.subs.len();
-        s.subs.retain(|x| x.endpoint != endpoint || user_id.is_some_and(|u| x.user_id != u));
+        s.subs
+            .retain(|x| x.endpoint != endpoint || user_id.is_some_and(|u| x.user_id != u));
         s.subs.len() != before
     }
 
@@ -181,13 +190,21 @@ impl PushStore {
     pub fn purge_user_tenant(&self, user_id: &str, tenant: &str) -> usize {
         let mut s = self.inner.write();
         let before = s.subs.len() + s.sms.len();
-        s.subs.retain(|x| !(x.user_id == user_id && x.tenant == tenant));
-        s.sms.retain(|x| !(x.user_id == user_id && x.tenant == tenant));
+        s.subs
+            .retain(|x| !(x.user_id == user_id && x.tenant == tenant));
+        s.sms
+            .retain(|x| !(x.user_id == user_id && x.tenant == tenant));
         before - (s.subs.len() + s.sms.len())
     }
 
     pub fn subscriptions_for_tenant(&self, tenant: &str) -> Vec<PushSubscription> {
-        self.inner.read().subs.iter().filter(|s| s.tenant == tenant).cloned().collect()
+        self.inner
+            .read()
+            .subs
+            .iter()
+            .filter(|s| s.tenant == tenant)
+            .cloned()
+            .collect()
     }
 
     pub fn devices_for(&self, user_id: &str, tenant: &str) -> Vec<PushSubscription> {
@@ -204,9 +221,20 @@ impl PushStore {
     /// the code, so no delivery happens until `verify_sms`. Changing the number
     /// clears any prior verification. Returns false (no code stored) if a fresh
     /// code was sent within the cooldown, to bound resend-driven SMS spend.
-    pub fn set_sms_pending(&self, user_id: &str, tenant: &str, phone: &str, code: &str, now: u64) -> bool {
+    pub fn set_sms_pending(
+        &self,
+        user_id: &str,
+        tenant: &str,
+        phone: &str,
+        code: &str,
+        now: u64,
+    ) -> bool {
         let mut s = self.inner.write();
-        if let Some(t) = s.sms.iter_mut().find(|x| x.user_id == user_id && x.tenant == tenant) {
+        if let Some(t) = s
+            .sms
+            .iter_mut()
+            .find(|x| x.user_id == user_id && x.tenant == tenant)
+        {
             if t.phone == phone && t.verified {
                 // Re-confirming the same, already-verified number: no new code.
                 return false;
@@ -231,7 +259,8 @@ impl PushStore {
             code_sent_ms: now,
             created_ms: now,
         });
-        s.sms.sort_by(|a, b| (&a.user_id, &a.tenant).cmp(&(&b.user_id, &b.tenant)));
+        s.sms
+            .sort_by(|a, b| (&a.user_id, &a.tenant).cmp(&(&b.user_id, &b.tenant)));
         true
     }
 
@@ -239,7 +268,11 @@ impl PushStore {
     /// row verified + enabled and clears the code.
     pub fn verify_sms(&self, user_id: &str, tenant: &str, code: &str, now: u64) -> bool {
         let mut s = self.inner.write();
-        let Some(t) = s.sms.iter_mut().find(|x| x.user_id == user_id && x.tenant == tenant) else {
+        let Some(t) = s
+            .sms
+            .iter_mut()
+            .find(|x| x.user_id == user_id && x.tenant == tenant)
+        else {
             return false;
         };
         let ok = t.pending_code.as_deref() == Some(code)
@@ -257,7 +290,11 @@ impl PushStore {
     /// off then back on needs no re-verification). No-op if unverified.
     pub fn set_sms_enabled(&self, user_id: &str, tenant: &str, enabled: bool) -> bool {
         let mut s = self.inner.write();
-        if let Some(t) = s.sms.iter_mut().find(|x| x.user_id == user_id && x.tenant == tenant && x.verified) {
+        if let Some(t) = s
+            .sms
+            .iter_mut()
+            .find(|x| x.user_id == user_id && x.tenant == tenant && x.verified)
+        {
             t.enabled = enabled;
             true
         } else {
@@ -266,12 +303,23 @@ impl PushStore {
     }
 
     pub fn sms_for(&self, user_id: &str, tenant: &str) -> Option<SmsTarget> {
-        self.inner.read().sms.iter().find(|x| x.user_id == user_id && x.tenant == tenant).cloned()
+        self.inner
+            .read()
+            .sms
+            .iter()
+            .find(|x| x.user_id == user_id && x.tenant == tenant)
+            .cloned()
     }
 
     /// Delivery targets: verified AND enabled only.
     pub fn sms_targets_for_tenant(&self, tenant: &str) -> Vec<SmsTarget> {
-        self.inner.read().sms.iter().filter(|x| x.tenant == tenant && x.enabled && x.verified).cloned().collect()
+        self.inner
+            .read()
+            .sms
+            .iter()
+            .filter(|x| x.tenant == tenant && x.enabled && x.verified)
+            .cloned()
+            .collect()
     }
 
     /// Tenants with at least one deliverable target — the dispatcher's work list.
@@ -281,7 +329,12 @@ impl PushStore {
             .subs
             .iter()
             .map(|x| x.tenant.clone())
-            .chain(s.sms.iter().filter(|x| x.enabled && x.verified).map(|x| x.tenant.clone()))
+            .chain(
+                s.sms
+                    .iter()
+                    .filter(|x| x.enabled && x.verified)
+                    .map(|x| x.tenant.clone()),
+            )
             .collect();
         t.sort();
         t.dedup();
@@ -289,7 +342,11 @@ impl PushStore {
     }
 
     pub fn was_delivered(&self, tenant: &str, id: &str) -> bool {
-        self.inner.read().delivered.get(tenant).is_some_and(|v| v.iter().any(|x| x == id))
+        self.inner
+            .read()
+            .delivered
+            .get(tenant)
+            .is_some_and(|v| v.iter().any(|x| x == id))
     }
 
     pub fn mark_delivered(&self, tenant: &str, id: &str) {
@@ -351,21 +408,39 @@ pub fn ensure_vapid_on_leader(c: &Arc<CloudState>) {
 /// VAPID-signed, server-side POSTs from being aimed at attacker-chosen URLs
 /// (SSRF/amplification) via a forged subscription.
 fn allowed_push_host(endpoint: &str) -> bool {
-    let Some(rest) = endpoint.strip_prefix("https://") else { return false };
-    let host = rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("");
+    let Some(rest) = endpoint.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
     const SUFFIXES: &[&str] = &[
-        "fcm.googleapis.com",              // Chrome / Android (FCM)
-        "android.googleapis.com",          // legacy GCM/FCM
-        ".push.services.mozilla.com",      // Firefox (autopush)
-        ".notify.windows.com",             // Edge (WNS)
-        ".push.apple.com",                 // Safari (Apple Push)
+        "fcm.googleapis.com",         // Chrome / Android (FCM)
+        "android.googleapis.com",     // legacy GCM/FCM
+        ".push.services.mozilla.com", // Firefox (autopush)
+        ".notify.windows.com",        // Edge (WNS)
+        ".push.apple.com",            // Safari (Apple Push)
     ];
-    SUFFIXES.iter().any(|s| if let Some(dom) = s.strip_prefix('.') { host == *s || host.ends_with(s) || host == dom } else { host == *s })
+    SUFFIXES.iter().any(|s| {
+        if let Some(dom) = s.strip_prefix('.') {
+            host == *s || host.ends_with(s) || host == dom
+        } else {
+            host == *s
+        }
+    })
 }
 
 /// Public entry for the handler: validate an endpoint (scheme + host allowlist)
 /// and the subscriber key sizes before storing a row.
-pub fn valid_subscription_input(endpoint: &str, p256dh: &str, auth: &str) -> Result<(), &'static str> {
+pub fn valid_subscription_input(
+    endpoint: &str,
+    p256dh: &str,
+    auth: &str,
+) -> Result<(), &'static str> {
     if !allowed_push_host(endpoint) {
         return Err("endpoint host is not a recognized push service");
     }
@@ -399,8 +474,17 @@ fn b64u_decode(s: &str) -> Option<Vec<u8>> {
 
 fn generate_vapid() -> Option<VapidKeys> {
     let rng = ring::rand::SystemRandom::new();
-    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(&ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING, &rng).ok()?;
-    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(&ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).ok()?;
+    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &rng,
+    )
+    .ok()?;
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        pkcs8.as_ref(),
+        &rng,
+    )
+    .ok()?;
     use ring::signature::KeyPair;
     Some(VapidKeys {
         public_b64: b64u(pair.public_key().as_ref()),
@@ -429,9 +513,18 @@ fn vapid_auth_header(keys: &VapidKeys, endpoint: &str) -> Option<String> {
     let signing_input = format!("{header}.{claims}");
     let rng = ring::rand::SystemRandom::new();
     let pkcs8 = b64u_decode(&keys.pkcs8_b64)?;
-    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(&ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING, &pkcs8, &rng).ok()?;
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING,
+        &pkcs8,
+        &rng,
+    )
+    .ok()?;
     let sig = pair.sign(&rng, signing_input.as_bytes()).ok()?;
-    Some(format!("vapid t={signing_input}.{}, k={}", b64u(sig.as_ref()), keys.public_b64))
+    Some(format!(
+        "vapid t={signing_input}.{}, k={}",
+        b64u(sig.as_ref()),
+        keys.public_b64
+    ))
 }
 
 // ============================ RFC 8291 content encryption ============================
@@ -464,9 +557,11 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
         return None;
     }
     let rng = ring::rand::SystemRandom::new();
-    let eph = ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng).ok()?;
+    let eph =
+        ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::ECDH_P256, &rng).ok()?;
     let as_public = eph.compute_public_key().ok()?.as_ref().to_vec(); // 65 bytes
-    let peer = ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, ua_public.clone());
+    let peer =
+        ring::agreement::UnparsedPublicKey::new(&ring::agreement::ECDH_P256, ua_public.clone());
     let ecdh = ring::agreement::agree_ephemeral(eph, &peer, |secret| secret.to_vec()).ok()?;
 
     // ikm = HKDF(salt=auth_secret, ikm=ecdh, info="WebPush: info"‖0x00‖ua_pub‖as_pub, 32)
@@ -484,9 +579,12 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
     // Single record: payload ‖ 0x02 (last-record delimiter), AES-128-GCM.
     let mut record = payload.to_vec();
     record.push(0x02);
-    let key = ring::aead::LessSafeKey::new(ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &cek).ok()?);
+    let key = ring::aead::LessSafeKey::new(
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &cek).ok()?,
+    );
     let n = ring::aead::Nonce::try_assume_unique_for_key(&nonce).ok()?;
-    key.seal_in_place_append_tag(n, ring::aead::Aad::empty(), &mut record).ok()?;
+    key.seal_in_place_append_tag(n, ring::aead::Aad::empty(), &mut record)
+        .ok()?;
 
     // aes128gcm coding header: salt(16) ‖ rs(4) ‖ idlen(1) ‖ keyid(as_public).
     let mut body = Vec::with_capacity(16 + 4 + 1 + 65 + record.len());
@@ -503,14 +601,19 @@ fn encrypt_payload(p256dh_b64: &str, auth_b64: &str, payload: &[u8]) -> Option<V
 /// One web push to one subscription. `Ok(true)` delivered; `Ok(false)` the
 /// push service reported the subscription permanently gone (prune it);
 /// `Err` transient/other failure (keep the subscription, log).
-pub async fn send_web_push(c: &Arc<CloudState>, sub: &PushSubscription, payload: &serde_json::Value) -> Result<bool, String> {
+pub async fn send_web_push(
+    c: &Arc<CloudState>,
+    sub: &PushSubscription,
+    payload: &serde_json::Value,
+) -> Result<bool, String> {
     let keys = c.push.vapid();
     if keys.public_b64.is_empty() {
         return Err("vapid keys unavailable".into());
     }
     let auth = vapid_auth_header(&keys, &sub.endpoint).ok_or("vapid header build failed")?;
     let bytes = serde_json::to_vec(payload).map_err(|e| e.to_string())?;
-    let body = encrypt_payload(&sub.p256dh, &sub.auth, &bytes).ok_or("payload encryption failed (bad subscription keys?)")?;
+    let body = encrypt_payload(&sub.p256dh, &sub.auth, &bytes)
+        .ok_or("payload encryption failed (bad subscription keys?)")?;
     let r = c
         .http
         .post(&sub.endpoint)
@@ -546,7 +649,12 @@ pub async fn send_web_push(c: &Arc<CloudState>, sub: &PushSubscription, payload:
 /// retry the send THROUGH a peer whose egress is reliably NA-classified
 /// (`HIVE_SMS_EGRESS_NODES`, default the LA nodes) over the authenticated
 /// mesh, so SMS keeps working no matter which node runs the dispatcher.
-pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
+pub async fn send_sms(
+    c: &Arc<CloudState>,
+    phone: &str,
+    message: &str,
+    test_mode: bool,
+) -> Result<(), String> {
     let primary = send_sms_primary(c, phone, message, test_mode).await;
     match primary {
         Ok(()) => Ok(()),
@@ -573,7 +681,10 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
                     // surface the combined error.
                     for peer in sms_egress_peers(&c.node_name) {
                         let dm = serde_json::json!({ "phone": phone, "message": message });
-                        if let Some(v) = crate::admin::put_to_host(c, &peer, "/v1/push/sms-direct-mx", "", &dm).await {
+                        if let Some(v) =
+                            crate::admin::put_to_host(c, &peer, "/v1/push/sms-direct-mx", "", &dm)
+                                .await
+                        {
                             if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
                                 tracing::warn!(node = %c.node_name, %peer, %primary_err, %fb_err, "delivered via direct-MX carrier gateway on NA-egress peer");
                                 return Ok(());
@@ -594,7 +705,12 @@ pub async fn send_sms(c: &Arc<CloudState>, phone: &str, message: &str, test_mode
 }
 
 /// The hosted-Textbelt path (direct + NA-egress relay), unchanged semantics.
-async fn send_sms_primary(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
+async fn send_sms_primary(
+    c: &Arc<CloudState>,
+    phone: &str,
+    message: &str,
+    test_mode: bool,
+) -> Result<(), String> {
     match send_sms_direct(c, phone, message, test_mode).await {
         Ok(()) => Ok(()),
         Err(raw) if is_region_error(&raw) => {
@@ -602,7 +718,9 @@ async fn send_sms_primary(c: &Arc<CloudState>, phone: &str, message: &str, test_
             let mut last = raw;
             for peer in sms_egress_peers(&c.node_name) {
                 let body = serde_json::json!({ "phone": phone, "message": message, "test_mode": test_mode });
-                if let Some(v) = crate::admin::put_to_host(c, &peer, "/v1/push/sms-relay", "", &body).await {
+                if let Some(v) =
+                    crate::admin::put_to_host(c, &peer, "/v1/push/sms-relay", "", &body).await
+                {
                     if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
                         tracing::info!(%peer, "SMS relayed via NA egress peer");
                         return Ok(());
@@ -635,7 +753,11 @@ async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> R
     // outright as "Invalid phone number" (live-witnessed). Strip a leading
     // country-code '1' when present so the fallback gets the shape it expects.
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-    let local = if digits.len() == 11 && digits.starts_with('1') { digits[1..].to_string() } else { digits };
+    let local = if digits.len() == 11 && digits.starts_with('1') {
+        digits[1..].to_string()
+    } else {
+        digits
+    };
     // The OSS service blasts an unknown-carrier number to all 15 US gateway
     // domains CONCURRENTLY (Promise.allSettled), but a single stalling
     // provider can legitimately take 6s connect + up to 6 SMTP replies x 10s
@@ -655,7 +777,11 @@ async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> R
     if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
         Ok(())
     } else {
-        Err(v.get("message").and_then(|m| m.as_str()).unwrap_or("send failed").to_string())
+        Err(v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("send failed")
+            .to_string())
     }
 }
 
@@ -665,9 +791,11 @@ async fn send_sms_fallback(c: &Arc<CloudState>, phone: &str, message: &str) -> R
 /// The effective Textbelt key: the operator-set store override (dashboard,
 /// fleet-replicated) wins over the `HIVE_TEXTBELT_KEY` env.
 pub fn textbelt_key(c: &Arc<CloudState>) -> Option<String> {
-    c.push
-        .sms_key_override()
-        .or_else(|| std::env::var("HIVE_TEXTBELT_KEY").ok().filter(|k| !k.trim().is_empty()))
+    c.push.sms_key_override().or_else(|| {
+        std::env::var("HIVE_TEXTBELT_KEY")
+            .ok()
+            .filter(|k| !k.trim().is_empty())
+    })
 }
 
 /// Drop the cached quota reading (call after the key changes so the settings
@@ -676,11 +804,20 @@ pub fn reset_sms_quota_cache() {
     *QUOTA_CACHE.write() = None;
 }
 
-async fn send_sms_direct(c: &Arc<CloudState>, phone: &str, message: &str, test_mode: bool) -> Result<(), String> {
+async fn send_sms_direct(
+    c: &Arc<CloudState>,
+    phone: &str,
+    message: &str,
+    test_mode: bool,
+) -> Result<(), String> {
     let Some(key) = textbelt_key(c) else {
         return Err("no Textbelt key configured (set one in Settings → Notifications, or HIVE_TEXTBELT_KEY)".into());
     };
-    let key = if test_mode { format!("{key}_test") } else { key };
+    let key = if test_mode {
+        format!("{key}_test")
+    } else {
+        key
+    };
     let r = c
         .http
         .post("https://textbelt.com/text")
@@ -693,7 +830,11 @@ async fn send_sms_direct(c: &Arc<CloudState>, phone: &str, message: &str, test_m
     if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
         Ok(())
     } else {
-        Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("textbelt send failed").to_string())
+        Err(v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("textbelt send failed")
+            .to_string())
     }
 }
 
@@ -721,15 +862,26 @@ fn sms_egress_peers(self_name: &str) -> Vec<String> {
 /// the caller already chose this node for its egress) and report a sanitized
 /// result. Served by the `/v1/push/sms-relay` admin route and its gossip arm.
 pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> serde_json::Value {
-    let phone = body.get("phone").and_then(|v| v.as_str()).unwrap_or_default();
-    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default();
-    let test_mode = body.get("test_mode").and_then(|v| v.as_bool()).unwrap_or(false);
+    let phone = body
+        .get("phone")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let test_mode = body
+        .get("test_mode")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if phone.is_empty() || message.is_empty() {
         return serde_json::json!({ "success": false, "error": "missing phone/message" });
     }
     match send_sms_direct(c, phone, message, test_mode).await {
         Ok(()) => serde_json::json!({ "success": true }),
-        Err(raw) => serde_json::json!({ "success": false, "error": sanitize_textbelt_error(c, &raw) }),
+        Err(raw) => {
+            serde_json::json!({ "success": false, "error": sanitize_textbelt_error(c, &raw) })
+        }
     }
 }
 
@@ -751,12 +903,12 @@ pub async fn sms_relay_exec(c: &Arc<CloudState>, body: serde_json::Value) -> ser
 /// to every listed gateway and the recipient's real carrier is whichever one
 /// accepts + delivers).
 const US_SMS_GATEWAYS: &[&str] = &[
-    "email.uscc.net",       // US Cellular  (proven accepting from fc-lax)
-    "vtext.com",            // Verizon
-    "tmomail.net",          // T-Mobile
-    "txt.att.net",          // AT&T
-    "sms.ntwls.net",        // Nextech
-    "msg.fi.google.com",    // Google Fi
+    "email.uscc.net",    // US Cellular  (proven accepting from fc-lax)
+    "vtext.com",         // Verizon
+    "tmomail.net",       // T-Mobile
+    "txt.att.net",       // AT&T
+    "sms.ntwls.net",     // Nextech
+    "msg.fi.google.com", // Google Fi
     "text.republicwireless.com",
     "qwestmp.com",
 ];
@@ -765,7 +917,10 @@ const US_SMS_GATEWAYS: &[&str] = &[
 /// Returns Ok on a 2xx to the final `.`; Err with the SMTP reason otherwise.
 async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let domain = to.split('@').nth(1).ok_or_else(|| format!("bad recipient {to}"))?;
+    let domain = to
+        .split('@')
+        .nth(1)
+        .ok_or_else(|| format!("bad recipient {to}"))?;
     // MX lookup (falls back to the domain itself as an implicit MX per RFC 5321).
     let resolver = hickory_resolver::Resolver::builder_tokio()
         .map_err(|e| format!("resolver init: {e}"))?
@@ -787,7 +942,10 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
                 })
                 .collect();
             mxs.sort_by_key(|(pref, _)| *pref);
-            mxs.into_iter().next().map(|(_, h)| h).ok_or_else(|| format!("no MX for {domain}"))?
+            mxs.into_iter()
+                .next()
+                .map(|(_, h)| h)
+                .ok_or_else(|| format!("no MX for {domain}"))?
         }
         Err(_) => return Err(format!("no MX for {domain}")),
     };
@@ -819,7 +977,11 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
             buf.extend_from_slice(&chunk[..n]);
             // A complete reply ends with a line whose 4th char is a space
             // ("NNN " — final) rather than '-' (continuation).
-            if let Some(line) = String::from_utf8_lossy(&buf).lines().last().map(str::to_string) {
+            if let Some(line) = String::from_utf8_lossy(&buf)
+                .lines()
+                .last()
+                .map(str::to_string)
+            {
                 if line.len() >= 4 && line.as_bytes()[3] == b' ' {
                     let code = &line[..3];
                     if code.starts_with(want as char) {
@@ -861,12 +1023,21 @@ async fn smtp_deliver_one(to: &str, from: &str, text: &str) -> Result<(), String
 pub async fn send_direct_mx(phone: &str, message: &str) -> Result<(), String> {
     // Bare 10-digit local number (gateways want no country code).
     let digits: String = phone.chars().filter(|c| c.is_ascii_digit()).collect();
-    let local = if digits.len() == 11 && digits.starts_with('1') { digits[1..].to_string() } else { digits };
+    let local = if digits.len() == 11 && digits.starts_with('1') {
+        digits[1..].to_string()
+    } else {
+        digits
+    };
     if local.len() != 10 {
         return Err(format!("not a US 10-digit number: {phone}"));
     }
     let from = std::env::var("SMS_FROM").unwrap_or_else(|_| "sms@shadw.cloud".into());
-    let from = from.rsplit('<').next().unwrap_or(&from).trim_end_matches('>').to_string();
+    let from = from
+        .rsplit('<')
+        .next()
+        .unwrap_or(&from)
+        .trim_end_matches('>')
+        .to_string();
     let futs = US_SMS_GATEWAYS.iter().map(|gw| {
         let to = format!("{local}@{gw}");
         let from = from.clone();
@@ -874,7 +1045,11 @@ pub async fn send_direct_mx(phone: &str, message: &str) -> Result<(), String> {
         async move { (to.clone(), smtp_deliver_one(&to, &from, &message).await) }
     });
     let results = futures::future::join_all(futs).await;
-    let accepted: Vec<&String> = results.iter().filter(|(_, r)| r.is_ok()).map(|(to, _)| to).collect();
+    let accepted: Vec<&String> = results
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(to, _)| to)
+        .collect();
     if !accepted.is_empty() {
         tracing::info!(?accepted, "direct-MX SMS accepted by carrier gateway(s)");
         return Ok(());
@@ -889,8 +1064,14 @@ pub async fn send_direct_mx(phone: &str, message: &str) -> Result<(), String> {
 /// Direct-MX relay executor: run the direct-MX blast on THIS node (the caller
 /// chose it for its open :25 egress). Served by `/v1/push/sms-direct-mx`.
 pub async fn sms_direct_mx_exec(body: serde_json::Value) -> serde_json::Value {
-    let phone = body.get("phone").and_then(|v| v.as_str()).unwrap_or_default();
-    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or_default();
+    let phone = body
+        .get("phone")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if phone.is_empty() || message.is_empty() {
         return serde_json::json!({ "success": false, "error": "missing phone/message" });
     }
@@ -930,7 +1111,10 @@ fn sanitize_textbelt_error(c: &Arc<CloudState>, raw: &str) -> String {
     // Belt-and-braces: drop any lingering key= query fragment (and everything
     // after it up to whitespace) even if the env value didn't textually match.
     if let Some(i) = s.find("key=") {
-        let tail_end = s[i..].find(char::is_whitespace).map(|w| i + w).unwrap_or(s.len());
+        let tail_end = s[i..]
+            .find(char::is_whitespace)
+            .map(|w| i + w)
+            .unwrap_or(s.len());
         s.replace_range(i..tail_end, "key=***");
     }
     s
@@ -967,7 +1151,9 @@ async fn sms_quota(c: &Arc<CloudState>) -> Option<i64> {
     // Clamp to >=0: Textbelt reports a negative quotaRemaining for an
     // exhausted/invalid key, which read as a nonsensical "-1 SMS remaining" in
     // the UI. 0 is the honest "none left" the settings page renders sensibly.
-    v.get("quotaRemaining").and_then(|q| q.as_i64()).map(|q| q.max(0))
+    v.get("quotaRemaining")
+        .and_then(|q| q.as_i64())
+        .map(|q| q.max(0))
 }
 
 /// Format one notification as an SMS body (single segment, 160 chars).
@@ -1038,7 +1224,11 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                     // affirmatively own (guards the orphan/untagged-project
                     // cross-tenant fallback in project_owned_by), already-read,
                     // or archived, or that we've already delivered.
-                    .filter(|n| !n.archived && !c.push.was_delivered(&tenant, &n.id) && crate::admin::project_owned_by(&c, &n.project, &tenant))
+                    .filter(|n| {
+                        !n.archived
+                            && !c.push.was_delivered(&tenant, &n.id)
+                            && crate::admin::project_owned_by(&c, &n.project, &tenant)
+                    })
                     .collect();
                 if notifs.is_empty() {
                     continue;
@@ -1053,12 +1243,15 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                     // Fan the web pushes out with bounded concurrency; a hung
                     // endpoint can't stall the others (each has its own 15s cap).
                     for chunk in subs.chunks(SEND_CONCURRENCY) {
-                        let results = futures::future::join_all(chunk.iter().map(|sub| {
-                            let c = c.clone();
-                            let payload = payload.clone();
-                            async move { (sub.endpoint.clone(), send_web_push(&c, sub, &payload).await) }
-                        }))
-                        .await;
+                        let results =
+                            futures::future::join_all(chunk.iter().map(|sub| {
+                                let c = c.clone();
+                                let payload = payload.clone();
+                                async move {
+                                    (sub.endpoint.clone(), send_web_push(&c, sub, &payload).await)
+                                }
+                            }))
+                            .await;
                         for (endpoint, res) in results {
                             match res {
                                 Ok(true) => {}
@@ -1069,7 +1262,9 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                                     // mark_delivered below (runs every
                                     // iteration), so the prune is persisted too.
                                 }
-                                Err(e) => tracing::warn!(tenant = %tenant, error = %e, "web push send failed"),
+                                Err(e) => {
+                                    tracing::warn!(tenant = %tenant, error = %e, "web push send failed")
+                                }
                             }
                         }
                     }
@@ -1084,7 +1279,9 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
                             }
                             match send_sms(&c, &target.phone, &sms_body(n), false).await {
                                 Ok(()) => window.push(now), // count real SENDS
-                                Err(e) => tracing::warn!(tenant = %tenant, error = %e, "sms send failed"),
+                                Err(e) => {
+                                    tracing::warn!(tenant = %tenant, error = %e, "sms send failed")
+                                }
                             }
                         }
                     }

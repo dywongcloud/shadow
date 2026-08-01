@@ -131,7 +131,8 @@ impl FirecrackerBackend {
 
     /// PATH for invoking podman on a Linux Firecracker host (systemd units run with
     /// a minimal env). Covers the standard distro locations.
-    const PODMAN_PATH: &'static str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const PODMAN_PATH: &'static str =
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
     /// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
     /// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
@@ -149,12 +150,21 @@ impl FirecrackerBackend {
         let candidates: Vec<String> = if v.contains('/') {
             vec![v.to_string()]
         } else {
-            ["/usr/local/bin", "/usr/bin", "/usr/local/sbin", "/usr/sbin", "/bin"]
-                .iter()
-                .map(|d| format!("{d}/{v}"))
-                .collect()
+            [
+                "/usr/local/bin",
+                "/usr/bin",
+                "/usr/local/sbin",
+                "/usr/sbin",
+                "/bin",
+            ]
+            .iter()
+            .map(|d| format!("{d}/{v}"))
+            .collect()
         };
-        if let Some(path) = candidates.into_iter().find(|p| std::path::Path::new(p).exists()) {
+        if let Some(path) = candidates
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        {
             Some(path)
         } else {
             tracing::warn!(runtime = %v, "HIVE_CONTAINER_RUNTIME set but binary not found — using podman default runtime");
@@ -210,7 +220,9 @@ impl FirecrackerBackend {
             let name = e.file_name().to_string_lossy().to_string();
             // Only this backend's own per-deployment data images. Never touch
             // the shared base rootfs/kernel artifacts sitting in the same dir.
-            let Some(stem) = name.strip_suffix(".data.ext4") else { continue };
+            let Some(stem) = name.strip_suffix(".data.ext4") else {
+                continue;
+            };
             total_images += 1;
             // Match BOTH the literal stem and the prefix-stripped form.
             //
@@ -379,7 +391,11 @@ impl FirecrackerBackend {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .map(|mib| mib * 1024 * 1024)
             .unwrap_or(3 * 1024 * 1024 * 1024);
-        let base = if self.cfg.run_dir.exists() { self.cfg.run_dir.as_path() } else { std::path::Path::new("/") };
+        let base = if self.cfg.run_dir.exists() {
+            self.cfg.run_dir.as_path()
+        } else {
+            std::path::Path::new("/")
+        };
         let before = Self::disk_free_bytes(base);
         if before >= floor_bytes {
             return Ok(());
@@ -414,14 +430,18 @@ impl FirecrackerBackend {
     }
 
     fn rootfs_for(&self, image: &str) -> PathBuf {
-        self.cfg.rootfs_dir.join(format!("{}.ext4", sanitize_image(image)))
+        self.cfg
+            .rootfs_dir
+            .join(format!("{}.ext4", sanitize_image(image)))
     }
 
     /// Per-deployment build-output ext4 (the artifact `deliver_build` packs and
     /// `provision` attaches as the cell's second drive). Lives alongside the
     /// base rootfs images, keyed by the same logical image name.
     fn data_image_for(&self, image: &str) -> PathBuf {
-        self.cfg.rootfs_dir.join(format!("{}.data.ext4", sanitize_image(image)))
+        self.cfg
+            .rootfs_dir
+            .join(format!("{}.data.ext4", sanitize_image(image)))
     }
 
     /// Locate a deployment's data image on disk for the storage broker
@@ -466,7 +486,10 @@ impl FirecrackerBackend {
     /// id before ever reaching here — this is defense in depth for whatever
     /// calls it next, not the only gate.
     pub fn snapshot_dir(&self, deployment_id: &str) -> PathBuf {
-        self.cfg.rootfs_dir.join("snapshots").join(format!("snaps-{}", sanitize_image(deployment_id)))
+        self.cfg
+            .rootfs_dir
+            .join("snapshots")
+            .join(format!("snaps-{}", sanitize_image(deployment_id)))
     }
 
     /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) can
@@ -497,7 +520,10 @@ impl FirecrackerBackend {
         // path the cell↔cell FORWARD DROP above is untouched (a guest still
         // cannot reach another guest this way — it reaches the same public
         // host-routing hive-cloud serves everyone).
-        let hairpin = match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
+        let hairpin = match std::env::var("HIVE_PUBLIC_IP")
+            .ok()
+            .map(|s| s.trim().to_string())
+        {
             // `auto` is a real configured value meaning "detect at runtime", not
             // an address — and an unset/unparseable value means this host has no
             // inbound-reachable address to hairpin to at all.
@@ -588,7 +614,10 @@ impl FirecrackerBackend {
     /// outbound `fetch`. Best-effort: DNS simply won't work if debugfs is absent.
     async fn write_guest_resolv(&self, overlay: &std::path::Path) {
         let tmp = overlay.with_extension("resolv.tmp");
-        if tokio::fs::write(&tmp, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n").await.is_err() {
+        if tokio::fs::write(&tmp, "nameserver 8.8.8.8\nnameserver 1.1.1.1\n")
+            .await
+            .is_err()
+        {
             return;
         }
         let script = format!(
@@ -598,7 +627,11 @@ impl FirecrackerBackend {
             ov = overlay.display(),
             tmp = tmp.display(),
         );
-        let _ = Command::new("/bin/sh").arg("-c").arg(&script).status().await;
+        let _ = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .await;
         let _ = tokio::fs::remove_file(&tmp).await;
     }
 
@@ -624,7 +657,13 @@ pub const DELIVERED_WORKDIR: &str = "/build";
 fn sanitize_image(image: &str) -> String {
     image
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -645,7 +684,13 @@ fn sanitize_image(image: &str) -> String {
 async fn reflink_or_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
-        if let Ok(out) = tokio::process::Command::new("cp").arg("--reflink=auto").arg(src).arg(dst).output().await {
+        if let Ok(out) = tokio::process::Command::new("cp")
+            .arg("--reflink=auto")
+            .arg(src)
+            .arg(dst)
+            .output()
+            .await
+        {
             if out.status.success() {
                 return Ok(());
             }
@@ -665,8 +710,16 @@ impl CellBackend for FirecrackerBackend {
         // microVM boot needed — just a per-cell run dir; `start_function` does the
         // `podman run`. This is what lets a Firecracker node also run containers.
         if let Some(ctr) = &spec.container {
-            let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
-            let run_dir = self.cfg.run_dir.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
+            let tenant = if spec.tenant.trim().is_empty() {
+                "personal"
+            } else {
+                spec.tenant.as_str()
+            };
+            let run_dir = self
+                .cfg
+                .run_dir
+                .join(crate::sanitize_tenant(tenant))
+                .join(spec.id.as_str());
             tokio::fs::create_dir_all(&run_dir).await?;
             tracing::debug!(cell = %spec.id, image = %ctr.image, "provisioning container cell (host podman)");
             return Ok(CellHandle {
@@ -691,8 +744,16 @@ impl CellBackend for FirecrackerBackend {
         // sockets / overlays / console logs are isolated on the host. (The VM
         // itself is already isolated by its own kernel + per-cell vsock; this
         // partitions the host-side artifacts too.) Empty tenant => "personal".
-        let tenant = if spec.tenant.trim().is_empty() { "personal" } else { spec.tenant.as_str() };
-        let run_dir = self.cfg.run_dir.join(crate::sanitize_tenant(tenant)).join(spec.id.as_str());
+        let tenant = if spec.tenant.trim().is_empty() {
+            "personal"
+        } else {
+            spec.tenant.as_str()
+        };
+        let run_dir = self
+            .cfg
+            .run_dir
+            .join(crate::sanitize_tenant(tenant))
+            .join(spec.id.as_str());
         tokio::fs::create_dir_all(&run_dir).await?;
 
         let api_sock = run_dir.join("api.sock");
@@ -705,7 +766,11 @@ impl CellBackend for FirecrackerBackend {
         // base and get their code from the data drive below.
         let base = {
             let per_image = self.rootfs_for(&spec.image);
-            if per_image.exists() { per_image } else { self.rootfs_for(&self.cfg.base_image) }
+            if per_image.exists() {
+                per_image
+            } else {
+                self.rootfs_for(&self.cfg.base_image)
+            }
         };
         anyhow::ensure!(
             base.exists(),
@@ -976,9 +1041,17 @@ impl CellBackend for FirecrackerBackend {
         // vsock — it was provisioned as a lightweight host-container cell.
         if func.start_cmd.first().map(String::as_str) == Some("__container__") {
             let image = func.start_cmd.get(1).cloned().unwrap_or_default();
-            let internal: u16 = func.start_cmd.get(2).and_then(|s| s.parse().ok()).unwrap_or(8080);
+            let internal: u16 = func
+                .start_cmd
+                .get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8080);
             // Multi-service (compose) deploys carry a JSON network config in start_cmd[3].
-            let net_json = func.start_cmd.get(3).map(|s| s.as_str()).filter(|s| !s.is_empty());
+            let net_json = func
+                .start_cmd
+                .get(3)
+                .map(|s| s.as_str())
+                .filter(|s| !s.is_empty());
             let runtime = Self::container_runtime();
             if let Some(rt) = &runtime {
                 tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
@@ -1083,7 +1156,10 @@ impl CellBackend for FirecrackerBackend {
             .stderr(Stdio::null())
             .status()
             .await?;
-        anyhow::ensure!(status.success(), "mkfs.ext4 -d failed packing build output for image '{image}'");
+        anyhow::ensure!(
+            status.success(),
+            "mkfs.ext4 -d failed packing build output for image '{image}'"
+        );
         tokio::fs::rename(&tmp, &out).await?;
         Ok(())
     }
@@ -1130,8 +1206,15 @@ impl FirecrackerBackend {
     /// (`ExecOutput`* then one `ExecDone`) on an unbounded channel. Returns as
     /// soon as the connection is established — the caller drains the channel
     /// (blocking: read until `ExecDone`; detached: spawn a task that drains it).
-    pub async fn exec_command(&self, cell: &CellHandle, req: hive_core::ExecRequest) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>> {
-        let uds = cell.endpoint.as_ref().ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
+    pub async fn exec_command(
+        &self,
+        cell: &CellHandle,
+        req: hive_core::ExecRequest,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<AgentEvent>> {
+        let uds = cell
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
         let mut stream = connect_agent(uds, Duration::from_secs(20)).await?;
         let payload = serde_json::to_vec(&AgentRequest::Exec(req))?;
         write_frame(&mut stream, &payload).await?;
@@ -1164,9 +1247,14 @@ impl FirecrackerBackend {
     /// output) — the guest agent's process-global exec registry finds the
     /// child by id and sends it `SIGKILL` regardless of which connection asks.
     pub async fn kill_exec(&self, cell: &CellHandle, exec_id: &str) -> anyhow::Result<()> {
-        let uds = cell.endpoint.as_ref().ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
+        let uds = cell
+            .endpoint
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("cell {} has no vsock endpoint", cell.id))?;
         let mut stream = connect_agent(uds, Duration::from_secs(10)).await?;
-        let payload = serde_json::to_vec(&AgentRequest::KillExec { id: exec_id.to_string() })?;
+        let payload = serde_json::to_vec(&AgentRequest::KillExec {
+            id: exec_id.to_string(),
+        })?;
         write_frame(&mut stream, &payload).await?;
         // Wait for the ack (Pong) so the caller knows the signal was actually
         // delivered to the guest, not just queued on the wire.
@@ -1244,7 +1332,13 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 fn cache_path(cache_dir: &PathBuf, key: &str) -> PathBuf {
     let safe: String = key
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     cache_dir.join(format!("{safe}.tar.gz"))
 }
@@ -1271,7 +1365,16 @@ async fn wait_for_path(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> 
 /// this and keep using the real `spec.id` (which may contain `_`, as every
 /// sandbox cell id does).
 fn firecracker_safe_id(id: &str) -> String {
-    id.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' }).take(64).collect()
+    id.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(64)
+        .collect()
 }
 
 // ---- vsock host-initiated connection + framing ------------------------------
@@ -1326,7 +1429,10 @@ async fn try_connect_once(uds: &str) -> anyhow::Result<UnixStream> {
 }
 
 /// Length-prefixed framing: 4-byte big-endian length, then JSON payload.
-pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> anyhow::Result<()> {
+pub async fn write_frame<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    payload: &[u8],
+) -> anyhow::Result<()> {
     let len = (payload.len() as u32).to_be_bytes();
     w.write_all(&len).await?;
     w.write_all(payload).await?;
@@ -1363,7 +1469,9 @@ mod tests {
         let payload = vec![0xABu8; 4096];
         std::fs::write(&src, &payload).unwrap();
         let dst = dir.join("dst.bin");
-        reflink_or_copy(&src, &dst).await.expect("copy must succeed");
+        reflink_or_copy(&src, &dst)
+            .await
+            .expect("copy must succeed");
         let got = std::fs::read(&dst).unwrap();
         assert_eq!(got, payload, "copied content must be byte-identical");
 
@@ -1371,7 +1479,9 @@ mod tests {
         // (the cold-start path always copies into a freshly created run_dir, but
         // this guards against any future reuse assumption).
         std::fs::write(&src, vec![0xCDu8; 128]).unwrap();
-        reflink_or_copy(&src, &dst).await.expect("overwrite copy must succeed");
+        reflink_or_copy(&src, &dst)
+            .await
+            .expect("overwrite copy must succeed");
         assert_eq!(std::fs::read(&dst).unwrap(), vec![0xCDu8; 128]);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1379,11 +1489,15 @@ mod tests {
 
     #[tokio::test]
     async fn reflink_or_copy_fails_cleanly_when_source_is_missing() {
-        let dir = std::env::temp_dir().join(format!("hive-reflink-missing-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("hive-reflink-missing-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let result = reflink_or_copy(&dir.join("does-not-exist.bin"), &dir.join("dst.bin")).await;
-        assert!(result.is_err(), "copying a missing source must return an error, never silently succeed");
+        assert!(
+            result.is_err(),
+            "copying a missing source must return an error, never silently succeed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1406,17 +1520,31 @@ mod tests {
         cfg.boot_args = "console=ttyS0 reboot=k panic=1 pci=off nokaslr i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd root=/dev/vda rw init=/sbin/hive-cell-agent".to_string();
 
         let backend = FirecrackerBackend::new(cfg);
-        assert!(backend.is_supported(), "this host must have /dev/kvm + the firecracker binary");
+        assert!(
+            backend.is_supported(),
+            "this host must have /dev/kvm + the firecracker binary"
+        );
 
         let spec = CellSpec {
             id: CellId::from("sbx-livetest-1".to_string()),
             image: "sandbox-node22".to_string(),
-            resources: hive_core::ResourceSpec { vcpus: 1, mem_mib: 512, disk_mib: 2048, timeout_secs: 60 },
+            resources: hive_core::ResourceSpec {
+                vcpus: 1,
+                mem_mib: 512,
+                disk_mib: 2048,
+                timeout_secs: 60,
+            },
             tenant: "personal".to_string(),
             container: None,
         };
-        let handle = backend.provision(&spec).await.expect("provision must succeed on a real FC host");
-        assert!(handle.endpoint.is_some(), "a real microVM cell must have a vsock endpoint");
+        let handle = backend
+            .provision(&spec)
+            .await
+            .expect("provision must succeed on a real FC host");
+        assert!(
+            handle.endpoint.is_some(),
+            "a real microVM cell must have a vsock endpoint"
+        );
 
         let req = hive_core::ExecRequest {
             id: "cmd-livetest-1".to_string(),
@@ -1427,7 +1555,10 @@ mod tests {
             sudo: false,
             shell: false,
         };
-        let mut rx = backend.exec_command(&handle, req).await.expect("exec_command must start");
+        let mut rx = backend
+            .exec_command(&handle, req)
+            .await
+            .expect("exec_command must start");
 
         let mut stdout = String::new();
         let mut exit_code: Option<Option<i32>> = None;
@@ -1438,7 +1569,9 @@ mod tests {
                     stdout.push_str(&line);
                     stdout.push('\n');
                 }
-                Ok(Some(AgentEvent::ExecDone { exit_code: code, .. })) => {
+                Ok(Some(AgentEvent::ExecDone {
+                    exit_code: code, ..
+                })) => {
                     exit_code = Some(code);
                     break;
                 }
@@ -1450,7 +1583,14 @@ mod tests {
 
         backend.terminate(&handle).await.ok();
 
-        assert_eq!(exit_code, Some(Some(0)), "node --version must exit 0 inside the real microVM; got stdout: {stdout:?}");
-        assert!(stdout.trim().starts_with('v'), "expected a real node version string (e.g. v22.x.x), got: {stdout:?}");
+        assert_eq!(
+            exit_code,
+            Some(Some(0)),
+            "node --version must exit 0 inside the real microVM; got stdout: {stdout:?}"
+        );
+        assert!(
+            stdout.trim().starts_with('v'),
+            "expected a real node version string (e.g. v22.x.x), got: {stdout:?}"
+        );
     }
 }

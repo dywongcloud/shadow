@@ -82,18 +82,33 @@ pub struct GitOpsStore {
 
 impl GitOpsStore {
     pub fn new() -> GitOpsStore {
-        GitOpsStore { map: RwLock::new(HashMap::new()) }
+        GitOpsStore {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 
     /// The link for a tenant (a disconnected default if none exists yet).
     pub fn get(&self, tenant: &str) -> GitOpsLink {
-        self.map.read().get(tenant).cloned().unwrap_or_else(|| GitOpsLink::empty(tenant))
+        self.map
+            .read()
+            .get(tenant)
+            .cloned()
+            .unwrap_or_else(|| GitOpsLink::empty(tenant))
     }
 
     /// Connect/point a tenant at a config repo.
-    pub fn set_link(&self, tenant: &str, repo: &str, branch: &str, path: &str, scope: &str) -> GitOpsLink {
+    pub fn set_link(
+        &self,
+        tenant: &str,
+        repo: &str,
+        branch: &str,
+        path: &str,
+        scope: &str,
+    ) -> GitOpsLink {
         let mut m = self.map.write();
-        let link = m.entry(tenant.to_string()).or_insert_with(|| GitOpsLink::empty(tenant));
+        let link = m
+            .entry(tenant.to_string())
+            .or_insert_with(|| GitOpsLink::empty(tenant));
         link.repo = repo.trim().to_string();
         if !branch.trim().is_empty() {
             link.branch = branch.trim().to_string();
@@ -114,7 +129,9 @@ impl GitOpsStore {
     /// Record the result of a successful config push.
     pub fn record_sync(&self, tenant: &str, commit: &str, hash: &str) -> GitOpsLink {
         let mut m = self.map.write();
-        let link = m.entry(tenant.to_string()).or_insert_with(|| GitOpsLink::empty(tenant));
+        let link = m
+            .entry(tenant.to_string())
+            .or_insert_with(|| GitOpsLink::empty(tenant));
         link.last_sync_ms = now_ms();
         link.last_commit = commit.to_string();
         link.last_hash = hash.to_string();
@@ -203,7 +220,10 @@ pub struct GitRepoIndex {
 
 impl GitRepoIndex {
     pub fn new() -> GitRepoIndex {
-        GitRepoIndex { by_repo: RwLock::new(HashMap::new()), by_project: RwLock::new(HashMap::new()) }
+        GitRepoIndex {
+            by_repo: RwLock::new(HashMap::new()),
+            by_project: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Record/update `project`'s git connection to `repo_url` (any URL form —
@@ -221,7 +241,10 @@ impl GitRepoIndex {
     /// disconnect).
     pub fn set_project_repo(&self, project: &str, repo_url: &str) {
         let repo_url = repo_url.trim();
-        if repo_url.is_empty() || repo_url.starts_with("upload://") || repo_url.starts_with("image://") {
+        if repo_url.is_empty()
+            || repo_url.starts_with("upload://")
+            || repo_url.starts_with("image://")
+        {
             return;
         }
         let norm = norm_repo(repo_url);
@@ -263,7 +286,11 @@ impl GitRepoIndex {
     /// type doc for why that's distinct from "index uninitialized."
     pub fn projects_for(&self, repo_url: &str) -> Vec<String> {
         let norm = norm_repo(repo_url);
-        self.by_repo.read().get(&norm).map(|s| s.iter().cloned().collect()).unwrap_or_default()
+        self.by_repo
+            .read()
+            .get(&norm)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// True when the index holds no rows at all — the defensive "never
@@ -283,14 +310,20 @@ impl GitRepoIndex {
         let mut by_project: HashMap<String, String> = HashMap::new();
         for (project, repo_url) in entries {
             let repo_url = repo_url.trim();
-            if repo_url.is_empty() || repo_url.starts_with("upload://") || repo_url.starts_with("image://") {
+            if repo_url.is_empty()
+                || repo_url.starts_with("upload://")
+                || repo_url.starts_with("image://")
+            {
                 continue;
             }
             let norm = norm_repo(repo_url);
             if norm.is_empty() {
                 continue;
             }
-            by_repo.entry(norm.clone()).or_default().insert(project.clone());
+            by_repo
+                .entry(norm.clone())
+                .or_default()
+                .insert(project.clone());
             by_project.insert(project, norm);
         }
         *self.by_repo.write() = by_repo;
@@ -327,7 +360,10 @@ mod tests {
 
     #[test]
     fn norm_repo_is_case_insensitive_and_trims() {
-        assert_eq!(norm_repo("  HTTPS://GitHub.com/Owner/Repo.git "), "owner/repo");
+        assert_eq!(
+            norm_repo("  HTTPS://GitHub.com/Owner/Repo.git "),
+            "owner/repo"
+        );
     }
 
     #[test]

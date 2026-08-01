@@ -107,22 +107,50 @@ impl BotManager {
                 // 1) Crawlers (training / indexing).
                 (g(r"(?i)gptbot"), "GPTBot", AiKind::Crawler),
                 (g(r"(?i)oai-searchbot"), "OAI-SearchBot", AiKind::Crawler),
-                (g(r"(?i)(claudebot|claude-web|anthropic-ai)"), "ClaudeBot", AiKind::Crawler),
+                (
+                    g(r"(?i)(claudebot|claude-web|anthropic-ai)"),
+                    "ClaudeBot",
+                    AiKind::Crawler,
+                ),
                 (g(r"(?i)ccbot"), "CCBot", AiKind::Crawler),
-                (g(r"(?i)google-extended"), "Google-Extended", AiKind::Crawler),
+                (
+                    g(r"(?i)google-extended"),
+                    "Google-Extended",
+                    AiKind::Crawler,
+                ),
                 (g(r"(?i)bytespider"), "Bytespider", AiKind::Crawler),
                 (g(r"(?i)amazonbot"), "Amazonbot", AiKind::Crawler),
-                (g(r"(?i)applebot-extended"), "Applebot-Extended", AiKind::Crawler),
-                (g(r"(?i)(meta-externalagent|facebookbot)"), "Meta-ExternalAgent", AiKind::Crawler),
+                (
+                    g(r"(?i)applebot-extended"),
+                    "Applebot-Extended",
+                    AiKind::Crawler,
+                ),
+                (
+                    g(r"(?i)(meta-externalagent|facebookbot)"),
+                    "Meta-ExternalAgent",
+                    AiKind::Crawler,
+                ),
                 (g(r"(?i)(perplexitybot)"), "PerplexityBot", AiKind::Crawler),
-                (g(r"(?i)(cohere-ai|diffbot|omgili|youbot|imagesiftbot|dataforseobot|timpibot)"), "AICrawler", AiKind::Crawler),
+                (
+                    g(r"(?i)(cohere-ai|diffbot|omgili|youbot|imagesiftbot|dataforseobot|timpibot)"),
+                    "AICrawler",
+                    AiKind::Crawler,
+                ),
                 // 2) Assistants (real-time fetch to answer a user).
                 (g(r"(?i)chatgpt-user"), "ChatGPT-User", AiKind::Assistant),
-                (g(r"(?i)perplexity-user"), "Perplexity-User", AiKind::Assistant),
+                (
+                    g(r"(?i)perplexity-user"),
+                    "Perplexity-User",
+                    AiKind::Assistant,
+                ),
                 (g(r"(?i)claude-user"), "Claude-User", AiKind::Assistant),
                 (g(r"(?i)gemini-user"), "Gemini-User", AiKind::Assistant),
                 // 3) Autonomous agents (take actions).
-                (g(r"(?i)(chatgpt-agent|openai-operator|\boperator\b)"), "AI-Agent", AiKind::Agent),
+                (
+                    g(r"(?i)(chatgpt-agent|openai-operator|\boperator\b)"),
+                    "AI-Agent",
+                    AiKind::Agent,
+                ),
             ],
             good: vec![
                 (g(r"(?i)googlebot"), "Googlebot"),
@@ -130,12 +158,21 @@ impl BotManager {
                 (g(r"(?i)duckduckbot"), "DuckDuckBot"),
                 (g(r"(?i)slackbot"), "Slackbot"),
                 (g(r"(?i)applebot"), "Applebot"),
-                (g(r"(?i)(twitterbot|discordbot|facebookexternalhit)"), "SocialPreview"),
+                (
+                    g(r"(?i)(twitterbot|discordbot|facebookexternalhit)"),
+                    "SocialPreview",
+                ),
                 (g(r"(?i)uptimerobot"), "UptimeRobot"),
             ],
             bad: vec![
-                (g(r"(?i)(semrushbot|ahrefsbot|mj12bot|dotbot|petalbot)"), "SEOScraper"),
-                (g(r"(?i)(python-requests|scrapy|go-http-client|httpclient|libwww-perl)"), "Scraper"),
+                (
+                    g(r"(?i)(semrushbot|ahrefsbot|mj12bot|dotbot|petalbot)"),
+                    "SEOScraper",
+                ),
+                (
+                    g(r"(?i)(python-requests|scrapy|go-http-client|httpclient|libwww-perl)"),
+                    "Scraper",
+                ),
                 (g(r"(?i)(masscan|nikto|sqlmap|nmap|zgrab)"), "Scanner"),
             ],
             generic_bot: g(r"(?i)(bot|spider|crawler|crawl)"),
@@ -145,21 +182,30 @@ impl BotManager {
     pub fn classify(&self, user_agent: &str) -> BotClass {
         for (re, name, kind) in &self.ai {
             if re.is_match(user_agent) {
-                return BotClass::AiBot { name: name.to_string(), kind: *kind };
+                return BotClass::AiBot {
+                    name: name.to_string(),
+                    kind: *kind,
+                };
             }
         }
         for (re, name) in &self.good {
             if re.is_match(user_agent) {
-                return BotClass::GoodBot { name: name.to_string() };
+                return BotClass::GoodBot {
+                    name: name.to_string(),
+                };
             }
         }
         for (re, name) in &self.bad {
             if re.is_match(user_agent) {
-                return BotClass::BadBot { name: name.to_string() };
+                return BotClass::BadBot {
+                    name: name.to_string(),
+                };
             }
         }
         if self.generic_bot.is_match(user_agent) {
-            return BotClass::BadBot { name: "UnverifiedBot".to_string() };
+            return BotClass::BadBot {
+                name: "UnverifiedBot".to_string(),
+            };
         }
         BotClass::Human
     }
@@ -229,17 +275,44 @@ mod tests {
     fn classifies_bots() {
         let b = BotManager::new();
         assert_eq!(b.classify("Mozilla/5.0 ... Chrome/120"), BotClass::Human);
-        assert!(matches!(b.classify("Googlebot/2.1"), BotClass::GoodBot { .. }));
-        assert!(matches!(b.classify("python-requests/2.31"), BotClass::BadBot { .. }));
-        assert!(matches!(b.classify("some-random-crawler/1.0"), BotClass::BadBot { .. }));
+        assert!(matches!(
+            b.classify("Googlebot/2.1"),
+            BotClass::GoodBot { .. }
+        ));
+        assert!(matches!(
+            b.classify("python-requests/2.31"),
+            BotClass::BadBot { .. }
+        ));
+        assert!(matches!(
+            b.classify("some-random-crawler/1.0"),
+            BotClass::BadBot { .. }
+        ));
     }
 
     #[test]
     fn classifies_ai_traffic() {
         let b = BotManager::new();
-        assert!(matches!(b.classify("Mozilla/5.0 (compatible; GPTBot/1.1)"), BotClass::AiBot { kind: AiKind::Crawler, .. }));
-        assert!(matches!(b.classify("Mozilla/5.0 ... ChatGPT-User/1.0"), BotClass::AiBot { kind: AiKind::Assistant, .. }));
-        assert!(matches!(b.classify("ClaudeBot/1.0"), BotClass::AiBot { kind: AiKind::Crawler, .. }));
+        assert!(matches!(
+            b.classify("Mozilla/5.0 (compatible; GPTBot/1.1)"),
+            BotClass::AiBot {
+                kind: AiKind::Crawler,
+                ..
+            }
+        ));
+        assert!(matches!(
+            b.classify("Mozilla/5.0 ... ChatGPT-User/1.0"),
+            BotClass::AiBot {
+                kind: AiKind::Assistant,
+                ..
+            }
+        ));
+        assert!(matches!(
+            b.classify("ClaudeBot/1.0"),
+            BotClass::AiBot {
+                kind: AiKind::Crawler,
+                ..
+            }
+        ));
     }
 
     #[test]

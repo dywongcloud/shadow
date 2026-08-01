@@ -116,7 +116,11 @@ impl Cluster {
     /// chain entry, else (chain unset or fully dark) the identity election with
     /// the legacy pin. THE single resolution point for every single-writer role
     /// (admin mutations, billing meter, ACME, Vercel DNS) — see the module doc.
-    pub fn control_plane_owner(chain: &[String], pref: Option<&str>, nodes: &[hive_edge::NodeInfo]) -> Option<String> {
+    pub fn control_plane_owner(
+        chain: &[String],
+        pref: Option<&str>,
+        nodes: &[hive_edge::NodeInfo],
+    ) -> Option<String> {
         let eligible = |name: &str| {
             nodes.iter().any(|n| {
                 n.name == name
@@ -171,13 +175,19 @@ impl Cluster {
     /// through it) — honored ONLY while that node is healthy and publicly
     /// addressable, so a dead or NAT'd pin falls back to the election instead of
     /// wedging the control plane. Must be set consistently fleet-wide.
-    pub fn billing_leader_with_pref(pref: Option<&str>, nodes: &[hive_edge::NodeInfo]) -> Option<String> {
+    pub fn billing_leader_with_pref(
+        pref: Option<&str>,
+        nodes: &[hive_edge::NodeInfo],
+    ) -> Option<String> {
         let addressable = |n: &hive_edge::NodeInfo| {
             n.public_ip.as_deref().is_some_and(|ip| !ip.is_empty())
                 || n.public_ip6.as_deref().is_some_and(|ip| !ip.is_empty())
         };
         if let Some(p) = pref.filter(|p| !p.is_empty()) {
-            if nodes.iter().any(|n| n.name == p && n.healthy && n.peer_id.is_some() && addressable(n)) {
+            if nodes
+                .iter()
+                .any(|n| n.name == p && n.healthy && n.peer_id.is_some() && addressable(n))
+            {
                 return Some(p.to_string());
             }
         }
@@ -339,7 +349,10 @@ mod tests {
             public(node("bkk", Some("aaa"), true), "43.152.247.70"), // lowest id
             public(node("sj", Some("ccc"), true), "170.106.158.151"),
         ];
-        assert_eq!(Cluster::billing_leader_with_pref(Some("sj"), &nodes).as_deref(), Some("sj"));
+        assert_eq!(
+            Cluster::billing_leader_with_pref(Some("sj"), &nodes).as_deref(),
+            Some("sj")
+        );
     }
 
     #[test]
@@ -348,14 +361,23 @@ mod tests {
             public(node("sj", Some("ccc"), false), "170.106.158.151"), // pinned but dead
             public(node("bkk", Some("aaa"), true), "43.152.247.70"),
         ];
-        assert_eq!(Cluster::billing_leader_with_pref(Some("sj"), &dead).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::billing_leader_with_pref(Some("sj"), &dead).as_deref(),
+            Some("bkk")
+        );
         let natted = vec![
             node("laptop", Some("aaa"), true), // pinned but no public_ip
             public(node("bkk", Some("bbb"), true), "43.152.247.70"),
         ];
-        assert_eq!(Cluster::billing_leader_with_pref(Some("laptop"), &natted).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::billing_leader_with_pref(Some("laptop"), &natted).as_deref(),
+            Some("bkk")
+        );
         // Unknown pin name → election.
-        assert_eq!(Cluster::billing_leader_with_pref(Some("ghost"), &dead).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::billing_leader_with_pref(Some("ghost"), &dead).as_deref(),
+            Some("bkk")
+        );
     }
 
     #[test]
@@ -377,7 +399,10 @@ mod tests {
             public(node("bkk", Some("aaa"), true), "43.152.247.70"), // lower id — must NOT matter
         ];
         let chain = vec!["sj".to_string(), "bkk".to_string()];
-        assert_eq!(Cluster::control_plane_owner(&chain, None, &nodes).as_deref(), Some("sj"));
+        assert_eq!(
+            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
+            Some("sj")
+        );
     }
 
     #[test]
@@ -388,7 +413,10 @@ mod tests {
             public(node("va", Some("bbb"), true), "43.166.206.175"),
         ];
         let chain = vec!["sj".to_string(), "bkk".to_string(), "va".to_string()];
-        assert_eq!(Cluster::control_plane_owner(&chain, None, &nodes).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
+            Some("bkk")
+        );
     }
 
     #[test]
@@ -400,7 +428,10 @@ mod tests {
             public(node("bkk", Some("bbb"), true), "43.152.247.70"),
         ];
         let chain = vec!["laptop".to_string(), "bkk".to_string()];
-        assert_eq!(Cluster::control_plane_owner(&chain, None, &nodes).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
+            Some("bkk")
+        );
     }
 
     #[test]
@@ -410,7 +441,10 @@ mod tests {
             public(node("other", Some("aaa"), true), "1.2.3.4"), // not in chain
         ];
         let chain = vec!["sj".to_string()];
-        assert_eq!(Cluster::control_plane_owner(&chain, None, &nodes).as_deref(), Some("other"));
+        assert_eq!(
+            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
+            Some("other")
+        );
     }
 
     #[test]
@@ -419,9 +453,15 @@ mod tests {
             public(node("bkk", Some("aaa"), true), "43.152.247.70"),
             public(node("sj", Some("ccc"), true), "170.106.158.151"),
         ];
-        assert_eq!(Cluster::control_plane_owner(&[], None, &nodes).as_deref(), Some("bkk"));
+        assert_eq!(
+            Cluster::control_plane_owner(&[], None, &nodes).as_deref(),
+            Some("bkk")
+        );
         // Legacy single pin still honored on the fallback path.
-        assert_eq!(Cluster::control_plane_owner(&[], Some("sj"), &nodes).as_deref(), Some("sj"));
+        assert_eq!(
+            Cluster::control_plane_owner(&[], Some("sj"), &nodes).as_deref(),
+            Some("sj")
+        );
     }
 
     // ---- epoch fencing ----
@@ -459,7 +499,10 @@ mod tests {
         // name-order so a primary still exists.
         let nodes = vec![node("zeta", None, true)];
         let cands = vec!["zeta".to_string(), "alpha".to_string()];
-        assert_eq!(Cluster::elect_among(&cands, &nodes).as_deref(), Some("alpha"));
+        assert_eq!(
+            Cluster::elect_among(&cands, &nodes).as_deref(),
+            Some("alpha")
+        );
         assert_eq!(Cluster::elect_among(&[], &nodes), None);
     }
 }

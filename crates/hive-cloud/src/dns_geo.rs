@@ -113,7 +113,11 @@ impl Asker {
 /// Returns `None` for anything malformed — a bad OPT must degrade to "no client
 /// subnet", never reject the query, because that would turn an unfamiliar
 /// resolver into an outage.
-pub fn parse_client_subnet(msg: &[u8], rr_start: usize, counts: (u16, u16, u16)) -> Option<ClientSubnet> {
+pub fn parse_client_subnet(
+    msg: &[u8],
+    rr_start: usize,
+    counts: (u16, u16, u16),
+) -> Option<ClientSubnet> {
     let (ancount, nscount, arcount) = counts;
     if arcount == 0 {
         return None;
@@ -178,7 +182,10 @@ fn decode_ecs(data: &[u8]) -> Option<ClientSubnet> {
             let mut o = [0u8; 4];
             let n = addr_bytes.len().min(4);
             o[..n].copy_from_slice(&addr_bytes[..n]);
-            Some(ClientSubnet { addr: IpAddr::V4(Ipv4Addr::from(o)), source_prefix })
+            Some(ClientSubnet {
+                addr: IpAddr::V4(Ipv4Addr::from(o)),
+                source_prefix,
+            })
         }
         2 => {
             if source_prefix > 128 {
@@ -187,7 +194,10 @@ fn decode_ecs(data: &[u8]) -> Option<ClientSubnet> {
             let mut o = [0u8; 16];
             let n = addr_bytes.len().min(16);
             o[..n].copy_from_slice(&addr_bytes[..n]);
-            Some(ClientSubnet { addr: IpAddr::V6(Ipv6Addr::from(o)), source_prefix })
+            Some(ClientSubnet {
+                addr: IpAddr::V6(Ipv6Addr::from(o)),
+                source_prefix,
+            })
         }
         // Family 0 means "no subnet available" (RFC 7871 §7.1.2); anything else
         // is unknown to us. Both mean: answer generically.
@@ -220,7 +230,11 @@ pub(crate) fn skip_name(msg: &[u8], mut off: usize) -> Option<usize> {
         }
         if len & 0xC0 == 0xC0 {
             // A compression pointer is two bytes and always terminates the name.
-            return if off + 2 <= msg.len() { Some(off + 2) } else { None };
+            return if off + 2 <= msg.len() {
+                Some(off + 2)
+            } else {
+                None
+            };
         }
         if len & 0xC0 != 0 {
             return None; // reserved label type
@@ -269,7 +283,10 @@ pub fn encode_opt_rr(echo: Option<ClientSubnet>, scope: u8) -> Vec<u8> {
 /// report a location. Returns `None` when proximity cannot be decided at all
 /// (no client location, or no node has lat/lon), so the caller keeps its
 /// existing health-ordered answer rather than inventing an order.
-pub fn nearest_first<'a>(nodes: &[&'a NodeInfo], client: Option<(f64, f64)>) -> Option<Vec<&'a NodeInfo>> {
+pub fn nearest_first<'a>(
+    nodes: &[&'a NodeInfo],
+    client: Option<(f64, f64)>,
+) -> Option<Vec<&'a NodeInfo>> {
     let c = client?;
     let mut located: Vec<(f64, &NodeInfo)> = nodes
         .iter()
@@ -283,7 +300,11 @@ pub fn nearest_first<'a>(nodes: &[&'a NodeInfo], client: Option<(f64, f64)>) -> 
     }
     // Distance, then name: a deterministic tie-break so two nodes at the same
     // site don't reorder between passes and defeat resolver caching.
-    located.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.1.name.cmp(&b.1.name)));
+    located.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
     let keep = nearest_count().min(located.len());
     let mut out: Vec<&NodeInfo> = located.iter().take(keep).map(|(_, n)| *n).collect();
     // Nodes with no known location still belong in the answer, after the ones we
@@ -328,7 +349,10 @@ fn unlocatable(ip: IpAddr) -> bool {
                 || a.octets()[0] == 100 && (64..128).contains(&a.octets()[1]) // CGNAT 100.64/10
         }
         IpAddr::V6(a) => {
-            a.is_loopback() || a.is_unspecified() || (a.segments()[0] & 0xfe00) == 0xfc00 || (a.segments()[0] & 0xffc0) == 0xfe80
+            a.is_loopback()
+                || a.is_unspecified()
+                || (a.segments()[0] & 0xfe00) == 0xfc00
+                || (a.segments()[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -441,7 +465,10 @@ const MAX_ENTRIES: usize = 8192;
 /// Read per call rather than cached in a static: it is only consulted on a local
 /// miss, which is rare, and a plain env read there beats another global.
 fn remote_endpoint() -> Option<String> {
-    std::env::var("HIVE_DNS_GEO_ENDPOINT").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    std::env::var("HIVE_DNS_GEO_ENDPOINT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 impl GeoCache {
@@ -478,7 +505,10 @@ impl GeoCache {
         let weak = Arc::downgrade(&cache);
         tokio::spawn(async move {
             let pace = std::time::Duration::from_millis(
-                std::env::var("HIVE_DNS_GEO_PACE_MS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(1500),
+                std::env::var("HIVE_DNS_GEO_PACE_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(1500),
             );
             while let Some(net) = rx.recv().await {
                 let Some(cache) = weak.upgrade() else { return };
@@ -498,7 +528,10 @@ impl GeoCache {
                         // Never downgrade a location we already hold; only a
                         // prefix with no known fix becomes a negative.
                         None => match prev {
-                            Some(Slot { entry: Entry::Known(lat, lon), .. }) => Entry::Known(lat, lon),
+                            Some(Slot {
+                                entry: Entry::Known(lat, lon),
+                                ..
+                            }) => Entry::Known(lat, lon),
                             _ => Entry::Unlocatable,
                         },
                     };
@@ -536,7 +569,9 @@ impl GeoCache {
                             cache.writes.fetch_add(1, Ordering::Relaxed);
                         }
                         // Leave `saved` behind `dirty` so the next tick retries.
-                        Ok(Err(e)) => tracing::warn!(error = %e, "dns_geo: cache save failed; retrying on next tick"),
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "dns_geo: cache save failed; retrying on next tick")
+                        }
                         Err(e) => tracing::warn!(error = %e, "dns_geo: cache save task failed"),
                     }
                 }
@@ -610,12 +645,27 @@ impl GeoCache {
         // rather than reverting to Pending. Expiry must never itself cause the
         // de-tailoring blip this whole module is about.
         let served = match existing {
-            Some(Slot { entry: Entry::Known(lat, lon), .. }) => {
-                w.insert(net, Slot { entry: Entry::Known(lat, lon), at_ms: now });
+            Some(Slot {
+                entry: Entry::Known(lat, lon),
+                ..
+            }) => {
+                w.insert(
+                    net,
+                    Slot {
+                        entry: Entry::Known(lat, lon),
+                        at_ms: now,
+                    },
+                );
                 Some((lat, lon))
             }
             _ => {
-                w.insert(net, Slot { entry: Entry::Pending, at_ms: now });
+                w.insert(
+                    net,
+                    Slot {
+                        entry: Entry::Pending,
+                        at_ms: now,
+                    },
+                );
                 None
             }
         };
@@ -634,8 +684,11 @@ impl GeoCache {
     /// at the population that would actually be hurt by a wrong answer.
     pub fn known_networks(&self) -> Vec<IpAddr> {
         let r = self.entries.read();
-        let mut v: Vec<IpAddr> =
-            r.iter().filter(|(_, e)| matches!(e.entry, Entry::Known(..))).map(|(k, _)| *k).collect();
+        let mut v: Vec<IpAddr> = r
+            .iter()
+            .filter(|(_, e)| matches!(e.entry, Entry::Known(..)))
+            .map(|(k, _)| *k)
+            .collect();
         v.sort();
         v
     }
@@ -665,7 +718,10 @@ impl GeoCache {
     /// (entries restored from disk at boot, durable writes since boot) — the
     /// operator's answer to "did the cache actually survive the restart?".
     pub fn persist_stats(&self) -> (u64, u64) {
-        (self.loaded_at_boot.load(Ordering::Relaxed), self.writes.load(Ordering::Relaxed))
+        (
+            self.loaded_at_boot.load(Ordering::Relaxed),
+            self.writes.load(Ordering::Relaxed),
+        )
     }
 
     /// Write the cache NOW, synchronously (graceful shutdown). Called next to
@@ -698,10 +754,18 @@ impl GeoCache {
         r.iter()
             .filter_map(|(net, slot)| match slot.entry {
                 Entry::Pending => None,
-                Entry::Known(lat, lon) => {
-                    Some(DiskEntry { n: net.to_string(), lat: Some(lat), lon: Some(lon), t: slot.at_ms })
-                }
-                Entry::Unlocatable => Some(DiskEntry { n: net.to_string(), lat: None, lon: None, t: slot.at_ms }),
+                Entry::Known(lat, lon) => Some(DiskEntry {
+                    n: net.to_string(),
+                    lat: Some(lat),
+                    lon: Some(lon),
+                    t: slot.at_ms,
+                }),
+                Entry::Unlocatable => Some(DiskEntry {
+                    n: net.to_string(),
+                    lat: None,
+                    lon: None,
+                    t: slot.at_ms,
+                }),
             })
             .take(MAX_ENTRIES)
             .collect()
@@ -715,7 +779,11 @@ impl GeoCache {
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(CACHE_FILE);
         let tmp = dir.join(format!("{CACHE_FILE}.tmp"));
-        let file = DiskFile { v: FORMAT_VERSION, saved_ms: hive_core::now_ms(), entries };
+        let file = DiskFile {
+            v: FORMAT_VERSION,
+            saved_ms: hive_core::now_ms(),
+            entries,
+        };
         let json = serde_json::to_string(&file).unwrap_or_else(|_| "{}".into());
         {
             let f = std::fs::File::create(&tmp)?;
@@ -794,7 +862,10 @@ pub(crate) fn cache_path() -> std::path::PathBuf {
 /// an unclean-kill loss to a few prefixes — each of which costs a single generic
 /// answer and re-looks-up by itself.
 fn save_interval() -> Option<std::time::Duration> {
-    let ms = std::env::var("HIVE_DNS_GEO_SAVE_MS").ok().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(10_000);
+    let ms = std::env::var("HIVE_DNS_GEO_SAVE_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(10_000);
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }
 
@@ -810,7 +881,9 @@ fn load_from_disk() -> std::collections::HashMap<IpAddr, Slot> {
     }
     let path = cache_path();
     // Absent is the normal first-boot case, not an error worth logging.
-    let Ok(meta) = std::fs::metadata(&path) else { return empty };
+    let Ok(meta) = std::fs::metadata(&path) else {
+        return empty;
+    };
     if meta.len() > MAX_FILE_BYTES {
         tracing::warn!(bytes = meta.len(), path = %path.display(), "dns_geo: cache file too large; ignoring");
         return empty;
@@ -830,7 +903,11 @@ fn load_from_disk() -> std::collections::HashMap<IpAddr, Slot> {
         }
     };
     if file.v != FORMAT_VERSION {
-        tracing::warn!(found = file.v, want = FORMAT_VERSION, "dns_geo: cache file version mismatch; starting empty");
+        tracing::warn!(
+            found = file.v,
+            want = FORMAT_VERSION,
+            "dns_geo: cache file version mismatch; starting empty"
+        );
         return empty;
     }
     let now = hive_core::now_ms();
@@ -846,7 +923,10 @@ fn load_from_disk() -> std::collections::HashMap<IpAddr, Slot> {
             let net = network_key(ip);
             let entry = match (e.lat, e.lon) {
                 (Some(lat), Some(lon))
-                    if lat.is_finite() && lon.is_finite() && (-90.0..=90.0).contains(&lat) && (-180.0..=180.0).contains(&lon) =>
+                    if lat.is_finite()
+                        && lon.is_finite()
+                        && (-90.0..=90.0).contains(&lat)
+                        && (-180.0..=180.0).contains(&lon) =>
                 {
                     Entry::Known(lat, lon)
                 }
@@ -856,7 +936,10 @@ fn load_from_disk() -> std::collections::HashMap<IpAddr, Slot> {
             };
             // Clamp a future timestamp (clock skew, hand-edit) to now, so no
             // entry can make itself immortal by claiming to be from 2099.
-            let slot = Slot { entry, at_ms: e.t.min(now) };
+            let slot = Slot {
+                entry,
+                at_ms: e.t.min(now),
+            };
             slot.is_fresh(now).then_some((net, slot))
         })
         .collect();
@@ -906,8 +989,17 @@ async fn lookup_geo(http: &reqwest::Client, net: IpAddr) -> Option<(f64, f64)> {
         }
         v6 => v6,
     };
-    let url = format!("{}/{}?fields=status,lat,lon", base.trim_end_matches('/'), probe);
-    let resp = http.get(&url).timeout(std::time::Duration::from_secs(5)).send().await.ok()?;
+    let url = format!(
+        "{}/{}?fields=status,lat,lon",
+        base.trim_end_matches('/'),
+        probe
+    );
+    let resp = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
     let v: serde_json::Value = resp.json().await.ok()?;
     if v.get("status").and_then(|s| s.as_str()) != Some("success") {
         return None;

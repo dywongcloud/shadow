@@ -32,9 +32,7 @@ impl ResourceSpec {
     /// Two specs are placement-compatible if a warm cell built for `self`
     /// can satisfy a job asking for `req`.
     pub fn satisfies(&self, req: &ResourceSpec) -> bool {
-        self.vcpus >= req.vcpus
-            && self.mem_mib >= req.mem_mib
-            && self.disk_mib >= req.disk_mib
+        self.vcpus >= req.vcpus && self.mem_mib >= req.mem_mib && self.disk_mib >= req.disk_mib
     }
 }
 

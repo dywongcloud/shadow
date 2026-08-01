@@ -138,7 +138,8 @@ impl Client {
     /// Resolve config from flags (highest priority) → env → config file → default.
     pub fn resolve(api: Option<String>, token: Option<String>, team: Option<String>) -> Client {
         let cfg = load_config();
-        let (api, token, team) = resolve_settings(api, token, team, &cfg, |k| std::env::var(k).ok());
+        let (api, token, team) =
+            resolve_settings(api, token, team, &cfg, |k| std::env::var(k).ok());
         Client {
             api,
             token,
@@ -173,7 +174,11 @@ impl Client {
             }
         }
         let email = cfg.email.clone().unwrap_or_default();
-        let tenant = cfg.team.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "personal".into());
+        let tenant = cfg
+            .team
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "personal".into());
         let body = serde_json::json!({
             "sub": format!("cli:{}", if email.is_empty() { "shadw" } else { &email }),
             "tenant": tenant,
@@ -268,7 +273,11 @@ impl Client {
                 method,
                 path,
                 status.as_u16(),
-                if text.is_empty() { String::new() } else { format!(": {}", text.trim()) }
+                if text.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", text.trim())
+                }
             ));
         }
         if text.is_empty() {
@@ -297,17 +306,28 @@ mod tests {
     use std::collections::HashMap;
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let m: HashMap<String, String> = pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         move |k: &str| m.get(k).cloned()
     }
 
     #[test]
     fn precedence_flag_over_env_over_config_over_default() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()), ..Default::default() };
+        let cfg = Config {
+            api: Some("http://cfg".into()),
+            token: Some("cfg_tok".into()),
+            team: Some("cfg_team".into()),
+            ..Default::default()
+        };
         // Flags win over everything.
         let (api, tok, team) = resolve_settings(
-            Some("http://flag".into()), Some("flag_tok".into()), Some("flag_team".into()),
-            &cfg, env_of(&[("SHADW_API_URL", "http://env"), ("SHADW_TOKEN", "env_tok")]),
+            Some("http://flag".into()),
+            Some("flag_tok".into()),
+            Some("flag_team".into()),
+            &cfg,
+            env_of(&[("SHADW_API_URL", "http://env"), ("SHADW_TOKEN", "env_tok")]),
         );
         assert_eq!(api, "http://flag");
         assert_eq!(tok.as_deref(), Some("flag_tok"));
@@ -316,15 +336,31 @@ mod tests {
 
     #[test]
     fn env_wins_over_config_when_no_flag() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: None, ..Default::default() };
-        let (api, tok, _) = resolve_settings(None, None, None, &cfg, env_of(&[("SHADW_API_URL", "http://env"), ("SHADW_TOKEN", "env_tok")]));
+        let cfg = Config {
+            api: Some("http://cfg".into()),
+            token: Some("cfg_tok".into()),
+            team: None,
+            ..Default::default()
+        };
+        let (api, tok, _) = resolve_settings(
+            None,
+            None,
+            None,
+            &cfg,
+            env_of(&[("SHADW_API_URL", "http://env"), ("SHADW_TOKEN", "env_tok")]),
+        );
         assert_eq!(api, "http://env");
         assert_eq!(tok.as_deref(), Some("env_tok"));
     }
 
     #[test]
     fn config_used_when_no_flag_or_env() {
-        let cfg = Config { api: Some("http://cfg".into()), token: Some("cfg_tok".into()), team: Some("cfg_team".into()), ..Default::default() };
+        let cfg = Config {
+            api: Some("http://cfg".into()),
+            token: Some("cfg_tok".into()),
+            team: Some("cfg_team".into()),
+            ..Default::default()
+        };
         let (api, tok, team) = resolve_settings(None, None, None, &cfg, env_of(&[]));
         assert_eq!(api, "http://cfg");
         assert_eq!(tok.as_deref(), Some("cfg_tok"));
@@ -342,17 +378,38 @@ mod tests {
     #[test]
     fn legacy_env_aliases_and_empty_strings_ignored() {
         // SHADW_API / SHADW_API_KEY are the legacy aliases.
-        let (api, tok, _) = resolve_settings(None, None, None, &Config::default(), env_of(&[("SHADW_API", "http://legacy"), ("SHADW_API_KEY", "legacy_key")]));
+        let (api, tok, _) = resolve_settings(
+            None,
+            None,
+            None,
+            &Config::default(),
+            env_of(&[
+                ("SHADW_API", "http://legacy"),
+                ("SHADW_API_KEY", "legacy_key"),
+            ]),
+        );
         assert_eq!(api, "http://legacy");
         assert_eq!(tok.as_deref(), Some("legacy_key"));
         // An empty token is treated as absent.
-        let (_, tok2, _) = resolve_settings(None, Some(String::new()), None, &Config::default(), env_of(&[]));
+        let (_, tok2, _) = resolve_settings(
+            None,
+            Some(String::new()),
+            None,
+            &Config::default(),
+            env_of(&[]),
+        );
         assert!(tok2.is_none());
     }
 
     #[test]
     fn trailing_slash_trimmed_and_url_join() {
-        let (api, _, _) = resolve_settings(Some("http://x:8786/".into()), None, None, &Config::default(), env_of(&[]));
+        let (api, _, _) = resolve_settings(
+            Some("http://x:8786/".into()),
+            None,
+            None,
+            &Config::default(),
+            env_of(&[]),
+        );
         assert_eq!(api, "http://x:8786");
         assert_eq!(join_url(&api, "/v1/overview"), "http://x:8786/v1/overview");
         assert_eq!(join_url(&api, "v1/overview"), "http://x:8786/v1/overview");

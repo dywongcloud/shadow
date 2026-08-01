@@ -19,14 +19,16 @@ use axum::{
     Json, Router,
 };
 use fluid_compute::{func_key, Fluid, FunctionStats, Lease};
-use fluid_core::{Deployment, DeploymentId, DeploymentInfo, DeployRequest, Manifest, RouteTarget};
+use fluid_core::{DeployRequest, Deployment, DeploymentId, DeploymentInfo, Manifest, RouteTarget};
 use fluid_tunnel::TunnelClient;
 use hive_backend::connect_endpoint;
 use hive_core::{now_ms, CellId};
-use parking_lot::Mutex;
-use serde::Serialize;
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,6 +39,52 @@ struct GwState {
     /// project name -> current deployment id.
     aliases: HashMap<String, DeploymentId>,
     default: Option<DeploymentId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserScope {
+    Team,
+    Public,
+}
+
+impl Default for BrowserScope {
+    fn default() -> Self {
+        Self::Team
+    }
+}
+
+/// One short-lived browser serving registration. The tenant and exact
+/// deployment/function are part of the key; a content digest alone is never an
+/// authorization capability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserTarget {
+    pub tenant: String,
+    pub deployment: String,
+    pub function: String,
+    pub endpoint_id: String,
+    pub addr_json: String,
+    pub digest: String,
+    pub expires_ms: u64,
+    #[serde(default)]
+    pub scope: BrowserScope,
+}
+
+#[derive(Clone, Debug)]
+pub struct BrowserInvokeFailure {
+    pub sent: bool,
+    pub message: String,
+}
+
+pub type BrowserInvokeFuture =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, BrowserInvokeFailure>> + Send>>;
+pub type BrowserInvoker = Arc<dyn Fn(BrowserTarget, String) -> BrowserInvokeFuture + Send + Sync>;
+
+#[derive(Default)]
+struct BrowserRoutes {
+    invoker: Option<BrowserInvoker>,
+    by_function: HashMap<String, Vec<BrowserTarget>>,
+    circuit_until: HashMap<String, u64>,
 }
 
 pub struct Gateway {
@@ -58,6 +106,10 @@ pub struct Gateway {
     /// access at all (fluid-gateway is a lower-level crate hive-cloud embeds,
     /// never the other way around).
     rum: RumStore,
+    /// Low-trust browser serving targets and their independent circuit state.
+    /// Kept outside Fluid's lease pools so a frozen tab can never be classified
+    /// as host capacity exhaustion.
+    browser: RwLock<BrowserRoutes>,
 }
 
 impl Gateway {
@@ -74,6 +126,7 @@ impl Gateway {
             tunnels_opened: AtomicU64::new(0),
             tunnels_reused: AtomicU64::new(0),
             rum: RumStore::new(),
+            browser: RwLock::new(BrowserRoutes::default()),
         })
     }
 
@@ -94,7 +147,12 @@ impl Gateway {
     /// the fleet via `rum_raw` + `RumRaw::merge` before calling `summarize()`,
     /// same reason `/v1/metrics` fans out (a tenant's visitors can land on
     /// any node).
-    pub fn rum_summary(&self, tenant: &str, minutes: usize, device: Option<RumDevice>) -> RumSummary {
+    pub fn rum_summary(
+        &self,
+        tenant: &str,
+        minutes: usize,
+        device: Option<RumDevice>,
+    ) -> RumSummary {
         self.rum.summary(tenant, minutes, device, now_ms())
     }
 
@@ -102,6 +160,85 @@ impl Gateway {
     /// fleet-wide `/v1/speed-insights` fan-out combines via `RumRaw::merge`.
     pub fn rum_raw(&self, tenant: &str, minutes: usize, device: Option<RumDevice>) -> RumRaw {
         self.rum.raw(tenant, minutes, device, now_ms())
+    }
+
+    pub fn set_browser_invoker(&self, invoker: BrowserInvoker) {
+        self.browser.write().invoker = Some(invoker);
+    }
+
+    /// Insert or replace the one target owned by an endpoint for a function.
+    /// Replacement is atomic: stale digest/address data cannot survive renewal.
+    pub fn upsert_browser_target(&self, target: BrowserTarget) -> Result<(), &'static str> {
+        if target.tenant.trim().is_empty()
+            || target.deployment.trim().is_empty()
+            || target.function.trim().is_empty()
+            || target.endpoint_id.len() != 64
+            || !target
+                .endpoint_id
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || target.digest.len() != 64
+            || !target
+                .digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err("invalid browser serving target");
+        }
+        let key = func_key(&target.deployment, &target.function);
+        let mut browser = self.browser.write();
+        // An endpoint owns exactly one serving registration across the whole
+        // gateway, not one per function key. A renewal that moves deployment or
+        // function must not leave its previous target reachable.
+        for targets in browser.by_function.values_mut() {
+            targets.retain(|old| old.endpoint_id != target.endpoint_id);
+        }
+        browser.by_function.retain(|_, targets| !targets.is_empty());
+        let targets = browser.by_function.entry(key).or_default();
+        targets.push(target);
+        targets.sort_by(|a, b| (&a.endpoint_id, &a.digest).cmp(&(&b.endpoint_id, &b.digest)));
+        Ok(())
+    }
+
+    pub fn remove_browser_endpoint(&self, endpoint_id: &str) -> usize {
+        let mut browser = self.browser.write();
+        let mut removed = 0usize;
+        for targets in browser.by_function.values_mut() {
+            let before = targets.len();
+            targets.retain(|target| target.endpoint_id != endpoint_id);
+            removed += before - targets.len();
+        }
+        browser.by_function.retain(|_, targets| !targets.is_empty());
+        browser
+            .circuit_until
+            .retain(|key, _| !key.starts_with(endpoint_id));
+        removed
+    }
+
+    pub fn browser_targets(&self) -> Vec<BrowserTarget> {
+        let browser = self.browser.read();
+        let mut out: Vec<_> = browser
+            .by_function
+            .values()
+            .flat_map(|targets| targets.iter().cloned())
+            .collect();
+        out.sort_by(|a, b| {
+            (
+                &a.tenant,
+                &a.deployment,
+                &a.function,
+                &a.endpoint_id,
+                &a.digest,
+            )
+                .cmp(&(
+                    &b.tenant,
+                    &b.deployment,
+                    &b.function,
+                    &b.endpoint_id,
+                    &b.digest,
+                ))
+        });
+        out
     }
 
     /// Get the live tunnel for an instance, opening one if needed. Creation is
@@ -133,7 +270,15 @@ impl Gateway {
     /// Register a deployment: wire its functions into the Fluid pool and make it
     /// routable. Becomes the default (most-recent) deployment.
     pub fn deploy(&self, root: String, manifest: Manifest) -> DeploymentInfo {
-        self.deploy_full(root, manifest, "you".into(), None, true, fluid_core::DeployState::Ready, String::new())
+        self.deploy_full(
+            root,
+            manifest,
+            "you".into(),
+            None,
+            true,
+            fluid_core::DeployState::Ready,
+            String::new(),
+        )
     }
 
     /// Name of the active isolation backend ("mock" | "firecracker").
@@ -143,7 +288,11 @@ impl Gateway {
 
     /// Pack a built deployment's output so the serving cells can reach it (only
     /// meaningful for an isolated backend; a no-op for the same-host mock).
-    pub async fn deliver_build(&self, image: &str, build_dir: &std::path::Path) -> anyhow::Result<()> {
+    pub async fn deliver_build(
+        &self,
+        image: &str,
+        build_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
         self.fluid.deliver_build(image, build_dir).await
     }
 
@@ -163,14 +312,23 @@ impl Gateway {
     ) -> DeploymentInfo {
         // Normalize the owner once at the boundary so the stored record, the
         // function pools, and every cell agree on the tenant (empty => "personal").
-        let tenant = if tenant.trim().is_empty() { "personal".to_string() } else { tenant };
+        let tenant = if tenant.trim().is_empty() {
+            "personal".to_string()
+        } else {
+            tenant
+        };
         let id = DeploymentId::new();
         let workdir_root = root.clone();
         let cell_image = manifest.image.clone().unwrap_or_else(|| self.image.clone());
         for f in &manifest.functions {
             let key = func_key(id.as_str(), &f.name);
-            self.fluid
-                .register(key, f.clone(), cell_image.clone(), workdir_root.clone(), tenant.clone());
+            self.fluid.register(
+                key,
+                f.clone(),
+                cell_image.clone(),
+                workdir_root.clone(),
+                tenant.clone(),
+            );
         }
         let dep = Deployment {
             id: id.clone(),
@@ -183,7 +341,11 @@ impl Gateway {
             git,
             production,
             // The build target is immutable; `production` (promoted) may later flip.
-            target: if production { "production".into() } else { "preview".into() },
+            target: if production {
+                "production".into()
+            } else {
+                "preview".into()
+            },
             tenant,
         };
         let info = view_of(&dep);
@@ -288,7 +450,8 @@ impl Gateway {
         let dep = st.deployments.get_mut(&did)?;
         mutate(&mut dep.manifest);
         for f in &dep.manifest.functions {
-            self.fluid.update_config(&func_key(did.as_str(), &f.name), f.clone());
+            self.fluid
+                .update_config(&func_key(did.as_str(), &f.name), f.clone());
         }
         Some(view_of(dep))
     }
@@ -415,10 +578,20 @@ impl Gateway {
     /// re-register its functions with the Fluid pool. Used on boot.
     pub fn restore(&self, rec: fluid_core::DeployRecord) {
         let id = DeploymentId::from(rec.id.clone());
-        let cell_image = rec.manifest.image.clone().unwrap_or_else(|| self.image.clone());
+        let cell_image = rec
+            .manifest
+            .image
+            .clone()
+            .unwrap_or_else(|| self.image.clone());
         for f in &rec.manifest.functions {
             let key = func_key(id.as_str(), &f.name);
-            self.fluid.register(key, f.clone(), cell_image.clone(), rec.root.clone(), rec.tenant.clone());
+            self.fluid.register(
+                key,
+                f.clone(),
+                cell_image.clone(),
+                rec.root.clone(),
+                rec.tenant.clone(),
+            );
         }
         let dep = Deployment {
             id: id.clone(),
@@ -432,7 +605,11 @@ impl Gateway {
             production: rec.production,
             // Old snapshots have no target — derive it from the production flag.
             target: if rec.target.is_empty() {
-                if rec.production { "production".into() } else { "preview".into() }
+                if rec.production {
+                    "production".into()
+                } else {
+                    "preview".into()
+                }
             } else {
                 rec.target
             },
@@ -444,7 +621,11 @@ impl Gateway {
             // another tenant's deployment to the platform owner's real
             // namespace on every restart of a node holding a stale snapshot.
             // Fail closed: never adopt an untagged record into a live tenant.
-            tenant: if rec.tenant.trim().is_empty() { "__untagged__".to_string() } else { rec.tenant },
+            tenant: if rec.tenant.trim().is_empty() {
+                "__untagged__".to_string()
+            } else {
+                rec.tenant
+            },
         };
         let project = dep.project.clone();
         let mut st = self.state.lock();
@@ -475,7 +656,9 @@ impl Gateway {
     /// the caller falls back to its normal mesh path on a miss.
     pub async fn lease_for_path(&self, host: Option<&str>, path: &str) -> Option<Lease> {
         let dep = self.select(host)?;
-        let RouteTarget::Function(name) = dep.manifest.resolve(path) else { return None };
+        let RouteTarget::Function(name) = dep.manifest.resolve(path) else {
+            return None;
+        };
         let key = func_key(dep.id.as_str(), &name);
         self.fluid.lease(&key).await.ok()
     }
@@ -489,7 +672,9 @@ impl Gateway {
                 return st.deployments.get(id).cloned();
             }
         }
-        st.default.as_ref().and_then(|id| st.deployments.get(id).cloned())
+        st.default
+            .as_ref()
+            .and_then(|id| st.deployments.get(id).cloned())
     }
 
     /// The deployment id a request `host` resolves to (its subdomain alias), if
@@ -498,7 +683,11 @@ impl Gateway {
     pub fn host_deployment_id(&self, host: &str) -> Option<String> {
         let h = host.split(':').next().unwrap_or(host);
         let sub = h.split('.').next().unwrap_or(h);
-        self.state.lock().aliases.get(sub).map(|id| id.as_str().to_string())
+        self.state
+            .lock()
+            .aliases
+            .get(sub)
+            .map(|id| id.as_str().to_string())
     }
 
     /// EXACT host attribution for event/log tagging: the `(deployment id,
@@ -542,7 +731,12 @@ impl Gateway {
         let mut out: Vec<String> = st
             .deployments
             .values()
-            .filter(|d| d.manifest.functions.iter().any(|f| f.runtime == "container"))
+            .filter(|d| {
+                d.manifest
+                    .functions
+                    .iter()
+                    .any(|f| f.runtime == "container")
+            })
             .map(|d| d.project.clone())
             .collect();
         out.sort();
@@ -558,7 +752,12 @@ impl Gateway {
         st.aliases
             .get(sub)
             .and_then(|id| st.deployments.get(id))
-            .map(|d| d.manifest.functions.iter().any(|f| f.runtime == "container"))
+            .map(|d| {
+                d.manifest
+                    .functions
+                    .iter()
+                    .any(|f| f.runtime == "container")
+            })
             .unwrap_or(false)
     }
 }
@@ -602,7 +801,11 @@ impl Gateway {
         let opened = self.tunnels_opened.load(Ordering::Relaxed);
         let reused = self.tunnels_reused.load(Ordering::Relaxed);
         let total = opened + reused;
-        let reuse_pct = if total > 0 { reused as f64 / total as f64 } else { 0.0 };
+        let reuse_pct = if total > 0 {
+            reused as f64 / total as f64
+        } else {
+            0.0
+        };
         let (mut bytes_in, mut bytes_out, mut queue_depth, mut bp, mut backpressured) =
             (0u64, 0u64, 0u32, 0u64, 0usize);
         let live = self.tunnels.lock().await;
@@ -702,7 +905,12 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                     gw.record_vitals(&dep.tenant, device, &bytes);
                 }
             }
-            return (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, "text/plain")], "ok").into_response();
+            return (
+                StatusCode::ACCEPTED,
+                [(header::CONTENT_TYPE, "text/plain")],
+                "ok",
+            )
+                .into_response();
         }
         if let Some(resp) = vercel_insights(&parts.method, &path) {
             return resp;
@@ -723,14 +931,22 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
     // Request context for `has`/`missing` conditions + host-scoped matching.
     let query = parts.uri.query().unwrap_or("").to_string();
     let with_query = |loc: String| -> String {
-        if query.is_empty() { loc } else { format!("{loc}?{query}") }
+        if query.is_empty() {
+            loc
+        } else {
+            format!("{loc}?{query}")
+        }
     };
     let ctx = fluid_core::ReqCtx {
         host: host.clone().unwrap_or_default(),
         headers: parts
             .headers
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_ascii_lowercase(), vs.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|vs| (k.as_str().to_ascii_lowercase(), vs.to_string()))
+            })
             .collect(),
         query: query.clone(),
     };
@@ -789,10 +1005,20 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                     None => {
                         let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
                             Ok(b) => b,
-                            Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
+                            Err(_) => {
+                                return (StatusCode::BAD_REQUEST, "body too large").into_response()
+                            }
                         };
-                        proxy_function(&gw, &dep, &origin, &parts.method, &path_q, &parts.headers, body_bytes)
-                            .await
+                        proxy_function(
+                            &gw,
+                            &dep,
+                            &origin,
+                            &parts.method,
+                            &path_q,
+                            &parts.headers,
+                            body_bytes,
+                        )
+                        .await
                     }
                 },
                 None => serve_static(&dep, &path).await,
@@ -803,8 +1029,16 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                 Ok(b) => b,
                 Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
             };
-            proxy_function(&gw, &dep, &name, &parts.method, &path_q, &parts.headers, body_bytes)
-                .await
+            proxy_function(
+                &gw,
+                &dep,
+                &name,
+                &parts.method,
+                &path_q,
+                &parts.headers,
+                body_bytes,
+            )
+            .await
         }
     };
     // Per-route policy (#16): when this deployment carries Next.js per-route
@@ -826,7 +1060,10 @@ fn apply_route_policy(mut resp: Response, dep: &Deployment, path: &str) -> Respo
         return resp;
     };
     // Observability: surfaces which class served the request (enables live verify).
-    resp.headers_mut().insert("x-hive-route-class", HeaderValue::from_static(policy.class.name()));
+    resp.headers_mut().insert(
+        "x-hive-route-class",
+        HeaderValue::from_static(policy.class.name()),
+    );
     // Only synthesize caching for cacheable (2xx) responses that don't already
     // carry a Cache-Control from the origin (don't override the app's intent).
     if !resp.status().is_success() || resp.headers().contains_key(header::CACHE_CONTROL) {
@@ -847,7 +1084,10 @@ fn inject_headers(mut resp: Response, extra: &[(String, String)]) -> Response {
     }
     let h = resp.headers_mut();
     for (k, v) in extra {
-        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             h.insert(name, val);
         }
     }
@@ -940,11 +1180,18 @@ impl RumStore {
     }
 
     fn record(&self, tenant: &str, device: RumDevice, body: &[u8]) {
-        let Ok(payload) = serde_json::from_slice::<VitalsIn>(body) else { return };
+        let Ok(payload) = serde_json::from_slice::<VitalsIn>(body) else {
+            return;
+        };
         let route = path_of_href(&payload.href);
         let mut map = self.by_tenant.write();
         let dq = map.entry(tenant.to_string()).or_default();
-        dq.push_back(VitalSample { t_ms: now_ms(), route, device, v: payload.vitals });
+        dq.push_back(VitalSample {
+            t_ms: now_ms(),
+            route,
+            device,
+            v: payload.vitals,
+        });
         while dq.len() > RUM_CAP_PER_TENANT {
             dq.pop_front();
         }
@@ -975,20 +1222,39 @@ impl RumStore {
         let mut by_route: HashMap<String, RouteRaw> = HashMap::new();
         for s in &samples {
             let r = by_route.entry(s.route.clone()).or_default();
-            if let Some(v) = s.v.fcp { r.fcp.push(v); }
-            if let Some(v) = s.v.lcp { r.lcp.push(v); }
-            if let Some(v) = s.v.cls { r.cls.push(v); }
-            if let Some(v) = s.v.inp { r.inp.push(v); }
-            if let Some(v) = s.v.ttfb { r.ttfb.push(v); }
+            if let Some(v) = s.v.fcp {
+                r.fcp.push(v);
+            }
+            if let Some(v) = s.v.lcp {
+                r.lcp.push(v);
+            }
+            if let Some(v) = s.v.cls {
+                r.cls.push(v);
+            }
+            if let Some(v) = s.v.inp {
+                r.inp.push(v);
+            }
+            if let Some(v) = s.v.ttfb {
+                r.ttfb.push(v);
+            }
             r.count += 1;
         }
         for r in by_route.values_mut() {
             r.sort();
         }
-        RumRaw { by_route, sample_count: samples.len() }
+        RumRaw {
+            by_route,
+            sample_count: samples.len(),
+        }
     }
 
-    fn summary(&self, tenant: &str, minutes: usize, device: Option<RumDevice>, now_ms: u64) -> RumSummary {
+    fn summary(
+        &self,
+        tenant: &str,
+        minutes: usize,
+        device: Option<RumDevice>,
+        now_ms: u64,
+    ) -> RumSummary {
         self.raw(tenant, minutes, device, now_ms).summarize()
     }
 }
@@ -1008,7 +1274,13 @@ pub struct RouteRaw {
 
 impl RouteRaw {
     fn sort(&mut self) {
-        for v in [&mut self.fcp, &mut self.lcp, &mut self.cls, &mut self.inp, &mut self.ttfb] {
+        for v in [
+            &mut self.fcp,
+            &mut self.lcp,
+            &mut self.cls,
+            &mut self.inp,
+            &mut self.ttfb,
+        ] {
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
         }
     }
@@ -1033,7 +1305,13 @@ impl RouteRaw {
             let idx = ((sorted.len() as f64 - 1.0) * p).round() as usize;
             sorted.get(idx.min(sorted.len() - 1)).copied()
         };
-        VitalPercentiles { fcp: pct(&self.fcp), lcp: pct(&self.lcp), cls: pct(&self.cls), inp: pct(&self.inp), ttfb: pct(&self.ttfb) }
+        VitalPercentiles {
+            fcp: pct(&self.fcp),
+            lcp: pct(&self.lcp),
+            cls: pct(&self.cls),
+            inp: pct(&self.inp),
+            ttfb: pct(&self.ttfb),
+        }
     }
 }
 
@@ -1064,8 +1342,15 @@ fn res_score(p75: &VitalPercentiles) -> Option<u32> {
         (score_of(p75.fcp, 1800.0, 3000.0), 15.0),
         (score_of(p75.ttfb, 800.0, 1800.0), 10.0),
     ];
-    let (sum, weight): (f64, f64) = weighted.iter().filter_map(|(s, w)| s.map(|s| (s * w, *w))).fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-    if weight > 0.0 { Some((sum / weight).round() as u32) } else { None }
+    let (sum, weight): (f64, f64) = weighted
+        .iter()
+        .filter_map(|(s, w)| s.map(|s| (s * w, *w)))
+        .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+    if weight > 0.0 {
+        Some((sum / weight).round() as u32)
+    } else {
+        None
+    }
 }
 
 impl RumRaw {
@@ -1090,7 +1375,12 @@ impl RumRaw {
             .iter()
             .map(|(route, r)| {
                 let p75 = r.percentiles(0.75);
-                RouteScore { route: route.clone(), count: r.count, res: res_score(&p75), p75 }
+                RouteScore {
+                    route: route.clone(),
+                    count: r.count,
+                    res: res_score(&p75),
+                    p75,
+                }
             })
             .collect();
         routes.sort_by(|a, b| b.count.cmp(&a.count));
@@ -1145,8 +1435,16 @@ pub struct RumSummary {
 /// `/a/b`) without pulling in a URL-parsing crate for one field.
 fn path_of_href(href: &str) -> String {
     let after_scheme = href.split("://").nth(1).unwrap_or(href);
-    let path_and_after = after_scheme.splitn(2, '/').nth(1).map(|s| format!("/{s}")).unwrap_or_else(|| "/".to_string());
-    path_and_after.split(['?', '#']).next().unwrap_or("/").to_string()
+    let path_and_after = after_scheme
+        .splitn(2, '/')
+        .nth(1)
+        .map(|s| format!("/{s}"))
+        .unwrap_or_else(|| "/".to_string());
+    path_and_after
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+        .to_string()
 }
 
 /// Vercel Web Analytics + Speed Insights endpoints.
@@ -1172,13 +1470,23 @@ addEventListener('visibilitychange',function(){if(document.visibilityState==='hi
     let js = |body: &'static str| -> Response {
         Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+            .header(
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            )
             .header(header::CACHE_CONTROL, "public, max-age=3600")
             .body(Body::from(body))
             .unwrap()
             .into_response()
     };
-    let accepted = || (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, "text/plain")], "ok").into_response();
+    let accepted = || {
+        (
+            StatusCode::ACCEPTED,
+            [(header::CONTENT_TYPE, "text/plain")],
+            "ok",
+        )
+            .into_response()
+    };
 
     match (method, path) {
         (&Method::GET, "/_vercel/insights/script.js") => Some(js(ANALYTICS_JS)),
@@ -1211,7 +1519,9 @@ fn static_cache_control(path: &str) -> &'static str {
 /// 8+ chars containing a digit), e.g. `index-4f3a9c2b.js`, `main.1a2b3c4d.css`.
 fn is_hashed_asset(file: &str) -> bool {
     file.split(['.', '-']).any(|seg| {
-        seg.len() >= 8 && seg.bytes().all(|b| b.is_ascii_hexdigit()) && seg.bytes().any(|b| b.is_ascii_digit())
+        seg.len() >= 8
+            && seg.bytes().all(|b| b.is_ascii_hexdigit())
+            && seg.bytes().any(|b| b.is_ascii_digit())
     })
 }
 
@@ -1220,7 +1530,11 @@ fn is_hashed_asset(file: &str) -> bool {
 /// cleanUrls `.html` sibling) exists; returns `None` on a miss WITHOUT the
 /// SPA-index/404 fallback, so the caller can fall through to an origin function.
 async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
-    let static_dir = dep.manifest.static_dir.clone().unwrap_or_else(|| ".".into());
+    let static_dir = dep
+        .manifest
+        .static_dir
+        .clone()
+        .unwrap_or_else(|| ".".into());
     let base = dep.root.join(static_dir);
     let rel = path.trim_start_matches('/');
     let mut file = base.join(rel);
@@ -1234,7 +1548,10 @@ async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
         let ctype = content_type(&file);
         return Some(
             (
-                [(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, static_cache_control(path))],
+                [
+                    (header::CONTENT_TYPE, ctype),
+                    (header::CACHE_CONTROL, static_cache_control(path)),
+                ],
                 bytes,
             )
                 .into_response(),
@@ -1262,7 +1579,11 @@ async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
 }
 
 async fn serve_static(dep: &Deployment, path: &str) -> Response {
-    let static_dir = dep.manifest.static_dir.clone().unwrap_or_else(|| ".".into());
+    let static_dir = dep
+        .manifest
+        .static_dir
+        .clone()
+        .unwrap_or_else(|| ".".into());
     let base = dep.root.join(static_dir);
     let rel = path.trim_start_matches('/');
     let mut file = base.join(rel);
@@ -1278,7 +1599,10 @@ async fn serve_static(dep: &Deployment, path: &str) -> Response {
         Ok(bytes) => {
             let ctype = content_type(&file);
             (
-                [(header::CONTENT_TYPE, ctype), (header::CACHE_CONTROL, static_cache_control(path))],
+                [
+                    (header::CONTENT_TYPE, ctype),
+                    (header::CACHE_CONTROL, static_cache_control(path)),
+                ],
                 bytes,
             )
                 .into_response()
@@ -1344,7 +1668,9 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
     if url.is_empty() {
         return bad("missing `url`");
     }
-    let Some(width) = w else { return bad("missing `w`") };
+    let Some(width) = w else {
+        return bad("missing `w`");
+    };
     if width == 0 || width > 4096 {
         return bad("invalid `w`");
     }
@@ -1369,7 +1695,10 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
         if !allowed {
             return bad("remote url not allowed by images.remotePatterns/domains");
         }
-        let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+        {
             Ok(c) => c,
             Err(_) => return (StatusCode::BAD_GATEWAY, "image fetch failed").into_response(),
         };
@@ -1382,7 +1711,9 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
                     .map(|t| t.contains("svg"))
                     .unwrap_or(false);
                 match r.bytes().await {
-                    Ok(b) if b.len() <= 16 * 1024 * 1024 => (b.to_vec(), svg || url.ends_with(".svg")),
+                    Ok(b) if b.len() <= 16 * 1024 * 1024 => {
+                        (b.to_vec(), svg || url.ends_with(".svg"))
+                    }
                     _ => return (StatusCode::BAD_GATEWAY, "image too large").into_response(),
                 }
             }
@@ -1395,9 +1726,17 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
                 return bad("local url not allowed by images.localPatterns");
             }
         }
-        let static_dir = dep.manifest.static_dir.clone().unwrap_or_else(|| ".".into());
+        let static_dir = dep
+            .manifest
+            .static_dir
+            .clone()
+            .unwrap_or_else(|| ".".into());
         let base = dep.root.join(static_dir);
-        let rel = url.split('?').next().unwrap_or(&url).trim_start_matches('/');
+        let rel = url
+            .split('?')
+            .next()
+            .unwrap_or(&url)
+            .trim_start_matches('/');
         let file = base.join(rel);
         if !is_within(&base, &file) {
             return bad("forbidden");
@@ -1424,7 +1763,10 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
         .map(|a| a.contains("image/webp"))
         .unwrap_or(false);
     let formats = cfg.map(|c| c.formats.clone()).unwrap_or_default();
-    let encoded = tokio::task::spawn_blocking(move || optimize_bytes(&bytes, width, q, accept_webp, &formats)).await;
+    let encoded = tokio::task::spawn_blocking(move || {
+        optimize_bytes(&bytes, width, q, accept_webp, &formats)
+    })
+    .await;
     match encoded {
         Ok(Some((out, ctype))) => image_response(out, ctype, cfg),
         _ => (StatusCode::UNPROCESSABLE_ENTITY, "could not process image").into_response(),
@@ -1437,7 +1779,10 @@ fn image_response(body: Vec<u8>, ctype: &str, cfg: Option<&fluid_core::ImagesCon
     let mut b = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, ctype)
-        .header(header::CACHE_CONTROL, format!("public, max-age={ttl}, must-revalidate"));
+        .header(
+            header::CACHE_CONTROL,
+            format!("public, max-age={ttl}, must-revalidate"),
+        );
     if let Some(c) = cfg {
         if let Some(disp) = &c.content_disposition_type {
             b = b.header(header::CONTENT_DISPOSITION, disp.clone());
@@ -1451,7 +1796,13 @@ fn image_response(body: Vec<u8>, ctype: &str, cfg: Option<&fluid_core::ImagesCon
 
 /// Decode, resize to `width` (preserving aspect), and re-encode. Returns the
 /// encoded bytes + content-type, or `None` if the input isn't a decodable image.
-fn optimize_bytes(bytes: &[u8], width: u32, quality: u8, accept_webp: bool, formats: &[String]) -> Option<(Vec<u8>, &'static str)> {
+fn optimize_bytes(
+    bytes: &[u8],
+    width: u32,
+    quality: u8,
+    accept_webp: bool,
+    formats: &[String],
+) -> Option<(Vec<u8>, &'static str)> {
     use image::imageops::FilterType;
     let img = image::load_from_memory(bytes).ok()?;
     let resized = if img.width() > width {
@@ -1463,7 +1814,8 @@ fn optimize_bytes(bytes: &[u8], width: u32, quality: u8, accept_webp: bool, form
 
     // Prefer WebP when the client accepts it and config permits (image 0.25's
     // WebP encoder is lossless; fall back to JPEG/PNG on any error).
-    let want_webp = accept_webp && (formats.is_empty() || formats.iter().any(|f| f == "image/webp"));
+    let want_webp =
+        accept_webp && (formats.is_empty() || formats.iter().any(|f| f == "image/webp"));
     if want_webp {
         let mut buf = std::io::Cursor::new(Vec::new());
         if resized.write_to(&mut buf, image::ImageFormat::WebP).is_ok() {
@@ -1479,7 +1831,12 @@ fn optimize_bytes(bytes: &[u8], width: u32, quality: u8, accept_webp: bool, form
         let mut buf = Vec::new();
         let rgb = resized.to_rgb8();
         image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
-            .write_image(rgb.as_raw(), rgb.width(), rgb.height(), image::ExtendedColorType::Rgb8)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
             .ok()?;
         Some((buf, "image/jpeg"))
     }
@@ -1521,9 +1878,18 @@ fn pct_decode(s: &str) -> String {
 fn remote_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
     // Parse scheme://host[:port]/path?query without a url crate.
     let after = url.splitn(2, "://").nth(1).unwrap_or("");
-    let (authority, rest) = after.split_once('/').map(|(a, r)| (a, format!("/{r}"))).unwrap_or((after, "/".to_string()));
-    let (host, port) = authority.split_once(':').map(|(h, p)| (h, Some(p))).unwrap_or((authority, None));
-    let (pathname, search) = rest.split_once('?').map(|(p, s)| (p.to_string(), format!("?{s}"))).unwrap_or((rest.clone(), String::new()));
+    let (authority, rest) = after
+        .split_once('/')
+        .map(|(a, r)| (a, format!("/{r}")))
+        .unwrap_or((after, "/".to_string()));
+    let (host, port) = authority
+        .split_once(':')
+        .map(|(h, p)| (h, Some(p)))
+        .unwrap_or((authority, None));
+    let (pathname, search) = rest
+        .split_once('?')
+        .map(|(p, s)| (p.to_string(), format!("?{s}")))
+        .unwrap_or((rest.clone(), String::new()));
     let scheme = url.split("://").next().unwrap_or("");
 
     if cfg.domains.iter().any(|d| d == host) {
@@ -1532,17 +1898,35 @@ fn remote_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
     cfg.remote_patterns.iter().any(|p| {
         p.protocol.as_deref().map(|pr| pr == scheme).unwrap_or(true)
             && host_matches(&p.hostname, host)
-            && p.port.as_deref().map(|pt| pt.is_empty() || Some(pt) == port).unwrap_or(true)
-            && p.pathname.as_deref().map(|pn| pattern_matches(pn, &pathname)).unwrap_or(true)
-            && p.search.as_deref().map(|s| s.is_empty() || s == search).unwrap_or(true)
+            && p.port
+                .as_deref()
+                .map(|pt| pt.is_empty() || Some(pt) == port)
+                .unwrap_or(true)
+            && p.pathname
+                .as_deref()
+                .map(|pn| pattern_matches(pn, &pathname))
+                .unwrap_or(true)
+            && p.search
+                .as_deref()
+                .map(|s| s.is_empty() || s == search)
+                .unwrap_or(true)
     })
 }
 
 fn local_allowed(cfg: &fluid_core::ImagesConfig, url: &str) -> bool {
-    let (pathname, search) = url.split_once('?').map(|(p, s)| (p.to_string(), format!("?{s}"))).unwrap_or((url.to_string(), String::new()));
+    let (pathname, search) = url
+        .split_once('?')
+        .map(|(p, s)| (p.to_string(), format!("?{s}")))
+        .unwrap_or((url.to_string(), String::new()));
     cfg.local_patterns.iter().any(|p| {
-        p.pathname.as_deref().map(|pn| pattern_matches(pn, &pathname)).unwrap_or(true)
-            && p.search.as_deref().map(|s| s.is_empty() || s == search).unwrap_or(true)
+        p.pathname
+            .as_deref()
+            .map(|pn| pattern_matches(pn, &pathname))
+            .unwrap_or(true)
+            && p.search
+                .as_deref()
+                .map(|s| s.is_empty() || s == search)
+                .unwrap_or(true)
     })
 }
 
@@ -1552,7 +1936,9 @@ fn host_matches(pattern: &str, host: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("**.") {
         host == suffix || host.ends_with(&format!(".{suffix}"))
     } else if let Some(suffix) = pattern.strip_prefix("*.") {
-        host.strip_suffix(suffix).map(|p| p.ends_with('.') && !p[..p.len() - 1].contains('.')).unwrap_or(false)
+        host.strip_suffix(suffix)
+            .map(|p| p.ends_with('.') && !p[..p.len() - 1].contains('.'))
+            .unwrap_or(false)
     } else {
         pattern == host
     }
@@ -1571,9 +1957,235 @@ fn pattern_matches(pattern: &str, value: &str) -> bool {
         return value == prefix || value.starts_with(&format!("{prefix}/"));
     }
     if let Some(prefix) = pat.strip_suffix("/*") {
-        return value.strip_prefix(&format!("{prefix}/")).map(|r| !r.contains('/')).unwrap_or(false);
+        return value
+            .strip_prefix(&format!("{prefix}/"))
+            .map(|r| !r.contains('/'))
+            .unwrap_or(false);
     }
     pat == value
+}
+
+enum BrowserAttempt {
+    None,
+    Response(Response),
+    Failed(BrowserInvokeFailure),
+}
+
+#[derive(Deserialize)]
+struct BrowserHttpEnvelope {
+    status: u16,
+    #[serde(default)]
+    headers: HashMap<String, String>,
+    #[serde(default)]
+    body: String,
+    #[serde(default, rename = "bodyBase64")]
+    body_base64: Option<String>,
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let a = chunk[0];
+        let b = chunk.get(1).copied().unwrap_or(0);
+        let c = chunk.get(2).copied().unwrap_or(0);
+        out.push(TABLE[(a >> 2) as usize] as char);
+        out.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(c & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    fn value(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let last = index + 1 == bytes.len() / 4;
+        let padding = if chunk[2] == b'=' {
+            if chunk[3] != b'=' {
+                return None;
+            }
+            2
+        } else if chunk[3] == b'=' {
+            1
+        } else {
+            0
+        };
+        if !last && padding != 0 {
+            return None;
+        }
+        let a = value(chunk[0])?;
+        let b = value(chunk[1])?;
+        let c = if padding == 2 { 0 } else { value(chunk[2])? };
+        let d = if padding == 0 { value(chunk[3])? } else { 0 };
+        if padding == 2 && b & 15 != 0 || padding == 1 && c & 3 != 0 {
+            return None;
+        }
+        out.push(a << 2 | b >> 4);
+        if padding < 2 {
+            out.push(b << 4 | c >> 2);
+        }
+        if padding == 0 {
+            out.push(c << 6 | d);
+        }
+    }
+    Some(out)
+}
+
+fn browser_response(bytes: &[u8]) -> Result<Response, String> {
+    let envelope: BrowserHttpEnvelope =
+        serde_json::from_slice(bytes).map_err(|e| format!("malformed browser response: {e}"))?;
+    let status = StatusCode::from_u16(envelope.status)
+        .map_err(|_| "browser response status is outside 100..599".to_string())?;
+    let body = match envelope.body_base64 {
+        Some(encoded) => base64_decode(&encoded)
+            .ok_or_else(|| "browser response bodyBase64 is not canonical base64".to_string())?,
+        None => envelope.body.into_bytes(),
+    };
+    if body.len() > (1 << 20) {
+        return Err("browser response body exceeds frame limit".into());
+    }
+    let mut response = Response::builder().status(status);
+    for (name, value) in envelope.headers {
+        let lower = name.to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+        ) {
+            continue;
+        }
+        let name = HeaderName::from_bytes(lower.as_bytes())
+            .map_err(|_| format!("invalid browser response header name: {name}"))?;
+        let value = HeaderValue::from_str(&value)
+            .map_err(|_| format!("invalid browser response header value: {name}"))?;
+        response = response.header(name, value);
+    }
+    let mut response = response
+        .body(Body::from(body))
+        .map_err(|e| format!("browser response build failed: {e}"))?
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-hive-runtime", HeaderValue::from_static("browser"));
+    Ok(response)
+}
+
+async fn try_browser(
+    gw: &Arc<Gateway>,
+    dep: &Deployment,
+    name: &str,
+    method: &Method,
+    path_q: &str,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> BrowserAttempt {
+    let key = func_key(dep.id.as_str(), name);
+    let now = now_ms();
+    let (target, invoker) = {
+        let browser = gw.browser.read();
+        let Some(invoker) = browser.invoker.clone() else {
+            return BrowserAttempt::None;
+        };
+        let Some(targets) = browser.by_function.get(&key) else {
+            return BrowserAttempt::None;
+        };
+        let target = targets.iter().find(|target| {
+            let circuit = format!("{}:{}", target.endpoint_id, target.digest);
+            target.tenant == dep.tenant
+                && target.deployment == dep.id.as_str()
+                && target.function == name
+                && target.scope == BrowserScope::Public
+                && target.expires_ms > now
+                && browser.circuit_until.get(&circuit).copied().unwrap_or(0) <= now
+        });
+        let Some(target) = target.cloned() else {
+            return BrowserAttempt::None;
+        };
+        (target, invoker)
+    };
+
+    let forwarded: HashMap<String, String> = headers
+        .iter()
+        .filter(|(name, _)| {
+            !matches!(
+                name.as_str(),
+                "connection" | "content-length" | "host" | "transfer-encoding" | "upgrade"
+            )
+        })
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let request = serde_json::json!({
+        "method": method.as_str(),
+        "path": path_q,
+        "headers": forwarded,
+        "body": std::str::from_utf8(body).unwrap_or(""),
+        "bodyBase64": base64_encode(body),
+    })
+    .to_string();
+    let result = invoker(target.clone(), request).await;
+    let failure = match result {
+        Ok(bytes) => match browser_response(&bytes) {
+            Ok(response) => return BrowserAttempt::Response(response),
+            Err(message) => BrowserInvokeFailure {
+                sent: true,
+                message,
+            },
+        },
+        Err(failure) => failure,
+    };
+    let circuit_ms = std::env::var("HIVE_BROWSER_CIRCUIT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    let circuit = format!("{}:{}", target.endpoint_id, target.digest);
+    gw.browser
+        .write()
+        .circuit_until
+        .insert(circuit, now_ms().saturating_add(circuit_ms));
+    tracing::warn!(
+        endpoint_id = %target.endpoint_id,
+        digest = %target.digest,
+        sent = failure.sent,
+        error = %failure.message,
+        "browser function failed; circuit opened"
+    );
+    BrowserAttempt::Failed(failure)
 }
 
 async fn proxy_function(
@@ -1594,8 +2206,34 @@ async fn proxy_function(
             let n = k.as_str();
             n != "connection" && n != "content-length" && n != "host"
         })
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
         .collect();
+
+    match try_browser(gw, dep, name, method, path_q, headers, &body).await {
+        BrowserAttempt::Response(response) => return response,
+        BrowserAttempt::Failed(failure)
+            if failure.sent && method != Method::GET && method != Method::HEAD =>
+        {
+            // The browser may already have executed this mutation. Replaying it
+            // on fleet compute would turn a transport failure into a duplicate
+            // side effect, so fail explicitly instead of lying about capacity.
+            let mut response =
+                (StatusCode::BAD_GATEWAY, "BROWSER_EXECUTION_UNCERTAIN").into_response();
+            response.headers_mut().insert(
+                "x-hive-error",
+                HeaderValue::from_static("BROWSER_EXECUTION_UNCERTAIN"),
+            );
+            return response;
+        }
+        BrowserAttempt::Failed(_) | BrowserAttempt::None => {
+            // Pre-send failures are safe for every method; GET/HEAD remain safe
+            // after send. The normal Fluid path is the hard fallback.
+        }
+    }
 
     // Per-function max duration (Vercel default 300s) — bounds the whole
     // invocation; on timeout we return 504 without affecting other requests
@@ -1619,9 +2257,11 @@ async fn proxy_function(
                 let es = e.to_string();
                 let class = classify_lease_error(&es);
                 warn!(func = %key, error = %es, code = class.code(), "lease failed");
-                let status = StatusCode::from_u16(class.status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
+                let status =
+                    StatusCode::from_u16(class.status()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE);
                 let mut resp = (status, class.code()).into_response();
-                resp.headers_mut().insert("x-hive-error", HeaderValue::from_static(class.code()));
+                resp.headers_mut()
+                    .insert("x-hive-error", HeaderValue::from_static(class.code()));
                 return resp;
             }
         };
@@ -1648,7 +2288,8 @@ async fn proxy_function(
                 // Exceeded max duration — 504, do not reroute (the instance is
                 // fine; only this invocation is over budget).
                 drop(lease);
-                return (StatusCode::GATEWAY_TIMEOUT, "FUNCTION_INVOCATION_TIMEOUT").into_response();
+                return (StatusCode::GATEWAY_TIMEOUT, "FUNCTION_INVOCATION_TIMEOUT")
+                    .into_response();
             }
             Ok(Ok(resp)) => {
                 tracing::debug!(cell = %cell, status = resp.status, "got response head");
@@ -1685,8 +2326,13 @@ async fn proxy_function(
         code = class.code(),
         "upstream failed after reroute budget"
     );
-    let mut resp = (StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY), class.code()).into_response();
-    resp.headers_mut().insert("x-hive-error", HeaderValue::from_static(class.code()));
+    let mut resp = (
+        StatusCode::from_u16(class.status()).unwrap_or(StatusCode::BAD_GATEWAY),
+        class.code(),
+    )
+        .into_response();
+    resp.headers_mut()
+        .insert("x-hive-error", HeaderValue::from_static(class.code()));
     resp
 }
 
@@ -1749,7 +2395,9 @@ async fn build_response(
             continue;
         }
         let vl = v.to_ascii_lowercase();
-        if kl == "content-type" && (vl.contains("event-stream") || vl.contains("x-component") || vl.contains("stream")) {
+        if kl == "content-type"
+            && (vl.contains("event-stream") || vl.contains("x-component") || vl.contains("stream"))
+        {
             forced_stream = true;
         }
         if let (Ok(name), Ok(val)) = (
@@ -1852,9 +2500,19 @@ struct BodyState {
 fn slug(s: &str) -> String {
     let mapped: String = s
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
         .collect();
-    mapped.split('-').filter(|p| !p.is_empty()).collect::<Vec<_>>().join("-")
+    mapped
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// Immutable commit URL label: `<project>-<shortsha>` (Vercel's per-commit URL).
@@ -1873,7 +2531,11 @@ fn branch_alias(project: &str, branch: &str) -> String {
 /// currently resolves to — ranked by (production, created_at). Keeps branch/commit
 /// aliases tracking the right deployment even when records restore out of order.
 fn set_alias_if_newer(st: &mut GwState, key: &str, id: &DeploymentId) {
-    let Some(cand) = st.deployments.get(id).map(|d| (d.production, d.created_at_ms)) else {
+    let Some(cand) = st
+        .deployments
+        .get(id)
+        .map(|d| (d.production, d.created_at_ms))
+    else {
         return;
     };
     let win = match st.aliases.get(key).and_then(|cur| st.deployments.get(cur)) {
@@ -1889,7 +2551,10 @@ fn set_alias_if_newer(st: &mut GwState, key: &str, id: &DeploymentId) {
 /// for a deployment already present in `st.deployments`.
 fn insert_deploy_aliases(st: &mut GwState, id: &DeploymentId) {
     st.aliases.insert(id.as_str().to_string(), id.clone());
-    let meta = st.deployments.get(id).map(|d| (d.project.clone(), d.git.clone()));
+    let meta = st
+        .deployments
+        .get(id)
+        .map(|d| (d.project.clone(), d.git.clone()));
     if let Some((project, Some(g))) = meta {
         if !g.commit.is_empty() {
             set_alias_if_newer(st, &commit_alias(&project, &g.commit), id);
@@ -1925,7 +2590,12 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
     DeploymentInfo {
         id: d.id.clone(),
         project: d.project.clone(),
-        functions: d.manifest.functions.iter().map(|f| f.name.clone()).collect(),
+        functions: d
+            .manifest
+            .functions
+            .iter()
+            .map(|f| f.name.clone())
+            .collect(),
         created_at_ms: d.created_at_ms,
         alias: format!("{}.localhost", d.project),
         commit_alias,
@@ -1933,7 +2603,11 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         id_alias: format!("{}.localhost", d.id.as_str()),
         // Immutable build environment (a superseded prod build stays "production").
         target: if d.target.is_empty() {
-            if d.production { "production".into() } else { "preview".into() }
+            if d.production {
+                "production".into()
+            } else {
+                "preview".into()
+            }
         } else {
             d.target.clone()
         },
@@ -1947,7 +2621,12 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
             rewrites: d.manifest.rewrites.len(),
             middleware: d.manifest.middleware.is_some(),
             edge_functions: d.manifest.edge_function_count(),
-            serverless_functions: d.manifest.functions.iter().filter(|f| f.runtime != "edge").count(),
+            serverless_functions: d
+                .manifest
+                .functions
+                .iter()
+                .filter(|f| f.runtime != "edge")
+                .count(),
         },
         tenant: d.tenant.clone(),
         // Stamped public raw-port bindings, so the fleet-deployments gossip
@@ -1995,7 +2674,11 @@ mod route_policy_tests {
             id: DeploymentId::from("dpl-test".to_string()),
             project: "p".into(),
             root: PathBuf::from("/tmp"),
-            manifest: Manifest { project: "p".into(), route_policies: policies, ..Default::default() },
+            manifest: Manifest {
+                project: "p".into(),
+                route_policies: policies,
+                ..Default::default()
+            },
             created_at_ms: 0,
             state: fluid_core::DeployState::Ready,
             creator: String::new(),
@@ -2015,7 +2698,9 @@ mod route_policy_tests {
     }
 
     fn cc(r: &Response) -> Option<String> {
-        r.headers().get(header::CACHE_CONTROL).map(|v| v.to_str().unwrap().to_string())
+        r.headers()
+            .get(header::CACHE_CONTROL)
+            .map(|v| v.to_str().unwrap().to_string())
     }
 
     #[test]
@@ -2028,24 +2713,47 @@ mod route_policy_tests {
 
     #[test]
     fn isr_route_gets_synthesized_cache_and_class_header() {
-        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
+        let dep = dep_with(vec![RoutePolicy {
+            pattern: "/blog/[slug]".into(),
+            class: RouteClass::Isr,
+            revalidate: Some(120),
+        }]);
         let r = apply_route_policy(resp(StatusCode::OK, None), &dep, "/blog/hello");
-        assert_eq!(cc(&r).as_deref(), Some("public, s-maxage=120, stale-while-revalidate"));
+        assert_eq!(
+            cc(&r).as_deref(),
+            Some("public, s-maxage=120, stale-while-revalidate")
+        );
         assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "isr");
     }
 
     #[test]
     fn origin_cache_control_is_never_overridden() {
-        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
-        let r = apply_route_policy(resp(StatusCode::OK, Some("private, no-store")), &dep, "/blog/hello");
-        assert_eq!(cc(&r).as_deref(), Some("private, no-store"), "app intent wins");
+        let dep = dep_with(vec![RoutePolicy {
+            pattern: "/blog/[slug]".into(),
+            class: RouteClass::Isr,
+            revalidate: Some(120),
+        }]);
+        let r = apply_route_policy(
+            resp(StatusCode::OK, Some("private, no-store")),
+            &dep,
+            "/blog/hello",
+        );
+        assert_eq!(
+            cc(&r).as_deref(),
+            Some("private, no-store"),
+            "app intent wins"
+        );
         // class header is still tagged for observability.
         assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "isr");
     }
 
     #[test]
     fn dynamic_route_tagged_but_no_synthetic_cache() {
-        let dep = dep_with(vec![RoutePolicy { pattern: "/api/claw".into(), class: RouteClass::ApiNode, revalidate: None }]);
+        let dep = dep_with(vec![RoutePolicy {
+            pattern: "/api/claw".into(),
+            class: RouteClass::ApiNode,
+            revalidate: None,
+        }]);
         let r = apply_route_policy(resp(StatusCode::OK, None), &dep, "/api/claw");
         assert!(cc(&r).is_none(), "dynamic defers to origin");
         assert_eq!(r.headers().get("x-hive-route-class").unwrap(), "api_node");
@@ -2053,8 +2761,16 @@ mod route_policy_tests {
 
     #[test]
     fn non_success_status_not_cached() {
-        let dep = dep_with(vec![RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(120) }]);
-        let r = apply_route_policy(resp(StatusCode::INTERNAL_SERVER_ERROR, None), &dep, "/blog/hello");
+        let dep = dep_with(vec![RoutePolicy {
+            pattern: "/blog/[slug]".into(),
+            class: RouteClass::Isr,
+            revalidate: Some(120),
+        }]);
+        let r = apply_route_policy(
+            resp(StatusCode::INTERNAL_SERVER_ERROR, None),
+            &dep,
+            "/blog/hello",
+        );
         assert!(cc(&r).is_none(), "errors are not cached");
     }
 }
@@ -2093,7 +2809,10 @@ mod failure_class_tests {
         // instead of silently downgrading throttles to 503 in production.
         let reason = fluid_compute::NackReason::TenantQuota;
         let bail = format!("function 'app:fn' saturated ({reason:?})");
-        assert!(bail.contains("TenantQuota"), "fluid bail string was: {bail}");
+        assert!(
+            bail.contains("TenantQuota"),
+            "fluid bail string was: {bail}"
+        );
         assert_eq!(classify_lease_error(&bail), FailureClass::TenantThrottled);
     }
 }
@@ -2139,14 +2858,35 @@ mod image_tests {
 
     #[test]
     fn static_cache_classification() {
-        assert_eq!(static_cache_control("/_next/static/chunks/main.js"), "public, max-age=31536000, immutable");
-        assert_eq!(static_cache_control("/assets/index-4f3a9c2b.js"), "public, max-age=31536000, immutable");
-        assert_eq!(static_cache_control("/main.1a2b3c4d.css"), "public, max-age=31536000, immutable");
+        assert_eq!(
+            static_cache_control("/_next/static/chunks/main.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            static_cache_control("/assets/index-4f3a9c2b.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            static_cache_control("/main.1a2b3c4d.css"),
+            "public, max-age=31536000, immutable"
+        );
         // Non-hashed assets + HTML get the safe revalidating default.
-        assert_eq!(static_cache_control("/index.html"), "public, max-age=0, must-revalidate");
-        assert_eq!(static_cache_control("/styles.css"), "public, max-age=0, must-revalidate");
-        assert_eq!(static_cache_control("/bootstrap5.css"), "public, max-age=0, must-revalidate"); // not a hex hash
-        assert_eq!(static_cache_control("/documentation.html"), "public, max-age=0, must-revalidate");
+        assert_eq!(
+            static_cache_control("/index.html"),
+            "public, max-age=0, must-revalidate"
+        );
+        assert_eq!(
+            static_cache_control("/styles.css"),
+            "public, max-age=0, must-revalidate"
+        );
+        assert_eq!(
+            static_cache_control("/bootstrap5.css"),
+            "public, max-age=0, must-revalidate"
+        ); // not a hex hash
+        assert_eq!(
+            static_cache_control("/documentation.html"),
+            "public, max-age=0, must-revalidate"
+        );
         assert!(!is_hashed_asset("react-dom.js"));
         assert!(is_hashed_asset("index-4f3a9c2b.js"));
     }

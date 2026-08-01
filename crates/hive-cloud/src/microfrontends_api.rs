@@ -19,7 +19,9 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 
 use crate::admin::{require_project, tenant};
-use crate::microfrontends::{validate_group, MfeDevelopment, MfeError, MfeGroup, MfeMembership, MfeRoute};
+use crate::microfrontends::{
+    validate_group, MfeDevelopment, MfeError, MfeGroup, MfeMembership, MfeRoute,
+};
 use crate::state::CloudState;
 use hive_core::now_ms;
 
@@ -33,14 +35,23 @@ pub fn routes() -> Router<Arc<CloudState>> {
             get(project_mfe_get).put(project_mfe_put),
         )
         // Group CRUD.
-        .route("/v1/microfrontends/groups", get(groups_list).post(group_create))
+        .route(
+            "/v1/microfrontends/groups",
+            get(groups_list).post(group_create),
+        )
         .route(
             "/v1/microfrontends/groups/:groupId",
             get(group_get).patch(group_patch).delete(group_delete),
         )
-        .route("/v1/microfrontends/groups/:groupId/config", get(group_config))
+        .route(
+            "/v1/microfrontends/groups/:groupId/config",
+            get(group_config),
+        )
         // Membership CRUD.
-        .route("/v1/microfrontends/groups/:groupId/members", post(member_add))
+        .route(
+            "/v1/microfrontends/groups/:groupId/members",
+            post(member_add),
+        )
         .route(
             "/v1/microfrontends/groups/:groupId/members/:projectId",
             axum::routing::patch(member_patch).delete(member_remove),
@@ -53,14 +64,17 @@ pub fn routes() -> Router<Arc<CloudState>> {
 
 fn mfe_err(e: MfeError) -> (StatusCode, String) {
     let status = match &e {
-        MfeError::GroupNotFound(_) | MfeError::UnknownMember(_) | MfeError::TargetDeploymentNotFound { .. } => {
-            StatusCode::NOT_FOUND
-        }
+        MfeError::GroupNotFound(_)
+        | MfeError::UnknownMember(_)
+        | MfeError::TargetDeploymentNotFound { .. } => StatusCode::NOT_FOUND,
         MfeError::Unauthorized(_) => StatusCode::FORBIDDEN,
         MfeError::ProjectAlreadyInGroup { .. } => StatusCode::CONFLICT,
         _ => StatusCode::BAD_REQUEST,
     };
-    (status, json!({ "code": e.code(), "error": e.message() }).to_string())
+    (
+        status,
+        json!({ "code": e.code(), "error": e.message() }).to_string(),
+    )
 }
 
 fn bad(msg: &str) -> (StatusCode, String) {
@@ -69,12 +83,18 @@ fn bad(msg: &str) -> (StatusCode, String) {
 
 /// Every referenced project (default + members) must belong to `team`, else the
 /// group could compose another tenant's deployments.
-fn ensure_team_owns(c: &Arc<CloudState>, team: &str, projects: impl IntoIterator<Item = String>) -> Result<(), (StatusCode, String)> {
+fn ensure_team_owns(
+    c: &Arc<CloudState>,
+    team: &str,
+    projects: impl IntoIterator<Item = String>,
+) -> Result<(), (StatusCode, String)> {
     for p in projects {
         // Fleet-aware ownership (settings rows are node-local; remotely-placed
         // projects are judged from their deployment tenant tags).
         if !crate::admin::project_owned_by(c, &p, team) {
-            return Err(mfe_err(MfeError::Unauthorized(format!("project '{p}' belongs to a different team"))));
+            return Err(mfe_err(MfeError::Unauthorized(format!(
+                "project '{p}' belongs to a different team"
+            ))));
         }
     }
     Ok(())
@@ -82,22 +102,49 @@ fn ensure_team_owns(c: &Arc<CloudState>, team: &str, projects: impl IntoIterator
 
 /// Plan gate for MFE writes (Pro or Enterprise).
 fn require_plan(c: &Arc<CloudState>, team: &str) -> Result<(), (StatusCode, String)> {
-    let plan = c.teams.get(team).map(|t| t.plan).unwrap_or_else(|| c.billing.account(team).plan);
+    let plan = c
+        .teams
+        .get(team)
+        .map(|t| t.plan)
+        .unwrap_or_else(|| c.billing.account(team).plan);
     if !crate::billing::plan_allows_microfrontends(&plan) {
-        return Err((StatusCode::FORBIDDEN, json!({ "error": "Microfrontends require the Pro or Enterprise plan" }).to_string()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            json!({ "error": "Microfrontends require the Pro or Enterprise plan" }).to_string(),
+        ));
     }
     Ok(())
 }
 
 /// Validate a candidate group, then commit it (upsert + persist + audit). The
 /// store only ever sees valid groups.
-fn commit_group(c: &Arc<CloudState>, team: &str, mut g: MfeGroup, action: &str) -> Result<MfeGroup, (StatusCode, String)> {
+fn commit_group(
+    c: &Arc<CloudState>,
+    team: &str,
+    mut g: MfeGroup,
+    action: &str,
+) -> Result<MfeGroup, (StatusCode, String)> {
     g.updated_ms = now_ms();
     let normalized = g.clone().normalized();
     validate_group(&normalized).map_err(mfe_err)?;
     let saved = c.enterprise.set_mfe_group(team, g);
-    c.audit.record(team, "user", action, "microfrontend_group", &saved.id, &saved.name);
-    let ev = c.event(&c.region, "PUT", "", &format!("/microfrontends/{}", saved.id), 200, "mfe-config", action);
+    c.audit.record(
+        team,
+        "user",
+        action,
+        "microfrontend_group",
+        &saved.id,
+        &saved.name,
+    );
+    let ev = c.event(
+        &c.region,
+        "PUT",
+        "",
+        &format!("/microfrontends/{}", saved.id),
+        200,
+        "mfe-config",
+        action,
+    );
     c.record(ev);
     crate::persist::persist(c);
     Ok(saved)
@@ -107,7 +154,11 @@ fn commit_group(c: &Arc<CloudState>, team: &str, mut g: MfeGroup, action: &str) 
 // Group CRUD
 // ---------------------------------------------------------------------------
 
-async fn groups_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn groups_list(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     Json(json!({ "groups": c.enterprise.mfe_groups(&t) }))
 }
@@ -134,10 +185,18 @@ async fn group_create(
     ensure_team_owns(&c, &t, [b.default_project.clone()])?;
     // First-implementation constraint: a project belongs to at most one group.
     if let Some(existing) = c.enterprise.mfe_group_of_project(&t, &b.default_project) {
-        return Err(mfe_err(MfeError::ProjectAlreadyInGroup { project: b.default_project, group: existing.id }));
+        return Err(mfe_err(MfeError::ProjectAlreadyInGroup {
+            project: b.default_project,
+            group: existing.id,
+        }));
     }
     let id = format!("mfe_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]);
-    let g = MfeGroup::new(id, b.name.trim().to_string(), b.default_project.trim().to_string(), now_ms());
+    let g = MfeGroup::new(
+        id,
+        b.name.trim().to_string(),
+        b.default_project.trim().to_string(),
+        now_ms(),
+    );
     let saved = commit_group(&c, &t, g, "create")?;
     Ok(Json(json!(saved)))
 }
@@ -149,7 +208,10 @@ async fn group_get(
     Path(group_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    c.enterprise.mfe_group(&t, &group_id).map(|g| Json(json!(g))).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id)))
+    c.enterprise
+        .mfe_group(&t, &group_id)
+        .map(|g| Json(json!(g)))
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id)))
 }
 
 async fn group_config(
@@ -159,7 +221,10 @@ async fn group_config(
     Path(group_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let g = c.enterprise.mfe_group(&t, &group_id).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id)))?;
+    let g = c
+        .enterprise
+        .mfe_group(&t, &group_id)
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id)))?;
     Ok(Json(crate::microfrontends::to_vercel_config(&g)))
 }
 
@@ -190,7 +255,10 @@ async fn group_patch(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     require_plan(&c, &t)?;
-    let mut g = c.enterprise.mfe_group(&t, &group_id).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
+    let mut g = c
+        .enterprise
+        .mfe_group(&t, &group_id)
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
     if let Some(n) = b.name.filter(|s| !s.trim().is_empty()) {
         g.name = n.trim().to_string();
     }
@@ -206,7 +274,11 @@ async fn group_patch(
         g.fallback_environment = fe;
     }
     if let Some(name) = b.custom_fallback_environment_name {
-        g.custom_fallback_environment_name = if name.trim().is_empty() { None } else { Some(name.trim().to_string()) };
+        g.custom_fallback_environment_name = if name.trim().is_empty() {
+            None
+        } else {
+            Some(name.trim().to_string())
+        };
     }
     if let Some(d) = b.disable_overrides {
         g.disable_overrides = d;
@@ -231,11 +303,16 @@ async fn group_delete(
     require_plan(&c, &t)?;
     // Only the OWNING node may authoritatively delete (local groups); a gossiped
     // copy is read-only here.
-    if c.enterprise.mfe_groups_local(&t).iter().all(|g| g.id != group_id) {
+    if c.enterprise
+        .mfe_groups_local(&t)
+        .iter()
+        .all(|g| g.id != group_id)
+    {
         return Err(mfe_err(MfeError::GroupNotFound(group_id)));
     }
     c.enterprise.remove_mfe_group(&t, &group_id);
-    c.audit.record(&t, "user", "delete", "microfrontend_group", &group_id, "");
+    c.audit
+        .record(&t, "user", "delete", "microfrontend_group", &group_id, "");
     crate::persist::persist(&c);
     Ok(Json(json!({ "ok": true })))
 }
@@ -266,7 +343,11 @@ struct RouteReq {
 
 impl RouteReq {
     fn into_route(self) -> MfeRoute {
-        MfeRoute { group: self.group.filter(|s| !s.trim().is_empty()), flag: self.flag.filter(|s| !s.trim().is_empty()), paths: self.paths }
+        MfeRoute {
+            group: self.group.filter(|s| !s.trim().is_empty()),
+            flag: self.flag.filter(|s| !s.trim().is_empty()),
+            paths: self.paths,
+        }
     }
 }
 
@@ -284,22 +365,40 @@ async fn member_add(
         return Err(bad("project is required"));
     }
     ensure_team_owns(&c, &t, [project.clone()])?;
-    let mut g = c.enterprise.mfe_group(&t, &group_id).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
+    let mut g = c
+        .enterprise
+        .mfe_group(&t, &group_id)
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
     // At most one group per project (across the team).
     if let Some(existing) = c.enterprise.mfe_group_of_project(&t, &project) {
         if existing.id != g.id {
-            return Err(mfe_err(MfeError::ProjectAlreadyInGroup { project, group: existing.id }));
+            return Err(mfe_err(MfeError::ProjectAlreadyInGroup {
+                project,
+                group: existing.id,
+            }));
         }
     }
     if g.member(&project).is_some() {
-        return Err(mfe_err(MfeError::ProjectAlreadyInGroup { project, group: g.id }));
+        return Err(mfe_err(MfeError::ProjectAlreadyInGroup {
+            project,
+            group: g.id,
+        }));
     }
     let now = now_ms();
     let make_default = b.role.as_deref() == Some("default");
-    let routing: Vec<MfeRoute> = b.routing.unwrap_or_default().into_iter().map(RouteReq::into_route).collect();
+    let routing: Vec<MfeRoute> = b
+        .routing
+        .unwrap_or_default()
+        .into_iter()
+        .map(RouteReq::into_route)
+        .collect();
     g.members.push(MfeMembership {
         project: project.clone(),
-        role: if make_default { "default".into() } else { "child".into() },
+        role: if make_default {
+            "default".into()
+        } else {
+            "child".into()
+        },
         routing,
         default_route: None,
         package_name: None,
@@ -345,7 +444,12 @@ struct DevelopmentReq {
 }
 
 /// Apply the membership patch to `g`'s member `project` in place.
-fn apply_member_patch(g: &mut MfeGroup, project: &str, b: MemberPatchReq, now: u64) -> Result<(), (StatusCode, String)> {
+fn apply_member_patch(
+    g: &mut MfeGroup,
+    project: &str,
+    b: MemberPatchReq,
+    now: u64,
+) -> Result<(), (StatusCode, String)> {
     // Promotion to default rewires the group's host_project.
     if b.role.as_deref() == Some("default") {
         g.host_project = project.to_string();
@@ -357,16 +461,32 @@ fn apply_member_patch(g: &mut MfeGroup, project: &str, b: MemberPatchReq, now: u
         m.routing = routing.into_iter().map(RouteReq::into_route).collect();
     }
     if let Some(dr) = b.default_route {
-        m.default_route = if dr.trim().is_empty() { None } else { Some(dr.trim().to_string()) };
+        m.default_route = if dr.trim().is_empty() {
+            None
+        } else {
+            Some(dr.trim().to_string())
+        };
     }
     if let Some(pn) = b.package_name {
-        m.package_name = if pn.trim().is_empty() { None } else { Some(pn.trim().to_string()) };
+        m.package_name = if pn.trim().is_empty() {
+            None
+        } else {
+            Some(pn.trim().to_string())
+        };
     }
     if let Some(ap) = b.asset_prefix {
-        m.asset_prefix = if ap.trim().is_empty() { None } else { Some(ap.trim().trim_matches('/').to_string()) };
+        m.asset_prefix = if ap.trim().is_empty() {
+            None
+        } else {
+            Some(ap.trim().trim_matches('/').to_string())
+        };
     }
     if let Some(obs) = b.observability_routing {
-        m.observability_routing = if obs == "this_project" { "this_project".into() } else { "default_application".into() };
+        m.observability_routing = if obs == "this_project" {
+            "this_project".into()
+        } else {
+            "default_application".into()
+        };
     }
     if let Some(dev) = b.development {
         let d = MfeDevelopment {
@@ -374,7 +494,11 @@ fn apply_member_patch(g: &mut MfeGroup, project: &str, b: MemberPatchReq, now: u
             task: dev.task.filter(|s| !s.trim().is_empty()),
             fallback: dev.fallback.filter(|s| !s.trim().is_empty()),
         };
-        m.development = if d == MfeDevelopment::default() { None } else { Some(d) };
+        m.development = if d == MfeDevelopment::default() {
+            None
+        } else {
+            Some(d)
+        };
     }
     m.updated_ms = now;
     Ok(())
@@ -389,7 +513,10 @@ async fn member_patch(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     require_plan(&c, &t)?;
-    let mut g = c.enterprise.mfe_group(&t, &group_id).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
+    let mut g = c
+        .enterprise
+        .mfe_group(&t, &group_id)
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
     apply_member_patch(&mut g, &project, b, now_ms())?;
     let saved = commit_group(&c, &t, g, "update_member")?;
     Ok(Json(json!(saved)))
@@ -403,7 +530,10 @@ async fn member_remove(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     require_plan(&c, &t)?;
-    let mut g = c.enterprise.mfe_group(&t, &group_id).ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
+    let mut g = c
+        .enterprise
+        .mfe_group(&t, &group_id)
+        .ok_or_else(|| mfe_err(MfeError::GroupNotFound(group_id.clone())))?;
     // The default app cannot be removed while children remain (pure guard).
     crate::microfrontends::can_remove_member(&g, &project).map_err(|e| match e {
         MfeError::MissingDefaultApp => (
@@ -420,7 +550,8 @@ async fn member_remove(
     if g.members.is_empty() {
         // Emptied the group: delete it outright rather than persist a defaultless shell.
         c.enterprise.remove_mfe_group(&t, &group_id);
-        c.audit.record(&t, "user", "delete", "microfrontend_group", &group_id, "");
+        c.audit
+            .record(&t, "user", "delete", "microfrontend_group", &group_id, "");
         crate::persist::persist(&c);
         return Ok(Json(json!({ "ok": true, "deleted_group": true })));
     }
@@ -442,7 +573,10 @@ async fn project_mfe_get(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     let group = c.enterprise.mfe_group_of_project(&t, &project);
-    let role = group.as_ref().and_then(|g| g.member(&project)).map(|m| m.role.clone());
+    let role = group
+        .as_ref()
+        .and_then(|g| g.member(&project))
+        .map(|m| m.role.clone());
     // Sibling projects in the team available to add to a group (not already in one).
     Ok(Json(json!({
         "project": project,

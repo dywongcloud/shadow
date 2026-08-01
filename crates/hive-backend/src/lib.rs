@@ -41,7 +41,13 @@ fn pid_cpu_time_ns(pid: u32) -> Option<u64> {
     let mut ti: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
     let n = unsafe {
-        libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTASKINFO, 0, &mut ti as *mut _ as *mut libc::c_void, size)
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            &mut ti as *mut _ as *mut libc::c_void,
+            size,
+        )
     };
     if n != size {
         return None;
@@ -87,7 +93,13 @@ fn all_procs() -> Vec<(u32, u32, u64)> {
         let mut bi: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
         let sz = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
         let r = unsafe {
-            libc::proc_pidinfo(p, libc::PROC_PIDTBSDINFO, 0, &mut bi as *mut _ as *mut libc::c_void, sz)
+            libc::proc_pidinfo(
+                p,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut bi as *mut _ as *mut libc::c_void,
+                sz,
+            )
         };
         if r != sz {
             continue;
@@ -112,15 +124,22 @@ fn parse_linux_stat(stat: &str) -> Option<(u32, u64)> {
     if hz <= 0 {
         return None;
     }
-    Some((ppid, (utime.saturating_add(stime)).saturating_mul(1_000_000_000) / hz as u64))
+    Some((
+        ppid,
+        (utime.saturating_add(stime)).saturating_mul(1_000_000_000) / hz as u64,
+    ))
 }
 
 #[cfg(target_os = "linux")]
 fn all_procs() -> Vec<(u32, u32, u64)> {
     let mut out = Vec::new();
-    let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+    let Ok(rd) = std::fs::read_dir("/proc") else {
+        return out;
+    };
     for e in rd.flatten() {
-        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             if let Some((ppid, cpu)) = parse_linux_stat(&stat) {
                 out.push((pid, ppid, cpu));
@@ -197,7 +216,10 @@ impl CpuSampler {
         let mut g = self.inner.lock().ok()?;
         // Refresh the all-process snapshot at most ~4×/s; per-cell queries in one
         // tick reuse it.
-        let stale = g.snapshot_at.map(|t| t.elapsed() >= std::time::Duration::from_millis(250)).unwrap_or(true);
+        let stale = g
+            .snapshot_at
+            .map(|t| t.elapsed() >= std::time::Duration::from_millis(250))
+            .unwrap_or(true);
         if stale {
             g.snapshot = all_procs();
             g.snapshot_at = Some(now);
@@ -296,7 +318,11 @@ impl ContainerPort {
     /// container) — and the bridge for callers that still carry one bare
     /// container/host port pair instead of a full list.
     pub fn tcp(container_port: u16, host_port: u16) -> ContainerPort {
-        ContainerPort { container_port, host_port, protocol: ContainerProtocol::Tcp }
+        ContainerPort {
+            container_port,
+            host_port,
+            protocol: ContainerProtocol::Tcp,
+        }
     }
 }
 
@@ -342,12 +368,19 @@ impl Default for ContainerLimits {
         // 512m was far too low and OOM-killed legitimate apps (exit 137). Env-tunable
         // fleet-wide; per-deployment override via fluid.json `container.memory`.
         fn env_or(key: &str, default: &str) -> String {
-            std::env::var(key).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| default.to_string())
+            std::env::var(key)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| default.to_string())
         }
         Self {
             memory: Some(env_or("HIVE_CONTAINER_MEMORY", "4g")),
             cpus: Some(env_or("HIVE_CONTAINER_CPUS", "2.0")),
-            pids: std::env::var("HIVE_CONTAINER_PIDS").ok().and_then(|s| s.trim().parse().ok()).or(Some(1024)),
+            pids: std::env::var("HIVE_CONTAINER_PIDS")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .or(Some(1024)),
         }
     }
 }
@@ -438,8 +471,14 @@ fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<
     let id = stderr
         .rsplit_once("container ID")
         .map(|(_, tail)| tail.trim())
-        .and_then(|tail| tail.split(|c: char| c.is_whitespace()).find(|s| !s.is_empty()))
-        .map(|s| s.trim_end_matches(|c: char| !c.is_ascii_alphanumeric()).to_string())
+        .and_then(|tail| {
+            tail.split(|c: char| c.is_whitespace())
+                .find(|s| !s.is_empty())
+        })
+        .map(|s| {
+            s.trim_end_matches(|c: char| !c.is_ascii_alphanumeric())
+                .to_string()
+        })
         .filter(|s| !s.is_empty())?;
     Some((netname, id))
 }
@@ -491,12 +530,23 @@ async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
     // Exited cell containers first: cheap, and each holds a lock plus (before
     // `rm -v` shipped) a leaked anonymous volume.
     if let Ok(out) = Command::new(bin)
-        .args(["ps", "-a", "--filter", "status=exited", "--format", "{{.Names}}"])
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            "status=exited",
+            "--format",
+            "{{.Names}}",
+        ])
         .env("PATH", path_env)
         .output()
         .await
     {
-        for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|n| n.starts_with("hive-cell-")) {
+        for name in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|n| n.starts_with("hive-cell-"))
+        {
             if Command::new(bin)
                 .args(["rm", "-f", "-v", name])
                 .env("PATH", path_env)
@@ -511,12 +561,23 @@ async fn reclaim_podman_locks(bin: &str, path_env: &str) -> (usize, usize) {
     }
     // Then dangling anonymous volumes — the actual leak that fills the pool.
     if let Ok(out) = Command::new(bin)
-        .args(["volume", "ls", "--filter", "dangling=true", "--format", "{{.Name}}"])
+        .args([
+            "volume",
+            "ls",
+            "--filter",
+            "dangling=true",
+            "--format",
+            "{{.Name}}",
+        ])
         .env("PATH", path_env)
         .output()
         .await
     {
-        for name in String::from_utf8_lossy(&out.stdout).lines().map(str::trim).filter(|n| is_anonymous_volume(n)) {
+        for name in String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|n| is_anonymous_volume(n))
+        {
             if Command::new(bin)
                 .args(["volume", "rm", "-f", name])
                 .env("PATH", path_env)
@@ -550,7 +611,10 @@ pub async fn podman_free_locks(path_env: &str) -> Option<u64> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// PROACTIVE lock sweep: reclaim leaked locks BEFORE anything fails.
@@ -652,9 +716,17 @@ pub(crate) async fn podman_run_container(
     gpu: bool,
 ) -> anyhow::Result<(String, CellEndpoint, tokio::task::JoinHandle<()>)> {
     use tokio::process::Command;
-    anyhow::ensure!(!ports.is_empty(), "podman_run_container: at least one port must be published");
+    anyhow::ensure!(
+        !ports.is_empty(),
+        "podman_run_container: at least one port must be published"
+    );
     let primary = ports[0];
-    let name = format!("hive-{}", cell_id.as_str().replace(|c: char| !c.is_ascii_alphanumeric(), "-"));
+    let name = format!(
+        "hive-{}",
+        cell_id
+            .as_str()
+            .replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+    );
 
     let net = net_json.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok());
     // A real multi-service (compose) deploy pins a static IP + sibling
@@ -667,10 +739,18 @@ pub(crate) async fn podman_run_container(
     // "standalone" single container, which still gets its own project-scoped
     // network purely for TENANT isolation, no static IP) is fully
     // Apple-`container`-eligible.
-    let apple = !net.as_ref().map(crate::container_cli::needs_podman_networking).unwrap_or(false) && crate::container_cli::is_apple_default();
+    let apple = !net
+        .as_ref()
+        .map(crate::container_cli::needs_podman_networking)
+        .unwrap_or(false)
+        && crate::container_cli::is_apple_default();
     let bin = crate::container_cli::bin(apple);
     // Clear any stale container from a prior cell at this id (kill_on_drop can't).
-    let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+    let _ = Command::new(bin)
+        .args(crate::container_cli::rm_args(apple, &name))
+        .env("PATH", path_env)
+        .output()
+        .await;
 
     // Automatic persistent volume: the run-config JSON (start_cmd[3]) may carry a
     // stable `vol` name + `volpath` mount point. Every container gets a host-backed
@@ -679,12 +759,23 @@ pub(crate) async fn podman_run_container(
     // project (not per cell), so redeploys keep the data. `volume create` is
     // idempotent — an "already exists" on a re-run is expected and fine.
     let volume: Option<(String, String)> = net.as_ref().and_then(|n| {
-        let name = n.get("vol").and_then(|v| v.as_str()).filter(|s| !s.is_empty())?;
-        let path = n.get("volpath").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("/data");
+        let name = n
+            .get("vol")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())?;
+        let path = n
+            .get("volpath")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/data");
         Some((name.to_string(), path.to_string()))
     });
     if let Some((vname, _)) = &volume {
-        let _ = Command::new(bin).args(["volume", "create", vname]).env("PATH", path_env).output().await;
+        let _ = Command::new(bin)
+            .args(["volume", "create", vname])
+            .env("PATH", path_env)
+            .output()
+            .await;
     }
     // Idempotently create the per-deployment network (podman: DNS-LESS, no
     // aardvark → no :53 collision with Seer DNS; Apple's `container` has no
@@ -693,23 +784,39 @@ pub(crate) async fn podman_run_container(
     // reason to pin one, `container`'s own allocator picks one within the
     // subnet). "already exists" / overlap on a re-run is fine either way.
     if let Some(n) = &net {
-        if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(netname) = n
+            .get("net")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             let mut c = vec!["network".to_string(), "create".to_string()];
             if !apple {
                 c.push("--disable-dns".to_string());
             }
-            if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(s) = n
+                .get("subnet")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 c.push("--subnet".into());
                 c.push(s.to_string());
             }
             if !apple {
-                if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                if let Some(g) = n
+                    .get("gw")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
                     c.push("--gateway".into());
                     c.push(g.to_string());
                 }
             }
             c.push(netname.to_string());
-            let created = Command::new(bin).args(&c).env("PATH", path_env).output().await;
+            let created = Command::new(bin)
+                .args(&c)
+                .env("PATH", path_env)
+                .output()
+                .await;
             // Subnet-reservation self-heal: netavark (podman 5.x) can leak a
             // network's SUBNET reservation into `ipam.db` so that after the
             // network is gone, recreating it with the SAME deterministic subnet
@@ -721,7 +828,10 @@ pub(crate) async fn podman_run_container(
             // (from net_json) then won't match, but the run's dynamic-IP fallback
             // below drops it — so serving always recovers. Tenant isolation
             // (a dedicated per-project network) is preserved regardless of subnet.
-            let ok = created.as_ref().map(|o| o.status.success()).unwrap_or(false);
+            let ok = created
+                .as_ref()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
             let exists = created
                 .as_ref()
                 .map(|o| {
@@ -736,7 +846,11 @@ pub(crate) async fn podman_run_container(
                     c2.push("--disable-dns".to_string());
                 }
                 c2.push(netname.to_string());
-                let _ = Command::new(bin).args(&c2).env("PATH", path_env).output().await;
+                let _ = Command::new(bin)
+                    .args(&c2)
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
             }
         }
     }
@@ -744,8 +858,11 @@ pub(crate) async fn podman_run_container(
     // published on 127.0.0.1 ONLY — the container is never exposed to the internet
     // directly; it's reached solely via the gateway/ngrok for the deployment.
     let mut base: Vec<String> = vec![
-        "-d".into(), "--name".into(), name.clone(),
-        "-e".into(), format!("PORT={}", primary.container_port),
+        "-d".into(),
+        "--name".into(),
+        name.clone(),
+        "-e".into(),
+        format!("PORT={}", primary.container_port),
     ];
     for (k, v) in env {
         base.push("-e".into());
@@ -761,10 +878,18 @@ pub(crate) async fn podman_run_container(
     // Shared network with a static IP + sibling host entries (multi-service only,
     // podman-only — see above).
     if let Some(n) = &net {
-        if let Some(netname) = n.get("net").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+        if let Some(netname) = n
+            .get("net")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
             base.push("--network".into());
             base.push(netname.to_string());
-            if let Some(ip) = n.get("ip").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(ip) = n
+                .get("ip")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 base.push("--ip".into());
                 base.push(ip.to_string());
             }
@@ -793,7 +918,10 @@ pub(crate) async fn podman_run_container(
             ContainerProtocol::Udp => "/udp",
             ContainerProtocol::Tcp => "",
         };
-        base.push(format!("127.0.0.1:{}:{}{suffix}", p.host_port, p.container_port));
+        base.push(format!(
+            "127.0.0.1:{}:{}{suffix}",
+            p.host_port, p.container_port
+        ));
     }
     base.push(image.to_string());
 
@@ -810,7 +938,11 @@ pub(crate) async fn podman_run_container(
         }
     }
     attempt.extend(base.iter().cloned());
-    let mut out = Command::new(bin).args(&attempt).env("PATH", path_env).output().await?;
+    let mut out = Command::new(bin)
+        .args(&attempt)
+        .env("PATH", path_env)
+        .output()
+        .await?;
 
     // Non-breaking fallback: if a sandbox runtime was requested but the container
     // couldn't start under it (a gVisor incompatibility), retry on podman's DEFAULT
@@ -822,10 +954,18 @@ pub(crate) async fn podman_run_container(
             err = %String::from_utf8_lossy(&out.stderr).trim(),
             "container failed under sandbox runtime — retrying with podman default runtime"
         );
-        let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+        let _ = Command::new(bin)
+            .args(crate::container_cli::rm_args(apple, &name))
+            .env("PATH", path_env)
+            .output()
+            .await;
         let mut fb: Vec<String> = vec!["run".into()];
         fb.extend(base.iter().cloned());
-        out = Command::new(bin).args(&fb).env("PATH", path_env).output().await?;
+        out = Command::new(bin)
+            .args(&fb)
+            .env("PATH", path_env)
+            .output()
+            .await?;
     }
 
     // CRITICAL leaked-IPAM self-heal (compose static-IP churn): a compose service
@@ -840,7 +980,10 @@ pub(crate) async fn podman_run_container(
     // offending container id out of the error, reap its stale lease (disconnect +
     // rm), and retry the run ONCE. Self-healing at the single chokepoint every
     // launch flows through, so no operator ever hand-frees an IP again.
-    if !apple && !out.status.success() && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr)) {
+    if !apple
+        && !out.status.success()
+        && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
+    {
         let netname = net
             .as_ref()
             .and_then(|n| n.get("net"))
@@ -849,7 +992,10 @@ pub(crate) async fn podman_run_container(
             .to_string();
         let build_run = |rt: Option<&str>| {
             let mut v: Vec<String> = vec!["run".into()];
-            if let Some(rt) = rt { v.push("--runtime".into()); v.push(rt.to_string()); }
+            if let Some(rt) = rt {
+                v.push("--runtime".into());
+                v.push(rt.to_string());
+            }
             v.extend(base.iter().cloned());
             v
         };
@@ -859,19 +1005,33 @@ pub(crate) async fn podman_run_container(
             // network, then remove it. Cheap + surgical when the ghost still
             // exists as a container. (An orphaned lease with no container is
             // handled by the network reset in step 2.)
-            if let Some((_, stale_id)) = parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr)) {
+            if let Some((_, stale_id)) =
+                parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr))
+            {
                 tracing::warn!(
                     network = %netname, stale = %stale_id,
                     "IPAM address collision on a leaked lease — reaping stale container and retrying"
                 );
                 let _ = Command::new(bin)
                     .args(["network", "disconnect", "--force", &netname, &stale_id])
-                    .env("PATH", path_env).output().await;
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
                 let _ = Command::new(bin)
                     .args(["rm", "-f", &stale_id])
-                    .env("PATH", path_env).output().await;
-                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
-                out = Command::new(bin).args(&build_run(runtime)).env("PATH", path_env).output().await?;
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
+                let _ = Command::new(bin)
+                    .args(crate::container_cli::rm_args(apple, &name))
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
+                out = Command::new(bin)
+                    .args(&build_run(runtime))
+                    .env("PATH", path_env)
+                    .output()
+                    .await?;
             }
 
             // Step 2: if the surgical reap didn't release the lease (a truly
@@ -884,21 +1044,45 @@ pub(crate) async fn podman_run_container(
             // re-acquires its own static IP on the fresh network. This is the
             // durable self-heal that survives restarts (the leak lives in the
             // persisted network DB, not process memory) with no operator action.
-            if !out.status.success() && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr)) {
+            if !out.status.success()
+                && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
+            {
                 if let Some(n) = &net {
                     tracing::warn!(network = %netname, "IPAM lease still held after reap — resetting project network");
                     // Remove containers still attached, then the network itself.
-                    let _ = Command::new(bin).args(["network", "rm", "--force", &netname]).env("PATH", path_env).output().await;
+                    let _ = Command::new(bin)
+                        .args(["network", "rm", "--force", &netname])
+                        .env("PATH", path_env)
+                        .output()
+                        .await;
                     // Recreate with the original subnet/gateway (DNS-less, as launched).
-                    let mut c = vec!["network".to_string(), "create".to_string(), "--disable-dns".to_string()];
-                    if let Some(s) = n.get("subnet").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        c.push("--subnet".into()); c.push(s.to_string());
+                    let mut c = vec![
+                        "network".to_string(),
+                        "create".to_string(),
+                        "--disable-dns".to_string(),
+                    ];
+                    if let Some(s) = n
+                        .get("subnet")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        c.push("--subnet".into());
+                        c.push(s.to_string());
                     }
-                    if let Some(g) = n.get("gw").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        c.push("--gateway".into()); c.push(g.to_string());
+                    if let Some(g) = n
+                        .get("gw")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        c.push("--gateway".into());
+                        c.push(g.to_string());
                     }
                     c.push(netname.clone());
-                    let rc = Command::new(bin).args(&c).env("PATH", path_env).output().await;
+                    let rc = Command::new(bin)
+                        .args(&c)
+                        .env("PATH", path_env)
+                        .output()
+                        .await;
                     // netavark can also leak the SUBNET reservation (survives network
                     // rm), so recreating with the same subnet fails — recreate with an
                     // auto-allocated subnet instead. The static --ip won't match, but
@@ -907,10 +1091,20 @@ pub(crate) async fn podman_run_container(
                     if !recreated {
                         let _ = Command::new(bin)
                             .args(["network", "create", "--disable-dns", &netname])
-                            .env("PATH", path_env).output().await;
+                            .env("PATH", path_env)
+                            .output()
+                            .await;
                     }
-                    let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
-                    out = Command::new(bin).args(&build_run(runtime)).env("PATH", path_env).output().await?;
+                    let _ = Command::new(bin)
+                        .args(crate::container_cli::rm_args(apple, &name))
+                        .env("PATH", path_env)
+                        .output()
+                        .await;
+                    out = Command::new(bin)
+                        .args(&build_run(runtime))
+                        .env("PATH", path_env)
+                        .output()
+                        .await?;
                 }
             }
 
@@ -925,7 +1119,9 @@ pub(crate) async fn podman_run_container(
             // gateway on its published 127.0.0.1 port exactly as before; only
             // sibling-by-pinned-IP `/etc/hosts` addressing degrades (logged). This
             // is the guaranteed self-heal — a leaked lease can never wedge serving.
-            if !out.status.success() && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr)) {
+            if !out.status.success()
+                && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
+            {
                 tracing::warn!(network = %netname, "IPAM lease unclearable — retrying with a dynamic address (dropping the static --ip pin)");
                 // Rebuild base without the `--ip <addr>` pair.
                 let mut dyn_base: Vec<String> = Vec::with_capacity(base.len());
@@ -937,11 +1133,22 @@ pub(crate) async fn podman_run_container(
                     }
                     dyn_base.push(a.clone());
                 }
-                let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+                let _ = Command::new(bin)
+                    .args(crate::container_cli::rm_args(apple, &name))
+                    .env("PATH", path_env)
+                    .output()
+                    .await;
                 let mut retry: Vec<String> = vec!["run".into()];
-                if let Some(rt) = runtime { retry.push("--runtime".into()); retry.push(rt.to_string()); }
+                if let Some(rt) = runtime {
+                    retry.push("--runtime".into());
+                    retry.push(rt.to_string());
+                }
                 retry.extend(dyn_base);
-                out = Command::new(bin).args(&retry).env("PATH", path_env).output().await?;
+                out = Command::new(bin)
+                    .args(&retry)
+                    .env("PATH", path_env)
+                    .output()
+                    .await?;
             }
         }
     }
@@ -955,7 +1162,8 @@ pub(crate) async fn podman_run_container(
     // condition heals itself. `rm_args` now carries `-v` so the leak stops at
     // source too; this handles a pool already exhausted by the old behaviour (or
     // by anything else that leaks a volume).
-    if !apple && !out.status.success() && is_lock_exhaustion(&String::from_utf8_lossy(&out.stderr)) {
+    if !apple && !out.status.success() && is_lock_exhaustion(&String::from_utf8_lossy(&out.stderr))
+    {
         let (vols, cells) = reclaim_podman_locks(bin, path_env).await;
         if vols > 0 || cells > 0 {
             tracing::warn!(
@@ -963,14 +1171,22 @@ pub(crate) async fn podman_run_container(
                 reclaimed_cells = cells,
                 "podman lock pool was exhausted — reclaimed dangling anonymous volumes + exited cells, retrying container start"
             );
-            let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+            let _ = Command::new(bin)
+                .args(crate::container_cli::rm_args(apple, &name))
+                .env("PATH", path_env)
+                .output()
+                .await;
             let mut retry: Vec<String> = vec!["run".into()];
             if let Some(rt) = runtime {
                 retry.push("--runtime".into());
                 retry.push(rt.to_string());
             }
             retry.extend(base.iter().cloned());
-            out = Command::new(bin).args(&retry).env("PATH", path_env).output().await?;
+            out = Command::new(bin)
+                .args(&retry)
+                .env("PATH", path_env)
+                .output()
+                .await?;
         } else {
             // Nothing was reclaimable, so the pool is genuinely full of live
             // objects — raising `num_locks` is the real remedy. Say so instead of
@@ -988,8 +1204,15 @@ pub(crate) async fn podman_run_container(
         // cell name, so without this `rm` the failures pile up in `created` state
         // and exhaust the lock pool fleet-wide → CAPACITY_EXHAUSTED on ALL
         // deployments (not just the one that failed). Reclaim the lock here.
-        let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
-        anyhow::bail!("{bin} run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        let _ = Command::new(bin)
+            .args(crate::container_cli::rm_args(apple, &name))
+            .env("PATH", path_env)
+            .output()
+            .await;
+        anyhow::bail!(
+            "{bin} run failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     // Wait for the container's port to accept connections (image pull + boot).
     // Budget is env-tunable (`HIVE_CONTAINER_READY_SECS`, default 180) — a heavy
@@ -1022,9 +1245,19 @@ pub(crate) async fn podman_run_container(
                 break;
             }
             // Actually crashed/exited → surface it.
-            let logs = Command::new(bin).args(crate::container_cli::logs_tail_args(apple, &name, 20)).env("PATH", path_env).output().await
-                .ok().map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string()).unwrap_or_default();
-            let _ = Command::new(bin).args(crate::container_cli::rm_args(apple, &name)).env("PATH", path_env).output().await;
+            let logs = Command::new(bin)
+                .args(crate::container_cli::logs_tail_args(apple, &name, 20))
+                .env("PATH", path_env)
+                .output()
+                .await
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+                .unwrap_or_default();
+            let _ = Command::new(bin)
+                .args(crate::container_cli::rm_args(apple, &name))
+                .env("PATH", path_env)
+                .output()
+                .await;
             anyhow::bail!("container {name} exited before listening on {func_addr}: {logs}");
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -1064,7 +1297,8 @@ pub(crate) async fn podman_run_container(
                             // this SAME listener) needs one connection
                             // switched to a raw byte splice — see
                             // `TunnelServer::serve_maybe_raw`'s doc.
-                            fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc).await;
+                            fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc)
+                                .await;
                         }
                     });
                 }
@@ -1110,9 +1344,19 @@ pub struct CellSpec {
 pub(crate) fn sanitize_tenant(t: &str) -> String {
     let s: String = t
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if s.is_empty() || s.chars().all(|c| c == '.') { "personal".into() } else { s }
+    if s.is_empty() || s.chars().all(|c| c == '.') {
+        "personal".into()
+    } else {
+        s
+    }
 }
 
 /// A live, backend-specific handle to a provisioned cell.
@@ -1153,7 +1397,11 @@ pub trait CellBackend: Send + Sync {
     /// the host's `build_dir`, so this packs it into a per-`image` artifact that
     /// `provision` later attaches to the cell. Called once per deployment, keyed
     /// by the same `image` the function pool will provision with.
-    async fn deliver_build(&self, _image: &str, _build_dir: &std::path::Path) -> anyhow::Result<()> {
+    async fn deliver_build(
+        &self,
+        _image: &str,
+        _build_dir: &std::path::Path,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1227,7 +1475,11 @@ mod container_limits_tests {
         // …and 0 falls back to the generous default (never the old 512m).
         let d = ContainerLimits::for_container(0, 0.0, 0).podman_run_flags();
         let dm = idx(&d, "--memory").expect("--memory present");
-        assert_ne!(d[dm + 1], "512m", "0 must not resurrect the OOM-killing 512m");
+        assert_ne!(
+            d[dm + 1],
+            "512m",
+            "0 must not resurrect the OOM-killing 512m"
+        );
     }
 
     #[test]
@@ -1242,9 +1494,17 @@ mod container_limits_tests {
         // …and 0.0/0 fall back to the fleet-wide env-tunable defaults.
         let d = ContainerLimits::for_container(0, 0.0, 0).podman_run_flags();
         let dc = idx(&d, "--cpus").expect("--cpus present");
-        assert_eq!(d[dc + 1], "2.0", "0.0 must fall back to the default cpus quota");
+        assert_eq!(
+            d[dc + 1],
+            "2.0",
+            "0.0 must fall back to the default cpus quota"
+        );
         let dp = idx(&d, "--pids-limit").expect("--pids-limit present");
-        assert_eq!(d[dp + 1], "1024", "0 must fall back to the default pids limit");
+        assert_eq!(
+            d[dp + 1],
+            "1024",
+            "0 must fall back to the default pids limit"
+        );
     }
 
     #[test]
@@ -1258,14 +1518,22 @@ mod container_limits_tests {
         // shared host").
         let flags = ContainerLimits::for_container(999_999, 0.0, 0).podman_run_flags();
         let m = idx(&flags, "--memory").expect("--memory present");
-        assert_eq!(flags[m + 1], "16384m", "an excessive request must be clamped to the fleet-wide maximum");
+        assert_eq!(
+            flags[m + 1],
+            "16384m",
+            "an excessive request must be clamped to the fleet-wide maximum"
+        );
 
         // A reasonable, legitimate request under the max is honored exactly
         // (already covered above for 8192, re-asserted here as a boundary
         // check right at the default max).
         let flags = ContainerLimits::for_container(16_384, 0.0, 0).podman_run_flags();
         let m = idx(&flags, "--memory").expect("--memory present");
-        assert_eq!(flags[m + 1], "16384m", "a request exactly at the max must pass through unchanged");
+        assert_eq!(
+            flags[m + 1],
+            "16384m",
+            "a request exactly at the max must pass through unchanged"
+        );
     }
 
     #[test]
@@ -1278,21 +1546,41 @@ mod container_limits_tests {
         // tenant can request, not just memory.
         let flags = ContainerLimits::for_container(0, 999.0, 999_999).podman_run_flags();
         let c = idx(&flags, "--cpus").expect("--cpus present");
-        assert_eq!(flags[c + 1], "8", "an excessive cpus request must be clamped to the fleet-wide maximum");
+        assert_eq!(
+            flags[c + 1],
+            "8",
+            "an excessive cpus request must be clamped to the fleet-wide maximum"
+        );
         let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
-        assert_eq!(flags[p + 1], "4096", "an excessive pids request must be clamped to the fleet-wide maximum");
+        assert_eq!(
+            flags[p + 1],
+            "4096",
+            "an excessive pids request must be clamped to the fleet-wide maximum"
+        );
 
         // A reasonable, legitimate request exactly at the max is honored exactly.
         let flags = ContainerLimits::for_container(0, 8.0, 4096).podman_run_flags();
         let c = idx(&flags, "--cpus").expect("--cpus present");
-        assert_eq!(flags[c + 1], "8", "a cpus request exactly at the max must pass through unchanged");
+        assert_eq!(
+            flags[c + 1],
+            "8",
+            "a cpus request exactly at the max must pass through unchanged"
+        );
         let p = idx(&flags, "--pids-limit").expect("--pids-limit present");
-        assert_eq!(flags[p + 1], "4096", "a pids request exactly at the max must pass through unchanged");
+        assert_eq!(
+            flags[p + 1],
+            "4096",
+            "a pids request exactly at the max must pass through unchanged"
+        );
     }
 
     #[test]
     fn none_fields_omit_their_flags_but_keep_hardening() {
-        let limits = ContainerLimits { memory: None, cpus: None, pids: None };
+        let limits = ContainerLimits {
+            memory: None,
+            cpus: None,
+            pids: None,
+        };
         let flags = limits.podman_run_flags();
         assert!(idx(&flags, "--memory").is_none());
         assert!(idx(&flags, "--cpus").is_none());
@@ -1347,14 +1635,18 @@ mod apple_container_live_tests {
         )
         .await;
 
-        let (name, _endpoint, task) = result.expect("container must boot successfully via apple container CLI");
+        let (name, _endpoint, task) =
+            result.expect("container must boot successfully via apple container CLI");
         assert!(name.starts_with("hive-livetest-"));
 
         // Real teardown: confirm the container is actually gone afterward, not
         // just that the call didn't error.
         task.abort();
         crate::container_cli::inject_hosts(&name, path_env, &[]).await; // no-op, exercises the empty-entries guard
-        let _ = tokio::process::Command::new("container").args(crate::container_cli::rm_args(true, &name)).output().await;
+        let _ = tokio::process::Command::new("container")
+            .args(crate::container_cli::rm_args(true, &name))
+            .output()
+            .await;
         let still_running = crate::container_cli::is_running(true, &name, path_env).await;
         assert!(!still_running, "container must be removed after teardown");
     }

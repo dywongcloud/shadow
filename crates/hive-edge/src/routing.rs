@@ -125,8 +125,15 @@ mod tests {
     #[test]
     fn redirect_then_rewrite() {
         let r = Router::new();
-        r.add_redirect(Redirect { source: "/old".into(), destination: "/new".into(), status: 308 });
-        r.add_rewrite(Rewrite { source: "/blog/".into(), destination: "/posts/".into() });
+        r.add_redirect(Redirect {
+            source: "/old".into(),
+            destination: "/new".into(),
+            status: 308,
+        });
+        r.add_rewrite(Rewrite {
+            source: "/blog/".into(),
+            destination: "/posts/".into(),
+        });
 
         match r.evaluate("/old") {
             RouteOutcome::Redirect { location, status } => {

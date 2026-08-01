@@ -130,7 +130,10 @@ pub struct ServerlessConfig {
     pub environment: HashMap<String, String>,
     #[serde(rename = "launcherType", skip_serializing_if = "Option::is_none")]
     pub launcher_type: Option<String>,
-    #[serde(rename = "supportsResponseStreaming", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "supportsResponseStreaming",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub supports_response_streaming: Option<bool>,
 }
 
@@ -142,7 +145,11 @@ pub struct EdgeConfig {
     pub runtime: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<String>,
-    #[serde(rename = "envVarsInUse", default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(
+        rename = "envVarsInUse",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
     pub env_vars_in_use: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regions: Vec<String>,
@@ -178,7 +185,9 @@ pub fn parse_vc_config(v: &serde_json::Value) -> anyhow::Result<FunctionConfig> 
     if runtime == "edge" {
         Ok(FunctionConfig::Edge(serde_json::from_value(v.clone())?))
     } else {
-        Ok(FunctionConfig::Serverless(serde_json::from_value(v.clone())?))
+        Ok(FunctionConfig::Serverless(serde_json::from_value(
+            v.clone(),
+        )?))
     }
 }
 

@@ -98,7 +98,11 @@ pub fn spawn(cloud: Arc<CloudState>) {
             // deleted / last deployment removed → `release_raw_ports`).
             // Aborting the accept task drops the socket; connections already
             // spliced run in their own tasks and drain naturally.
-            let stale: Vec<u16> = listeners.keys().filter(|p| !desired.contains(p)).copied().collect();
+            let stale: Vec<u16> = listeners
+                .keys()
+                .filter(|p| !desired.contains(p))
+                .copied()
+                .collect();
             for p in stale {
                 if let Some(h) = listeners.remove(&p) {
                     h.abort();
@@ -196,7 +200,10 @@ async fn handle(cloud: Arc<CloudState>, port: u16, mut client: TcpStream) -> any
     // live container lease names the ONE node allowed to serve this project's
     // container — never serve locally past someone else's lease, never proxy
     // away from our own.
-    let lease_owner = cloud.leases.owner_of(&target.project).filter(|o| o != &cloud.node_name);
+    let lease_owner = cloud
+        .leases
+        .owner_of(&target.project)
+        .filter(|o| o != &cloud.node_name);
 
     if lease_owner.is_none() {
         // We are the lease owner, or no live lease exists: local resolution
@@ -232,17 +239,25 @@ fn resolve_binding(cloud: &Arc<CloudState>, port: u16) -> Option<Target> {
         });
     }
     let from = |d: &fluid_core::DeploymentInfo| {
-        d.raw_ports.iter().find(|b| b.public_port == port).map(|b| Target {
-            project: d.project.clone(),
-            function: b.function.clone(),
-            container_port: b.container_port,
-            protocol: b.protocol,
-        })
+        d.raw_ports
+            .iter()
+            .find(|b| b.public_port == port)
+            .map(|b| Target {
+                project: d.project.clone(),
+                function: b.function.clone(),
+                container_port: b.container_port,
+                protocol: b.protocol,
+            })
     };
     if let Some(t) = cloud.gw.list().iter().find_map(&from) {
         return Some(t);
     }
-    cloud.peer_deployments.read().values().flatten().find_map(&from)
+    cloud
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .find_map(&from)
 }
 
 /// Cross-node hop: open a raw mesh stream to the owner (the `ws_proxy`
@@ -261,11 +276,9 @@ async fn splice_remote<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mesh = cloud
-        .mesh
-        .read()
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("P2P mesh not enabled — cannot reach remote raw deployment"))?;
+    let mesh = cloud.mesh.read().clone().ok_or_else(|| {
+        anyhow::anyhow!("P2P mesh not enabled — cannot reach remote raw deployment")
+    })?;
     // A live lease is authoritative and EXCLUSIVE (stateful single-writer):
     // only the owner may serve, so it is the only candidate. Without one,
     // any healthy node that gossiped a Ready deployment carrying this port.
@@ -277,8 +290,12 @@ where
     let hs = target.raw_target();
     let mut last_err = anyhow::anyhow!("no healthy node serves raw port {port}");
     for cand in &cands {
-        let Some(node) = nodes.iter().find(|n| &n.id == cand && n.healthy) else { continue };
-        let Some(addr_json) = node.iroh_addr.clone() else { continue };
+        let Some(node) = nodes.iter().find(|n| &n.id == cand && n.healthy) else {
+            continue;
+        };
+        let Some(addr_json) = node.iroh_addr.clone() else {
+            continue;
+        };
         match mesh.open_raw_to_port(cand, &addr_json, &hs).await {
             Ok(mut raw) => {
                 tracing::debug!(port, owner = %cand, project = %target.project, "raw-proxy: mesh splice");

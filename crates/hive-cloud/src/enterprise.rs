@@ -146,7 +146,12 @@ fn preview_scope() -> String {
 }
 impl Default for DeployProtection {
     fn default() -> Self {
-        DeployProtection { mode: "off".into(), scope: "preview".into(), password_hash: String::new(), updated_ms: 0 }
+        DeployProtection {
+            mode: "off".into(),
+            scope: "preview".into(),
+            password_hash: String::new(),
+            updated_ms: 0,
+        }
     }
 }
 impl DeployProtection {
@@ -221,11 +226,20 @@ pub struct ConformanceReport {
 /// pass/fail from the deployment's service graph + settings.
 pub const RULES: &[(&str, &str)] = &[
     ("https-only", "Serves over HTTPS with HSTS"),
-    ("env-no-plaintext-secrets", "No plaintext secrets in env (sensitive flag set)"),
+    (
+        "env-no-plaintext-secrets",
+        "No plaintext secrets in env (sensitive flag set)",
+    ),
     ("firewall-enabled", "WAF / firewall protection enabled"),
-    ("preview-protected", "Preview deployments are access-protected"),
+    (
+        "preview-protected",
+        "Preview deployments are access-protected",
+    ),
     ("has-production", "Has a healthy production deployment"),
-    ("pinned-runtime", "Build pins a framework / runtime (not 'unknown')"),
+    (
+        "pinned-runtime",
+        "Build pins a framework / runtime (not 'unknown')",
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -258,7 +272,7 @@ pub struct EnterpriseStore {
     protection: RwLock<HashMap<String, DeployProtection>>, // project -> protection
     mfe: RwLock<HashMap<String, Vec<MfeGroup>>>,      // team -> microfrontend groups
     conformance: RwLock<HashMap<String, ConformancePolicy>>, // team -> policy
-    reports: RwLock<HashMap<String, ConformanceReport>>,     // deployment_id -> report
+    reports: RwLock<HashMap<String, ConformanceReport>>, // deployment_id -> report
     /// Gossip-replicated edge config from peers (node name -> their export).
     /// Refreshed every gossip round; NOT persisted (rebuilt from the mesh).
     peer_edge: RwLock<HashMap<String, EdgeExport>>,
@@ -292,7 +306,9 @@ fn password_matches(project: &str, stored: &str, submitted: &str) -> bool {
         use argon2::password_hash::{PasswordHash, PasswordVerifier};
         use argon2::Argon2;
         return match PasswordHash::new(stored) {
-            Ok(parsed) => Argon2::default().verify_password(submitted.as_bytes(), &parsed).is_ok(),
+            Ok(parsed) => Argon2::default()
+                .verify_password(submitted.as_bytes(), &parsed)
+                .is_ok(),
             Err(_) => false,
         };
     }
@@ -309,7 +325,11 @@ fn password_matches(project: &str, stored: &str, submitted: &str) -> bool {
 }
 
 fn norm(team: &str) -> String {
-    if team.trim().is_empty() { "personal".into() } else { team.trim().to_string() }
+    if team.trim().is_empty() {
+        "personal".into()
+    } else {
+        team.trim().to_string()
+    }
 }
 
 impl EnterpriseStore {
@@ -319,7 +339,11 @@ impl EnterpriseStore {
 
     // ---- IP blocking ----
     pub fn ip_blocks(&self, team: &str) -> Vec<IpBlock> {
-        self.ip_blocks.read().get(&norm(team)).cloned().unwrap_or_default()
+        self.ip_blocks
+            .read()
+            .get(&norm(team))
+            .cloned()
+            .unwrap_or_default()
     }
     pub fn add_ip_block(&self, team: &str, prefix: &str, note: &str) -> IpBlock {
         let b = IpBlock {
@@ -329,7 +353,11 @@ impl EnterpriseStore {
             enabled: true,
             created_ms: now_ms(),
         };
-        self.ip_blocks.write().entry(norm(team)).or_default().push(b.clone());
+        self.ip_blocks
+            .write()
+            .entry(norm(team))
+            .or_default()
+            .push(b.clone());
         b
     }
     pub fn remove_ip_block(&self, team: &str, id: &str) {
@@ -342,17 +370,31 @@ impl EnterpriseStore {
     /// coordinator, but enforcement happens on whatever node the request enters).
     pub fn ip_allowed(&self, team: &str, ip: &str) -> bool {
         let t = norm(team);
-        let hit = |v: &Vec<IpBlock>| v.iter().any(|b| b.enabled && !b.prefix.is_empty() && ip.starts_with(&b.prefix));
+        let hit = |v: &Vec<IpBlock>| {
+            v.iter()
+                .any(|b| b.enabled && !b.prefix.is_empty() && ip.starts_with(&b.prefix))
+        };
         if self.ip_blocks.read().get(&t).map(&hit).unwrap_or(false) {
             return false;
         }
-        !self.peer_edge.read().values().filter_map(|e| e.ip_blocks.get(&t)).any(|v| hit(v))
+        !self
+            .peer_edge
+            .read()
+            .values()
+            .filter_map(|e| e.ip_blocks.get(&t))
+            .any(|v| hit(v))
     }
     /// Any team block this ip on ANY team? (fast pre-filter when team unknown).
     pub fn any_team_blocks(&self, ip: &str) -> bool {
         let hit = |b: &IpBlock| b.enabled && !b.prefix.is_empty() && ip.starts_with(&b.prefix);
         self.ip_blocks.read().values().flatten().any(hit)
-            || self.peer_edge.read().values().flat_map(|e| e.ip_blocks.values()).flatten().any(hit)
+            || self
+                .peer_edge
+                .read()
+                .values()
+                .flat_map(|e| e.ip_blocks.values())
+                .flatten()
+                .any(hit)
     }
 
     // ---- mesh replication of the edge-enforcement subset ----
@@ -375,7 +417,14 @@ impl EnterpriseStore {
     pub fn siem(&self, team: &str) -> Option<SiemConfig> {
         self.siem.read().get(&norm(team)).cloned()
     }
-    pub fn set_siem(&self, team: &str, format: &str, endpoint: &str, token_plain: Option<&str>, enabled: bool) -> SiemConfig {
+    pub fn set_siem(
+        &self,
+        team: &str,
+        format: &str,
+        endpoint: &str,
+        token_plain: Option<&str>,
+        enabled: bool,
+    ) -> SiemConfig {
         let mut m = self.siem.write();
         let e = m.entry(norm(team)).or_default();
         e.format = format.to_string();
@@ -399,7 +448,11 @@ impl EnterpriseStore {
 
     // ---- SAML ----
     pub fn saml(&self, team: &str) -> SamlConfig {
-        self.saml.read().get(&norm(team)).cloned().unwrap_or_default()
+        self.saml
+            .read()
+            .get(&norm(team))
+            .cloned()
+            .unwrap_or_default()
     }
     pub fn set_saml(&self, team: &str, c: SamlConfig) -> SamlConfig {
         let mut c = c;
@@ -410,7 +463,11 @@ impl EnterpriseStore {
 
     // ---- SCIM ----
     pub fn scim(&self, team: &str) -> ScimTenant {
-        self.scim.read().get(&norm(team)).cloned().unwrap_or_default()
+        self.scim
+            .read()
+            .get(&norm(team))
+            .cloned()
+            .unwrap_or_default()
     }
     /// Enable SCIM and (re)issue a bearer token. Returns the PLAINTEXT token once.
     pub fn scim_enable(&self, team: &str) -> String {
@@ -432,13 +489,25 @@ impl EnterpriseStore {
         self.scim
             .read()
             .iter()
-            .find(|(_, t)| t.enabled && crate::admin::ct_eq(&crate::secrets::decrypt(&t.token_enc), token))
+            .find(|(_, t)| {
+                t.enabled && crate::admin::ct_eq(&crate::secrets::decrypt(&t.token_enc), token)
+            })
             .map(|(team, _)| team.clone())
     }
-    pub fn scim_upsert_user(&self, team: &str, user_name: &str, display_name: &str, active: bool) -> ScimUser {
+    pub fn scim_upsert_user(
+        &self,
+        team: &str,
+        user_name: &str,
+        display_name: &str,
+        active: bool,
+    ) -> ScimUser {
         let mut m = self.scim.write();
         let t = m.entry(norm(team)).or_default();
-        if let Some(u) = t.users.iter_mut().find(|u| u.user_name.eq_ignore_ascii_case(user_name)) {
+        if let Some(u) = t
+            .users
+            .iter_mut()
+            .find(|u| u.user_name.eq_ignore_ascii_case(user_name))
+        {
             u.display_name = display_name.to_string();
             u.active = active;
             return u.clone();
@@ -478,7 +547,13 @@ impl EnterpriseStore {
         false
     }
     pub fn scim_user(&self, team: &str, id: &str) -> Option<ScimUser> {
-        self.scim.read().get(&norm(team))?.users.iter().find(|u| u.id == id).cloned()
+        self.scim
+            .read()
+            .get(&norm(team))?
+            .users
+            .iter()
+            .find(|u| u.id == id)
+            .cloned()
     }
 
     // ---- Deployment protection ----
@@ -497,7 +572,13 @@ impl EnterpriseStore {
             .cloned()
             .unwrap_or_default()
     }
-    pub fn set_protection(&self, project: &str, mode: &str, scope: &str, password_plain: Option<&str>) -> DeployProtection {
+    pub fn set_protection(
+        &self,
+        project: &str,
+        mode: &str,
+        scope: &str,
+        password_plain: Option<&str>,
+    ) -> DeployProtection {
         let mut m = self.protection.write();
         let p = m.entry(project.to_string()).or_default();
         p.mode = mode.to_string();
@@ -543,7 +624,8 @@ impl EnterpriseStore {
     pub fn mfe_groups(&self, team: &str) -> Vec<MfeGroup> {
         let team = norm(team);
         let mut out: Vec<MfeGroup> = self.mfe.read().get(&team).cloned().unwrap_or_default();
-        let mut seen: std::collections::HashSet<String> = out.iter().map(|g| g.id.clone()).collect();
+        let mut seen: std::collections::HashSet<String> =
+            out.iter().map(|g| g.id.clone()).collect();
         for exp in self.peer_edge.read().values() {
             if let Some(groups) = exp.mfe.get(&team) {
                 for g in groups {
@@ -558,15 +640,25 @@ impl EnterpriseStore {
     /// Only the LOCAL groups (no peer merge) — for the authoritative write/read of
     /// the owning node (delete-conflict checks, config generation).
     pub fn mfe_groups_local(&self, team: &str) -> Vec<MfeGroup> {
-        self.mfe.read().get(&norm(team)).cloned().unwrap_or_default().into_iter().map(|g| g.normalized()).collect()
+        self.mfe
+            .read()
+            .get(&norm(team))
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| g.normalized())
+            .collect()
     }
     /// Fast pre-filter for the edge: does ANY team (local OR peer) have an enabled
     /// group with at least one child? Cheap gate so the hot path skips MFE work.
     pub fn has_mfe(&self) -> bool {
         let has = |m: &HashMap<String, Vec<MfeGroup>>| {
             m.values().any(|v| {
-                v.iter()
-                    .any(|g| g.enabled && (g.members.iter().any(|mm| mm.project != g.host_project) || !g.children.is_empty()))
+                v.iter().any(|g| {
+                    g.enabled
+                        && (g.members.iter().any(|mm| mm.project != g.host_project)
+                            || !g.children.is_empty())
+                })
             })
         };
         has(&self.mfe.read()) || self.peer_edge.read().values().any(|e| has(&e.mfe))
@@ -575,7 +667,9 @@ impl EnterpriseStore {
     /// merged across local + peers. The edge then resolves the child + fallback via
     /// [`crate::microfrontends`].
     pub fn mfe_group_for_host(&self, team: &str, host_project: &str) -> Option<MfeGroup> {
-        self.mfe_groups(team).into_iter().find(|g| g.enabled && g.host_project == host_project)
+        self.mfe_groups(team)
+            .into_iter()
+            .find(|g| g.enabled && g.host_project == host_project)
     }
     /// A single group by id within a team (local + peers, normalized).
     pub fn mfe_group(&self, team: &str, id: &str) -> Option<MfeGroup> {
@@ -583,7 +677,9 @@ impl EnterpriseStore {
     }
     /// The group a project currently belongs to (as default or child), if any.
     pub fn mfe_group_of_project(&self, team: &str, project: &str) -> Option<MfeGroup> {
-        self.mfe_groups(team).into_iter().find(|g| g.members.iter().any(|m| m.project == project))
+        self.mfe_groups(team)
+            .into_iter()
+            .find(|g| g.members.iter().any(|m| m.project == project))
     }
     pub fn set_mfe_group(&self, team: &str, mut g: MfeGroup) -> MfeGroup {
         g = g.normalized();
@@ -604,7 +700,11 @@ impl EnterpriseStore {
 
     // ---- Conformance ----
     pub fn conformance_policy(&self, team: &str) -> ConformancePolicy {
-        self.conformance.read().get(&norm(team)).cloned().unwrap_or_default()
+        self.conformance
+            .read()
+            .get(&norm(team))
+            .cloned()
+            .unwrap_or_default()
     }
     pub fn set_conformance_policy(&self, team: &str, p: ConformancePolicy) -> ConformancePolicy {
         let mut p = p;
@@ -640,7 +740,11 @@ impl EnterpriseStore {
         *self.protection.write() = s.protection;
         *self.mfe.write() = s.mfe;
         *self.conformance.write() = s.conformance;
-        *self.reports.write() = s.reports.into_iter().map(|r| (r.deployment_id.clone(), r)).collect();
+        *self.reports.write() = s
+            .reports
+            .into_iter()
+            .map(|r| (r.deployment_id.clone(), r))
+            .collect();
     }
 }
 
@@ -670,7 +774,8 @@ pub struct EnterpriseSnapshot {
 // SIEM streamer — a global async sink fed by audit.rs::record.
 // ---------------------------------------------------------------------------
 
-static SIEM_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<crate::audit::AuditEntry>> = std::sync::OnceLock::new();
+static SIEM_TX: std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<crate::audit::AuditEntry>> =
+    std::sync::OnceLock::new();
 
 /// Start the background SIEM streamer. Every audit entry emitted via
 /// [`siem_emit`] is looked up against its tenant's [`SiemConfig`] and, if
@@ -706,7 +811,12 @@ pub fn siem_emit(entry: &crate::audit::AuditEntry) {
     }
 }
 
-async fn deliver_siem(http: &reqwest::Client, cfg: &SiemConfig, token: &str, e: &crate::audit::AuditEntry) -> bool {
+async fn deliver_siem(
+    http: &reqwest::Client,
+    cfg: &SiemConfig,
+    token: &str,
+    e: &crate::audit::AuditEntry,
+) -> bool {
     // Vendor-shaped payloads so a real Datadog/Splunk endpoint accepts them.
     let body = match cfg.format.as_str() {
         "datadog" => serde_json::json!({
@@ -720,7 +830,10 @@ async fn deliver_siem(http: &reqwest::Client, cfg: &SiemConfig, token: &str, e: 
         }),
         _ => serde_json::to_value(e).unwrap_or_default(),
     };
-    let mut req = http.post(&cfg.endpoint).json(&body).timeout(std::time::Duration::from_secs(8));
+    let mut req = http
+        .post(&cfg.endpoint)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(8));
     if !token.is_empty() {
         req = match cfg.format.as_str() {
             "datadog" => req.header("DD-API-KEY", token),
@@ -766,7 +879,10 @@ mod tests {
         assert!(s.verify_password("proj", "hunter2"));
         assert!(!s.verify_password("proj", "wrong"));
         // stored value is an encrypted envelope, never the plaintext
-        assert!(s.protection("proj").password_hash.starts_with("enc:v1:") || s.protection("proj").password_hash != "hunter2");
+        assert!(
+            s.protection("proj").password_hash.starts_with("enc:v1:")
+                || s.protection("proj").password_hash != "hunter2"
+        );
         let tok = s.scim_enable("acme");
         assert_eq!(s.scim_team_for_token(&tok).as_deref(), Some("acme"));
         assert!(s.scim_team_for_token("nope").is_none());
@@ -784,11 +900,17 @@ mod tests {
         let s = EnterpriseStore::new();
         s.set_protection("proj", "password", "preview", Some("hunter2"));
         let stored = s.protection("proj").password_hash;
-        assert!(stored.starts_with("$argon2id$"), "stored must be an Argon2id PHC string, got {stored}");
+        assert!(
+            stored.starts_with("$argon2id$"),
+            "stored must be an Argon2id PHC string, got {stored}"
+        );
         assert!(s.verify_password("proj", "hunter2"));
         assert!(!s.verify_password("proj", "wrong"));
         // Salted: a second hash of the same password is a different string.
-        assert_ne!(password_hash("proj", "hunter2"), password_hash("proj", "hunter2"));
+        assert_ne!(
+            password_hash("proj", "hunter2"),
+            password_hash("proj", "hunter2")
+        );
         // Cookie seal returns the stored hash (constant-time comparable on peers).
         assert_eq!(s.seal_password_cookie("proj", "hunter2"), stored);
         assert!(s.verify_password_cookie("proj", &stored));
@@ -819,11 +941,17 @@ mod tests {
         // Deactivate alone (the OLD behavior) must NOT erase the record —
         // confirms the two operations are genuinely distinct.
         assert!(s.scim_deactivate_user("acme", &u.id));
-        assert!(s.scim_user("acme", &u.id).is_some(), "deactivate must not erase the record");
+        assert!(
+            s.scim_user("acme", &u.id).is_some(),
+            "deactivate must not erase the record"
+        );
 
         // The real fix: purge actually removes it.
         assert!(s.scim_purge_user("acme", &u.id));
-        assert!(s.scim_user("acme", &u.id).is_none(), "purge must fully erase the user record (email/display name)");
+        assert!(
+            s.scim_user("acme", &u.id).is_none(),
+            "purge must fully erase the user record (email/display name)"
+        );
 
         // Idempotent / honest return value: purging an already-gone id reports false.
         assert!(!s.scim_purge_user("acme", &u.id));

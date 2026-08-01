@@ -81,8 +81,10 @@ impl Waf {
         Arc::new(Waf {
             inner: RwLock::new(Vec::new()),
             managed: RwLock::new(true),
-            sqli: Regex::new(r"(?i)(union\s+select|or\s+1\s*=\s*1|;\s*drop\s+table|/\*|--\s|xp_cmdshell)")
-                .unwrap(),
+            sqli: Regex::new(
+                r"(?i)(union\s+select|or\s+1\s*=\s*1|;\s*drop\s+table|/\*|--\s|xp_cmdshell)",
+            )
+            .unwrap(),
             xss: Regex::new(r"(?i)(<script|onerror\s*=|onload\s*=|javascript:|<img[^>]+src)")
                 .unwrap(),
             traversal: Regex::new(r"(\.\./|\.\.%2f|%2e%2e/)").unwrap(),
@@ -117,7 +119,11 @@ impl Waf {
     }
 
     pub fn add_rule(&self, rule: WafRule) {
-        let path_re = rule.when.path_regex.as_ref().and_then(|p| Regex::new(p).ok());
+        let path_re = rule
+            .when
+            .path_regex
+            .as_ref()
+            .and_then(|p| Regex::new(p).ok());
         self.inner.write().push(Compiled { rule, path_re });
     }
 
@@ -206,7 +212,13 @@ mod tests {
     use super::*;
 
     fn ctx<'a>(path: &'a str, query: &'a str, ip: &'a str) -> RequestCtx<'a> {
-        RequestCtx { method: "GET", path, query, ip, headers: &[] }
+        RequestCtx {
+            method: "GET",
+            path,
+            query,
+            ip,
+            headers: &[],
+        }
     }
 
     #[test]
@@ -235,9 +247,15 @@ mod tests {
             description: "block 10.0.0.0/8".into(),
             action: WafAction::Deny,
             enabled: true,
-            when: WafMatch { ip_prefix: Some("10.0.".into()), ..Default::default() },
+            when: WafMatch {
+                ip_prefix: Some("10.0.".into()),
+                ..Default::default()
+            },
         });
-        assert!(matches!(waf.evaluate(&ctx("/", "", "10.0.5.5")), Verdict::Deny { .. }));
+        assert!(matches!(
+            waf.evaluate(&ctx("/", "", "10.0.5.5")),
+            Verdict::Deny { .. }
+        ));
         assert_eq!(waf.evaluate(&ctx("/", "", "8.8.8.8")), Verdict::Allow);
     }
 }

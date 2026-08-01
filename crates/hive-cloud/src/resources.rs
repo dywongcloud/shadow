@@ -8,13 +8,20 @@ use sysinfo::{Disks, Networks, System};
 /// Static capacity of this host: (cpu_cores, mem_total_mb, disk_total_gb).
 /// Read once at startup and published on the node's `NodeInfo`.
 pub fn capacity() -> (u32, u64, u64) {
-    let cores = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1);
     let mut sys = System::new();
     sys.refresh_memory();
     let mem_total_mb = sys.total_memory() / 1024 / 1024; // bytes -> MiB
     let disks = Disks::new_with_refreshed_list();
     // Root/primary volume capacity (sum distinct mounts, bytes -> GiB).
-    let disk_total_bytes: u64 = disks.list().iter().map(|d| d.total_space()).max().unwrap_or(0);
+    let disk_total_bytes: u64 = disks
+        .list()
+        .iter()
+        .map(|d| d.total_space())
+        .max()
+        .unwrap_or(0);
     (cores, mem_total_mb, disk_total_bytes / 1024 / 1024 / 1024)
 }
 
@@ -29,14 +36,26 @@ pub fn capacity() -> (u32, u64, u64) {
 pub fn detect_gpus() -> (u32, Option<String>, u64) {
     if let Ok(v) = std::env::var("HIVE_GPUS") {
         let mut it = v.splitn(3, ',');
-        let count = it.next().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0);
-        let model = it.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let vram = it.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        let count = it
+            .next()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let model = it
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let vram = it
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         return (count, model, vram);
     }
     // `--query-gpu` CSV: one line per GPU, "name, vram_mib".
     let out = std::process::Command::new("nvidia-smi")
-        .args(["--query-gpu=name,memory.total", "--format=csv,noheader,nounits"])
+        .args([
+            "--query-gpu=name,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
         .output();
     let Ok(out) = out else { return (0, None, 0) };
     if !out.status.success() {
@@ -48,7 +67,10 @@ pub fn detect_gpus() -> (u32, Option<String>, u64) {
     let mut vram_mb = 0u64;
     for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
         let mut parts = line.rsplitn(2, ',');
-        let mem = parts.next().and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0);
+        let mem = parts
+            .next()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let name = parts.next().map(str::trim).unwrap_or("");
         count += 1;
         vram_mb += mem;
@@ -84,8 +106,24 @@ pub async fn live() -> LiveUsage {
     let mem_used_mb = sys.used_memory() / 1024 / 1024;
 
     let disks = Disks::new_with_refreshed_list();
-    let disk_total_gb = disks.list().iter().map(|d| d.total_space()).max().unwrap_or(0) / 1024 / 1024 / 1024;
-    let disk_free_gb = disks.list().iter().map(|d| d.available_space()).max().unwrap_or(0) / 1024 / 1024 / 1024;
+    let disk_total_gb = disks
+        .list()
+        .iter()
+        .map(|d| d.total_space())
+        .max()
+        .unwrap_or(0)
+        / 1024
+        / 1024
+        / 1024;
+    let disk_free_gb = disks
+        .list()
+        .iter()
+        .map(|d| d.available_space())
+        .max()
+        .unwrap_or(0)
+        / 1024
+        / 1024
+        / 1024;
 
     let nets = Networks::new_with_refreshed_list();
     let mut net_rx_bytes = 0u64;
@@ -114,7 +152,15 @@ pub async fn live() -> LiveUsage {
 /// disk number.
 pub fn disk_free_gb() -> u64 {
     let disks = Disks::new_with_refreshed_list();
-    disks.list().iter().map(|d| d.available_space()).max().unwrap_or(0) / 1024 / 1024 / 1024
+    disks
+        .list()
+        .iter()
+        .map(|d| d.available_space())
+        .max()
+        .unwrap_or(0)
+        / 1024
+        / 1024
+        / 1024
 }
 
 /// MEASURED free VRAM on this host, MiB — summed across every GPU, straight

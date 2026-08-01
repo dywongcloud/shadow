@@ -227,32 +227,38 @@ raw-bytes CryptoKey.
 
 ### 2.4 Node-compat layer
 
-Fork-and-own **almostnode** (MIT; 17 days of development, dormant since 2026-02-14;
-1.1k stars): in-memory VFS, ~40 shims, eval-based CJS + acorn ESM→CJS, real npm installs
-straight from registry.npmjs.org (CORS-open), and the decisive seam — **all inbound HTTP
-funnels through `ServerBridge.handleRequest(port, method, url, headers, body)`** over the
-http shim's `Map<port, Server>` registry. The SHADW browser node adds a third transport
-feeder to that chokepoint: the iroh ProtocolHandler decodes an inbound mesh request, calls
-`handleRequest`, streams the response back — an express app in a tab becomes mesh-servable
-with no service worker involved (the SW stays for local same-tab preview only).
+The implementation is a **clean-room, deliberately small compatibility lane** in
+`crates/hive-browser/www/node-compat.js`; no Lagon or almostnode source is copied.
+`BrowserNodeCompat.pin()` wraps one local CommonJS source string as the same pinned
+BLAKE3 artifact the function runtime already serves, so inbound requests use the
+existing `{method,path,headers,body}` invoke path and executable source never crosses
+the wire.
 
-Verified corrections that *expand* what we can reuse: `fs.promises` **is** implemented
-(promise wrappers over the VFS — common-surface node code runs), and `shims/ws.ts` **does**
-ship a server side (`WebSocketServer` with working `handleUpgrade`/connection events over an
-internal loopback channel) — the mesh feeder can call `wss.handleUpgrade` directly instead of
-building WS serving from nothing. What the transport path still lacks: no WS through the
-`/__virtual__/{port}` service worker (confirmed absent).
+The supported surface is explicit:
 
-Boundaries: almostnode is the **compat layer, never the security layer** (it evals in the
-host realm and even writes `globalThis.process`) — it runs entirely inside the §2.3 iframe
-substrate. Replace the fake `net.ts` (queueMicrotask 'connect') with sockets-over-iroh-streams
-and route `http.request` over the mesh — real egress plain browsers can't have, which
-almostnode structurally cannot do and SHADW uniquely can. VFS is in-memory with
-`toSnapshot`/`fromSnapshot` + `syncFile` listeners — exactly where OPFS persistence and
-replication attach. `better-sqlite3` and native modules will never work (stubs only); sqlite
-is the wasm build of §2.5. Audit the framework dev-server paths' esm.sh/CDN fetches
-(`src/config/cdn.ts`) before allowing them under a no-third-party-egress policy — the core
-require path is clean.
+- `require("express")`: `use/get/post/put/patch/delete/all`, exact or `:param`-shaped
+  routes, query parsing, and `status/set/json/send/end` responses;
+- `require("http")` / `node:http`: `createServer(listener)` as an inbound request
+  adapter; `listen()` throws because browsers cannot bind sockets;
+- `require("fs")` / `node:fs`: callback `readFile` and `fs.promises.readFile` against
+  a per-artifact virtual read-only mount;
+- `require("path")` / `node:path`: `join`, `basename`, and `dirname` over virtual
+  paths; and a `Uint8Array`-backed minimal `Buffer.from/isBuffer` surface.
+
+Filesystem reads cross numbered host op 16. The trusted runner supplies the current
+artifact digest to the op handler; the handler selects that digest's mount and ignores
+any guest-selected namespace, so one granted app cannot name another app's files.
+Paths are normalized inside the virtual root and reject NUL/traversal. Pure route/path
+shims remain in the guest because they convey no authority; all external capability
+continues to cross the existing numbered op table.
+
+Honest limits: no npm installer, package graph, ESM transform, native addon,
+`better-sqlite3`, outbound `net`, real listening socket, streaming response, WebSocket
+upgrade, Node process globals, or broad Buffer compatibility. `listen()` and unknown
+modules fail loudly rather than pretending to work. This lane targets small
+Express-style request handlers; broader package compatibility is admitted only when a
+real app witnesses the missing API and the implementation can preserve the same
+sandbox/op boundary.
 
 ### 2.5 sqlite + CRDT stack
 
@@ -295,26 +301,30 @@ require path is clean.
 
 ### 2.6 Asset store & serving
 
-- **Store**: OPFS content-addressed chunks (`cas/ab/cdef…` fan-out), written by **one
-  dedicated worker** holding a readwrite `createSyncAccessHandle` per file (exclusive lock =
-  free single-writer; blake3 verify while writing; in-place offset writes = resumable
-  partials). The Cache API is disqualified for the CAS: no random access — serving a Range
-  means reading the whole cached body (workbox's own documented approach).
-- **Serve**: a service worker intercepts fetch for hosted-app origins and hand-builds
-  **206 Partial Content** from lazily-sliced OPFS Files
-  (`getFile → file.slice(start, end+1) → Response(slice, {status:206, Content-Range,
-  Accept-Ranges})`). Mandatory: Safari probes video with `Range: bytes=0-1` and refuses
-  playback without a real 206. The async OPFS handle API is spec-exposed to Workers
-  (ServiceWorker included), so SW-read/dedicated-worker-write is the correct split. Cache
-  miss ⇒ fetch the chunk once over the relay, write to OPFS, respond — content addressing
-  bounds each chunk to one relay crossing per browser.
-- **Replication transport**: stock `iroh-blobs` 0.103 `default-features = false` —
-  `MemStore` + `Downloader` + `BlobsProtocol` all compile on wasm (CI-proven upstream); the
-  browser can both fetch and provide BLAKE3-verified blobs. Browser blob RAM-store is
-  transfer plumbing; durable bytes live in OPFS (a custom `api::Store` over OPFS is the
-  eventual slot-in).
-- **Placement**: per §1.4 — demand-side mirror + ingest buffer; never in the serving set for
-  other consumers; replication factor contribution zero.
+- **Addressing**: one wasm-exported BLAKE3 implementation produces the canonical
+  64-lowercase-hex identifier for both function source and asset bytes. The browser
+  does not depend on a slow or incompatible JavaScript BLAKE3 package. Every ingest
+  and completed peer pull re-hashes before persistence.
+- **Durability**: `BrowserAssetStore` writes bytes plus MIME metadata to an
+  origin-private `hive-browser-assets-v1` OPFS directory. A per-digest Web Lock is
+  mandatory, so concurrent tabs serialize replacement/removal instead of racing.
+  `createWritable().close()` is the commit boundary; a failed writer aborts loudly.
+- **Serving**: the trusted host mirrors pinned responses into the
+  `hive-browser-assets-v1` Cache Storage namespace. `asset-sw.js` owns only
+  `/__hive_asset/<digest>` and serves GET/HEAD plus one RFC byte range with real 206,
+  `Content-Range`, `Accept-Ranges`, and 416 for malformed/unsatisfiable ranges. OPFS
+  remains the durable source; a cache miss is rehydrated and re-verified by the page.
+  The opaque tenant iframe does not register a service worker — host ops transfer
+  asset bytes into the sandbox when a function needs them.
+- **Peer pull**: `Op::AssetGet` on `hive/browser/0` requests
+  `[digest, offset, max_len]`; replies carry `[total_len, chunk]`. The shared 1 MiB
+  frame cap leaves eight bytes for total length, so arbitrary assets transfer in
+  bounded chunks. Every chunk re-checks an exact `(TLS EndpointId, digest)` grant;
+  revocation therefore stops an existing pooled connection on its next range.
+- **Placement**: this remains a demand-side mirror + browser-originated ingest buffer.
+  Browser copies contribute replication factor zero and are never advertised as a
+  general CDN serving set. Browser-to-browser pulls are explicit scoped cache fills,
+  not opportunistic placement.
 
 ### 2.7 Tab-lifetime placement
 
@@ -464,15 +474,16 @@ must land before `bn-verify-e2e` can run at all.
    postMessage broker, ops table with batched completions, throwing denied-op stubs, pending
    predicate + unresolved-promise termination; QuickJS metered variant nested behind the same
    ops ABI.
-5. **`bn-impl-node-compat`** — §2.4: vendored almostnode fork inside the substrate; iroh
-   feeder into `ServerBridge.handleRequest`; `wss.handleUpgrade` mesh WS feeder; net/http
-   shims re-pointed at mesh ops; CDN-egress audit of framework paths.
+5. **`bn-impl-node-compat`** — §2.4: clean-room CommonJS request wrapper inside the
+   existing sandbox, explicit Express/http/fs/path subset, artifact-scoped VFS host op,
+   and loud unsupported-module/listen boundaries.
 6. **`bn-impl-sqlite-automerge`** — §2.5: sqlite wasm + sahpool worker, Web Locks writer
    election, vendored superfly/cr-sqlite wasm link, `crsql_changes` exchange over the browser
    ALPN, fleet-side native extension load; automerge slim + iroh NetworkAdapter + samod
    fleet peer for doc-shaped state.
-7. **`bn-impl-asset-store`** — §2.6: OPFS CAS writer worker, SW 206/Range serving (Safari
-   probe test is the gate), iroh-blobs fetch/provide, persist()/estimate() gossiped.
+7. **`bn-impl-asset-store`** — §2.6: shared wasm BLAKE3, OPFS durable CAS,
+   Cache-backed service-worker GET/HEAD/206/416 serving, and chunked exact-digest
+   AssetGet with per-endpoint grants and final re-verification.
 8. **`bn-impl-mesh-admission`** — §2.8 + §2.9: admission mint endpoint + replicated
    BrowserAdmissions store, two-level revocation + relay AccessControl deny, embedded-relay
    access closed, standalone relay audit, per-eid caps, relay token issuance in the session

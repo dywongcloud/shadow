@@ -18,7 +18,10 @@ pub struct DeploymentId(pub String);
 
 impl DeploymentId {
     pub fn new() -> Self {
-        DeploymentId(format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]))
+        DeploymentId(format!(
+            "dpl-{}",
+            &Uuid::new_v4().simple().to_string()[..10]
+        ))
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -93,7 +96,10 @@ impl ServiceProtocol {
     /// allocated public port; HTTP-family specs ride 80/443 Host routing).
     /// `json-rpc` stays HTTP-framed (it's HTTP-transported despite the name).
     pub fn needs_raw_proxy(self) -> bool {
-        matches!(self, ServiceProtocol::Grpc | ServiceProtocol::Tcp | ServiceProtocol::Udp)
+        matches!(
+            self,
+            ServiceProtocol::Grpc | ServiceProtocol::Tcp | ServiceProtocol::Udp
+        )
     }
 
     /// The lowercase wire string for this protocol — the inverse of
@@ -231,14 +237,20 @@ impl PortSpec {
     /// the codebase not rewritten in this pass). No `label`: there is no
     /// multi-port distinction to make with only one port.
     pub fn single(container_port: u16, protocol: ServiceProtocol) -> PortSpec {
-        PortSpec { container_port, protocol, label: None, public_port: None }
+        PortSpec {
+            container_port,
+            protocol,
+            label: None,
+            public_port: None,
+        }
     }
 
     /// Same bridge for an `Option<u16>` legacy port field: `None` normalizes
     /// to an empty port list (nothing declared), `Some(port)` to a
     /// single-element list via [`PortSpec::single`].
     pub fn from_legacy_port(port: Option<u16>, protocol: ServiceProtocol) -> Vec<PortSpec> {
-        port.map(|p| vec![PortSpec::single(p, protocol)]).unwrap_or_default()
+        port.map(|p| vec![PortSpec::single(p, protocol)])
+            .unwrap_or_default()
     }
 }
 
@@ -505,7 +517,10 @@ impl RouteClass {
     /// kinds must still pass the method+idempotency gate (`hive-cloud retry`).
     /// Returns only "definitely safe", never "definitely unsafe".
     pub fn always_replayable(self) -> bool {
-        matches!(self, RouteClass::Static | RouteClass::Isr | RouteClass::SsrPage)
+        matches!(
+            self,
+            RouteClass::Static | RouteClass::Isr | RouteClass::SsrPage
+        )
     }
 
     /// Whether serving this route consumes a runtime instance (function
@@ -533,9 +548,10 @@ impl RouteCachePolicy {
     pub fn cache_control(self) -> Option<String> {
         match self {
             RouteCachePolicy::Immutable => Some("public, max-age=31536000, immutable".to_string()),
-            RouteCachePolicy::Revalidate(n) => {
-                Some(format!("public, s-maxage={}, stale-while-revalidate", n.max(1)))
-            }
+            RouteCachePolicy::Revalidate(n) => Some(format!(
+                "public, s-maxage={}, stale-while-revalidate",
+                n.max(1)
+            )),
             RouteCachePolicy::Origin => None,
         }
     }
@@ -642,8 +658,13 @@ impl CondValue {
         match self {
             CondValue::Text(t) => candidate == t,
             CondValue::Expr { pre, suf } => {
-                pre.as_deref().map(|p| candidate.starts_with(p)).unwrap_or(true)
-                    && suf.as_deref().map(|s| candidate.ends_with(s)).unwrap_or(true)
+                pre.as_deref()
+                    .map(|p| candidate.starts_with(p))
+                    .unwrap_or(true)
+                    && suf
+                        .as_deref()
+                        .map(|s| candidate.ends_with(s))
+                        .unwrap_or(true)
             }
         }
     }
@@ -710,7 +731,10 @@ pub struct ReqCtx {
 impl ReqCtx {
     pub fn header(&self, key: &str) -> Option<String> {
         let k = key.to_ascii_lowercase();
-        self.headers.iter().find(|(hk, _)| *hk == k).map(|(_, v)| v.clone())
+        self.headers
+            .iter()
+            .find(|(hk, _)| *hk == k)
+            .map(|(_, v)| v.clone())
     }
     pub fn cookie(&self, key: &str) -> Option<String> {
         let raw = self.header("cookie")?;
@@ -748,7 +772,7 @@ fn cond_matches(c: &RuleCondition, ctx: &ReqCtx) -> bool {
         _ => None,
     };
     match (&c.value, actual) {
-        (None, Some(_)) => true,       // presence only
+        (None, Some(_)) => true, // presence only
         (None, None) => false,
         (Some(v), Some(a)) => v.matches(&a),
         (Some(_), None) => false,
@@ -1023,11 +1047,15 @@ fn validate_protocols_strict(s: &str) -> Result<(), serde_json::Error> {
         return Ok(());
     };
     for f in functions {
-        let name = f.get("name").and_then(|n| n.as_str()).unwrap_or("<unnamed>");
+        let name = f
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("<unnamed>");
         let mut check = |v: &serde_json::Value, ctx: &str| -> Result<(), serde_json::Error> {
             if let Some(p) = v.as_str() {
-                p.parse::<ServiceProtocol>()
-                    .map_err(|e| serde_json::Error::custom(format!("function {name:?}{ctx}: {e}")))?;
+                p.parse::<ServiceProtocol>().map_err(|e| {
+                    serde_json::Error::custom(format!("function {name:?}{ctx}: {e}"))
+                })?;
             }
             Ok(())
         };
@@ -1098,7 +1126,8 @@ impl Manifest {
                 }
             }
         }
-        best.map(|r| r.target.clone()).unwrap_or(RouteTarget::Static)
+        best.map(|r| r.target.clone())
+            .unwrap_or(RouteTarget::Static)
     }
 
     /// The per-route runtime policy (#16) for a request path, if any. Matches the
@@ -1202,7 +1231,10 @@ impl Manifest {
 
     /// Count of edge-runtime functions in this deployment.
     pub fn edge_function_count(&self) -> usize {
-        self.functions.iter().filter(|f| f.runtime == "edge").count()
+        self.functions
+            .iter()
+            .filter(|f| f.runtime == "edge")
+            .count()
     }
 }
 
@@ -1249,8 +1281,16 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
 pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
     let pat = pattern.trim_matches('/');
     let req = path.trim_matches('/');
-    let pseg: Vec<&str> = if pat.is_empty() { vec![] } else { pat.split('/').collect() };
-    let rseg: Vec<&str> = if req.is_empty() { vec![] } else { req.split('/').collect() };
+    let pseg: Vec<&str> = if pat.is_empty() {
+        vec![]
+    } else {
+        pat.split('/').collect()
+    };
+    let rseg: Vec<&str> = if req.is_empty() {
+        vec![]
+    } else {
+        req.split('/').collect()
+    };
 
     let mut score: u32 = 0;
     let mut i = 0;
@@ -1262,7 +1302,11 @@ pub fn next_route_match(pattern: &str, path: &str) -> Option<u32> {
         }
         if p.starts_with("[...") && p.ends_with(']') {
             // Requires at least one remaining segment.
-            return if i < rseg.len() { Some(score + 2) } else { None };
+            return if i < rseg.len() {
+                Some(score + 2)
+            } else {
+                None
+            };
         }
         // Out of request segments but pattern still has required parts -> no match.
         if i >= rseg.len() {
@@ -1318,7 +1362,9 @@ pub enum DeployState {
     Error,
 }
 impl Default for DeployState {
-    fn default() -> Self { DeployState::Ready }
+    fn default() -> Self {
+        DeployState::Ready
+    }
 }
 
 /// Serializable snapshot of a deployment (for persistence + restore).
@@ -1713,15 +1759,27 @@ mod tests {
             static_dir: Some("public".into()),
             functions: vec![],
             routes: vec![
-                Route { pattern: "/".into(), target: RouteTarget::Static },
-                Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) },
-                Route { pattern: "/api/admin".into(), target: RouteTarget::Function("admin".into()) },
+                Route {
+                    pattern: "/".into(),
+                    target: RouteTarget::Static,
+                },
+                Route {
+                    pattern: "/api".into(),
+                    target: RouteTarget::Function("api".into()),
+                },
+                Route {
+                    pattern: "/api/admin".into(),
+                    target: RouteTarget::Function("admin".into()),
+                },
             ],
             ..Default::default()
         };
         assert_eq!(m.resolve("/index.html"), RouteTarget::Static);
         assert_eq!(m.resolve("/api/users"), RouteTarget::Function("api".into()));
-        assert_eq!(m.resolve("/api/admin/x"), RouteTarget::Function("admin".into()));
+        assert_eq!(
+            m.resolve("/api/admin/x"),
+            RouteTarget::Function("admin".into())
+        );
         assert!(!path_matches("/api", "/apixyz"));
     }
 }
@@ -1752,7 +1810,10 @@ mod routing_tests {
         assert!(f.needs_raw_proxy());
         // A default (http) protocol is skipped on the wire (backward-compatible manifests).
         let j = serde_json::to_string(&FunctionConfig::default()).unwrap();
-        assert!(!j.contains("\"protocol\""), "default protocol omitted from JSON");
+        assert!(
+            !j.contains("\"protocol\""),
+            "default protocol omitted from JSON"
+        );
         // And a manifest without `protocol` deserializes to the http default.
         let back: FunctionConfig = serde_json::from_str(&j).unwrap();
         assert_eq!(back.protocol_or_http(), "http");
@@ -1777,14 +1838,20 @@ mod routing_tests {
                 r#"{{"name":"f","start_cmd":[],"protocol":"{wire}"}}"#
             ))
             .unwrap();
-            assert_eq!(stored.protocol, variant, "stored deployment protocol {wire:?} must round-trip");
+            assert_eq!(
+                stored.protocol, variant,
+                "stored deployment protocol {wire:?} must round-trip"
+            );
         }
         // Strict-vs-lenient split: FromStr (the deploy-input boundary) rejects
         // unknown strings; serde Deserialize (the stored-state path) NEVER
         // fails on them — it coerces to http (see lenient_deserialize tests).
         assert!("quic".parse::<ServiceProtocol>().is_err());
         // PortSpec compatibility bridge from a legacy bare `Option<u16>` port.
-        assert_eq!(PortSpec::from_legacy_port(None, ServiceProtocol::Tcp), vec![]);
+        assert_eq!(
+            PortSpec::from_legacy_port(None, ServiceProtocol::Tcp),
+            vec![]
+        );
         assert_eq!(
             PortSpec::from_legacy_port(Some(25565), ServiceProtocol::Tcp),
             vec![PortSpec::single(25565, ServiceProtocol::Tcp)]
@@ -1793,9 +1860,24 @@ mod routing_tests {
         // (e.g. a Minecraft-style multi-port service).
         assert!(FunctionConfig::default().ports.is_empty());
         f.ports = vec![
-            PortSpec { container_port: 25565, protocol: ServiceProtocol::Tcp, label: Some("game".into()), public_port: None },
-            PortSpec { container_port: 25575, protocol: ServiceProtocol::Tcp, label: Some("rcon".into()), public_port: None },
-            PortSpec { container_port: 25565, protocol: ServiceProtocol::Udp, label: Some("query".into()), public_port: None },
+            PortSpec {
+                container_port: 25565,
+                protocol: ServiceProtocol::Tcp,
+                label: Some("game".into()),
+                public_port: None,
+            },
+            PortSpec {
+                container_port: 25575,
+                protocol: ServiceProtocol::Tcp,
+                label: Some("rcon".into()),
+                public_port: None,
+            },
+            PortSpec {
+                container_port: 25565,
+                protocol: ServiceProtocol::Udp,
+                label: Some("query".into()),
+                public_port: None,
+            },
         ];
         let j2 = serde_json::to_string(&f).unwrap();
         let back2: FunctionConfig = serde_json::from_str(&j2).unwrap();
@@ -1810,14 +1892,26 @@ mod routing_tests {
     #[test]
     fn route_class_policy_semantics() {
         // Cache.
-        assert_eq!(RouteClass::Static.cache_policy(None), RouteCachePolicy::Immutable);
         assert_eq!(
-            RouteClass::Static.cache_policy(None).cache_control().as_deref(),
+            RouteClass::Static.cache_policy(None),
+            RouteCachePolicy::Immutable
+        );
+        assert_eq!(
+            RouteClass::Static
+                .cache_policy(None)
+                .cache_control()
+                .as_deref(),
             Some("public, max-age=31536000, immutable")
         );
-        assert_eq!(RouteClass::Isr.cache_policy(Some(60)), RouteCachePolicy::Revalidate(60));
         assert_eq!(
-            RouteClass::Isr.cache_policy(Some(60)).cache_control().as_deref(),
+            RouteClass::Isr.cache_policy(Some(60)),
+            RouteCachePolicy::Revalidate(60)
+        );
+        assert_eq!(
+            RouteClass::Isr
+                .cache_policy(Some(60))
+                .cache_control()
+                .as_deref(),
             Some("public, s-maxage=60, stale-while-revalidate")
         );
         // revalidate 0 / None / negative all clamp to a valid >=1 s-maxage.
@@ -1827,7 +1921,13 @@ mod routing_tests {
                 Some("public, s-maxage=1, stale-while-revalidate")
             );
         }
-        for c in [RouteClass::SsrPage, RouteClass::ApiNode, RouteClass::RouteHandler, RouteClass::Edge, RouteClass::Middleware] {
+        for c in [
+            RouteClass::SsrPage,
+            RouteClass::ApiNode,
+            RouteClass::RouteHandler,
+            RouteClass::Edge,
+            RouteClass::Middleware,
+        ] {
             assert_eq!(c.cache_policy(Some(10)), RouteCachePolicy::Origin);
             assert_eq!(c.cache_policy(None).cache_control(), None);
         }
@@ -1835,7 +1935,12 @@ mod routing_tests {
         for c in [RouteClass::Static, RouteClass::Isr, RouteClass::SsrPage] {
             assert!(c.always_replayable());
         }
-        for c in [RouteClass::ApiNode, RouteClass::RouteHandler, RouteClass::Edge, RouteClass::Middleware] {
+        for c in [
+            RouteClass::ApiNode,
+            RouteClass::RouteHandler,
+            RouteClass::Edge,
+            RouteClass::Middleware,
+        ] {
             assert!(!c.always_replayable());
         }
         assert!(!RouteClass::Static.uses_runtime() && !RouteClass::Isr.uses_runtime());
@@ -1846,9 +1951,12 @@ mod routing_tests {
     fn route_class_from_name_roundtrip_and_unknown() {
         // Mirrors fluid_build::per_route::RouteKind::class_name strings.
         for (s, c) in [
-            ("static", RouteClass::Static), ("isr", RouteClass::Isr),
-            ("api_node", RouteClass::ApiNode), ("route_handler", RouteClass::RouteHandler),
-            ("ssr_page", RouteClass::SsrPage), ("edge", RouteClass::Edge),
+            ("static", RouteClass::Static),
+            ("isr", RouteClass::Isr),
+            ("api_node", RouteClass::ApiNode),
+            ("route_handler", RouteClass::RouteHandler),
+            ("ssr_page", RouteClass::SsrPage),
+            ("edge", RouteClass::Edge),
             ("middleware", RouteClass::Middleware),
         ] {
             assert_eq!(RouteClass::from_name(s), c);
@@ -1878,28 +1986,48 @@ mod routing_tests {
         assert!(next_route_match("/", "/").is_some());
         assert!(next_route_match("/", "/x").is_none());
         // Specificity ordering: exact > dynamic.
-        assert!(next_route_match("/blog/featured", "/blog/featured").unwrap()
-            > next_route_match("/blog/[slug]", "/blog/featured").unwrap());
+        assert!(
+            next_route_match("/blog/featured", "/blog/featured").unwrap()
+                > next_route_match("/blog/[slug]", "/blog/featured").unwrap()
+        );
     }
 
     #[test]
     fn manifest_route_policy_prefers_most_specific() {
         let m = Manifest {
             route_policies: vec![
-                RoutePolicy { pattern: "/blog/[slug]".into(), class: RouteClass::Isr, revalidate: Some(60) },
-                RoutePolicy { pattern: "/blog/featured".into(), class: RouteClass::Static, revalidate: None },
-                RoutePolicy { pattern: "/api/claw".into(), class: RouteClass::ApiNode, revalidate: None },
+                RoutePolicy {
+                    pattern: "/blog/[slug]".into(),
+                    class: RouteClass::Isr,
+                    revalidate: Some(60),
+                },
+                RoutePolicy {
+                    pattern: "/blog/featured".into(),
+                    class: RouteClass::Static,
+                    revalidate: None,
+                },
+                RoutePolicy {
+                    pattern: "/api/claw".into(),
+                    class: RouteClass::ApiNode,
+                    revalidate: None,
+                },
             ],
             ..Default::default()
         };
         // Exact static beats the dynamic ISR for the same path.
-        assert_eq!(m.route_policy("/blog/featured").unwrap().class, RouteClass::Static);
+        assert_eq!(
+            m.route_policy("/blog/featured").unwrap().class,
+            RouteClass::Static
+        );
         // Dynamic ISR for any other slug.
         let p = m.route_policy("/blog/hello").unwrap();
         assert_eq!(p.class, RouteClass::Isr);
         assert_eq!(p.revalidate, Some(60));
         // API route.
-        assert_eq!(m.route_policy("/api/claw?x=1").unwrap().class, RouteClass::ApiNode);
+        assert_eq!(
+            m.route_policy("/api/claw?x=1").unwrap().class,
+            RouteClass::ApiNode
+        );
         // No policy for unmatched path.
         assert!(m.route_policy("/nope").is_none());
         // Empty policies (common case) -> always None, no allocation/iteration.
@@ -1910,8 +2038,14 @@ mod routing_tests {
     fn manifest_resolve_longest_prefix_wins() {
         let m = Manifest {
             routes: vec![
-                Route { pattern: "/".into(), target: RouteTarget::Static },
-                Route { pattern: "/api".into(), target: RouteTarget::Function("api".into()) },
+                Route {
+                    pattern: "/".into(),
+                    target: RouteTarget::Static,
+                },
+                Route {
+                    pattern: "/api".into(),
+                    target: RouteTarget::Function("api".into()),
+                },
             ],
             ..Default::default()
         };
@@ -1922,8 +2056,19 @@ mod routing_tests {
     #[test]
     fn manifest_redirect_and_rewrite() {
         let m = Manifest {
-            redirects: vec![Redirect { source: "/old".into(), destination: "/new".into(), status: 308, has: vec![], missing: vec![] }],
-            rewrites: vec![Rewrite { source: "/proxy".into(), destination: "/internal".into(), has: vec![], missing: vec![] }],
+            redirects: vec![Redirect {
+                source: "/old".into(),
+                destination: "/new".into(),
+                status: 308,
+                has: vec![],
+                missing: vec![],
+            }],
+            rewrites: vec![Rewrite {
+                source: "/proxy".into(),
+                destination: "/internal".into(),
+                has: vec![],
+                missing: vec![],
+            }],
             ..Default::default()
         };
         assert_eq!(m.redirect_for("/old"), Some(("/new".to_string(), 308)));
@@ -1932,8 +2077,20 @@ mod routing_tests {
         assert_eq!(m.rewrite_path("/untouched"), "/untouched");
     }
 
-    fn red(source: &str, dest: &str, status: u16, has: Vec<RuleCondition>, missing: Vec<RuleCondition>) -> Redirect {
-        Redirect { source: source.into(), destination: dest.into(), status, has, missing }
+    fn red(
+        source: &str,
+        dest: &str,
+        status: u16,
+        has: Vec<RuleCondition>,
+        missing: Vec<RuleCondition>,
+    ) -> Redirect {
+        Redirect {
+            source: source.into(),
+            destination: dest.into(),
+            status,
+            has,
+            missing,
+        }
     }
 
     #[test]
@@ -1946,8 +2103,14 @@ mod routing_tests {
             ],
             ..Default::default()
         };
-        assert_eq!(m.redirect_for("/blog/hello"), Some(("/news/hello".into(), 308)));
-        assert_eq!(m.redirect_for("/proxy/a/b/c"), Some(("/internal/a/b/c".into(), 307)));
+        assert_eq!(
+            m.redirect_for("/blog/hello"),
+            Some(("/news/hello".into(), 308))
+        );
+        assert_eq!(
+            m.redirect_for("/proxy/a/b/c"),
+            Some(("/internal/a/b/c".into(), 307))
+        );
         assert_eq!(m.redirect_for("/post/42"), Some(("/n/42".into(), 308)));
         assert_eq!(m.redirect_for("/post/abc"), None); // non-numeric fails the inline regex
     }
@@ -1959,7 +2122,11 @@ mod routing_tests {
                 source: "/dashboard".into(),
                 destination: "/login".into(),
                 has: vec![],
-                missing: vec![RuleCondition { kind: "cookie".into(), key: Some("auth_token".into()), value: None }],
+                missing: vec![RuleCondition {
+                    kind: "cookie".into(),
+                    key: Some("auth_token".into()),
+                    value: None,
+                }],
             }],
             ..Default::default()
         };
@@ -1967,7 +2134,10 @@ mod routing_tests {
         let ctx_no = ReqCtx::default();
         assert_eq!(m.rewrite_path_ctx("/dashboard", &ctx_no), "/login");
         // With auth cookie present -> NOT rewritten.
-        let ctx_yes = ReqCtx { headers: vec![("cookie".into(), "auth_token=abc".into())], ..Default::default() };
+        let ctx_yes = ReqCtx {
+            headers: vec![("cookie".into(), "auth_token=abc".into())],
+            ..Default::default()
+        };
         assert_eq!(m.rewrite_path_ctx("/dashboard", &ctx_yes), "/dashboard");
     }
 
@@ -1976,25 +2146,46 @@ mod routing_tests {
         let m = Manifest {
             headers: vec![HeaderRule {
                 source: "/(.*)".into(),
-                headers: vec![Header { key: "X-Frame-Options".into(), value: "DENY".into() }],
+                headers: vec![Header {
+                    key: "X-Frame-Options".into(),
+                    value: "DENY".into(),
+                }],
                 has: vec![],
                 missing: vec![],
             }],
             ..Default::default()
         };
         let got = m.headers_for("/anything", &ReqCtx::default());
-        assert_eq!(got, vec![("X-Frame-Options".to_string(), "DENY".to_string())]);
+        assert_eq!(
+            got,
+            vec![("X-Frame-Options".to_string(), "DENY".to_string())]
+        );
     }
 
     #[test]
     fn trailing_slash_normalization() {
-        let strip = Manifest { trailing_slash: Some(false), ..Default::default() };
-        assert_eq!(strip.trailing_slash_redirect("/about/"), Some("/about".into()));
+        let strip = Manifest {
+            trailing_slash: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            strip.trailing_slash_redirect("/about/"),
+            Some("/about".into())
+        );
         assert_eq!(strip.trailing_slash_redirect("/about"), None);
-        let add = Manifest { trailing_slash: Some(true), ..Default::default() };
-        assert_eq!(add.trailing_slash_redirect("/about"), Some("/about/".into()));
+        let add = Manifest {
+            trailing_slash: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            add.trailing_slash_redirect("/about"),
+            Some("/about/".into())
+        );
         assert_eq!(add.trailing_slash_redirect("/styles.css"), None); // file ext untouched
-        let none = Manifest { trailing_slash: None, ..Default::default() };
+        let none = Manifest {
+            trailing_slash: None,
+            ..Default::default()
+        };
         assert_eq!(none.trailing_slash_redirect("/about/"), None);
     }
 
@@ -2018,11 +2209,17 @@ mod routing_tests {
         assert_eq!(FailureClass::CapacityExhausted.code(), "CAPACITY_EXHAUSTED");
         // codes are stable + uppercase machine tokens, never internal detail
         for c in [
-            FailureClass::TenantThrottled, FailureClass::CapacityExhausted,
-            FailureClass::NoHealthyPeer, FailureClass::PeerUnreachable,
-            FailureClass::DeadlineExceeded, FailureClass::DeploymentNotFound,
+            FailureClass::TenantThrottled,
+            FailureClass::CapacityExhausted,
+            FailureClass::NoHealthyPeer,
+            FailureClass::PeerUnreachable,
+            FailureClass::DeadlineExceeded,
+            FailureClass::DeploymentNotFound,
         ] {
-            assert!(c.code().chars().all(|ch| ch.is_ascii_uppercase() || ch == '_'));
+            assert!(c
+                .code()
+                .chars()
+                .all(|ch| ch.is_ascii_uppercase() || ch == '_'));
         }
     }
 
@@ -2048,7 +2245,10 @@ mod routing_tests {
         let rec: DeployRecord =
             serde_json::from_str(json).expect("stored snapshot row must load despite bad protocol");
         assert_eq!(rec.manifest.functions[0].protocol, ServiceProtocol::Http);
-        assert_eq!(rec.manifest.functions[0].ports[0].protocol, ServiceProtocol::Http);
+        assert_eq!(
+            rec.manifest.functions[0].ports[0].protocol,
+            ServiceProtocol::Http
+        );
     }
 
     #[test]
@@ -2060,7 +2260,10 @@ mod routing_tests {
         )
         .expect_err("unknown protocol in fresh fluid.json must be rejected");
         let msg = err.to_string();
-        assert!(msg.contains("h2c") && msg.contains("unknown protocol"), "clear error, got: {msg}");
+        assert!(
+            msg.contains("h2c") && msg.contains("unknown protocol"),
+            "clear error, got: {msg}"
+        );
         // ports[].protocol is validated too.
         assert!(Manifest::from_json(
             r#"{"project":"p","functions":[{"name":"api","start_cmd":["node"],

@@ -86,10 +86,15 @@ pub struct ParsedService {
 
 /// Locate a Compose file in `dir` (the canonical names, newest spec first).
 pub fn compose_file(dir: &Path) -> Option<PathBuf> {
-    ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"]
-        .iter()
-        .map(|f| dir.join(f))
-        .find(|p| p.exists())
+    [
+        "compose.yaml",
+        "compose.yml",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+    ]
+    .iter()
+    .map(|f| dir.join(f))
+    .find(|p| p.exists())
 }
 
 /// Parse Compose YAML text into normalized services, sorted by name (deterministic).
@@ -108,17 +113,37 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
             Some(s) => s.to_string(),
             None => continue,
         };
-        let image = svc.get("image").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let image = svc
+            .get("image")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let build = parse_build(svc.get("build"));
-        let ports = svc.get("ports").and_then(|v| v.as_sequence()).cloned().unwrap_or_default();
+        let ports = svc
+            .get("ports")
+            .and_then(|v| v.as_sequence())
+            .cloned()
+            .unwrap_or_default();
         let published = !ports.is_empty();
         let (port, protocol) = container_port(&ports)
-            .or_else(|| svc.get("expose").and_then(|v| v.as_sequence()).and_then(|s| first_port(s)))
+            .or_else(|| {
+                svc.get("expose")
+                    .and_then(|v| v.as_sequence())
+                    .and_then(|s| first_port(s))
+            })
             .unwrap_or((8080, ServiceProtocol::Http));
         let env = parse_env(svc.get("environment"));
         let expose = parse_expose_ext(svc.get("x-shadw-expose"))
             .map_err(|e| anyhow::anyhow!("service '{name}': {e}"))?;
-        out.push(ParsedService { name, image, build, port, published, env, protocol, expose });
+        out.push(ParsedService {
+            name,
+            image,
+            build,
+            port,
+            published,
+            env,
+            protocol,
+            expose,
+        });
     }
     anyhow::ensure!(!out.is_empty(), "compose file declares no services");
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -138,11 +163,24 @@ pub fn primary_service(services: &[ParsedService]) -> Option<&ParsedService> {
 
 fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
     match v {
-        Some(serde_yaml::Value::String(s)) => Some(ComposeBuild { context: s.clone(), dockerfile: None }),
+        Some(serde_yaml::Value::String(s)) => Some(ComposeBuild {
+            context: s.clone(),
+            dockerfile: None,
+        }),
         Some(serde_yaml::Value::Mapping(_)) => {
-            let context = v?.get("context").and_then(|c| c.as_str()).unwrap_or(".").to_string();
-            let dockerfile = v?.get("dockerfile").and_then(|c| c.as_str()).map(|s| s.to_string());
-            Some(ComposeBuild { context, dockerfile })
+            let context = v?
+                .get("context")
+                .and_then(|c| c.as_str())
+                .unwrap_or(".")
+                .to_string();
+            let dockerfile = v?
+                .get("dockerfile")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string());
+            Some(ComposeBuild {
+                context,
+                dockerfile,
+            })
         }
         _ => None,
     }
@@ -166,7 +204,13 @@ fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)>
             let proto = p
                 .get("protocol")
                 .and_then(|v| v.as_str())
-                .map(|s| if s.eq_ignore_ascii_case("udp") { ServiceProtocol::Udp } else { ServiceProtocol::Http })
+                .map(|s| {
+                    if s.eq_ignore_ascii_case("udp") {
+                        ServiceProtocol::Udp
+                    } else {
+                        ServiceProtocol::Http
+                    }
+                })
                 .unwrap_or(ServiceProtocol::Http);
             return u16::try_from(n).ok().map(|n| (n, proto));
         } else if let Some(n) = p.as_u64() {
@@ -191,11 +235,14 @@ fn split_proto_suffix(s: &str) -> (&str, ServiceProtocol) {
 
 fn first_port(seq: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
     seq.iter().find_map(|v| {
-        v.as_u64().and_then(|n| u16::try_from(n).ok()).map(|n| (n, ServiceProtocol::Http)).or_else(|| {
-            let s = v.as_str()?;
-            let (bare, proto) = split_proto_suffix(s);
-            bare.trim().parse::<u16>().ok().map(|n| (n, proto))
-        })
+        v.as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .map(|n| (n, ServiceProtocol::Http))
+            .or_else(|| {
+                let s = v.as_str()?;
+                let (bare, proto) = split_proto_suffix(s);
+                bare.trim().parse::<u16>().ok().map(|n| (n, proto))
+            })
     })
 }
 
@@ -208,20 +255,32 @@ fn first_port(seq: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
 fn parse_expose_ext(v: Option<&serde_yaml::Value>) -> anyhow::Result<ComposeExpose> {
     match v {
         None => Ok(ComposeExpose::default()),
-        Some(serde_yaml::Value::Bool(b)) => Ok(ComposeExpose { enabled: *b, protocol: None, port: None }),
+        Some(serde_yaml::Value::Bool(b)) => Ok(ComposeExpose {
+            enabled: *b,
+            protocol: None,
+            port: None,
+        }),
         Some(m @ serde_yaml::Value::Mapping(_)) => {
             let enabled = m.get("expose").and_then(|e| e.as_bool()).unwrap_or(true);
             let protocol = match m.get("protocol").and_then(|p| p.as_str()) {
-                Some(s) => {
-                    Some(ServiceProtocol::from_str(s).map_err(|e| anyhow::anyhow!("x-shadw-expose.protocol: {e}"))?)
-                }
+                Some(s) => Some(
+                    ServiceProtocol::from_str(s)
+                        .map_err(|e| anyhow::anyhow!("x-shadw-expose.protocol: {e}"))?,
+                ),
                 None => None,
             };
             let port = match m.get("port").and_then(|p| p.as_u64()) {
-                Some(n) => Some(u16::try_from(n).map_err(|_| anyhow::anyhow!("x-shadw-expose.port out of range"))?),
+                Some(n) => Some(
+                    u16::try_from(n)
+                        .map_err(|_| anyhow::anyhow!("x-shadw-expose.port out of range"))?,
+                ),
                 None => None,
             };
-            Ok(ComposeExpose { enabled, protocol, port })
+            Ok(ComposeExpose {
+                enabled,
+                protocol,
+                port,
+            })
         }
         Some(_) => Ok(ComposeExpose::default()),
     }
@@ -296,8 +355,14 @@ services:
         let api = svcs.iter().find(|s| s.name == "api").unwrap();
         assert_eq!(api.port, 9000); // from `expose`
         assert!(!api.published); // expose-only = internal
-        assert_eq!(api.build.as_ref().unwrap().dockerfile.as_deref(), Some("Dockerfile.api"));
-        assert_eq!(api.env.get("DATABASE_URL").unwrap(), "postgres://db:5432/app");
+        assert_eq!(
+            api.build.as_ref().unwrap().dockerfile.as_deref(),
+            Some("Dockerfile.api")
+        );
+        assert_eq!(
+            api.env.get("DATABASE_URL").unwrap(),
+            "postgres://db:5432/app"
+        );
 
         let db = svcs.iter().find(|s| s.name == "db").unwrap();
         assert_eq!(db.port, 5432);

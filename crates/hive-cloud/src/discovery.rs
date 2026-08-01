@@ -69,7 +69,13 @@ impl DiscoveryStore {
                 return;
             }
         }
-        m.insert(z32, Entry { packet, stored: std::time::Instant::now() });
+        m.insert(
+            z32,
+            Entry {
+                packet,
+                stored: std::time::Instant::now(),
+            },
+        );
     }
 
     fn get(&self, z32: &str) -> Option<SignedPacket> {
@@ -78,7 +84,9 @@ impl DiscoveryStore {
 
     fn prune(&self) {
         let now = std::time::Instant::now();
-        self.inner.write().retain(|_, e| now.duration_since(e.stored) < RECORD_TTL);
+        self.inner
+            .write()
+            .retain(|_, e| now.duration_since(e.stored) < RECORD_TTL);
     }
 }
 
@@ -94,7 +102,11 @@ async fn get_record(State(store): State<DiscoveryStore>, Path(z32): Path<String>
     }
 }
 
-async fn put_record(State(store): State<DiscoveryStore>, Path(z32): Path<String>, body: Bytes) -> StatusCode {
+async fn put_record(
+    State(store): State<DiscoveryStore>,
+    Path(z32): Path<String>,
+    body: Bytes,
+) -> StatusCode {
     // The z32 in the path IS the public key; `from_relay_payload` verifies the body's
     // signature against it, so a forged/altered record (or wrong key) is rejected.
     let Ok(pubkey) = pkarr::PublicKey::try_from(z32.as_str()) else {
@@ -157,7 +169,11 @@ mod tests {
         store.put(z32.clone(), newer.clone());
         store.put(z32.clone(), older.clone()); // older must NOT overwrite newer
         assert_eq!(store.len(), 1);
-        assert_eq!(store.get(&z32).unwrap().timestamp(), newer.timestamp(), "newest wins");
+        assert_eq!(
+            store.get(&z32).unwrap().timestamp(),
+            newer.timestamp(),
+            "newest wins"
+        );
 
         // A record stored long ago is pruned.
         store.inner.write().get_mut(&z32).unwrap().stored =
@@ -195,7 +211,11 @@ mod tests {
         assert_eq!(got.status(), 200, "GET returns stored record");
         let body = got.bytes().await.unwrap();
         let parsed = SignedPacket::from_relay_payload(&kp.public_key(), &body).unwrap();
-        assert_eq!(parsed.timestamp(), pkt.timestamp(), "round-tripped record matches");
+        assert_eq!(
+            parsed.timestamp(),
+            pkt.timestamp(),
+            "round-tripped record matches"
+        );
 
         let bad = cli
             .put(format!("{base}/notavalidz32key"))

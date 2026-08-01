@@ -117,7 +117,11 @@ fn build_query(id: u16, qname: &str, qtype: u16, ecs: Option<ClientSubnet>) -> V
     m.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
     m.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
     m.extend_from_slice(&(ecs.is_some() as u16).to_be_bytes()); // ARCOUNT (the OPT RR)
-    for label in qname.trim_end_matches('.').split('.').filter(|l| !l.is_empty()) {
+    for label in qname
+        .trim_end_matches('.')
+        .split('.')
+        .filter(|l| !l.is_empty())
+    {
         let b = label.as_bytes();
         let n = b.len().min(63);
         m.push(n as u8);
@@ -226,9 +230,17 @@ pub async fn probe_query(
     ecs: Option<ClientSubnet>,
     timeout: Duration,
 ) -> Result<usize, String> {
-    let bind: SocketAddr = if target.is_ipv6() { "[::]:0".parse().unwrap() } else { "0.0.0.0:0".parse().unwrap() };
-    let sock = tokio::net::UdpSocket::bind(bind).await.map_err(|e| format!("bind: {e}"))?;
-    sock.connect(target).await.map_err(|e| format!("connect: {e}"))?;
+    let bind: SocketAddr = if target.is_ipv6() {
+        "[::]:0".parse().unwrap()
+    } else {
+        "0.0.0.0:0".parse().unwrap()
+    };
+    let sock = tokio::net::UdpSocket::bind(bind)
+        .await
+        .map_err(|e| format!("bind: {e}"))?;
+    sock.connect(target)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
     let id = uuid::Uuid::new_v4().as_u128() as u16;
     let msg = build_query(id, qname, qtype, ecs);
     sock.send(&msg).await.map_err(|e| format!("send: {e}"))?;
@@ -306,11 +318,12 @@ pub async fn probe_nameserver(
     let target = SocketAddr::new(ip, 53);
     let started = std::time::Instant::now();
     let mut queries = 1usize;
-    let (mut ok, mut reason, answers) = match probe_query_once_retried(target, zone, 1, None, timeout).await {
-        Err(e) => (false, e, 0),
-        Ok(0) => (false, "empty-answer".to_string(), 0),
-        Ok(n) => (true, "ok".to_string(), n),
-    };
+    let (mut ok, mut reason, answers) =
+        match probe_query_once_retried(target, zone, 1, None, timeout).await {
+            Err(e) => (false, e, 0),
+            Ok(0) => (false, "empty-answer".to_string(), 0),
+            Ok(n) => (true, "ok".to_string(), n),
+        };
     if ok {
         for cs in clients {
             queries += 1;
@@ -373,7 +386,12 @@ impl NsProbes {
     }
 
     pub fn snapshot(&self) -> Vec<(String, PeerProbe)> {
-        let mut v: Vec<(String, PeerProbe)> = self.inner.read().iter().map(|(k, p)| (k.clone(), p.clone())).collect();
+        let mut v: Vec<(String, PeerProbe)> = self
+            .inner
+            .read()
+            .iter()
+            .map(|(k, p)| (k.clone(), p.clone()))
+            .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0));
         v
     }
@@ -383,7 +401,11 @@ impl NsProbes {
     fn record(&self, node: &str, ip: IpAddr, r: ProbeReport) -> bool {
         let mut w = self.inner.write();
         let prev_streak = w.get(node).map(|p| p.fail_streak).unwrap_or(0);
-        let fail_streak = if r.ok { 0 } else { prev_streak.saturating_add(1) };
+        let fail_streak = if r.ok {
+            0
+        } else {
+            prev_streak.saturating_add(1)
+        };
         let attested = r.ok || fail_streak < FAILED_ROUNDS_BEFORE_WITHDRAW;
         w.insert(
             node.to_string(),
@@ -436,7 +458,10 @@ pub struct NsVerdict {
 /// function so an operator can never be looking at a different answer than the
 /// one being published.
 pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
-    let region_of: HashMap<&str, &str> = nodes.iter().map(|n| (n.name.as_str(), n.region.as_str())).collect();
+    let region_of: HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.name.as_str(), n.region.as_str()))
+        .collect();
     let mut out = Vec::new();
     for cand in nodes.iter().filter(|n| n.dns_ns.is_some()) {
         let has_addr = cand.public_ip.is_some() || cand.public_ip6.is_some();
@@ -451,16 +476,21 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
             .collect();
         attesters.sort();
         attesters.dedup();
-        let mut attester_regions: Vec<String> =
-            attesters.iter().filter_map(|a| region_of.get(a.as_str()).map(|r| (*r).to_string())).collect();
+        let mut attester_regions: Vec<String> = attesters
+            .iter()
+            .filter_map(|a| region_of.get(a.as_str()).map(|r| (*r).to_string()))
+            .collect();
         attester_regions.sort();
         attester_regions.dedup();
         // How many independent vantages the fleet could possibly offer. A
         // two-region fleet cannot produce two attester regions for a candidate
         // that owns one of them, and refusing to ever delegate in that case
         // would be a worse failure than a thinner proof.
-        let mut other_regions: Vec<&str> =
-            nodes.iter().filter(|n| n.name != cand.name).map(|n| n.region.as_str()).collect();
+        let mut other_regions: Vec<&str> = nodes
+            .iter()
+            .filter(|n| n.name != cand.name)
+            .map(|n| n.region.as_str())
+            .collect();
         other_regions.sort();
         other_regions.dedup();
         let required_regions = MIN_ATTESTER_REGIONS.min(other_regions.len().max(1));
@@ -468,7 +498,11 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
         let reason = if !has_addr {
             "no public address — nothing to publish glue for".to_string()
         } else if validated {
-            format!("proven by {} peer(s) across {} region(s)", attesters.len(), attester_regions.len())
+            format!(
+                "proven by {} peer(s) across {} region(s)",
+                attesters.len(),
+                attester_regions.len()
+            )
         } else {
             format!(
                 "unproven: {} attester(s) across {} region(s), need {}",
@@ -498,14 +532,20 @@ pub fn validate_nameservers(nodes: &[NodeInfo]) -> Vec<NsVerdict> {
 
 fn probe_timeout() -> Duration {
     Duration::from_millis(
-        std::env::var("HIVE_DNS_PROBE_TIMEOUT_MS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(2000),
+        std::env::var("HIVE_DNS_PROBE_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(2000),
     )
 }
 
 /// Turn a cached client NETWORK KEY (`GeoCache` stores /24 v4, /48 v6) back
 /// into the ECS option that asks a nameserver to answer for that client.
 fn subnet_of(net: IpAddr) -> ClientSubnet {
-    ClientSubnet { addr: net, source_prefix: if net.is_ipv4() { 24 } else { 48 } }
+    ClientSubnet {
+        addr: net,
+        source_prefix: if net.is_ipv4() { 24 } else { 48 },
+    }
 }
 
 /// Every node runs this: probe every peer that claims to be a nameserver, and
@@ -514,11 +554,17 @@ fn subnet_of(net: IpAddr) -> ClientSubnet {
 /// vantage with a single network path.
 pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
     let Some(zone) = crate::dnsserver::deploy_zone() else {
-        tracing::info!("nameserver prover idle: HIVE_DEPLOY_ZONE unset — no zone is delegated here to prove");
+        tracing::info!(
+            "nameserver prover idle: HIVE_DEPLOY_ZONE unset — no zone is delegated here to prove"
+        );
         return;
     };
-    let interval =
-        Duration::from_secs(std::env::var("HIVE_DNS_PROBE_SECS").ok().and_then(|s| s.trim().parse().ok()).unwrap_or(30));
+    let interval = Duration::from_secs(
+        std::env::var("HIVE_DNS_PROBE_SECS")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(30),
+    );
     tracing::info!(%zone, secs = interval.as_secs(), "nameserver prover up (peer-attested prove-before-advertise)");
     tokio::spawn(async move {
         // Let gossip converge before the first round: probing an empty registry
@@ -538,7 +584,8 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
                 tokio::time::sleep(interval).await;
                 continue;
             }
-            let known: std::collections::HashSet<String> = nodes.iter().map(|n| n.name.clone()).collect();
+            let known: std::collections::HashSet<String> =
+                nodes.iter().map(|n| n.name.clone()).collect();
             cloud.dns_probes.retain(&known);
             let candidates: Vec<(String, IpAddr)> = nodes
                 .iter()
@@ -547,7 +594,11 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
                     n.public_ip
                         .as_deref()
                         .and_then(|s| s.parse::<IpAddr>().ok())
-                        .or_else(|| n.public_ip6.as_deref().and_then(|s| s.parse::<IpAddr>().ok()))
+                        .or_else(|| {
+                            n.public_ip6
+                                .as_deref()
+                                .and_then(|s| s.parse::<IpAddr>().ok())
+                        })
                         .map(|ip| (n.name.clone(), ip))
                 })
                 .collect();
@@ -560,18 +611,33 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
                 Vec::new()
             } else {
                 (0..ECS_SAMPLE.min(nets.len()))
-                    .map(|i| subnet_of(nets[(round.wrapping_mul(ECS_SAMPLE).wrapping_add(i)) % nets.len()]))
+                    .map(|i| {
+                        subnet_of(
+                            nets[(round.wrapping_mul(ECS_SAMPLE).wrapping_add(i)) % nets.len()],
+                        )
+                    })
                     .collect()
             };
             let timeout = probe_timeout();
             let results = futures::future::join_all(candidates.into_iter().map(|(name, ip)| {
                 let clients = clients.clone();
-                async move { (name, ip, probe_nameserver(ip, zone, &clients, timeout).await) }
+                async move {
+                    (
+                        name,
+                        ip,
+                        probe_nameserver(ip, zone, &clients, timeout).await,
+                    )
+                }
             }))
             .await;
             let mut attest: Vec<String> = Vec::new();
             for (name, ip, report) in results {
-                let was = cloud.dns_probes.snapshot().into_iter().find(|(k, _)| *k == name).map(|(_, p)| p.attested);
+                let was = cloud
+                    .dns_probes
+                    .snapshot()
+                    .into_iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, p)| p.attested);
                 let ok = report.ok;
                 let reason = report.reason.clone();
                 let attested = cloud.dns_probes.record(&name, ip, report);
@@ -586,7 +652,9 @@ pub fn spawn_ns_prober(cloud: Arc<CloudState>) {
                     (Some(false), true) => {
                         tracing::info!(node = %name, %ip, "nameserver recovered: answering DNS from this host again")
                     }
-                    _ if !ok => tracing::warn!(node = %name, %ip, reason = %reason, "nameserver probe failed"),
+                    _ if !ok => {
+                        tracing::warn!(node = %name, %ip, reason = %reason, "nameserver probe failed")
+                    }
                     _ => {}
                 }
             }
@@ -614,7 +682,9 @@ pub async fn run_cli(targets: &[String]) -> anyhow::Result<()> {
         .ok()
         .map(|s| s.trim().trim_matches('.').to_lowercase())
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("HIVE_DEPLOY_ZONE must be set (the delegated zone to prove)"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("HIVE_DEPLOY_ZONE must be set (the delegated zone to prove)")
+        })?;
     let clients: Vec<ClientSubnet> = std::env::var("HIVE_DNS_PROBE_SUBNETS")
         .unwrap_or_default()
         .split(',')
@@ -622,7 +692,10 @@ pub async fn run_cli(targets: &[String]) -> anyhow::Result<()> {
         .filter(|s| !s.is_empty())
         .filter_map(|s| {
             let (addr, plen) = s.split_once('/')?;
-            Some(ClientSubnet { addr: addr.parse().ok()?, source_prefix: plen.parse().ok()? })
+            Some(ClientSubnet {
+                addr: addr.parse().ok()?,
+                source_prefix: plen.parse().ok()?,
+            })
         })
         .collect();
     let timeout = probe_timeout();
@@ -648,7 +721,10 @@ pub async fn run_cli(targets: &[String]) -> anyhow::Result<()> {
         );
     }
     if failures > 0 {
-        anyhow::bail!("{failures} of {} nameserver(s) failed to prove they serve {zone}", targets.len());
+        anyhow::bail!(
+            "{failures} of {} nameserver(s) failed to prove they serve {zone}",
+            targets.len()
+        );
     }
     Ok(())
 }

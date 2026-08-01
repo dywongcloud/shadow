@@ -46,7 +46,10 @@ impl RouteKind {
     /// Whether the per-route Node dispatcher can serve this kind. Edge/middleware
     /// stay on the fallback until a real V8 isolate runtime exists.
     pub fn per_route_eligible(self) -> bool {
-        matches!(self, RouteKind::ApiNode | RouteKind::RouteHandler | RouteKind::SsrPage)
+        matches!(
+            self,
+            RouteKind::ApiNode | RouteKind::RouteHandler | RouteKind::SsrPage
+        )
     }
     pub fn runtime(self) -> &'static str {
         match self {
@@ -107,10 +110,16 @@ pub struct PerRouteManifest {
 
 impl PerRouteManifest {
     pub fn eligible_count(&self) -> usize {
-        self.routes.iter().filter(|r| r.kind.per_route_eligible() && !r.fallback).count()
+        self.routes
+            .iter()
+            .filter(|r| r.kind.per_route_eligible() && !r.fallback)
+            .count()
     }
     pub fn fallback_count(&self) -> usize {
-        self.routes.iter().filter(|r| r.fallback || !r.kind.per_route_eligible()).count()
+        self.routes
+            .iter()
+            .filter(|r| r.fallback || !r.kind.per_route_eligible())
+            .count()
     }
 }
 
@@ -135,12 +144,19 @@ fn read_json(dir: &Path, name: &str) -> Option<serde_json::Value> {
 /// list (relative to the trace file's directory, as Next emits them).
 fn read_trace(next_dir: &Path, server_file_rel: &str) -> Vec<String> {
     let nft = next_dir.join(format!("{server_file_rel}.nft.json"));
-    let Some(v) = std::fs::read_to_string(&nft).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else {
+    let Some(v) = std::fs::read_to_string(&nft)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+    else {
         return Vec::new();
     };
     v.get("files")
         .and_then(|f| f.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -154,10 +170,15 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
     // ISR/SSG routes (route -> revalidate) from prerender-manifest.
     let mut prerender: BTreeMap<String, Option<i64>> = BTreeMap::new();
     if let Some(pr) = read_json(next_dir, "prerender-manifest.json") {
-        m.next_version = pr.get("version").and_then(|v| v.as_i64()).or(m.next_version);
+        m.next_version = pr
+            .get("version")
+            .and_then(|v| v.as_i64())
+            .or(m.next_version);
         if let Some(routes) = pr.get("routes").and_then(|r| r.as_object()) {
             for (route, meta) in routes {
-                let rev = meta.get("initialRevalidateSeconds").and_then(|v| v.as_i64());
+                let rev = meta
+                    .get("initialRevalidateSeconds")
+                    .and_then(|v| v.as_i64());
                 prerender.insert(route.clone(), rev);
             }
         }
@@ -171,19 +192,34 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
             for (route, _) in fns {
                 // Normalize manifest keys ("/api/geo/route", "/x/page") to URL form.
                 let u = route.trim_end_matches("/page").trim_end_matches("/route");
-                edge_routes.insert(if u.is_empty() { "/".into() } else { u.to_string() });
+                edge_routes.insert(if u.is_empty() {
+                    "/".into()
+                } else {
+                    u.to_string()
+                });
             }
         }
-        if mw.get("middleware").and_then(|x| x.as_object()).map(|o| !o.is_empty()).unwrap_or(false) {
+        if mw
+            .get("middleware")
+            .and_then(|x| x.as_object())
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+        {
             has_middleware = true;
         }
     }
 
     // required-server-files: base files for any Node bundle.
     if let Some(rsf) = read_json(next_dir, "required-server-files.json") {
-        m.next_version = rsf.get("version").and_then(|v| v.as_i64()).or(m.next_version);
+        m.next_version = rsf
+            .get("version")
+            .and_then(|v| v.as_i64())
+            .or(m.next_version);
         if let Some(files) = rsf.get("files").and_then(|f| f.as_array()) {
-            m.required_files = files.iter().filter_map(|x| x.as_str().map(String::from)).collect();
+            m.required_files = files
+                .iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect();
         }
     }
 
@@ -204,8 +240,13 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
         } else {
             RouteKind::SsrPage
         };
-        let traced = if kind.per_route_eligible() { read_trace(next_dir, server_file) } else { Vec::new() };
-        let fallback = !kind.per_route_eligible() || (kind != RouteKind::Static && server_file.is_empty());
+        let traced = if kind.per_route_eligible() {
+            read_trace(next_dir, server_file)
+        } else {
+            Vec::new()
+        };
+        let fallback =
+            !kind.per_route_eligible() || (kind != RouteKind::Static && server_file.is_empty());
         RouteBundle {
             route: route.to_string(),
             kind,
@@ -219,7 +260,9 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
 
     // App Router: app-paths-manifest maps route -> server file (relative to .next).
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(app) = read_json(next_dir, "app-paths-manifest.json").and_then(|v| v.as_object().cloned()) {
+    if let Some(app) =
+        read_json(next_dir, "app-paths-manifest.json").and_then(|v| v.as_object().cloned())
+    {
         for (route, file) in app {
             let sf = file.as_str().unwrap_or("");
             // App Router server files live under server/. Normalize route key
@@ -227,13 +270,18 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
             let url = route.trim_end_matches("/page").trim_end_matches("/route");
             let url = if url.is_empty() { "/" } else { url };
             if seen.insert(url.to_string()) {
-                m.routes.push(classify(url, &format!("server/{}", sf.trim_start_matches('/'))));
+                m.routes.push(classify(
+                    url,
+                    &format!("server/{}", sf.trim_start_matches('/')),
+                ));
             }
         }
     }
 
     // Pages Router: pages-manifest maps route -> server file.
-    if let Some(pages) = read_json(next_dir, "pages-manifest.json").and_then(|v| v.as_object().cloned()) {
+    if let Some(pages) =
+        read_json(next_dir, "pages-manifest.json").and_then(|v| v.as_object().cloned())
+    {
         for (route, file) in pages {
             // Skip Next internals.
             if route.starts_with("/_") && route != "/_error" {
@@ -241,7 +289,10 @@ pub fn discover(next_dir: &Path) -> PerRouteManifest {
             }
             if seen.insert(route.clone()) {
                 let sf = file.as_str().unwrap_or("");
-                m.routes.push(classify(&route, &format!("server/{}", sf.trim_start_matches('/'))));
+                m.routes.push(classify(
+                    &route,
+                    &format!("server/{}", sf.trim_start_matches('/')),
+                ));
             }
         }
     }
@@ -288,24 +339,48 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         // App Router: an SSR page, a route handler, plus an API + an edge route.
-        write(&base, "app-paths-manifest.json", r#"{
+        write(
+            &base,
+            "app-paths-manifest.json",
+            r#"{
             "/page": "app/page.js",
             "/ui/page": "app/ui/page.js",
             "/api/claw/route": "app/api/claw/route.js",
             "/api/geo/route": "app/api/geo/route.js"
-        }"#);
-        write(&base, "prerender-manifest.json", r#"{
+        }"#,
+        );
+        write(
+            &base,
+            "prerender-manifest.json",
+            r#"{
             "version": 4,
             "routes": { "/": { "initialRevalidateSeconds": false }, "/blog": { "initialRevalidateSeconds": 60 } }
-        }"#);
-        write(&base, "middleware-manifest.json", r#"{
+        }"#,
+        );
+        write(
+            &base,
+            "middleware-manifest.json",
+            r#"{
             "middleware": { "/": { "name": "middleware" } },
             "functions": { "/api/geo/route": { "name": "app/api/geo/route" } }
-        }"#);
-        write(&base, "required-server-files.json", r#"{ "version": 1, "files": ["server/next.config.js", "server/required.js"] }"#);
+        }"#,
+        );
+        write(
+            &base,
+            "required-server-files.json",
+            r#"{ "version": 1, "files": ["server/next.config.js", "server/required.js"] }"#,
+        );
         // nft trace for the SSR page + the route handler.
-        write(&base, "server/app/ui/page.js.nft.json", r#"{ "version": 1, "files": ["../../chunks/x.js", "../../../node_modules/foo/index.js"] }"#);
-        write(&base, "server/app/api/claw/route.js.nft.json", r#"{ "version": 1, "files": ["../../../chunks/y.js"] }"#);
+        write(
+            &base,
+            "server/app/ui/page.js.nft.json",
+            r#"{ "version": 1, "files": ["../../chunks/x.js", "../../../node_modules/foo/index.js"] }"#,
+        );
+        write(
+            &base,
+            "server/app/api/claw/route.js.nft.json",
+            r#"{ "version": 1, "files": ["../../../chunks/y.js"] }"#,
+        );
         base
     }
 
@@ -313,9 +388,21 @@ mod tests {
     fn classifies_app_router_routes() {
         let m = discover(&fixture());
         let by = |r: &str| m.routes.iter().find(|x| x.route == r).cloned();
-        assert_eq!(by("/ui").unwrap().kind, RouteKind::SsrPage, "/ui is an SSR page");
-        assert_eq!(by("/api/claw").unwrap().kind, RouteKind::ApiNode, "/api/claw is a Node API");
-        assert_eq!(by("/api/geo").unwrap().kind, RouteKind::EdgeRoute, "/api/geo is edge (in middleware-manifest functions)");
+        assert_eq!(
+            by("/ui").unwrap().kind,
+            RouteKind::SsrPage,
+            "/ui is an SSR page"
+        );
+        assert_eq!(
+            by("/api/claw").unwrap().kind,
+            RouteKind::ApiNode,
+            "/api/claw is a Node API"
+        );
+        assert_eq!(
+            by("/api/geo").unwrap().kind,
+            RouteKind::EdgeRoute,
+            "/api/geo is edge (in middleware-manifest functions)"
+        );
         // "/" is prerendered (revalidate false) → Static.
         assert_eq!(by("/").unwrap().kind, RouteKind::Static);
     }
@@ -325,7 +412,12 @@ mod tests {
         let m = discover(&fixture());
         let geo = m.routes.iter().find(|x| x.route == "/api/geo").unwrap();
         assert!(geo.fallback, "edge route must fall back to next start");
-        assert!(m.routes.iter().any(|r| r.kind == RouteKind::Middleware && r.fallback), "middleware present + fallback");
+        assert!(
+            m.routes
+                .iter()
+                .any(|r| r.kind == RouteKind::Middleware && r.fallback),
+            "middleware present + fallback"
+        );
     }
 
     #[test]
@@ -334,7 +426,11 @@ mod tests {
         let ui = m.routes.iter().find(|x| x.route == "/ui").unwrap();
         assert!(ui.kind.per_route_eligible() && !ui.fallback);
         assert_eq!(ui.entrypoint.as_deref(), Some("server/app/ui/page.js"));
-        assert_eq!(ui.traced_files.len(), 2, "trace files loaded from .nft.json");
+        assert_eq!(
+            ui.traced_files.len(),
+            2,
+            "trace files loaded from .nft.json"
+        );
         let claw = m.routes.iter().find(|x| x.route == "/api/claw").unwrap();
         assert_eq!(claw.traced_files.len(), 1);
         assert_eq!(m.required_files.len(), 2, "required-server-files loaded");
@@ -365,11 +461,31 @@ mod tests {
         let base = std::env::temp_dir().join(format!("nft-srv-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
-        write(&base, "server/app-paths-manifest.json", r#"{ "/ui/page": "app/ui/page.js", "/api/x/route": "app/api/x/route.js" }"#);
-        write(&base, "prerender-manifest.json", r#"{ "version": 4, "routes": {} }"#);
-        write(&base, "server/app/ui/page.js.nft.json", r#"{ "files": ["../../chunks/a.js"] }"#);
+        write(
+            &base,
+            "server/app-paths-manifest.json",
+            r#"{ "/ui/page": "app/ui/page.js", "/api/x/route": "app/api/x/route.js" }"#,
+        );
+        write(
+            &base,
+            "prerender-manifest.json",
+            r#"{ "version": 4, "routes": {} }"#,
+        );
+        write(
+            &base,
+            "server/app/ui/page.js.nft.json",
+            r#"{ "files": ["../../chunks/a.js"] }"#,
+        );
         let m = discover(&base);
-        assert!(m.routes.iter().any(|r| r.route == "/ui" && r.kind == RouteKind::SsrPage), "must find app route under server/");
-        assert!(m.routes.iter().any(|r| r.route == "/api/x" && r.kind == RouteKind::ApiNode));
+        assert!(
+            m.routes
+                .iter()
+                .any(|r| r.route == "/ui" && r.kind == RouteKind::SsrPage),
+            "must find app route under server/"
+        );
+        assert!(m
+            .routes
+            .iter()
+            .any(|r| r.route == "/api/x" && r.kind == RouteKind::ApiNode));
     }
 }

@@ -124,7 +124,8 @@ fn safe_component(s: &str) -> bool {
         && s.len() <= 128
         && s != ".."
         && !s.starts_with('.')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
         && !s.contains("..")
 }
 
@@ -143,10 +144,18 @@ pub fn snapshot_image(
         "invalid snapshot id {snap_id:?}: must be a single [A-Za-z0-9._-] component, \
          no leading dot, no '..'"
     );
-    anyhow::ensure!(image.is_file(), "source image does not exist: {}", image.display());
+    anyhow::ensure!(
+        image.is_file(),
+        "source image does not exist: {}",
+        image.display()
+    );
     std::fs::create_dir_all(dest_dir)?;
     let dest = dest_dir.join(format!("{snap_id}.snap.ext4"));
-    anyhow::ensure!(!dest.exists(), "snapshot already exists: {}", dest.display());
+    anyhow::ensure!(
+        !dest.exists(),
+        "snapshot already exists: {}",
+        dest.display()
+    );
 
     let t0 = std::time::Instant::now();
     // Try CoW first, fall back to a real copy. `--reflink=auto` would silently
@@ -173,7 +182,11 @@ pub fn snapshot_image(
     let outcome = SnapshotOutcome {
         path: dest,
         method,
-        consistency: if quiesced { Consistency::Application } else { Consistency::Crash },
+        consistency: if quiesced {
+            Consistency::Application
+        } else {
+            Consistency::Crash
+        },
         bytes,
         took_ms: t0.elapsed().as_millis() as u64,
     };

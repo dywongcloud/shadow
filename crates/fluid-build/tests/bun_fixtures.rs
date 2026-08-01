@@ -19,12 +19,18 @@ fn node_control_project_is_completely_unaffected_by_bun_support() {
     assert!(dir.exists(), "fixture missing: {}", dir.display());
 
     let framework = fluid_build::detect(&dir);
-    assert_eq!(framework.slug, "node", "must classify as a plain Node.js Server");
+    assert_eq!(
+        framework.slug, "node",
+        "must classify as a plain Node.js Server"
+    );
 
     let pm = fluid_build::detect_package_manager(&dir);
     assert_eq!(pm.manager, "npm");
     assert_eq!(pm.source, fluid_build::PackageManagerSource::NpmLock);
-    assert!(pm.conflict_warning.is_none(), "a clean npm project must never warn");
+    assert!(
+        pm.conflict_warning.is_none(),
+        "a clean npm project must never warn"
+    );
 
     // No vercel.json at all in this fixture — the runtime-resolution precedence
     // chain (git.rs's `runtime_override`) has nothing to latch onto here, so it
@@ -39,7 +45,10 @@ fn bun_basic_api_resolves_bun_via_native_runtime_field() {
     assert!(dir.exists(), "fixture missing: {}", dir.display());
 
     let framework = fluid_build::detect(&dir);
-    assert_eq!(framework.slug, "node", "a plain `scripts.start` server, same shape as the Node control project");
+    assert_eq!(
+        framework.slug, "node",
+        "a plain `scripts.start` server, same shape as the Node control project"
+    );
 
     let pm = fluid_build::detect_package_manager(&dir);
     assert_eq!(pm.manager, "bun");
@@ -67,7 +76,10 @@ fn bun_typescript_api_resolves_bun_via_vercel_bun_version_field() {
     // platform-native `runtime` field — proving BOTH precedence paths resolve
     // to Bun, matching git.rs's `runtime_override` resolution chain.
     let vc = fluid_build::load_vercel_config(&dir).expect("vercel.json must parse");
-    assert!(vc.runtime.is_none(), "this fixture deliberately uses bunVersion, not the native field");
+    assert!(
+        vc.runtime.is_none(),
+        "this fixture deliberately uses bunVersion, not the native field"
+    );
     assert_eq!(vc.bun_version.as_deref(), Some("1.x"));
 }
 
@@ -82,10 +94,18 @@ fn bun_conflicting_lockfiles_resolve_deterministically_and_never_force_runtime()
     let pm = fluid_build::detect_package_manager(&dir);
     assert_eq!(pm.manager, "bun");
     assert_eq!(pm.source, fluid_build::PackageManagerSource::BunLock);
-    let warning = pm.conflict_warning.expect("must warn about the conflicting pnpm-lock.yaml");
+    let warning = pm
+        .conflict_warning
+        .expect("must warn about the conflicting pnpm-lock.yaml");
     assert!(warning.contains("pnpm-lock.yaml"));
-    assert!(dir.join("bun.lock").exists(), "must never delete a lockfile");
-    assert!(dir.join("pnpm-lock.yaml").exists(), "must never delete a lockfile");
+    assert!(
+        dir.join("bun.lock").exists(),
+        "must never delete a lockfile"
+    );
+    assert!(
+        dir.join("pnpm-lock.yaml").exists(),
+        "must never delete a lockfile"
+    );
 
     // No vercel.json at all in this fixture — package-manager choice (bun for
     // install) must NOT force the runtime. This fixture's package.json start

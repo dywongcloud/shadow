@@ -43,7 +43,9 @@ pub struct LeaseStore {
 
 impl LeaseStore {
     pub fn new() -> LeaseStore {
-        LeaseStore { map: RwLock::new(HashMap::new()) }
+        LeaseStore {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<ContainerLease> {
@@ -57,7 +59,11 @@ impl LeaseStore {
     /// The current (live) owner of a key, if any.
     pub fn owner_of(&self, key: &str) -> Option<String> {
         let now = now_ms();
-        self.map.read().get(key).filter(|l| l.is_live(now)).map(|l| l.owner.clone())
+        self.map
+            .read()
+            .get(key)
+            .filter(|l| l.is_live(now))
+            .map(|l| l.owner.clone())
     }
 
     pub fn is_owner(&self, key: &str, node: &str) -> bool {
@@ -83,12 +89,22 @@ impl LeaseStore {
     /// - If we already own it → renew (same epoch, extend expiry).
     /// - If it's held by a *live* other owner → refuse (None).
     /// - If it's free or expired → take over with `epoch + 1` (the fencing bump).
-    pub fn acquire_or_renew(&self, key: &str, self_node: &str, region: &str, ttl_ms: u64) -> Option<ContainerLease> {
+    pub fn acquire_or_renew(
+        &self,
+        key: &str,
+        self_node: &str,
+        region: &str,
+        ttl_ms: u64,
+    ) -> Option<ContainerLease> {
         let now = now_ms();
         let mut m = self.map.write();
         match m.get(key) {
             Some(cur) if cur.owner == self_node => {
-                let renewed = ContainerLease { expires_ms: now + ttl_ms, acquired_ms: cur.acquired_ms, ..cur.clone() };
+                let renewed = ContainerLease {
+                    expires_ms: now + ttl_ms,
+                    acquired_ms: cur.acquired_ms,
+                    ..cur.clone()
+                };
                 m.insert(key.to_string(), renewed.clone());
                 Some(renewed)
             }
@@ -155,13 +171,21 @@ mod tests {
 
     #[test]
     fn hrw_is_deterministic_and_stable() {
-        let nodes = vec!["node-a".to_string(), "node-b".to_string(), "node-c".to_string()];
+        let nodes = vec![
+            "node-a".to_string(),
+            "node-b".to_string(),
+            "node-c".to_string(),
+        ];
         let o1 = hrw_owner("proj-x", &nodes).unwrap();
         let o2 = hrw_owner("proj-x", &nodes).unwrap();
         assert_eq!(o1, o2, "HRW must be deterministic");
         assert!(nodes.contains(&o1));
         // Removing a non-owner doesn't change the owner.
-        let without_other: Vec<String> = nodes.iter().filter(|n| **n != "node-c" || o1 == "node-c").cloned().collect();
+        let without_other: Vec<String> = nodes
+            .iter()
+            .filter(|n| **n != "node-c" || o1 == "node-c")
+            .cloned()
+            .collect();
         if o1 != "node-c" {
             assert_eq!(hrw_owner("proj-x", &without_other).unwrap(), o1);
         }
@@ -189,11 +213,32 @@ mod tests {
     #[test]
     fn merge_prefers_higher_epoch() {
         let s = LeaseStore::new();
-        s.merge(ContainerLease { key: "x".into(), owner: "a".into(), epoch: 1, region: "iad1".into(), acquired_ms: 0, expires_ms: u64::MAX });
-        s.merge(ContainerLease { key: "x".into(), owner: "b".into(), epoch: 2, region: "sfo1".into(), acquired_ms: 0, expires_ms: u64::MAX });
+        s.merge(ContainerLease {
+            key: "x".into(),
+            owner: "a".into(),
+            epoch: 1,
+            region: "iad1".into(),
+            acquired_ms: 0,
+            expires_ms: u64::MAX,
+        });
+        s.merge(ContainerLease {
+            key: "x".into(),
+            owner: "b".into(),
+            epoch: 2,
+            region: "sfo1".into(),
+            acquired_ms: 0,
+            expires_ms: u64::MAX,
+        });
         assert_eq!(s.get("x").unwrap().owner, "b");
         // A stale lower-epoch update is ignored.
-        s.merge(ContainerLease { key: "x".into(), owner: "a".into(), epoch: 1, region: "iad1".into(), acquired_ms: 0, expires_ms: u64::MAX });
+        s.merge(ContainerLease {
+            key: "x".into(),
+            owner: "a".into(),
+            epoch: 1,
+            region: "iad1".into(),
+            acquired_ms: 0,
+            expires_ms: u64::MAX,
+        });
         assert_eq!(s.get("x").unwrap().owner, "b");
     }
 }

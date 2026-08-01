@@ -29,8 +29,8 @@
 //! and is the future NS-delegation path.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::state::CloudState;
 
@@ -107,9 +107,17 @@ pub struct VercelApi {
 
 impl VercelApi {
     pub fn from_env(http: reqwest::Client) -> Option<Self> {
-        let token = std::env::var("VERCEL_API_TOKEN").ok().filter(|s| !s.is_empty())?;
-        let team_id = std::env::var("VERCEL_TEAM_ID").ok().filter(|s| !s.is_empty());
-        Some(Self { http, token, team_id })
+        let token = std::env::var("VERCEL_API_TOKEN")
+            .ok()
+            .filter(|s| !s.is_empty())?;
+        let team_id = std::env::var("VERCEL_TEAM_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        Some(Self {
+            http,
+            token,
+            team_id,
+        })
     }
 
     fn url(&self, version: &str, rest: &str) -> String {
@@ -149,7 +157,14 @@ impl DnsApi for VercelApi {
                 .await?;
             let status = resp.status();
             if !status.is_success() {
-                anyhow::bail!("vercel list {domain}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
+                anyhow::bail!(
+                    "vercel list {domain}: {status}{}",
+                    if retryable(status) {
+                        " (retryable)"
+                    } else {
+                        ""
+                    }
+                );
             }
             let v: serde_json::Value = resp.json().await?;
             let page: Vec<RecordView> = v
@@ -174,7 +189,10 @@ impl DnsApi for VercelApi {
                 .unwrap_or_default();
             let empty = page.is_empty();
             out.extend(page);
-            until = v.get("pagination").and_then(|p| p.get("next")).and_then(|n| n.as_u64());
+            until = v
+                .get("pagination")
+                .and_then(|p| p.get("next"))
+                .and_then(|n| n.as_u64());
             if empty || until.is_none() {
                 break;
             }
@@ -194,10 +212,22 @@ impl DnsApi for VercelApi {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("vercel create {domain} {} {}: {status}{}", rec.rtype, rec.name, if retryable(status) { " (retryable)" } else { "" });
+            anyhow::bail!(
+                "vercel create {domain} {} {}: {status}{}",
+                rec.rtype,
+                rec.name,
+                if retryable(status) {
+                    " (retryable)"
+                } else {
+                    ""
+                }
+            );
         }
         let v: serde_json::Value = resp.json().await?;
-        Ok(v.get("uid").and_then(|u| u.as_str()).unwrap_or_default().to_string())
+        Ok(v.get("uid")
+            .and_then(|u| u.as_str())
+            .unwrap_or_default()
+            .to_string())
     }
 
     async fn delete(&self, domain: &str, id: &str) -> anyhow::Result<()> {
@@ -209,7 +239,14 @@ impl DnsApi for VercelApi {
             .await?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("vercel delete {domain}/{id}: {status}{}", if retryable(status) { " (retryable)" } else { "" });
+            anyhow::bail!(
+                "vercel delete {domain}/{id}: {status}{}",
+                if retryable(status) {
+                    " (retryable)"
+                } else {
+                    ""
+                }
+            );
         }
         Ok(())
     }
@@ -252,10 +289,20 @@ pub fn desired_apps(nodes: &[PublishNode]) -> Vec<DesiredRecord> {
     for name in ["*", ""] {
         for n in nodes {
             if let Some(ip) = &n.ip4 {
-                out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.into(),
+                    rtype: "A".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
             if let Some(ip) = &n.ip6 {
-                out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.into(),
+                    rtype: "AAAA".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
         }
     }
@@ -272,7 +319,9 @@ pub fn geo_label(deploy_zone: &str, apps_domain: &str) -> Option<String> {
     if dz.is_empty() || apps.is_empty() {
         return None;
     }
-    dz.strip_suffix(&format!(".{apps}")).filter(|l| !l.is_empty() && !l.contains('.')).map(str::to_string)
+    dz.strip_suffix(&format!(".{apps}"))
+        .filter(|l| !l.is_empty() && !l.contains('.'))
+        .map(str::to_string)
 }
 
 /// Stable nameserver label for a node: `ns-<node-name>`, so the record set is a
@@ -323,10 +372,20 @@ pub fn desired_geo_delegation(
     for n in nodes.iter().filter(|n| n.dns_ns && n.dns_validated) {
         let ns = ns_label(&n.name);
         if let Some(ip) = &n.ip4 {
-            out.push(DesiredRecord { name: ns.clone(), rtype: "A".into(), value: ip.clone(), ttl: 300 });
+            out.push(DesiredRecord {
+                name: ns.clone(),
+                rtype: "A".into(),
+                value: ip.clone(),
+                ttl: 300,
+            });
         }
         if let Some(ip) = &n.ip6 {
-            out.push(DesiredRecord { name: ns.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 300 });
+            out.push(DesiredRecord {
+                name: ns.clone(),
+                rtype: "AAAA".into(),
+                value: ip.clone(),
+                ttl: 300,
+            });
         }
         if n.ip4.is_some() || n.ip6.is_some() {
             // FULLY QUALIFIED, always: Vercel rejects a relative NS target
@@ -335,7 +394,12 @@ pub fn desired_geo_delegation(
             // records published while every NS create silently failed, leaving
             // the zone undelegated with correct-looking glue in place.
             let target = format!("{ns}.{}", apps_domain.trim().trim_matches('.'));
-            out.push(DesiredRecord { name: label.to_string(), rtype: "NS".into(), value: target, ttl: 300 });
+            out.push(DesiredRecord {
+                name: label.to_string(),
+                rtype: "NS".into(),
+                value: target,
+                ttl: 300,
+            });
             managed.push(ns);
         }
     }
@@ -446,7 +510,12 @@ pub fn desired_apps_affinity(
         // bare labels, but a full host slipping in must not become a record
         // named `app.example.com` inside the apps zone.
         let label = label.split(':').next().unwrap_or(label);
-        let label = label.split('.').next().unwrap_or(label).trim().to_ascii_lowercase();
+        let label = label
+            .split('.')
+            .next()
+            .unwrap_or(label)
+            .trim()
+            .to_ascii_lowercase();
         if label.is_empty() || label == "*" || label == "www" {
             continue;
         }
@@ -474,16 +543,28 @@ pub fn desired_apps_affinity(
         // Only a PUBLISHABLE node may be named: pointing a specific record at an
         // unhealthy/NAT'd node would be strictly worse than the wildcard, since
         // the specific record wins and the client would have no other answer.
-        let Some(n) = nodes.iter().find(|n| n.name == node) else { continue };
+        let Some(n) = nodes.iter().find(|n| n.name == node) else {
+            continue;
+        };
         if n.ip4.is_none() && n.ip6.is_none() {
             continue;
         }
         managed.push(label.clone());
         if let Some(ip) = &n.ip4 {
-            out.push(DesiredRecord { name: label.clone(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+            out.push(DesiredRecord {
+                name: label.clone(),
+                rtype: "A".into(),
+                value: ip.clone(),
+                ttl: 60,
+            });
         }
         if let Some(ip) = &n.ip6 {
-            out.push(DesiredRecord { name: label.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+            out.push(DesiredRecord {
+                name: label.clone(),
+                rtype: "AAAA".into(),
+                value: ip.clone(),
+                ttl: 60,
+            });
         }
     }
     (out, managed)
@@ -509,11 +590,18 @@ pub fn desired_apps_affinity(
 /// (`san-jose`, `hong-kong`); anything that isn't is skipped rather than
 /// published as an invalid name. An empty region (a node that never reported
 /// one) is skipped for the same reason.
-pub fn desired_region_names(nodes: &[PublishNode], prefix: &str) -> (Vec<DesiredRecord>, Vec<String>) {
+pub fn desired_region_names(
+    nodes: &[PublishNode],
+    prefix: &str,
+) -> (Vec<DesiredRecord>, Vec<String>) {
     let mut by_region: std::collections::BTreeMap<String, Vec<&PublishNode>> = Default::default();
     for n in nodes {
         let r = n.region.trim().to_ascii_lowercase();
-        if r.is_empty() || !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || r.starts_with('-') || r.ends_with('-') {
+        if r.is_empty()
+            || !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            || r.starts_with('-')
+            || r.ends_with('-')
+        {
             continue;
         }
         by_region.entry(r).or_default().push(n);
@@ -525,10 +613,20 @@ pub fn desired_region_names(nodes: &[PublishNode], prefix: &str) -> (Vec<Desired
         names.push(name.clone());
         for n in ns {
             if let Some(ip) = &n.ip4 {
-                out.push(DesiredRecord { name: name.clone(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.clone(),
+                    rtype: "A".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
             if let Some(ip) = &n.ip6 {
-                out.push(DesiredRecord { name: name.clone(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.clone(),
+                    rtype: "AAAA".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
         }
     }
@@ -556,14 +654,28 @@ pub fn desired_platform(
     // flat A/AAAA set is withheld: address records at a zone cut are occluded
     // by the delegation anyway, and publishing both makes the diff fight
     // itself every pass.
-    let names: Vec<&str> = if delegate_api { vec!["admin", "webhook", "sms"] } else { vec!["api", "admin", "webhook", "sms"] };
+    let names: Vec<&str> = if delegate_api {
+        vec!["admin", "webhook", "sms"]
+    } else {
+        vec!["api", "admin", "webhook", "sms"]
+    };
     for name in names {
         for n in nodes {
             if let Some(ip) = &n.ip4 {
-                out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.into(),
+                    rtype: "A".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
             if let Some(ip) = &n.ip6 {
-                out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                out.push(DesiredRecord {
+                    name: name.into(),
+                    rtype: "AAAA".into(),
+                    value: ip.clone(),
+                    ttl: 60,
+                });
             }
         }
     }
@@ -577,15 +689,28 @@ pub fn desired_platform(
         // probe-degraded fleet serves exactly as before rather than collapsing
         // the apex onto one node (or zero).
         let capable: Vec<&PublishNode> = nodes.iter().filter(|n| n.dashboard).collect();
-        let apex_set: Vec<&PublishNode> =
-            if capable.len() >= 2 { capable } else { nodes.iter().collect() };
+        let apex_set: Vec<&PublishNode> = if capable.len() >= 2 {
+            capable
+        } else {
+            nodes.iter().collect()
+        };
         for name in ["", "www"] {
             for n in &apex_set {
                 if let Some(ip) = &n.ip4 {
-                    out.push(DesiredRecord { name: name.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                    out.push(DesiredRecord {
+                        name: name.into(),
+                        rtype: "A".into(),
+                        value: ip.clone(),
+                        ttl: 60,
+                    });
                 }
                 if let Some(ip) = &n.ip6 {
-                    out.push(DesiredRecord { name: name.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                    out.push(DesiredRecord {
+                        name: name.into(),
+                        rtype: "AAAA".into(),
+                        value: ip.clone(),
+                        ttl: 60,
+                    });
                 }
             }
         }
@@ -593,7 +718,12 @@ pub fn desired_platform(
     for (sub, ips) in [("relay", relay_ips), ("discovery", discovery_ips)] {
         for ip in ips {
             let rtype = if ip.contains(':') { "AAAA" } else { "A" };
-            out.push(DesiredRecord { name: sub.into(), rtype: rtype.into(), value: ip.clone(), ttl: 300 });
+            out.push(DesiredRecord {
+                name: sub.into(),
+                rtype: rtype.into(),
+                value: ip.clone(),
+                ttl: 300,
+            });
         }
     }
     out
@@ -631,7 +761,9 @@ pub fn diff(
         .filter(|r| {
             r.rtype == "ALIAS"
                 && managed(&r.name)
-                && desired.iter().any(|d| d.name == r.name && (d.rtype == "A" || d.rtype == "AAAA"))
+                && desired
+                    .iter()
+                    .any(|d| d.name == r.name && (d.rtype == "A" || d.rtype == "AAAA"))
         })
         .map(|r| r.id.clone())
         .collect();
@@ -752,7 +884,12 @@ const CREATE_PACING: std::time::Duration = std::time::Duration::from_millis(1100
 fn env_ips(key: &str) -> Vec<String> {
     std::env::var(key)
         .ok()
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -900,7 +1037,11 @@ fn plan_writes(
         let missing_ns: Vec<DesiredRecord> = desired
             .iter()
             .filter(|d| d.name == name && d.rtype == "NS")
-            .filter(|d| !current.iter().any(|r| r.name == name && r.rtype == "NS" && norm(&r.value) == norm(&d.value)))
+            .filter(|d| {
+                !current
+                    .iter()
+                    .any(|r| r.name == name && r.rtype == "NS" && norm(&r.value) == norm(&d.value))
+            })
             .cloned()
             .collect();
         if missing_ns.is_empty() {
@@ -927,9 +1068,12 @@ fn plan_writes(
         if blockers.is_empty() {
             continue; // nothing blocks — the NS creates flow normally
         }
-        let blocker_ids: std::collections::HashSet<&str> = blockers.iter().map(|r| r.id.as_str()).collect();
+        let blocker_ids: std::collections::HashSet<&str> =
+            blockers.iter().map(|r| r.id.as_str()).collect();
         deletes.retain(|id| !blocker_ids.contains(id.as_str()));
-        creates.retain(|c| !(c.name == name && c.rtype == "NS" && missing_ns.iter().any(|m| m.value == c.value)));
+        creates.retain(|c| {
+            !(c.name == name && c.rtype == "NS" && missing_ns.iter().any(|m| m.value == c.value))
+        });
         cutovers.push((name.to_string(), blockers, missing_ns));
     }
     // NS deletes are hoisted ONLY for names with NO desired NS (a true
@@ -938,10 +1082,17 @@ fn plan_writes(
     let (ns_first, rest): (Vec<String>, Vec<String>) = deletes.into_iter().partition(|id| {
         by_id
             .get(id.as_str())
-            .map(|r| r.rtype == "NS" && !desired.iter().any(|d| d.name == r.name && d.rtype == "NS"))
+            .map(|r| {
+                r.rtype == "NS" && !desired.iter().any(|d| d.name == r.name && d.rtype == "NS")
+            })
             .unwrap_or(false)
     });
-    WritePlan { ns_deletes_first: ns_first, cutovers, creates, deletes: rest }
+    WritePlan {
+        ns_deletes_first: ns_first,
+        cutovers,
+        creates,
+        deletes: rest,
+    }
 }
 
 /// Is this `_acme-challenge.*` TXT an orphan candidate? The replicated
@@ -1017,15 +1168,20 @@ async fn reconcile_zone<A: DnsApi>(
     let deletes: Vec<String> = if empty_names.is_empty() {
         deletes
     } else {
-        let by_id: HashMap<&str, &RecordView> = current.iter().map(|r| (r.id.as_str(), r)).collect();
+        let by_id: HashMap<&str, &RecordView> =
+            current.iter().map(|r| (r.id.as_str(), r)).collect();
         let (held, kept): (Vec<String>, Vec<String>) = deletes.into_iter().partition(|id| {
             by_id
                 .get(id.as_str())
-                .map(|r| (r.rtype == "A" || r.rtype == "AAAA") && empty_names.contains(r.name.as_str()))
+                .map(|r| {
+                    (r.rtype == "A" || r.rtype == "AAAA") && empty_names.contains(r.name.as_str())
+                })
                 .unwrap_or(false)
         });
         if !held.is_empty() {
-            STATS.per_name_holds.fetch_add(held.len() as u64, Ordering::Relaxed);
+            STATS
+                .per_name_holds
+                .fetch_add(held.len() as u64, Ordering::Relaxed);
             tracing::error!(
                 %domain,
                 held = held.len(),
@@ -1047,12 +1203,15 @@ async fn reconcile_zone<A: DnsApi>(
     // delete it here, where the zone listing already exists, instead of
     // letting it veto a future delegation.
     let now_ms = hive_core::now_ms();
-    for r in current
-        .iter()
-        .filter(|r| r.rtype == "TXT" && (r.name == "_acme-challenge" || r.name.starts_with("_acme-challenge.")))
-    {
+    for r in current.iter().filter(|r| {
+        r.rtype == "TXT" && (r.name == "_acme-challenge" || r.name.starts_with("_acme-challenge."))
+    }) {
         let fqdn = format!("{}.{}", r.name, domain);
-        if !is_orphan_candidate(!cloud.acme_challenges.lookup(&fqdn).is_empty(), r.created_ms, now_ms) {
+        if !is_orphan_candidate(
+            !cloud.acme_challenges.lookup(&fqdn).is_empty(),
+            r.created_ms,
+            now_ms,
+        ) {
             continue;
         }
         match api.delete(domain, &r.id).await {
@@ -1067,7 +1226,11 @@ async fn reconcile_zone<A: DnsApi>(
     }
 
     let plan = plan_writes(&current, desired, managed_names, creates, deletes);
-    if plan.ns_deletes_first.is_empty() && plan.cutovers.is_empty() && plan.creates.is_empty() && plan.deletes.is_empty() {
+    if plan.ns_deletes_first.is_empty()
+        && plan.cutovers.is_empty()
+        && plan.creates.is_empty()
+        && plan.deletes.is_empty()
+    {
         return Ok(()); // converged — write nothing
     }
     // Creates are PACED and individually fault-tolerant. Previously this was a
@@ -1152,13 +1315,21 @@ async fn reconcile_zone<A: DnsApi>(
             tracing::info!(%domain, name = %name, ns = ns_records.len(), "delegation cutover complete: flat addresses removed, full NS set confirmed created");
             continue;
         }
-        STATS.delegation_cutover_rollbacks.fetch_add(1, Ordering::Relaxed);
+        STATS
+            .delegation_cutover_rollbacks
+            .fetch_add(1, Ordering::Relaxed);
         // Roll back: remove the partial NS (both what this pass created AND
         // any leftovers already present — either blocks the address restores)
         // before re-creating the flat addresses.
-        let leftover_ns: Vec<&RecordView> =
-            current.iter().filter(|r| r.name == *name && r.rtype == "NS").collect();
-        for id in created_ns_ids.iter().map(|s| s.as_str()).chain(leftover_ns.iter().map(|r| r.id.as_str())) {
+        let leftover_ns: Vec<&RecordView> = current
+            .iter()
+            .filter(|r| r.name == *name && r.rtype == "NS")
+            .collect();
+        for id in created_ns_ids
+            .iter()
+            .map(|s| s.as_str())
+            .chain(leftover_ns.iter().map(|r| r.id.as_str()))
+        {
             if let Err(e) = api.delete(domain, id).await {
                 tracing::warn!(%domain, name = %name, id = %id, error = %e, "cutover rollback: partial-NS delete failed; continuing");
                 if failed.is_none() {
@@ -1167,8 +1338,12 @@ async fn reconcile_zone<A: DnsApi>(
             }
         }
         for r in &deleted_addr {
-            let restore =
-                DesiredRecord { name: r.name.clone(), rtype: r.rtype.clone(), value: r.value.clone(), ttl: 60 };
+            let restore = DesiredRecord {
+                name: r.name.clone(),
+                rtype: r.rtype.clone(),
+                value: r.value.clone(),
+                ttl: 60,
+            };
             tokio::time::sleep(CREATE_PACING).await;
             match api.create(domain, &restore).await {
                 Ok(_) => {
@@ -1225,10 +1400,16 @@ async fn reconcile_zone<A: DnsApi>(
         if !addr_create_failed.contains(name) || addr_create_ok.contains(name) {
             continue;
         }
-        STATS.delegation_cutover_rollbacks.fetch_add(1, Ordering::Relaxed);
+        STATS
+            .delegation_cutover_rollbacks
+            .fetch_add(1, Ordering::Relaxed);
         for r in ns_records {
-            let restore =
-                DesiredRecord { name: r.name.clone(), rtype: "NS".into(), value: r.value.clone(), ttl: 300 };
+            let restore = DesiredRecord {
+                name: r.name.clone(),
+                rtype: "NS".into(),
+                value: r.value.clone(),
+                ttl: 300,
+            };
             tokio::time::sleep(CREATE_PACING).await;
             match api.create(domain, &restore).await {
                 Ok(_) => {
@@ -1261,7 +1442,10 @@ async fn reconcile_zone<A: DnsApi>(
         // backs off and the operator sees it.
         return Err(e);
     }
-    let published: Vec<String> = desired.iter().map(|r| format!("{} {} {}", r.name, r.rtype, r.value)).collect();
+    let published: Vec<String> = desired
+        .iter()
+        .map(|r| format!("{} {} {}", r.name, r.rtype, r.value))
+        .collect();
     tracing::info!(%domain, created = created, deleted = plan.deletes.len(), published = ?published, "DNS reconciled");
     Ok(())
 }
@@ -1271,7 +1455,9 @@ async fn reconcile_zone<A: DnsApi>(
 /// Enabled when a `VERCEL_API_TOKEN` is present AND (`HIVE_INGRESS != ngrok` or
 /// `HIVE_DNS_RECONCILE=1` for pre-cutover testing).
 pub fn spawn_reconciler(cloud: Arc<CloudState>) {
-    let forced = std::env::var("HIVE_DNS_RECONCILE").map(|v| v == "1").unwrap_or(false);
+    let forced = std::env::var("HIVE_DNS_RECONCILE")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     if cloud.ingress == "ngrok" && !forced {
         return;
     }
@@ -1279,12 +1465,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
         tracing::warn!("DNS reconciler enabled but VERCEL_API_TOKEN is not set — not starting");
         return;
     };
-    let interval = std::env::var("HIVE_DNS_RECONCILE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(30u64);
+    let interval = std::env::var("HIVE_DNS_RECONCILE_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30u64);
     tracing::info!(interval, apps = %cloud.apps_domain, platform = %cloud.platform_domain, "Vercel DNS reconciler up (leader-elected)");
     tokio::spawn(async move {
         let mut damping = PublishDamping::default();
         let mut backoff: u64 = 0; // consecutive failures
-        // Edge-trigger for the "delegation held" incident (see the call site).
+                                  // Edge-trigger for the "delegation held" incident (see the call site).
         let mut geo_hold_active = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
         loop {
@@ -1292,7 +1481,10 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             if backoff > 0 {
                 // Exponential backoff on API failure: 30s * 2^n, capped at 5 min.
                 let extra = (interval << backoff.min(4)).min(300);
-                tokio::time::sleep(std::time::Duration::from_secs(extra.saturating_sub(interval))).await;
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    extra.saturating_sub(interval),
+                ))
+                .await;
             }
             // Same single-writer resolution as admin mutations, ACME and the
             // billing meter (owner chain first, health+addressability gated;
@@ -1302,11 +1494,16 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // deliberate LEGACY split-pin on the fallback path (health-gated,
             // never a raw unguarded check — an unguarded pin silently freezes
             // published DNS if the pinned node dies).
-            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE").ok().filter(|s| !s.trim().is_empty());
+            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             let chain = crate::cluster::Cluster::owner_chain_from_env();
             let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
-            let leader =
-                crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &cloud.registry.nodes());
+            let leader = crate::cluster::Cluster::control_plane_owner(
+                &chain,
+                pref.as_deref(),
+                &cloud.registry.nodes(),
+            );
             if leader.as_deref() != Some(cloud.node_name.as_str()) {
                 continue;
             }
@@ -1319,7 +1516,9 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // shadw.cloud/*.shadw.app to only-itself for ~30s until the real
             // leader re-reconciled). A founding node (no bootstrap peers) has
             // no peers to clobber, so it is exempt and still bootstraps DNS.
-            let has_bootstrap = std::env::var("HIVE_BOOTSTRAP_PEERS").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let has_bootstrap = std::env::var("HIVE_BOOTSTRAP_PEERS")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             if has_bootstrap && cloud.registry.nodes().len() <= 1 {
                 tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
                 continue;
@@ -1330,12 +1529,22 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // looking at a different verdict than the one being published.
             let registry_nodes = cloud.registry.nodes();
             let verdicts = crate::dns_probe::validate_nameservers(&registry_nodes);
-            let proven: std::collections::HashSet<&str> =
-                verdicts.iter().filter(|v| v.validated).map(|v| v.node.as_str()).collect();
-            let unproven: Vec<&str> =
-                verdicts.iter().filter(|v| !v.validated).map(|v| v.node.as_str()).collect();
-            STATS.geo_ns_validated.store(proven.len() as u64, Ordering::Relaxed);
-            STATS.geo_ns_unproven.store(unproven.len() as u64, Ordering::Relaxed);
+            let proven: std::collections::HashSet<&str> = verdicts
+                .iter()
+                .filter(|v| v.validated)
+                .map(|v| v.node.as_str())
+                .collect();
+            let unproven: Vec<&str> = verdicts
+                .iter()
+                .filter(|v| !v.validated)
+                .map(|v| v.node.as_str())
+                .collect();
+            STATS
+                .geo_ns_validated
+                .store(proven.len() as u64, Ordering::Relaxed);
+            STATS
+                .geo_ns_unproven
+                .store(unproven.len() as u64, Ordering::Relaxed);
             let nodes: Vec<NodeView> = registry_nodes
                 .iter()
                 .map(|n| NodeView {
@@ -1359,20 +1568,26 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // then has to forward. Local aliases first (authoritative for what
             // WE serve), then the gossiped peer route table — first writer wins,
             // so a host we serve is never attributed to a peer.
-            let mut owners: Vec<(String, String)> =
-                cloud.gw.served_hosts().into_iter().map(|h| (h, cloud.node_name.clone())).collect();
+            let mut owners: Vec<(String, String)> = cloud
+                .gw
+                .served_hosts()
+                .into_iter()
+                .map(|h| (h, cloud.node_name.clone()))
+                .collect();
             {
                 let routes = cloud.peer_routes.read();
                 for (label, rs) in routes.iter() {
                     // Lowest-latency healthy route wins when several nodes serve
                     // the same label (replicas): that is the best single answer
                     // we can give, and the wildcard still covers the rest.
-                    if let Some(best) = rs.iter().filter(|r| r.healthy).min_by_key(|r| r.latency_ms) {
+                    if let Some(best) = rs.iter().filter(|r| r.healthy).min_by_key(|r| r.latency_ms)
+                    {
                         owners.push((label.clone(), best.node_id.clone()));
                     }
                 }
             }
-            let (affinity, affinity_names) = desired_apps_affinity(&owners, &publish, APPS_AFFINITY_CAP);
+            let (affinity, affinity_names) =
+                desired_apps_affinity(&owners, &publish, APPS_AFFINITY_CAP);
             let affinity_count = affinity_names.len();
             apps.extend(affinity);
             // Per-region names in BOTH zones: `<region>.<apps>` for app traffic
@@ -1384,17 +1599,29 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // region name is dropped for that one region — publishing both would
             // put two different A sets under one name and break the deployment.
             let (apps_region, apps_region_names) = desired_region_names(&publish, "");
-            let claimed: std::collections::HashSet<&str> = affinity_names.iter().map(|s| s.as_str()).collect();
-            let dropped: Vec<&String> = apps_region_names.iter().filter(|n| claimed.contains(n.as_str())).collect();
+            let claimed: std::collections::HashSet<&str> =
+                affinity_names.iter().map(|s| s.as_str()).collect();
+            let dropped: Vec<&String> = apps_region_names
+                .iter()
+                .filter(|n| claimed.contains(n.as_str()))
+                .collect();
             if !dropped.is_empty() {
                 tracing::warn!(
                     names = ?dropped,
                     "per-region apps name(s) collide with a deployment label — deployment wins, region name not published"
                 );
             }
-            apps.extend(apps_region.into_iter().filter(|r| !claimed.contains(r.name.as_str())));
+            apps.extend(
+                apps_region
+                    .into_iter()
+                    .filter(|r| !claimed.contains(r.name.as_str())),
+            );
             let mut apps_managed: Vec<String> = vec!["*".into(), String::new()];
-            apps_managed.extend(apps_region_names.into_iter().filter(|n| !claimed.contains(n.as_str())));
+            apps_managed.extend(
+                apps_region_names
+                    .into_iter()
+                    .filter(|n| !claimed.contains(n.as_str())),
+            );
             apps_managed.extend(affinity_names);
             // Geo-zone delegation: hand the deploy zone to the fleet's own
             // nameservers so Seer's geo/health-aware answers are actually
@@ -1402,12 +1629,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // the apps zone because the deploy zone is a child of it, and only
             // for nodes PEERS HAVE PROVEN answer DNS, never for nodes that
             // merely claim to (see desired_geo_delegation).
-            let geo_zone_label = crate::dnsserver::deploy_zone().and_then(|dz| geo_label(dz, &cloud.apps_domain));
+            let geo_zone_label =
+                crate::dnsserver::deploy_zone().and_then(|dz| geo_label(dz, &cloud.apps_domain));
             let (geo_records, geo_names) = geo_zone_label
                 .as_deref()
                 .map(|label| desired_geo_delegation(&publish, label, &cloud.apps_domain))
                 .unwrap_or_default();
-            STATS.geo_delegation_records.store(geo_records.len() as u64, Ordering::Relaxed);
+            STATS
+                .geo_delegation_records
+                .store(geo_records.len() as u64, Ordering::Relaxed);
             // A HELD delegation must be loud. `desired_geo_delegation` returning
             // nothing while nodes still declare `dns_ns` means the zone is
             // running on last-known-good NS records that nobody can currently
@@ -1417,7 +1647,8 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // condition persists for as long as the proof is missing, and
             // `incidents::open` does not dedup, so per-pass would bury the
             // incident list.
-            if geo_zone_label.is_some() && geo_records.is_empty() && nodes.iter().any(|n| n.dns_ns) {
+            if geo_zone_label.is_some() && geo_records.is_empty() && nodes.iter().any(|n| n.dns_ns)
+            {
                 STATS.geo_delegation_holds.fetch_add(1, Ordering::Relaxed);
                 tracing::error!(
                     proven = proven.len(),
@@ -1444,24 +1675,40 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             apps.extend(geo_records);
             apps_managed.extend(geo_names);
             let apps_managed_refs: Vec<&str> = apps_managed.iter().map(|s| s.as_str()).collect();
-            STATS.affinity_records.store(affinity_count as u64, Ordering::Relaxed);
-            let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM").map(|v| !v.trim().is_empty()).unwrap_or(false);
+            STATS
+                .affinity_records
+                .store(affinity_count as u64, Ordering::Relaxed);
+            let dashboard = std::env::var("HIVE_DASHBOARD_UPSTREAM")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
             // Geo-DNS for the API host: when >=2 `dns_api`-capable nameservers
             // exist, delegate the `api` label to Seer (health-aware, proximity-
             // ordered answers) and withhold the flat round-robin A set; below
             // the floor, the flat set stays — self-healing in both directions
             // as the fleet rolls or the capable set shrinks.
             let api_delegation = desired_api_delegation(&publish, &cloud.apps_domain);
-            STATS.api_delegation_records.store(api_delegation.len() as u64, Ordering::Relaxed);
+            STATS
+                .api_delegation_records
+                .store(api_delegation.len() as u64, Ordering::Relaxed);
             let delegate_api = !api_delegation.is_empty();
-            let mut platform = desired_platform(&publish, &relay_ips, &discovery_ips, dashboard, delegate_api);
+            let mut platform = desired_platform(
+                &publish,
+                &relay_ips,
+                &discovery_ips,
+                dashboard,
+                delegate_api,
+            );
             platform.extend(api_delegation);
             let (platform_region, platform_region_names) = desired_region_names(&publish, "api-");
             platform.extend(platform_region);
-            STATS.region_records.store(platform_region_names.len() as u64, Ordering::Relaxed);
+            STATS
+                .region_records
+                .store(platform_region_names.len() as u64, Ordering::Relaxed);
 
             let mut ok = true;
-            if let Err(e) = reconcile_zone(&api, &cloud.apps_domain, &apps, &apps_managed_refs, &cloud).await {
+            if let Err(e) =
+                reconcile_zone(&api, &cloud.apps_domain, &apps, &apps_managed_refs, &cloud).await
+            {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.apps_domain, "DNS reconcile failed");
                 ok = false;
@@ -1476,10 +1723,11 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // stale and replaced, since `diff()` never considers a name outside
             // this list at all. Recurring gap; closed here for `sms` alongside
             // the prior two.
-            let mut platform_managed: Vec<String> = ["api", "admin", "webhook", "sms", "relay", "discovery"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
+            let mut platform_managed: Vec<String> =
+                ["api", "admin", "webhook", "sms", "relay", "discovery"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
             if dashboard {
                 platform_managed.push(String::new());
                 platform_managed.push("www".into());
@@ -1488,8 +1736,17 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // an unmanaged name is invisible to diff() forever, so a withdrawn
             // region's records would never be cleaned up.
             platform_managed.extend(platform_region_names);
-            let platform_managed_refs: Vec<&str> = platform_managed.iter().map(|s| s.as_str()).collect();
-            if let Err(e) = reconcile_zone(&api, &cloud.platform_domain, &platform, &platform_managed_refs, &cloud).await {
+            let platform_managed_refs: Vec<&str> =
+                platform_managed.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = reconcile_zone(
+                &api,
+                &cloud.platform_domain,
+                &platform,
+                &platform_managed_refs,
+                &cloud,
+            )
+            .await
+            {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");
                 ok = false;
@@ -1522,23 +1779,35 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 // sequential per-peer await (each up to ~10-20s inside
                 // fetch_from_host's own HTTP+iroh timeouts) would stretch a slow
                 // pass to 10s-2min and starve those zones' reconcile cadence.
-                let peer_names: Vec<String> =
-                    all_nodes.iter().filter(|n| n.name != cloud.node_name && n.healthy).map(|n| n.name.clone()).collect();
+                let peer_names: Vec<String> = all_nodes
+                    .iter()
+                    .filter(|n| n.name != cloud.node_name && n.healthy)
+                    .map(|n| n.name.clone())
+                    .collect();
                 let peer_results = futures::future::join_all(peer_names.iter().map(|name| {
                     let cloud = cloud.clone();
                     let name = name.clone();
                     async move {
-                        tokio::time::timeout(std::time::Duration::from_secs(8), crate::admin::fetch_from_host(&cloud, &name, "/v1/db-directory", ""))
-                            .await
-                            .ok()
-                            .flatten()
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(8),
+                            crate::admin::fetch_from_host(&cloud, &name, "/v1/db-directory", ""),
+                        )
+                        .await
+                        .ok()
+                        .flatten()
                     }
                 }))
                 .await;
                 for v in peer_results.into_iter().flatten() {
                     for e in v.as_array().map(|a| a.as_slice()).unwrap_or_default() {
-                        let host = e.get("db_host").and_then(|x| x.as_str()).unwrap_or_default();
-                        let hn = e.get("host_node").and_then(|x| x.as_str()).unwrap_or_default();
+                        let host = e
+                            .get("db_host")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default();
+                        let hn = e
+                            .get("host_node")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default();
                         if !host.is_empty() && !hn.is_empty() {
                             dir.push((host.to_string(), hn.to_string()));
                         }
@@ -1546,21 +1815,37 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 }
                 let mut seen = std::collections::HashSet::new();
                 for (db_host, host_node) in dir {
-                    let Some(slug) = db_host.strip_suffix(&suffix) else { continue };
+                    let Some(slug) = db_host.strip_suffix(&suffix) else {
+                        continue;
+                    };
                     if !seen.insert(slug.to_string()) {
                         continue;
                     }
-                    let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else { continue };
+                    let Some(node) = all_nodes.iter().find(|n| n.name == host_node) else {
+                        continue;
+                    };
                     managed.push(slug.to_string());
                     if let Some(ip) = &node.public_ip {
-                        db_desired.push(DesiredRecord { name: slug.into(), rtype: "A".into(), value: ip.clone(), ttl: 60 });
+                        db_desired.push(DesiredRecord {
+                            name: slug.into(),
+                            rtype: "A".into(),
+                            value: ip.clone(),
+                            ttl: 60,
+                        });
                     }
                     if let Some(ip) = &node.public_ip6 {
-                        db_desired.push(DesiredRecord { name: slug.into(), rtype: "AAAA".into(), value: ip.clone(), ttl: 60 });
+                        db_desired.push(DesiredRecord {
+                            name: slug.into(),
+                            rtype: "AAAA".into(),
+                            value: ip.clone(),
+                            ttl: 60,
+                        });
                     }
                 }
                 let managed_refs: Vec<&str> = managed.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = reconcile_zone(&api, &cloud.db_domain, &db_desired, &managed_refs, &cloud).await {
+                if let Err(e) =
+                    reconcile_zone(&api, &cloud.db_domain, &db_desired, &managed_refs, &cloud).await
+                {
                     STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %e, zone = %cloud.db_domain, "DNS reconcile failed");
                     ok = false;
@@ -1568,7 +1853,9 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             }
             backoff = if ok { 0 } else { (backoff + 1).min(6) };
             STATS.passes.fetch_add(1, Ordering::Relaxed);
-            STATS.last_pass_ms.store(hive_core::now_ms(), Ordering::Relaxed);
+            STATS
+                .last_pass_ms
+                .store(hive_core::now_ms(), Ordering::Relaxed);
         }
     });
 }
@@ -1580,15 +1867,29 @@ mod tests {
     use super::*;
 
     fn rv(id: &str, name: &str, t: &str, v: &str) -> RecordView {
-        RecordView { id: id.into(), name: name.into(), rtype: t.into(), value: v.into(), created_ms: None }
+        RecordView {
+            id: id.into(),
+            name: name.into(),
+            rtype: t.into(),
+            value: v.into(),
+            created_ms: None,
+        }
     }
     fn dr(name: &str, t: &str, v: &str) -> DesiredRecord {
-        DesiredRecord { name: name.into(), rtype: t.into(), value: v.into(), ttl: 60 }
+        DesiredRecord {
+            name: name.into(),
+            rtype: t.into(),
+            value: v.into(),
+            ttl: 60,
+        }
     }
 
     #[test]
     fn diff_creates_missing_and_deletes_stale() {
-        let current = vec![rv("1", "api", "A", "1.1.1.1"), rv("2", "api", "A", "2.2.2.2")];
+        let current = vec![
+            rv("1", "api", "A", "1.1.1.1"),
+            rv("2", "api", "A", "2.2.2.2"),
+        ];
         let desired = vec![dr("api", "A", "1.1.1.1"), dr("api", "A", "3.3.3.3")];
         let (c, d) = diff(&current, &desired, &["api"]);
         assert_eq!(c, vec![dr("api", "A", "3.3.3.3")]);
@@ -1600,7 +1901,10 @@ mod tests {
         let current = vec![rv("1", "*", "A", "1.1.1.1"), rv("2", "", "A", "1.1.1.1")];
         let desired = vec![dr("*", "A", "1.1.1.1"), dr("", "A", "1.1.1.1")];
         let (c, d) = diff(&current, &desired, &["*", ""]);
-        assert!(c.is_empty() && d.is_empty(), "converged sets must write nothing");
+        assert!(
+            c.is_empty() && d.is_empty(),
+            "converged sets must write nothing"
+        );
     }
 
     #[test]
@@ -1616,7 +1920,11 @@ mod tests {
         let desired = vec![dr("api", "A", "1.1.1.1")];
         let (c, d) = diff(&current, &desired, &["api"]);
         assert_eq!(c, vec![dr("api", "A", "1.1.1.1")]);
-        assert_eq!(d, vec!["1".to_string()], "only the managed A record is replaced");
+        assert_eq!(
+            d,
+            vec!["1".to_string()],
+            "only the managed A record is replaced"
+        );
     }
 
     #[test]
@@ -1707,8 +2015,14 @@ mod tests {
         // Delegation cutover: api has flat A records at the parent, desired
         // wants NS instead — the pair must come out of the ordinary flow as
         // ONE restore-on-failure transaction.
-        let current = vec![rv("a1", "api", "A", "9.9.9.9"), rv("a2", "api", "A", "8.8.8.8")];
-        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let current = vec![
+            rv("a1", "api", "A", "9.9.9.9"),
+            rv("a2", "api", "A", "8.8.8.8"),
+        ];
+        let desired = vec![
+            dr("api", "NS", "ns-n1.shadw.app"),
+            dr("api", "NS", "ns-n2.shadw.app"),
+        ];
         let (creates, deletes) = diff(&current, &desired, &["api"]);
         assert_eq!(creates.len(), 2);
         assert_eq!(deletes.len(), 2);
@@ -1718,14 +2032,19 @@ mod tests {
         assert_eq!(name, "api");
         assert_eq!(addr.len(), 2, "both flat addresses ride the transaction");
         assert_eq!(ns.len(), 2, "both missing NS ride the transaction");
-        assert!(plan.creates.is_empty() && plan.deletes.is_empty() && plan.ns_deletes_first.is_empty());
+        assert!(
+            plan.creates.is_empty() && plan.deletes.is_empty() && plan.ns_deletes_first.is_empty()
+        );
     }
 
     #[test]
     fn plan_writes_ns_deletes_precede_address_creates() {
         // Disengagement: api is delegated (NS present), desired wants the flat
         // A set back — the NS delete must run FIRST or the A create 409s.
-        let current = vec![rv("n1", "api", "NS", "ns-n1.shadw.app."), rv("n2", "api", "NS", "ns-n2.shadw.app.")];
+        let current = vec![
+            rv("n1", "api", "NS", "ns-n1.shadw.app."),
+            rv("n2", "api", "NS", "ns-n2.shadw.app."),
+        ];
         let desired = vec![dr("api", "A", "1.1.1.1")];
         let (creates, deletes) = diff(&current, &desired, &["api"]);
         let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
@@ -1743,12 +2062,22 @@ mod tests {
             rv("n2", "api", "NS", "ns-n2.shadw.app."),
             rv("a1", "api", "A", "9.9.9.9"),
         ];
-        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let desired = vec![
+            dr("api", "NS", "ns-n1.shadw.app"),
+            dr("api", "NS", "ns-n2.shadw.app"),
+        ];
         let (creates, deletes) = diff(&current, &desired, &["api"]);
         let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
-        assert!(plan.cutovers.is_empty(), "complete NS set = no cutover transaction");
+        assert!(
+            plan.cutovers.is_empty(),
+            "complete NS set = no cutover transaction"
+        );
         assert!(plan.creates.is_empty());
-        assert_eq!(plan.deletes.len(), 1, "the stale address delete flows normally");
+        assert_eq!(
+            plan.deletes.len(),
+            1,
+            "the stale address delete flows normally"
+        );
     }
 
     #[test]
@@ -1758,14 +2087,34 @@ mod tests {
         // below its target count (adversarial-review confirmed the hoist
         // opened a below-floor window). Hoisting is only for names with NO
         // desired NS (true disengagement).
-        let current = vec![rv("n1", "api", "NS", "ns-old.shadw.app."), rv("n2", "api", "NS", "ns-old2.shadw.app.")];
-        let desired = vec![dr("api", "NS", "ns-new.shadw.app"), dr("api", "NS", "ns-old2.shadw.app")];
+        let current = vec![
+            rv("n1", "api", "NS", "ns-old.shadw.app."),
+            rv("n2", "api", "NS", "ns-old2.shadw.app."),
+        ];
+        let desired = vec![
+            dr("api", "NS", "ns-new.shadw.app"),
+            dr("api", "NS", "ns-old2.shadw.app"),
+        ];
         let (creates, deletes) = diff(&current, &desired, &["api"]);
         let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
-        assert!(plan.ns_deletes_first.is_empty(), "rotation keeps creates-then-deletes order");
-        assert!(plan.cutovers.is_empty(), "no address blockers -> no transaction");
-        assert_eq!(plan.creates.len(), 1, "the replacement NS flows as a normal create");
-        assert_eq!(plan.deletes.len(), 1, "the retired NS flows as a normal delete");
+        assert!(
+            plan.ns_deletes_first.is_empty(),
+            "rotation keeps creates-then-deletes order"
+        );
+        assert!(
+            plan.cutovers.is_empty(),
+            "no address blockers -> no transaction"
+        );
+        assert_eq!(
+            plan.creates.len(),
+            1,
+            "the replacement NS flows as a normal create"
+        );
+        assert_eq!(
+            plan.deletes.len(),
+            1,
+            "the retired NS flows as a normal delete"
+        );
     }
 
     #[test]
@@ -1780,16 +2129,27 @@ mod tests {
             rv("s2", "api", "TXT", "verify-me"),
             rv("s3", "api", "NS", "ns-foreign.shadw.app."),
         ];
-        let desired = vec![dr("api", "NS", "ns-n1.shadw.app"), dr("api", "NS", "ns-n2.shadw.app")];
+        let desired = vec![
+            dr("api", "NS", "ns-n1.shadw.app"),
+            dr("api", "NS", "ns-n2.shadw.app"),
+        ];
         let (creates, deletes) = diff(&current, &desired, &["api"]);
         let plan = plan_writes(&current, &desired, &["api"], creates, deletes);
         assert_eq!(plan.cutovers.len(), 1);
         let (name, blockers, ns) = &plan.cutovers[0];
         assert_eq!(name, "api");
-        assert_eq!(blockers.len(), 3, "address + CNAME + stray TXT ride the transaction");
+        assert_eq!(
+            blockers.len(),
+            3,
+            "address + CNAME + stray TXT ride the transaction"
+        );
         assert_eq!(ns.len(), 2);
         assert!(plan.creates.is_empty());
-        assert_eq!(plan.deletes.len(), 1, "the foreign NS target is no blocker — it leaves as a normal delete");
+        assert_eq!(
+            plan.deletes.len(),
+            1,
+            "the foreign NS target is no blocker — it leaves as a normal delete"
+        );
     }
 
     #[test]
@@ -1797,11 +2157,23 @@ mod tests {
         let now = 1_000_000u64;
         let old = Some(now - ACME_ORPHAN_MIN_AGE_MS - 1);
         let young = Some(now - ACME_ORPHAN_MIN_AGE_MS + 1);
-        assert!(!is_orphan_candidate(true, old, now), "in-flight is never swept");
+        assert!(
+            !is_orphan_candidate(true, old, now),
+            "in-flight is never swept"
+        );
         assert!(!is_orphan_candidate(true, None, now));
-        assert!(is_orphan_candidate(false, old, now), "store-unknown + provably old = orphan");
-        assert!(!is_orphan_candidate(false, young, now), "store-unknown but brand-new: keep");
-        assert!(!is_orphan_candidate(false, None, now), "age unknowable (schema-nullable): keep — deletes are forever");
+        assert!(
+            is_orphan_candidate(false, old, now),
+            "store-unknown + provably old = orphan"
+        );
+        assert!(
+            !is_orphan_candidate(false, young, now),
+            "store-unknown but brand-new: keep"
+        );
+        assert!(
+            !is_orphan_candidate(false, None, now),
+            "age unknowable (schema-nullable): keep — deletes are forever"
+        );
     }
 
     #[test]
@@ -1834,15 +2206,67 @@ mod tests {
             region: "san-jose".into(),
         }];
         let apps = desired_apps(&nodes);
-        assert!(apps.contains(&DesiredRecord { name: "*".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
-        assert!(apps.contains(&DesiredRecord { name: "".into(), rtype: "AAAA".into(), value: "::1".into(), ttl: 60 }));
-        let plat = desired_platform(&nodes, &["2.2.2.2".into()], &["3.3.3.3".into()], true, false);
-        assert!(plat.contains(&DesiredRecord { name: "".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }), "apex published when dashboard hosting on");
-        assert!(plat.contains(&DesiredRecord { name: "www".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
-        assert!(plat.contains(&DesiredRecord { name: "api".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }));
-        assert!(plat.contains(&DesiredRecord { name: "admin".into(), rtype: "A".into(), value: "1.1.1.1".into(), ttl: 60 }), "ops console host published");
-        assert!(plat.contains(&DesiredRecord { name: "relay".into(), rtype: "A".into(), value: "2.2.2.2".into(), ttl: 300 }));
-        assert!(plat.contains(&DesiredRecord { name: "discovery".into(), rtype: "A".into(), value: "3.3.3.3".into(), ttl: 300 }));
+        assert!(apps.contains(&DesiredRecord {
+            name: "*".into(),
+            rtype: "A".into(),
+            value: "1.1.1.1".into(),
+            ttl: 60
+        }));
+        assert!(apps.contains(&DesiredRecord {
+            name: "".into(),
+            rtype: "AAAA".into(),
+            value: "::1".into(),
+            ttl: 60
+        }));
+        let plat = desired_platform(
+            &nodes,
+            &["2.2.2.2".into()],
+            &["3.3.3.3".into()],
+            true,
+            false,
+        );
+        assert!(
+            plat.contains(&DesiredRecord {
+                name: "".into(),
+                rtype: "A".into(),
+                value: "1.1.1.1".into(),
+                ttl: 60
+            }),
+            "apex published when dashboard hosting on"
+        );
+        assert!(plat.contains(&DesiredRecord {
+            name: "www".into(),
+            rtype: "A".into(),
+            value: "1.1.1.1".into(),
+            ttl: 60
+        }));
+        assert!(plat.contains(&DesiredRecord {
+            name: "api".into(),
+            rtype: "A".into(),
+            value: "1.1.1.1".into(),
+            ttl: 60
+        }));
+        assert!(
+            plat.contains(&DesiredRecord {
+                name: "admin".into(),
+                rtype: "A".into(),
+                value: "1.1.1.1".into(),
+                ttl: 60
+            }),
+            "ops console host published"
+        );
+        assert!(plat.contains(&DesiredRecord {
+            name: "relay".into(),
+            rtype: "A".into(),
+            value: "2.2.2.2".into(),
+            ttl: 300
+        }));
+        assert!(plat.contains(&DesiredRecord {
+            name: "discovery".into(),
+            rtype: "A".into(),
+            value: "3.3.3.3".into(),
+            ttl: 300
+        }));
     }
 
     // ---- mocked-API reconcile tests ----
@@ -1857,7 +2281,13 @@ mod tests {
     }
     impl MockApi {
         fn new(records: Vec<RecordView>) -> Self {
-            Self { records: Mutex::new(records), fail_lists: Mutex::new(0), next_id: Mutex::new(100), creates: Mutex::new(0), deletes: Mutex::new(0) }
+            Self {
+                records: Mutex::new(records),
+                fail_lists: Mutex::new(0),
+                next_id: Mutex::new(100),
+                creates: Mutex::new(0),
+                deletes: Mutex::new(0),
+            }
         }
     }
     impl DnsApi for MockApi {
@@ -1874,7 +2304,13 @@ mod tests {
             *id += 1;
             *self.creates.lock().unwrap() += 1;
             let rid = id.to_string();
-            self.records.lock().unwrap().push(RecordView { id: rid.clone(), name: rec.name.clone(), rtype: rec.rtype.clone(), value: rec.value.clone(), created_ms: None });
+            self.records.lock().unwrap().push(RecordView {
+                id: rid.clone(),
+                name: rec.name.clone(),
+                rtype: rec.rtype.clone(),
+                value: rec.value.clone(),
+                created_ms: None,
+            });
             Ok(rid)
         }
         async fn delete(&self, _d: &str, id: &str) -> anyhow::Result<()> {
@@ -1892,8 +2328,12 @@ mod tests {
         // the empty-set incident path, covered separately).
         let current = api.list("z").await.unwrap();
         let (c, d) = diff(&current, &desired, &["api"]);
-        for r in &c { api.create("z", r).await.unwrap(); }
-        for id in &d { api.delete("z", id).await.unwrap(); }
+        for r in &c {
+            api.create("z", r).await.unwrap();
+        }
+        for id in &d {
+            api.delete("z", id).await.unwrap();
+        }
         assert_eq!(*api.creates.lock().unwrap(), 1);
         assert_eq!(*api.deletes.lock().unwrap(), 1);
         // Second pass: converged, zero writes.
@@ -1906,7 +2346,10 @@ mod tests {
     async fn mock_list_429_is_an_error_not_a_wipe() {
         let api = MockApi::new(vec![rv("1", "api", "A", "1.1.1.1")]);
         *api.fail_lists.lock().unwrap() = 1;
-        assert!(api.list("z").await.is_err(), "429 must surface as an error (caller backs off)");
+        assert!(
+            api.list("z").await.is_err(),
+            "429 must surface as an error (caller backs off)"
+        );
         // Records untouched by the failed pass.
         assert_eq!(api.records.lock().unwrap().len(), 1);
     }

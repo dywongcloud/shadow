@@ -5,7 +5,9 @@ use std::collections::BTreeMap;
 
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
-use hive_core::{BuildJob, ClusterStatus, JobView, LogLine, LogStream, ResourceSpec, SubmitResponse};
+use hive_core::{
+    BuildJob, ClusterStatus, JobView, LogLine, LogStream, ResourceSpec, SubmitResponse,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "hivectl", about = "Client for a Hive node")]
@@ -218,7 +220,13 @@ fn print_status(s: &ClusterStatus) {
     for b in &s.boxes {
         println!(
             "  {}  vcpu {}/{}  mem {}/{} MiB  cells {} (warm {})",
-            b.id, b.vcpus_used, b.vcpus_total, b.mem_used_mib, b.mem_total_mib, b.cells, b.warm_cells
+            b.id,
+            b.vcpus_used,
+            b.vcpus_total,
+            b.mem_used_mib,
+            b.mem_total_mib,
+            b.cells,
+            b.warm_cells
         );
     }
     println!("\nCells:");
@@ -228,7 +236,10 @@ fn print_status(s: &ClusterStatus) {
             c.id,
             c.state,
             c.image,
-            c.job.as_ref().map(|j| j.to_string()).unwrap_or_else(|| "-".into())
+            c.job
+                .as_ref()
+                .map(|j| j.to_string())
+                .unwrap_or_else(|| "-".into())
         );
     }
     println!("\nJobs:");

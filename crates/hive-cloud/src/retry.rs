@@ -55,17 +55,29 @@ pub fn can_retry(
 ) -> RetryDecision {
     // Once bytes are on the wire to the client, a transparent retry is impossible.
     if response == ResponseState::Started {
-        return RetryDecision { allowed: false, reason: "response_already_started" };
+        return RetryDecision {
+            allowed: false,
+            reason: "response_already_started",
+        };
     }
     // Can't re-send a body we couldn't buffer.
     if body == BodyReplay::NonReplayable {
-        return RetryDecision { allowed: false, reason: "body_not_replayable" };
+        return RetryDecision {
+            allowed: false,
+            reason: "body_not_replayable",
+        };
     }
     // A non-idempotent method without an idempotency key might double-execute.
     if !is_idempotent(method) && !has_idempotency_key {
-        return RetryDecision { allowed: false, reason: "non_idempotent_no_key" };
+        return RetryDecision {
+            allowed: false,
+            reason: "non_idempotent_no_key",
+        };
     }
-    RetryDecision { allowed: true, reason: "safe" }
+    RetryDecision {
+        allowed: true,
+        reason: "safe",
+    }
 }
 
 #[cfg(test)]

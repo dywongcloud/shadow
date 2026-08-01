@@ -120,7 +120,10 @@ async fn response_streams_incrementally_cross_node() {
         .await
         .expect("first chunk should arrive before the server's 500ms pause (incremental)")
         .expect("a first body chunk");
-    assert!(t0.elapsed() < Duration::from_millis(400), "delivered incrementally, not buffered");
+    assert!(
+        t0.elapsed() < Duration::from_millis(400),
+        "delivered incrementally, not buffered"
+    );
 
     let mut body = Vec::new();
     body.extend_from_slice(&first);
@@ -128,7 +131,10 @@ async fn response_streams_incrementally_cross_node() {
         body.extend_from_slice(&c);
     }
     let s = String::from_utf8_lossy(&body);
-    assert!(s.contains("first") && s.contains("second"), "full body reassembles: {s:?}");
+    assert!(
+        s.contains("first") && s.contains("second"),
+        "full body reassembles: {s:?}"
+    );
 }
 
 /// #2 — a raw bidirectional stream over the trunk splices bytes both ways
@@ -140,13 +146,14 @@ async fn raw_stream_splices_both_ways_cross_node() {
         eprintln!("skipping: iroh could not bind");
         return;
     };
-    let mut raw = match tokio::time::timeout(Duration::from_secs(20), pool.open_raw(&id, &addr)).await {
-        Ok(Ok(s)) => s,
-        _ => {
-            eprintln!("skipping: open_raw failed (offline?)");
-            return;
-        }
-    };
+    let mut raw =
+        match tokio::time::timeout(Duration::from_secs(20), pool.open_raw(&id, &addr)).await {
+            Ok(Ok(s)) => s,
+            _ => {
+                eprintln!("skipping: open_raw failed (offline?)");
+                return;
+            }
+        };
     // A WebSocket handshake + frame, relayed verbatim over the raw splice.
     let msg = b"GET /ws HTTP/1.1\r\nupgrade: websocket\r\n\r\n[frame:hello]";
     raw.write_all(msg).await.unwrap();
@@ -156,5 +163,8 @@ async fn raw_stream_splices_both_ways_cross_node() {
         .await
         .expect("echo returns within 10s")
         .expect("read the echoed bytes");
-    assert_eq!(&got, msg, "raw bytes echo back over the cross-node splice (both directions)");
+    assert_eq!(
+        &got, msg,
+        "raw bytes echo back over the cross-node splice (both directions)"
+    );
 }

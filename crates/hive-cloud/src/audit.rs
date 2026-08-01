@@ -63,11 +63,23 @@ impl AuditLog {
     }
 
     /// Record a mutation: append to the immutable history (durable) + ring.
-    pub fn record(&self, tenant: &str, actor: &str, action: &str, entity: &str, entity_id: &str, detail: &str) {
+    pub fn record(
+        &self,
+        tenant: &str,
+        actor: &str,
+        action: &str,
+        entity: &str,
+        entity_id: &str,
+        detail: &str,
+    ) {
         let entry = AuditEntry {
             seq: self.seq.fetch_add(1, Ordering::SeqCst),
             ts_ms: now_ms(),
-            tenant: if tenant.is_empty() { "personal".into() } else { tenant.into() },
+            tenant: if tenant.is_empty() {
+                "personal".into()
+            } else {
+                tenant.into()
+            },
             actor: actor.to_string(),
             action: action.to_string(),
             entity: entity.to_string(),
@@ -78,7 +90,11 @@ impl AuditLog {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&self.path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             if let Ok(line) = serde_json::to_string(&entry) {
                 let _ = writeln!(f, "{line}");
                 let _ = f.flush();

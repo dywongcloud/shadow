@@ -52,15 +52,20 @@ pub(crate) async fn init_schema() {
     };
     let mut session = Session::new(db, "hive-init");
     for (table, ddl) in [
-        ("project_teams", "CREATE TABLE IF NOT EXISTS project_teams (\
+        (
+            "project_teams",
+            "CREATE TABLE IF NOT EXISTS project_teams (\
             project TEXT PRIMARY KEY, \
             team TEXT NOT NULL, \
             root_dir TEXT NOT NULL DEFAULT '', \
             updated_ms BIGINT NOT NULL\
-        )"),
+        )",
+        ),
         // Normalized (real columns, one row per fact) — replaces the old
         // single-JSON-blob-per-tenant `account_json`. See `upsert_billing`.
-        ("billing_accounts", "CREATE TABLE IF NOT EXISTS billing_accounts (\
+        (
+            "billing_accounts",
+            "CREATE TABLE IF NOT EXISTS billing_accounts (\
             tenant TEXT PRIMARY KEY, \
             plan TEXT NOT NULL, \
             status TEXT NOT NULL, \
@@ -72,8 +77,11 @@ pub(crate) async fn init_schema() {
             period_start_ms BIGINT NOT NULL, \
             period_end_ms BIGINT NOT NULL, \
             updated_ms BIGINT NOT NULL\
-        )"),
-        ("billing_ledger", "CREATE TABLE IF NOT EXISTS billing_ledger (\
+        )",
+        ),
+        (
+            "billing_ledger",
+            "CREATE TABLE IF NOT EXISTS billing_ledger (\
             id TEXT PRIMARY KEY, \
             tenant TEXT NOT NULL, \
             ts_ms BIGINT NOT NULL, \
@@ -81,8 +89,11 @@ pub(crate) async fn init_schema() {
             amount_cents BIGINT NOT NULL, \
             balance_after_cents BIGINT NOT NULL, \
             note TEXT NOT NULL DEFAULT ''\
-        )"),
-        ("billing_invoices", "CREATE TABLE IF NOT EXISTS billing_invoices (\
+        )",
+        ),
+        (
+            "billing_invoices",
+            "CREATE TABLE IF NOT EXISTS billing_invoices (\
             id TEXT PRIMARY KEY, \
             tenant TEXT NOT NULL, \
             number TEXT NOT NULL, \
@@ -93,14 +104,20 @@ pub(crate) async fn init_schema() {
             total_cents BIGINT NOT NULL, \
             status TEXT NOT NULL, \
             created_ms BIGINT NOT NULL\
-        )"),
-        ("billing_invoice_lines", "CREATE TABLE IF NOT EXISTS billing_invoice_lines (\
+        )",
+        ),
+        (
+            "billing_invoice_lines",
+            "CREATE TABLE IF NOT EXISTS billing_invoice_lines (\
             id TEXT PRIMARY KEY, \
             invoice_id TEXT NOT NULL, \
             description TEXT NOT NULL, \
             amount_cents BIGINT NOT NULL\
-        )"),
-        ("billing_checkouts", "CREATE TABLE IF NOT EXISTS billing_checkouts (\
+        )",
+        ),
+        (
+            "billing_checkouts",
+            "CREATE TABLE IF NOT EXISTS billing_checkouts (\
             id TEXT PRIMARY KEY, \
             tenant TEXT NOT NULL, \
             kind TEXT NOT NULL, \
@@ -108,8 +125,11 @@ pub(crate) async fn init_schema() {
             amount_cents BIGINT NOT NULL, \
             stripe_session_id TEXT NOT NULL DEFAULT '', \
             created_ms BIGINT NOT NULL\
-        )"),
-        ("teams", "CREATE TABLE IF NOT EXISTS teams (\
+        )",
+        ),
+        (
+            "teams",
+            "CREATE TABLE IF NOT EXISTS teams (\
             slug TEXT PRIMARY KEY, \
             name TEXT NOT NULL, \
             plan TEXT NOT NULL, \
@@ -117,8 +137,11 @@ pub(crate) async fn init_schema() {
             sso_enabled BIGINT NOT NULL, \
             created_ms BIGINT NOT NULL, \
             updated_ms BIGINT NOT NULL\
-        )"),
-        ("team_members", "CREATE TABLE IF NOT EXISTS team_members (\
+        )",
+        ),
+        (
+            "team_members",
+            "CREATE TABLE IF NOT EXISTS team_members (\
             id TEXT PRIMARY KEY, \
             team TEXT NOT NULL, \
             email TEXT NOT NULL, \
@@ -126,8 +149,11 @@ pub(crate) async fn init_schema() {
             role TEXT NOT NULL, \
             added_ms BIGINT NOT NULL, \
             updated_ms BIGINT NOT NULL\
-        )"),
-        ("deployments", "CREATE TABLE IF NOT EXISTS deployments (\
+        )",
+        ),
+        (
+            "deployments",
+            "CREATE TABLE IF NOT EXISTS deployments (\
             id TEXT PRIMARY KEY, \
             project TEXT NOT NULL, \
             team TEXT NOT NULL, \
@@ -139,7 +165,8 @@ pub(crate) async fn init_schema() {
             production BIGINT NOT NULL, \
             created_at_ms BIGINT NOT NULL, \
             updated_ms BIGINT NOT NULL\
-        )"),
+        )",
+        ),
     ] {
         ensure_table_exists(&mut session, table, ddl).await;
     }
@@ -210,7 +237,11 @@ const SCHEMA_BRINGUP_MAX_ATTEMPTS: u32 = 4;
 /// view), so the only reliable defense is to check afterward, from a freshly
 /// reloaded session view, whether the table is REALLY there — which is what
 /// this function does.
-async fn ensure_table_exists(s: &mut Session<guardian_db::sql::GuardianRelationalStorage>, table: &str, ddl: &str) {
+async fn ensure_table_exists(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+    table: &str,
+    ddl: &str,
+) {
     for attempt in 1..=SCHEMA_BRINGUP_MAX_ATTEMPTS {
         if let Err(e) = exec(s, ddl).await {
             tracing::warn!(table, attempt, error = %e, "relational: schema bring-up CREATE TABLE statement failed");
@@ -307,7 +338,9 @@ fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
     for r in res {
         if let ExecResult::Rows { rows, .. } = r {
             for row in rows {
-                if let (Some(SqlValue::Text(a)), Some(SqlValue::Text(b))) = (row.first(), row.get(1)) {
+                if let (Some(SqlValue::Text(a)), Some(SqlValue::Text(b))) =
+                    (row.first(), row.get(1))
+                {
                     out.push((a.clone(), b.clone()));
                 }
             }
@@ -331,7 +364,9 @@ fn all_text_pairs(res: &[ExecResult]) -> Vec<(String, String)> {
 /// regardless of this call).
 async fn session(db: SqlDb) -> Session<guardian_db::sql::GuardianRelationalStorage> {
     match tokio::time::timeout(SQL_OP_TIMEOUT, db.storage().refresh()).await {
-        Ok(Err(e)) => tracing::debug!(error = %e, "relational: index refresh failed (serving from the previous local index)"),
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "relational: index refresh failed (serving from the previous local index)")
+        }
         Err(_) => tracing::warn!(
             timeout_secs = SQL_OP_TIMEOUT.as_secs(),
             "relational: index refresh timed out (serving from the previous local index) -- \
@@ -384,7 +419,9 @@ async fn exec(
 /// zero deployments fleet-wide, so the peer_deployments-derived fallback in
 /// `gitops_projects` can't help it).
 pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str) {
-    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
     let mut s = session(db).await;
     let query = format!(
         "INSERT INTO project_teams (project, team, root_dir, updated_ms) VALUES ({}, {}, {}, {}) \
@@ -401,7 +438,9 @@ pub(crate) async fn set_project_team(project: &str, team: &str, root_dir: &str) 
 
 /// Forget a project's relational row (mirrors `ProjectStore::remove`).
 pub(crate) async fn remove_project(project: &str) {
-    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
     let mut s = session(db).await;
     let query = format!("DELETE FROM project_teams WHERE project = {}", q(project));
     if let Err(e) = exec(&mut s, &query).await {
@@ -415,10 +454,17 @@ pub(crate) async fn remove_project(project: &str) {
 /// projects with zero deployments anywhere, unlike the peer_deployments-only
 /// fallback.
 pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
-    let Ok(db) = crate::guardian::sql_db().await else { return Vec::new() };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return Vec::new();
+    };
     let mut s = session(db).await;
-    let query = format!("SELECT project, team FROM project_teams WHERE team = {}", q(team));
-    let Ok(res) = exec(&mut s, &query).await else { return Vec::new() };
+    let query = format!(
+        "SELECT project, team FROM project_teams WHERE team = {}",
+        q(team)
+    );
+    let Ok(res) = exec(&mut s, &query).await else {
+        return Vec::new();
+    };
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
 }
 
@@ -481,7 +527,9 @@ pub(crate) async fn upsert_billing(
     invoices: &[crate::billing::Invoice],
     checkouts: &[crate::billing::Checkout],
 ) {
-    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
     let now = hive_core::now_ms();
     let mut s = session(db).await;
     reconcile_billing_accounts_schema(&mut s).await;
@@ -728,7 +776,8 @@ const BILLING_ACCOUNTS_NEW_COLUMNS: &[(&str, &str)] = &[
 /// best-effort memoization racing independent loops, not a
 /// correctness-critical lock — at worst a concurrent miss re-runs a handful
 /// of idempotent ALTERs once more, never a wrong result.
-static BILLING_ACCOUNTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BILLING_ACCOUNTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Idempotent `billing_accounts` column reconciliation — issues `ALTER TABLE
 /// ... ADD COLUMN IF NOT EXISTS` for every column in
@@ -746,7 +795,9 @@ static BILLING_ACCOUNTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool = std::
 /// itself idempotent. See `BILLING_ACCOUNTS_NEW_COLUMNS`'s doc comment for
 /// why this one table specifically needs ALTER-based reconciliation instead
 /// of relying on plain `CREATE TABLE IF NOT EXISTS`.
-async fn reconcile_billing_accounts_schema(s: &mut Session<guardian_db::sql::GuardianRelationalStorage>) {
+async fn reconcile_billing_accounts_schema(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+) {
     if BILLING_ACCOUNTS_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -803,7 +854,9 @@ async fn reconcile_billing_accounts_schema(s: &mut Session<guardian_db::sql::Gua
 /// against data that no longer exists would be strictly worse than surfacing
 /// the gap loudly.
 pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json::Value, String> {
-    let db = crate::guardian::sql_db().await.map_err(|e| format!("relational store unavailable: {e}"))?;
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("relational store unavailable: {e}"))?;
     let mut s = session(db).await;
 
     if let Err(e) = exec(
@@ -819,13 +872,23 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     )
     .await
     {
-        return Err(format!("could not bring up billing_backfill_state marker table: {e}"));
+        return Err(format!(
+            "could not bring up billing_backfill_state marker table: {e}"
+        ));
     }
 
     // ---- Step 1: is each OLD source still queryable AT ALL? ----
     let old_accounts_res = exec(&mut s, "SELECT tenant, account_json FROM billing_accounts").await;
-    let old_ledger_res = exec(&mut s, "SELECT tenant, ledger_json FROM billing_ledger_snapshot").await;
-    let old_invoices_res = exec(&mut s, "SELECT tenant, invoices_json FROM billing_invoices_snapshot").await;
+    let old_ledger_res = exec(
+        &mut s,
+        "SELECT tenant, ledger_json FROM billing_ledger_snapshot",
+    )
+    .await;
+    let old_invoices_res = exec(
+        &mut s,
+        "SELECT tenant, invoices_json FROM billing_invoices_snapshot",
+    )
+    .await;
 
     let accounts_old_queryable = old_accounts_res.is_ok();
     let ledger_old_queryable = old_ledger_res.is_ok();
@@ -848,29 +911,36 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     }
 
     // ---- Step 2: parse whatever IS available into per-tenant buckets ----
-    let mut accounts_by_tenant: std::collections::HashMap<String, crate::billing::BillingAccount> = std::collections::HashMap::new();
+    let mut accounts_by_tenant: std::collections::HashMap<String, crate::billing::BillingAccount> =
+        std::collections::HashMap::new();
     if let Ok(res) = &old_accounts_res {
         for (tenant, blob) in all_text_pairs(res) {
             match serde_json::from_str::<crate::billing::BillingAccount>(&blob) {
                 Ok(acc) => {
                     accounts_by_tenant.insert(tenant, acc);
                 }
-                Err(e) => tracing::warn!(tenant, error = %e, "backfill: could not parse old account_json (row skipped, NOT counted as migrated)"),
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "backfill: could not parse old account_json (row skipped, NOT counted as migrated)")
+                }
             }
         }
     }
-    let mut ledger_by_tenant: std::collections::HashMap<String, Vec<crate::billing::LedgerEntry>> = std::collections::HashMap::new();
+    let mut ledger_by_tenant: std::collections::HashMap<String, Vec<crate::billing::LedgerEntry>> =
+        std::collections::HashMap::new();
     if let Ok(res) = &old_ledger_res {
         for (tenant, blob) in all_text_pairs(res) {
             match serde_json::from_str::<Vec<crate::billing::LedgerEntry>>(&blob) {
                 Ok(entries) => {
                     ledger_by_tenant.insert(tenant, entries);
                 }
-                Err(e) => tracing::warn!(tenant, error = %e, "backfill: could not parse old ledger_json (row skipped, NOT counted as migrated)"),
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "backfill: could not parse old ledger_json (row skipped, NOT counted as migrated)")
+                }
             }
         }
     }
-    let mut invoices_by_tenant: std::collections::HashMap<String, Vec<crate::billing::Invoice>> = std::collections::HashMap::new();
+    let mut invoices_by_tenant: std::collections::HashMap<String, Vec<crate::billing::Invoice>> =
+        std::collections::HashMap::new();
     if let Ok(res) = &old_invoices_res {
         for (tenant, blob) in all_text_pairs(res) {
             match serde_json::from_str::<Vec<crate::billing::Invoice>>(&blob) {
@@ -881,9 +951,14 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
                 // "never persist a draft" rule so the new tables end up in
                 // exactly the state they'd be in had they been written live.
                 Ok(invs) => {
-                    invoices_by_tenant.insert(tenant, invs.into_iter().filter(|i| i.status == "paid").collect());
+                    invoices_by_tenant.insert(
+                        tenant,
+                        invs.into_iter().filter(|i| i.status == "paid").collect(),
+                    );
                 }
-                Err(e) => tracing::warn!(tenant, error = %e, "backfill: could not parse old invoices_json (row skipped, NOT counted as migrated)"),
+                Err(e) => {
+                    tracing::warn!(tenant, error = %e, "backfill: could not parse old invoices_json (row skipped, NOT counted as migrated)")
+                }
             }
         }
     }
@@ -914,15 +989,16 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     // (old-schema row) and one the regular mirror loop already refreshed
     // with live, post-migration data. Used below as the freshness guard
     // against a retry clobbering a fresher live row with the frozen blob.
-    let current_account_updated_ms: std::collections::HashMap<String, u64> = if accounts_old_queryable {
-        exec(&mut s, "SELECT tenant, updated_ms FROM billing_accounts")
-            .await
-            .ok()
-            .map(|r| text_num_pairs(&r).into_iter().collect())
-            .unwrap_or_default()
-    } else {
-        std::collections::HashMap::new()
-    };
+    let current_account_updated_ms: std::collections::HashMap<String, u64> =
+        if accounts_old_queryable {
+            exec(&mut s, "SELECT tenant, updated_ms FROM billing_accounts")
+                .await
+                .ok()
+                .map(|r| text_num_pairs(&r).into_iter().collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let mut all_tenants: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     all_tenants.extend(accounts_by_tenant.keys().cloned());
@@ -996,42 +1072,74 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
         // ---- Verify: row-count parity before considering this tenant done ----
         let mut mismatches = Vec::new();
         if acc.is_some() {
-            let has_row = exec(&mut s, &format!("SELECT tenant FROM billing_accounts WHERE tenant = {} AND plan IS NOT NULL", q(&tenant)))
-                .await
-                .ok()
-                .map(|r| !all_text_firsts(&r).is_empty())
-                .unwrap_or(false);
+            let has_row = exec(
+                &mut s,
+                &format!(
+                    "SELECT tenant FROM billing_accounts WHERE tenant = {} AND plan IS NOT NULL",
+                    q(&tenant)
+                ),
+            )
+            .await
+            .ok()
+            .map(|r| !all_text_firsts(&r).is_empty())
+            .unwrap_or(false);
             if !has_row {
                 mismatches.push("billing_accounts row missing or not yet populated".to_string());
             }
         }
-        let ledger_count = exec(&mut s, &format!("SELECT id FROM billing_ledger WHERE tenant = {}", q(&tenant)))
-            .await
-            .ok()
-            .map(|r| all_text_firsts(&r).len())
-            .unwrap_or(0);
+        let ledger_count = exec(
+            &mut s,
+            &format!(
+                "SELECT id FROM billing_ledger WHERE tenant = {}",
+                q(&tenant)
+            ),
+        )
+        .await
+        .ok()
+        .map(|r| all_text_firsts(&r).len())
+        .unwrap_or(0);
         if ledger_count != ledger.len() {
-            mismatches.push(format!("billing_ledger row count {ledger_count} != expected {}", ledger.len()));
+            mismatches.push(format!(
+                "billing_ledger row count {ledger_count} != expected {}",
+                ledger.len()
+            ));
         }
-        let invoice_count = exec(&mut s, &format!("SELECT id FROM billing_invoices WHERE tenant = {}", q(&tenant)))
-            .await
-            .ok()
-            .map(|r| all_text_firsts(&r).len())
-            .unwrap_or(0);
+        let invoice_count = exec(
+            &mut s,
+            &format!(
+                "SELECT id FROM billing_invoices WHERE tenant = {}",
+                q(&tenant)
+            ),
+        )
+        .await
+        .ok()
+        .map(|r| all_text_firsts(&r).len())
+        .unwrap_or(0);
         if invoice_count != invoices.len() {
-            mismatches.push(format!("billing_invoices row count {invoice_count} != expected {}", invoices.len()));
+            mismatches.push(format!(
+                "billing_invoices row count {invoice_count} != expected {}",
+                invoices.len()
+            ));
         }
         let expected_lines: usize = invoices.iter().map(|i| i.lines.len()).sum();
         let mut actual_lines = 0usize;
         for inv in invoices.iter() {
-            actual_lines += exec(&mut s, &format!("SELECT id FROM billing_invoice_lines WHERE invoice_id = {}", q(&inv.id)))
-                .await
-                .ok()
-                .map(|r| all_text_firsts(&r).len())
-                .unwrap_or(0);
+            actual_lines += exec(
+                &mut s,
+                &format!(
+                    "SELECT id FROM billing_invoice_lines WHERE invoice_id = {}",
+                    q(&inv.id)
+                ),
+            )
+            .await
+            .ok()
+            .map(|r| all_text_firsts(&r).len())
+            .unwrap_or(0);
         }
         if actual_lines != expected_lines {
-            mismatches.push(format!("billing_invoice_lines row count {actual_lines} != expected {expected_lines}"));
+            mismatches.push(format!(
+                "billing_invoice_lines row count {actual_lines} != expected {expected_lines}"
+            ));
         }
 
         if mismatches.is_empty() {
@@ -1050,14 +1158,23 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
                 now,
             );
             if let Err(e) = exec(&mut s, &marker).await {
-                failed.push(serde_json::json!({ "tenant": tenant, "stage": "mark-migrated", "error": e }));
+                failed.push(
+                    serde_json::json!({ "tenant": tenant, "stage": "mark-migrated", "error": e }),
+                );
             } else {
                 migrated.push(tenant);
             }
         } else {
             // Never leave a stale marker for a tenant that just failed
             // verification -- a retry must reprocess it, not skip it.
-            let _ = exec(&mut s, &format!("DELETE FROM billing_backfill_state WHERE tenant = {}", q(&tenant))).await;
+            let _ = exec(
+                &mut s,
+                &format!(
+                    "DELETE FROM billing_backfill_state WHERE tenant = {}",
+                    q(&tenant)
+                ),
+            )
+            .await;
             failed.push(serde_json::json!({ "tenant": tenant, "stage": "verify", "mismatches": mismatches }));
         }
     }
@@ -1120,7 +1237,9 @@ fn all_text_firsts(res: &[ExecResult]) -> Vec<String> {
 /// discipline as `upsert_billing`. Upserts every current team/member, then
 /// deletes rows whose team/member no longer exists in the snapshot.
 pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
-    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
     let now = hive_core::now_ms();
     let mut s = session(db).await;
     for t in teams {
@@ -1150,7 +1269,10 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
         }
         for m in &t.members {
             let id = format!("{}/{}", t.slug, m.email.to_lowercase());
-            let role = serde_json::to_string(&m.role).unwrap_or_default().trim_matches('"').to_string();
+            let role = serde_json::to_string(&m.role)
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_string();
             let mq = format!(
                 "INSERT INTO team_members (id, team, email, name, role, added_ms, updated_ms) \
                  VALUES ({}, {}, {}, {}, {}, {}, {}) \
@@ -1188,21 +1310,36 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(600)
         * 1000;
-    let live_teams: std::collections::HashSet<String> = teams.iter().map(|t| t.slug.clone()).collect();
-    let live_members: std::collections::HashSet<String> =
-        teams.iter().flat_map(|t| t.members.iter().map(move |m| format!("{}/{}", t.slug, m.email.to_lowercase()))).collect();
+    let live_teams: std::collections::HashSet<String> =
+        teams.iter().map(|t| t.slug.clone()).collect();
+    let live_members: std::collections::HashSet<String> = teams
+        .iter()
+        .flat_map(|t| {
+            t.members
+                .iter()
+                .map(move |m| format!("{}/{}", t.slug, m.email.to_lowercase()))
+        })
+        .collect();
     let stale = |updated: u64| now.saturating_sub(updated) > tombstone_ms;
     if let Ok(res) = exec(&mut s, "SELECT slug, updated_ms FROM teams").await {
         for (slug, updated) in text_num_pairs(&res) {
             if !live_teams.contains(&slug) && stale(updated) {
-                let _ = exec(&mut s, &format!("DELETE FROM teams WHERE slug = {}", q(&slug))).await;
+                let _ = exec(
+                    &mut s,
+                    &format!("DELETE FROM teams WHERE slug = {}", q(&slug)),
+                )
+                .await;
             }
         }
     }
     if let Ok(res) = exec(&mut s, "SELECT id, updated_ms FROM team_members").await {
         for (id, updated) in text_num_pairs(&res) {
             if !live_members.contains(&id) && stale(updated) {
-                let _ = exec(&mut s, &format!("DELETE FROM team_members WHERE id = {}", q(&id))).await;
+                let _ = exec(
+                    &mut s,
+                    &format!("DELETE FROM team_members WHERE id = {}", q(&id)),
+                )
+                .await;
             }
         }
     }
@@ -1214,12 +1351,21 @@ pub(crate) async fn sync_teams(teams: &[crate::teams::Team]) {
 /// multi-node sync converges without conflicts (a relocated deployment's row
 /// moves to the new host on its next tick via the id-keyed upsert).
 pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentInfo]) {
-    let Ok(db) = crate::guardian::sql_db().await else { return };
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
     let now = hive_core::now_ms();
     let mut s = session(db).await;
     for d in deps {
-        let state = serde_json::to_string(&d.state).unwrap_or_default().trim_matches('"').to_string();
-        let team = if d.tenant.is_empty() { "personal" } else { d.tenant.as_str() };
+        let state = serde_json::to_string(&d.state)
+            .unwrap_or_default()
+            .trim_matches('"')
+            .to_string();
+        let team = if d.tenant.is_empty() {
+            "personal"
+        } else {
+            d.tenant.as_str()
+        };
         let query = format!(
             "INSERT INTO deployments (id, project, team, node, alias, kind, target, state, production, created_at_ms, updated_ms) \
              VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}) \
@@ -1249,7 +1395,11 @@ pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentI
     if let Ok(res) = exec(&mut s, &sel).await {
         for id in all_text_firsts(&res) {
             if !live.contains(&id) {
-                let _ = exec(&mut s, &format!("DELETE FROM deployments WHERE id = {}", q(&id))).await;
+                let _ = exec(
+                    &mut s,
+                    &format!("DELETE FROM deployments WHERE id = {}", q(&id)),
+                )
+                .await;
             }
         }
     }
@@ -1281,7 +1431,12 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
     vec![
         SqlTableInfo {
             name: "project_teams",
-            columns: vec![col("project", "text"), col("team", "text"), col("root_dir", "text"), col("updated_ms", "bigint")],
+            columns: vec![
+                col("project", "text"),
+                col("team", "text"),
+                col("root_dir", "text"),
+                col("updated_ms", "bigint"),
+            ],
         },
         SqlTableInfo {
             name: "billing_accounts",
@@ -1328,7 +1483,12 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
         },
         SqlTableInfo {
             name: "billing_invoice_lines",
-            columns: vec![col("id", "text"), col("invoice_id", "text"), col("description", "text"), col("amount_cents", "bigint")],
+            columns: vec![
+                col("id", "text"),
+                col("invoice_id", "text"),
+                col("description", "text"),
+                col("amount_cents", "bigint"),
+            ],
         },
         SqlTableInfo {
             name: "billing_checkouts",
@@ -1408,8 +1568,10 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
 /// whole token (split on any non-alphanumeric byte) so an ordinary column or
 /// table name that merely CONTAINS one of these words as a substring (e.g. a
 /// hypothetical `updated_by` column) is never a false-positive rejection.
-const BLOCKED_SQL_KEYWORDS: &[&str] =
-    &["INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE", "REPLACE", "MERGE", "CALL", "EXEC", "EXECUTE", "COPY", "VACUUM"];
+const BLOCKED_SQL_KEYWORDS: &[&str] = &[
+    "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE", "CREATE", "GRANT", "REVOKE",
+    "REPLACE", "MERGE", "CALL", "EXEC", "EXECUTE", "COPY", "VACUUM",
+];
 
 /// `Err(reason)` if `sql` contains anything beyond a single read-only
 /// statement. This is the ONLY gate between an admin's typed input and a live
@@ -1423,7 +1585,10 @@ fn reject_unless_readonly(sql: &str) -> Result<(), String> {
         return Err("empty query".into());
     }
     let upper = trimmed.to_uppercase();
-    let first_token = upper.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').find(|s| !s.is_empty()).unwrap_or("");
+    let first_token = upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
     if first_token != "SELECT" && first_token != "WITH" {
         return Err("only SELECT (or a read-only WITH ... SELECT) is allowed here".into());
     }
@@ -1477,19 +1642,26 @@ fn sql_value_to_json(v: &SqlValue) -> serde_json::Value {
 /// live mutation path).
 pub(crate) async fn run_readonly_query(sql: &str) -> Result<serde_json::Value, String> {
     reject_unless_readonly(sql)?;
-    let db = crate::guardian::sql_db().await.map_err(|e| format!("relational store unavailable: {e}"))?;
+    let db = crate::guardian::sql_db()
+        .await
+        .map_err(|e| format!("relational store unavailable: {e}"))?;
     let mut s = session(db).await;
     let results = exec(&mut s, sql).await?;
     for r in &results {
         if let ExecResult::Rows { fields, rows } = r {
             let field_names: Vec<String> = fields.iter().map(|f| f.name.clone()).collect();
-            let json_rows: Vec<Vec<serde_json::Value>> = rows.iter().map(|row| row.iter().map(sql_value_to_json).collect()).collect();
+            let json_rows: Vec<Vec<serde_json::Value>> = rows
+                .iter()
+                .map(|row| row.iter().map(sql_value_to_json).collect())
+                .collect();
             return Ok(serde_json::json!({ "fields": field_names, "rows": json_rows }));
         }
     }
     // A read-only statement that legitimately returns zero result sets (rare,
     // but not itself evidence of anything unsafe having run) — an empty grid.
-    Ok(serde_json::json!({ "fields": Vec::<String>::new(), "rows": Vec::<Vec<serde_json::Value>>::new() }))
+    Ok(
+        serde_json::json!({ "fields": Vec::<String>::new(), "rows": Vec::<Vec<serde_json::Value>>::new() }),
+    )
 }
 
 /// Build `{field: value, ...}` JSON objects from a query's result rows, keyed
@@ -1539,7 +1711,9 @@ fn rows_to_json_objects(res: &[ExecResult]) -> Vec<serde_json::Value> {
 /// in-progress period's draft is never persisted here (see
 /// `upsert_billing`'s doc comment) — `admin::billing_invoices` appends
 /// `BillingStore::current_invoice` itself to restore that field for callers.
-pub(crate) async fn billing_snapshot(tenant: &str) -> Option<(Option<String>, Option<String>, Option<String>)> {
+pub(crate) async fn billing_snapshot(
+    tenant: &str,
+) -> Option<(Option<String>, Option<String>, Option<String>)> {
     let db = crate::guardian::sql_db().await.ok()?;
     let mut s = session(db).await;
 
@@ -1565,7 +1739,11 @@ pub(crate) async fn billing_snapshot(tenant: &str) -> Option<(Option<String>, Op
          FROM billing_ledger WHERE tenant = {} ORDER BY ts_ms DESC",
         q(tenant)
     );
-    let ledger_rows = exec(&mut s, &ledger_q).await.ok().map(|r| rows_to_json_objects(&r)).unwrap_or_default();
+    let ledger_rows = exec(&mut s, &ledger_q)
+        .await
+        .ok()
+        .map(|r| rows_to_json_objects(&r))
+        .unwrap_or_default();
     let ledger = Some(serde_json::Value::Array(ledger_rows).to_string());
 
     let inv_q = format!(
@@ -1573,17 +1751,32 @@ pub(crate) async fn billing_snapshot(tenant: &str) -> Option<(Option<String>, Op
          FROM billing_invoices WHERE tenant = {} ORDER BY period_start_ms DESC",
         q(tenant)
     );
-    let invoice_rows = exec(&mut s, &inv_q).await.ok().map(|r| rows_to_json_objects(&r)).unwrap_or_default();
+    let invoice_rows = exec(&mut s, &inv_q)
+        .await
+        .ok()
+        .map(|r| rows_to_json_objects(&r))
+        .unwrap_or_default();
     let mut invoices_out = Vec::with_capacity(invoice_rows.len());
     for mut inv in invoice_rows {
-        let id = inv.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let id = inv
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
         let lines_q = format!(
             "SELECT description, amount_cents FROM billing_invoice_lines WHERE invoice_id = {} ORDER BY id",
             q(&id)
         );
-        let lines = exec(&mut s, &lines_q).await.ok().map(|r| rows_to_json_objects(&r)).unwrap_or_default();
+        let lines = exec(&mut s, &lines_q)
+            .await
+            .ok()
+            .map(|r| rows_to_json_objects(&r))
+            .unwrap_or_default();
         if let Some(obj) = inv.as_object_mut() {
-            obj.insert("tenant".into(), serde_json::Value::String(tenant.to_string()));
+            obj.insert(
+                "tenant".into(),
+                serde_json::Value::String(tenant.to_string()),
+            );
             obj.insert("lines".into(), serde_json::Value::Array(lines));
         }
         invoices_out.push(inv);

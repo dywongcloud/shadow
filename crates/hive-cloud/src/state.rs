@@ -230,7 +230,8 @@ pub struct CloudState {
     /// gossip. Lets the dashboard's per-project deployment list show deployments
     /// that the placement scheduler placed on OTHER nodes (e.g. the default
     /// San-Jose placement), not just the ones this coordinator hosts locally.
-    pub peer_deployments: RwLock<std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>>,
+    pub peer_deployments:
+        RwLock<std::collections::HashMap<String, Vec<fluid_core::DeploymentInfo>>>,
     /// Per-project last-seen tracked-branch HEAD SHA for the webhook-less git
     /// auto-deploy poller (`git::spawn_git_poll_reconcile`). Keyed by project.
     /// Seeded from the deployed commit on first sight so an already-current
@@ -245,6 +246,16 @@ pub struct CloudState {
     /// peer, a NEW stream per request (no per-request handshake). Set when `iroh`
     /// binds; `None` = P2P disabled (HTTP mesh still routes). See [`hive_p2p::PeerPool`].
     pub mesh: RwLock<Option<Arc<hive_p2p::PeerPool>>>,
+    /// Separate `hive/browser/0` connection pool. ALPN is negotiated per QUIC
+    /// connection, so browser invokes never share trusted fleet trunks.
+    pub browser_mesh: RwLock<Option<Arc<hive_p2p::BrowserPool>>>,
+    /// Leader-owned, short-lived browser serving grants. Browser endpoint ids
+    /// stay here and never enter the trusted fleet registry or scheduler.
+    pub browser_admissions: crate::browser_admission::BrowserAdmissionStore,
+    /// Replicated, TTL-bound coarse presence for admitted browser peers (for
+    /// the constellation's satellite markers) — separate from `NodeInfo` and
+    /// from `browser_admissions`; never read by placement/scheduling/DNS.
+    pub browser_presence: crate::browser_presence::BrowserPresenceStore,
     /// Live relay-set tracker for the bound `iroh` endpoint (dynamic-relay-list):
     /// diffs [own relay_url + healthy peers' relay_url + the central backstop]
     /// against what's actually applied via `Endpoint::insert_relay`/`remove_relay`
@@ -314,7 +325,9 @@ fn host_has_allowed_suffix(host: &str, suffixes: &[String]) -> bool {
     if h.is_empty() || !h.contains('.') {
         return true;
     }
-    suffixes.iter().any(|s| h == *s || h.ends_with(&format!(".{s}")))
+    suffixes
+        .iter()
+        .any(|s| h == *s || h.ends_with(&format!(".{s}")))
 }
 
 /// Apps-domain host rule (`*.{apps_domain}`): the apex is allowed (landing/
@@ -327,7 +340,10 @@ pub fn host_matches_apps_domain(host: &str, apps_domain: &str) -> bool {
         return false;
     }
     let h = host.split(':').next().unwrap_or(host).to_ascii_lowercase();
-    let d = apps_domain.trim().trim_start_matches('.').to_ascii_lowercase();
+    let d = apps_domain
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
     if h == d {
         return true; // apex
     }
@@ -348,7 +364,10 @@ mod apps_domain_tests {
         assert!(host_matches_apps_domain("shadw.app", "shadw.app"));
         assert!(host_matches_apps_domain("myapp.shadw.app", "shadw.app"));
         assert!(host_matches_apps_domain("MyApp.Shadw.App:443", "shadw.app"));
-        assert!(host_matches_apps_domain("my-app-git-main-team.shadw.app", "shadw.app"));
+        assert!(host_matches_apps_domain(
+            "my-app-git-main-team.shadw.app",
+            "shadw.app"
+        ));
         assert!(!host_matches_apps_domain("a.b.shadw.app", "shadw.app"));
         assert!(!host_matches_apps_domain(".shadw.app", "shadw.app"));
         assert!(!host_matches_apps_domain("shadw.app.evil.com", "shadw.app"));
@@ -434,9 +453,12 @@ impl CloudState {
     pub fn control_plane_leader(&self) -> String {
         let chain = crate::cluster::Cluster::owner_chain_from_env();
         let pref = std::env::var("HIVE_CP_LEADER").ok();
-        let owner =
-            crate::cluster::Cluster::control_plane_owner(&chain, pref.as_deref(), &self.registry.nodes())
-                .unwrap_or_else(|| self.node_name.clone());
+        let owner = crate::cluster::Cluster::control_plane_owner(
+            &chain,
+            pref.as_deref(),
+            &self.registry.nodes(),
+        )
+        .unwrap_or_else(|| self.node_name.clone());
         self.cluster.observe_owner(&owner);
         owner
     }
@@ -563,7 +585,10 @@ impl CloudState {
             // / 10s per deployment — generous for real traffic, isolating any
             // single deployment's surge from every other tenant on the node.
             admission: Arc::new(RateLimiter::new(
-                std::env::var("HIVE_DEPLOY_BURST").ok().and_then(|v| v.parse().ok()).unwrap_or(1000),
+                std::env::var("HIVE_DEPLOY_BURST")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(1000),
                 10_000,
             )),
             ratelimit: Arc::new(RateLimiter::new(100, 10_000)),
@@ -604,6 +629,9 @@ impl CloudState {
             git_poll_seen: RwLock::new(std::collections::HashMap::new()),
             iroh: RwLock::new(None),
             mesh: RwLock::new(None),
+            browser_mesh: RwLock::new(None),
+            browser_admissions: crate::browser_admission::BrowserAdmissionStore::new(),
+            browser_presence: crate::browser_presence::BrowserPresenceStore::new(),
             relay_set: RwLock::new(None),
             leases: crate::lease::LeaseStore::new(),
             container_holders: RwLock::new(std::collections::HashMap::new()),
@@ -645,7 +673,8 @@ impl CloudState {
 
     /// Epoch-ms of the last successful gossip sync (0 = never).
     pub fn last_gossip_ms(&self) -> u64 {
-        self.last_gossip_ok_ms.load(std::sync::atomic::Ordering::Relaxed)
+        self.last_gossip_ok_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the control plane is degraded: we have peers configured but haven't
@@ -663,7 +692,12 @@ impl CloudState {
         let expected: std::collections::HashSet<String> = self
             .trusted_peer_ids
             .read()
-            .map(|g| g.iter().filter(|id| Some((*id).as_str()) != self_pid.as_deref()).cloned().collect())
+            .map(|g| {
+                g.iter()
+                    .filter(|id| Some((*id).as_str()) != self_pid.as_deref())
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         let visible: std::collections::HashSet<String> = self
             .registry
@@ -769,7 +803,16 @@ impl CloudState {
         }
     }
 
-    pub fn event(&self, region: &str, method: &str, host: &str, path: &str, status: u16, action: &str, detail: &str) -> Event {
+    pub fn event(
+        &self,
+        region: &str,
+        method: &str,
+        host: &str,
+        path: &str,
+        status: u16,
+        action: &str,
+        detail: &str,
+    ) -> Event {
         // EXACT attribution only (no default-deployment fallback, no detail
         // fallback): an event belongs to a project/deployment iff the request
         // host's subdomain actually ALIASES one of this node's deployments.
@@ -823,22 +866,37 @@ mod tests {
         // Round where we reached NO peer: alive node survives, aged-out node drops.
         let alive: HashSet<String> = ["fc-virginia".to_string()].into_iter().collect();
         let merged = merge_deployments_ttl(&prev, HashMap::new(), &alive);
-        assert!(merged.contains_key("fc-virginia"), "alive-but-unreached node carried forward");
-        assert!(!merged.contains_key("dead-node"), "node gone from registry is dropped");
+        assert!(
+            merged.contains_key("fc-virginia"),
+            "alive-but-unreached node carried forward"
+        );
+        assert!(
+            !merged.contains_key("dead-node"),
+            "node gone from registry is dropped"
+        );
 
         // Reached this round with an empty list → authoritative (node truly has none now).
         let mut fresh: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
         fresh.insert("fc-virginia".into(), vec![]);
         let merged = merge_deployments_ttl(&prev, fresh, &alive);
-        assert!(merged.get("fc-virginia").unwrap().is_empty(), "reached node's empty list wins");
+        assert!(
+            merged.get("fc-virginia").unwrap().is_empty(),
+            "reached node's empty list wins"
+        );
     }
 
     #[test]
     fn allowed_suffixes_route_foreign_roots_rejected() {
         let s = suffixes();
         // Legit wildcard ingress hosts.
-        assert!(host_has_allowed_suffix("myapp.deployment.shadow.ngrok.pizza", &s));
-        assert!(host_has_allowed_suffix("dpl-abc.deployment.shadow.ngrok.pizza:443", &s));
+        assert!(host_has_allowed_suffix(
+            "myapp.deployment.shadow.ngrok.pizza",
+            &s
+        ));
+        assert!(host_has_allowed_suffix(
+            "dpl-abc.deployment.shadow.ngrok.pizza:443",
+            &s
+        ));
         assert!(host_has_allowed_suffix("myapp.localhost", &s));
         assert!(host_has_allowed_suffix("myapp.localhost:8787", &s));
         // Bare / empty / direct hosts are allowed (no foreign root to spoof).
@@ -847,7 +905,10 @@ mod tests {
         // Foreign roots are rejected even if the first label collides with an alias.
         assert!(!host_has_allowed_suffix("myapp.evil.com", &s));
         assert!(!host_has_allowed_suffix("foobar.evil.com", &s));
-        assert!(!host_has_allowed_suffix("deployment.shadow.ngrok.pizza.evil.com", &s));
+        assert!(!host_has_allowed_suffix(
+            "deployment.shadow.ngrok.pizza.evil.com",
+            &s
+        ));
     }
 
     #[test]
@@ -855,14 +916,21 @@ mod tests {
         use super::{merge_routes_ttl, PeerRoute};
         use std::collections::{HashMap, HashSet};
         let mk = |node: &str, seen: u64| PeerRoute {
-            node_id: node.into(), region: "r".into(), gateway: format!("http://{node}"),
-            latency_ms: 1, healthy: true, last_seen_ms: seen,
+            node_id: node.into(),
+            region: "r".into(),
+            gateway: format!("http://{node}"),
+            latency_ms: 1,
+            healthy: true,
+            last_seen_ms: seen,
         };
         let now = 1_000_000u64;
         let ttl = 30_000u64;
         // prev: host "app" served by peer-X (seen recently) and peer-Y (seen long ago).
         let mut prev: HashMap<String, Vec<PeerRoute>> = HashMap::new();
-        prev.insert("app".into(), vec![mk("peer-x", now - 5_000), mk("peer-y", now - 90_000)]);
+        prev.insert(
+            "app".into(),
+            vec![mk("peer-x", now - 5_000), mk("peer-y", now - 90_000)],
+        );
 
         // This round we reached only peer-z (serves "app"); X and Y were NOT reached.
         let mut fresh: HashMap<String, Vec<PeerRoute>> = HashMap::new();
@@ -872,7 +940,10 @@ mod tests {
         let merged = merge_routes_ttl(&prev, fresh, &seen, now, ttl);
         let nodes: HashSet<&str> = merged["app"].iter().map(|r| r.node_id.as_str()).collect();
         assert!(nodes.contains("peer-z"), "freshly-gossiped route present");
-        assert!(nodes.contains("peer-x"), "transient-miss peer kept within TTL");
+        assert!(
+            nodes.contains("peer-x"),
+            "transient-miss peer kept within TTL"
+        );
         assert!(!nodes.contains("peer-y"), "stale (>TTL) peer dropped");
 
         // If peer-x IS reached this round but no longer serves "app", it must drop
@@ -880,8 +951,14 @@ mod tests {
         let mut fresh2: HashMap<String, Vec<PeerRoute>> = HashMap::new();
         let seen2: HashSet<String> = ["peer-x".to_string()].into_iter().collect();
         let merged2 = merge_routes_ttl(&prev, fresh2.drain().collect(), &seen2, now, ttl);
-        let nodes2: HashSet<&str> = merged2.get("app").map(|v| v.iter().map(|r| r.node_id.as_str()).collect()).unwrap_or_default();
-        assert!(!nodes2.contains("peer-x"), "reached peer that dropped the deployment ages out immediately");
+        let nodes2: HashSet<&str> = merged2
+            .get("app")
+            .map(|v| v.iter().map(|r| r.node_id.as_str()).collect())
+            .unwrap_or_default();
+        assert!(
+            !nodes2.contains("peer-x"),
+            "reached peer that dropped the deployment ages out immediately"
+        );
     }
 
     #[test]
@@ -909,7 +986,10 @@ mod tests {
         // (peer_count from self.peers) would report "not degraded" — but
         // `mesh_isolated` uses the static trusted-peer-id EXPECTATION instead,
         // so it correctly flags isolation even when cp_degraded is blind to it.
-        assert!(super::mesh_isolated(7, 0), "peers expected, none visible = isolated");
+        assert!(
+            super::mesh_isolated(7, 0),
+            "peers expected, none visible = isolated"
+        );
         // Standalone-by-design (genuinely zero trusted peers configured) is never
         // isolated — nothing was expected.
         assert!(!super::mesh_isolated(0, 0));

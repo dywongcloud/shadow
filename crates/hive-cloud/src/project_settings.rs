@@ -37,19 +37,34 @@ fn looks_like_secret(v: &str) -> bool {
     }
     const PREFIXES: &[&str] = &[
         // GitHub personal/app/OAuth/refresh tokens + fine-grained PATs.
-        "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
         // AWS access key IDs (both long-term and STS-issued).
-        "AKIA", "ASIA",
+        "AKIA",
+        "ASIA",
         // Stripe secret/restricted keys (live and test).
-        "sk_live_", "sk_test_", "rk_live_", "rk_test_",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_",
         // npm publish tokens.
         "npm_",
         // Slack bot/user/app/config tokens.
-        "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+        "xoxs-",
         // Google API keys.
         "AIza",
         // Anthropic / OpenAI API keys.
-        "sk-ant-", "sk-proj-", "sk-",
+        "sk-ant-",
+        "sk-proj-",
+        "sk-",
         // PEM-encoded private key blocks.
         "-----BEGIN ",
     ];
@@ -257,7 +272,9 @@ pub struct ProjectStore {
 
 impl ProjectStore {
     pub fn new() -> ProjectStore {
-        ProjectStore { map: RwLock::new(HashMap::new()) }
+        ProjectStore {
+            map: RwLock::new(HashMap::new()),
+        }
     }
 
     pub fn get(&self, project: &str) -> ProjectSettings {
@@ -275,7 +292,11 @@ impl ProjectStore {
     /// checks run on every deploy/create) where the old `snapshot()` clone was
     /// O(all projects × settings size). Semantics-preserving.
     pub fn find_key_ci(&self, name: &str) -> Option<String> {
-        self.map.read().keys().find(|k| k.eq_ignore_ascii_case(name)).cloned()
+        self.map
+            .read()
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(name))
+            .cloned()
     }
 
     /// Replace the whole store (used on boot).
@@ -390,7 +411,9 @@ impl ProjectStore {
         // regardless of which node actually owns this in-memory row.
         let (project, team, root_dir) = (project.to_string(), team.to_string(), root_dir);
         if let Ok(h) = tokio::runtime::Handle::try_current() {
-            h.spawn(async move { crate::relational::set_project_team(&project, &team, &root_dir).await });
+            h.spawn(async move {
+                crate::relational::set_project_team(&project, &team, &root_dir).await
+            });
         }
     }
 
@@ -402,12 +425,20 @@ impl ProjectStore {
 
     /// The configured root/subdirectory for a project ("" if none).
     pub fn root_dir_of(&self, project: &str) -> String {
-        self.map.read().get(project).map(|s| s.build.root_dir.clone()).unwrap_or_default()
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.build.root_dir.clone())
+            .unwrap_or_default()
     }
 
     /// The project's production branch ("" if not yet classified).
     pub fn production_branch_of(&self, project: &str) -> String {
-        self.map.read().get(project).map(|s| s.production_branch.clone()).unwrap_or_default()
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.production_branch.clone())
+            .unwrap_or_default()
     }
 
     /// Set the production branch (Vercel "Production Branch"). Called once on the
@@ -430,25 +461,41 @@ impl ProjectStore {
     /// Whether this project's cron jobs are allowed to fire (default true —
     /// an unknown/never-configured project is not disabled).
     pub fn cron_enabled(&self, project: &str) -> bool {
-        self.map.read().get(project).map(|s| s.cron_enabled).unwrap_or(true)
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.cron_enabled)
+            .unwrap_or(true)
     }
 
     /// Team slug owning a project. A project absent from this store (never
     /// `set_team`'d) is UNOWNED — resolves to `UNTAGGED_TENANT`, never the
     /// owner's real "personal" namespace (see `default_team`).
     pub fn team_of(&self, project: &str) -> String {
-        self.map.read().get(project).map(|s| s.team.clone()).unwrap_or_else(default_team)
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.team.clone())
+            .unwrap_or_else(default_team)
     }
 
     /// Count of projects owned by a team/tenant (for plan-quota enforcement).
     pub fn count_for_team(&self, team: &str) -> usize {
         let t = team.trim().to_lowercase();
-        self.map.read().values().filter(|s| s.team.trim().to_lowercase() == t).count()
+        self.map
+            .read()
+            .values()
+            .filter(|s| s.team.trim().to_lowercase() == t)
+            .count()
     }
 
     /// Whether previews for a project are protected (defaults to true).
     pub fn preview_protected(&self, project: &str) -> bool {
-        self.map.read().get(project).map(|s| s.preview_protection).unwrap_or(true)
+        self.map
+            .read()
+            .get(project)
+            .map(|s| s.preview_protection)
+            .unwrap_or(true)
     }
 
     pub fn add_domain(&self, project: &str, domain: String) {
@@ -493,7 +540,13 @@ mod tests {
     use super::*;
 
     fn ev(key: &str, value: &str, sensitive: bool) -> EnvVar {
-        EnvVar { key: key.into(), value: value.into(), target: "all".into(), sensitive, updated_ms: 0 }
+        EnvVar {
+            key: key.into(),
+            value: value.into(),
+            target: "all".into(),
+            sensitive,
+            updated_ms: 0,
+        }
     }
 
     #[test]
@@ -515,7 +568,10 @@ mod tests {
         assert_eq!(m.get("FOO").map(|v| v.as_str()), Some("bar"));
         // Same key+target replaces rather than duplicates.
         s.put_env("app", ev("FOO", "baz", false));
-        assert_eq!(s.get("app").env.iter().filter(|e| e.key == "FOO").count(), 1);
+        assert_eq!(
+            s.get("app").env.iter().filter(|e| e.key == "FOO").count(),
+            1
+        );
         assert_eq!(s.env_map("app").get("FOO").map(|v| v.as_str()), Some("baz"));
     }
 
@@ -524,14 +580,34 @@ mod tests {
         let s = ProjectStore::new();
         s.put_env("app", ev("API_TOKEN", "supersecret", true));
         // Stored at rest: not plaintext (encrypted blob).
-        let stored = s.get("app").env.iter().find(|e| e.key == "API_TOKEN").unwrap().value.clone();
+        let stored = s
+            .get("app")
+            .env
+            .iter()
+            .find(|e| e.key == "API_TOKEN")
+            .unwrap()
+            .value
+            .clone();
         assert_ne!(stored, "supersecret");
-        assert!(crate::secrets::is_encrypted(&stored), "sensitive env sealed at rest");
+        assert!(
+            crate::secrets::is_encrypted(&stored),
+            "sensitive env sealed at rest"
+        );
         // Masked view blanks the value.
-        let masked = s.get_masked("app").env.iter().find(|e| e.key == "API_TOKEN").unwrap().value.clone();
+        let masked = s
+            .get_masked("app")
+            .env
+            .iter()
+            .find(|e| e.key == "API_TOKEN")
+            .unwrap()
+            .value
+            .clone();
         assert_eq!(masked, "");
         // Runtime injection decrypts back to plaintext.
-        assert_eq!(s.env_map("app").get("API_TOKEN").map(|v| v.as_str()), Some("supersecret"));
+        assert_eq!(
+            s.env_map("app").get("API_TOKEN").map(|v| v.as_str()),
+            Some("supersecret")
+        );
     }
 
     #[test]
@@ -577,7 +653,11 @@ mod tests {
         let snap = s.snapshot();
         for probe in ["MyApp", "myapp", "nope", "my-app"] {
             let old = snap.keys().find(|k| k.eq_ignore_ascii_case(probe)).cloned();
-            assert_eq!(s.find_key_ci(probe), old, "find_key_ci disagrees for {probe}");
+            assert_eq!(
+                s.find_key_ci(probe),
+                old,
+                "find_key_ci disagrees for {probe}"
+            );
         }
     }
 
@@ -588,6 +668,9 @@ mod tests {
         let snap = s.snapshot();
         let s2 = ProjectStore::new();
         s2.load(snap);
-        assert_eq!(s2.env_map("app").get("SECRET").map(|v| v.as_str()), Some("v"));
+        assert_eq!(
+            s2.env_map("app").get("SECRET").map(|v| v.as_str()),
+            Some("v")
+        );
     }
 }

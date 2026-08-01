@@ -135,7 +135,9 @@ pub fn save_peer_iroh(map: &std::collections::HashMap<String, (String, String)>)
         return;
     }
     let tmp = dir.join("peer_iroh.json.tmp");
-    let Ok(json) = serde_json::to_string(map) else { return };
+    let Ok(json) = serde_json::to_string(map) else {
+        return;
+    };
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, peer_iroh_path());
     }
@@ -170,7 +172,9 @@ pub fn save_peer_guardian_addr(map: &std::collections::HashMap<String, String>) 
         return;
     }
     let tmp = dir.join("peer_guardian_addr.json.tmp");
-    let Ok(json) = serde_json::to_string(map) else { return };
+    let Ok(json) = serde_json::to_string(map) else {
+        return;
+    };
     if std::fs::write(&tmp, json).is_ok() {
         let _ = std::fs::rename(&tmp, peer_guardian_addr_path());
     }
@@ -185,7 +189,9 @@ pub fn load_peer_guardian_addr() -> std::collections::HashMap<String, String> {
 }
 
 fn dirs_home() -> PathBuf {
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."))
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn state_path() -> PathBuf {
@@ -225,7 +231,11 @@ pub fn save(snap: &PlatformSnapshot) -> std::io::Result<()> {
 
 /// Normalize a tenant namespace: empty => "personal".
 fn ns_norm(team: &str) -> String {
-    if team.trim().is_empty() { "personal".into() } else { team.trim().to_string() }
+    if team.trim().is_empty() {
+        "personal".into()
+    } else {
+        team.trim().to_string()
+    }
 }
 
 /// Partition the global snapshot into **per-tenant namespace documents**. Every
@@ -241,12 +251,19 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     // let another tenant's deployment/webhook re-materialize as personal-owned
     // on any node that later restores/clones this namespace doc.
     let team_of = |project: &str| -> String {
-        snap.projects.get(project).map(|s| ns_norm(&s.team)).unwrap_or_else(|| "__untagged__".into())
+        snap.projects
+            .get(project)
+            .map(|s| ns_norm(&s.team))
+            .unwrap_or_else(|| "__untagged__".into())
     };
     let mut docs: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
     let mut push = |ns: String, key: &str, val: Value| {
         let doc = docs.entry(ns).or_default();
-        doc.entry(key.to_string()).or_insert_with(|| json!([])).as_array_mut().unwrap().push(val);
+        doc.entry(key.to_string())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .unwrap()
+            .push(val);
     };
 
     for d in &snap.deployments {
@@ -293,7 +310,9 @@ pub fn namespaced(snap: &PlatformSnapshot) -> BTreeMap<String, Value> {
     global.insert("rewrites".into(), json!(snap.rewrites));
     global.insert("incidents".into(), json!(snap.incidents));
 
-    docs.into_iter().map(|(k, v)| (k, Value::Object(v))).collect()
+    docs.into_iter()
+        .map(|(k, v)| (k, Value::Object(v)))
+        .collect()
 }
 
 /// Write each tenant namespace document to `$HIVE_DATA/ns/<namespace>.json`.
@@ -358,7 +377,12 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         enterprise: cloud.enterprise.snapshot(),
         sandboxes: {
             let (sandboxes, commands, snapshots, mounts) = cloud.sandboxes.snapshot();
-            crate::sandboxes::SandboxesSnapshot { sandboxes, commands, snapshots, mounts }
+            crate::sandboxes::SandboxesSnapshot {
+                sandboxes,
+                commands,
+                snapshots,
+                mounts,
+            }
         },
     }
 }
@@ -484,9 +508,20 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // hours, which is indistinguishable from "the build never starts" to the
     // user. Reconciling to Error on boot gives an actionable, retryable state
     // instead of a silent hang.
-    let orphaned_count = deployments.iter().filter(|d| matches!(d.state, fluid_core::DeployState::Queued | fluid_core::DeployState::Building)).count();
+    let orphaned_count = deployments
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.state,
+                fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+            )
+        })
+        .count();
     for rec in &mut deployments {
-        if matches!(rec.state, fluid_core::DeployState::Queued | fluid_core::DeployState::Building) {
+        if matches!(
+            rec.state,
+            fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+        ) {
             rec.state = fluid_core::DeployState::Error;
         }
     }
@@ -502,8 +537,13 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         //                       image — requiring `root` here wrongly dropped live
         //                       Firecracker deployments on restart (e.g. shoomoo).
         //   • mock (static/serverless) → serves files from `root`, so root must exist.
-        let is_container = rec.manifest.functions.iter().any(|f| f.runtime == "container");
-        let fc_image_backed = cloud.gw.backend_name() == "firecracker" && rec.manifest.image.is_some();
+        let is_container = rec
+            .manifest
+            .functions
+            .iter()
+            .any(|f| f.runtime == "container");
+        let fc_image_backed =
+            cloud.gw.backend_name() == "firecracker" && rec.manifest.image.is_some();
         if is_container || fc_image_backed || std::path::Path::new(&rec.root).exists() {
             // Re-adopt any PUBLIC raw-port stamps this record carries into the
             // allocator registry (self-heal for a lost raw_ports.json): the
@@ -533,7 +573,10 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
         }
     }
     if healed_domains > 0 {
-        tracing::info!(count = healed_domains, "persist::restore: re-applied custom-domain aliases");
+        tracing::info!(
+            count = healed_domains,
+            "persist::restore: re-applied custom-domain aliases"
+        );
     }
     // Warm the git-webhook reverse index (`gitops::GitRepoIndex`) from what's
     // already known locally at this point: every deployment this node hosts was
@@ -544,11 +587,9 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     // also falls back to a full scan defensively for the window before this
     // call returns.
     cloud.git_index.rebuild(
-        cloud
-            .projects
-            .snapshot()
-            .into_keys()
-            .filter_map(|p| crate::admin::git_for_project_fleet(cloud, &p).map(|g| (p, g.repo_url))),
+        cloud.projects.snapshot().into_keys().filter_map(|p| {
+            crate::admin::git_for_project_fleet(cloud, &p).map(|g| (p, g.repo_url))
+        }),
     );
     if !snap.waf_rules.is_empty() {
         cloud.waf.set_rules(snap.waf_rules);
@@ -587,7 +628,12 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.docs.load(snap.docs);
     cloud.gitops.load(snap.gitops);
     cloud.enterprise.load(snap.enterprise);
-    cloud.sandboxes.load(snap.sandboxes.sandboxes, snap.sandboxes.commands, snap.sandboxes.snapshots, snap.sandboxes.mounts);
+    cloud.sandboxes.load(
+        snap.sandboxes.sandboxes,
+        snap.sandboxes.commands,
+        snap.sandboxes.snapshots,
+        snap.sandboxes.mounts,
+    );
     for def in snap.workflow_defs {
         cloud.workflows.define(def);
     }

@@ -63,13 +63,20 @@ pub struct SecureLinkStore {
 
 impl SecureLinkStore {
     pub fn new() -> SecureLinkStore {
-        SecureLinkStore { kes: Kes::new(), links: RwLock::new(Vec::new()) }
+        SecureLinkStore {
+            kes: Kes::new(),
+            links: RwLock::new(Vec::new()),
+        }
     }
 
     /// Provision a connector: bind a local listener that relays over WireGuard to
     /// `target`, mint a lease, and record it. Returns the record (with the local
     /// address a function should dial).
-    pub async fn provision(&self, req: ProvisionReq, default_region: &str) -> Result<LinkRecord, String> {
+    pub async fn provision(
+        &self,
+        req: ProvisionReq,
+        default_region: &str,
+    ) -> Result<LinkRecord, String> {
         let ttl = req.ttl_secs.unwrap_or(900).clamp(30, 24 * 3600);
         // Validate the tunnel is establishable (real handshake), then mint lease.
         let (lease, _probe) = SecureLink::establish_with_kes(&self.kes, &req.target, ttl)?;
@@ -89,7 +96,11 @@ impl SecureLinkStore {
             public_key: lease.public_key,
             created_ms: lease.created_ms,
             expires_ms: lease.expires_ms,
-            team: if req.team.is_empty() { "personal".into() } else { req.team },
+            team: if req.team.is_empty() {
+                "personal".into()
+            } else {
+                req.team
+            },
             project: req.project.unwrap_or_default(),
             env_var: req.env_var.unwrap_or_default(),
         };
@@ -124,7 +135,11 @@ impl SecureLinkStore {
         }
         l.iter()
             .filter(|r| {
-                let t = if r.team.is_empty() { "personal" } else { &r.team };
+                let t = if r.team.is_empty() {
+                    "personal"
+                } else {
+                    &r.team
+                };
                 t == team
             })
             .cloned()
@@ -144,7 +159,11 @@ impl SecureLinkStore {
 
     pub fn active(&self) -> usize {
         let now = now_ms();
-        self.links.read().iter().filter(|r| r.expires_ms > now).count()
+        self.links
+            .read()
+            .iter()
+            .filter(|r| r.expires_ms > now)
+            .count()
     }
 }
 
@@ -181,7 +200,9 @@ pub async fn start_connector(target: String) -> std::io::Result<u16> {
 /// through a per-connection WireGuard tunnel.
 async fn relay(client: TcpStream, target: &str) -> Result<(), String> {
     let mut link = SecureLink::establish(target)?;
-    let upstream = TcpStream::connect(target).await.map_err(|e| format!("dial backend: {e}"))?;
+    let upstream = TcpStream::connect(target)
+        .await
+        .map_err(|e| format!("dial backend: {e}"))?;
     let (mut cr, mut cw) = client.into_split();
     let (mut ur, mut uw) = upstream.into_split();
     let mut cbuf = vec![0u8; 16 * 1024];

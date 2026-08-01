@@ -58,7 +58,9 @@ impl MeteredSender {
     fn send(&self, f: Frame) -> Result<(), mpsc::error::SendError<Frame>> {
         let depth = self.meter.queued.fetch_add(1, Ordering::Relaxed) + 1;
         if depth >= BACKPRESSURE_HWM {
-            self.meter.backpressure_events.fetch_add(1, Ordering::Relaxed);
+            self.meter
+                .backpressure_events
+                .fetch_add(1, Ordering::Relaxed);
         }
         if let Err(e) = self.tx.send(f) {
             // Send failed (tunnel closed) — undo the depth bump so the gauge
@@ -83,7 +85,10 @@ impl TunnelServer {
         let (raw_tx, mut out_rx) = mpsc::unbounded_channel::<Frame>();
         let inflight = Arc::new(AtomicU32::new(0));
         let meter = Arc::new(TunnelMeter::default());
-        let out_tx = MeteredSender { tx: raw_tx, meter: meter.clone() };
+        let out_tx = MeteredSender {
+            tx: raw_tx,
+            meter: meter.clone(),
+        };
 
         // Writer task: flushes frames and accounts bytes_out + drains the queue gauge.
         let writer = {
@@ -98,7 +103,9 @@ impl TunnelServer {
                     if wr.write_all(&enc).await.is_err() {
                         break;
                     }
-                    meter.bytes_out.fetch_add(enc.len() as u64, Ordering::Relaxed);
+                    meter
+                        .bytes_out
+                        .fetch_add(enc.len() as u64, Ordering::Relaxed);
                 }
             })
         };
@@ -120,7 +127,10 @@ impl TunnelServer {
                         backpressure_events: meter.backpressure_events.load(Ordering::Relaxed),
                     };
                     let payload = serde_json::to_vec(&m).unwrap_or_default();
-                    if out.send(Frame::new(0, FrameKind::Metrics, payload)).is_err() {
+                    if out
+                        .send(Frame::new(0, FrameKind::Metrics, payload))
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -134,7 +144,9 @@ impl TunnelServer {
                 Err(_) => break,
             };
             // Account inbound bytes (#14): request payloads dominate ingress.
-            meter.bytes_in.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+            meter
+                .bytes_in
+                .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
             match frame.kind {
                 FrameKind::Ping => {
                     let _ = out_tx.send(Frame::new(0, FrameKind::Pong, Bytes::new()));
@@ -211,7 +223,8 @@ impl TunnelServer {
     /// connection to the SAME listener ordinary framed traffic uses.
     pub async fn serve_maybe_raw(stream: TcpStream, local_addr: String, max_concurrency: u32) {
         let mut peek = [0u8; 1];
-        let is_raw = matches!(stream.peek(&mut peek).await, Ok(1) if peek[0] == Self::RAW_UPGRADE_MAGIC);
+        let is_raw =
+            matches!(stream.peek(&mut peek).await, Ok(1) if peek[0] == Self::RAW_UPGRADE_MAGIC);
         if !is_raw {
             Self::serve(stream, local_addr, max_concurrency).await;
             return;
@@ -227,12 +240,7 @@ impl TunnelServer {
     }
 }
 
-async fn handle_request(
-    id: u64,
-    payload: Bytes,
-    local_http: &str,
-    out: &MeteredSender,
-) {
+async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &MeteredSender) {
     if let Err(e) = proxy_local(id, &payload, local_http, out).await {
         // Make sure the caller gets *something* terminal.
         let meta = RespMeta {
@@ -387,7 +395,11 @@ async fn proxy_local(
                 anyhow::ensure!(r > 0, "function closed mid-chunk");
                 buf.extend_from_slice(&tmp[..r]);
             }
-            out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&buf[..size])))?;
+            out.send(Frame::new(
+                id,
+                FrameKind::RespBody,
+                Bytes::copy_from_slice(&buf[..size]),
+            ))?;
             buf.drain(..size + 2); // consume data + trailing CRLF
         }
     } else {
@@ -409,7 +421,11 @@ async fn proxy_local(
                     let want = (n - sent).min(tmp.len());
                     let r = conn.read(&mut tmp[..want]).await?;
                     anyhow::ensure!(r > 0, "function closed mid-body");
-                    out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
+                    out.send(Frame::new(
+                        id,
+                        FrameKind::RespBody,
+                        Bytes::copy_from_slice(&tmp[..r]),
+                    ))?;
                     sent += r;
                 }
             }
@@ -418,7 +434,11 @@ async fn proxy_local(
                 if r == 0 {
                     break;
                 }
-                out.send(Frame::new(id, FrameKind::RespBody, Bytes::copy_from_slice(&tmp[..r])))?;
+                out.send(Frame::new(
+                    id,
+                    FrameKind::RespBody,
+                    Bytes::copy_from_slice(&tmp[..r]),
+                ))?;
             },
         }
     }
@@ -443,23 +463,38 @@ mod tests {
     fn metered_sender_tracks_queue_depth_and_backpressure() {
         let meter = Arc::new(TunnelMeter::default());
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
-        let s = MeteredSender { tx, meter: meter.clone() };
+        let s = MeteredSender {
+            tx,
+            meter: meter.clone(),
+        };
 
         // Enqueue past the high-water mark without draining.
         let n = BACKPRESSURE_HWM + 10;
         for _ in 0..n {
-            s.send(Frame::new(1, FrameKind::RespBody, Bytes::from_static(b"x"))).unwrap();
+            s.send(Frame::new(1, FrameKind::RespBody, Bytes::from_static(b"x")))
+                .unwrap();
         }
-        assert_eq!(meter.queued.load(Ordering::Relaxed), n, "depth = all undrained frames");
+        assert_eq!(
+            meter.queued.load(Ordering::Relaxed),
+            n,
+            "depth = all undrained frames"
+        );
         // Events trip for every enqueue at/after the HWM: depths HWM..=n.
-        assert_eq!(meter.backpressure_events.load(Ordering::Relaxed), n - BACKPRESSURE_HWM + 1);
+        assert_eq!(
+            meter.backpressure_events.load(Ordering::Relaxed),
+            n - BACKPRESSURE_HWM + 1
+        );
 
         // Simulate the writer draining (it decrements on dequeue).
         for _ in 0..n {
             let _ = rx.try_recv();
             meter.queued.fetch_sub(1, Ordering::Relaxed);
         }
-        assert_eq!(meter.queued.load(Ordering::Relaxed), 0, "queue fully drained");
+        assert_eq!(
+            meter.queued.load(Ordering::Relaxed),
+            0,
+            "queue fully drained"
+        );
     }
 
     // A send on a closed tunnel must not leak the depth gauge upward.
@@ -467,9 +502,18 @@ mod tests {
     fn metered_sender_undoes_depth_on_closed_channel() {
         let meter = Arc::new(TunnelMeter::default());
         let (tx, rx) = mpsc::unbounded_channel::<Frame>();
-        let s = MeteredSender { tx, meter: meter.clone() };
+        let s = MeteredSender {
+            tx,
+            meter: meter.clone(),
+        };
         drop(rx); // close the receiver
-        assert!(s.send(Frame::new(1, FrameKind::RespEnd, Bytes::new())).is_err());
-        assert_eq!(meter.queued.load(Ordering::Relaxed), 0, "depth restored on send failure");
+        assert!(s
+            .send(Frame::new(1, FrameKind::RespEnd, Bytes::new()))
+            .is_err());
+        assert_eq!(
+            meter.queued.load(Ordering::Relaxed),
+            0,
+            "depth restored on send failure"
+        );
     }
 }

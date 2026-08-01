@@ -190,7 +190,13 @@ const nextConfig = {
     // close clickjacking, base-href hijack and cross-origin form posting).
     const CSP_ENFORCED = [
       "default-src 'self'",
-      `script-src 'self' 'unsafe-inline' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
+      // 'wasm-unsafe-eval' is required for WebAssembly.instantiateStreaming
+      // (the "Run a node" browser peer's iroh wasm bundle) — it is NARROWLY
+      // scoped to wasm module compilation only, distinct from 'unsafe-eval'
+      // (arbitrary JS string eval), and does not weaken the policy against
+      // JS-eval-based XSS. Without it every "Run a node" attempt fails with a
+      // CSP violation the instant the wasm module tries to compile.
+      `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",
@@ -209,7 +215,7 @@ const nextConfig = {
     // `'unsafe-inline'` can be dropped from the enforcing policy above.
     const CSP_REPORT_ONLY = [
       "default-src 'self'",
-      `script-src 'self' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
+      `script-src 'self' 'wasm-unsafe-eval' ${CLERK_CSP_ORIGINS} https://challenges.cloudflare.com`,
       "style-src 'self' 'unsafe-inline'",
       "img-src 'self' data: blob: https:",
       "font-src 'self' data:",

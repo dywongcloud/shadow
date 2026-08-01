@@ -104,7 +104,10 @@ impl PublicKey {
         self.0.compress().to_bytes()
     }
     pub fn from_bytes(b: &[u8; 32]) -> Result<PublicKey, Error> {
-        CompressedRistretto(*b).decompress().map(PublicKey).ok_or(Error::Malformed)
+        CompressedRistretto(*b)
+            .decompress()
+            .map(PublicKey)
+            .ok_or(Error::Malformed)
     }
 }
 
@@ -140,7 +143,9 @@ impl Proof {
             return Err(Error::Malformed);
         }
         let c0 = scalar_from(&b[0..32])?;
-        let key_image = CompressedRistretto(arr(&b[32..64])).decompress().ok_or(Error::Malformed)?;
+        let key_image = CompressedRistretto(arr(&b[32..64]))
+            .decompress()
+            .ok_or(Error::Malformed)?;
         let mut s = Vec::new();
         let mut off = 64;
         while off < b.len() {
@@ -155,7 +160,12 @@ impl Proof {
 ///
 /// `scope` namespaces the nullifier (e.g. a deployment id / topic). The proof
 /// reveals nothing about which ring member signed — only that one of them did.
-pub fn prove(secret: &SecretKey, ring: &[PublicKey], scope: &[u8], message: &[u8]) -> Result<Proof, Error> {
+pub fn prove(
+    secret: &SecretKey,
+    ring: &[PublicKey],
+    scope: &[u8],
+    message: &[u8],
+) -> Result<Proof, Error> {
     let n = ring.len();
     if n == 0 {
         return Err(Error::EmptyRing);
@@ -190,7 +200,11 @@ pub fn prove(secret: &SecretKey, ring: &[PublicKey], scope: &[u8], message: &[u8
     // Close the ring at the signer.
     s[pi] = u - c[pi] * secret.0;
 
-    Ok(Proof { c0: c[0], s, key_image })
+    Ok(Proof {
+        c0: c[0],
+        s,
+        key_image,
+    })
 }
 
 /// Verify an anonymous membership proof against `ring`, `scope` and `message`.
@@ -236,7 +250,13 @@ fn hash_to_point(p: &PublicKey, scope: &[u8]) -> RistrettoPoint {
     RistrettoPoint::from_uniform_bytes(&wide)
 }
 
-fn challenge(ring_h: &[u8; 64], scope: &[u8], msg: &[u8], l: &RistrettoPoint, r: &RistrettoPoint) -> Scalar {
+fn challenge(
+    ring_h: &[u8; 64],
+    scope: &[u8],
+    msg: &[u8],
+    l: &RistrettoPoint,
+    r: &RistrettoPoint,
+) -> Scalar {
     let mut h = Sha512::new();
     h.update(CHAL_DOMAIN);
     h.update(ring_h);
@@ -297,18 +317,35 @@ impl Roster {
     /// The ring for "role ≥ `min`": every member who satisfies the threshold.
     /// Sorted by key bytes so provers and verifiers agree on ring order.
     pub fn ring(&self, min: Role) -> Vec<PublicKey> {
-        let mut ring: Vec<PublicKey> = self.members.iter().filter(|(_, r)| *r >= min).map(|(p, _)| *p).collect();
+        let mut ring: Vec<PublicKey> = self
+            .members
+            .iter()
+            .filter(|(_, r)| *r >= min)
+            .map(|(p, _)| *p)
+            .collect();
         ring.sort_by_key(|p| p.to_bytes());
         ring
     }
 
     /// Prove "I hold role ≥ `min` in this team", anonymously, for `scope`/`message`.
-    pub fn prove_membership(&self, secret: &SecretKey, min: Role, scope: &[u8], message: &[u8]) -> Result<Proof, Error> {
+    pub fn prove_membership(
+        &self,
+        secret: &SecretKey,
+        min: Role,
+        scope: &[u8],
+        message: &[u8],
+    ) -> Result<Proof, Error> {
         prove(secret, &self.ring(min), scope, message)
     }
 
     /// Verify a role-membership proof against the current roster.
-    pub fn verify_membership(&self, min: Role, scope: &[u8], message: &[u8], proof: &Proof) -> bool {
+    pub fn verify_membership(
+        &self,
+        min: Role,
+        scope: &[u8],
+        message: &[u8],
+        proof: &Proof,
+    ) -> bool {
         verify(&self.ring(min), scope, message, proof)
     }
 }
@@ -342,7 +379,13 @@ mod tests {
         let mut roster = Roster::new();
         for i in 0..n {
             let sk = SecretKey::generate();
-            let role = if i == 0 { Role::Owner } else if i < 3 { Role::Admin } else { Role::Member };
+            let role = if i == 0 {
+                Role::Owner
+            } else if i < 3 {
+                Role::Admin
+            } else {
+                Role::Member
+            };
             roster.enroll(sk.public(), role);
             secrets.push(sk);
         }
@@ -352,7 +395,9 @@ mod tests {
     #[test]
     fn prove_and_verify_roundtrip() {
         let (sk, roster) = team(6);
-        let p = roster.prove_membership(&sk[4], Role::Member, b"deploy:app", b"GET /").unwrap();
+        let p = roster
+            .prove_membership(&sk[4], Role::Member, b"deploy:app", b"GET /")
+            .unwrap();
         assert!(roster.verify_membership(Role::Member, b"deploy:app", b"GET /", &p));
     }
 
@@ -361,9 +406,16 @@ mod tests {
         let (sk, roster) = team(6);
         // A plain Member (index 4) cannot produce an Admin-ring proof — they're
         // not in that ring.
-        assert_eq!(roster.prove_membership(&sk[4], Role::Admin, b"s", b"m").err(), Some(Error::NotInRing));
+        assert_eq!(
+            roster
+                .prove_membership(&sk[4], Role::Admin, b"s", b"m")
+                .err(),
+            Some(Error::NotInRing)
+        );
         // An Owner (index 0) can prove Admin-level access (Owner ≥ Admin).
-        let p = roster.prove_membership(&sk[0], Role::Admin, b"s", b"m").unwrap();
+        let p = roster
+            .prove_membership(&sk[0], Role::Admin, b"s", b"m")
+            .unwrap();
         assert!(roster.verify_membership(Role::Admin, b"s", b"m", &p));
     }
 
@@ -371,13 +423,18 @@ mod tests {
     fn non_member_cannot_prove() {
         let (_sk, roster) = team(5);
         let outsider = SecretKey::generate();
-        assert_eq!(prove(&outsider, &roster.ring(Role::Member), b"s", b"m").err(), Some(Error::NotInRing));
+        assert_eq!(
+            prove(&outsider, &roster.ring(Role::Member), b"s", b"m").err(),
+            Some(Error::NotInRing)
+        );
     }
 
     #[test]
     fn tamper_is_rejected() {
         let (sk, roster) = team(5);
-        let p = roster.prove_membership(&sk[3], Role::Member, b"scope", b"msg").unwrap();
+        let p = roster
+            .prove_membership(&sk[3], Role::Member, b"scope", b"msg")
+            .unwrap();
         assert!(!roster.verify_membership(Role::Member, b"scope", b"DIFFERENT", &p));
         assert!(!roster.verify_membership(Role::Member, b"OTHER-SCOPE", b"msg", &p));
         assert!(!roster.verify_membership(Role::Admin, b"scope", b"msg", &p)); // different ring
@@ -387,14 +444,22 @@ mod tests {
     fn nullifier_links_within_scope_only() {
         let (sk, roster) = team(6);
         // Same member, same scope → same nullifier (reuse detectable).
-        let a = roster.prove_membership(&sk[4], Role::Member, b"scope-1", b"m1").unwrap();
-        let b = roster.prove_membership(&sk[4], Role::Member, b"scope-1", b"m2").unwrap();
+        let a = roster
+            .prove_membership(&sk[4], Role::Member, b"scope-1", b"m1")
+            .unwrap();
+        let b = roster
+            .prove_membership(&sk[4], Role::Member, b"scope-1", b"m2")
+            .unwrap();
         assert_eq!(a.nullifier(), b.nullifier());
         // Same member, different scope → different nullifier (unlinkable).
-        let c = roster.prove_membership(&sk[4], Role::Member, b"scope-2", b"m1").unwrap();
+        let c = roster
+            .prove_membership(&sk[4], Role::Member, b"scope-2", b"m1")
+            .unwrap();
         assert_ne!(a.nullifier(), c.nullifier());
         // Different member, same scope → different nullifier.
-        let d = roster.prove_membership(&sk[5], Role::Member, b"scope-1", b"m1").unwrap();
+        let d = roster
+            .prove_membership(&sk[5], Role::Member, b"scope-1", b"m1")
+            .unwrap();
         assert_ne!(a.nullifier(), d.nullifier());
     }
 
@@ -403,8 +468,12 @@ mod tests {
         let (sk, roster) = team(8);
         // Two different members produce valid proofs for the same ring/scope/msg;
         // verification can't tell which one signed (no index is revealed).
-        let p4 = roster.prove_membership(&sk[4], Role::Member, b"s", b"m").unwrap();
-        let p7 = roster.prove_membership(&sk[7], Role::Member, b"s", b"m").unwrap();
+        let p4 = roster
+            .prove_membership(&sk[4], Role::Member, b"s", b"m")
+            .unwrap();
+        let p7 = roster
+            .prove_membership(&sk[7], Role::Member, b"s", b"m")
+            .unwrap();
         assert!(roster.verify_membership(Role::Member, b"s", b"m", &p4));
         assert!(roster.verify_membership(Role::Member, b"s", b"m", &p7));
         assert_ne!(p4.nullifier(), p7.nullifier());
@@ -414,16 +483,22 @@ mod tests {
     fn nullifier_set_detects_reuse() {
         let (sk, roster) = team(5);
         let mut spent = NullifierSet::new();
-        let p = roster.prove_membership(&sk[3], Role::Member, b"vote", b"once").unwrap();
+        let p = roster
+            .prove_membership(&sk[3], Role::Member, b"vote", b"once")
+            .unwrap();
         assert!(spent.redeem(&p)); // first use accepted
-        let again = roster.prove_membership(&sk[3], Role::Member, b"vote", b"twice").unwrap();
+        let again = roster
+            .prove_membership(&sk[3], Role::Member, b"vote", b"twice")
+            .unwrap();
         assert!(!spent.redeem(&again)); // same member+scope → rejected
     }
 
     #[test]
     fn proof_serialization_roundtrips() {
         let (sk, roster) = team(5);
-        let p = roster.prove_membership(&sk[2], Role::Member, b"s", b"m").unwrap();
+        let p = roster
+            .prove_membership(&sk[2], Role::Member, b"s", b"m")
+            .unwrap();
         let bytes = p.to_bytes();
         let p2 = Proof::from_bytes(&bytes).unwrap();
         assert_eq!(p.nullifier(), p2.nullifier());

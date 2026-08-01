@@ -28,7 +28,10 @@ fn test_hive(warm: BTreeMap<String, usize>, provision_ms: u64) -> Arc<Hive> {
     let uid = unique_test_id();
     let cfg = HiveConfig {
         hive_id: "hive-test".into(),
-        boxes: vec![BoxConfig { vcpus: 8, mem_mib: 8192 }],
+        boxes: vec![BoxConfig {
+            vcpus: 8,
+            mem_mib: 8192,
+        }],
         warm_targets: warm,
         default_warm_target: 0,
         warm_spec: ResourceSpec::default(),
@@ -66,7 +69,11 @@ async fn wait_terminal(hive: &Hive, id: &JobId) -> JobState {
 async fn wait_capacity_drained(hive: &Hive) {
     for _ in 0..400 {
         let status = hive.cluster_status();
-        if status.boxes.iter().all(|b| b.vcpus_used == 0 && b.cells == 0) {
+        if status
+            .boxes
+            .iter()
+            .all(|b| b.vcpus_used == 0 && b.cells == 0)
+        {
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;

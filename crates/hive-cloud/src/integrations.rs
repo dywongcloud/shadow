@@ -99,7 +99,9 @@ pub struct IntegrationStore {
 
 impl IntegrationStore {
     pub fn new() -> IntegrationStore {
-        IntegrationStore { items: RwLock::new(Vec::new()) }
+        IntegrationStore {
+            items: RwLock::new(Vec::new()),
+        }
     }
 
     pub fn snapshot(&self) -> Vec<IntegrationResource> {
@@ -112,11 +114,26 @@ impl IntegrationStore {
     /// Link or update an integration for a team. Idempotent on (team, provider):
     /// re-linking the same provider refreshes its credentials/env in place.
     pub fn upsert(&self, team: &str, req: UpsertReq) -> IntegrationResource {
-        let team = if team.is_empty() { "personal".to_string() } else { team.to_string() };
-        let name = if req.name.trim().is_empty() { req.provider.clone() } else { req.name.clone() };
-        let kind = if req.kind.trim().is_empty() { "oauth".to_string() } else { req.kind.clone() };
+        let team = if team.is_empty() {
+            "personal".to_string()
+        } else {
+            team.to_string()
+        };
+        let name = if req.name.trim().is_empty() {
+            req.provider.clone()
+        } else {
+            req.name.clone()
+        };
+        let kind = if req.kind.trim().is_empty() {
+            "oauth".to_string()
+        } else {
+            req.kind.clone()
+        };
         let mut items = self.items.write();
-        if let Some(existing) = items.iter_mut().find(|i| i.team == team && i.provider == req.provider) {
+        if let Some(existing) = items
+            .iter_mut()
+            .find(|i| i.team == team && i.provider == req.provider)
+        {
             existing.name = name;
             existing.kind = kind;
             existing.entity = req.entity;
@@ -142,11 +159,20 @@ impl IntegrationStore {
     }
 
     pub fn list(&self, team: &str) -> Vec<IntegrationResource> {
-        self.items.read().iter().filter(|i| i.team == team).cloned().collect()
+        self.items
+            .read()
+            .iter()
+            .filter(|i| i.team == team)
+            .cloned()
+            .collect()
     }
 
     pub fn get(&self, team: &str, id: &str) -> Option<IntegrationResource> {
-        self.items.read().iter().find(|i| i.team == team && i.id == id).cloned()
+        self.items
+            .read()
+            .iter()
+            .find(|i| i.team == team && i.id == id)
+            .cloned()
     }
 
     pub fn delete(&self, team: &str, id: &str) -> bool {
@@ -172,7 +198,14 @@ mod tests {
         creds.insert("token".into(), "secret-xyz".into());
         let mut env = BTreeMap::new();
         env.insert("STRIPE_API_KEY".into(), "secret-xyz".into());
-        UpsertReq { provider: provider.into(), name: "Stripe".into(), kind: "oauth".into(), entity: "gh_u1".into(), credentials: creds, env }
+        UpsertReq {
+            provider: provider.into(),
+            name: "Stripe".into(),
+            kind: "oauth".into(),
+            entity: "gh_u1".into(),
+            credentials: creds,
+            env,
+        }
     }
 
     #[test]
@@ -192,7 +225,10 @@ mod tests {
         let a = s.upsert("t1", req("stripe"));
         s.upsert("t2", req("stripe"));
         assert_eq!(s.list("t1").len(), 1);
-        assert!(!s.delete("t2", &a.id), "cannot delete another team's resource");
+        assert!(
+            !s.delete("t2", &a.id),
+            "cannot delete another team's resource"
+        );
         assert!(s.delete("t1", &a.id));
         assert!(s.list("t1").is_empty());
     }
@@ -202,7 +238,10 @@ mod tests {
         let s = IntegrationStore::new();
         let r = s.upsert("t", req("stripe"));
         let pubv = r.public();
-        assert!(pubv.get("credentials").is_none(), "list/get must not leak credentials");
+        assert!(
+            pubv.get("credentials").is_none(),
+            "list/get must not leak credentials"
+        );
         assert_eq!(pubv["env_keys"][0], "STRIPE_API_KEY");
         assert_eq!(pubv["has_credentials"], true);
         let full = r.full();

@@ -22,7 +22,9 @@ fn jb(j: axum::Json<serde_json::Value>) -> Vec<u8> {
 
 /// Whether iroh is the preferred gossip transport (opt-in; HTTP-over-SSH otherwise).
 pub fn iroh_enabled() -> bool {
-    std::env::var("HIVE_GOSSIP_IROH").map(|v| v == "1" || v == "true").unwrap_or(false)
+    std::env::var("HIVE_GOSSIP_IROH")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
 }
 
 /// Active health probe to a specific node over the iroh mesh, addressed DIRECTLY by
@@ -32,7 +34,12 @@ pub fn iroh_enabled() -> bool {
 /// QUIC path to the peer is alive). Returns round-trip ms on success, `None` on
 /// failure / when no mesh transport is bound. Reuses `/v1/nodes` (the same path the
 /// gossip loop already treats as the liveness signal) so no new endpoint is added.
-pub async fn probe(cloud: &Arc<CloudState>, node_id: &str, addr: &str, timeout: Duration) -> Option<u64> {
+pub async fn probe(
+    cloud: &Arc<CloudState>,
+    node_id: &str,
+    addr: &str,
+    timeout: Duration,
+) -> Option<u64> {
     let pool = cloud.mesh.read().clone()?;
     let t0 = hive_core::now_ms();
     match tokio::time::timeout(
@@ -120,14 +127,18 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
     match path {
         "/v1/nodes/announce" if method == hive_p2p::GOSSIP_POST => {
             if let Ok(node) = serde_json::from_slice::<hive_edge::NodeInfo>(body) {
-                return jb(crate::admin::node_announce(State(cloud.clone()), axum::Json(node)).await);
+                return jb(
+                    crate::admin::node_announce(State(cloud.clone()), axum::Json(node)).await,
+                );
             }
             Vec::new()
         }
-        "/v1/nodes" => match crate::admin::nodes(State(cloud.clone()), mesh_operator_claims()).await {
-            Ok(j) => jb(j),
-            Err(_) => Vec::new(),
-        },
+        "/v1/nodes" => {
+            match crate::admin::nodes(State(cloud.clone()), mesh_operator_claims()).await {
+                Ok(j) => jb(j),
+                Err(_) => Vec::new(),
+            }
+        }
         "/v1/serve-hosts" => jb(crate::admin::serve_hosts(State(cloud.clone())).await),
         // Full TeamStore snapshot for the leader->follower teams sync (see
         // spawn_relational_mirror_loop's follower branch). Team mutations only
@@ -152,6 +163,50 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         "/v1/incidents/snapshot" if method == hive_p2p::GOSSIP_GET => {
             serde_json::to_vec(&cloud.incidents.snapshot()).unwrap_or_default()
         }
+        // Accept-side browser admission recheck is identity-only and must
+        // precede the tenant-scoped endpoint arm below.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/accept/") => {
+            let endpoint_id = p
+                .trim_start_matches("/v1/browser/admissions/accept/")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            crate::browser_admission::mesh_accept(cloud, endpoint_id)
+        }
+        // Browser admission first-read leader fallback. The endpoint-specific
+        // arm must precede the list arm. Tenant comes from the verified,
+        // short-lived mesh delegation token appended by fetch_from_host.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/") => {
+            let endpoint_id = p
+                .trim_start_matches("/v1/browser/admissions/")
+                .split("?")
+                .next()
+                .unwrap_or("");
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                crate::browser_admission::mesh_get(cloud, &tenant, endpoint_id)
+            }
+        }
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions") => {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                crate::browser_admission::mesh_list(cloud, &tenant)
+            }
+        }
+        // Coarse browser presence first-read leader fallback (constellation
+        // satellites) — tenant-scoped the same way as the admissions list arm.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/presence") => {
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                crate::browser_presence::mesh_list(cloud, &tenant)
+            }
+        }
         // Generic leader->follower store snapshot: `GET /v1/store-snapshot/<name>`
         // serves any store registered in `store_sync::REGISTRY` (teams,
         // incidents, apikeys, webhooks, databases, domains, integrations,
@@ -170,7 +225,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // bundle_for_mesh — key decrypted in transit inside peer-authenticated
         // QUIC only; receiver re-encrypts with its own node key).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/tls/bundle") => {
-            let name = p.split_once("name=").map(|(_, n)| n.split('&').next().unwrap_or(n)).unwrap_or("");
+            let name = p
+                .split_once("name=")
+                .map(|(_, n)| n.split('&').next().unwrap_or(n))
+                .unwrap_or("");
             crate::acme::bundle_for_mesh(name)
         }
         // NON-SECRET directory of gateway-addressable DBs hosted on this node
@@ -208,7 +266,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
         // project on THIS node (or the project must be absent — idempotent).
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/projects/") && p.contains("/delete") => {
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.contains("/delete") =>
+        {
             let project = p
                 .trim_start_matches("/v1/projects/")
                 .split('/')
@@ -222,21 +283,27 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             // breaking the cross-node delete cascade on enforced fleets.
             let team = team_claims(p)
                 .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| if crate::auth::enforced() { None } else { qparam(p, "team") })
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
                 .unwrap_or_default();
             let owner = cloud.projects.team_of(&project);
             let owns_settings = !team.is_empty() && crate::admin::norm(&owner) == team;
             let owns_deploys = !team.is_empty()
-                && cloud
-                    .gw
-                    .list()
-                    .iter()
-                    .any(|d| d.project == project && crate::admin::record_tenant(&d.tenant) == team);
+                && cloud.gw.list().iter().any(|d| {
+                    d.project == project && crate::admin::record_tenant(&d.tenant) == team
+                });
             if project.is_empty() || !(owns_settings || owns_deploys) {
-                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" })).unwrap_or_default();
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
             }
             let removed = crate::admin::delete_project_local(&cloud, &project, &team).await;
-            serde_json::to_vec(&serde_json::json!({ "project": project, "removed": removed })).unwrap_or_default()
+            serde_json::to_vec(&serde_json::json!({ "project": project, "removed": removed }))
+                .unwrap_or_default()
         }
         "/v1/fleet-deployments" => jb(crate::admin::fleet_deployments(State(cloud.clone())).await),
         "/v1/leases" => jb(crate::admin::leases_get(State(cloud.clone())).await),
@@ -255,24 +322,42 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // the existing cross-node read helper rather than a new POST path.
         #[cfg(feature = "zkauth")]
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/zkauth/mint") => {
-            let team = qparam(p, "team").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
-            let user = qparam(p, "user").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
-            let project = qparam(p, "project").map(|v| crate::zkauth::urldecode(&v)).unwrap_or_default();
+            let team = qparam(p, "team")
+                .map(|v| crate::zkauth::urldecode(&v))
+                .unwrap_or_default();
+            let user = qparam(p, "user")
+                .map(|v| crate::zkauth::urldecode(&v))
+                .unwrap_or_default();
+            let project = qparam(p, "project")
+                .map(|v| crate::zkauth::urldecode(&v))
+                .unwrap_or_default();
             jb(crate::zkauth::mint_rpc(&team, &user, &project).await)
         }
         // Deploy FANOUT over the mesh: a NAT'd coordinator (no HTTP path to FC nodes,
         // SSH tunnels cut) dispatches the per-target build here. Team rides as `?team=`
         // since the iroh transport carries no HTTP headers.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/git/deploy") => {
-            let team = p.split_once("?team=").map(|(_, t)| t.to_string()).unwrap_or_default();
+            let team = p
+                .split_once("?team=")
+                .map(|(_, t)| t.to_string())
+                .unwrap_or_default();
             let mut headers = axum::http::HeaderMap::new();
             if let Ok(hv) = axum::http::HeaderValue::from_str(&team) {
                 headers.insert("x-hive-team", hv);
             }
             match serde_json::from_slice::<fluid_core::GitDeployRequest>(body) {
-                Ok(req) => match crate::admin::git_deploy(State(cloud.clone()), headers, team_claims(p), axum::Json(req)).await {
+                Ok(req) => match crate::admin::git_deploy(
+                    State(cloud.clone()),
+                    headers,
+                    team_claims(p),
+                    axum::Json(req),
+                )
+                .await
+                {
                     Ok(j) => jb(j),
-                    Err((_, msg)) => serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default(),
+                    Err((_, msg)) => {
+                        serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default()
+                    }
                 },
                 Err(_) => Vec::new(),
             }
@@ -280,9 +365,24 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // Instant rollback to a placed deployment: the coordinator proxies the
         // promote (a mutation) to the host node over the mesh. The host runs it
         // locally (it holds the deployment), so there's no re-proxy loop.
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/deployments/") && p.contains("/promote") => {
-            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
-            match crate::admin::dep_promote(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/deployments/")
+            && p.contains("/promote") =>
+        {
+            let id = p
+                .trim_start_matches("/v1/deployments/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::dep_promote(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+            )
+            .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
@@ -295,8 +395,16 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // `NetworkPutBody` JSON; team rides via `?team=`/`?tok=` since the
         // mesh transport carries no HTTP headers. The host runs it locally
         // (it holds the record), so there's no re-proxy loop.
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/projects/") && p.contains("/network") => {
-            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.contains("/network") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
             let parsed: crate::admin::NetworkPutBody = match serde_json::from_slice(body) {
                 Ok(v) => v,
                 Err(_) => return Vec::new(),
@@ -317,8 +425,20 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // Build status/log polling for the fanout mirror (coordinator streams the
         // target's build into its own record so the dashboard UX is unchanged).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/builds/") => {
-            let id = p.trim_start_matches("/v1/builds/").split('?').next().unwrap_or("").to_string();
-            match crate::admin::build_get(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+            let id = p
+                .trim_start_matches("/v1/builds/")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::build_get(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+            )
+            .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
@@ -327,9 +447,23 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // node over the mesh (the NAT'd coordinator has no HTTP admin path to FC nodes).
         // Team rides as `?team=`. The host serves these LOCALLY (it hosts the project),
         // and the coordinator always requests `local=true` so there's no re-proxy loop.
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/resources") => {
-            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
-            jb(crate::admin::deployment_resources(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await)
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/deployments/")
+            && p.contains("/resources") =>
+        {
+            let id = p
+                .trim_start_matches("/v1/deployments/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            jb(crate::admin::deployment_resources(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+            )
+            .await)
         }
         // Project settings for a project whose (node-local, never-gossiped) row
         // lives on THIS node — proxied by whichever node answered the dashboard
@@ -340,21 +474,49 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // that received the dashboard read but doesn't host the deployment.
         // Ownership is enforced by `project_preview` itself from the verified
         // delegation token, exactly as the `/settings` arm below does.
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/preview") => {
-            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/projects/")
+            && p.contains("/preview") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
             let hdrs = axum::http::HeaderMap::new();
             let claims = team_claims(p);
-            jb(crate::admin::project_preview(State(cloud.clone()), hdrs, claims, axum::extract::Path(project)).await)
+            jb(crate::admin::project_preview(
+                State(cloud.clone()),
+                hdrs,
+                claims,
+                axum::extract::Path(project),
+            )
+            .await)
         }
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/settings") => {
-            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/projects/")
+            && p.contains("/settings") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
             // Tenant from the VERIFIED mesh delegation token (`?tok=`), never a
             // raw `?team=` parse — under enforcement the query is
             // `team=<t>&tok=<jwt>`, so `split_once("?team=")` swallows the
             // token into the team string and every ownership compare misses.
             let team = team_claims(p)
                 .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
-                .or_else(|| if crate::auth::enforced() { None } else { qparam(p, "team") })
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
                 .unwrap_or_default();
             if project.is_empty()
                 || team.is_empty()
@@ -362,69 +524,159 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             {
                 return Vec::new();
             }
-            serde_json::to_vec(&serde_json::json!(cloud.projects.get_masked(&project))).unwrap_or_default()
+            serde_json::to_vec(&serde_json::json!(cloud.projects.get_masked(&project)))
+                .unwrap_or_default()
         }
         // Build record + logs for a deployment hosted on THIS node (proxied by the
         // coordinator when the deployment was placed here — build logs live where it built).
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/build") => {
-            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
-            match crate::admin::deployment_build(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/deployments/")
+            && p.contains("/build") =>
+        {
+            let id = p
+                .trim_start_matches("/v1/deployments/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::deployment_build(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+            )
+            .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
         }
         // Intelligent service graph for a deployment hosted on THIS node (scanned here).
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/deployments/") && p.contains("/service-graph") => {
-            let id = p.trim_start_matches("/v1/deployments/").split('/').next().unwrap_or("").to_string();
-            match crate::admin::deployment_service_graph(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id)).await {
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/deployments/")
+            && p.contains("/service-graph") =>
+        {
+            let id = p
+                .trim_start_matches("/v1/deployments/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::deployment_service_graph(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+            )
+            .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
         }
         // Project's latest service graph, served LOCALLY (the coordinator fans this
         // out to the node that built the project). Local-only → no re-proxy loop.
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/projects/") && p.contains("/service-graph") => {
-            let project = p.trim_start_matches("/v1/projects/").split('/').next().unwrap_or("").to_string();
+        p if method == hive_p2p::GOSSIP_GET
+            && p.starts_with("/v1/projects/")
+            && p.contains("/service-graph") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
             let team = qparam(p, "team").unwrap_or_default();
             // Only return it to the owning tenant (this node built it, so it has the
             // project→team mapping). Empty team = trusted/no-scope caller.
             let owner = cloud.projects.team_of(&project);
-            let owner_ns = if owner.trim().is_empty() { "personal".to_string() } else { owner };
-            let team_ns = if team.trim().is_empty() { String::new() } else { team };
+            let owner_ns = if owner.trim().is_empty() {
+                "personal".to_string()
+            } else {
+                owner
+            };
+            let team_ns = if team.trim().is_empty() {
+                String::new()
+            } else {
+                team
+            };
             // On-demand scan if not yet stored (backfills existing/failed deployments).
             match crate::admin::local_project_graph(&cloud, &project).await {
-                Some(g) if team_ns.is_empty() || team_ns == owner_ns => jb(axum::Json(serde_json::json!(g))),
+                Some(g) if team_ns.is_empty() || team_ns == owner_ns => {
+                    jb(axum::Json(serde_json::json!(g)))
+                }
                 _ => Vec::new(),
             }
         }
         // A single run's DETAIL — must match before the runs LIST arm below.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/runs/") => {
-            let id = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("").to_string();
-            match crate::admin::wf_run_detail(State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path(id), wf_query(p)).await {
+            let id = p
+                .trim_start_matches("/v1/workflows/runs/")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::wf_run_detail(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path(id),
+                wf_query(p),
+            )
+            .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
         }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/runs") => {
-            jb(crate::admin::wf_runs(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+            jb(crate::admin::wf_runs(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                wf_query(p),
+            )
+            .await)
         }
         // Workflow summary rollup — must match before the generic `/v1/workflows` arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/summary") => {
-            jb(crate::admin::wf_summary(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+            jb(crate::admin::wf_summary(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                wf_query(p),
+            )
+            .await)
         }
         // Workflow hooks list — must match before the generic `/v1/workflows` arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows/hooks") => {
-            jb(crate::admin::wf_hooks(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+            jb(crate::admin::wf_hooks(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                wf_query(p),
+            )
+            .await)
         }
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/workflows") => {
-            jb(crate::admin::wf_list(State(cloud.clone()), team_headers(p), team_claims(p), wf_query(p)).await)
+            jb(crate::admin::wf_list(
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                wf_query(p),
+            )
+            .await)
         }
         // Request/routing event log: recorded on the SERVING node, so the coordinator
         // proxies here to read a placed project's logs. `local=true` rides in the query
         // so this node returns only its own events (no re-fan-out → no loop).
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => {
-            jb(crate::admin::logs(State(cloud.clone()), team_headers(p), team_claims(p), logs_query(p)).await)
-        }
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/logs") => jb(crate::admin::logs(
+            State(cloud.clone()),
+            team_headers(p),
+            team_claims(p),
+            logs_query(p),
+        )
+        .await),
         // Cron fan-out: a peer answering `cron_list`'s fleet merge returns ONLY
         // its own jobs (local=true) for the requesting team. Same tenant-scoped
         // shape as /v1/logs above.
@@ -446,41 +698,78 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // every sandbox read (live-reproduced). One consolidated arm dispatches on
         // segment shape rather than N ordered prefix-checks, so there is no
         // most-specific-first ordering hazard to maintain as sandbox routes grow.
-        p if method == hive_p2p::GOSSIP_GET && p.split('?').next().unwrap_or(p).contains("/sandboxes") => {
+        p if method == hive_p2p::GOSSIP_GET
+            && p.split('?').next().unwrap_or(p).contains("/sandboxes") =>
+        {
             let (project, segs) = sandbox_path_project_and_segs(p);
             let project = project.to_string();
             let state = State(cloud.clone());
             let hdrs = team_headers(p);
             let clm = team_claims(p);
             match segs.len() {
-                0 => match crate::sandboxes_api::list_sandboxes(state, hdrs, clm, axum::extract::Path(project)).await {
+                0 => match crate::sandboxes_api::list_sandboxes(
+                    state,
+                    hdrs,
+                    clm,
+                    axum::extract::Path(project),
+                )
+                .await
+                {
                     Ok(j) => jb(j),
                     Err(_) => Vec::new(),
                 },
                 1 => {
                     let sandbox_id = segs[0].to_string();
-                    match crate::sandboxes_api::get_sandbox(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                    match crate::sandboxes_api::get_sandbox(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
                 }
                 2 if segs[1] == "commands" => {
                     let sandbox_id = segs[0].to_string();
-                    match crate::sandboxes_api::list_commands(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                    match crate::sandboxes_api::list_commands(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
                 }
                 2 if segs[1] == "snapshots" => {
                     let sandbox_id = segs[0].to_string();
-                    match crate::sandboxes_api::list_snapshots(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                    match crate::sandboxes_api::list_snapshots(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
                 }
                 2 if segs[1] == "mounts" => {
                     let sandbox_id = segs[0].to_string();
-                    match crate::sandboxes_api::list_mounts(state, hdrs, clm, axum::extract::Path((project, sandbox_id))).await {
+                    match crate::sandboxes_api::list_mounts(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
@@ -488,7 +777,15 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 2 if segs[1] == "domain" => {
                     let sandbox_id = segs[0].to_string();
                     let port: u16 = qparam(p, "port").and_then(|s| s.parse().ok()).unwrap_or(0);
-                    match crate::sandboxes_api::get_domain(state, hdrs, clm, axum::extract::Path((project, sandbox_id)), axum::extract::Query(crate::sandboxes_api::DomainQuery { port })).await {
+                    match crate::sandboxes_api::get_domain(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                        axum::extract::Query(crate::sandboxes_api::DomainQuery { port }),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
@@ -496,15 +793,32 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 3 if segs[1] == "commands" => {
                     let sandbox_id = segs[0].to_string();
                     let command_id = segs[2].to_string();
-                    match crate::sandboxes_api::get_command(state, hdrs, clm, axum::extract::Path((project, sandbox_id, command_id))).await {
+                    match crate::sandboxes_api::get_command(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id, command_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
                 }
                 3 if segs[1] == "files" && segs[2] == "read" => {
                     let sandbox_id = segs[0].to_string();
-                    let q = crate::sandboxes_api::ReadFileQuery { path: qparam(p, "path").unwrap_or_default() };
-                    match crate::sandboxes_api::read_file(state, hdrs, clm, axum::extract::Path((project, sandbox_id)), axum::extract::Query(q)).await {
+                    let q = crate::sandboxes_api::ReadFileQuery {
+                        path: qparam(p, "path").unwrap_or_default(),
+                    };
+                    match crate::sandboxes_api::read_file(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id)),
+                        axum::extract::Query(q),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
@@ -512,7 +826,14 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 4 if segs[1] == "commands" && segs[3] == "logs" => {
                     let sandbox_id = segs[0].to_string();
                     let command_id = segs[2].to_string();
-                    match crate::sandboxes_api::get_command_logs(state, hdrs, clm, axum::extract::Path((project, sandbox_id, command_id))).await {
+                    match crate::sandboxes_api::get_command_logs(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, sandbox_id, command_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
@@ -530,7 +851,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         {
             let (project, deployment_id, _) = snapshot_path_parts(p);
             match crate::storage_api::list_snapshots(
-                State(cloud.clone()), team_headers(p), team_claims(p), axum::extract::Path((project, deployment_id)),
+                State(cloud.clone()),
+                team_headers(p),
+                team_claims(p),
+                axum::extract::Path((project, deployment_id)),
             )
             .await
             {
@@ -556,13 +880,28 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                         Ok(b) => b,
                         Err(_) => return Vec::new(),
                     };
-                    match crate::storage_api::create_snapshot(state, hdrs, clm, axum::extract::Path((project, deployment_id)), axum::Json(req)).await {
+                    match crate::storage_api::create_snapshot(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, deployment_id)),
+                        axum::Json(req),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
                 }
                 Some(snap_id) => {
-                    match crate::storage_api::delete_snapshot(state, hdrs, clm, axum::extract::Path((project, deployment_id, snap_id))).await {
+                    match crate::storage_api::delete_snapshot(
+                        state,
+                        hdrs,
+                        clm,
+                        axum::extract::Path((project, deployment_id, snap_id)),
+                    )
+                    .await
+                    {
                         Ok(j) => jb(j),
                         Err(_) => Vec::new(),
                     }
@@ -573,16 +912,34 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // over the mesh: the host runs the world write locally (env decrypts
         // here). `local:true` in the body prevents a re-forward loop. Match
         // before any generic `/v1/workflows` arm.
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/workflows/runs/")
-            && (p.contains("/cancel") || p.contains("/replay") || p.contains("/reenqueue") || p.contains("/wakeup")) =>
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/workflows/runs/")
+            && (p.contains("/cancel")
+                || p.contains("/replay")
+                || p.contains("/reenqueue")
+                || p.contains("/wakeup")) =>
         {
-            let rest = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("");
+            let rest = p
+                .trim_start_matches("/v1/workflows/runs/")
+                .split('?')
+                .next()
+                .unwrap_or("");
             let mut it = rest.splitn(2, '/');
             let id = it.next().unwrap_or("").to_string();
             let op = it.next().unwrap_or("");
-            let mut parsed: crate::admin::RunOpBody = serde_json::from_slice(body).unwrap_or_default();
+            let mut parsed: crate::admin::RunOpBody =
+                serde_json::from_slice(body).unwrap_or_default();
             parsed.local = Some(true); // host executes without re-forwarding
-            match crate::admin::wf_run_op_dispatch(cloud, &team_headers(p), team_claims(p).map(|axum::Extension(c)| c).as_ref(), &id, op, parsed).await {
+            match crate::admin::wf_run_op_dispatch(
+                cloud,
+                &team_headers(p),
+                team_claims(p).map(|axum::Extension(c)| c).as_ref(),
+                &id,
+                op,
+                parsed,
+            )
+            .await
+            {
                 Ok(axum::Json(v)) => jb(axum::Json(v)),
                 Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
             }
@@ -598,35 +955,61 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // `team_claims` (needed for the `wf_in_team` ownership check these
         // ops also enforce, unlike the fully-global `require_operator`
         // call sites `mesh_operator_claims` was built for).
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/workflows/runs/")
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/workflows/runs/")
             && (p.contains("/events") || p.contains("/attributes")) =>
         {
-            let rest = p.trim_start_matches("/v1/workflows/runs/").split('?').next().unwrap_or("");
+            let rest = p
+                .trim_start_matches("/v1/workflows/runs/")
+                .split('?')
+                .next()
+                .unwrap_or("");
             let mut it = rest.splitn(2, '/');
             let id = it.next().unwrap_or("").to_string();
             let op = it.next().unwrap_or("");
-            let mut claims = team_claims(p).map(|axum::Extension(c)| c).unwrap_or(crate::auth::Claims {
-                sub: "mesh-internal".into(),
-                tenant: String::new(),
-                role: "service".into(),
-                iat: 0,
-                exp: 0,
-                platform_admin: false,
-            });
+            let mut claims =
+                team_claims(p)
+                    .map(|axum::Extension(c)| c)
+                    .unwrap_or(crate::auth::Claims {
+                        sub: "mesh-internal".into(),
+                        tenant: String::new(),
+                        role: "service".into(),
+                        iat: 0,
+                        exp: 0,
+                        platform_admin: false,
+                    });
             claims.platform_admin = true;
             match op {
                 "events" => {
-                    let mut parsed: crate::admin::RunEventBody = serde_json::from_slice(body).unwrap_or_default();
+                    let mut parsed: crate::admin::RunEventBody =
+                        serde_json::from_slice(body).unwrap_or_default();
                     parsed.local = Some(true);
-                    match crate::admin::wf_run_event_dispatch(cloud, &team_headers(p), Some(&claims), &id, parsed).await {
+                    match crate::admin::wf_run_event_dispatch(
+                        cloud,
+                        &team_headers(p),
+                        Some(&claims),
+                        &id,
+                        parsed,
+                    )
+                    .await
+                    {
                         Ok(axum::Json(v)) => jb(axum::Json(v)),
                         Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
                     }
                 }
                 "attributes" => {
-                    let mut parsed: crate::admin::RunAttributesBody = serde_json::from_slice(body).unwrap_or_default();
+                    let mut parsed: crate::admin::RunAttributesBody =
+                        serde_json::from_slice(body).unwrap_or_default();
                     parsed.local = Some(true);
-                    match crate::admin::wf_run_attributes_dispatch(cloud, &team_headers(p), Some(&claims), &id, parsed).await {
+                    match crate::admin::wf_run_attributes_dispatch(
+                        cloud,
+                        &team_headers(p),
+                        Some(&claims),
+                        &id,
+                        parsed,
+                    )
+                    .await
+                    {
                         Ok(axum::Json(v)) => jb(axum::Json(v)),
                         Err((_, msg)) => jb(axum::Json(serde_json::json!({ "error": msg }))),
                     }
@@ -655,7 +1038,9 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // Cross-region DB replica control (register/remove) over the mesh.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
             match serde_json::from_slice::<serde_json::Value>(body) {
-                Ok(v) => match crate::admin::database_replica(State(cloud.clone()), axum::Json(v)).await {
+                Ok(v) => match crate::admin::database_replica(State(cloud.clone()), axum::Json(v))
+                    .await
+                {
                     Ok(j) => jb(j),
                     Err((_, e)) => jb(axum::Json(serde_json::json!({ "error": e }))),
                 },
@@ -665,7 +1050,10 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // Mirrored storage writes over the mesh (replication data plane). The team
         // rides as `?team=` and is applied to the SAME tenant namespace on this
         // replica; these NEVER re-mirror (they're already replicated writes).
-        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/storage/") && (qparam(p, "mirror").as_deref() == Some("1")) => {
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/storage/")
+            && (qparam(p, "mirror").as_deref() == Some("1")) =>
+        {
             crate::admin::apply_mirrored_write(&cloud, p, body).await;
             jb(axum::Json(serde_json::json!({ "ok": true })))
         }
@@ -682,21 +1070,30 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // MUST precede the bare `/v1/billing` arm below, which would otherwise
         // shadow it (longest-prefix-first ordering, same as invoices/ledger).
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/checkout/") => {
-            let id = p.trim_start_matches("/v1/billing/checkout/").split('?').next().unwrap_or("").to_string();
-            match crate::admin::billing_checkout_get(State(cloud.clone()), axum::extract::Path(id)).await {
+            let id = p
+                .trim_start_matches("/v1/billing/checkout/")
+                .split('?')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            match crate::admin::billing_checkout_get(State(cloud.clone()), axum::extract::Path(id))
+                .await
+            {
                 Ok(j) => jb(j),
                 Err(_) => Vec::new(),
             }
         }
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/invoices") => {
-            jb(crate::admin::billing_invoices(State(cloud.clone()), team_headers(p), team_claims(p)).await)
-        }
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/ledger") => {
-            jb(crate::admin::billing_ledger(State(cloud.clone()), team_headers(p), team_claims(p)).await)
-        }
-        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => {
-            jb(crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await)
-        }
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/invoices") => jb(
+            crate::admin::billing_invoices(State(cloud.clone()), team_headers(p), team_claims(p))
+                .await,
+        ),
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing/ledger") => jb(
+            crate::admin::billing_ledger(State(cloud.clone()), team_headers(p), team_claims(p))
+                .await,
+        ),
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/billing") => jb(
+            crate::admin::billing_get(State(cloud.clone()), team_headers(p), team_claims(p)).await,
+        ),
         // Fleet-global raw-port allocation coordination (closes the F1
         // node-local-registry-vs-fleet-global-port-space race): the actual
         // claim decision runs ONLY on the control-plane leader — a non-leader
@@ -706,7 +1103,9 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // and `allocate_raw_ports_coordinated`.
         "/v1/raw-ports/allocate" if method == hive_p2p::GOSSIP_POST => {
             if !cloud.is_control_plane_leader() {
-                return jb(axum::Json(serde_json::json!({ "error": "not the control-plane leader" })));
+                return jb(axum::Json(
+                    serde_json::json!({ "error": "not the control-plane leader" }),
+                ));
             }
             #[derive(serde::Deserialize)]
             struct Req {
@@ -714,11 +1113,16 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 manifest: fluid_core::Manifest,
             }
             match serde_json::from_slice::<Req>(body) {
-                Ok(req) => match crate::raw_ports::allocate_raw_ports_records(&req.project, &req.manifest) {
-                    Ok(allocs) => jb(axum::Json(serde_json::json!({ "allocs": allocs }))),
-                    Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
-                },
-                Err(e) => jb(axum::Json(serde_json::json!({ "error": format!("malformed request: {e}") }))),
+                Ok(req) => {
+                    match crate::raw_ports::allocate_raw_ports_records(&req.project, &req.manifest)
+                    {
+                        Ok(allocs) => jb(axum::Json(serde_json::json!({ "allocs": allocs }))),
+                        Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+                    }
+                }
+                Err(e) => jb(axum::Json(
+                    serde_json::json!({ "error": format!("malformed request: {e}") }),
+                )),
             }
         }
         // Mirror of the allocate arm above, for release — see
@@ -727,7 +1131,9 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         // in the leader's authoritative registry forever).
         "/v1/raw-ports/release" if method == hive_p2p::GOSSIP_POST => {
             if !cloud.is_control_plane_leader() {
-                return jb(axum::Json(serde_json::json!({ "error": "not the control-plane leader" })));
+                return jb(axum::Json(
+                    serde_json::json!({ "error": "not the control-plane leader" }),
+                ));
             }
             #[derive(serde::Deserialize)]
             struct Req {
@@ -738,7 +1144,9 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                     let released = crate::raw_ports::release_raw_ports(&req.project);
                     jb(axum::Json(serde_json::json!({ "released": released })))
                 }
-                Err(e) => jb(axum::Json(serde_json::json!({ "error": format!("malformed request: {e}") }))),
+                Err(e) => jb(axum::Json(
+                    serde_json::json!({ "error": format!("malformed request: {e}") }),
+                )),
             }
         }
         _ => Vec::new(),
@@ -746,6 +1154,19 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
 }
 
 /// Reconstruct the logs `Query<LimitQ>` from a dispatched path's query string.
+fn mesh_tenant(path: &str) -> String {
+    team_claims(path)
+        .map(|axum::Extension(claims)| crate::admin::norm(&claims.tenant).to_string())
+        .or_else(|| {
+            if crate::auth::enforced() {
+                None
+            } else {
+                qparam(path, "team")
+            }
+        })
+        .unwrap_or_default()
+}
+
 fn logs_query(path: &str) -> axum::extract::Query<crate::admin::LimitQ> {
     axum::extract::Query(crate::admin::LimitQ {
         limit: qparam(path, "limit").and_then(|v| v.parse().ok()),
@@ -776,7 +1197,11 @@ fn sandbox_path_project_and_segs(path: &str) -> (&str, Vec<&str>) {
     let mut it = rest.splitn(2, "/sandboxes");
     let project = it.next().unwrap_or("");
     let tail = it.next().unwrap_or("");
-    let segs = tail.trim_start_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let segs = tail
+        .trim_start_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     (project, segs)
 }
 
@@ -796,7 +1221,11 @@ fn snapshot_path_parts(path: &str) -> (String, String, Option<String>) {
     let mut it2 = tail.splitn(2, "/snapshots");
     let deployment_id = it2.next().unwrap_or("").to_string();
     let snap = it2.next().unwrap_or("").trim_start_matches('/');
-    let snapshot_id = if snap.is_empty() { None } else { Some(snap.to_string()) };
+    let snapshot_id = if snap.is_empty() {
+        None
+    } else {
+        Some(snap.to_string())
+    };
     (project, deployment_id, snapshot_id)
 }
 
@@ -920,12 +1349,23 @@ pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
             if let Some(s) = &signer {
                 tracing::trace!(signer = %s, %path, "verified signed gossip");
             }
-            let trust_configured = cloud.trusted_peer_ids.read().map(|s| !s.is_empty()).unwrap_or(false);
-            let signer_trusted = trust_configured
-                .then(|| signer.as_deref().map(|s| hive_p2p::peer_trusted(&cloud.trusted_peer_ids, s)).unwrap_or(false));
+            let trust_configured = cloud
+                .trusted_peer_ids
+                .read()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            let signer_trusted = trust_configured.then(|| {
+                signer
+                    .as_deref()
+                    .map(|s| hive_p2p::peer_trusted(&cloud.trusted_peer_ids, s))
+                    .unwrap_or(false)
+            });
             if !mesh_mutation_authorized(method, signer_trusted) {
                 tracing::warn!(%path, signer = ?signer, "REJECTED mutating gossip: no verified+trusted signer (trust set configured)");
-                return serde_json::to_vec(&serde_json::json!({ "error": "untrusted or unsigned mesh caller" })).unwrap_or_default();
+                return serde_json::to_vec(
+                    &serde_json::json!({ "error": "untrusted or unsigned mesh caller" }),
+                )
+                .unwrap_or_default();
             }
             dispatch(&cloud, method, &path, &body).await
         })
@@ -995,7 +1435,11 @@ pub async fn fetch(
     // HTTP-over-SSH (bootstrap + fallback).
     let url = format!("{peer}{path}");
     let req = if method == hive_p2p::GOSSIP_POST {
-        cloud.http.post(&url).header("content-type", "application/json").body(body.to_vec())
+        cloud
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body.to_vec())
     } else {
         cloud.http.get(&url)
     };
@@ -1031,7 +1475,10 @@ mod mesh_auth_tests {
 
     #[test]
     fn mutations_require_a_trusted_signer_once_a_trust_set_is_configured() {
-        assert!(mesh_mutation_authorized(hive_p2p::GOSSIP_POST, Some(true)), "a verified, trusted signer must be allowed");
+        assert!(
+            mesh_mutation_authorized(hive_p2p::GOSSIP_POST, Some(true)),
+            "a verified, trusted signer must be allowed"
+        );
         assert!(
             !mesh_mutation_authorized(hive_p2p::GOSSIP_POST, Some(false)),
             "an unsigned or untrusted-signer mutation must be REJECTED once trust is configured"
@@ -1044,17 +1491,27 @@ mod mesh_auth_tests {
         // the auth helpers, not global process state, so this can't race the
         // suite's other enforced()-sensitive tests. A signed token's tenant is
         // AUTHORITATIVE over a spoofed `?team=`; a garbled token yields no claims.
-        let tok = crate::auth::issue_with_secret("mesh-internal", "acme", "service", false, 60, "sekret").unwrap();
+        let tok =
+            crate::auth::issue_with_secret("mesh-internal", "acme", "service", false, 60, "sekret")
+                .unwrap();
         let path = format!("/v1/git/deploy?team=SPOOFED&tok={tok}");
         let (tok_in_path, _) = (super::qparam(&path, "tok").unwrap(), ());
         let claims = crate::auth::verify_with_secret(&tok_in_path, "sekret").unwrap();
-        assert_eq!(claims.tenant, "acme", "signed token tenant is authoritative over the raw param");
+        assert_eq!(
+            claims.tenant, "acme",
+            "signed token tenant is authoritative over the raw param"
+        );
         assert!(crate::auth::verify_with_secret("not-a-jwt", "sekret").is_err());
 
         // The raw `?team=` fallback (no token) still resolves a tenant for
         // dev/rolling-upgrade — this path needs no secret.
-        let claims = team_claims("/v1/logs?team=personal").expect("raw team fallback").0;
+        let claims = team_claims("/v1/logs?team=personal")
+            .expect("raw team fallback")
+            .0;
         assert_eq!(claims.tenant, "personal");
-        assert!(team_claims("/v1/logs").is_none(), "no team and no token yields no claims");
+        assert!(
+            team_claims("/v1/logs").is_none(),
+            "no team and no token yields no claims"
+        );
     }
 }

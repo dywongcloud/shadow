@@ -81,7 +81,12 @@ async fn setup() -> Option<(Arc<hive_p2p::PeerPool>, String, String)> {
     Some((pool, node_b_id, addr_b_json))
 }
 
-async fn one(pool: &hive_p2p::PeerPool, node_id: &str, addr_json: &str, path: &str) -> (u16, String) {
+async fn one(
+    pool: &hive_p2p::PeerPool,
+    node_id: &str,
+    addr_json: &str,
+    path: &str,
+) -> (u16, String) {
     let tr = tokio::time::timeout(
         Duration::from_secs(20),
         pool.request(node_id, addr_json, "GET", path, &[], b""),
@@ -110,7 +115,10 @@ async fn sequential_requests_reuse_one_connection() {
     assert!(b2.contains("iroh-p2p"), "body: {b2}");
 
     let (opened, reused) = pool.stats();
-    assert_eq!(opened, 1, "second request must reuse the trunk, not re-dial");
+    assert_eq!(
+        opened, 1,
+        "second request must reuse the trunk, not re-dial"
+    );
     assert_eq!(reused, 1, "exactly one reuse");
 }
 
@@ -135,7 +143,9 @@ async fn concurrent_requests_share_one_connection() {
         let pool = pool.clone();
         let id = id.clone();
         let addr = addr.clone();
-        handles.push(tokio::spawn(async move { one(&pool, &id, &addr, &format!("/c/{i}")).await }));
+        handles.push(tokio::spawn(async move {
+            one(&pool, &id, &addr, &format!("/c/{i}")).await
+        }));
     }
     let mut ok = 0;
     for h in handles {
@@ -148,7 +158,10 @@ async fn concurrent_requests_share_one_connection() {
 
     let (opened, reused) = pool.stats();
     assert_eq!(opened, 1, "16 concurrent streams must share ONE connection");
-    assert_eq!(reused, 16, "all 16 reused the warm trunk (no lock serialization stalls)");
+    assert_eq!(
+        reused, 16,
+        "all 16 reused the warm trunk (no lock serialization stalls)"
+    );
 }
 
 /// Killing the trunk forces an in-call re-dial on the next request: opened == 2.
@@ -198,18 +211,27 @@ async fn severed_cached_trunk_is_detected_and_redialed() {
     // prove is the DELTA below: a severed-but-cached trunk is detected dead and
     // re-dialed exactly once more. Anchoring on the delta keeps that guarantee
     // while removing the load-sensitivity.
-    assert!(opened0 >= 1, "first request opens at least one trunk (got {opened0})");
+    assert!(
+        opened0 >= 1,
+        "first request opens at least one trunk (got {opened0})"
+    );
     assert_eq!(reused0, 0, "nothing to reuse yet");
 
     // Close the underlying QUIC connection but KEEP it in the pool's map. The
     // cached handle now reports closed (shared Arc state), proving real severance.
     let was_cached_and_closed = pool.sever_peer(&id).await;
-    assert!(was_cached_and_closed, "a live trunk was cached and is now severed");
+    assert!(
+        was_cached_and_closed,
+        "a live trunk was cached and is now severed"
+    );
 
     // The next request finds a cached-but-dead trunk → must re-dial in-call.
     let (s2, b2) = one(&pool, &id, &addr, "/after-sever").await;
     assert_eq!(s2, 200);
-    assert!(b2.contains("iroh-p2p"), "round-trip over the NEW connection: {b2}");
+    assert!(
+        b2.contains("iroh-p2p"),
+        "round-trip over the NEW connection: {b2}"
+    );
     assert_eq!(
         pool.stats().0,
         opened0 + 1,
@@ -225,19 +247,33 @@ async fn severed_cached_trunk_is_detected_and_redialed() {
 async fn untrusted_peer_is_rejected() {
     let _serial = net_serial();
     let function = spawn_function().await;
-    let ep_b = match hive_p2p::bind().await { Ok(e) => e, Err(_) => { eprintln!("skip: no iroh"); return; } };
+    let ep_b = match hive_p2p::bind().await {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
+    };
     let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
     let id_b = ep_b.id().to_string();
     // Empty trust set → B trusts no one.
-    let trust: hive_p2p::TrustSet = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, function, 100, Some(trust), None));
+    let trust: hive_p2p::TrustSet =
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b,
+        function,
+        100,
+        Some(trust),
+        None,
+    ));
 
     let ep_a = hive_p2p::bind().await.unwrap();
     let pool = hive_p2p::PeerPool::new(ep_a);
     let res = tokio::time::timeout(
         Duration::from_secs(8),
         pool.request(&id_b, &addr_b, "GET", "/x", &[], b""),
-    ).await;
+    )
+    .await;
     let ok = matches!(res, Ok(Ok(_)));
     assert!(!ok, "untrusted peer must NOT be served");
 }
@@ -248,15 +284,28 @@ async fn untrusted_peer_is_rejected() {
 async fn trusted_peer_is_admitted() {
     let _serial = net_serial();
     let function = spawn_function().await;
-    let ep_b = match hive_p2p::bind().await { Ok(e) => e, Err(_) => { eprintln!("skip: no iroh"); return; } };
+    let ep_b = match hive_p2p::bind().await {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
+    };
     let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
     let id_b = ep_b.id().to_string();
     // Bind A first so we can put its identity in B's trust set.
     let ep_a = hive_p2p::bind().await.unwrap();
     let id_a = ep_a.id().to_string();
-    let trust: hive_p2p::TrustSet = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+    let trust: hive_p2p::TrustSet =
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
     trust.write().unwrap().insert(id_a);
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, function, 100, Some(trust), None));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b,
+        function,
+        100,
+        Some(trust),
+        None,
+    ));
 
     let pool = hive_p2p::PeerPool::new(ep_a);
     let (status, body) = one(&pool, &id_b, &addr_b, "/ok").await;
@@ -280,10 +329,17 @@ async fn relay_stats_classifies_and_counts_bytes() {
     let (s, _) = one(&pool, &id, &addr, "/a").await;
     assert_eq!(s, 200);
     let rs = pool.relay_stats().await;
-    assert_eq!(rs.relayed_conns + rs.direct_conns, 1, "exactly one trunk, classified into one bucket");
+    assert_eq!(
+        rs.relayed_conns + rs.direct_conns,
+        1,
+        "exactly one trunk, classified into one bucket"
+    );
     let relayed = rs.relayed_bytes_tx + rs.relayed_bytes_rx;
     let direct = rs.direct_bytes_tx + rs.direct_bytes_rx;
-    assert!(relayed + direct > 0, "trunk bytes accounted (relay or direct): relayed={relayed} direct={direct}");
+    assert!(
+        relayed + direct > 0,
+        "trunk bytes accounted (relay or direct): relayed={relayed} direct={direct}"
+    );
     // Bytes land in the SAME bucket the connection was classified into.
     if rs.direct_conns == 1 {
         assert_eq!(relayed, 0, "direct-classified trunk has no relayed bytes");
@@ -297,7 +353,13 @@ async fn relay_stats_classifies_and_counts_bytes() {
 #[tokio::test]
 async fn gossip_request_round_trips_over_iroh() {
     let _serial = net_serial();
-    let ep_b = match hive_p2p::bind().await { Ok(e) => e, Err(_) => { eprintln!("skip: no iroh"); return; } };
+    let ep_b = match hive_p2p::bind().await {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
+    };
     let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
     let id_b = ep_b.id().to_string();
     // Handler echoes "<method>:<path>:<body>" so we can assert all three round-trip.
@@ -306,7 +368,13 @@ async fn gossip_request_round_trips_over_iroh() {
             format!("{method}:{path}:{}", String::from_utf8_lossy(&body)).into_bytes()
         })
     });
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, "127.0.0.1:1".into(), 100, None, Some(handler)));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b,
+        "127.0.0.1:1".into(),
+        100,
+        None,
+        Some(handler),
+    ));
 
     let ep_a = hive_p2p::bind().await.unwrap();
     let pool = hive_p2p::PeerPool::new(ep_a);
@@ -315,11 +383,17 @@ async fn gossip_request_round_trips_over_iroh() {
         // the whole suite runs concurrently (8 endpoint pairs contend on connect setup).
         Duration::from_secs(20),
         pool.gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_POST, "/v1/nodes", b"hello"),
-    ).await.expect("timed out").expect("gossip failed");
+    )
+    .await
+    .expect("timed out")
+    .expect("gossip failed");
     assert_eq!(String::from_utf8_lossy(&resp), "1:/v1/nodes:hello");
 
     // A second gossip request reuses the trunk (no re-dial).
-    let r2 = pool.gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", b"").await.unwrap();
+    let r2 = pool
+        .gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", b"")
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&r2), "0:/v1/serve-hosts:");
 }
 
@@ -331,27 +405,52 @@ async fn signed_gossip_verifies_and_passes_signer() {
     let _serial = net_serial();
     std::env::set_var("HIVE_GOSSIP_SIGN", "1");
     std::env::set_var("HIVE_GOSSIP_VERIFY", "enforce");
-    let ep_b = match hive_p2p::bind().await { Ok(e) => e, Err(_) => { eprintln!("skip: no iroh"); return; } };
+    let ep_b = match hive_p2p::bind().await {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
+    };
     let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
     let id_b = ep_b.id().to_string();
     // Handler echoes the VERIFIED signer id so the test can assert verification ran.
     let handler: hive_p2p::GossipHandler = Arc::new(|_m, _p, _b, signer| {
         Box::pin(async move { signer.unwrap_or_else(|| "UNSIGNED".into()).into_bytes() })
     });
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, "127.0.0.1:1".into(), 100, None, Some(handler)));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b,
+        "127.0.0.1:1".into(),
+        100,
+        None,
+        Some(handler),
+    ));
 
     let ep_a = hive_p2p::bind().await.unwrap();
     let id_a = ep_a.id().to_string();
     let pool = hive_p2p::PeerPool::new(ep_a);
     let resp = tokio::time::timeout(
         Duration::from_secs(20),
-        pool.gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_POST, "/v1/nodes", b"signed"),
-    ).await.expect("timed out").expect("signed gossip failed");
+        pool.gossip_request(
+            &id_b,
+            &addr_b,
+            hive_p2p::GOSSIP_POST,
+            "/v1/nodes",
+            b"signed",
+        ),
+    )
+    .await
+    .expect("timed out")
+    .expect("signed gossip failed");
     // Even in ENFORCE mode the request is served, and the verified signer is the
     // sender's cryptographic identity (not just any string). This equality is the
     // end-to-end proof: the handler only receives Some(signer) after a VALID
     // signature bound to the QUIC remote identity.
-    assert_eq!(String::from_utf8_lossy(&resp), id_a, "handler must see the verified signer id");
+    assert_eq!(
+        String::from_utf8_lossy(&resp),
+        id_a,
+        "handler must see the verified signer id"
+    );
     // Counters are process-global and other suite tests gossip concurrently, so
     // only assert the monotonic signal (at least our request verified).
     let (ok, ..) = hive_p2p::verify_stats();
@@ -381,7 +480,13 @@ async fn signed_gossip_with_trust_set_including_sender_still_verifies() {
     let _serial = net_serial();
     std::env::set_var("HIVE_GOSSIP_SIGN", "1");
     std::env::set_var("HIVE_GOSSIP_VERIFY", "enforce");
-    let ep_b = match hive_p2p::bind().await { Ok(e) => e, Err(_) => { eprintln!("skip: no iroh"); return; } };
+    let ep_b = match hive_p2p::bind().await {
+        Ok(e) => e,
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
+    };
     let addr_b = hive_p2p::addr_json(&ep_b).unwrap();
     let id_b = ep_b.id().to_string();
     let handler: hive_p2p::GossipHandler = Arc::new(|_m, _p, _b, signer| {
@@ -393,15 +498,37 @@ async fn signed_gossip_with_trust_set_including_sender_still_verifies() {
 
     // Trust set includes the sender (id_a) — the legitimate, "hardened and
     // correctly configured" case.
-    let trust: hive_p2p::TrustSet = Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([id_a.clone()])));
-    tokio::spawn(hive_p2p::serve_tunnels(ep_b, "127.0.0.1:1".into(), 100, Some(trust), Some(handler)));
+    let trust: hive_p2p::TrustSet =
+        Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
+            id_a.clone(),
+        ])));
+    tokio::spawn(hive_p2p::serve_tunnels(
+        ep_b,
+        "127.0.0.1:1".into(),
+        100,
+        Some(trust),
+        Some(handler),
+    ));
 
     let pool = hive_p2p::PeerPool::new(ep_a);
     let resp = tokio::time::timeout(
         Duration::from_secs(20),
-        pool.gossip_request(&id_b, &addr_b, hive_p2p::GOSSIP_POST, "/v1/nodes", b"signed"),
-    ).await.expect("timed out").expect("signed gossip from a trusted peer must succeed");
-    assert_eq!(String::from_utf8_lossy(&resp), id_a, "handler must still see the verified signer id when trusted");
+        pool.gossip_request(
+            &id_b,
+            &addr_b,
+            hive_p2p::GOSSIP_POST,
+            "/v1/nodes",
+            b"signed",
+        ),
+    )
+    .await
+    .expect("timed out")
+    .expect("signed gossip from a trusted peer must succeed");
+    assert_eq!(
+        String::from_utf8_lossy(&resp),
+        id_a,
+        "handler must still see the verified signer id when trusted"
+    );
 
     std::env::remove_var("HIVE_GOSSIP_SIGN");
     std::env::remove_var("HIVE_GOSSIP_VERIFY");
@@ -417,18 +544,44 @@ async fn gossip_signature_rejects_tamper_replay_and_mismatch() {
     let trailer = hive_p2p::sign_gossip(&sk, hive_p2p::GOSSIP_POST, "/v1/x", b"body", now);
     // Valid.
     assert_eq!(
-        hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now).unwrap(),
+        hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now)
+            .unwrap(),
         id
     );
     // Tampered body / path / method.
-    assert!(hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"evil", &id, now).is_err());
-    assert!(hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/y", b"body", &id, now).is_err());
-    assert!(hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_GET, "/v1/x", b"body", &id, now).is_err());
+    assert!(
+        hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"evil", &id, now)
+            .is_err()
+    );
+    assert!(
+        hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/y", b"body", &id, now)
+            .is_err()
+    );
+    assert!(
+        hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_GET, "/v1/x", b"body", &id, now)
+            .is_err()
+    );
     // Replay outside the freshness window.
-    assert!(hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &id, now + 10 * 60 * 1000).is_err());
+    assert!(hive_p2p::verify_gossip(
+        &trailer,
+        hive_p2p::GOSSIP_POST,
+        "/v1/x",
+        b"body",
+        &id,
+        now + 10 * 60 * 1000
+    )
+    .is_err());
     // Signer/transport mismatch: valid signature but from a DIFFERENT connection identity.
     let other = iroh::SecretKey::generate().public().to_string();
-    assert!(hive_p2p::verify_gossip(&trailer, hive_p2p::GOSSIP_POST, "/v1/x", b"body", &other, now).is_err());
+    assert!(hive_p2p::verify_gossip(
+        &trailer,
+        hive_p2p::GOSSIP_POST,
+        "/v1/x",
+        b"body",
+        &other,
+        now
+    )
+    .is_err());
 }
 
 /// Eager trunking: `warm()` (what the background trunk-warmer calls) pre-establishes
@@ -458,7 +611,10 @@ async fn warm_pre_establishes_trunk_reused_by_request() {
     assert_eq!(s, 200);
     assert!(b.contains("iroh-p2p"), "body: {b}");
     let (opened, reused) = pool.stats();
-    assert_eq!(opened, 1, "request reused the pre-warmed trunk (no cold dial)");
+    assert_eq!(
+        opened, 1,
+        "request reused the pre-warmed trunk (no cold dial)"
+    );
     assert_eq!(reused, 1, "exactly one reuse of the warm trunk");
 }
 
@@ -524,7 +680,10 @@ async fn spawn_slow_function(chunks: usize, gap: Duration, then_hang: bool) -> S
                 }
                 let _ = s.flush().await;
                 for i in 0..chunks {
-                    if s.write_all(format!("data: {i}\n\n").as_bytes()).await.is_err() {
+                    if s.write_all(format!("data: {i}\n\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     let _ = s.flush().await;
@@ -558,7 +717,10 @@ async fn blackhole_connect_times_out_and_is_marked_dead() {
     // Bind B but DO NOT serve/accept — held alive so its addr stays advertised.
     let ep_b = match hive_p2p::bind().await {
         Ok(e) => e,
-        Err(_) => { eprintln!("skip: no iroh"); return; }
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
     };
     let id = ep_b.id().to_string();
     let addr = hive_p2p::addr_json(&ep_b).unwrap();
@@ -574,15 +736,21 @@ async fn blackhole_connect_times_out_and_is_marked_dead() {
     .expect("request must NOT hang — the connect budget must bound it");
     let elapsed = t0.elapsed();
 
-    let err = res.err().expect("blackhole connect must error, not succeed");
+    let err = res
+        .err()
+        .expect("blackhole connect must error, not succeed");
     assert!(
         err.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some(),
         "a pre-send (connect/open) timeout is the dead-peer signal: {err}"
     );
-    assert!(elapsed < Duration::from_secs(4), "bounded by connect+open budget (×retry), took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "bounded by connect+open budget (×retry), took {elapsed:?}"
+    );
     let ts = pool.relay_stats().await.timeouts;
     assert!(
-        ts.iter().any(|t| t.node_id == id && (t.phase == "connect" || t.phase == "open")),
+        ts.iter()
+            .any(|t| t.node_id == id && (t.phase == "connect" || t.phase == "open")),
         "a connect/open timeout must be counted: {ts:?}"
     );
     drop(ep_b);
@@ -597,7 +765,10 @@ async fn accept_but_silent_first_byte_times_out_without_retry() {
     let _g = EnvGuard::set("HIVE_P2P_FIRSTBYTE_MS", "700");
     let ep_b = match hive_p2p::bind().await {
         Ok(e) => e,
-        Err(_) => { eprintln!("skip: no iroh"); return; }
+        Err(_) => {
+            eprintln!("skip: no iroh");
+            return;
+        }
     };
     let id = ep_b.id().to_string();
     let addr = hive_p2p::addr_json(&ep_b).unwrap();
@@ -614,7 +785,11 @@ async fn accept_but_silent_first_byte_times_out_without_retry() {
         .await
         .expect("warm must not hang")
         .expect("trunk warms");
-    assert_eq!(pool.stats().0, 1, "exactly one connection opened (the warm)");
+    assert_eq!(
+        pool.stats().0,
+        1,
+        "exactly one connection opened (the warm)"
+    );
 
     let t0 = std::time::Instant::now();
     let res = tokio::time::timeout(
@@ -631,12 +806,21 @@ async fn accept_but_silent_first_byte_times_out_without_retry() {
         "first-byte is post-send (no retry): {err}"
     );
     // Trunk was warm → measured window is just the firstbyte budget (~700ms).
-    assert!(elapsed < Duration::from_secs(3), "bounded by the firstbyte budget, took {elapsed:?}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "bounded by the firstbyte budget, took {elapsed:?}"
+    );
     // No redial from the post-send failure: still exactly one connection ever opened.
     let (opened, _reused) = pool.stats();
-    assert_eq!(opened, 1, "post-send timeout must NOT redial (opened stays 1)");
+    assert_eq!(
+        opened, 1,
+        "post-send timeout must NOT redial (opened stays 1)"
+    );
     let ts = pool.relay_stats().await.timeouts;
-    assert!(ts.iter().any(|t| t.phase == "firstbyte"), "firstbyte timeout counted: {ts:?}");
+    assert!(
+        ts.iter().any(|t| t.phase == "firstbyte"),
+        "firstbyte timeout counted: {ts:?}"
+    );
 }
 
 /// Idle mid-stream: head + one chunk, then the owner goes silent. The inter-chunk
@@ -660,7 +844,9 @@ async fn idle_timeout_fires_when_stream_goes_silent() {
     .expect("stream opens");
     assert_eq!(ts.status, 200);
 
-    let first = tokio::time::timeout(Duration::from_secs(3), ts.recv()).await.expect("first chunk soon");
+    let first = tokio::time::timeout(Duration::from_secs(3), ts.recv())
+        .await
+        .expect("first chunk soon");
     assert!(first.is_some(), "the one emitted chunk arrives");
 
     // The peer is now silent; the next recv must self-terminate on the idle budget.
@@ -670,9 +856,16 @@ async fn idle_timeout_fires_when_stream_goes_silent() {
         .expect("recv must self-terminate on idle, not hang");
     assert!(next.is_none(), "idle timeout ends the stream (None)");
     assert!(ts.timed_out(), "ended via idle timeout, not a clean EOF");
-    assert!(t0.elapsed() < Duration::from_secs(3), "fired within the idle budget (~700ms): {:?}", t0.elapsed());
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "fired within the idle budget (~700ms): {:?}",
+        t0.elapsed()
+    );
     let cnt = pool.relay_stats().await.timeouts;
-    assert!(cnt.iter().any(|t| t.phase == "idle"), "idle timeout counted: {cnt:?}");
+    assert!(
+        cnt.iter().any(|t| t.phase == "idle"),
+        "idle timeout counted: {cnt:?}"
+    );
 }
 
 /// Slow-but-alive: chunks every 150ms with a 700ms idle budget. The stream must NOT
@@ -703,7 +896,13 @@ async fn slow_but_alive_stream_survives() {
     {
         body.extend_from_slice(&c);
     }
-    assert!(!ts.timed_out(), "an active stream (chunk gap < idle) must NOT be killed");
+    assert!(
+        !ts.timed_out(),
+        "an active stream (chunk gap < idle) must NOT be killed"
+    );
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("data: 0") && body.contains("data: 3"), "all chunks delivered: {body}");
+    assert!(
+        body.contains("data: 0") && body.contains("data: 3"),
+        "all chunks delivered: {body}"
+    );
 }

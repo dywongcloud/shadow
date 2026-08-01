@@ -5,74 +5,76 @@
 //! pipeline (WAF, bot management, CDN), cron, workflows, previews, and a
 //! region-aware node registry that meshes with peer nodes over HTTP gossip.
 
+mod acme;
 mod admin;
 mod apikeys;
 mod audit;
 mod auth;
 mod billing;
+mod browser_admission;
+mod browser_presence;
 mod cluster;
 mod compose;
 mod databases;
 mod db_gateway;
 mod db_replicate;
 mod db_rest;
+mod discovery;
 mod dns;
 mod dns_geo;
 mod dns_probe;
 mod dnsserver;
-mod geoip;
 mod docstore;
 mod edge;
 mod enterprise;
 mod enterprise_api;
+mod geoip;
 mod git;
 mod github_app_auth;
-mod gossip;
-mod discovery;
 mod gitops;
+mod gossip;
 mod gpu_pool;
-mod inference;
-mod lease;
-mod mesh_raw;
 mod guardian;
 mod identity;
 mod incidents;
+mod inference;
 mod integrations;
+mod lease;
+mod mesh_raw;
 mod metrics;
-mod resp_cache;
 mod microfrontends;
 mod microfrontends_api;
 mod notifications;
-mod push;
 mod persist;
 mod project_settings;
+mod push;
 mod raw_ports;
 mod raw_proxy;
 mod relational;
-mod udp_relay;
 mod resources;
 mod resp;
+mod resp_cache;
 mod retry;
 mod sandboxes;
 mod sandboxes_api;
 mod sandboxes_platform;
+mod schedule;
+mod secrets;
+mod securelink;
+mod state;
 mod storage_api;
 mod storage_broker;
 mod store_sync;
 mod supervise;
-mod schedule;
+mod svcgraph;
+mod teams;
+mod udp_relay;
+mod vercel_dns;
+mod webhooks;
 mod world;
 mod world_queue;
-mod secrets;
-mod vercel_dns;
-mod acme;
-mod securelink;
-mod svcgraph;
 #[cfg(feature = "zkauth")]
 mod zkauth;
-mod state;
-mod teams;
-mod webhooks;
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -127,7 +129,10 @@ pub static malloc_conf: &[u8] = b"prof:true,prof_active:false,lg_prof_sample:19\
 static SHUTDOWN_HTTPS_HANDLE: std::sync::OnceLock<axum_server::Handle> = std::sync::OnceLock::new();
 
 #[derive(Parser, Debug)]
-#[command(name = "hive-cloud", about = "A unified cloud node (builds + serving + edge + cron + workflows)")]
+#[command(
+    name = "hive-cloud",
+    about = "A unified cloud node (builds + serving + edge + cron + workflows)"
+)]
 struct Args {
     /// Region id for this node. Default "auto" derives it from the node's real
     /// geolocation (e.g. a node in Los Angeles → "los-angeles"); pass an explicit
@@ -186,8 +191,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
     // Install the process-level rustls CryptoProvider FIRST (later installs
@@ -212,7 +216,9 @@ async fn main() -> anyhow::Result<()> {
     // Firecracker microVM backend whenever the host supports it (Linux + /dev/kvm),
     // and fall back to the sandboxed child-process MockBackend otherwise (e.g. local
     // dev on macOS). `HIVE_FORCE_MOCK=1` forces the mock for local development.
-    let force_mock = std::env::var("HIVE_FORCE_MOCK").map(|v| v == "1").unwrap_or(false);
+    let force_mock = std::env::var("HIVE_FORCE_MOCK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     // Guest kernel cmdline override. Some hosts need extra args — e.g. PVM
     // (software-virtualized KVM on a cloud VM) wants the i8042 probes disabled:
     //   HIVE_FC_BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off i8042.noaux \
@@ -231,26 +237,26 @@ async fn main() -> anyhow::Result<()> {
     // exec/kill methods are Firecracker-specific, not part of the generic
     // `CellBackend` trait object every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
-    let sandbox_fc: Option<Arc<FirecrackerBackend>> = sandbox_fc_supported.then(|| firecracker.clone());
-    let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) =
-        if sandbox_fc_supported {
-            tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
-            (firecracker, "firecracker")
+    let sandbox_fc: Option<Arc<FirecrackerBackend>> =
+        sandbox_fc_supported.then(|| firecracker.clone());
+    let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) = if sandbox_fc_supported {
+        tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
+        (firecracker, "firecracker")
+    } else {
+        if force_mock {
+            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
         } else {
-            if force_mock {
-                tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
-            } else {
-                tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
-            }
-            (
-                Arc::new(MockBackend::new(MockConfig {
-                    root: std::env::temp_dir().join("hive-cloud-cells"),
-                    provision_latency: Duration::from_millis(200),
-                    cache_root: std::env::temp_dir().join("hive-cloud-cache"),
-                })),
-                "mock",
-            )
-        };
+            tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
+        }
+        (
+            Arc::new(MockBackend::new(MockConfig {
+                root: std::env::temp_dir().join("hive-cloud-cells"),
+                provision_latency: Duration::from_millis(200),
+                cache_root: std::env::temp_dir().join("hive-cloud-cache"),
+            })),
+            "mock",
+        )
+    };
     let backend_name = backend_name.to_string();
 
     // Auto-detect this node's real-world location (IP geolocation) so it reports
@@ -312,24 +318,45 @@ async fn main() -> anyhow::Result<()> {
     // with over iroh (no SSH, no prior state). From `HIVE_BOOTSTRAP_PEERS` (CSV) or a
     // `$HIVE_DATA/bootstrap_peers` file. Registered with iroh so seeds dial by NodeId.
     let bootstrap_seeds = {
-        let csv = std::env::var("HIVE_BOOTSTRAP_PEERS").ok().filter(|s| !s.trim().is_empty()).or_else(|| {
-            std::fs::read_to_string(persist::data_dir().join("bootstrap_peers"))
-                .ok()
-                .map(|s| s.replace(['\n', '\r'], ","))
-        });
-        csv.map(|c| hive_p2p::parse_bootstrap_seeds(&c)).unwrap_or_default()
+        let csv = std::env::var("HIVE_BOOTSTRAP_PEERS")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                std::fs::read_to_string(persist::data_dir().join("bootstrap_peers"))
+                    .ok()
+                    .map(|s| s.replace(['\n', '\r'], ","))
+            });
+        csv.map(|c| hive_p2p::parse_bootstrap_seeds(&c))
+            .unwrap_or_default()
     };
     // Self-hosted discovery (Seer): pkarr relay URLs the node publishes to + resolves
     // from, instead of depending on n0's public pkarr/DNS. Added alongside n0 (the
     // mesh keeps working if Seer is down). Run Seer itself with HIVE_SEER_ADDR.
     let discovery_urls: Vec<String> = std::env::var("HIVE_DISCOVERY_DNS")
         .ok()
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
     // HIVE_DISCOVERY_N0=0 drops n0's public pkarr/DNS (Seer-only discovery, n0 relay
     // kept). Default keeps n0 (Seer additive).
-    let n0_discovery = std::env::var("HIVE_DISCOVERY_N0").map(|v| v != "0" && v != "false").unwrap_or(true);
-    let iroh_ep = match tokio::time::timeout(Duration::from_secs(8), hive_p2p::bind_full(Some(iroh_key_path), &bootstrap_seeds, &discovery_urls, n0_discovery)).await {
+    let n0_discovery = std::env::var("HIVE_DISCOVERY_N0")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true);
+    let iroh_ep = match tokio::time::timeout(
+        Duration::from_secs(8),
+        hive_p2p::bind_full(
+            Some(iroh_key_path),
+            &bootstrap_seeds,
+            &discovery_urls,
+            n0_discovery,
+        ),
+    )
+    .await
+    {
         Ok(Ok(ep)) => {
             tracing::info!(peer_id = %ep.id(), "iroh P2P endpoint bound (real QUIC mesh)");
             Some(ep)
@@ -350,9 +377,15 @@ async fn main() -> anyhow::Result<()> {
     // detection (correct for 1:1-NAT cloud nodes; do NOT use on home-NAT'd nodes, where
     // the detected IP is the ISP gateway, not reachable inbound). Unset → None (NAT-safe).
     let public_ip = resolve_public_ip(geo.as_ref().and_then(|g| g.4.clone()));
-    let public_ip6 = std::env::var("HIVE_PUBLIC_IP6").ok().and_then(|s| {
-        s.trim().parse::<std::net::Ipv6Addr>().ok().filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
-    }).map(|ip| ip.to_string());
+    let public_ip6 = std::env::var("HIVE_PUBLIC_IP6")
+        .ok()
+        .and_then(|s| {
+            s.trim()
+                .parse::<std::net::Ipv6Addr>()
+                .ok()
+                .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        })
+        .map(|ip| ip.to_string());
     if let Some(ip) = &public_ip {
         tracing::info!(%ip, ip6 = ?public_ip6, "node public IP (advertised to client DNS / Seer)");
     }
@@ -373,8 +406,10 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(args.relay_port);
-    let relay_bind: SocketAddr =
-        SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), relay_port);
+    let relay_bind: SocketAddr = SocketAddr::new(
+        std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        relay_port,
+    );
     let mut embedded_relay_cfg = iroh_relay::server::ServerConfig::default();
     let mut relay_cfg = iroh_relay::server::RelayConfig::new(relay_bind);
     // PER-CLIENT INGRESS RATE LIMIT. This relay is PUBLIC-FACING on :3340 on
@@ -403,7 +438,10 @@ async fn main() -> anyhow::Result<()> {
         // over a relayed trunk) is not clipped by the steady-state rate.
         rl.max_burst_bytes = std::num::NonZeroU32::new(bps.get().saturating_mul(2));
         relay_cfg.limits.client_rx = Some(rl);
-        tracing::info!(bytes_per_second = bps.get(), "embedded relay: per-client rate limit armed");
+        tracing::info!(
+            bytes_per_second = bps.get(),
+            "embedded relay: per-client rate limit armed"
+        );
     } else {
         tracing::warn!("embedded relay: per-client rate limit DISABLED (HIVE_RELAY_CLIENT_BPS=0)");
     }
@@ -425,7 +463,10 @@ async fn main() -> anyhow::Result<()> {
             None
         }
         Err(_) => {
-            tracing::warn!(port = relay_port, "embedded iroh-relay server bind timed out (continuing without it)");
+            tracing::warn!(
+                port = relay_port,
+                "embedded iroh-relay server bind timed out (continuing without it)"
+            );
             None
         }
     };
@@ -435,8 +476,10 @@ async fn main() -> anyhow::Result<()> {
     // already follow). Kept alive for the whole process (`relay_server` isn't
     // dropped until `main` returns, which — barring a fatal listener error below
     // — is never, so the server outlives the boot function).
-    let own_relay_url: Option<String> =
-        relay_server.as_ref().and(public_ip.as_ref()).map(|ip| format!("http://{ip}:{relay_port}"));
+    let own_relay_url: Option<String> = relay_server
+        .as_ref()
+        .and(public_ip.as_ref())
+        .map(|ip| format!("http://{ip}:{relay_port}"));
     if let Some(url) = &own_relay_url {
         tracing::info!(%url, "this node's relay_url (advertised via gossip)");
     }
@@ -480,12 +523,18 @@ async fn main() -> anyhow::Result<()> {
         // zone's NS set. Older binaries never set this, which is what gates the
         // api delegation until enough of the fleet can actually answer it.
         dns_api: {
-            let ns_ok = std::env::var("HIVE_DNS_ADDR").ok().map(|a| {
-                let port_is_53 = a.rsplit(':').next() == Some("53");
-                let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
-                port_is_53 && (host == "0.0.0.0" || host == "[::]" || host == "::")
-            }).unwrap_or(false);
-            ns_ok && std::env::var("HIVE_PLATFORM_DOMAIN").map(|v| !v.trim().is_empty()).unwrap_or(false)
+            let ns_ok = std::env::var("HIVE_DNS_ADDR")
+                .ok()
+                .map(|a| {
+                    let port_is_53 = a.rsplit(':').next() == Some("53");
+                    let host = a.rsplit_once(':').map(|(h, _)| h).unwrap_or("");
+                    port_is_53 && (host == "0.0.0.0" || host == "[::]" || host == "::")
+                })
+                .unwrap_or(false);
+            ns_ok
+                && std::env::var("HIVE_PLATFORM_DOMAIN")
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
         },
         // Filled in by `dns_probe::spawn_ns_prober` from this node's own
         // off-host probes of its peers, refreshed every round (same post-boot
@@ -556,7 +605,11 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // `--acme-txt-selftest` seed (see the arg's doc comment).
-    if let Some((fqdn, value)) = args.acme_txt_selftest.as_deref().and_then(|s| s.split_once('=')) {
+    if let Some((fqdn, value)) = args
+        .acme_txt_selftest
+        .as_deref()
+        .and_then(|s| s.split_once('='))
+    {
         cloud.acme_challenges.insert(fqdn, value);
         tracing::info!(%fqdn, "ACME DNS-01 selftest TXT seeded into the challenge store");
     }
@@ -594,14 +647,16 @@ async fn main() -> anyhow::Result<()> {
         let flush_cloud = cloud.clone();
         tokio::spawn(async move {
             let _ = &flush_cloud; // keep state alive for the flush
-            let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut intr = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+            let mut intr =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
             tokio::select! {
                 _ = term.recv() => {}
                 _ = intr.recv() => {}
@@ -643,7 +698,9 @@ async fn main() -> anyhow::Result<()> {
                 let budget = Duration::from_secs(env_u64("HIVE_ENDPOINT_CLOSE_SECS", 3));
                 match tokio::time::timeout(budget, ep.close()).await {
                     Ok(()) => tracing::info!("iroh endpoint closed cleanly — peers notified"),
-                    Err(_) => tracing::warn!(?budget, "iroh endpoint close timed out; exiting anyway"),
+                    Err(_) => {
+                        tracing::warn!(?budget, "iroh endpoint close timed out; exiting anyway")
+                    }
                 }
             }
             std::process::exit(0);
@@ -666,16 +723,26 @@ async fn main() -> anyhow::Result<()> {
     let seed_targets: Vec<(String, String, String)> = bootstrap_seeds
         .iter()
         .filter(|s| self_iroh_id.as_deref() != Some(s.node_id.as_str()))
-        .map(|s| (format!("seed:{}", s.node_id), s.node_id.clone(), s.addr_json.clone()))
+        .map(|s| {
+            (
+                format!("seed:{}", s.node_id),
+                s.node_id.clone(),
+                s.addr_json.clone(),
+            )
+        })
         .collect();
     {
         let mut pi = cloud.peer_iroh.write();
         for (key, nid, addr) in &seed_targets {
-            pi.entry(key.clone()).or_insert_with(|| (nid.clone(), addr.clone()));
+            pi.entry(key.clone())
+                .or_insert_with(|| (nid.clone(), addr.clone()));
         }
     }
     if !seed_targets.is_empty() {
-        tracing::info!(seeds = seed_targets.len(), "cold-start bootstrap seeds registered");
+        tracing::info!(
+            seeds = seed_targets.len(),
+            "cold-start bootstrap seeds registered"
+        );
     }
 
     // Record mesh peers so the build cache can be pulled P2P from other nodes.
@@ -689,6 +756,25 @@ async fn main() -> anyhow::Result<()> {
         // Pooled cross-node transport: reuse one QUIC connection per peer, a new
         // stream per request (built here, alongside the endpoint it dials with).
         *cloud.mesh.write() = Some(hive_p2p::PeerPool::new(ep.clone()));
+        let browser_pool = hive_p2p::BrowserPool::new(ep.clone());
+        *cloud.browser_mesh.write() = Some(browser_pool.clone());
+        gw.set_browser_invoker(std::sync::Arc::new(move |target, request| {
+            let browser_pool = browser_pool.clone();
+            Box::pin(async move {
+                browser_pool
+                    .invoke(
+                        &target.endpoint_id,
+                        &target.addr_json,
+                        &target.digest,
+                        &request,
+                    )
+                    .await
+                    .map_err(|error| fluid_gateway::BrowserInvokeFailure {
+                        sent: error.sent,
+                        message: error.message,
+                    })
+            })
+        }));
         // Live relay-set tracker (dynamic-hive-relay-urls-list): kept alongside
         // `mesh`, synced on an interval by `spawn_relay_sync_loop` below.
         *cloud.relay_set.write() = Some(hive_p2p::RelaySet::new(ep.clone()));
@@ -764,7 +850,24 @@ async fn main() -> anyhow::Result<()> {
         // inbound `STREAM_RAW_TARGET` handshakes to this node's local container
         // legs — the cross-node hop behind the raw-port proxy / UDP relay.
         let raw_resolver = crate::mesh_raw::resolver(cloud.clone());
-        tokio::spawn(hive_p2p::serve_tunnels_full(ep, gateway_addr, 256, trust, Some(gossip_handler), join_handler, Some(raw_resolver)));
+        let admission_cloud = cloud.clone();
+        let browser_admission: hive_p2p::BrowserAdmissionHandler =
+            std::sync::Arc::new(move |endpoint_id: String| {
+                let cloud = admission_cloud.clone();
+                Box::pin(async move {
+                    crate::browser_admission::endpoint_admitted(&cloud, &endpoint_id).await
+                })
+            });
+        tokio::spawn(hive_p2p::serve_tunnels_full(
+            ep,
+            gateway_addr,
+            256,
+            trust,
+            Some(gossip_handler),
+            join_handler,
+            Some(raw_resolver),
+            Some(browser_admission),
+        ));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }
 
@@ -805,7 +908,11 @@ async fn main() -> anyhow::Result<()> {
     // has real data starting the restart after the gossip loop has had a
     // chance to populate and persist it. See set_boot_seed_peers's doc
     // comment for why this specific window matters.
-    guardian::set_boot_seed_peers(crate::persist::load_peer_guardian_addr().into_values().collect());
+    guardian::set_boot_seed_peers(
+        crate::persist::load_peer_guardian_addr()
+            .into_values()
+            .collect(),
+    );
     guardian::init_background();
     // Fleet-consistent relational tables (project_teams, billing_*) — see
     // relational.rs's module doc. Idempotent (CREATE TABLE IF NOT EXISTS);
@@ -882,7 +989,10 @@ async fn main() -> anyhow::Result<()> {
                     return; // seeds/CLI/live gossip already populated it
                 }
                 if let Some(bytes) = guardian::get("mesh/roster").await {
-                    if let Ok(map) = serde_json::from_slice::<std::collections::HashMap<String, (String, String)>>(&bytes) {
+                    if let Ok(map) = serde_json::from_slice::<
+                        std::collections::HashMap<String, (String, String)>,
+                    >(&bytes)
+                    {
                         let me = c.registry.me().peer_id;
                         let mut pi = c.peer_iroh.write();
                         for (k, v) in map {
@@ -891,7 +1001,10 @@ async fn main() -> anyhow::Result<()> {
                             }
                             pi.entry(k).or_insert(v);
                         }
-                        tracing::info!(entries = pi.len(), "mesh roster adopted from GuardianDB replica");
+                        tracing::info!(
+                            entries = pi.len(),
+                            "mesh roster adopted from GuardianDB replica"
+                        );
                         return;
                     }
                 }
@@ -943,7 +1056,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Managed World Queue delivery loop (hive-native Queue for the Vercel WDK
     // World interface -- no external queue dependency).
-    tokio::spawn(crate::world_queue::run_delivery_loop(cloud.clone(), cloud.world_queue.clone()));
+    tokio::spawn(crate::world_queue::run_delivery_loop(
+        cloud.clone(),
+        cloud.world_queue.clone(),
+    ));
 
     // Nameserver prover: EVERY node (not leader-only — the whole value is
     // independent vantages) queries every peer that claims a public `:53` and
@@ -963,8 +1079,10 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .map(|v| v.trim().trim_end_matches('/').to_string())
             .filter(|v| !v.is_empty());
-        let budget_ms: u64 =
-            std::env::var("HIVE_DASHBOARD_PROBE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1500);
+        let budget_ms: u64 = std::env::var("HIVE_DASHBOARD_PROBE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1500);
         tokio::spawn(async move {
             let Some(up) = upstream else { return };
             loop {
@@ -1022,23 +1140,36 @@ async fn main() -> anyhow::Result<()> {
     spawn_container_lock_sweep();
 
     // Public gateway, wrapped in the edge pipeline.
-    let public = fluid_gateway::public_router(gw.clone())
-        .layer(axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline));
+    let public = fluid_gateway::public_router(gw.clone()).layer(
+        axum::middleware::from_fn_with_state(cloud.clone(), edge::edge_pipeline),
+    );
     // Connection-level DoS bounds on the control plane (the admin router has no
     // streaming/SSE endpoints and deploys enqueue-then-return, so a bounded
     // per-request timeout and body cap are safe — unlike the public gateway,
     // which streams tenant responses and already caps request bodies at 16 MiB
     // + per-IP rate-limits in the edge pipeline). Env-tunable.
     let admin_max_body: usize = std::env::var("HIVE_ADMIN_MAX_BODY_MIB")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(64) * 1024 * 1024;
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64)
+        * 1024
+        * 1024;
     let admin_req_timeout = Duration::from_secs(
-        std::env::var("HIVE_ADMIN_REQUEST_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(120),
+        std::env::var("HIVE_ADMIN_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
         .layer(axum::middleware::from_fn(admin_cache_headers))
-        .layer(axum::middleware::from_fn_with_state(cloud.clone(), auth::require_auth))
+        .layer(axum::middleware::from_fn_with_state(
+            cloud.clone(),
+            auth::require_auth,
+        ))
         .layer(axum::middleware::from_fn(admin::admin_rate_limit))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(admin_max_body))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(
+            admin_max_body,
+        ))
         .layer(tower_http::timeout::TimeoutLayer::new(admin_req_timeout));
     if auth::enforced() {
         tracing::info!("JWT auth enforced on admin mutations (HIVE_JWT_SECRET set)");
@@ -1071,10 +1202,26 @@ async fn main() -> anyhow::Result<()> {
             // — each node's own self-hosted dashboard on loopback
             // (http://127.0.0.1:3002), never an external tunnel. Empty upstream =
             // no dashboard hosts.
-            let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM").ok().map(|v| v.trim().trim_end_matches('/').to_string()).filter(|v| !v.is_empty());
-            let dash_hosts = vec![cloud.platform_domain.clone(), format!("www.{}", cloud.platform_domain)];
+            let dash_upstream = std::env::var("HIVE_DASHBOARD_UPSTREAM")
+                .ok()
+                .map(|v| v.trim().trim_end_matches('/').to_string())
+                .filter(|v| !v.is_empty());
+            let dash_hosts = vec![
+                cloud.platform_domain.clone(),
+                format!("www.{}", cloud.platform_domain),
+            ];
             tracing::info!(%api_host, %admin_host, %webhook_host, dashboard = ?dash_upstream, "host-based dispatch active (api/admin/webhook hosts → admin router; apex/www → dashboard proxy)");
-            host_switch_router(cloud.clone(), api_host, admin_host, webhook_host, dash_hosts, dash_upstream, cloud.http.clone(), admin_router.clone(), public)
+            host_switch_router(
+                cloud.clone(),
+                api_host,
+                admin_host,
+                webhook_host,
+                dash_hosts,
+                dash_upstream,
+                cloud.http.clone(),
+                admin_router.clone(),
+                public,
+            )
         }
     } else {
         public
@@ -1140,7 +1287,9 @@ async fn main() -> anyhow::Result<()> {
         // finish instead of the previous behavior (immediate `process::exit`
         // severing every in-flight request/tunnel the instant SIGTERM arrived).
         let https_shutdown_handle = axum_server::Handle::new();
-        SHUTDOWN_HTTPS_HANDLE.set(https_shutdown_handle.clone()).ok();
+        SHUTDOWN_HTTPS_HANDLE
+            .set(https_shutdown_handle.clone())
+            .ok();
         tokio::spawn(async move {
             let _ = rustls::crypto::ring::default_provider().install_default();
             let cfg = axum_server::tls_rustls::RustlsConfig::from_config(acme::server_config());
@@ -1155,21 +1304,27 @@ async fn main() -> anyhow::Result<()> {
         });
         // Port 80: redirect-only (no content ever served in cleartext).
         tokio::spawn(async move {
-            let redirect = axum::Router::new().fallback(|req: axum::http::Request<axum::body::Body>| async move {
-                let host = req
-                    .headers()
-                    .get(axum::http::header::HOST)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|s| s.to_string())
-                    .or_else(|| req.uri().host().map(|h| h.to_string()))
-                    .unwrap_or_default()
-                    .split(':')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                let path_q = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
-                axum::response::Redirect::permanent(&format!("https://{host}{path_q}"))
-            });
+            let redirect = axum::Router::new().fallback(
+                |req: axum::http::Request<axum::body::Body>| async move {
+                    let host = req
+                        .headers()
+                        .get(axum::http::header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string())
+                        .or_else(|| req.uri().host().map(|h| h.to_string()))
+                        .unwrap_or_default()
+                        .split(':')
+                        .next()
+                        .unwrap_or("")
+                        .to_string();
+                    let path_q = req
+                        .uri()
+                        .path_and_query()
+                        .map(|p| p.as_str().to_string())
+                        .unwrap_or_else(|| "/".into());
+                    axum::response::Redirect::permanent(&format!("https://{host}{path_q}"))
+                },
+            );
             tracing::info!(%http_addr, "port-80 listener (301 → https only)");
             match tokio::net::TcpListener::bind(http_addr).await {
                 Ok(l) => {
@@ -1177,7 +1332,9 @@ async fn main() -> anyhow::Result<()> {
                         tracing::error!(error = %e, "port-80 redirect listener failed");
                     }
                 }
-                Err(e) => tracing::error!(error = %e, %http_addr, "cannot bind port 80 (check CAP_NET_BIND_SERVICE)"),
+                Err(e) => {
+                    tracing::error!(error = %e, %http_addr, "cannot bind port 80 (check CAP_NET_BIND_SERVICE)")
+                }
             }
         });
     }
@@ -1267,7 +1424,10 @@ fn host_switch_router(
             // Dashboard hosts: reverse-proxy to the configured origin — each
             // node's own self-hosted dashboard on loopback, never an external
             // tunnel (HIVE_DASHBOARD_UPSTREAM=http://127.0.0.1:3002).
-            if let (true, Some(up)) = (dash_hosts.iter().any(|h| *h == host), dash_upstream.as_ref()) {
+            if let (true, Some(up)) = (
+                dash_hosts.iter().any(|h| *h == host),
+                dash_upstream.as_ref(),
+            ) {
                 return dashboard_proxy(&http, up, req).await;
             }
             match tower::ServiceExt::oneshot(public, req).await {
@@ -1312,15 +1472,21 @@ async fn admin_cache_headers(
     let is_get = req.method() == axum::http::Method::GET;
     let path = req.uri().path().to_string();
     let mut resp = next.run(req).await;
-    if is_get && !resp.headers().contains_key(axum::http::header::CACHE_CONTROL) {
-        let public_catalog = path == "/v1/frameworks" || path == "/v1/regions" || path.starts_with("/v1/regions/");
+    if is_get
+        && !resp
+            .headers()
+            .contains_key(axum::http::header::CACHE_CONTROL)
+    {
+        let public_catalog =
+            path == "/v1/frameworks" || path == "/v1/regions" || path.starts_with("/v1/regions/");
         let value = if public_catalog {
             "public, max-age=300, s-maxage=3600, stale-while-revalidate=86400"
         } else {
             "private, no-store"
         };
         if let Ok(v) = axum::http::HeaderValue::from_str(value) {
-            resp.headers_mut().insert(axum::http::header::CACHE_CONTROL, v);
+            resp.headers_mut()
+                .insert(axum::http::header::CACHE_CONTROL, v);
         }
     }
     resp
@@ -1333,7 +1499,10 @@ async fn admin_ingress(
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
-    async fn serve_local(admin: axum::Router, req: axum::http::Request<axum::body::Body>) -> axum::response::Response {
+    async fn serve_local(
+        admin: axum::Router,
+        req: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
         match tower::ServiceExt::oneshot(admin, req).await {
             Ok(resp) => resp,
             Err(never) => match never {},
@@ -1365,7 +1534,11 @@ async fn admin_ingress(
             if let Some(e) = sender_epoch {
                 let ours = cloud.cluster.epoch();
                 if e < ours {
-                    tracing::warn!(sender_epoch = e, local_epoch = ours, "rejected forwarded mutation with stale control-plane epoch (fenced)");
+                    tracing::warn!(
+                        sender_epoch = e,
+                        local_epoch = ours,
+                        "rejected forwarded mutation with stale control-plane epoch (fenced)"
+                    );
                     return (
                         axum::http::StatusCode::SERVICE_UNAVAILABLE,
                         "stale control-plane epoch (ownership changed); retry",
@@ -1378,7 +1551,11 @@ async fn admin_ingress(
             return serve_local(admin, req).await;
         }
         if is_mutation {
-            return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "not control-plane leader").into_response();
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "not control-plane leader",
+            )
+                .into_response();
         }
         return serve_local(admin, req).await;
     }
@@ -1400,10 +1577,17 @@ async fn admin_ingress(
             // leader's `require_auth` re-verifies either; this gate only
             // fails fast. JWT-only here made API keys silently read-only.
             let ok = crate::auth::extract_token(req.headers())
-                .map(|t| crate::auth::verify(&t).is_ok() || crate::auth::api_key_claims(&cloud, &t).is_some())
+                .map(|t| {
+                    crate::auth::verify(&t).is_ok()
+                        || crate::auth::api_key_claims(&cloud, &t).is_some()
+                })
                 .unwrap_or(false);
             if !ok {
-                return (axum::http::StatusCode::UNAUTHORIZED, "missing or invalid bearer token").into_response();
+                return (
+                    axum::http::StatusCode::UNAUTHORIZED,
+                    "missing or invalid bearer token",
+                )
+                    .into_response();
             }
         }
     }
@@ -1431,14 +1615,20 @@ async fn admin_ingress(
     // must FAIL CLOSED (never fall back to plain DNS, which could send the write
     // anywhere). In that case avoid split-brain: serve reads locally (best effort),
     // refuse mutations with 503.
-    let leader_ip = cloud.leader_node().and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
+    let leader_ip = cloud
+        .leader_node()
+        .and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
     if let Some(ip) = leader_ip {
         if let Some(client) = leader_client(&ip, &api_host) {
             return admin_forward_to_leader(client, &api_host, cloud.cluster.epoch(), req).await;
         }
     }
     if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
-        (axum::http::StatusCode::SERVICE_UNAVAILABLE, "control-plane leader unreachable").into_response()
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "control-plane leader unreachable",
+        )
+            .into_response()
     } else {
         serve_local(admin, req).await
     }
@@ -1451,8 +1641,9 @@ async fn admin_ingress(
 /// built, so the caller FAILS CLOSED rather than falling back to plain DNS (which
 /// would resolve `api_host` to an arbitrary node and mis-route the forward).
 fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>> =
-        std::sync::OnceLock::new();
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
+    > = std::sync::OnceLock::new();
     let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let key = format!("{ip}|{api_host}");
     if let Some(c) = cache.lock().unwrap().get(&key) {
@@ -1482,13 +1673,21 @@ async fn admin_forward_to_leader(
     let (parts, body) = req.into_parts();
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+        Err(_) => {
+            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()
+        }
     };
-    let path_q = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    let path_q = parts
+        .uri
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
     let url = format!("https://{api_host}{path_q}");
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,
-        Err(_) => return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response(),
+        Err(_) => {
+            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
+        }
     };
     // The forwarder's control-plane epoch rides along as the fencing token —
     // the receiver refuses the write if this is behind ITS epoch (the sender's
@@ -1504,22 +1703,32 @@ async fn admin_forward_to_leader(
         }
         rb = rb.header(k, v);
     }
-    rb = rb.header(reqwest::header::HOST, api_host).body(body.to_vec());
+    rb = rb
+        .header(reqwest::header::HOST, api_host)
+        .body(body.to_vec());
     match rb.send().await {
         Ok(resp) => {
             let mut out = axum::http::Response::builder().status(resp.status().as_u16());
             for (k, v) in resp.headers().iter() {
                 let n = k.as_str().to_ascii_lowercase();
-                if matches!(n.as_str(), "connection" | "transfer-encoding" | "content-length") {
+                if matches!(
+                    n.as_str(),
+                    "connection" | "transfer-encoding" | "content-length"
+                ) {
                     continue;
                 }
                 out = out.header(k.as_str(), v.as_bytes());
             }
             let bytes = resp.bytes().await.unwrap_or_default();
-            out.body(axum::body::Body::from(bytes))
-                .unwrap_or_else(|_| (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response())
+            out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+                (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response()
+            })
         }
-        Err(_) => (axum::http::StatusCode::BAD_GATEWAY, "control-plane leader forward failed").into_response(),
+        Err(_) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            "control-plane leader forward failed",
+        )
+            .into_response(),
     }
 }
 
@@ -1557,22 +1766,45 @@ async fn dashboard_proxy(
         .next()
         .unwrap_or("")
         .to_string();
-    let upstream_host = upstream.trim_start_matches("https://").trim_start_matches("http://").trim_end_matches('/').to_string();
-    let path_q = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_else(|| "/".into());
+    let upstream_host = upstream
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .to_string();
+    let path_q = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .unwrap_or_else(|| "/".into());
     let url = format!("{upstream}{path_q}");
     let (parts, body) = req.into_parts();
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
-        Err(_) => return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response(),
+        Err(_) => {
+            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()
+        }
     };
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,
-        Err(_) => return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response(),
+        Err(_) => {
+            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
+        }
     };
     let mut rb = http.request(method, &url).body(body.to_vec());
     for (k, v) in parts.headers.iter() {
         let name = k.as_str().to_ascii_lowercase();
-        if matches!(name.as_str(), "host" | "connection" | "transfer-encoding" | "content-length" | "upgrade" | "keep-alive" | "accept-encoding" | "x-forwarded-host" | "x-forwarded-proto") {
+        if matches!(
+            name.as_str(),
+            "host"
+                | "connection"
+                | "transfer-encoding"
+                | "content-length"
+                | "upgrade"
+                | "keep-alive"
+                | "accept-encoding"
+                | "x-forwarded-host"
+                | "x-forwarded-proto"
+        ) {
             continue;
         }
         rb = rb.header(k, v);
@@ -1586,14 +1818,20 @@ async fn dashboard_proxy(
     // loopback upstream doesn't need Host forwarding at all (there's only one
     // app listening there); x-forwarded-host/proto remain the mechanism the
     // app itself is expected to read for its own absolute-URL construction.
-    rb = rb.header("x-forwarded-host", &public_host).header("x-forwarded-proto", "https");
+    rb = rb
+        .header("x-forwarded-host", &public_host)
+        .header("x-forwarded-proto", "https");
     match rb.send().await {
         Ok(resp) => {
-            let status = axum::http::StatusCode::from_u16(resp.status().as_u16()).unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
+            let status = axum::http::StatusCode::from_u16(resp.status().as_u16())
+                .unwrap_or(axum::http::StatusCode::BAD_GATEWAY);
             let mut builder = axum::http::Response::builder().status(status);
             for (k, v) in resp.headers().iter() {
                 let name = k.as_str().to_ascii_lowercase();
-                if matches!(name.as_str(), "connection" | "transfer-encoding" | "content-length" | "content-encoding") {
+                if matches!(
+                    name.as_str(),
+                    "connection" | "transfer-encoding" | "content-length" | "content-encoding"
+                ) {
                     continue;
                 }
                 // Keep the user on the PUBLIC host across auth bounces: rewrite
@@ -1618,9 +1856,15 @@ async fn dashboard_proxy(
             builder
                 .body(axum::body::Body::from_stream(stream))
                 .map(|r| r.into_response())
-                .unwrap_or_else(|_| (axum::http::StatusCode::BAD_GATEWAY, "proxy build failed").into_response())
+                .unwrap_or_else(|_| {
+                    (axum::http::StatusCode::BAD_GATEWAY, "proxy build failed").into_response()
+                })
         }
-        Err(e) => (axum::http::StatusCode::BAD_GATEWAY, format!("dashboard origin unreachable: {e}")).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_GATEWAY,
+            format!("dashboard origin unreachable: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -1655,7 +1899,10 @@ async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
     // Install the ring crypto provider for rustls (idempotent).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let config = match (std::env::var("HIVE_TLS_CERT"), std::env::var("HIVE_TLS_KEY")) {
+    let config = match (
+        std::env::var("HIVE_TLS_CERT"),
+        std::env::var("HIVE_TLS_KEY"),
+    ) {
         (Ok(cert_path), Ok(key_path)) if !cert_path.is_empty() && !key_path.is_empty() => {
             tracing::info!(cert=%cert_path, "TLS using provided certificate");
             RustlsConfig::from_pem_file(cert_path, key_path).await?
@@ -1686,13 +1933,19 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
     let is_public_v4 = |ip: &std::net::Ipv4Addr| {
         !ip.is_unspecified() && !ip.is_loopback() && !ip.is_private() && !ip.is_link_local()
     };
-    match std::env::var("HIVE_PUBLIC_IP").ok().map(|s| s.trim().to_string()) {
-        Some(v) if v.eq_ignore_ascii_case("auto") => {
-            detected.and_then(|s| s.parse::<std::net::Ipv4Addr>().ok()).filter(is_public_v4).map(|ip| ip.to_string())
-        }
-        Some(v) if !v.is_empty() => {
-            v.parse::<std::net::Ipv4Addr>().ok().filter(|ip| !ip.is_unspecified() && !ip.is_loopback()).map(|ip| ip.to_string())
-        }
+    match std::env::var("HIVE_PUBLIC_IP")
+        .ok()
+        .map(|s| s.trim().to_string())
+    {
+        Some(v) if v.eq_ignore_ascii_case("auto") => detected
+            .and_then(|s| s.parse::<std::net::Ipv4Addr>().ok())
+            .filter(is_public_v4)
+            .map(|ip| ip.to_string()),
+        Some(v) if !v.is_empty() => v
+            .parse::<std::net::Ipv4Addr>()
+            .ok()
+            .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+            .map(|ip| ip.to_string()),
         _ => None,
     }
 }
@@ -1756,13 +2009,17 @@ fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
             loop {
                 tokio::time::sleep(interval).await;
                 crate::supervise::beat("geo-refresh");
-                let Some((lat, lon, city, country, _ip)) = geolocate().await else { continue };
+                let Some((lat, lon, city, country, _ip)) = geolocate().await else {
+                    continue;
+                };
                 let (prev_lat, prev_lon) = {
                     let me = registry.me();
                     (me.lat, me.lon)
                 };
                 let moved = match (prev_lat, prev_lon) {
-                    (Some(plat), Some(plon)) => hive_edge::haversine_km((plat, plon), (lat, lon)) >= min_km,
+                    (Some(plat), Some(plon)) => {
+                        hive_edge::haversine_km((plat, plon), (lat, lon)) >= min_km
+                    }
                     // No prior geo at all (boot geolocation failed, e.g. offline
                     // at start) — any successful lookup now is real information.
                     _ => true,
@@ -1786,7 +2043,13 @@ async fn geolocate() -> Option<(f64, f64, String, String, Option<String>)> {
         let parts: Vec<&str> = manual.splitn(4, ',').collect();
         if parts.len() == 4 {
             if let (Ok(lat), Ok(lon)) = (parts[0].trim().parse(), parts[1].trim().parse()) {
-                return Some((lat, lon, parts[2].trim().to_string(), parts[3].trim().to_string(), None));
+                return Some((
+                    lat,
+                    lon,
+                    parts[2].trim().to_string(),
+                    parts[3].trim().to_string(),
+                    None,
+                ));
             }
         }
     }
@@ -1806,7 +2069,9 @@ async fn geolocate() -> Option<(f64, f64, String, String, Option<String>)> {
         v.get("lon")?.as_f64()?,
         v.get("city")?.as_str()?.to_string(),
         v.get("country")?.as_str()?.to_string(),
-        v.get("query").and_then(|q| q.as_str()).map(|s| s.to_string()),
+        v.get("query")
+            .and_then(|q| q.as_str())
+            .map(|s| s.to_string()),
     ))
 }
 
@@ -1822,13 +2087,18 @@ async fn serve(router: axum::Router, addr: SocketAddr, label: &str) -> anyhow::R
             std::net::IpAddr::V6(_) => (std::net::Ipv4Addr::LOCALHOST, addr.port()).into(),
         };
         match tokio::net::TcpListener::bind(alt).await {
-            Ok(l) => { tracing::info!(%alt, "{label} also listening (dual-stack loopback)"); listeners.push(l); }
+            Ok(l) => {
+                tracing::info!(%alt, "{label} also listening (dual-stack loopback)");
+                listeners.push(l);
+            }
             Err(e) => tracing::warn!(%alt, error=%e, "{label} could not bind alt loopback address"),
         }
     }
     let mut tasks = Vec::new();
     for l in listeners {
-        let r = router.clone().into_make_service_with_connect_info::<SocketAddr>();
+        let r = router
+            .clone()
+            .into_make_service_with_connect_info::<SocketAddr>();
         tasks.push(tokio::spawn(async move { axum::serve(l, r).await }));
     }
     for t in tasks {
@@ -1860,11 +2130,15 @@ async fn invoke(
 pub fn wf_invoker(cloud: Arc<CloudState>) -> hive_edge::StepInvoker {
     Arc::new(move |step: WorkflowStep| {
         let cloud = cloud.clone();
-        let fut: Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> = Box::pin(async move {
-            let (status, body) = invoke(&cloud, &step.deployment, &step.path).await?;
-            anyhow::ensure!(status < 500, "step {} -> HTTP {status}", step.name);
-            Ok(format!("HTTP {status}: {}", body.chars().take(200).collect::<String>()))
-        });
+        let fut: Pin<Box<dyn Future<Output = anyhow::Result<String>> + Send>> =
+            Box::pin(async move {
+                let (status, body) = invoke(&cloud, &step.deployment, &step.path).await?;
+                anyhow::ensure!(status < 500, "step {} -> HTTP {status}", step.name);
+                Ok(format!(
+                    "HTTP {status}: {}",
+                    body.chars().take(200).collect::<String>()
+                ))
+            });
         fut
     })
 }
@@ -1893,8 +2167,10 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
                 .collect();
             // node -> region, so the election can be region-constrained. Every node
             // sees the same gossiped regions → all compute the same owner.
-            let node_region: HashMap<String, String> =
-                nodes_now.iter().map(|n| (n.id.clone(), n.region.clone())).collect();
+            let node_region: HashMap<String, String> = nodes_now
+                .iter()
+                .map(|n| (n.id.clone(), n.region.clone()))
+                .collect();
             let holders = cloud.container_holders.read().clone();
             for key in cloud.gw.container_projects() {
                 // The live nodes that can actually run this container (self + peers
@@ -1931,7 +2207,10 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
                 }
                 match crate::lease::hrw_owner(&key, &h) {
                     Some(pref) if pref == self_id => {
-                        if let Some(l) = cloud.leases.acquire_or_renew(&key, &self_id, &region, 10_000) {
+                        if let Some(l) = cloud
+                            .leases
+                            .acquire_or_renew(&key, &self_id, &region, 10_000)
+                        {
                             tracing::debug!(key=%key, epoch=l.epoch, "holding container lease");
                         }
                     }
@@ -2009,7 +2288,11 @@ fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
             if cloud.is_control_plane_leader() {
                 let (reaped, withheld) = crate::guardian::reap_departed_node_snapshots().await;
                 if reaped > 0 {
-                    tracing::warn!(reaped, withheld, "guardian reap: retired departed node snapshot keys");
+                    tracing::warn!(
+                        reaped,
+                        withheld,
+                        "guardian reap: retired departed node snapshot keys"
+                    );
                 }
             }
             tokio::time::sleep(interval).await;
@@ -2085,7 +2368,15 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
                         Ok((s, _)) => (s, format!("cron {} -> {s}", job.name)),
                         Err(e) => (0, format!("cron {} error: {e}", job.name)),
                     };
-                    let ev = cloud.event(&cloud.region, "CRON", &job.deployment, &job.path, status, "cron", &detail);
+                    let ev = cloud.event(
+                        &cloud.region,
+                        "CRON",
+                        &job.deployment,
+                        &job.path,
+                        status,
+                        "cron",
+                        &detail,
+                    );
                     cloud.record(ev);
                 });
             }
@@ -2114,10 +2405,18 @@ struct PeerSync {
 /// loop-local data is returned as a [`PeerSync`] to merge after `join_all`.
 async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) -> PeerSync {
     let mut out = PeerSync::default();
-    let _ = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_POST, "/v1/nodes/announce", &me_bytes).await;
+    let _ = gossip::fetch(
+        &cloud,
+        &peer,
+        hive_p2p::GOSSIP_POST,
+        "/v1/nodes/announce",
+        &me_bytes,
+    )
+    .await;
     let t0 = now_ms();
     let mut rtt = 0u64;
-    let mut nodes_bytes = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await;
+    let mut nodes_bytes =
+        gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/nodes", &[]).await;
     // MESH HOT-JOIN (client side): a gossip failure to this target may mean we are
     // not yet in ITS trust set (first contact of a brand-new node, or a wiped trust
     // roster). When the fleet secret is configured, present a join proof —
@@ -2156,7 +2455,11 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                         if !bytes.is_empty() {
                             tracing::info!(peer = %node_id, "mesh join accepted — roster received");
                             // Restore the transport mapping fetch() evicted.
-                            cloud.peer_iroh.write().entry(peer.clone()).or_insert((node_id, addr));
+                            cloud
+                                .peer_iroh
+                                .write()
+                                .entry(peer.clone())
+                                .or_insert((node_id, addr));
                             nodes_bytes = Some(bytes);
                         }
                     }
@@ -2170,7 +2473,10 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             let peer_self = nodes.first().cloned();
             if let Some(ps) = &peer_self {
                 if let Some(addr) = ps.iroh_addr.clone() {
-                    cloud.peer_iroh.write().insert(peer.clone(), (ps.id.clone(), addr));
+                    cloud
+                        .peer_iroh
+                        .write()
+                        .insert(peer.clone(), (ps.id.clone(), addr));
                 }
             }
             let peer_self_id = peer_self.map(|n| n.id);
@@ -2247,11 +2553,25 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             cloud.registry.set_health(&id, 0, false);
         }
     }
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await {
+    if let Some(bytes) =
+        gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await
+    {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let region = v.get("region").and_then(|x| x.as_str()).unwrap_or("").to_string();
-            let gateway = v.get("gateway").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let node_id = v
+                .get("node")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let region = v
+                .get("region")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let gateway = v
+                .get("gateway")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if !gateway.is_empty() && node_id != cloud.node_name {
                 out.seen = Some(node_id.clone());
                 if let Some(hosts) = v.get("hosts").and_then(|x| x.as_array()) {
@@ -2277,12 +2597,26 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             }
         }
     }
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/fleet-deployments", &[]).await {
+    if let Some(bytes) = gossip::fetch(
+        &cloud,
+        &peer,
+        hive_p2p::GOSSIP_GET,
+        "/v1/fleet-deployments",
+        &[],
+    )
+    .await
+    {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            let node_id = v.get("node").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let node_id = v
+                .get("node")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
             if !node_id.is_empty() && node_id != cloud.node_name {
                 if let Some(deps) = v.get("deployments") {
-                    if let Ok(list) = serde_json::from_value::<Vec<fluid_core::DeploymentInfo>>(deps.clone()) {
+                    if let Ok(list) =
+                        serde_json::from_value::<Vec<fluid_core::DeploymentInfo>>(deps.clone())
+                    {
                         out.fleet = Some((node_id, list));
                     }
                 }
@@ -2290,17 +2624,34 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
         }
     }
     #[cfg(feature = "zkauth")]
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/zkauth/roster-export", &[]).await {
+    if let Some(bytes) = gossip::fetch(
+        &cloud,
+        &peer,
+        hive_p2p::GOSSIP_GET,
+        "/v1/zkauth/roster-export",
+        &[],
+    )
+    .await
+    {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
             crate::zkauth::ingest_peer_export(&v);
         }
     }
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/enterprise/edge-export", &[]).await {
+    if let Some(bytes) = gossip::fetch(
+        &cloud,
+        &peer,
+        hive_p2p::GOSSIP_GET,
+        "/v1/enterprise/edge-export",
+        &[],
+    )
+    .await
+    {
         if let Ok(exp) = serde_json::from_slice::<crate::enterprise::EdgeExport>(&bytes) {
             cloud.enterprise.ingest_peer_edge(&peer, exp);
         }
     }
-    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/leases", &[]).await {
+    if let Some(bytes) = gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/leases", &[]).await
+    {
         if let Ok(leases) = serde_json::from_slice::<Vec<crate::lease::ContainerLease>>(&bytes) {
             for l in leases {
                 cloud.leases.merge(l);
@@ -2310,7 +2661,11 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     out
 }
 
-fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(String, String, String)>) {
+fn spawn_gossip_loop(
+    cloud: Arc<CloudState>,
+    peers: Vec<String>,
+    seeds: Vec<(String, String, String)>,
+) {
     use std::collections::HashMap;
     // STATIC gossip targets = the configured --peer URLs (warm path, via persisted
     // peer_iroh or HTTP) PLUS the bootstrap seed keys (always-available iroh
@@ -2335,7 +2690,8 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             {
                 let mut pi = cloud.peer_iroh.write();
                 for (key, nid, addr) in &seeds {
-                    pi.entry(key.clone()).or_insert_with(|| (nid.clone(), addr.clone()));
+                    pi.entry(key.clone())
+                        .or_insert_with(|| (nid.clone(), addr.clone()));
                 }
             }
             // DYNAMIC target set (hot-join, key-addressed): every round, dial the
@@ -2349,7 +2705,8 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             // next round dials it first-hand.
             let targets: Vec<String> = {
                 let mut round: Vec<String> = targets.clone();
-                let mut covered: std::collections::HashSet<String> = std::collections::HashSet::new();
+                let mut covered: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
                 if let Some(me) = cloud.registry.me().peer_id.clone() {
                     covered.insert(me);
                 }
@@ -2369,7 +2726,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                         continue;
                     }
                     let Some(addr) = n.iroh_addr else { continue };
-                    let Some(eid) = hive_p2p::endpoint_id_from_addr_json(&addr) else { continue };
+                    let Some(eid) = hive_p2p::endpoint_id_from_addr_json(&addr) else {
+                        continue;
+                    };
                     if covered.insert(eid.clone()) {
                         adds.push((eid, addr));
                     }
@@ -2402,7 +2761,8 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             let mut routes: HashMap<String, Vec<crate::state::PeerRoute>> = HashMap::new();
             // #24: node ids successfully gossiped this round — drives the route TTL
             // merge so a transient miss to a healthy peer doesn't drop its routes.
-            let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut seen_nodes: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Deployments hosted on each peer (name -> list), for the fleet-wide
             // dashboard deployment view.
             let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
@@ -2413,7 +2773,10 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             #[cfg(feature = "zkauth")]
             crate::zkauth::clear_peer_cache();
             for key in cloud.gw.container_projects() {
-                holders.entry(key).or_default().push(cloud.node_name.clone());
+                holders
+                    .entry(key)
+                    .or_default()
+                    .push(cloud.node_name.clone());
             }
             // Announce + learn each peer's view CONCURRENTLY. The per-peer cloud.* writes
             // (registry, peer_iroh, node_admins, trusted ids, enterprise, leases, zkauth)
@@ -2423,21 +2786,37 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             let me = cloud.registry.me();
             let me_bytes = serde_json::to_vec(&me).unwrap_or_default();
             let partials = futures::future::join_all(
-                targets.iter().map(|peer| sync_one_peer(cloud.clone(), peer.clone(), me_bytes.clone())),
+                targets
+                    .iter()
+                    .map(|peer| sync_one_peer(cloud.clone(), peer.clone(), me_bytes.clone())),
             )
             .await;
             for pr in partials {
-                if let Some(n) = pr.seen { seen_nodes.insert(n); }
-                for (h, route) in pr.routes { routes.entry(h).or_default().push(route); }
-                if let Some((nid, list)) = pr.fleet { fleet.insert(nid, list); }
-                for (k, nid) in pr.holders { holders.entry(k).or_default().push(nid); }
+                if let Some(n) = pr.seen {
+                    seen_nodes.insert(n);
+                }
+                for (h, route) in pr.routes {
+                    routes.entry(h).or_default().push(route);
+                }
+                if let Some((nid, list)) = pr.fleet {
+                    fleet.insert(nid, list);
+                }
+                for (k, nid) in pr.holders {
+                    holders.entry(k).or_default().push(nid);
+                }
             }
             // #24: TTL-merge routes so a route from a peer we briefly couldn't reach
             // this round survives (up to ROUTE_TTL_MS) instead of vanishing and
             // 404-ing the deployment; reached peers' routes are still authoritative.
             let merged = {
                 let prev = cloud.peer_routes.read().clone();
-                crate::state::merge_routes_ttl(&prev, routes, &seen_nodes, now_ms(), crate::state::ROUTE_TTL_MS)
+                crate::state::merge_routes_ttl(
+                    &prev,
+                    routes,
+                    &seen_nodes,
+                    now_ms(),
+                    crate::state::ROUTE_TTL_MS,
+                )
             };
             *cloud.peer_routes.write() = merged;
             // TTL-merge fleet deployments too (same rationale as routes): a single missed
@@ -2461,14 +2840,19 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             // already has a LOCAL real-git record for — matching
             // `admin::git_for_project_fleet`'s local-wins precedence exactly.
             {
-                let mut newest_by_project: HashMap<&str, &fluid_core::DeploymentInfo> = HashMap::new();
+                let mut newest_by_project: HashMap<&str, &fluid_core::DeploymentInfo> =
+                    HashMap::new();
                 for d in merged_deps.values().flatten() {
                     if !d.git.as_ref().is_some_and(|g| g.is_real_git()) {
                         continue;
                     }
                     newest_by_project
                         .entry(d.project.as_str())
-                        .and_modify(|cur| if d.created_at_ms > cur.created_at_ms { *cur = d })
+                        .and_modify(|cur| {
+                            if d.created_at_ms > cur.created_at_ms {
+                                *cur = d
+                            }
+                        })
                         .or_insert(d);
                 }
                 for (project, d) in newest_by_project {
@@ -2498,7 +2882,11 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
                         .registry
                         .nodes()
                         .into_iter()
-                        .filter_map(|n| n.iroh_addr.as_deref().and_then(hive_p2p::endpoint_id_from_addr_json))
+                        .filter_map(|n| {
+                            n.iroh_addr
+                                .as_deref()
+                                .and_then(hive_p2p::endpoint_id_from_addr_json)
+                        })
                         .chain(targets.iter().cloned())
                         .collect();
                     pi.retain(|k, (nid, _)| keep.contains(k) || keep.contains(nid));
@@ -2551,7 +2939,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             let cloud_for_self_addr = cloud.clone();
             tokio::spawn(async move {
                 if let Some(addr) = crate::guardian::my_iroh_addr().await {
-                    cloud_for_self_addr.registry.set_self_guardian_addr(Some(addr));
+                    cloud_for_self_addr
+                        .registry
+                        .set_self_guardian_addr(Some(addr));
                 }
             });
             // Seed GuardianDB's OWN iroh client with every currently-known
@@ -2574,7 +2964,9 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
             if !guardian_peer_map.is_empty() {
                 crate::persist::save_peer_guardian_addr(&guardian_peer_map);
                 let guardian_addrs: Vec<String> = guardian_peer_map.into_values().collect();
-                tokio::spawn(async move { crate::guardian::seed_known_peers(&guardian_addrs).await });
+                tokio::spawn(
+                    async move { crate::guardian::seed_known_peers(&guardian_addrs).await },
+                );
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         }
@@ -2583,7 +2975,12 @@ fn spawn_gossip_loop(cloud: Arc<CloudState>, peers: Vec<String>, seeds: Vec<(Str
 
 /// Parse a positive-u64 env var with a default (clamped to >= 1).
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|s| s.trim().parse::<u64>().ok()).filter(|&v| v > 0).unwrap_or(default).max(1)
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+        .max(1)
 }
 
 /// Decide the health write from a probe result + the running consecutive-miss count.
@@ -2596,7 +2993,11 @@ fn health_decision(prev_misses: u32, ok: bool, threshold: u32) -> (u32, Option<b
         (0, Some(true))
     } else {
         let m = prev_misses + 1;
-        if m >= threshold { (m, Some(false)) } else { (m, None) }
+        if m >= threshold {
+            (m, Some(false))
+        } else {
+            (m, None)
+        }
     }
 }
 
@@ -2672,9 +3073,18 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
     // reads at bind time) — merged into every refresh, not just the seed.
     let manual: Vec<String> = std::env::var("HIVE_RELAY_URLS")
         .ok()
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
-    tracing::info!(?interval, manual = manual.len(), "live relay-set refresh loop (dynamic relay list)");
+    tracing::info!(
+        ?interval,
+        manual = manual.len(),
+        "live relay-set refresh loop (dynamic relay list)"
+    );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         loop {
@@ -2728,7 +3138,10 @@ fn spawn_relay_sync_loop(cloud: Arc<CloudState>) {
 /// `HIVE_ANTI_ENTROPY_INTERVAL_SECS` (s, default 60).
 fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_ANTI_ENTROPY_INTERVAL_SECS", 60));
-    tracing::info!(?interval, "guardian-db anti-entropy loop (head-CID exchange + targeted reconciliation)");
+    tracing::info!(
+        ?interval,
+        "guardian-db anti-entropy loop (head-CID exchange + targeted reconciliation)"
+    );
     crate::supervise::spawn_supervised("anti-entropy", move || {
         let cloud = cloud.clone();
         async move {
@@ -2757,17 +3170,28 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
     }
     let idx = (now_ms() as usize) % candidates.len();
     let peer = &candidates[idx];
-    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
+    let (peer_id, peer_addr) = (
+        peer.peer_id.clone().unwrap(),
+        peer.iroh_addr.clone().unwrap(),
+    );
 
-    let remote_bytes =
-        match gossip::request_to(cloud, &peer_id, &peer_addr, hive_p2p::GOSSIP_GET, "/v1/guardian/heads", &[], 10).await
-        {
-            Some(b) => b,
-            None => {
-                tracing::warn!(peer = %peer.name, error = "no response from peer", "anti-entropy: heads RPC failed");
-                return;
-            }
-        };
+    let remote_bytes = match gossip::request_to(
+        cloud,
+        &peer_id,
+        &peer_addr,
+        hive_p2p::GOSSIP_GET,
+        "/v1/guardian/heads",
+        &[],
+        10,
+    )
+    .await
+    {
+        Some(b) => b,
+        None => {
+            tracing::warn!(peer = %peer.name, error = "no response from peer", "anti-entropy: heads RPC failed");
+            return;
+        }
+    };
     let remote: std::collections::HashMap<String, Vec<guardian_db::traits::EntryHead>> =
         match serde_json::from_slice(&remote_bytes) {
             Ok(v) => v,
@@ -2781,10 +3205,17 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
     for (ns, remote_heads) in &remote {
         let local_by_key: std::collections::HashMap<&str, &str> = local
             .get(ns)
-            .map(|v| v.iter().map(|h| (h.key.as_str(), h.hash.as_str())).collect())
+            .map(|v| {
+                v.iter()
+                    .map(|h| (h.key.as_str(), h.hash.as_str()))
+                    .collect()
+            })
             .unwrap_or_default();
         // Entries whose (key -> hash) disagree: classic entry-level divergence.
-        let diverged = remote_heads.iter().filter(|h| local_by_key.get(h.key.as_str()) != Some(&h.hash.as_str())).count();
+        let diverged = remote_heads
+            .iter()
+            .filter(|h| local_by_key.get(h.key.as_str()) != Some(&h.hash.as_str()))
+            .count();
         // CONTENT-level divergence: the hashes agree, but one of us cannot
         // actually read the bytes. This is invisible to the entry comparison
         // above, and it is the divergence this fleet actually suffers from —
@@ -2871,133 +3302,149 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
 /// Config: `HIVE_RELATIONAL_MIRROR_SECS` (s, def 60).
 fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_RELATIONAL_MIRROR_SECS", 60));
-    tracing::info!(?interval, "relational mirror loop (teams/members/deployments + billing backfill → SQL view)");
+    tracing::info!(
+        ?interval,
+        "relational mirror loop (teams/members/deployments + billing backfill → SQL view)"
+    );
     crate::supervise::spawn_supervised("relational-mirror", move || {
         let cloud = cloud.clone();
         async move {
-        let hash_of = |s: &str| {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            s.hash(&mut h);
-            h.finish()
-        };
-        let mut tick = tokio::time::interval(interval);
-        let (mut teams_hash, mut billing_hash, mut deps_hash) = (0u64, 0u64, 0u64);
-        let billing_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        loop {
-            tick.tick().await;
-            crate::supervise::beat("relational-mirror");
-            // Deployments: every node, own rows only.
-            let deps = cloud.gw.list();
-            if let Ok(json) = serde_json::to_string(&deps) {
-                let h = hash_of(&json);
-                if h != deps_hash {
-                    relational::sync_deployments(&cloud.node_name, &deps).await;
-                    deps_hash = h;
-                }
-            }
-            let isolated = cloud.mesh_health().isolated;
-            let cp_leader = cloud.control_plane_leader() == cloud.node_name && !isolated;
-            if cp_leader {
-                let teams = cloud.teams.list();
-                if let Ok(json) = serde_json::to_string(&teams) {
+            let hash_of = |s: &str| {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                s.hash(&mut h);
+                h.finish()
+            };
+            let mut tick = tokio::time::interval(interval);
+            let (mut teams_hash, mut billing_hash, mut deps_hash) = (0u64, 0u64, 0u64);
+            let billing_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            loop {
+                tick.tick().await;
+                crate::supervise::beat("relational-mirror");
+                // Deployments: every node, own rows only.
+                let deps = cloud.gw.list();
+                if let Ok(json) = serde_json::to_string(&deps) {
                     let h = hash_of(&json);
-                    if h != teams_hash {
-                        relational::sync_teams(&teams).await;
-                        teams_hash = h;
+                    if h != deps_hash {
+                        relational::sync_deployments(&cloud.node_name, &deps).await;
+                        deps_hash = h;
                     }
                 }
-            } else if !isolated {
-                // Follower: adopt the leader's node-local stores wholesale. A
-                // whole CLASS of stores (teams, incidents, apikeys, webhooks,
-                // databases, domains, integrations, gitops, docs, notifications,
-                // identity, enterprise) take mutations only on the leader
-                // (admin_ingress forward) but serve GETs from the local store,
-                // so a follower's copy otherwise diverges forever -- live-
-                // witnessed as sj=5 / bkk=4 / va=2 teams (a stale failover
-                // stand-in then corrupted the teams mirror) and the admin
-                // incidents page showing nothing on non-leader nodes. Wholesale
-                // replace (not merge) is correct under the single-writer model:
-                // the leader IS the authority. `store_sync::REGISTRY` drives
-                // every one through the same generic path; each entry's `adopt`
-                // declines an empty/unparsable payload so an unreachable/booting
-                // leader can never wipe a follower. See `crate::store_sync`.
-                let leader = cloud.control_plane_leader();
-                let peer = cloud
-                    .registry
-                    .nodes()
-                    .into_iter()
-                    .find(|n| n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some());
-                if let Some(peer) = peer {
-                    let (peer_id, peer_addr) = (peer.peer_id.clone().unwrap(), peer.iroh_addr.clone().unwrap());
-                    for store in store_sync::REGISTRY {
-                        let local = (store.snapshot)(&cloud);
-                        let path = format!("/v1/store-snapshot/{}", store.name);
-                        if let Some(bytes) =
-                            gossip::request_to(&cloud, &peer_id, &peer_addr, hive_p2p::GOSSIP_GET, &path, &[], 10).await
-                        {
-                            // Raw byte-compare change-gate: `snapshot` is
-                            // deterministic, so equal bytes = no change. Skip
-                            // empties (an old leader without this arm returns []).
-                            if !bytes.is_empty() && bytes != local {
-                                if let Some(n) = (store.adopt)(&cloud, &bytes) {
-                                    tracing::info!(
-                                        leader = %leader,
-                                        store = store.name,
-                                        count = n,
-                                        "store follower-sync: adopted the leader's snapshot"
-                                    );
+                let isolated = cloud.mesh_health().isolated;
+                let cp_leader = cloud.control_plane_leader() == cloud.node_name && !isolated;
+                if cp_leader {
+                    let teams = cloud.teams.list();
+                    if let Ok(json) = serde_json::to_string(&teams) {
+                        let h = hash_of(&json);
+                        if h != teams_hash {
+                            relational::sync_teams(&teams).await;
+                            teams_hash = h;
+                        }
+                    }
+                } else if !isolated {
+                    // Follower: adopt the leader's node-local stores wholesale. A
+                    // whole CLASS of stores (teams, incidents, apikeys, webhooks,
+                    // databases, domains, integrations, gitops, docs, notifications,
+                    // identity, enterprise) take mutations only on the leader
+                    // (admin_ingress forward) but serve GETs from the local store,
+                    // so a follower's copy otherwise diverges forever -- live-
+                    // witnessed as sj=5 / bkk=4 / va=2 teams (a stale failover
+                    // stand-in then corrupted the teams mirror) and the admin
+                    // incidents page showing nothing on non-leader nodes. Wholesale
+                    // replace (not merge) is correct under the single-writer model:
+                    // the leader IS the authority. `store_sync::REGISTRY` drives
+                    // every one through the same generic path; each entry's `adopt`
+                    // declines an empty/unparsable payload so an unreachable/booting
+                    // leader can never wipe a follower. See `crate::store_sync`.
+                    let leader = cloud.control_plane_leader();
+                    let peer = cloud.registry.nodes().into_iter().find(|n| {
+                        n.name == leader
+                            && !n.is_self
+                            && n.healthy
+                            && n.peer_id.is_some()
+                            && n.iroh_addr.is_some()
+                    });
+                    if let Some(peer) = peer {
+                        let (peer_id, peer_addr) = (
+                            peer.peer_id.clone().unwrap(),
+                            peer.iroh_addr.clone().unwrap(),
+                        );
+                        for store in store_sync::REGISTRY {
+                            let local = (store.snapshot)(&cloud);
+                            let path = format!("/v1/store-snapshot/{}", store.name);
+                            if let Some(bytes) = gossip::request_to(
+                                &cloud,
+                                &peer_id,
+                                &peer_addr,
+                                hive_p2p::GOSSIP_GET,
+                                &path,
+                                &[],
+                                10,
+                            )
+                            .await
+                            {
+                                // Raw byte-compare change-gate: `snapshot` is
+                                // deterministic, so equal bytes = no change. Skip
+                                // empties (an old leader without this arm returns []).
+                                if !bytes.is_empty() && bytes != local {
+                                    if let Some(n) = (store.adopt)(&cloud, &bytes) {
+                                        tracing::info!(
+                                            leader = %leader,
+                                            store = store.name,
+                                            count = n,
+                                            "store follower-sync: adopted the leader's snapshot"
+                                        );
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-            let billing_authority = match &billing_pin {
-                Some(pin) => pin == &cloud.node_name && !isolated,
-                None => cp_leader,
-            };
-            if billing_authority {
-                let (accounts, _) = cloud.billing.snapshot();
-                // Per-tenant (ledger, invoices, checkouts) fetched ONCE up
-                // front and reused for both the dirty-check hash below and
-                // (if dirty) the actual upsert loop.
-                //
-                // DIRTY-CHECK MUST COVER MORE THAN JUST ACCOUNTS: previously
-                // `h` hashed `accounts` alone, so a checkout/ledger-entry/
-                // invoice landing with no accompanying account-field change
-                // never flipped `billing_hash` and the whole billing mirror
-                // section stayed gated shut — live-witnessed: a checkout
-                // opened against an otherwise-unchanged account stayed absent
-                // from `billing_checkouts` for multiple ticks, only appearing
-                // once an unrelated account field happened to change on the
-                // same tick. Hashing the full per-tenant (account, ledger,
-                // invoices, checkouts) tuple set closes that gap: ANY
-                // billing-related change on ANY tenant flips the hash and
-                // triggers a re-sync on the next tick.
-                let per_tenant: Vec<_> = accounts
-                    .iter()
-                    .map(|acc| {
-                        let ledger = cloud.billing.ledger(&acc.tenant);
-                        let invoices = cloud.billing.finalized_invoices(&acc.tenant);
-                        let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
-                        (acc, ledger, invoices, checkouts)
-                    })
-                    .collect();
-                if let Ok(json) = serde_json::to_string(&per_tenant) {
-                    let h = hash_of(&json);
-                    if h != billing_hash {
-                        for (acc, ledger, invoices, checkouts) in &per_tenant {
-                            relational::upsert_billing(acc, ledger, invoices, checkouts).await;
+                let billing_authority = match &billing_pin {
+                    Some(pin) => pin == &cloud.node_name && !isolated,
+                    None => cp_leader,
+                };
+                if billing_authority {
+                    let (accounts, _) = cloud.billing.snapshot();
+                    // Per-tenant (ledger, invoices, checkouts) fetched ONCE up
+                    // front and reused for both the dirty-check hash below and
+                    // (if dirty) the actual upsert loop.
+                    //
+                    // DIRTY-CHECK MUST COVER MORE THAN JUST ACCOUNTS: previously
+                    // `h` hashed `accounts` alone, so a checkout/ledger-entry/
+                    // invoice landing with no accompanying account-field change
+                    // never flipped `billing_hash` and the whole billing mirror
+                    // section stayed gated shut — live-witnessed: a checkout
+                    // opened against an otherwise-unchanged account stayed absent
+                    // from `billing_checkouts` for multiple ticks, only appearing
+                    // once an unrelated account field happened to change on the
+                    // same tick. Hashing the full per-tenant (account, ledger,
+                    // invoices, checkouts) tuple set closes that gap: ANY
+                    // billing-related change on ANY tenant flips the hash and
+                    // triggers a re-sync on the next tick.
+                    let per_tenant: Vec<_> = accounts
+                        .iter()
+                        .map(|acc| {
+                            let ledger = cloud.billing.ledger(&acc.tenant);
+                            let invoices = cloud.billing.finalized_invoices(&acc.tenant);
+                            let checkouts = cloud.billing.checkouts_for_tenant(&acc.tenant);
+                            (acc, ledger, invoices, checkouts)
+                        })
+                        .collect();
+                    if let Ok(json) = serde_json::to_string(&per_tenant) {
+                        let h = hash_of(&json);
+                        if h != billing_hash {
+                            for (acc, ledger, invoices, checkouts) in &per_tenant {
+                                relational::upsert_billing(acc, ledger, invoices, checkouts).await;
+                            }
+                            billing_hash = h;
                         }
-                        billing_hash = h;
                     }
                 }
             }
-        }
         }
     });
 }
@@ -3011,7 +3458,10 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
 /// metering. Config: `HIVE_BILLING_METER_INTERVAL` (s, def 60).
 fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_BILLING_METER_INTERVAL", 60));
-    tracing::info!(?interval, "billing meter loop (usage → charges → invoices; leader-elected)");
+    tracing::info!(
+        ?interval,
+        "billing meter loop (usage → charges → invoices; leader-elected)"
+    );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
         // Election state: how many consecutive ticks THIS node has been the elected
@@ -3040,7 +3490,11 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             // than charging one tick late.
             let am_leader = elected.as_deref() == Some(cloud.node_name.as_str())
                 && !cloud.mesh_health().isolated;
-            leader_ticks = if am_leader { leader_ticks.saturating_add(1) } else { 0 };
+            leader_ticks = if am_leader {
+                leader_ticks.saturating_add(1)
+            } else {
+                0
+            };
             // Stability window: act only after 2 consecutive leader ticks, so two
             // nodes with briefly divergent health views can't both charge a delta.
             let acting = am_leader && leader_ticks >= 2;
@@ -3065,8 +3519,9 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
             for s in &stats {
                 let t = totals.entry(s.tenant.clone()).or_default();
                 t.active_cpu_ms = t.active_cpu_ms.saturating_add(s.active_cpu_ms);
-                t.mem_gb_hr_milli =
-                    t.mem_gb_hr_milli.saturating_add((s.memory_gb_hrs * 1000.0) as u64);
+                t.mem_gb_hr_milli = t
+                    .mem_gb_hr_milli
+                    .saturating_add((s.memory_gb_hrs * 1000.0) as u64);
                 t.requests = t.requests.saturating_add(s.requests);
                 if s.gpu {
                     // GPU is held for the instance's entire life — meter its
@@ -3148,7 +3603,12 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
     let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));
     let threshold = env_u64("HIVE_HEALTH_FAIL_THRESHOLD", 2) as u32;
-    tracing::info!(?interval, ?timeout, threshold, "active health probing (public nodes)");
+    tracing::info!(
+        ?interval,
+        ?timeout,
+        threshold,
+        "active health probing (public nodes)"
+    );
     tokio::spawn(async move {
         let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         loop {
@@ -3185,7 +3645,11 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
             let results = futures::future::join_all(targets.into_iter().map(|(name, id, addr)| {
                 let cloud = cloud.clone();
                 let failing = *misses.get(&name).unwrap_or(&0) >= threshold;
-                let budget = if failing { hive_p2p::dial_fallback_ceiling() } else { timeout };
+                let budget = if failing {
+                    hive_p2p::dial_fallback_ceiling()
+                } else {
+                    timeout
+                };
                 async move { (name, gossip::probe(&cloud, &id, &addr, budget).await) }
             }))
             .await;

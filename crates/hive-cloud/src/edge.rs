@@ -80,7 +80,11 @@ async fn edge_pipeline_inner(
     let headers_vec: Vec<(String, String)> = req
         .headers()
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
         .collect();
     // Host resolution: HTTP/1.1 carries it in the `Host` header, but HTTP/2 (used
     // by our TLS listener after ALPN negotiates h2) carries it in the `:authority`
@@ -136,12 +140,21 @@ async fn edge_pipeline_inner(
             // shedding real floods; the body is JSON so Upstash-compatible
             // clients surface a clean error instead of a JSON-parse crash.
             fn db_rest_rate_limiter() -> &'static hive_edge::RateLimiter {
-                static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> = std::sync::OnceLock::new();
+                static LIMITER: std::sync::OnceLock<hive_edge::RateLimiter> =
+                    std::sync::OnceLock::new();
                 LIMITER.get_or_init(|| hive_edge::RateLimiter::new(5000, 10_000))
             }
             let rl_key = format!("{ip}|{hp}");
             if !db_rest_rate_limiter().check(&rl_key, hive_core::now_ms()) {
-                let ev = cloud.event(&region, &method, &status_host, &path, 429, "rate-limited", &ip);
+                let ev = cloud.event(
+                    &region,
+                    &method,
+                    &status_host,
+                    &path,
+                    429,
+                    "rate-limited",
+                    &ip,
+                );
                 cloud.record(ev);
                 let mut resp = (
                     StatusCode::TOO_MANY_REQUESTS,
@@ -152,7 +165,15 @@ async fn edge_pipeline_inner(
                 return resp;
             }
             let resp = crate::db_rest::handle(cloud.clone(), hp, req).await;
-            let ev = cloud.event(&region, &method, &status_host, &path, resp.status().as_u16(), "db-rest", &status_host);
+            let ev = cloud.event(
+                &region,
+                &method,
+                &status_host,
+                &path,
+                resp.status().as_u16(),
+                "db-rest",
+                &status_host,
+            );
             cloud.record(ev);
             return resp;
         }
@@ -178,11 +199,20 @@ async fn edge_pipeline_inner(
         if let Some(dep) = cloud.gw.deployment_for_host(&host) {
             let team = cloud.projects.team_of(&dep.project);
             if let Some(group) = cloud.enterprise.mfe_group_for_host(&team, &dep.project) {
-                if let Some((child, matched)) = crate::microfrontends::resolve_child(&group, &path) {
+                if let Some((child, matched)) = crate::microfrontends::resolve_child(&group, &path)
+                {
                     // The request environment/commit come from the DEFAULT app's
                     // resolved deployment (production alias vs a preview commit URL).
-                    let req_env = if dep.production || dep.target == "production" { "production" } else { "preview" };
-                    let req_commit = dep.git.as_ref().map(|g| g.commit.clone()).unwrap_or_default();
+                    let req_env = if dep.production || dep.target == "production" {
+                        "production"
+                    } else {
+                        "preview"
+                    };
+                    let req_commit = dep
+                        .git
+                        .as_ref()
+                        .map(|g| g.commit.clone())
+                        .unwrap_or_default();
                     let cands: Vec<crate::microfrontends::DeployCand> = cloud
                         .gw
                         .list()
@@ -190,12 +220,22 @@ async fn edge_pipeline_inner(
                         .filter(|d| d.project == child)
                         .map(|d| crate::microfrontends::DeployCand {
                             id: d.id.to_string(),
-                            env: if d.production || d.target == "production" { "production".into() } else { "preview".into() },
+                            env: if d.production || d.target == "production" {
+                                "production".into()
+                            } else {
+                                "preview".into()
+                            },
                             commit: d.git.as_ref().map(|g| g.commit.clone()).unwrap_or_default(),
                             production: d.production,
                         })
                         .collect();
-                    if let Ok(target) = crate::microfrontends::resolve_child_target(&group, &child, req_env, &req_commit, &cands) {
+                    if let Ok(target) = crate::microfrontends::resolve_child_target(
+                        &group,
+                        &child,
+                        req_env,
+                        &req_commit,
+                        &cands,
+                    ) {
                         // The target deployment id is a served-host alias label
                         // (published locally + gossiped), so rewriting the host's
                         // first label routes to that exact deployment via the same
@@ -213,7 +253,12 @@ async fn edge_pipeline_inner(
                         // by the child + across mesh hops) and stamped on the local
                         // response below.
                         if req_env != "production" {
-                            let dbg = [group.id.clone(), child.clone(), matched.clone(), target.fallback.clone()];
+                            let dbg = [
+                                group.id.clone(),
+                                child.clone(),
+                                matched.clone(),
+                                target.fallback.clone(),
+                            ];
                             for (k, val) in [
                                 ("x-mfe-group", &dbg[0]),
                                 ("x-mfe-project", &dbg[1]),
@@ -226,7 +271,8 @@ async fn edge_pipeline_inner(
                             }
                             mfe_dbg = Some(dbg);
                         }
-                        let ev = cloud.event(&region, &method, &host, &path, 0, "mfe-route", &child);
+                        let ev =
+                            cloud.event(&region, &method, &host, &path, 0, "mfe-route", &child);
                         cloud.record(ev);
                     }
                 }
@@ -270,7 +316,11 @@ async fn edge_pipeline_inner(
         .map(|u| u.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false)
         && hget(&req, "connection")
-            .map(|c| c.to_ascii_lowercase().split(',').any(|t| t.trim() == "upgrade"))
+            .map(|c| {
+                c.to_ascii_lowercase()
+                    .split(',')
+                    .any(|t| t.trim() == "upgrade")
+            })
             .unwrap_or(false);
 
     // ---- Account-level IP blocking (enterprise) ----------------------------------
@@ -282,21 +332,43 @@ async fn edge_pipeline_inner(
     // list itself is mesh-replicated (see enterprise::EdgeExport), so this works
     // no matter which node authored the config or receives the request.
     if !host.is_empty() && cloud.enterprise.any_team_blocks(&ip) {
-        let subl = host.split(':').next().unwrap_or(&host).split('.').next().unwrap_or(&host).to_string();
+        let subl = host
+            .split(':')
+            .next()
+            .unwrap_or(&host)
+            .split('.')
+            .next()
+            .unwrap_or(&host)
+            .to_string();
         let team: Option<String> = cloud
             .gw
             .deployment_for_host(&host)
-            .map(|d| if d.tenant.is_empty() { cloud.projects.team_of(&d.project) } else { d.tenant })
+            .map(|d| {
+                if d.tenant.is_empty() {
+                    cloud.projects.team_of(&d.project)
+                } else {
+                    d.tenant
+                }
+            })
             .or_else(|| {
-                cloud.peer_deployments.read().values().flatten().find_map(|d| {
-                    let m = [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
-                        .iter()
-                        .any(|a| a.split('.').next().unwrap_or(a) == subl);
-                    if !m {
-                        return None;
-                    }
-                    Some(if d.tenant.is_empty() { cloud.projects.team_of(&d.project) } else { d.tenant.clone() })
-                })
+                cloud
+                    .peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .find_map(|d| {
+                        let m = [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                            .iter()
+                            .any(|a| a.split('.').next().unwrap_or(a) == subl);
+                        if !m {
+                            return None;
+                        }
+                        Some(if d.tenant.is_empty() {
+                            cloud.projects.team_of(&d.project)
+                        } else {
+                            d.tenant.clone()
+                        })
+                    })
             });
         if let Some(team) = team {
             if !cloud.enterprise.ip_allowed(&team, &ip) {
@@ -319,8 +391,12 @@ async fn edge_pipeline_inner(
     let already_proxied = hget(&req, "x-hive-proxied").is_some();
     let serve_local = cloud.gw.serves_host(&host);
     let sub = host
-        .split(':').next().unwrap_or(&host)
-        .split('.').next().unwrap_or(&host)
+        .split(':')
+        .next()
+        .unwrap_or(&host)
+        .split('.')
+        .next()
+        .unwrap_or(&host)
         .to_string();
     // CONTAINER single-owner routing: a container deployment has a placement LEASE,
     // and ONLY its lease owner may serve it (prevents split-brain double-running of a
@@ -377,7 +453,10 @@ async fn edge_pipeline_inner(
                 .into_iter()
                 .collect()
         } else {
-            let project = cloud.gw.project_for_host(&host).unwrap_or_else(|| sub.clone());
+            let project = cloud
+                .gw
+                .project_for_host(&host)
+                .unwrap_or_else(|| sub.clone());
             let fs = cloud.projects.get(&project).functions;
             order_candidates(raw.clone(), &fs, &region)
         };
@@ -390,7 +469,15 @@ async fn edge_pipeline_inner(
             // elsewhere (#5/#6). `container_owner.is_some()` ⇒ the deployment exists
             // (we hold its lease) even if peer_routes is empty on this node.
             if container_owner.is_some() {
-                let mut ev = cloud.event(&region, &method, &host, &path, 503, "mesh-region-unavailable", &sub);
+                let mut ev = cloud.event(
+                    &region,
+                    &method,
+                    &host,
+                    &path,
+                    503,
+                    "mesh-region-unavailable",
+                    &sub,
+                );
                 ev.request_id = rid.clone();
                 cloud.record(ev);
                 return fail_response(fluid_core::FailureClass::NoHealthyRegion, &region, &rid);
@@ -418,7 +505,11 @@ async fn edge_pipeline_inner(
             // else: no routes at all → fall through to DEPLOYMENT_NOT_FOUND below.
         }
         if !cands.is_empty() {
-            let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+            let path_q = if query.is_empty() {
+                path.clone()
+            } else {
+                format!("{path}?{query}")
+            };
 
             // Region-affinity redirect (browser navigations only): a request that
             // entered the WRONG region for this deployment (e.g. `app.iad.ngrok.pizza`
@@ -438,7 +529,15 @@ async fn edge_pipeline_inner(
                         .unwrap_or(false);
                     if wants_html && !home_code.is_empty() && home_code != host_code {
                         let target = format!("https://{sub}.{home_code}.ngrok.pizza{path_q}");
-                        let mut ev = cloud.event(&region, &method, &host, &path, 307, "region-redirect", home_code);
+                        let mut ev = cloud.event(
+                            &region,
+                            &method,
+                            &host,
+                            &path,
+                            307,
+                            "region-redirect",
+                            home_code,
+                        );
                         ev.request_id = rid.clone();
                         cloud.record(ev);
                         return axum::response::Redirect::temporary(&target).into_response();
@@ -462,7 +561,14 @@ async fn edge_pipeline_inner(
             ];
             for (k, v) in &headers_vec {
                 let lk = k.to_lowercase();
-                if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied" | "x-hive-request-id") {
+                if matches!(
+                    lk.as_str(),
+                    "host"
+                        | "connection"
+                        | "content-length"
+                        | "x-hive-proxied"
+                        | "x-hive-request-id"
+                ) {
                     continue;
                 }
                 fwd_headers.push((k.clone(), v.clone()));
@@ -478,10 +584,32 @@ async fn edge_pipeline_inner(
             // client upgrade is only consumed once an owner side is ready —
             // so trying each remaining candidate's trunk in turn is safe).
             if is_ws_upgrade {
-                let host_opt = if host.is_empty() { None } else { Some(host.as_str()) };
+                let host_opt = if host.is_empty() {
+                    None
+                } else {
+                    Some(host.as_str())
+                };
                 if cands.iter().any(|c| c.node_id == cloud.node_name) {
-                    if let Ok(resp) = local_ws_proxy(&mut req, &cloud, host_opt, &path, &method, &path_q, &fwd_headers).await {
-                        let mut ev = cloud.event(&region, &method, &host, &path, resp.status().as_u16(), "local-ws", &cloud.node_name);
+                    if let Ok(resp) = local_ws_proxy(
+                        &mut req,
+                        &cloud,
+                        host_opt,
+                        &path,
+                        &method,
+                        &path_q,
+                        &fwd_headers,
+                    )
+                    .await
+                    {
+                        let mut ev = cloud.event(
+                            &region,
+                            &method,
+                            &host,
+                            &path,
+                            resp.status().as_u16(),
+                            "local-ws",
+                            &cloud.node_name,
+                        );
                         ev.request_id = rid.clone();
                         cloud.record(ev);
                         return resp;
@@ -490,10 +618,27 @@ async fn edge_pipeline_inner(
                 if let Some(pool) = &mesh {
                     for cand in cands.iter().filter(|c| c.node_id != cloud.node_name) {
                         if let Some(addr_json) = node_iroh.get(&cand.node_id) {
-                            if let Ok(resp) =
-                                ws_proxy(&mut req, pool, &cloud.registry, &cand.node_id, addr_json, &method, &path_q, &fwd_headers).await
+                            if let Ok(resp) = ws_proxy(
+                                &mut req,
+                                pool,
+                                &cloud.registry,
+                                &cand.node_id,
+                                addr_json,
+                                &method,
+                                &path_q,
+                                &fwd_headers,
+                            )
+                            .await
                             {
-                                let mut ev = cloud.event(&region, &method, &host, &path, resp.status().as_u16(), "mesh-ws", &cand.node_id);
+                                let mut ev = cloud.event(
+                                    &region,
+                                    &method,
+                                    &host,
+                                    &path,
+                                    resp.status().as_u16(),
+                                    "mesh-ws",
+                                    &cand.node_id,
+                                );
                                 ev.request_id = rid.clone();
                                 cloud.record(ev);
                                 return resp;
@@ -504,19 +649,25 @@ async fn edge_pipeline_inner(
                 let mut ev = cloud.event(&region, &method, &host, &path, 502, "mesh-ws-fail", &sub);
                 ev.request_id = rid.clone();
                 cloud.record(ev);
-                let mut resp = (StatusCode::BAD_GATEWAY, "no node could serve this websocket").into_response();
+                let mut resp = (
+                    StatusCode::BAD_GATEWAY,
+                    "no node could serve this websocket",
+                )
+                    .into_response();
                 set(&mut resp, "x-hive-region", &region);
                 set(&mut resp, "x-hive-request-id", &rid);
                 return resp;
             }
 
             // HTTP: buffer the request body once (reused across failover attempts).
-            let rmethod = reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
+            let rmethod =
+                reqwest::Method::from_bytes(method.as_bytes()).unwrap_or(reqwest::Method::GET);
             let (_parts, body) = req.into_parts();
             // Track replayability (#7): a body we couldn't fully buffer is NOT safe to
             // re-send on a retry. (>16 MiB streaming uploads are a known gap — they
             // still go out empty on the first attempt; here we just never RETRY them.)
-            let (body_bytes, body_replay) = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+            let (body_bytes, body_replay) = match axum::body::to_bytes(body, 16 * 1024 * 1024).await
+            {
                 Ok(b) => (b, crate::retry::BodyReplay::Buffered),
                 Err(_) => (Bytes::new(), crate::retry::BodyReplay::NonReplayable),
             };
@@ -552,150 +703,218 @@ async fn edge_pipeline_inner(
                 // Two passes per candidate — the SAME two attempts as before, in
                 // the cost-chosen order. Pass 0 is the preferred transport.
                 for pass in 0..2u8 {
-                let do_iroh = (pass == 0) != same_region_http_first;
-                if do_iroh {
-                // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
-                // works across NATs. STREAM the response so SSE / chunked bodies
-                // arrive incrementally cross-node (#1). Fall through to HTTP on error.
-                if let (Some(pool), Some(addr_json)) = (&mesh, node_iroh.get(&cand.node_id)) {
-                    // Gate a RE-attempt: refuse if retrying could double-execute / replay unsafely.
+                    let do_iroh = (pass == 0) != same_region_http_first;
+                    if do_iroh {
+                        // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
+                        // works across NATs. STREAM the response so SSE / chunked bodies
+                        // arrive incrementally cross-node (#1). Fall through to HTTP on error.
+                        if let (Some(pool), Some(addr_json)) = (&mesh, node_iroh.get(&cand.node_id))
+                        {
+                            // Gate a RE-attempt: refuse if retrying could double-execute / replay unsafely.
+                            if attempted
+                                && !crate::retry::can_retry(
+                                    &method,
+                                    has_idem_key,
+                                    body_replay,
+                                    crate::retry::ResponseState::NotStarted,
+                                )
+                                .allowed
+                            {
+                                refused_retry = true;
+                                break 'cands;
+                            }
+                            attempted = true;
+                            match pool
+                                .request_stream(
+                                    &cand.node_id,
+                                    addr_json,
+                                    &method,
+                                    &path_q,
+                                    &fwd_headers,
+                                    &body_bytes,
+                                )
+                                .await
+                            {
+                                Ok(ts) => {
+                                    let status = ts.status;
+                                    let mut builder = Response::builder().status(ts.status);
+                                    for (k, v) in &ts.headers {
+                                        let lk = k.to_lowercase();
+                                        if matches!(
+                                            lk.as_str(),
+                                            "transfer-encoding" | "connection" | "content-length"
+                                        ) {
+                                            continue;
+                                        }
+                                        if let (Ok(name), Ok(val)) = (
+                                            HeaderName::from_bytes(k.as_bytes()),
+                                            HeaderValue::from_bytes(v.as_bytes()),
+                                        ) {
+                                            builder = builder.header(name, val);
+                                        }
+                                    }
+                                    // Body streams from the tunnel's chunk channel — no
+                                    // buffering, no forced content-length on a streamed body.
+                                    // The whole `TunnelStream` is moved into the unfold state
+                                    // so the tunnel stays open until the body is fully sent.
+                                    let stream = futures::stream::unfold(ts, |mut ts| async move {
+                                        ts.recv()
+                                            .await
+                                            .map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), ts))
+                                    });
+                                    let mut out =
+                                        builder.body(Body::from_stream(stream)).unwrap_or_else(
+                                            |_| StatusCode::BAD_GATEWAY.into_response(),
+                                        );
+                                    // Report the ACTUAL serving region (the owner node's),
+                                    // not this intermediate node's — else the Network tab
+                                    // shows the wrong region for a cross-node serve.
+                                    let serve_region = if cand.region.is_empty() {
+                                        region.as_str()
+                                    } else {
+                                        cand.region.as_str()
+                                    };
+                                    set(&mut out, "x-hive-routed-to", &cand.node_id);
+                                    set(&mut out, "x-hive-transport", "iroh-p2p");
+                                    set(&mut out, "x-hive-region", serve_region);
+                                    set(&mut out, "x-hive-request-id", &rid);
+                                    let mut ev = cloud.event(
+                                        serve_region,
+                                        &method,
+                                        &host,
+                                        &path,
+                                        status,
+                                        "mesh-route-p2p",
+                                        &cand.node_id,
+                                    );
+                                    ev.request_id = rid.clone();
+                                    cloud.record(ev);
+                                    return out;
+                                }
+                                Err(e) => {
+                                    // A pre-send (connect/open) timeout is the strongest
+                                    // "peer dead" signal (#H4): mark it unhealthy so
+                                    // order_candidates stops ranking it — otherwise every
+                                    // request re-pays the connect budget against a dead node.
+                                    if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
+                                        cloud.registry.set_health(&cand.node_id, u64::MAX, false);
+                                        tracing::warn!(node = %cand.node_id, "p2p peer marked unhealthy after connect/open timeout");
+                                    }
+                                    /* iroh failed → the other transport gets the next pass */
+                                }
+                            }
+                        }
+                        continue; // this pass was iroh; next pass (if any) is HTTP
+                    }
+                    // ---- HTTP attempt (preferred pass for a same-region public peer,
+                    // fallback pass otherwise) ----
+                    // Gate it like any re-attempt (after iroh for this candidate, or
+                    // after a previous candidate). First attempt passes.
                     if attempted
-                        && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
+                        && !crate::retry::can_retry(
+                            &method,
+                            has_idem_key,
+                            body_replay,
+                            crate::retry::ResponseState::NotStarted,
+                        )
+                        .allowed
                     {
                         refused_retry = true;
                         break 'cands;
                     }
                     attempted = true;
-                    match pool.request_stream(&cand.node_id, addr_json, &method, &path_q, &fwd_headers, &body_bytes).await {
-                        Ok(ts) => {
-                            let status = ts.status;
-                            let mut builder = Response::builder().status(ts.status);
-                            for (k, v) in &ts.headers {
-                                let lk = k.to_lowercase();
-                                if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
+                    let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
+                    let mut rb = cloud
+                        .http
+                        .request(rmethod.clone(), &url)
+                        .header("host", &host)
+                        .header("x-hive-proxied", "1")
+                        .header("x-hive-request-id", &rid)
+                        .timeout(if same_region_http_first && pass == 0 {
+                            // Preferred intra-region direct hop: bound it SHORT so a
+                            // dead same-region peer costs ~2s before iroh gets the
+                            // rest of the budget — measured healthy latency here is
+                            // ~12ms, so 2s is two orders of magnitude of headroom.
+                            std::time::Duration::from_millis(
+                                std::env::var("HIVE_FORWARD_INTRA_HTTP_MS")
+                                    .ok()
+                                    .and_then(|s| s.parse().ok())
+                                    .filter(|&v| v > 0)
+                                    .unwrap_or(2000),
+                            )
+                            .min(http_fallback_budget(cand_start))
+                        } else {
+                            http_fallback_budget(cand_start)
+                        })
+                        .body(body_bytes.clone());
+                    for (k, v) in &headers_vec {
+                        let lk = k.to_lowercase();
+                        if matches!(
+                            lk.as_str(),
+                            "host"
+                                | "connection"
+                                | "content-length"
+                                | "x-hive-proxied"
+                                | "x-hive-request-id"
+                        ) {
+                            continue;
+                        }
+                        rb = rb.header(k, v);
+                    }
+                    match rb.send().await {
+                        Ok(r) => {
+                            let status = r.status();
+                            let rheaders = r.headers().clone();
+                            let mut builder = Response::builder().status(status.as_u16());
+                            for (k, v) in rheaders.iter() {
+                                let lk = k.as_str().to_lowercase();
+                                // Skip hop-by-hop headers — the body framing is re-derived.
+                                if matches!(
+                                    lk.as_str(),
+                                    "transfer-encoding" | "connection" | "content-length"
+                                ) {
                                     continue;
                                 }
-                                if let (Ok(name), Ok(val)) =
-                                    (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
-                                {
+                                if let (Ok(name), Ok(val)) = (
+                                    HeaderName::from_bytes(k.as_str().as_bytes()),
+                                    HeaderValue::from_bytes(v.as_bytes()),
+                                ) {
                                     builder = builder.header(name, val);
                                 }
                             }
-                            // Body streams from the tunnel's chunk channel — no
-                            // buffering, no forced content-length on a streamed body.
-                            // The whole `TunnelStream` is moved into the unfold state
-                            // so the tunnel stays open until the body is fully sent.
-                            let stream = futures::stream::unfold(ts, |mut ts| async move {
-                                ts.recv().await.map(|chunk| (Ok::<Bytes, std::io::Error>(chunk), ts))
-                            });
+                            // Stream the upstream body through (SSE / chunked stay incremental).
                             let mut out = builder
-                                .body(Body::from_stream(stream))
+                                .body(Body::from_stream(r.bytes_stream()))
                                 .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-                            // Report the ACTUAL serving region (the owner node's),
-                            // not this intermediate node's — else the Network tab
-                            // shows the wrong region for a cross-node serve.
-                            let serve_region = if cand.region.is_empty() { region.as_str() } else { cand.region.as_str() };
+                            let serve_region = if cand.region.is_empty() {
+                                region.as_str()
+                            } else {
+                                cand.region.as_str()
+                            };
                             set(&mut out, "x-hive-routed-to", &cand.node_id);
-                            set(&mut out, "x-hive-transport", "iroh-p2p");
+                            // Which transport actually served, so the cost-based
+                            // choice above is observable instead of inferred (the
+                            // iroh path has always set this; the HTTP path never did,
+                            // which is why "everything uses iroh" had to be measured
+                            // by elimination).
+                            set(&mut out, "x-hive-transport", "http-direct");
                             set(&mut out, "x-hive-region", serve_region);
                             set(&mut out, "x-hive-request-id", &rid);
-                            let mut ev = cloud.event(serve_region, &method, &host, &path, status, "mesh-route-p2p", &cand.node_id);
+                            let mut ev = cloud.event(
+                                serve_region,
+                                &method,
+                                &host,
+                                &path,
+                                status.as_u16(),
+                                "mesh-route",
+                                &cand.node_id,
+                            );
                             ev.request_id = rid.clone();
                             cloud.record(ev);
                             return out;
                         }
-                        Err(e) => {
-                            // A pre-send (connect/open) timeout is the strongest
-                            // "peer dead" signal (#H4): mark it unhealthy so
-                            // order_candidates stops ranking it — otherwise every
-                            // request re-pays the connect budget against a dead node.
-                            if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-                                cloud.registry.set_health(&cand.node_id, u64::MAX, false);
-                                tracing::warn!(node = %cand.node_id, "p2p peer marked unhealthy after connect/open timeout");
-                            }
-                            /* iroh failed → the other transport gets the next pass */
-                        }
+                        Err(_) => {} // this pass failed — the other transport gets the next pass (if any)
                     }
-                }
-                continue; // this pass was iroh; next pass (if any) is HTTP
-                }
-                // ---- HTTP attempt (preferred pass for a same-region public peer,
-                // fallback pass otherwise) ----
-                // Gate it like any re-attempt (after iroh for this candidate, or
-                // after a previous candidate). First attempt passes.
-                if attempted
-                    && !crate::retry::can_retry(&method, has_idem_key, body_replay, crate::retry::ResponseState::NotStarted).allowed
-                {
-                    refused_retry = true;
-                    break 'cands;
-                }
-                attempted = true;
-                let url = format!("{}{}", cand.gateway.trim_end_matches('/'), path_q);
-                let mut rb = cloud
-                    .http
-                    .request(rmethod.clone(), &url)
-                    .header("host", &host)
-                    .header("x-hive-proxied", "1")
-                    .header("x-hive-request-id", &rid)
-                    .timeout(if same_region_http_first && pass == 0 {
-                        // Preferred intra-region direct hop: bound it SHORT so a
-                        // dead same-region peer costs ~2s before iroh gets the
-                        // rest of the budget — measured healthy latency here is
-                        // ~12ms, so 2s is two orders of magnitude of headroom.
-                        std::time::Duration::from_millis(
-                            std::env::var("HIVE_FORWARD_INTRA_HTTP_MS").ok().and_then(|s| s.parse().ok()).filter(|&v| v > 0).unwrap_or(2000),
-                        )
-                        .min(http_fallback_budget(cand_start))
-                    } else {
-                        http_fallback_budget(cand_start)
-                    })
-                    .body(body_bytes.clone());
-                for (k, v) in &headers_vec {
-                    let lk = k.to_lowercase();
-                    if matches!(lk.as_str(), "host" | "connection" | "content-length" | "x-hive-proxied" | "x-hive-request-id") {
-                        continue;
-                    }
-                    rb = rb.header(k, v);
-                }
-                match rb.send().await {
-                    Ok(r) => {
-                        let status = r.status();
-                        let rheaders = r.headers().clone();
-                        let mut builder = Response::builder().status(status.as_u16());
-                        for (k, v) in rheaders.iter() {
-                            let lk = k.as_str().to_lowercase();
-                            // Skip hop-by-hop headers — the body framing is re-derived.
-                            if matches!(lk.as_str(), "transfer-encoding" | "connection" | "content-length") {
-                                continue;
-                            }
-                            if let (Ok(name), Ok(val)) = (
-                                HeaderName::from_bytes(k.as_str().as_bytes()),
-                                HeaderValue::from_bytes(v.as_bytes()),
-                            ) {
-                                builder = builder.header(name, val);
-                            }
-                        }
-                        // Stream the upstream body through (SSE / chunked stay incremental).
-                        let mut out = builder
-                            .body(Body::from_stream(r.bytes_stream()))
-                            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
-                        let serve_region = if cand.region.is_empty() { region.as_str() } else { cand.region.as_str() };
-                        set(&mut out, "x-hive-routed-to", &cand.node_id);
-                        // Which transport actually served, so the cost-based
-                        // choice above is observable instead of inferred (the
-                        // iroh path has always set this; the HTTP path never did,
-                        // which is why "everything uses iroh" had to be measured
-                        // by elimination).
-                        set(&mut out, "x-hive-transport", "http-direct");
-                        set(&mut out, "x-hive-region", serve_region);
-                        set(&mut out, "x-hive-request-id", &rid);
-                        let mut ev = cloud.event(serve_region, &method, &host, &path, status.as_u16(), "mesh-route", &cand.node_id);
-                        ev.request_id = rid.clone();
-                        cloud.record(ev);
-                        return out;
-                    }
-                    Err(_) => {} // this pass failed — the other transport gets the next pass (if any)
-                }
                 } // end per-transport pass loop
             }
             // Either every candidate failed, OR the first attempt failed and the
@@ -723,7 +942,15 @@ async fn edge_pipeline_inner(
     // instead of silently falling back to the default deployment / preview gate.
     // (`_vercel/*` + `/_shadw/zk` were already handled above.)
     if !serve_local && !already_proxied && !host.is_empty() {
-        let ev = cloud.event(&region, &method, &host, &path, 404, "deployment-not-found", &host);
+        let ev = cloud.event(
+            &region,
+            &method,
+            &host,
+            &path,
+            404,
+            "deployment-not-found",
+            &host,
+        );
         cloud.record(ev);
         return deployment_not_found(&region);
     }
@@ -749,7 +976,9 @@ async fn edge_pipeline_inner(
             let mut resp = (code, "").into_response();
             set(&mut resp, "location", &location);
             set(&mut resp, "x-hive-region", &region);
-            let ev = cloud.event(&region, &method, &host, &path, status, "redirect", &location);
+            let ev = cloud.event(
+                &region, &method, &host, &path, status, "redirect", &location,
+            );
             cloud.record(ev);
             return resp;
         }
@@ -761,7 +990,11 @@ async fn edge_pipeline_inner(
             }
         }
     }
-    let path_q = if query.is_empty() { path.clone() } else { format!("{path}?{query}") };
+    let path_q = if query.is_empty() {
+        path.clone()
+    } else {
+        format!("{path}?{query}")
+    };
 
     // 1) WAF (evaluate on percent-decoded path+query).
     let dpath = percent_decode(&path);
@@ -773,9 +1006,18 @@ async fn edge_pipeline_inner(
         ip: &ip,
         headers: &headers_vec,
     }) {
-        let ev = cloud.event(&region, &method, &host, &path, 403, "waf-deny", &format!("{rule_id}: {reason}"));
+        let ev = cloud.event(
+            &region,
+            &method,
+            &host,
+            &path,
+            403,
+            "waf-deny",
+            &format!("{rule_id}: {reason}"),
+        );
         cloud.record(ev);
-        let mut resp = (StatusCode::FORBIDDEN, format!("blocked by WAF ({rule_id})")).into_response();
+        let mut resp =
+            (StatusCode::FORBIDDEN, format!("blocked by WAF ({rule_id})")).into_response();
         set(&mut resp, "x-hive-region", &region);
         set(&mut resp, "x-hive-waf-rule", &rule_id);
         return resp;
@@ -826,8 +1068,21 @@ async fn edge_pipeline_inner(
             }
             Lookup::Stale(c) => {
                 // stale-while-revalidate: serve stale now, refresh in background.
-                spawn_revalidate(cloud.clone(), host.clone(), path_q.clone(), cache_key.clone());
-                let ev = cloud.event(&region, &method, &host, &path, c.status, "cache-stale", "swr");
+                spawn_revalidate(
+                    cloud.clone(),
+                    host.clone(),
+                    path_q.clone(),
+                    cache_key.clone(),
+                );
+                let ev = cloud.event(
+                    &region,
+                    &method,
+                    &host,
+                    &path,
+                    c.status,
+                    "cache-stale",
+                    "swr",
+                );
                 cloud.record(ev);
                 return cached_response(c, &region, CacheState::Stale);
             }
@@ -840,7 +1095,15 @@ async fn edge_pipeline_inner(
     // starve every other tenant on this node — the node-wide backstop below no
     // longer conflates one noisy tenant with genuine total overload.
     if !cloud.admission.check(&host, hive_core::now_ms()) {
-        let ev = cloud.event(&region, &method, &host, &path, 503, "throttled", "FUNCTION_THROTTLED");
+        let ev = cloud.event(
+            &region,
+            &method,
+            &host,
+            &path,
+            503,
+            "throttled",
+            "FUNCTION_THROTTLED",
+        );
         cloud.record(ev);
         let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "FUNCTION_THROTTLED").into_response();
         set(&mut resp, "x-hive-region", &region);
@@ -850,7 +1113,15 @@ async fn edge_pipeline_inner(
     }
     // 4b) Node-wide concurrency backstop (total-overload self-protection).
     if !cloud.limiter.try_admit() {
-        let ev = cloud.event(&region, &method, &host, &path, 503, "throttled", "FUNCTION_THROTTLED");
+        let ev = cloud.event(
+            &region,
+            &method,
+            &host,
+            &path,
+            503,
+            "throttled",
+            "FUNCTION_THROTTLED",
+        );
         cloud.record(ev);
         let mut resp = (StatusCode::SERVICE_UNAVAILABLE, "FUNCTION_THROTTLED").into_response();
         set(&mut resp, "x-hive-region", &region);
@@ -871,11 +1142,17 @@ async fn edge_pipeline_inner(
 
     if cacheable {
         let (parts, body) = resp.into_parts();
-        let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024).await.unwrap_or_else(|_| Bytes::new());
+        let bytes = axum::body::to_bytes(body, 16 * 1024 * 1024)
+            .await
+            .unwrap_or_else(|_| Bytes::new());
         let hdrs: Vec<(String, String)> = parts
             .headers
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
             .collect();
         cloud.cdn.maybe_store(&cache_key, status, &hdrs, &bytes);
         let mut resp = Response::from_parts(parts, Body::from(bytes));
@@ -927,8 +1204,16 @@ fn region_code(region: &str) -> String {
     if !code.is_empty() {
         return code.to_string();
     }
-    let slug: String = r.chars().filter(|c| c.is_ascii_alphanumeric()).take(3).collect();
-    if slug.is_empty() { "dev1".into() } else { format!("{slug}1") }
+    let slug: String = r
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(3)
+        .collect();
+    if slug.is_empty() {
+        "dev1".into()
+    } else {
+        format!("{slug}1")
+    }
 }
 
 /// Vercel-style `404: NOT_FOUND` / `DEPLOYMENT_NOT_FOUND` page. The id encodes the
@@ -970,8 +1255,17 @@ fn deployment_not_found(region: &str) -> Response {
     let docs = std::env::var("HIVE_PUBLIC_DASHBOARD_URL")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .or_else(|| std::env::var("HIVE_DASHBOARD_URL").ok().filter(|v| !v.trim().is_empty()))
-        .map(|d| format!("{}/docs/errors/deployment-not-found", d.trim_end_matches('/')))
+        .or_else(|| {
+            std::env::var("HIVE_DASHBOARD_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .map(|d| {
+            format!(
+                "{}/docs/errors/deployment-not-found",
+                d.trim_end_matches('/')
+            )
+        })
         .unwrap_or_else(|| "/docs/errors/deployment-not-found".into());
     let html = format!(
         r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>404: NOT_FOUND</title>
@@ -1019,9 +1313,15 @@ fn set_anycast(resp: &mut Response, node: &Option<hive_edge::NodeInfo>) {
 }
 
 fn cached_response(c: hive_edge::cdn::CachedResponse, region: &str, state: CacheState) -> Response {
-    let mut resp = Response::builder().status(c.status).body(Body::from(c.body)).unwrap();
+    let mut resp = Response::builder()
+        .status(c.status)
+        .body(Body::from(c.body))
+        .unwrap();
     for (k, v) in &c.headers {
-        if let (Ok(n), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v)) {
+        if let (Ok(n), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_str(v),
+        ) {
             resp.headers_mut().insert(n, val);
         }
     }
@@ -1048,12 +1348,24 @@ fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: S
             let hdrs: Vec<(String, String)> = resp
                 .headers()
                 .iter()
-                .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+                .filter_map(|(k, v)| {
+                    v.to_str()
+                        .ok()
+                        .map(|s| (k.as_str().to_string(), s.to_string()))
+                })
                 .collect();
             if let Ok(body) = resp.bytes().await {
                 if cloud.cdn.maybe_store(&key, status, &hdrs, &body) {
                     cloud.cdn.note_revalidated();
-                    let ev = cloud.event(&cloud.region, "GET", &host, &path_q, status, "cache-revalidate", "");
+                    let ev = cloud.event(
+                        &cloud.region,
+                        "GET",
+                        &host,
+                        &path_q,
+                        status,
+                        "cache-revalidate",
+                        "",
+                    );
                     cloud.record(ev);
                 }
             }
@@ -1064,7 +1376,11 @@ fn spawn_revalidate(cloud: Arc<CloudState>, host: String, path_q: String, key: S
 fn is_cacheable(headers: &axum::http::HeaderMap) -> bool {
     let hdrs: Vec<(String, String)> = headers
         .iter()
-        .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|s| (k.as_str().to_string(), s.to_string()))
+        })
         .collect();
     hive_edge::cdn::cache_policy(&hdrs).is_some()
 }
@@ -1072,7 +1388,11 @@ fn is_cacheable(headers: &axum::http::HeaderMap) -> bool {
 /// Rebuild the request URI with the (possibly rewritten) path, preserving query.
 fn with_path(req: Request, path: &str, query: &str) -> Request {
     let (mut parts, body) = req.into_parts();
-    let pq = if query.is_empty() { path.to_string() } else { format!("{path}?{query}") };
+    let pq = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
     if let Ok(uri) = pq.parse::<axum::http::Uri>() {
         parts.uri = uri;
     }
@@ -1153,7 +1473,10 @@ fn derive_dashboard(
             // `state::host_matches_apps_domain` for ingress) was never consulted
             // here. Fall back to it directly instead of depending on a second,
             // redundant env var to duplicate the same value.
-            .or_else(|| crate::state::host_matches_apps_domain(&h, apps_domain).then(|| apps_domain.to_string()))
+            .or_else(|| {
+                crate::state::host_matches_apps_domain(&h, apps_domain)
+                    .then(|| apps_domain.to_string())
+            })
     } else {
         None
     };
@@ -1192,7 +1515,11 @@ fn preview_gate(
     let dep = cloud.gw.deployment_for_host(host)?;
     let project = dep.project.clone();
     let target = if dep.target.is_empty() {
-        if dep.production { "production" } else { "preview" }
+        if dep.production {
+            "production"
+        } else {
+            "preview"
+        }
     } else {
         dep.target.as_str()
     };
@@ -1208,7 +1535,10 @@ fn preview_gate(
     if ent_protects && ent.mode == "password" {
         // Already unlocked via the sealed `hive_pw` cookie?
         if let Some(pw_cookie) = cookie_value(headers, "hive_pw") {
-            if cloud.enterprise.verify_password_cookie(&project, &pw_cookie) {
+            if cloud
+                .enterprise
+                .verify_password_cookie(&project, &pw_cookie)
+            {
                 return None;
             }
         }
@@ -1218,14 +1548,34 @@ fn preview_gate(
             if cloud.enterprise.verify_password(&project, &submitted) {
                 let cookie = cloud.enterprise.seal_password_cookie(&project, &submitted);
                 let mut resp = axum::response::Redirect::temporary(path).into_response();
-                set(&mut resp, "set-cookie", &format!("hive_pw={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"));
+                set(
+                    &mut resp,
+                    "set-cookie",
+                    &format!("hive_pw={cookie}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400"),
+                );
                 set(&mut resp, "x-hive-region", region);
                 set(&mut resp, "x-hive-preview", "password-unlocked");
-                let ev = cloud.event(region, method, host, path, 302, "deploy-password-ok", &project);
+                let ev = cloud.event(
+                    region,
+                    method,
+                    host,
+                    path,
+                    302,
+                    "deploy-password-ok",
+                    &project,
+                );
                 cloud.record(ev);
                 return Some(resp);
             }
-            let ev = cloud.event(region, method, host, path, 401, "deploy-password-bad", &project);
+            let ev = cloud.event(
+                region,
+                method,
+                host,
+                path,
+                401,
+                "deploy-password-bad",
+                &project,
+            );
             cloud.record(ev);
             return Some(password_page(&project, path, region, true));
         }
@@ -1252,7 +1602,15 @@ fn preview_gate(
     if crate::zkauth::cookie_access(&project, headers) {
         return None;
     }
-    let ev = cloud.event(region, method, host, path, 401, "preview-protected", &project);
+    let ev = cloud.event(
+        region,
+        method,
+        host,
+        path,
+        401,
+        "preview-protected",
+        &project,
+    );
     cloud.record(ev);
 
     // One-and-done unlock: for a BROWSER navigation (Accept: text/html) we bounce to
@@ -1261,13 +1619,18 @@ fn preview_gate(
     // cookie ON THIS deployment domain — solving the cross-domain cookie problem.
     // Needs HIVE_DASHBOARD_URL (the dashboard origin); without it we fall back to the
     // plain 401 so nothing breaks.
-    let wants_html = header(headers, "accept").map(|a| a.contains("text/html")).unwrap_or(false);
+    let wants_html = header(headers, "accept")
+        .map(|a| a.contains("text/html"))
+        .unwrap_or(false);
     if wants_html && method.eq_ignore_ascii_case("GET") {
         if let Some(dash) = dashboard_origin(cloud, host) {
             {
                 let url = format!(
                     "{dash}/preview-unlock?host={}&project={}&team={}&next={}",
-                    pct(host), pct(&project), pct(&team), pct(path),
+                    pct(host),
+                    pct(&project),
+                    pct(&team),
+                    pct(path),
                 );
                 let mut resp = axum::response::Redirect::temporary(&url).into_response();
                 set(&mut resp, "x-hive-region", region);
@@ -1291,13 +1654,18 @@ fn preview_gate(
 fn cookie_value(headers: &[(String, String)], name: &str) -> Option<String> {
     let cookie = header(headers, "cookie")?;
     let prefix = format!("{name}=");
-    cookie.split(';').map(|p| p.trim()).find_map(|kv| kv.strip_prefix(&prefix).map(|v| v.to_string()))
+    cookie
+        .split(';')
+        .map(|p| p.trim())
+        .find_map(|kv| kv.strip_prefix(&prefix).map(|v| v.to_string()))
 }
 
 /// Extract one raw (percent-decoded) query-parameter value from a query string.
 fn query_param(query: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    query.split('&').find_map(|kv| kv.strip_prefix(&prefix).map(|v| percent_decode(v)))
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(&prefix).map(|v| percent_decode(v)))
 }
 
 /// Vercel-style deployment-password prompt. A minimal self-contained HTML page
@@ -1346,7 +1714,9 @@ fn password_page(project: &str, path: &str, region: &str, bad: bool) -> Response
 fn pct(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
@@ -1389,7 +1759,10 @@ fn has_preview_access(headers: &[(String, String)], team: &str) -> bool {
 /// `headers_vec` because they need the full header list.
 #[inline]
 fn hget(req: &Request, name: &str) -> Option<String> {
-    req.headers().get(name).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 fn header(headers: &[(String, String)], name: &str) -> Option<String> {
@@ -1410,7 +1783,9 @@ fn http_fallback_budget(cand_start: std::time::Instant) -> std::time::Duration {
         .filter(|&v| v > 0)
         .unwrap_or(30_000);
     let total = std::time::Duration::from_millis(total_ms);
-    total.saturating_sub(cand_start.elapsed()).max(std::time::Duration::from_secs(1))
+    total
+        .saturating_sub(cand_start.elapsed())
+        .max(std::time::Duration::from_secs(1))
 }
 
 /// Order mesh candidates by the deployment's configured region/failover policy (#5).
@@ -1431,11 +1806,18 @@ fn order_candidates(
 ) -> Vec<crate::state::PeerRoute> {
     let regions: Vec<&String> = fs.regions.iter().filter(|r| !r.is_empty()).collect();
     if regions.is_empty() {
-        raw.sort_by_key(|r| (if r.region == serving_region { 0u8 } else { 1u8 }, r.latency_ms));
+        raw.sort_by_key(|r| {
+            (
+                if r.region == serving_region { 0u8 } else { 1u8 },
+                r.latency_ms,
+            )
+        });
         return balance_same_region(raw);
     }
     let rank = |r: &crate::state::PeerRoute| {
-        regions.iter().position(|cr| cr.eq_ignore_ascii_case(&r.region))
+        regions
+            .iter()
+            .position(|cr| cr.eq_ignore_ascii_case(&r.region))
     };
     if fs.failover {
         raw.retain(|r| rank(r).is_some());
@@ -1467,7 +1849,9 @@ fn balance_same_region(mut raw: Vec<crate::state::PeerRoute>) -> Vec<crate::stat
         let best_lat = raw[0].latency_ms;
         let n = raw
             .iter()
-            .take_while(|r| r.region.eq_ignore_ascii_case(&best) && r.latency_ms <= best_lat + BAND_MS)
+            .take_while(|r| {
+                r.region.eq_ignore_ascii_case(&best) && r.latency_ms <= best_lat + BAND_MS
+            })
             .count();
         if n > 1 {
             let k = RR.fetch_add(1, Ordering::Relaxed) % n;
@@ -1531,9 +1915,10 @@ async fn ws_proxy(
     let (status, resp_headers, leftover) = read_http_head(&mut raw).await?;
     let mut builder = Response::builder().status(status);
     for (k, v) in &resp_headers {
-        if let (Ok(name), Ok(val)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
-        {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) {
             builder = builder.header(name, val);
         }
     }
@@ -1583,8 +1968,12 @@ async fn local_ws_proxy(
         // targets do — see `mesh_raw::resolve`).
         hive_backend::CellEndpoint::Vsock { .. } => return Err(()),
     };
-    let mut raw = tokio::net::TcpStream::connect(&addr).await.map_err(|_| ())?;
-    raw.write_all(&[fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC]).await.map_err(|_| ())?;
+    let mut raw = tokio::net::TcpStream::connect(&addr)
+        .await
+        .map_err(|_| ())?;
+    raw.write_all(&[fluid_tunnel::TunnelServer::RAW_UPGRADE_MAGIC])
+        .await
+        .map_err(|_| ())?;
     let mut head = format!("{method} {path_q} HTTP/1.1\r\n");
     for (k, v) in fwd_headers {
         head.push_str(&format!("{k}: {v}\r\n"));
@@ -1597,9 +1986,10 @@ async fn local_ws_proxy(
     let (status, resp_headers, leftover) = read_http_head(&mut raw).await?;
     let mut builder = Response::builder().status(status);
     for (k, v) in &resp_headers {
-        if let (Ok(name), Ok(val)) =
-            (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_bytes(v.as_bytes()))
-        {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_bytes(v.as_bytes()),
+        ) {
             builder = builder.header(name, val);
         }
     }
@@ -1641,7 +2031,10 @@ async fn read_http_head<R: tokio::io::AsyncRead + Unpin>(
                 .ok_or(())?;
             let status = StatusCode::from_u16(code).map_err(|_| ())?;
             let headers = lines
-                .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
+                .filter_map(|l| {
+                    l.split_once(':')
+                        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+                })
                 .collect();
             return Ok((status, headers, leftover));
         }
@@ -1672,7 +2065,13 @@ mod tests {
         let local = Some("http://localhost:3002".to_string());
         // Public wildcard host → derived public dashboard (NOT localhost:3002).
         assert_eq!(
-            derive_dashboard("app.deployment.shadow.ngrok.pizza", &s, "", None, local.clone()),
+            derive_dashboard(
+                "app.deployment.shadow.ngrok.pizza",
+                &s,
+                "",
+                None,
+                local.clone()
+            ),
             Some("https://shadow.ngrok.pizza".to_string())
         );
         // Explicit override wins.
@@ -1704,7 +2103,13 @@ mod tests {
         let s = vec!["localhost".to_string()]; // the real fleet default
         let public = Some("https://shadw.cloud".to_string());
         assert_eq!(
-            derive_dashboard("gm-verify-final-fe62ab2.shadw.app", &s, "shadw.app", public.clone(), None),
+            derive_dashboard(
+                "gm-verify-final-fe62ab2.shadw.app",
+                &s,
+                "shadw.app",
+                public.clone(),
+                None
+            ),
             Some("https://shadw.cloud".to_string())
         );
         // Apex of the apps domain also matches.
@@ -1713,7 +2118,10 @@ mod tests {
             Some("https://shadw.cloud".to_string())
         );
         // A totally unrelated host matches neither suffixes nor apps_domain.
-        assert_eq!(derive_dashboard("evil.example.com", &s, "shadw.app", public, None), None);
+        assert_eq!(
+            derive_dashboard("evil.example.com", &s, "shadw.app", public, None),
+            None
+        );
     }
 
     fn route(node: &str, region: &str, lat: u64) -> PeerRoute {
@@ -1753,29 +2161,51 @@ mod tests {
         let raw = vec![route("la1", "los-angeles", 5), route("bkk1", "bangkok", 50)];
         let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
         let ids: Vec<_> = out.iter().map(|r| r.node_id.as_str()).collect();
-        assert_eq!(ids, vec!["bkk1"], "no cross-region: only the primary region's node");
+        assert_eq!(
+            ids,
+            vec!["bkk1"],
+            "no cross-region: only the primary region's node"
+        );
     }
 
     #[test]
     fn failover_false_primary_down_yields_empty() {
-        let raw = vec![route("la1", "los-angeles", 5), route("sf1", "san-francisco", 1)];
+        let raw = vec![
+            route("la1", "los-angeles", 5),
+            route("sf1", "san-francisco", 1),
+        ];
         let out = order_candidates(raw, &fs(&["bangkok"], false), "los-angeles");
-        assert!(out.is_empty(), "primary down + no failover → empty (caller returns 503, never crosses)");
+        assert!(
+            out.is_empty(),
+            "primary down + no failover → empty (caller returns 503, never crosses)"
+        );
     }
 
     #[test]
     fn no_regions_is_anycast_serving_region_first() {
-        let raw = vec![route("la1", "los-angeles", 5), route("sf1", "san-francisco", 50)];
+        let raw = vec![
+            route("la1", "los-angeles", 5),
+            route("sf1", "san-francisco", 50),
+        ];
         let out = order_candidates(raw, &fs(&[], false), "san-francisco");
-        assert_eq!(out[0].node_id, "sf1", "serving region first even at higher latency");
+        assert_eq!(
+            out[0].node_id, "sf1",
+            "serving region first even at higher latency"
+        );
     }
 
     #[test]
     fn within_region_latency_is_the_tiebreak() {
-        let raw = vec![route("bkk-slow", "bangkok", 90), route("bkk-fast", "bangkok", 3)];
+        let raw = vec![
+            route("bkk-slow", "bangkok", 90),
+            route("bkk-fast", "bangkok", 3),
+        ];
         let out = order_candidates(raw, &fs(&["bangkok"], true), "x");
         // 90ms is outside the co-location band of 3ms → not rotated in; latency wins.
-        assert_eq!(out[0].node_id, "bkk-fast", "lowest latency within the region wins");
+        assert_eq!(
+            out[0].node_id, "bkk-fast",
+            "lowest latency within the region wins"
+        );
     }
 
     #[test]
@@ -1791,6 +2221,9 @@ mod tests {
             // Both peers are always present (balancing reorders, never drops).
             assert_eq!(out.len(), 2);
         }
-        assert!(seen.contains("va1") && seen.contains("va2"), "both same-region peers must take first-tried turns, got {seen:?}");
+        assert!(
+            seen.contains("va1") && seen.contains("va2"),
+            "both same-region peers must take first-tried turns, got {seen:?}"
+        );
     }
 }

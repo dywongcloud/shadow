@@ -10,6 +10,7 @@ import { Triangle } from "@/components/ui";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { VercelMark } from "@/components/logo";
 import { NotificationBell } from "@/components/notifications";
+import { RunNodeControl } from "@/components/run-node-control";
 import { WithIdentity, type Identity } from "@/components/identity";
 import { usePoll, switchTeam, mintSessionToken, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
@@ -167,6 +168,7 @@ export function TopNav() {
               <ShieldHalf className="h-3.5 w-3.5" /> Ops
             </Link>
           )}
+          <RunNodeControl />
           <NotificationBell />
           <ThemeToggle />
           <Link

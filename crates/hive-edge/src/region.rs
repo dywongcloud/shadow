@@ -234,8 +234,12 @@ pub fn select_relay_hint(target: &NodeInfo, nodes: &[NodeInfo], me: &NodeInfo) -
     if let (Some(tlat), Some(tlon)) = (target.lat, target.lon) {
         let mut best: Option<(f64, &str)> = None;
         for n in others.clone() {
-            let Some(r) = present(&n.relay_url) else { continue };
-            let (Some(lat), Some(lon)) = (n.lat, n.lon) else { continue };
+            let Some(r) = present(&n.relay_url) else {
+                continue;
+            };
+            let (Some(lat), Some(lon)) = (n.lat, n.lon) else {
+                continue;
+            };
             let d = (lat - tlat).powi(2) + (lon - tlon).powi(2);
             if best.map(|(bd, _)| d < bd).unwrap_or(true) {
                 best = Some((d, r));
@@ -454,7 +458,11 @@ impl NodeRegistry {
     /// The full anycast routing table (healthy first, by latency).
     pub fn routing_table(&self) -> Vec<NodeInfo> {
         let mut nodes = self.nodes();
-        nodes.sort_by(|a, b| b.healthy.cmp(&a.healthy).then(a.latency_ms.cmp(&b.latency_ms)));
+        nodes.sort_by(|a, b| {
+            b.healthy
+                .cmp(&a.healthy)
+                .then(a.latency_ms.cmp(&b.latency_ms))
+        });
         nodes
     }
 
@@ -493,7 +501,9 @@ impl NodeRegistry {
     pub fn upsert_peer_self_report(&self, peer: NodeInfo) {
         if let Some(pid) = peer.peer_id.as_deref().filter(|s| !s.is_empty()) {
             let pid = pid.to_string();
-            self.peers.write().retain(|k, v| k == &peer.id || v.peer_id.as_deref() != Some(pid.as_str()));
+            self.peers
+                .write()
+                .retain(|k, v| k == &peer.id || v.peer_id.as_deref() != Some(pid.as_str()));
         }
         self.upsert_peer(peer);
     }
@@ -680,7 +690,10 @@ mod tests {
         reg.upsert_peer(node("peer", "sfo1", 10, true));
         // ...but locally-observed health wins: it stays unhealthy until OUR probe succeeds.
         let p = reg.nodes().into_iter().find(|n| n.id == "peer").unwrap();
-        assert!(!p.healthy, "second-hand gossip must not resurrect a directly-failed node");
+        assert!(
+            !p.healthy,
+            "second-hand gossip must not resurrect a directly-failed node"
+        );
         // A real direct success does bring it back.
         reg.set_health("peer", 5, true);
         let p = reg.nodes().into_iter().find(|n| n.id == "peer").unwrap();

@@ -165,7 +165,7 @@ pub struct RateCard {
 }
 
 pub const RATE_CARD: RateCard = RateCard {
-    active_cpu_hr_cents: 12.8,          // $0.128 / active-CPU-hr
+    active_cpu_hr_cents: 12.8,         // $0.128 / active-CPU-hr
     mem_gb_hr_cents: 1.06,             // $0.0106 / GB-hr
     requests_per_million_cents: 200.0, // $2.00 / M requests
     waf_per_million_cents: 60.0,       // $0.60 / M blocked
@@ -374,9 +374,15 @@ impl BillingStore {
 
     /// Get (or lazily create a Hobby) account for a tenant.
     pub fn account(&self, tenant: &str) -> BillingAccount {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let mut m = self.accounts.write();
-        let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+        let acc = m
+            .entry(tenant.to_string())
+            .or_insert_with(|| BillingAccount::default_for(tenant));
         // Roll the monthly period (renew included allowance) if elapsed — and
         // FINALIZE the closing period's invoice before resetting the counters.
         let now = now_ms();
@@ -392,7 +398,11 @@ impl BillingStore {
             // control-plane leader once account() started being called more
             // frequently (relational mirror loop, one call per tenant per
             // tick) raised the odds of landing on a tenant mid-rollover.
-            let closing = build_invoice(acc, self.usage_cost_cents_since(tenant, acc.period_start_ms), "paid");
+            let closing = build_invoice(
+                acc,
+                self.usage_cost_cents_since(tenant, acc.period_start_ms),
+                "paid",
+            );
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
@@ -405,8 +415,18 @@ impl BillingStore {
         let out = acc.clone();
         drop(m);
         if let Some(inv) = rolled {
-            self.invoices.write().entry(out.tenant.clone()).or_default().push(inv);
-            self.ledger_push(&out.tenant, "renewal", 0, out.balance_cents, "Monthly period renewed; invoice finalized");
+            self.invoices
+                .write()
+                .entry(out.tenant.clone())
+                .or_default()
+                .push(inv);
+            self.ledger_push(
+                &out.tenant,
+                "renewal",
+                0,
+                out.balance_cents,
+                "Monthly period renewed; invoice finalized",
+            );
         }
         out
     }
@@ -418,7 +438,12 @@ impl BillingStore {
     /// path holds `self.accounts`'s write lock across this computation and
     /// must use `usage_cost_cents_since` instead (see its call site).
     fn usage_cost_cents_for(&self, tenant: &str) -> i64 {
-        let acc_start = self.accounts.read().get(tenant).map(|a| a.period_start_ms).unwrap_or(0);
+        let acc_start = self
+            .accounts
+            .read()
+            .get(tenant)
+            .map(|a| a.period_start_ms)
+            .unwrap_or(0);
         self.usage_cost_cents_since(tenant, acc_start)
     }
 
@@ -444,7 +469,9 @@ impl BillingStore {
         let bal_after;
         {
             let mut m = self.accounts.write();
-            let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
             let included_left = acc.included_cents.saturating_sub(acc.used_cents);
             let from_included = cents.min(included_left);
             acc.used_cents += from_included;
@@ -463,7 +490,11 @@ impl BillingStore {
     /// lost. Handles counter resets (pool recycle / node restart) by charging the
     /// fresh value. This is the metering→billing pipeline. Returns cents charged.
     pub fn meter_usage(&self, tenant: &str, current: UsageTotals) -> u64 {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let (delta, carry) = {
             let mut meters = self.meters.write();
             let st = meters.entry(tenant.to_string()).or_default();
@@ -511,15 +542,28 @@ impl BillingStore {
 
     /// The current (in-progress) draft invoice for a tenant.
     pub fn current_invoice(&self, tenant: &str) -> Invoice {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let acc = self.account(tenant);
         build_invoice(&acc, self.usage_cost_cents_for(tenant), "draft")
     }
 
     /// Finalized invoices for a tenant (newest first) plus the current draft.
     pub fn invoices(&self, tenant: &str) -> Vec<Invoice> {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
-        let mut v = self.invoices.read().get(tenant).cloned().unwrap_or_default();
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        let mut v = self
+            .invoices
+            .read()
+            .get(tenant)
+            .cloned()
+            .unwrap_or_default();
         v.push(self.current_invoice(tenant));
         v.sort_by(|a, b| b.period_start_ms.cmp(&a.period_start_ms));
         v
@@ -533,11 +577,26 @@ impl BillingStore {
     /// construction; used by the relational mirror (`relational::upsert_billing`),
     /// which must NEVER persist a draft (transient/computed, not a stored fact).
     pub fn finalized_invoices(&self, tenant: &str) -> Vec<Invoice> {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
-        self.invoices.read().get(tenant).cloned().unwrap_or_default()
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        self.invoices
+            .read()
+            .get(tenant)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    fn ledger_push(&self, tenant: &str, kind: &str, amount: i64, balance_after: i64, note: &str) -> LedgerEntry {
+    fn ledger_push(
+        &self,
+        tenant: &str,
+        kind: &str,
+        amount: i64,
+        balance_after: i64,
+        note: &str,
+    ) -> LedgerEntry {
         let e = LedgerEntry {
             id: format!("led_{}", &Uuid::new_v4().simple().to_string()[..12]),
             tenant: tenant.to_string(),
@@ -552,26 +611,44 @@ impl BillingStore {
     }
 
     pub fn set_plan(&self, tenant: &str, plan: &str) -> BillingAccount {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let spec = plan_spec(plan);
         {
             let mut m = self.accounts.write();
-            let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
             acc.plan = spec.id.to_string();
             acc.included_cents = spec.included_cents;
             acc.updated_ms = now_ms();
         }
         let bal = self.account(tenant).balance_cents;
-        self.ledger_push(tenant, "plan_change", spec.price_cents as i64, bal, &format!("Switched to {} plan", spec.name));
+        self.ledger_push(
+            tenant,
+            "plan_change",
+            spec.price_cents as i64,
+            bal,
+            &format!("Switched to {} plan", spec.name),
+        );
         self.account(tenant)
     }
 
     pub fn add_credits(&self, tenant: &str, cents: u64, note: &str) -> BillingAccount {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let bal;
         {
             let mut m = self.accounts.write();
-            let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
             acc.balance_cents += cents as i64;
             acc.updated_ms = now_ms();
             bal = acc.balance_cents;
@@ -584,11 +661,17 @@ impl BillingStore {
     /// prepaid balance. On Hobby (no overage) a charge that would go negative is
     /// rejected. Returns Ok(account) or Err(reason).
     pub fn charge(&self, tenant: &str, cents: u64, note: &str) -> Result<BillingAccount, String> {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let bal_after;
         {
             let mut m = self.accounts.write();
-            let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
             let spec = plan_spec(&acc.plan);
             let mut remaining = cents;
             let included_left = acc.included_cents.saturating_sub(acc.used_cents);
@@ -623,15 +706,26 @@ impl BillingStore {
         }
         if acc.remaining_included() == 0 && acc.balance_cents <= 0 {
             return Err(
-                "Monthly included compute exhausted — upgrade to Pro or add credits to deploy.".into(),
+                "Monthly included compute exhausted — upgrade to Pro or add credits to deploy."
+                    .into(),
             );
         }
         Ok(())
     }
 
     pub fn ledger(&self, tenant: &str) -> Vec<LedgerEntry> {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
-        let mut v: Vec<LedgerEntry> = self.ledger.read().iter().filter(|e| e.tenant == tenant).cloned().collect();
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        let mut v: Vec<LedgerEntry> = self
+            .ledger
+            .read()
+            .iter()
+            .filter(|e| e.tenant == tenant)
+            .cloned()
+            .collect();
         v.sort_by(|a, b| b.ts_ms.cmp(&a.ts_ms));
         v
     }
@@ -641,11 +735,26 @@ impl BillingStore {
     /// by the relational mirror to persist a tenant's in-flight checkout
     /// state (`billing_checkouts`, previously not mirrored at all).
     pub fn checkouts_for_tenant(&self, tenant: &str) -> Vec<Checkout> {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
-        self.checkouts.read().values().filter(|c| c.tenant == tenant).cloned().collect()
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        self.checkouts
+            .read()
+            .values()
+            .filter(|c| c.tenant == tenant)
+            .cloned()
+            .collect()
     }
 
-    pub fn open_checkout(&self, tenant: &str, kind: &str, plan: &str, amount_cents: u64) -> Checkout {
+    pub fn open_checkout(
+        &self,
+        tenant: &str,
+        kind: &str,
+        plan: &str,
+        amount_cents: u64,
+    ) -> Checkout {
         let c = Checkout {
             id: format!("co_{}", &Uuid::new_v4().simple().to_string()[..18]),
             tenant: tenant.to_string(),
@@ -672,9 +781,15 @@ impl BillingStore {
     /// webhook). Empty strings are no-ops (never overwrite a known id with
     /// nothing just because one event's payload omitted it).
     pub fn set_stripe_ids(&self, tenant: &str, customer: &str, subscription: &str) {
-        let tenant = if tenant.is_empty() { "personal" } else { tenant };
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
         let mut m = self.accounts.write();
-        let acc = m.entry(tenant.to_string()).or_insert_with(|| BillingAccount::default_for(tenant));
+        let acc = m
+            .entry(tenant.to_string())
+            .or_insert_with(|| BillingAccount::default_for(tenant));
         if !customer.is_empty() {
             acc.stripe_customer = customer.to_string();
         }
@@ -688,7 +803,11 @@ impl BillingStore {
     /// id — used by the `customer.subscription.deleted`/`.updated` webhook,
     /// which identifies the subscription but not our tenant slug directly.
     pub fn tenant_for_subscription(&self, subscription_id: &str) -> Option<String> {
-        self.accounts.read().values().find(|a| a.stripe_subscription == subscription_id).map(|a| a.tenant.clone())
+        self.accounts
+            .read()
+            .values()
+            .find(|a| a.stripe_subscription == subscription_id)
+            .map(|a| a.tenant.clone())
     }
 
     pub fn get_checkout(&self, id: &str) -> Option<Checkout> {
@@ -733,7 +852,10 @@ impl BillingStore {
         )
     }
     pub fn load(&self, accounts: Vec<BillingAccount>, ledger: Vec<LedgerEntry>) {
-        *self.accounts.write() = accounts.into_iter().map(|a| (a.tenant.clone(), a)).collect();
+        *self.accounts.write() = accounts
+            .into_iter()
+            .map(|a| (a.tenant.clone(), a))
+            .collect();
         *self.ledger.write() = ledger;
     }
     /// Finalized invoices across all tenants (for persistence).
@@ -769,13 +891,19 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
         });
         if covered > 0 {
             lines.push(InvoiceLine {
-                description: format!("Included allowance credit (${:.2})", included as f64 / 100.0),
+                description: format!(
+                    "Included allowance credit (${:.2})",
+                    included as f64 / 100.0
+                ),
                 amount_cents: -covered,
             });
         }
     }
     let subtotal: i64 = lines.iter().map(|l| l.amount_cents).sum();
-    let num = format!("INV-{}", &Uuid::new_v4().simple().to_string()[..8].to_uppercase());
+    let num = format!(
+        "INV-{}",
+        &Uuid::new_v4().simple().to_string()[..8].to_uppercase()
+    );
     Invoice {
         id: format!("in_{}", &Uuid::new_v4().simple().to_string()[..18]),
         number: num,
@@ -792,7 +920,9 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
 }
 
 pub fn stripe_configured() -> bool {
-    std::env::var("STRIPE_SECRET_KEY").map(|k| !k.is_empty()).unwrap_or(false)
+    std::env::var("STRIPE_SECRET_KEY")
+        .map(|k| !k.is_empty())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -807,11 +937,17 @@ mod tests {
         // dashboard displays one number while Stripe charges another.
         let pro = plan_spec("pro");
         assert_eq!(pro.stripe_price_id, Some("price_1TqK9jRj0yq8r94Ek8Gjgl7d"));
-        assert_eq!(pro.price_cents, 2000, "Pro must be $20/mo, matching the real Stripe price");
+        assert_eq!(
+            pro.price_cents, 2000,
+            "Pro must be $20/mo, matching the real Stripe price"
+        );
 
         let ent = plan_spec("enterprise");
         assert_eq!(ent.stripe_price_id, Some("price_1TqKCGRj0yq8r94E4B8VhCC3"));
-        assert_eq!(ent.price_cents, 100_000, "Enterprise must be $1,000/mo, matching the real Stripe price");
+        assert_eq!(
+            ent.price_cents, 100_000,
+            "Enterprise must be $1,000/mo, matching the real Stripe price"
+        );
 
         // Hobby has no paid subscription — must never reference a Stripe price.
         assert_eq!(plan_spec("hobby").stripe_price_id, None);
@@ -831,25 +967,49 @@ mod tests {
         signed.extend_from_slice(payload);
         let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(&signed);
-        let sig_hex: String = mac.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let sig_hex: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
 
         let header = format!("t={ts},v1={sig_hex}");
-        assert!(verify_webhook_signature(payload, &header, secret), "a genuinely valid signature must verify");
+        assert!(
+            verify_webhook_signature(payload, &header, secret),
+            "a genuinely valid signature must verify"
+        );
 
         // Wrong secret.
-        assert!(!verify_webhook_signature(payload, &header, "whsec_wrong_secret"));
+        assert!(!verify_webhook_signature(
+            payload,
+            &header,
+            "whsec_wrong_secret"
+        ));
         // Tampered payload (the classic webhook-forgery attempt).
         assert!(!verify_webhook_signature(b"{}", &header, secret));
         // Tampered signature.
-        let bad_header = format!("t={ts},v1=0000000000000000000000000000000000000000000000000000000000000000");
+        let bad_header =
+            format!("t={ts},v1=0000000000000000000000000000000000000000000000000000000000000000");
         assert!(!verify_webhook_signature(payload, &bad_header, secret));
         // Stale timestamp (older than Stripe's 5-minute tolerance) — replay defense.
         let stale_header = format!("t={},v1={sig_hex}", ts - 301);
-        assert!(!verify_webhook_signature(payload, &stale_header, secret), "a >5-minute-old signature must be rejected");
+        assert!(
+            !verify_webhook_signature(payload, &stale_header, secret),
+            "a >5-minute-old signature must be rejected"
+        );
         // Missing v1 entirely.
-        assert!(!verify_webhook_signature(payload, &format!("t={ts}"), secret));
+        assert!(!verify_webhook_signature(
+            payload,
+            &format!("t={ts}"),
+            secret
+        ));
         // Garbage header.
-        assert!(!verify_webhook_signature(payload, "not-a-real-header", secret));
+        assert!(!verify_webhook_signature(
+            payload,
+            "not-a-real-header",
+            secret
+        ));
     }
 
     #[test]
@@ -868,7 +1028,10 @@ mod tests {
         // Stripe verification there instead of failing closed on nothing to verify.
         let s = BillingStore::new();
         let co = s.open_checkout("acme", "plan", "pro", 2000);
-        assert!(co.stripe_session_id.is_empty(), "a freshly-opened checkout has no Stripe session yet");
+        assert!(
+            co.stripe_session_id.is_empty(),
+            "a freshly-opened checkout has no Stripe session yet"
+        );
         s.attach_stripe_session(&co.id, "cs_test_realsession123");
         let refreshed = s.get_checkout(&co.id).unwrap();
         assert_eq!(refreshed.stripe_session_id, "cs_test_realsession123");
@@ -882,7 +1045,10 @@ mod tests {
         let acc = s.account("acme");
         assert_eq!(acc.stripe_customer, "cus_realcustomer");
         assert_eq!(acc.stripe_subscription, "sub_realsubscription");
-        assert_eq!(s.tenant_for_subscription("sub_realsubscription").as_deref(), Some("acme"));
+        assert_eq!(
+            s.tenant_for_subscription("sub_realsubscription").as_deref(),
+            Some("acme")
+        );
         assert_eq!(s.tenant_for_subscription("sub_doesnotexist"), None);
 
         // An empty id in a later call must NOT clobber a known one (a webhook
@@ -903,13 +1069,22 @@ mod tests {
         let co = s.open_checkout("victim-team", "plan", "enterprise", 100_000);
         assert_eq!(co.tenant, "victim-team");
         let fetched = s.get_checkout(&co.id).unwrap();
-        assert_eq!(fetched.tenant, "victim-team", "the handler's tenant-ownership check depends on this being immutable");
+        assert_eq!(
+            fetched.tenant, "victim-team",
+            "the handler's tenant-ownership check depends on this being immutable"
+        );
     }
 
     #[test]
     fn rate_card_cost_matches_ui() {
         // 1 CPU-hr = $0.128 = 12.8¢; 1 GB-hr = 1.06¢; 1M req = $2 = 200¢.
-        let u = UsageTotals { active_cpu_ms: 3_600_000, mem_gb_hr_milli: 1000, requests: 1_000_000, blocked: 0, gpu_ms: 0 };
+        let u = UsageTotals {
+            active_cpu_ms: 3_600_000,
+            mem_gb_hr_milli: 1000,
+            requests: 1_000_000,
+            blocked: 0,
+            gpu_ms: 0,
+        };
         let c = RATE_CARD.cost_cents(&u);
         assert!((c - (12.8 + 1.06 + 200.0)).abs() < 1e-6, "got {c}");
     }
@@ -918,29 +1093,47 @@ mod tests {
     fn meter_charges_delta_and_carries_fraction() {
         let s = BillingStore::new();
         s.set_plan("acme", "pro"); // overage plan so balance can go negative
-        // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
-        let half = UsageTotals { active_cpu_ms: (3_600_000.0 * 0.5 / 12.8) as u64, ..Default::default() };
+                                   // First reading: 0.5¢ worth (below a whole cent) → nothing charged yet.
+        let half = UsageTotals {
+            active_cpu_ms: (3_600_000.0 * 0.5 / 12.8) as u64,
+            ..Default::default()
+        };
         let c1 = s.meter_usage("acme", half);
         assert_eq!(c1, 0, "sub-cent usage should not charge yet");
         // Cumulative grows to ~1.5¢ → the crossed whole cent (1¢) is charged.
-        let onefive = UsageTotals { active_cpu_ms: (3_600_000.0 * 1.5 / 12.8) as u64, ..Default::default() };
+        let onefive = UsageTotals {
+            active_cpu_ms: (3_600_000.0 * 1.5 / 12.8) as u64,
+            ..Default::default()
+        };
         let c2 = s.meter_usage("acme", onefive);
         assert!(c2 >= 1, "should charge the crossed whole cent, got {c2}");
         // The usage is recorded in the ledger as a negative "usage" entry.
-        assert!(s.ledger("acme").iter().any(|e| e.kind == "usage" && e.amount_cents < 0));
+        assert!(s
+            .ledger("acme")
+            .iter()
+            .any(|e| e.kind == "usage" && e.amount_cents < 0));
     }
 
     #[test]
     fn meter_handles_counter_reset() {
         let s = BillingStore::new();
         s.set_plan("acme", "pro");
-        let big = UsageTotals { active_cpu_ms: 3_600_000 * 10, ..Default::default() }; // 128¢
+        let big = UsageTotals {
+            active_cpu_ms: 3_600_000 * 10,
+            ..Default::default()
+        }; // 128¢
         s.meter_usage("acme", big);
         // Node restarts → counter drops to a small value; must not underflow/panic and
         // should charge the fresh (small) amount, not a huge delta.
-        let small = UsageTotals { active_cpu_ms: 3_600_000, ..Default::default() }; // 12.8¢
+        let small = UsageTotals {
+            active_cpu_ms: 3_600_000,
+            ..Default::default()
+        }; // 12.8¢
         let c = s.meter_usage("acme", small);
-        assert!(c <= 13, "reset should charge only the fresh amount, got {c}");
+        assert!(
+            c <= 13,
+            "reset should charge only the fresh amount, got {c}"
+        );
     }
 
     #[test]
@@ -949,7 +1142,10 @@ mod tests {
         // Fresh hobby account can deploy.
         assert!(s.can_deploy("h").is_ok());
         // Consume just past the $5 (500¢) included allowance (small overage).
-        let over = UsageTotals { active_cpu_ms: (3_600_000.0 * 520.0 / 12.8) as u64, ..Default::default() };
+        let over = UsageTotals {
+            active_cpu_ms: (3_600_000.0 * 520.0 / 12.8) as u64,
+            ..Default::default()
+        };
         s.meter_usage("h", over);
         // Now included is gone and balance is negative → deploys are locked.
         assert!(s.can_deploy("h").is_err());
@@ -962,12 +1158,21 @@ mod tests {
     fn invoice_has_subscription_and_usage_lines() {
         let s = BillingStore::new();
         s.set_plan("acme", "pro");
-        let u = UsageTotals { active_cpu_ms: 3_600_000 * 5, ..Default::default() }; // 64¢
+        let u = UsageTotals {
+            active_cpu_ms: 3_600_000 * 5,
+            ..Default::default()
+        }; // 64¢
         s.meter_usage("acme", u);
         let inv = s.current_invoice("acme");
         assert_eq!(inv.status, "draft");
-        assert!(inv.lines.iter().any(|l| l.description.contains("subscription")));
-        assert!(inv.lines.iter().any(|l| l.description.contains("Compute usage")));
+        assert!(inv
+            .lines
+            .iter()
+            .any(|l| l.description.contains("subscription")));
+        assert!(inv
+            .lines
+            .iter()
+            .any(|l| l.description.contains("Compute usage")));
         // Pro subscription is $20 = 2000¢; total is subtotal of all lines.
         assert!(inv.total_cents >= 2000);
     }
@@ -1015,13 +1220,22 @@ pub async fn stripe_checkout(
             // (not just the checkout session) — that's what the
             // `customer.subscription.*` webhooks carry, and the session's own
             // metadata isn't copied onto it automatically.
-            params.push(("subscription_data[metadata][checkout_id]".into(), checkout_id.to_string()));
+            params.push((
+                "subscription_data[metadata][checkout_id]".into(),
+                checkout_id.to_string(),
+            ));
         }
         None => {
             params.push(("mode".into(), "payment".into()));
             params.push(("line_items[0][price_data][currency]".into(), "usd".into()));
-            params.push(("line_items[0][price_data][unit_amount]".into(), amount_cents.to_string()));
-            params.push(("line_items[0][price_data][product_data][name]".into(), product_name.to_string()));
+            params.push((
+                "line_items[0][price_data][unit_amount]".into(),
+                amount_cents.to_string(),
+            ));
+            params.push((
+                "line_items[0][price_data][product_data][name]".into(),
+                product_name.to_string(),
+            ));
         }
     }
     let resp = http
@@ -1031,8 +1245,14 @@ pub async fn stripe_checkout(
         .send()
         .await?;
     let v: serde_json::Value = resp.json().await?;
-    let url = v.get("url").and_then(|u| u.as_str()).ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({v})"))?;
-    let session_id = v.get("id").and_then(|u| u.as_str()).ok_or_else(|| anyhow::anyhow!("stripe: no session id ({v})"))?;
+    let url = v
+        .get("url")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow::anyhow!("stripe: no checkout url ({v})"))?;
+    let session_id = v
+        .get("id")
+        .and_then(|u| u.as_str())
+        .ok_or_else(|| anyhow::anyhow!("stripe: no session id ({v})"))?;
     Ok((url.to_string(), session_id.to_string()))
 }
 
@@ -1048,10 +1268,15 @@ pub struct StripeSessionStatus {
     pub subscription: Option<String>,
 }
 
-pub async fn stripe_verify_session(http: &reqwest::Client, session_id: &str) -> anyhow::Result<StripeSessionStatus> {
+pub async fn stripe_verify_session(
+    http: &reqwest::Client,
+    session_id: &str,
+) -> anyhow::Result<StripeSessionStatus> {
     let key = std::env::var("STRIPE_SECRET_KEY")?;
     let resp = http
-        .get(format!("https://api.stripe.com/v1/checkout/sessions/{session_id}"))
+        .get(format!(
+            "https://api.stripe.com/v1/checkout/sessions/{session_id}"
+        ))
         .basic_auth(&key, Some(""))
         .send()
         .await?;
@@ -1063,8 +1288,14 @@ pub async fn stripe_verify_session(http: &reqwest::Client, session_id: &str) -> 
         || v.get("status").and_then(|s| s.as_str()) == Some("complete");
     Ok(StripeSessionStatus {
         paid,
-        customer: v.get("customer").and_then(|c| c.as_str()).map(|s| s.to_string()),
-        subscription: v.get("subscription").and_then(|c| c.as_str()).map(|s| s.to_string()),
+        customer: v
+            .get("customer")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string()),
+        subscription: v
+            .get("subscription")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string()),
     })
 }
 

@@ -59,13 +59,23 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
 
     // The engine lives on the host node's loopback. If per-DB DNS routed the
     // client elsewhere (stale record), say so honestly instead of a generic 500.
-    let local = db.connection.get("local_port").filter(|p| !p.is_empty()).and_then(|p| p.parse::<u16>().ok());
+    let local = db
+        .connection
+        .get("local_port")
+        .filter(|p| !p.is_empty())
+        .and_then(|p| p.parse::<u16>().ok());
 
     // ---- AuthZ: bearer must match THIS DB's credential (constant-time) --------
     let bearer = bearer_token(&headers).unwrap_or_default();
     if bearer.is_empty() || !credential_matches(&db, &bearer) {
-        let mut resp = err(StatusCode::UNAUTHORIZED, "missing or invalid bearer token for this database");
-        resp.headers_mut().insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
+        let mut resp = err(
+            StatusCode::UNAUTHORIZED,
+            "missing or invalid bearer token for this database",
+        );
+        resp.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            header::HeaderValue::from_static("Bearer"),
+        );
         return with_cors(resp);
     }
 
@@ -83,7 +93,10 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
     // DATABASE_URL clients on the same engine. Reserves headroom rather than
     // eliminating the risk entirely (still correct-first, not a real pool).
     let Some(_permit) = rest_conn_permit(&db.id) else {
-        return with_cors(err(StatusCode::SERVICE_UNAVAILABLE, "database REST concurrency limit reached; retry"));
+        return with_cors(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database REST concurrency limit reached; retry",
+        ));
     };
 
     // ---- Dispatch by engine kind ----------------------------------------------
@@ -110,7 +123,9 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
 /// app's own `DATABASE_URL` pool on the same container.
 const MAX_REST_CONNS_PER_DB: usize = 16;
 
-static REST_CONNS: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>> = std::sync::OnceLock::new();
+static REST_CONNS: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>,
+> = std::sync::OnceLock::new();
 
 /// Acquire one of this DB's REST connection slots; `None` if all are in use
 /// (caller should respond 503, not queue indefinitely).
@@ -118,14 +133,22 @@ fn rest_conn_permit(db_id: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
     let map = REST_CONNS.get_or_init(Default::default);
     let sem = {
         let mut m = map.lock();
-        m.entry(db_id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_REST_CONNS_PER_DB))).clone()
+        m.entry(db_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_REST_CONNS_PER_DB)))
+            .clone()
     };
     sem.try_acquire_owned().ok()
 }
 
 // ---- Redis: Upstash-compatible ------------------------------------------------
 
-async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: Request) -> Response {
+async fn redis_rest(
+    db: &Database,
+    port: u16,
+    method: &Method,
+    path: &str,
+    req: Request,
+) -> Response {
     let password = db.connection.get("password").cloned().unwrap_or_default();
     // `Upstash-Encoding: base64` (sent BY DEFAULT by @upstash/redis >=1.x):
     // the client base64-DECODES every string result (except the literal "OK")
@@ -148,7 +171,11 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
         let parts: Vec<String> = path
             .trim_matches('/')
             .split('/')
-            .map(|s| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned())
+            .map(|s| {
+                percent_encoding::percent_decode_str(s)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
             .filter(|s| !s.is_empty())
             .collect();
         if parts.is_empty() {
@@ -161,7 +188,10 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
     }
 
     if method != Method::POST {
-        return err(StatusCode::METHOD_NOT_ALLOWED, "use POST / with a command array, POST /pipeline, or GET /<CMD>/<args>");
+        return err(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "use POST / with a command array, POST /pipeline, or GET /<CMD>/<args>",
+        );
     }
     let Some(body) = read_body(req).await else {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
@@ -170,22 +200,41 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
     // POST /pipeline: [["SET","a","1"],["GET","a"]] → one reply object per command.
     if path == "/pipeline" {
         let cmds: Vec<Vec<String>> = match serde_json::from_slice::<Vec<Vec<Value>>>(&body) {
-            Ok(c) if !c.is_empty() => c.into_iter().map(|c| c.into_iter().map(json_arg).collect()).collect(),
-            Ok(_) => return err(StatusCode::BAD_REQUEST, "pipeline body must be a non-empty array of command arrays"),
+            Ok(c) if !c.is_empty() => c
+                .into_iter()
+                .map(|c| c.into_iter().map(json_arg).collect())
+                .collect(),
+            Ok(_) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "pipeline body must be a non-empty array of command arrays",
+                )
+            }
             Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad pipeline body: {e}")),
         };
         if cmds.len() > 1000 {
-            return err(StatusCode::BAD_REQUEST, "pipeline too long (max 1000 commands)");
+            return err(
+                StatusCode::BAD_REQUEST,
+                "pipeline too long (max 1000 commands)",
+            );
         }
         for c in &cmds {
             if c.is_empty() {
-                return err(StatusCode::BAD_REQUEST, "pipeline contains an empty command");
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "pipeline contains an empty command",
+                );
             }
             if let Some(deny) = command_denied(&c[0]) {
                 return deny;
             }
         }
-        return match tokio::time::timeout(ENGINE_TIMEOUT, crate::resp::run_pipeline(port, &password, &cmds)).await {
+        return match tokio::time::timeout(
+            ENGINE_TIMEOUT,
+            crate::resp::run_pipeline(port, &password, &cmds),
+        )
+        .await
+        {
             Ok(Ok(replies)) => {
                 let body: Vec<Value> = replies
                     .iter()
@@ -205,7 +254,12 @@ async fn redis_rest(db: &Database, port: u16, method: &Method, path: &str, req: 
     let parts: Vec<String> = match serde_json::from_slice::<Vec<Value>>(&body) {
         Ok(p) if !p.is_empty() => p.into_iter().map(json_arg).collect(),
         Ok(_) => return err(StatusCode::BAD_REQUEST, "command array must be non-empty"),
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad command body (expected JSON array): {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("bad command body (expected JSON array): {e}"),
+            )
+        }
     };
     if let Some(deny) = command_denied(&parts[0]) {
         return deny;
@@ -227,7 +281,9 @@ fn maybe_b64(v: Value, on: bool) -> Value {
     fn enc(v: Value) -> Value {
         match v {
             Value::String(s) if s == "OK" => Value::String(s),
-            Value::String(s) => Value::String(base64::engine::general_purpose::STANDARD.encode(s.as_bytes())),
+            Value::String(s) => {
+                Value::String(base64::engine::general_purpose::STANDARD.encode(s.as_bytes()))
+            }
             Value::Array(a) => Value::Array(a.into_iter().map(enc).collect()),
             other => other,
         }
@@ -236,7 +292,12 @@ fn maybe_b64(v: Value, on: bool) -> Value {
 }
 
 async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Response {
-    match tokio::time::timeout(ENGINE_TIMEOUT, crate::resp::run_command(port, password, parts)).await {
+    match tokio::time::timeout(
+        ENGINE_TIMEOUT,
+        crate::resp::run_command(port, password, parts),
+    )
+    .await
+    {
         Ok(Ok(crate::resp::Reply::Error(e))) => err(StatusCode::BAD_REQUEST, &e),
         Ok(Ok(reply)) => ok_json(json!({ "result": maybe_b64(reply.to_json(), b64) })),
         Ok(Err(e)) => err(StatusCode::BAD_GATEWAY, &format!("redis engine error: {e}")),
@@ -255,13 +316,49 @@ async fn run_redis(port: u16, password: &str, parts: &[String], b64: bool) -> Re
 /// assumption and silently misattributes later replies to the wrong command).
 fn command_denied(cmd: &str) -> Option<Response> {
     const DENY: &[&str] = &[
-        "shutdown", "config", "debug", "module", "acl", "cluster", "replicaof", "slaveof", "migrate", "save", "bgsave",
-        "bgrewriteaof", "failover", "latency", "monitor", "psync", "sync", "slowlog",
-        "eval", "evalsha", "eval_ro", "evalsha_ro", "fcall", "fcall_ro", "function", "script", "reset", "swapdb",
-        "subscribe", "psubscribe", "ssubscribe", "unsubscribe", "punsubscribe", "sunsubscribe",
+        "shutdown",
+        "config",
+        "debug",
+        "module",
+        "acl",
+        "cluster",
+        "replicaof",
+        "slaveof",
+        "migrate",
+        "save",
+        "bgsave",
+        "bgrewriteaof",
+        "failover",
+        "latency",
+        "monitor",
+        "psync",
+        "sync",
+        "slowlog",
+        "eval",
+        "evalsha",
+        "eval_ro",
+        "evalsha_ro",
+        "fcall",
+        "fcall_ro",
+        "function",
+        "script",
+        "reset",
+        "swapdb",
+        "subscribe",
+        "psubscribe",
+        "ssubscribe",
+        "unsubscribe",
+        "punsubscribe",
+        "sunsubscribe",
     ];
     if DENY.contains(&cmd.to_ascii_lowercase().as_str()) {
-        return Some(err(StatusCode::FORBIDDEN, &format!("command {} is not available over the REST gateway", cmd.to_uppercase())));
+        return Some(err(
+            StatusCode::FORBIDDEN,
+            &format!(
+                "command {} is not available over the REST gateway",
+                cmd.to_uppercase()
+            ),
+        ));
     }
     None
 }
@@ -287,29 +384,51 @@ struct SqlReq {
     params: Vec<Value>,
 }
 
-async fn postgres_rest(db: &Database, port: u16, method: &Method, path: &str, req: Request) -> Response {
+async fn postgres_rest(
+    db: &Database,
+    port: u16,
+    method: &Method,
+    path: &str,
+    req: Request,
+) -> Response {
     if method != Method::POST || !(path == "/sql" || path == "/") {
-        return err(StatusCode::METHOD_NOT_ALLOWED, "use POST /sql with {\"query\": \"...\", \"params\": [...]}");
+        return err(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "use POST /sql with {\"query\": \"...\", \"params\": [...]}",
+        );
     }
     let Some(body) = read_body(req).await else {
         return err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     };
     let sql_req: SqlReq = match serde_json::from_slice(&body) {
         Ok(r) => r,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("bad body (expected {{query, params?}}): {e}")),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("bad body (expected {{query, params?}}): {e}"),
+            )
+        }
     };
 
     let g = |k: &str| db.connection.get(k).cloned().unwrap_or_default();
     let (user, password, dbname) = (g("user"), g("password"), g("database"));
 
-    match tokio::time::timeout(ENGINE_TIMEOUT, run_sql(port, &user, &password, &dbname, &sql_req)).await {
+    match tokio::time::timeout(
+        ENGINE_TIMEOUT,
+        run_sql(port, &user, &password, &dbname, &sql_req),
+    )
+    .await
+    {
         Ok(Ok(v)) => ok_json(v),
         Ok(Err(e)) => {
             // Surface the real Postgres error (it's the caller's own query failing —
             // syntax, constraint, type). Engine-unreachable stays a 502.
             let msg = e.to_string();
             if msg.contains("unreachable") || msg.contains("connect") {
-                err(StatusCode::BAD_GATEWAY, &format!("postgres engine error: {msg}"))
+                err(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("postgres engine error: {msg}"),
+                )
             } else {
                 err(StatusCode::BAD_REQUEST, &msg)
             }
@@ -355,12 +474,22 @@ impl tokio_postgres::types::ToSql for TextParam {
     tokio_postgres::types::to_sql_checked!();
 }
 
-async fn run_sql(port: u16, user: &str, password: &str, dbname: &str, r: &SqlReq) -> anyhow::Result<Value> {
+async fn run_sql(
+    port: u16,
+    user: &str,
+    password: &str,
+    dbname: &str,
+    r: &SqlReq,
+) -> anyhow::Result<Value> {
     use futures::TryStreamExt;
     use tokio_postgres::types::Type;
 
     let mut cfg = tokio_postgres::Config::new();
-    cfg.host("127.0.0.1").port(port).user(user).password(password).dbname(dbname);
+    cfg.host("127.0.0.1")
+        .port(port)
+        .user(user)
+        .password(password)
+        .dbname(dbname);
     cfg.connect_timeout(std::time::Duration::from_secs(10));
     let (client, connection) = cfg
         .connect(tokio_postgres::NoTls)
@@ -397,16 +526,24 @@ async fn run_sql(port: u16, user: &str, password: &str, dbname: &str, r: &SqlReq
     while let Some(row) = stream.try_next().await? {
         let mut obj = serde_json::Map::with_capacity(row.len());
         for (i, col) in row.columns().iter().enumerate() {
-            obj.insert(col.name().to_string(), col_to_json(&row, i, col.name(), col.type_())?);
+            obj.insert(
+                col.name().to_string(),
+                col_to_json(&row, i, col.name(), col.type_())?,
+            );
         }
         let val = Value::Object(obj);
         total_bytes += serde_json::to_vec(&val).map(|b| b.len()).unwrap_or(0);
         rows_json.push(val);
         if rows_json.len() >= 10_000 {
-            anyhow::bail!("result too large (max 10000 rows over REST — paginate with LIMIT/OFFSET)");
+            anyhow::bail!(
+                "result too large (max 10000 rows over REST — paginate with LIMIT/OFFSET)"
+            );
         }
         if total_bytes >= REPLY_BYTE_BUDGET {
-            anyhow::bail!("result too large (max {}MiB over REST — narrow the projection or paginate)", REPLY_BYTE_BUDGET / (1024 * 1024));
+            anyhow::bail!(
+                "result too large (max {}MiB over REST — narrow the projection or paginate)",
+                REPLY_BYTE_BUDGET / (1024 * 1024)
+            );
         }
     }
     // For INSERT/UPDATE/DELETE without RETURNING the row stream is empty but the
@@ -431,7 +568,10 @@ async fn run_sql(port: u16, user: &str, password: &str, dbname: &str, r: &SqlReq
 /// them as UTF-8 would silently return garbled data — worse than an error.
 struct AnyUtf8(String);
 impl<'a> tokio_postgres::types::FromSql<'a> for AnyUtf8 {
-    fn from_sql(_ty: &tokio_postgres::types::Type, raw: &'a [u8]) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
+    fn from_sql(
+        _ty: &tokio_postgres::types::Type,
+        raw: &'a [u8],
+    ) -> Result<Self, Box<dyn std::error::Error + Sync + Send>> {
         Ok(AnyUtf8(std::str::from_utf8(raw)?.to_owned()))
     }
     fn accepts(_ty: &tokio_postgres::types::Type) -> bool {
@@ -445,7 +585,12 @@ impl<'a> tokio_postgres::types::FromSql<'a> for AnyUtf8 {
 /// name + Postgres type name in the error (visible in the HTTP response) rather
 /// than silently returning null indistinguishable from a real NULL — cast it in
 /// the query (e.g. `::text`, `::float8`) to bridge.
-fn col_to_json(row: &tokio_postgres::Row, i: usize, name: &str, ty: &tokio_postgres::types::Type) -> anyhow::Result<Value> {
+fn col_to_json(
+    row: &tokio_postgres::Row,
+    i: usize,
+    name: &str,
+    ty: &tokio_postgres::types::Type,
+) -> anyhow::Result<Value> {
     use tokio_postgres::types::{Kind, Type};
     let wrong_type = |e: tokio_postgres::Error| {
         anyhow::anyhow!("column \"{name}\" has unsupported type \"{}\" over REST ({e}) — cast it in the query (e.g. ::text, ::float8)", ty.name())
@@ -459,35 +604,71 @@ fn col_to_json(row: &tokio_postgres::Row, i: usize, name: &str, ty: &tokio_postg
         };
     }
     match *ty {
-        Type::BOOL => row.try_get::<_, Option<bool>>(i).map(|v| v.map(Value::Bool).unwrap_or(Value::Null)).map_err(wrong_type),
-        Type::INT2 => row.try_get::<_, Option<i16>>(i).map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null)).map_err(wrong_type),
-        Type::INT4 => row.try_get::<_, Option<i32>>(i).map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null)).map_err(wrong_type),
-        Type::INT8 => row.try_get::<_, Option<i64>>(i).map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null)).map_err(wrong_type),
-        Type::FLOAT4 => row.try_get::<_, Option<f32>>(i).map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null)).map_err(wrong_type),
-        Type::FLOAT8 => row.try_get::<_, Option<f64>>(i).map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null)).map_err(wrong_type),
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(i)
+            .map(|v| v.map(Value::Bool).unwrap_or(Value::Null))
+            .map_err(wrong_type),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(i)
+            .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
+            .map_err(wrong_type),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(i)
+            .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
+            .map_err(wrong_type),
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(i)
+            .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
+            .map_err(wrong_type),
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(i)
+            .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
+            .map_err(wrong_type),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(i)
+            .map(|v| v.map(|n| json!(n)).unwrap_or(Value::Null))
+            .map_err(wrong_type),
         // Serialized as a STRING (not f64): NUMERIC routinely exceeds f64
         // precision (money/quantities), and Neon/Upstash-style REST APIs do the
         // same to avoid silent precision loss.
         Type::NUMERIC => row
             .try_get::<_, Option<rust_decimal::Decimal>>(i)
-            .map(|v| v.map(|d| Value::String(d.to_string())).unwrap_or(Value::Null))
+            .map(|v| {
+                v.map(|d| Value::String(d.to_string()))
+                    .unwrap_or(Value::Null)
+            })
             .map_err(wrong_type),
-        Type::JSON | Type::JSONB => row.try_get::<_, Option<Value>>(i).map(|v| v.unwrap_or(Value::Null)).map_err(wrong_type),
+        Type::JSON | Type::JSONB => row
+            .try_get::<_, Option<Value>>(i)
+            .map(|v| v.unwrap_or(Value::Null))
+            .map_err(wrong_type),
         Type::UUID => row
             .try_get::<_, Option<uuid::Uuid>>(i)
-            .map(|v| v.map(|u| Value::String(u.to_string())).unwrap_or(Value::Null))
+            .map(|v| {
+                v.map(|u| Value::String(u.to_string()))
+                    .unwrap_or(Value::Null)
+            })
             .map_err(wrong_type),
         Type::TIMESTAMPTZ => row
             .try_get::<_, Option<chrono::DateTime<chrono::Utc>>>(i)
-            .map(|v| v.map(|t| Value::String(t.to_rfc3339())).unwrap_or(Value::Null))
+            .map(|v| {
+                v.map(|t| Value::String(t.to_rfc3339()))
+                    .unwrap_or(Value::Null)
+            })
             .map_err(wrong_type),
         Type::TIMESTAMP => row
             .try_get::<_, Option<chrono::NaiveDateTime>>(i)
-            .map(|v| v.map(|t| Value::String(t.to_string())).unwrap_or(Value::Null))
+            .map(|v| {
+                v.map(|t| Value::String(t.to_string()))
+                    .unwrap_or(Value::Null)
+            })
             .map_err(wrong_type),
         Type::DATE => row
             .try_get::<_, Option<chrono::NaiveDate>>(i)
-            .map(|v| v.map(|t| Value::String(t.to_string())).unwrap_or(Value::Null))
+            .map(|v| {
+                v.map(|t| Value::String(t.to_string()))
+                    .unwrap_or(Value::Null)
+            })
             .map_err(wrong_type),
         Type::BYTEA => row
             .try_get::<_, Option<Vec<u8>>>(i)
@@ -502,7 +683,10 @@ fn col_to_json(row: &tokio_postgres::Row, i: usize, name: &str, ty: &tokio_postg
         // TEXT/VARCHAR/NAME/BPCHAR (+ citext/ltree family) decode as text; any
         // other type falls through to the same call, which fails loud via
         // `wrong_type` rather than swallowing the error as null.
-        _ => row.try_get::<_, Option<String>>(i).map(|v| v.map(Value::String).unwrap_or(Value::Null)).map_err(wrong_type),
+        _ => row
+            .try_get::<_, Option<String>>(i)
+            .map(|v| v.map(Value::String).unwrap_or(Value::Null))
+            .map_err(wrong_type),
     }
 }
 
@@ -522,7 +706,9 @@ fn credential_matches(db: &Database, bearer: &str) -> bool {
         .filter(|v| !v.is_empty())
         .collect();
     if !dedicated.is_empty() {
-        return dedicated.iter().any(|v| ct_eq(v.as_bytes(), bearer.as_bytes()));
+        return dedicated
+            .iter()
+            .any(|v| ct_eq(v.as_bytes(), bearer.as_bytes()));
     }
     // Legacy DB with no dedicated REST token: fall back to the engine password.
     match db.connection.get("password") {
@@ -541,7 +727,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let rest = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer "))?;
+    let rest = v
+        .strip_prefix("Bearer ")
+        .or_else(|| v.strip_prefix("bearer "))?;
     let t = rest.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
@@ -552,18 +740,37 @@ async fn read_body(req: Request) -> Option<axum::body::Bytes> {
 }
 
 fn ok_json(v: Value) -> Response {
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        v.to_string(),
+    )
+        .into_response()
 }
 
 fn err(code: StatusCode, msg: &str) -> Response {
-    (code, [(header::CONTENT_TYPE, "application/json")], json!({ "error": msg }).to_string()).into_response()
+    (
+        code,
+        [(header::CONTENT_TYPE, "application/json")],
+        json!({ "error": msg }).to_string(),
+    )
+        .into_response()
 }
 
 fn with_cors(mut resp: Response) -> Response {
     let h = resp.headers_mut();
-    h.insert("access-control-allow-origin", header::HeaderValue::from_static("*"));
-    h.insert("access-control-allow-methods", header::HeaderValue::from_static("GET, POST, OPTIONS"));
-    h.insert("access-control-allow-headers", header::HeaderValue::from_static("authorization, content-type"));
+    h.insert(
+        "access-control-allow-origin",
+        header::HeaderValue::from_static("*"),
+    );
+    h.insert(
+        "access-control-allow-methods",
+        header::HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        "access-control-allow-headers",
+        header::HeaderValue::from_static("authorization, content-type"),
+    );
     resp
 }
 
@@ -600,8 +807,14 @@ mod tests {
             "password": "engine-pw-abc",
             "DB_REST_TOKEN": "pgrest_tok_xyz",
         }));
-        assert!(credential_matches(&db, "pgrest_tok_xyz"), "dedicated REST token must authorize");
-        assert!(!credential_matches(&db, "engine-pw-abc"), "engine password must NOT authorize once a REST token exists");
+        assert!(
+            credential_matches(&db, "pgrest_tok_xyz"),
+            "dedicated REST token must authorize"
+        );
+        assert!(
+            !credential_matches(&db, "engine-pw-abc"),
+            "engine password must NOT authorize once a REST token exists"
+        );
         assert!(!credential_matches(&db, "wrong"));
 
         // Redis's existing dedicated token behaves the same way.
@@ -639,7 +852,10 @@ mod tests {
             provider: "Upstash".into(),
             mode: "live".into(),
             created_ms: 0,
-            connection: [("local_port", port), ("password", password)].into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            connection: [("local_port", port), ("password", password)]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
             container: None,
             note: String::new(),
             replicas: vec![],
@@ -659,26 +875,70 @@ mod tests {
     #[ignore = "requires a live redis on 127.0.0.1:54444 with --requirepass resttestpw123 (see doc comment)"]
     async fn redis_rest_dispatch_all_three_entry_forms() {
         let db = redis_db("54444", "resttestpw123");
-        let req_body = |b: &'static str| Request::builder().method(Method::POST).body(axum::body::Body::from(b)).unwrap();
+        let req_body = |b: &'static str| {
+            Request::builder()
+                .method(Method::POST)
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        };
 
         // GET /<CMD>/<args> form.
-        let resp = redis_rest(&db, 54444, &Method::POST, "/", req_body(r#"["SET","k","v1"]"#)).await;
+        let resp = redis_rest(
+            &db,
+            54444,
+            &Method::POST,
+            "/",
+            req_body(r#"["SET","k","v1"]"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let resp = redis_rest(&db, 54444, &Method::GET, "/GET/k", Request::builder().method(Method::GET).body(axum::body::Body::empty()).unwrap()).await;
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let resp = redis_rest(
+            &db,
+            54444,
+            &Method::GET,
+            "/GET/k",
+            Request::builder()
+                .method(Method::GET)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["result"], json!("v1"), "GET /<CMD>/<arg> form must dispatch and return the real value");
+        assert_eq!(
+            v["result"],
+            json!("v1"),
+            "GET /<CMD>/<arg> form must dispatch and return the real value"
+        );
 
         // POST /pipeline form: order must match input order (real engine, real TCP).
-        let resp = redis_rest(&db, 54444, &Method::POST, "/pipeline", req_body(r#"[["SET","p1","1"],["SET","p2","2"],["GET","p1"],["GET","p2"]]"#)).await;
-        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let resp = redis_rest(
+            &db,
+            54444,
+            &Method::POST,
+            "/pipeline",
+            req_body(r#"[["SET","p1","1"],["SET","p2","2"],["GET","p1"],["GET","p2"]]"#),
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
         let v: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(v[2]["result"], json!("1"));
         assert_eq!(v[3]["result"], json!("2"));
 
         // Denied command must 403 through the real dispatch, not just the unit-level helper.
-        let resp = redis_rest(&db, 54444, &Method::POST, "/", req_body(r#"["EVAL","return 1","0"]"#)).await;
+        let resp = redis_rest(
+            &db,
+            54444,
+            &Method::POST,
+            "/",
+            req_body(r#"["EVAL","return 1","0"]"#),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
@@ -692,30 +952,109 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live postgres on 127.0.0.1:55433 (see doc comment)"]
     async fn sql_over_http_binds_non_text_params() {
-        let q = |query: &str, params: Vec<Value>| SqlReq { query: query.to_string(), params };
+        let q = |query: &str, params: Vec<Value>| SqlReq {
+            query: query.to_string(),
+            params,
+        };
 
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select $1::int + 1 as v", vec![json!("41")])).await.unwrap();
-        assert_eq!(r["rows"][0]["v"], json!(42), "doc-example int param must bind");
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select $1::int + 1 as v", vec![json!("41")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            r["rows"][0]["v"],
+            json!(42),
+            "doc-example int param must bind"
+        );
 
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select $1::boolean as v", vec![json!(true)])).await.unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select $1::boolean as v", vec![json!(true)]),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["v"], json!(true));
 
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select $1::jsonb as v", vec![json!({"a": 1})])).await.unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select $1::jsonb as v", vec![json!({"a": 1})]),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["v"], json!({"a": 1}));
 
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select $1::int as v", vec![Value::Null])).await.unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select $1::int as v", vec![Value::Null]),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["v"], Value::Null);
 
         // A bare (non-cast) comparison against an int column — the everyday
         // `where id = $1` shape the old binding broke. A REGULAR table, not
         // TEMP: run_sql opens a fresh connection per call (no pooling), and a
         // temp table is connection-scoped — it would vanish before the next call.
-        run_sql(55433, "testuser", "testpw", "testdb", &q("drop table if exists t_binds_test", vec![])).await.unwrap();
-        run_sql(55433, "testuser", "testpw", "testdb", &q("create table t_binds_test(id int)", vec![])).await.unwrap();
-        run_sql(55433, "testuser", "testpw", "testdb", &q("insert into t_binds_test values (7)", vec![])).await.unwrap();
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select id from t_binds_test where id = $1", vec![json!(7)])).await.unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("drop table if exists t_binds_test", vec![]),
+        )
+        .await
+        .unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("create table t_binds_test(id int)", vec![]),
+        )
+        .await
+        .unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("insert into t_binds_test values (7)", vec![]),
+        )
+        .await
+        .unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select id from t_binds_test where id = $1", vec![json!(7)]),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["id"], json!(7));
-        run_sql(55433, "testuser", "testpw", "testdb", &q("drop table t_binds_test", vec![])).await.unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("drop table t_binds_test", vec![]),
+        )
+        .await
+        .unwrap();
     }
 
     /// Real Postgres round-trip proving col_to_json's NUMERIC/enum decode +
@@ -723,23 +1062,69 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a live postgres on 127.0.0.1:55433 (see doc comment on sql_over_http_binds_non_text_params)"]
     async fn sql_over_http_decodes_numeric_and_enum_and_fails_loud_on_unsupported() {
-        let q = |query: &str| SqlReq { query: query.to_string(), params: vec![] };
+        let q = |query: &str| SqlReq {
+            query: query.to_string(),
+            params: vec![],
+        };
 
         // NUMERIC (e.g. avg()/sum() over numeric columns) decodes as a string,
         // not silently null, and preserves precision beyond f64.
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select 12345678901234567890.123456789::numeric as v")).await.unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select 12345678901234567890.123456789::numeric as v"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["v"], json!("12345678901234567890.123456789"));
 
         // Enum: binary wire format is the label text.
-        run_sql(55433, "testuser", "testpw", "testdb", &q("drop type if exists mood")).await.unwrap();
-        run_sql(55433, "testuser", "testpw", "testdb", &q("create type mood as enum ('sad','ok','happy')")).await.unwrap();
-        let r = run_sql(55433, "testuser", "testpw", "testdb", &q("select 'happy'::mood as v")).await.unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("drop type if exists mood"),
+        )
+        .await
+        .unwrap();
+        run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("create type mood as enum ('sad','ok','happy')"),
+        )
+        .await
+        .unwrap();
+        let r = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select 'happy'::mood as v"),
+        )
+        .await
+        .unwrap();
         assert_eq!(r["rows"][0]["v"], json!("happy"));
 
         // A genuinely unsupported type (interval — binary format is 3 ints, NOT
         // UTF-8 text) must error rather than silently return null.
-        let err = run_sql(55433, "testuser", "testpw", "testdb", &q("select interval '1 day' as v")).await.unwrap_err();
-        assert!(err.to_string().contains("unsupported type"), "expected a loud type error, got: {err}");
+        let err = run_sql(
+            55433,
+            "testuser",
+            "testpw",
+            "testdb",
+            &q("select interval '1 day' as v"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported type"),
+            "expected a loud type error, got: {err}"
+        );
     }
 
     #[test]

@@ -47,7 +47,9 @@ pub struct CronScheduler {
 
 impl CronScheduler {
     pub fn new() -> CronScheduler {
-        CronScheduler { jobs: RwLock::new(Vec::new()) }
+        CronScheduler {
+            jobs: RwLock::new(Vec::new()),
+        }
     }
 
     pub fn add(&self, mut job: CronJob) -> Result<CronJob, String> {
@@ -94,7 +96,10 @@ impl CronScheduler {
     /// schedule. Deduping here converges the store on the next restart.
     pub fn replace_all(&self, jobs: Vec<CronJob>) {
         let mut seen = std::collections::HashSet::new();
-        let deduped: Vec<CronJob> = jobs.into_iter().filter(|j| seen.insert(j.id.clone())).collect();
+        let deduped: Vec<CronJob> = jobs
+            .into_iter()
+            .filter(|j| seen.insert(j.id.clone()))
+            .collect();
         *self.jobs.write() = deduped;
     }
 
@@ -169,7 +174,10 @@ fn normalize(expr: &str) -> String {
 pub fn next_after(expr: &str, after_ms: u64) -> Option<u64> {
     let sched = Schedule::from_str(&normalize(expr)).ok()?;
     let after = Utc.timestamp_millis_opt(after_ms as i64).single()?;
-    sched.after(&after).next().map(|dt| dt.timestamp_millis() as u64)
+    sched
+        .after(&after)
+        .next()
+        .map(|dt| dt.timestamp_millis() as u64)
 }
 
 #[cfg(test)]
@@ -225,7 +233,10 @@ mod tests {
         let updated = sched.record_manual_run("j2", now).expect("job exists");
         assert_eq!(updated.runs, 1);
         assert_eq!(updated.last_run_ms, Some(now));
-        assert_eq!(updated.next_run_ms, original_next, "a manual run must not disturb the real schedule");
+        assert_eq!(
+            updated.next_run_ms, original_next,
+            "a manual run must not disturb the real schedule"
+        );
         assert!(sched.record_manual_run("no-such-id", now).is_none());
         assert_eq!(sched.get("j2").unwrap().runs, 1);
     }
@@ -261,18 +272,37 @@ mod tests {
         let sched = CronScheduler::new();
         let jobs = vec![
             CronJob {
-                id: "vj1".into(), name: "hourly".into(), schedule: "0 0 * * *".into(),
-                deployment: "app".into(), path: "/api/cron".into(), enabled: true,
-                last_run_ms: None, next_run_ms: None, runs: 0, source: "vercel.json".into(), tenant: String::new(),
+                id: "vj1".into(),
+                name: "hourly".into(),
+                schedule: "0 0 * * *".into(),
+                deployment: "app".into(),
+                path: "/api/cron".into(),
+                enabled: true,
+                last_run_ms: None,
+                next_run_ms: None,
+                runs: 0,
+                source: "vercel.json".into(),
+                tenant: String::new(),
             },
             CronJob {
-                id: "vj2".into(), name: "every-5-min".into(), schedule: "*/5 * * * *".into(),
-                deployment: "app".into(), path: "/api/claw".into(), enabled: true,
-                last_run_ms: None, next_run_ms: None, runs: 0, source: "vercel.json".into(), tenant: String::new(),
+                id: "vj2".into(),
+                name: "every-5-min".into(),
+                schedule: "*/5 * * * *".into(),
+                deployment: "app".into(),
+                path: "/api/claw".into(),
+                enabled: true,
+                last_run_ms: None,
+                next_run_ms: None,
+                runs: 0,
+                source: "vercel.json".into(),
+                tenant: String::new(),
             },
         ];
         let registered = sched.set_source_jobs("app", "vercel.json", jobs);
-        assert_eq!(registered, 2, "both standard 5-field vercel.json crons must register");
+        assert_eq!(
+            registered, 2,
+            "both standard 5-field vercel.json crons must register"
+        );
         assert_eq!(sched.list().len(), 2);
         assert!(sched.list().iter().all(|j| j.next_run_ms.is_some()));
 

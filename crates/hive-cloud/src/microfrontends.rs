@@ -34,20 +34,39 @@ fn default_observability() -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MfeError {
     GroupNotFound(String),
-    ProjectAlreadyInGroup { project: String, group: String },
+    ProjectAlreadyInGroup {
+        project: String,
+        group: String,
+    },
     MissingDefaultApp,
     MultipleDefaultApps,
-    InvalidRoute { path: String, reason: String },
-    RouteConflict { a: String, b: String },
+    InvalidRoute {
+        path: String,
+        reason: String,
+    },
+    RouteConflict {
+        a: String,
+        b: String,
+    },
     MissingFallback,
     Unauthorized(String),
-    TargetDeploymentNotFound { project: String },
+    TargetDeploymentNotFound {
+        project: String,
+    },
     /// A child declared no routes (only the default app may omit routing).
-    ChildMissingRoute { project: String },
+    ChildMissingRoute {
+        project: String,
+    },
     /// `asset_prefix` set without a matching `/{prefix}/:path*` route.
-    AssetPrefixWithoutRoute { project: String, asset_prefix: String },
+    AssetPrefixWithoutRoute {
+        project: String,
+        asset_prefix: String,
+    },
     /// `default_route` did not start with `/`.
-    InvalidDefaultRoute { project: String, value: String },
+    InvalidDefaultRoute {
+        project: String,
+        value: String,
+    },
     /// A referenced project is not a member of the group.
     UnknownMember(String),
 }
@@ -63,7 +82,9 @@ impl MfeError {
             MfeError::RouteConflict { .. } => "MICROFRONTENDS_ROUTE_CONFLICT",
             MfeError::MissingFallback => "MICROFRONTENDS_MISSING_FALLBACK",
             MfeError::Unauthorized(_) => "MICROFRONTENDS_UNAUTHORIZED",
-            MfeError::TargetDeploymentNotFound { .. } => "MICROFRONTENDS_TARGET_DEPLOYMENT_NOT_FOUND",
+            MfeError::TargetDeploymentNotFound { .. } => {
+                "MICROFRONTENDS_TARGET_DEPLOYMENT_NOT_FOUND"
+            }
             MfeError::ChildMissingRoute { .. } => "MICROFRONTENDS_INVALID_ROUTE",
             MfeError::AssetPrefixWithoutRoute { .. } => "MICROFRONTENDS_INVALID_ROUTE",
             MfeError::InvalidDefaultRoute { .. } => "MICROFRONTENDS_INVALID_ROUTE",
@@ -76,15 +97,30 @@ impl MfeError {
             MfeError::ProjectAlreadyInGroup { project, group } => {
                 format!("project '{project}' already belongs to microfrontend group '{group}'")
             }
-            MfeError::MissingDefaultApp => "a microfrontend group must have exactly one default application".into(),
-            MfeError::MultipleDefaultApps => "a microfrontend group must have exactly one default application".into(),
+            MfeError::MissingDefaultApp => {
+                "a microfrontend group must have exactly one default application".into()
+            }
+            MfeError::MultipleDefaultApps => {
+                "a microfrontend group must have exactly one default application".into()
+            }
             MfeError::InvalidRoute { path, reason } => format!("invalid route '{path}': {reason}"),
-            MfeError::RouteConflict { a, b } => format!("route '{a}' conflicts with '{b}' (cannot uniquely resolve priority)"),
-            MfeError::MissingFallback => "custom fallback environment requires customFallbackEnvironmentName".into(),
+            MfeError::RouteConflict { a, b } => {
+                format!("route '{a}' conflicts with '{b}' (cannot uniquely resolve priority)")
+            }
+            MfeError::MissingFallback => {
+                "custom fallback environment requires customFallbackEnvironmentName".into()
+            }
             MfeError::Unauthorized(m) => m.clone(),
-            MfeError::TargetDeploymentNotFound { project } => format!("no deployment found for project '{project}'"),
-            MfeError::ChildMissingRoute { project } => format!("child project '{project}' must declare at least one route"),
-            MfeError::AssetPrefixWithoutRoute { project, asset_prefix } => {
+            MfeError::TargetDeploymentNotFound { project } => {
+                format!("no deployment found for project '{project}'")
+            }
+            MfeError::ChildMissingRoute { project } => {
+                format!("child project '{project}' must declare at least one route")
+            }
+            MfeError::AssetPrefixWithoutRoute {
+                project,
+                asset_prefix,
+            } => {
                 format!("project '{project}' sets assetPrefix '{asset_prefix}' but has no matching route '/{asset_prefix}/:path*'")
             }
             MfeError::InvalidDefaultRoute { project, value } => {
@@ -159,7 +195,10 @@ impl MfeMembership {
     }
     /// Every path across every route rule, flattened.
     pub fn all_paths(&self) -> Vec<String> {
-        self.routing.iter().flat_map(|r| r.paths.iter().cloned()).collect()
+        self.routing
+            .iter()
+            .flat_map(|r| r.paths.iter().cloned())
+            .collect()
     }
 }
 
@@ -253,11 +292,19 @@ impl MfeGroup {
             });
             for ch in &self.children {
                 let p = ch.path_prefix.trim_end_matches('/').to_string();
-                let paths = if p.is_empty() { vec![] } else { vec![p.clone(), format!("{p}/:path*")] };
+                let paths = if p.is_empty() {
+                    vec![]
+                } else {
+                    vec![p.clone(), format!("{p}/:path*")]
+                };
                 members.push(MfeMembership {
                     project: ch.project.clone(),
                     role: "child".into(),
-                    routing: vec![MfeRoute { group: None, flag: None, paths }],
+                    routing: vec![MfeRoute {
+                        group: None,
+                        flag: None,
+                        paths,
+                    }],
                     default_route: None,
                     package_name: None,
                     asset_prefix: None,
@@ -272,7 +319,11 @@ impl MfeGroup {
         self.children.clear();
         // Stamp roles from host_project so `role` is always authoritative.
         for m in &mut self.members {
-            m.role = if m.project == self.host_project { "default".into() } else { "child".into() };
+            m.role = if m.project == self.host_project {
+                "default".into()
+            } else {
+                "child".into()
+            };
         }
         self
     }
@@ -281,7 +332,9 @@ impl MfeGroup {
         self.members.iter().find(|m| m.project == self.host_project)
     }
     pub fn child_members(&self) -> impl Iterator<Item = &MfeMembership> {
-        self.members.iter().filter(move |m| m.project != self.host_project)
+        self.members
+            .iter()
+            .filter(move |m| m.project != self.host_project)
     }
     pub fn member(&self, project: &str) -> Option<&MfeMembership> {
         self.members.iter().find(|m| m.project == project)
@@ -359,7 +412,9 @@ fn parse_seg(s: &str) -> Result<Seg, String> {
         let prefix = s[..colon].to_string();
         let after = &s[colon + 1..];
         // Read the identifier, then the suffix is the literal remainder.
-        let id_end = after.find(|c: char| !is_ident_char(c)).unwrap_or(after.len());
+        let id_end = after
+            .find(|c: char| !is_ident_char(c))
+            .unwrap_or(after.len());
         let name = &after[..id_end];
         let suffix = after[id_end..].to_string();
         if is_ident(name) && (!prefix.is_empty() || !suffix.is_empty()) && !suffix.contains(':') {
@@ -381,16 +436,29 @@ impl RoutePattern {
     /// Compile a Vercel-style pattern. Errors on syntax the matcher can't honor.
     pub fn compile(pattern: &str) -> Result<RoutePattern, MfeError> {
         if !pattern.starts_with('/') {
-            return Err(MfeError::InvalidRoute { path: pattern.to_string(), reason: "path must start with '/'".into() });
+            return Err(MfeError::InvalidRoute {
+                path: pattern.to_string(),
+                reason: "path must start with '/'".into(),
+            });
         }
         let body = pattern.trim_start_matches('/');
-        let raw_segs: Vec<&str> = if body.is_empty() { vec![] } else { body.split('/').collect() };
+        let raw_segs: Vec<&str> = if body.is_empty() {
+            vec![]
+        } else {
+            body.split('/').collect()
+        };
         let mut segs = Vec::with_capacity(raw_segs.len());
         for (i, rs) in raw_segs.iter().enumerate() {
             if rs.is_empty() {
-                return Err(MfeError::InvalidRoute { path: pattern.to_string(), reason: "empty path segment ('//')".into() });
+                return Err(MfeError::InvalidRoute {
+                    path: pattern.to_string(),
+                    reason: "empty path segment ('//')".into(),
+                });
             }
-            let seg = parse_seg(rs).map_err(|reason| MfeError::InvalidRoute { path: pattern.to_string(), reason })?;
+            let seg = parse_seg(rs).map_err(|reason| MfeError::InvalidRoute {
+                path: pattern.to_string(),
+                reason,
+            })?;
             if matches!(seg, Seg::CatchAllStar | Seg::CatchAllPlus) && i != raw_segs.len() - 1 {
                 return Err(MfeError::InvalidRoute {
                     path: pattern.to_string(),
@@ -410,7 +478,11 @@ impl RoutePattern {
                 Seg::CatchAllStar => 1,
             })
             .sum();
-        Ok(RoutePattern { raw: pattern.to_string(), segs, specificity })
+        Ok(RoutePattern {
+            raw: pattern.to_string(),
+            segs,
+            specificity,
+        })
     }
 
     pub fn as_str(&self) -> &str {
@@ -424,7 +496,11 @@ impl RoutePattern {
     pub fn matches(&self, path: &str) -> bool {
         let path = path.split(['?', '#']).next().unwrap_or(path);
         let body = path.trim_start_matches('/');
-        let segs: Vec<&str> = if body.is_empty() { vec![] } else { body.split('/').collect() };
+        let segs: Vec<&str> = if body.is_empty() {
+            vec![]
+        } else {
+            body.split('/').collect()
+        };
         match_segs(&self.segs, &segs)
     }
 }
@@ -439,13 +515,17 @@ fn match_segs(pat: &[Seg], path: &[&str]) -> bool {
             Seg::CatchAllPlus => return si < path.len(), // needs >= 1 remaining
             _ => {}
         }
-        let Some(seg) = path.get(si) else { return false };
+        let Some(seg) = path.get(si) else {
+            return false;
+        };
         let ok = match &pat[pi] {
             Seg::Literal(t) => seg == t,
             Seg::Param => !seg.is_empty(),
             Seg::Alt(alts) => alts.iter().any(|a| a == seg),
             Seg::Affix { prefix, suffix } => {
-                seg.len() > prefix.len() + suffix.len() && seg.starts_with(prefix.as_str()) && seg.ends_with(suffix.as_str())
+                seg.len() > prefix.len() + suffix.len()
+                    && seg.starts_with(prefix.as_str())
+                    && seg.ends_with(suffix.as_str())
             }
             Seg::CatchAllStar | Seg::CatchAllPlus => unreachable!(),
         };
@@ -541,7 +621,11 @@ pub fn patterns_conflict(a: &RoutePattern, b: &RoutePattern) -> bool {
 /// Full structural + routing validation of a group. Returns the FIRST error.
 pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
     // Exactly one default application.
-    let defaults = group.members.iter().filter(|m| m.project == group.host_project).count();
+    let defaults = group
+        .members
+        .iter()
+        .filter(|m| m.project == group.host_project)
+        .count();
     match defaults {
         0 => return Err(MfeError::MissingDefaultApp),
         1 => {}
@@ -550,7 +634,12 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
 
     // Fallback policy.
     if group.fallback_environment == "custom"
-        && group.custom_fallback_environment_name.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && group
+            .custom_fallback_environment_name
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
     {
         return Err(MfeError::MissingFallback);
     }
@@ -562,13 +651,18 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
 
         if let Some(dr) = m.default_route.as_deref() {
             if !dr.is_empty() && !dr.starts_with('/') {
-                return Err(MfeError::InvalidDefaultRoute { project: m.project.clone(), value: dr.to_string() });
+                return Err(MfeError::InvalidDefaultRoute {
+                    project: m.project.clone(),
+                    value: dr.to_string(),
+                });
             }
         }
 
         let paths = m.all_paths();
         if !is_default && paths.is_empty() {
-            return Err(MfeError::ChildMissingRoute { project: m.project.clone() });
+            return Err(MfeError::ChildMissingRoute {
+                project: m.project.clone(),
+            });
         }
 
         for p in &paths {
@@ -581,9 +675,14 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
             let ap = ap.trim().trim_matches('/');
             if !ap.is_empty() {
                 let want = format!("/{ap}/:path*");
-                let has = paths.iter().any(|p| normalize_pattern(p) == normalize_pattern(&want));
+                let has = paths
+                    .iter()
+                    .any(|p| normalize_pattern(p) == normalize_pattern(&want));
                 if !has {
-                    return Err(MfeError::AssetPrefixWithoutRoute { project: m.project.clone(), asset_prefix: ap.to_string() });
+                    return Err(MfeError::AssetPrefixWithoutRoute {
+                        project: m.project.clone(),
+                        asset_prefix: ap.to_string(),
+                    });
                 }
             }
         }
@@ -597,7 +696,10 @@ pub fn validate_group(group: &MfeGroup) -> Result<(), MfeError> {
                 continue;
             }
             if patterns_conflict(&compiled[i].1, &compiled[j].1) {
-                return Err(MfeError::RouteConflict { a: compiled[i].1.as_str().to_string(), b: compiled[j].1.as_str().to_string() });
+                return Err(MfeError::RouteConflict {
+                    a: compiled[i].1.as_str().to_string(),
+                    b: compiled[j].1.as_str().to_string(),
+                });
             }
         }
     }
@@ -613,7 +715,11 @@ pub fn can_remove_member(group: &MfeGroup, project: &str) -> Result<(), MfeError
         return Err(MfeError::UnknownMember(project.to_string()));
     }
     let is_default = group.host_project == project;
-    let child_count = group.members.iter().filter(|m| m.project != group.host_project).count();
+    let child_count = group
+        .members
+        .iter()
+        .filter(|m| m.project != group.host_project)
+        .count();
     if is_default && child_count > 0 {
         return Err(MfeError::MissingDefaultApp);
     }
@@ -768,18 +874,31 @@ pub fn resolve_child_target(
     request_commit: &str,
     cands: &[DeployCand],
 ) -> Result<ChildTarget, MfeError> {
-    let production = cands.iter().find(|c| c.production).or_else(|| cands.iter().find(|c| c.env == "production"));
+    let production = cands
+        .iter()
+        .find(|c| c.production)
+        .or_else(|| cands.iter().find(|c| c.env == "production"));
 
     if request_env == "production" {
         return production
-            .map(|c| ChildTarget { project: child_project.into(), deployment_id: c.id.clone(), fallback: String::new() })
-            .ok_or(MfeError::TargetDeploymentNotFound { project: child_project.into() });
+            .map(|c| ChildTarget {
+                project: child_project.into(),
+                deployment_id: c.id.clone(),
+                fallback: String::new(),
+            })
+            .ok_or(MfeError::TargetDeploymentNotFound {
+                project: child_project.into(),
+            });
     }
 
     // Preview/custom: exact same-commit deployment wins with no fallback.
     if !request_commit.is_empty() {
         if let Some(exact) = cands.iter().find(|c| c.commit == request_commit) {
-            return Ok(ChildTarget { project: child_project.into(), deployment_id: exact.id.clone(), fallback: String::new() });
+            return Ok(ChildTarget {
+                project: child_project.into(),
+                deployment_id: exact.id.clone(),
+                fallback: String::new(),
+            });
         }
     }
 
@@ -793,10 +912,15 @@ pub fn resolve_child_target(
                     deployment_id: c.id.clone(),
                     fallback: "same_environment".into(),
                 })
-                .ok_or(MfeError::TargetDeploymentNotFound { project: child_project.into() })
+                .ok_or(MfeError::TargetDeploymentNotFound {
+                    project: child_project.into(),
+                })
         }
         "custom" => {
-            let name = group.custom_fallback_environment_name.as_deref().unwrap_or_default();
+            let name = group
+                .custom_fallback_environment_name
+                .as_deref()
+                .unwrap_or_default();
             let custom = cands.iter().find(|c| !name.is_empty() && c.commit == name);
             let chosen = custom.or(production);
             chosen
@@ -805,7 +929,9 @@ pub fn resolve_child_target(
                     deployment_id: c.id.clone(),
                     fallback: format!("custom:{name}"),
                 })
-                .ok_or(MfeError::TargetDeploymentNotFound { project: child_project.into() })
+                .ok_or(MfeError::TargetDeploymentNotFound {
+                    project: child_project.into(),
+                })
         }
         // "production" (default): route to the child's production deployment.
         _ => production
@@ -814,7 +940,9 @@ pub fn resolve_child_target(
                 deployment_id: c.id.clone(),
                 fallback: "production".into(),
             })
-            .ok_or(MfeError::TargetDeploymentNotFound { project: child_project.into() }),
+            .ok_or(MfeError::TargetDeploymentNotFound {
+                project: child_project.into(),
+            }),
     }
 }
 
@@ -826,7 +954,11 @@ mod tests {
         MfeMembership {
             project: project.into(),
             role: "child".into(),
-            routing: vec![MfeRoute { group: None, flag: None, paths: paths.iter().map(|s| s.to_string()).collect() }],
+            routing: vec![MfeRoute {
+                group: None,
+                flag: None,
+                paths: paths.iter().map(|s| s.to_string()).collect(),
+            }],
             default_route: None,
             package_name: None,
             asset_prefix: None,
@@ -912,18 +1044,32 @@ mod tests {
 
     #[test]
     fn matcher_ignores_query_and_fragment() {
-        assert!(RoutePattern::compile("/docs/:path*").unwrap().matches("/docs/page?x=1"));
+        assert!(RoutePattern::compile("/docs/:path*")
+            .unwrap()
+            .matches("/docs/page?x=1"));
         assert!(RoutePattern::compile("/docs").unwrap().matches("/docs?y=2"));
     }
 
     // ---- Specificity / resolution ----
     #[test]
     fn nested_prefixes_resolve_by_specificity() {
-        let g = group("web", vec![child("docs", &["/docs/:path*"]), child("api", &["/docs/api/:path*"])]);
+        let g = group(
+            "web",
+            vec![
+                child("docs", &["/docs/:path*"]),
+                child("api", &["/docs/api/:path*"]),
+            ],
+        );
         // /docs/api/x matches both; the more specific (2 literal segs) wins.
-        assert_eq!(resolve_child(&g, "/docs/api/users").map(|(p, _)| p), Some("api".into()));
+        assert_eq!(
+            resolve_child(&g, "/docs/api/users").map(|(p, _)| p),
+            Some("api".into())
+        );
         // /docs/guide matches only the docs child.
-        assert_eq!(resolve_child(&g, "/docs/guide").map(|(p, _)| p), Some("docs".into()));
+        assert_eq!(
+            resolve_child(&g, "/docs/guide").map(|(p, _)| p),
+            Some("docs".into())
+        );
         // / is unmatched -> default app.
         assert_eq!(resolve_child(&g, "/"), None);
         assert_eq!(resolve_child(&g, "/pricing"), None);
@@ -958,7 +1104,10 @@ mod tests {
 
         // Child with no routes -> error.
         let g2 = group("web", vec![child("docs", &[])]);
-        assert_eq!(validate_group(&g2).unwrap_err().code(), "MICROFRONTENDS_INVALID_ROUTE");
+        assert_eq!(
+            validate_group(&g2).unwrap_err().code(),
+            "MICROFRONTENDS_INVALID_ROUTE"
+        );
 
         // Missing default (host_project not among members).
         g.host_project = "ghost".into();
@@ -968,10 +1117,19 @@ mod tests {
     #[test]
     fn validate_rejects_bad_route_syntax_and_conflicts() {
         let g = group("web", vec![child("docs", &["docs/:path*"])]); // missing leading '/'
-        assert_eq!(validate_group(&g).unwrap_err().code(), "MICROFRONTENDS_INVALID_ROUTE");
+        assert_eq!(
+            validate_group(&g).unwrap_err().code(),
+            "MICROFRONTENDS_INVALID_ROUTE"
+        );
 
-        let g2 = group("web", vec![child("a", &["/shop/:path*"]), child("b", &["/shop/:path*"])]);
-        assert_eq!(validate_group(&g2).unwrap_err().code(), "MICROFRONTENDS_ROUTE_CONFLICT");
+        let g2 = group(
+            "web",
+            vec![child("a", &["/shop/:path*"]), child("b", &["/shop/:path*"])],
+        );
+        assert_eq!(
+            validate_group(&g2).unwrap_err().code(),
+            "MICROFRONTENDS_ROUTE_CONFLICT"
+        );
     }
 
     #[test]
@@ -979,7 +1137,10 @@ mod tests {
         let mut m = child("docs", &["/docs/:path*"]);
         m.asset_prefix = Some("docs-assets".into());
         let g = group("web", vec![m]);
-        assert_eq!(validate_group(&g).unwrap_err().code(), "MICROFRONTENDS_INVALID_ROUTE");
+        assert_eq!(
+            validate_group(&g).unwrap_err().code(),
+            "MICROFRONTENDS_INVALID_ROUTE"
+        );
 
         let mut m2 = child("docs", &["/docs/:path*", "/docs-assets/:path*"]);
         m2.asset_prefix = Some("docs-assets".into());
@@ -1001,7 +1162,10 @@ mod tests {
         let mut m = child("docs", &["/docs/:path*"]);
         m.default_route = Some("docs/home".into());
         let g = group("web", vec![m]);
-        assert_eq!(validate_group(&g).unwrap_err().code(), "MICROFRONTENDS_INVALID_ROUTE");
+        assert_eq!(
+            validate_group(&g).unwrap_err().code(),
+            "MICROFRONTENDS_INVALID_ROUTE"
+        );
     }
 
     // ---- Config generation ----
@@ -1009,35 +1173,62 @@ mod tests {
     fn config_matches_vercel_shape() {
         let mut docs = child("docs", &["/docs/:path*"]);
         docs.asset_prefix = Some("docs-assets".into());
-        docs.routing[0].paths.push("/docs-assets/:path*".to_string());
-        docs.development = Some(MfeDevelopment { local: Some("3001".into()), task: Some("dev".into()), fallback: None });
+        docs.routing[0]
+            .paths
+            .push("/docs-assets/:path*".to_string());
+        docs.development = Some(MfeDevelopment {
+            local: Some("3001".into()),
+            task: Some("dev".into()),
+            fallback: None,
+        });
         let mut g = group("web", vec![docs]);
         g.local_proxy_port = Some(3024);
         // default app fallback origin
-        g.members[0].development = Some(MfeDevelopment { local: None, task: None, fallback: Some("example.com".into()) });
+        g.members[0].development = Some(MfeDevelopment {
+            local: None,
+            task: None,
+            fallback: Some("example.com".into()),
+        });
 
         let cfg = to_vercel_config(&g);
-        assert_eq!(cfg["$schema"], "https://openapi.vercel.sh/microfrontends.json");
+        assert_eq!(
+            cfg["$schema"],
+            "https://openapi.vercel.sh/microfrontends.json"
+        );
         assert_eq!(cfg["options"]["localProxyPort"], 3024);
         assert_eq!(cfg["options"]["disableOverrides"], false);
-        assert_eq!(cfg["applications"]["web"]["development"]["fallback"], "example.com");
+        assert_eq!(
+            cfg["applications"]["web"]["development"]["fallback"],
+            "example.com"
+        );
         assert_eq!(cfg["applications"]["docs"]["assetPrefix"], "docs-assets");
         assert_eq!(cfg["applications"]["docs"]["development"]["local"], 3001); // numeric
         assert_eq!(cfg["applications"]["docs"]["development"]["task"], "dev");
-        assert_eq!(cfg["applications"]["docs"]["routing"][0]["paths"][0], "/docs/:path*");
+        assert_eq!(
+            cfg["applications"]["docs"]["routing"][0]["paths"][0],
+            "/docs/:path*"
+        );
         // Default app has no routing key.
         assert!(cfg["applications"]["web"].get("routing").is_none());
     }
 
     // ---- Fallback resolution ----
     fn cand(id: &str, env: &str, commit: &str, prod: bool) -> DeployCand {
-        DeployCand { id: id.into(), env: env.into(), commit: commit.into(), production: prod }
+        DeployCand {
+            id: id.into(),
+            env: env.into(),
+            commit: commit.into(),
+            production: prod,
+        }
     }
 
     #[test]
     fn production_requests_always_route_to_production() {
         let g = group("web", vec![child("docs", &["/docs/:path*"])]);
-        let cands = vec![cand("dpl_prod", "production", "aaa", true), cand("dpl_prev", "preview", "bbb", false)];
+        let cands = vec![
+            cand("dpl_prod", "production", "aaa", true),
+            cand("dpl_prev", "preview", "bbb", false),
+        ];
         let t = resolve_child_target(&g, "docs", "production", "bbb", &cands).unwrap();
         assert_eq!(t.deployment_id, "dpl_prod");
         assert_eq!(t.fallback, "");
@@ -1046,7 +1237,10 @@ mod tests {
     #[test]
     fn preview_same_commit_wins_without_fallback() {
         let g = group("web", vec![child("docs", &["/docs/:path*"])]);
-        let cands = vec![cand("dpl_prod", "production", "aaa", true), cand("dpl_c", "preview", "ccc", false)];
+        let cands = vec![
+            cand("dpl_prod", "production", "aaa", true),
+            cand("dpl_c", "preview", "ccc", false),
+        ];
         let t = resolve_child_target(&g, "docs", "preview", "ccc", &cands).unwrap();
         assert_eq!(t.deployment_id, "dpl_c");
         assert_eq!(t.fallback, "");
@@ -1066,7 +1260,10 @@ mod tests {
     fn preview_same_environment_fallback_prefers_preview() {
         let mut g = group("web", vec![child("docs", &["/docs/:path*"])]);
         g.fallback_environment = "same_environment".into();
-        let cands = vec![cand("dpl_prod", "production", "aaa", true), cand("dpl_prev", "preview", "bbb", false)];
+        let cands = vec![
+            cand("dpl_prod", "production", "aaa", true),
+            cand("dpl_prev", "preview", "bbb", false),
+        ];
         let t = resolve_child_target(&g, "docs", "preview", "zzz", &cands).unwrap();
         assert_eq!(t.deployment_id, "dpl_prev");
         assert_eq!(t.fallback, "same_environment");
@@ -1093,12 +1290,18 @@ mod tests {
         assert!(validate_group(&g).is_ok());
 
         // Route /docs/page -> docs; / -> default (None).
-        assert_eq!(resolve_child(&g, "/docs/page").map(|(p, _)| p), Some("docs".into()));
+        assert_eq!(
+            resolve_child(&g, "/docs/page").map(|(p, _)| p),
+            Some("docs".into())
+        );
         assert_eq!(resolve_child(&g, "/"), None);
         assert_eq!(resolve_child(&g, "/pricing"), None);
 
         // Cannot remove the default while the child remains.
-        assert_eq!(can_remove_member(&g, "web").unwrap_err(), MfeError::MissingDefaultApp);
+        assert_eq!(
+            can_remove_member(&g, "web").unwrap_err(),
+            MfeError::MissingDefaultApp
+        );
         // Removing the child is fine.
         assert!(can_remove_member(&g, "docs").is_ok());
         g.members.retain(|m| m.project != "docs");
@@ -1118,7 +1321,10 @@ mod tests {
         assert_eq!(g.default_member().unwrap().project, "docs");
         assert_eq!(g.member("web").unwrap().role, "child");
         // web now has no route (was default) -> must add one or it's invalid.
-        assert_eq!(validate_group(&g).unwrap_err().code(), "MICROFRONTENDS_INVALID_ROUTE");
+        assert_eq!(
+            validate_group(&g).unwrap_err().code(),
+            "MICROFRONTENDS_INVALID_ROUTE"
+        );
     }
 
     // ---- Legacy migration ----
@@ -1136,7 +1342,10 @@ mod tests {
             local_proxy_port: None,
             created_ms: 5,
             updated_ms: 0,
-            children: vec![MfeChild { project: "docs".into(), path_prefix: "/docs".into() }],
+            children: vec![MfeChild {
+                project: "docs".into(),
+                path_prefix: "/docs".into(),
+            }],
         }
         .normalized();
         assert_eq!(g.members.len(), 2);
@@ -1147,6 +1356,9 @@ mod tests {
         assert!(docs.routing[0].paths.contains(&"/docs/:path*".to_string()));
         assert!(g.children.is_empty());
         // And it routes.
-        assert_eq!(resolve_child(&g, "/docs/x").map(|(p, _)| p), Some("docs".into()));
+        assert_eq!(
+            resolve_child(&g, "/docs/x").map(|(p, _)| p),
+            Some("docs".into())
+        );
     }
 }

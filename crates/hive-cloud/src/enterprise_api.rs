@@ -22,7 +22,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::admin::tenant;
-use crate::enterprise::{ConformancePolicy, ConformanceReport, ConformanceResult, MfeChild, MfeGroup, SamlConfig, RULES};
+use crate::enterprise::{
+    ConformancePolicy, ConformanceReport, ConformanceResult, MfeChild, MfeGroup, SamlConfig, RULES,
+};
 use crate::state::CloudState;
 use crate::teams::Role;
 use hive_core::now_ms;
@@ -32,7 +34,10 @@ type Claims = Option<axum::Extension<crate::auth::Claims>>;
 pub fn routes() -> Router<Arc<CloudState>> {
     Router::new()
         // ---- Account-level IP blocking ----
-        .route("/v1/enterprise/ip-blocks", get(ip_blocks_list).post(ip_block_add))
+        .route(
+            "/v1/enterprise/ip-blocks",
+            get(ip_blocks_list).post(ip_block_add),
+        )
         .route("/v1/enterprise/ip-blocks/:id", delete(ip_block_delete))
         // ---- SIEM audit-log streaming ----
         .route("/v1/enterprise/siem", get(siem_get).put(siem_put))
@@ -42,20 +47,40 @@ pub fn routes() -> Router<Arc<CloudState>> {
         .route("/v1/enterprise/saml/metadata", get(saml_metadata))
         .route("/v1/saml/:team/acs", post(saml_acs))
         // ---- SCIM 2.0 directory sync (admin config) ----
-        .route("/v1/enterprise/scim", get(scim_get).post(scim_enable).delete(scim_disable))
+        .route(
+            "/v1/enterprise/scim",
+            get(scim_get).post(scim_enable).delete(scim_disable),
+        )
         // ---- SCIM 2.0 protocol surface (IdP-facing, bearer-token auth) ----
         .route("/v1/scim/v2/ServiceProviderConfig", get(scim_spc))
-        .route("/v1/scim/v2/Users", get(scim_users_list).post(scim_users_create))
-        .route("/v1/scim/v2/Users/:id", get(scim_user_get).patch(scim_user_patch).delete(scim_user_delete))
+        .route(
+            "/v1/scim/v2/Users",
+            get(scim_users_list).post(scim_users_create),
+        )
+        .route(
+            "/v1/scim/v2/Users/:id",
+            get(scim_user_get)
+                .patch(scim_user_patch)
+                .delete(scim_user_delete),
+        )
         // ---- Deployment protection (password / scope) ----
-        .route("/v1/enterprise/projects/:project/protection", get(protection_get).put(protection_put))
+        .route(
+            "/v1/enterprise/projects/:project/protection",
+            get(protection_get).put(protection_put),
+        )
         // ---- Microfrontends ----
-        .route("/v1/enterprise/microfrontends", get(mfe_list).post(mfe_upsert))
+        .route(
+            "/v1/enterprise/microfrontends",
+            get(mfe_list).post(mfe_upsert),
+        )
         .route("/v1/enterprise/microfrontends/:id", delete(mfe_delete))
         // ---- Mesh-internal: edge-enforcement config replication ----
         .route("/v1/enterprise/edge-export", get(edge_export))
         // ---- Conformance ----
-        .route("/v1/enterprise/conformance", get(conformance_get).put(conformance_put))
+        .route(
+            "/v1/enterprise/conformance",
+            get(conformance_get).put(conformance_put),
+        )
         .route("/v1/enterprise/conformance/rules", get(conformance_rules))
         .route("/v1/enterprise/conformance/run", post(conformance_run))
 }
@@ -68,18 +93,28 @@ pub fn routes() -> Router<Arc<CloudState>> {
 /// `team_set_plan`/`team_set_sso` gate on); fall back to the billing account,
 /// then "hobby".
 fn plan_of(c: &Arc<CloudState>, team: &str) -> String {
-    c.teams.get(team).map(|t| t.plan).unwrap_or_else(|| c.billing.account(team).plan)
+    c.teams
+        .get(team)
+        .map(|t| t.plan)
+        .unwrap_or_else(|| c.billing.account(team).plan)
 }
 
 fn forbid(feature: &str) -> (StatusCode, String) {
-    (StatusCode::FORBIDDEN, format!("{feature} requires the Enterprise plan"))
+    (
+        StatusCode::FORBIDDEN,
+        format!("{feature} requires the Enterprise plan"),
+    )
 }
 
 // ==========================================================================
 // Account-level IP blocking
 // ==========================================================================
 
-async fn ip_blocks_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn ip_blocks_list(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     Json(json!({ "blocks": c.enterprise.ip_blocks(&t) }))
 }
@@ -105,12 +140,18 @@ async fn ip_block_add(
         return Err((StatusCode::BAD_REQUEST, "prefix required".into()));
     }
     let block = c.enterprise.add_ip_block(&t, &b.prefix, &b.note);
-    c.audit.record(&t, "user", "create", "ip-block", &block.id, &block.prefix);
+    c.audit
+        .record(&t, "user", "create", "ip-block", &block.id, &block.prefix);
     crate::persist::persist(&c);
     Ok(Json(json!(block)))
 }
 
-async fn ip_block_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path(id): Path<String>) -> Json<Value> {
+async fn ip_block_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Path(id): Path<String>,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     c.enterprise.remove_ip_block(&t, &id);
     c.audit.record(&t, "user", "delete", "ip-block", &id, "");
@@ -135,11 +176,17 @@ fn siem_view(cfg: &crate::enterprise::SiemConfig) -> Value {
     })
 }
 
-async fn siem_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn siem_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     match c.enterprise.siem(&t) {
         Some(cfg) => Json(siem_view(&cfg)),
-        None => Json(json!({ "format": "http", "endpoint": "", "enabled": false, "has_token": false })),
+        None => {
+            Json(json!({ "format": "http", "endpoint": "", "enabled": false, "has_token": false }))
+        }
     }
 }
 
@@ -169,23 +216,49 @@ async fn siem_put(
         return Err(forbid("SIEM log streaming"));
     }
     if !matches!(b.format.as_str(), "http" | "datadog" | "splunk-hec") {
-        return Err((StatusCode::BAD_REQUEST, "format must be http|datadog|splunk-hec".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "format must be http|datadog|splunk-hec".into(),
+        ));
     }
-    let cfg = c.enterprise.set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled);
-    c.audit.record(&t, "user", "update", "siem", &t, &format!("{} {}", cfg.format, cfg.endpoint));
+    let cfg = c
+        .enterprise
+        .set_siem(&t, &b.format, &b.endpoint, b.token.as_deref(), b.enabled);
+    c.audit.record(
+        &t,
+        "user",
+        "update",
+        "siem",
+        &t,
+        &format!("{} {}", cfg.format, cfg.endpoint),
+    );
     crate::persist::persist(&c);
     Ok(Json(siem_view(&cfg)))
 }
 
 /// Fire a synthetic audit entry through the SIEM streamer so operators can
 /// confirm delivery from the UI.
-async fn siem_test(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Result<Json<Value>, (StatusCode, String)> {
+async fn siem_test(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    if c.enterprise.siem(&t).map(|s| !s.enabled || s.endpoint.is_empty()).unwrap_or(true) {
-        return Err((StatusCode::BAD_REQUEST, "SIEM not configured/enabled".into()));
+    if c.enterprise
+        .siem(&t)
+        .map(|s| !s.enabled || s.endpoint.is_empty())
+        .unwrap_or(true)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "SIEM not configured/enabled".into(),
+        ));
     }
-    c.audit.record(&t, "system", "test", "siem", &t, "siem connectivity test");
-    Ok(Json(json!({ "ok": true, "note": "test event emitted to the SIEM stream" })))
+    c.audit
+        .record(&t, "system", "test", "siem", &t, "siem connectivity test");
+    Ok(Json(
+        json!({ "ok": true, "note": "test event emitted to the SIEM stream" }),
+    ))
 }
 
 // ==========================================================================
@@ -204,7 +277,11 @@ fn saml_view(cfg: &SamlConfig) -> Value {
     })
 }
 
-async fn saml_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn saml_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     Json(saml_view(&c.enterprise.saml(&t)))
 }
@@ -250,13 +327,18 @@ async fn saml_put(
     );
     // Reflect into the team SSO flag so the rest of the platform sees SSO on.
     c.teams.set_sso(&t, cfg.enabled);
-    c.audit.record(&t, "user", "update", "saml", &t, &cfg.idp_entity_id);
+    c.audit
+        .record(&t, "user", "update", "saml", &t, &cfg.idp_entity_id);
     crate::persist::persist(&c);
     Ok(Json(saml_view(&cfg)))
 }
 
 /// SP metadata for this team — hand to the IdP to configure the connection.
-async fn saml_metadata(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Response {
+async fn saml_metadata(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Response {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let base = c.api_base();
     let entity_id = format!("{base}/v1/saml/{t}");
@@ -304,16 +386,29 @@ async fn saml_acs(
     if cfg.auto_provision && !c.teams.is_member(&team, &email) {
         c.teams.add_member(&team, &email, Role::Member);
         c.enterprise.scim_upsert_user(&team, &email, &email, true);
-        c.audit.record(&team, "saml", "provision", "member", &email, "auto-provisioned via SAML");
+        c.audit.record(
+            &team,
+            "saml",
+            "provision",
+            "member",
+            &email,
+            "auto-provisioned via SAML",
+        );
         crate::persist::persist(&c);
     } else {
-        c.audit.record(&team, "saml", "login", "member", &email, "SAML sign-in");
+        c.audit
+            .record(&team, "saml", "login", "member", &email, "SAML sign-in");
     }
     // Land the user on the dashboard (session is established by the dashboard's
     // own auth; this endpoint federates directory membership).
     let dash = std::env::var("HIVE_DASHBOARD_URL").unwrap_or_else(|_| c.api_base());
-    let next = if form.relay_state.is_empty() { "/".to_string() } else { form.relay_state };
-    axum::response::Redirect::temporary(&format!("{}{}", dash.trim_end_matches('/'), next)).into_response()
+    let next = if form.relay_state.is_empty() {
+        "/".to_string()
+    } else {
+        form.relay_state
+    };
+    axum::response::Redirect::temporary(&format!("{}{}", dash.trim_end_matches('/'), next))
+        .into_response()
 }
 
 /// Best-effort NameID extraction from a base64 SAML response. Handles both raw
@@ -346,7 +441,11 @@ fn decode_saml_nameid(b64: &str) -> Option<String> {
 // SCIM directory sync — admin config
 // ==========================================================================
 
-async fn scim_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn scim_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let s = c.enterprise.scim(&t);
     let base = c.api_base();
@@ -360,19 +459,30 @@ async fn scim_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: 
 }
 
 /// Enable SCIM + (re)issue a bearer token. Returns the plaintext token ONCE.
-async fn scim_enable(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Result<Json<Value>, (StatusCode, String)> {
+async fn scim_enable(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !crate::billing::plan_allows_scim(&plan_of(&c, &t)) {
         return Err(forbid("SCIM directory sync"));
     }
     let token = c.enterprise.scim_enable(&t);
     let base = c.api_base();
-    c.audit.record(&t, "user", "enable", "scim", &t, "issued SCIM bearer token");
+    c.audit
+        .record(&t, "user", "enable", "scim", &t, "issued SCIM bearer token");
     crate::persist::persist(&c);
-    Ok(Json(json!({ "token": token, "endpoint": format!("{base}/v1/scim/v2"), "note": "store this token now — it is not shown again" })))
+    Ok(Json(
+        json!({ "token": token, "endpoint": format!("{base}/v1/scim/v2"), "note": "store this token now — it is not shown again" }),
+    ))
 }
 
-async fn scim_disable(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn scim_disable(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     c.enterprise.scim_disable(&t);
     c.audit.record(&t, "user", "disable", "scim", &t, "");
@@ -440,22 +550,43 @@ struct ScimCreate {
     active: bool,
 }
 
-async fn scim_users_create(State(c): State<Arc<CloudState>>, headers: HeaderMap, Json(b): Json<ScimCreate>) -> Response {
+async fn scim_users_create(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Json(b): Json<ScimCreate>,
+) -> Response {
     let Some(team) = scim_auth(&c, &headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
-    let display = if b.display_name.is_empty() { b.user_name.clone() } else { b.display_name };
-    let u = c.enterprise.scim_upsert_user(&team, &b.user_name, &display, b.active);
+    let display = if b.display_name.is_empty() {
+        b.user_name.clone()
+    } else {
+        b.display_name
+    };
+    let u = c
+        .enterprise
+        .scim_upsert_user(&team, &b.user_name, &display, b.active);
     // Provision into the team roster so the directory drives real membership.
     if b.active {
         c.teams.add_member(&team, &b.user_name, Role::Member);
     }
-    c.audit.record(&team, "scim", "create", "member", &u.user_name, "provisioned via SCIM");
+    c.audit.record(
+        &team,
+        "scim",
+        "create",
+        "member",
+        &u.user_name,
+        "provisioned via SCIM",
+    );
     crate::persist::persist(&c);
     (StatusCode::CREATED, Json(scim_user_json(&u))).into_response()
 }
 
-async fn scim_user_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn scim_user_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let Some(team) = scim_auth(&c, &headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
@@ -466,7 +597,12 @@ async fn scim_user_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, Pat
 }
 
 /// SCIM PATCH — Okta/Azure use this to deactivate (`active:false`) on offboard.
-async fn scim_user_patch(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>, Json(body): Json<Value>) -> Response {
+async fn scim_user_patch(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
     let Some(team) = scim_auth(&c, &headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
@@ -488,7 +624,14 @@ async fn scim_user_patch(State(c): State<Arc<CloudState>>, headers: HeaderMap, P
         c.enterprise.scim_deactivate_user(&team, &id);
         if let Some(u) = c.enterprise.scim_user(&team, &id) {
             c.teams.remove_member(&team, &u.user_name);
-            c.audit.record(&team, "scim", "deactivate", "member", &u.user_name, "deprovisioned via SCIM");
+            c.audit.record(
+                &team,
+                "scim",
+                "deactivate",
+                "member",
+                &u.user_name,
+                "deprovisioned via SCIM",
+            );
         }
         crate::persist::persist(&c);
     }
@@ -498,7 +641,11 @@ async fn scim_user_patch(State(c): State<Arc<CloudState>>, headers: HeaderMap, P
     }
 }
 
-async fn scim_user_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, Path(id): Path<String>) -> Response {
+async fn scim_user_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
     let Some(team) = scim_auth(&c, &headers) else {
         return (StatusCode::UNAUTHORIZED, "invalid SCIM token").into_response();
     };
@@ -510,7 +657,14 @@ async fn scim_user_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, 
         // erasures in this codebase are logged.
         c.enterprise.scim_purge_user(&team, &id);
         c.teams.remove_member(&team, &u.user_name);
-        c.audit.record(&team, "scim", "delete", "member", &u.user_name, "deprovisioned + purged via SCIM");
+        c.audit.record(
+            &team,
+            "scim",
+            "delete",
+            "member",
+            &u.user_name,
+            "deprovisioned + purged via SCIM",
+        );
         crate::persist::persist(&c);
     }
     StatusCode::NO_CONTENT.into_response()
@@ -571,19 +725,43 @@ async fn protection_put(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = crate::admin::require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     if !crate::billing::plan_allows_deploy_protection(&plan_of(&c, &t)) {
-        return Err((StatusCode::FORBIDDEN, "Deployment protection requires the Pro or Enterprise plan".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Deployment protection requires the Pro or Enterprise plan".into(),
+        ));
     }
     if !matches!(b.mode.as_str(), "off" | "standard" | "password") {
-        return Err((StatusCode::BAD_REQUEST, "mode must be off|standard|password".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be off|standard|password".into(),
+        ));
     }
     if !matches!(b.scope.as_str(), "preview" | "all" | "production") {
-        return Err((StatusCode::BAD_REQUEST, "scope must be preview|all|production".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "scope must be preview|all|production".into(),
+        ));
     }
-    if b.mode == "password" && b.password.as_deref().unwrap_or("").is_empty() && c.enterprise.protection(&project).password_hash.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "password required for password mode".into()));
+    if b.mode == "password"
+        && b.password.as_deref().unwrap_or("").is_empty()
+        && c.enterprise.protection(&project).password_hash.is_empty()
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "password required for password mode".into(),
+        ));
     }
-    let p = c.enterprise.set_protection(&project, &b.mode, &b.scope, b.password.as_deref());
-    c.audit.record(&t, "user", "update", "deploy-protection", &project, &format!("{}/{}", p.mode, p.scope));
+    let p = c
+        .enterprise
+        .set_protection(&project, &b.mode, &b.scope, b.password.as_deref());
+    c.audit.record(
+        &t,
+        "user",
+        "update",
+        "deploy-protection",
+        &project,
+        &format!("{}/{}", p.mode, p.scope),
+    );
     crate::persist::persist(&c);
     Ok(Json(protection_view(&p)))
 }
@@ -592,7 +770,11 @@ async fn protection_put(
 // Microfrontends
 // ==========================================================================
 
-async fn mfe_list(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn mfe_list(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     Json(json!({ "groups": c.enterprise.mfe_groups(&t) }))
 }
@@ -620,10 +802,16 @@ async fn mfe_upsert(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     if !crate::billing::plan_allows_microfrontends(&plan_of(&c, &t)) {
-        return Err((StatusCode::FORBIDDEN, "Microfrontends require the Pro or Enterprise plan".into()));
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Microfrontends require the Pro or Enterprise plan".into(),
+        ));
     }
     if b.name.trim().is_empty() || b.host_project.trim().is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "name and host_project required".into()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "name and host_project required".into(),
+        ));
     }
     // Every referenced project (host + children) must belong to THIS team — a
     // microfrontend group must never compose another tenant's deployments.
@@ -631,25 +819,52 @@ async fn mfe_upsert(
     // project's ownership is judged from its deployment tenant tags.
     for p in std::iter::once(&b.host_project).chain(b.children.iter().map(|ch| &ch.project)) {
         if !crate::admin::project_owned_by(&c, p, &t) {
-            return Err((StatusCode::FORBIDDEN, format!("project '{p}' belongs to a different team")));
+            return Err((
+                StatusCode::FORBIDDEN,
+                format!("project '{p}' belongs to a different team"),
+            ));
         }
     }
-    let id = if b.id.is_empty() { format!("mfe_{}", &uuid::Uuid::new_v4().simple().to_string()[..12]) } else { b.id };
+    let id = if b.id.is_empty() {
+        format!("mfe_{}", &uuid::Uuid::new_v4().simple().to_string()[..12])
+    } else {
+        b.id
+    };
     // Build via the legacy `children` shape; `set_mfe_group` normalizes it into the
     // rich `members` model (default member + child members with derived routing).
     let mut g = MfeGroup::new(id, b.name, b.host_project, now_ms());
     g.members.clear();
-    g.children = b.children.into_iter().map(|ch| MfeChild { project: ch.project, path_prefix: ch.path_prefix }).collect();
+    g.children = b
+        .children
+        .into_iter()
+        .map(|ch| MfeChild {
+            project: ch.project,
+            path_prefix: ch.path_prefix,
+        })
+        .collect();
     let saved = c.enterprise.set_mfe_group(&t, g);
-    c.audit.record(&t, "user", "update", "microfrontend", &saved.id, &saved.name);
+    c.audit.record(
+        &t,
+        "user",
+        "update",
+        "microfrontend",
+        &saved.id,
+        &saved.name,
+    );
     crate::persist::persist(&c);
     Ok(Json(json!(saved)))
 }
 
-async fn mfe_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims, Path(id): Path<String>) -> Json<Value> {
+async fn mfe_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+    Path(id): Path<String>,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     c.enterprise.remove_mfe_group(&t, &id);
-    c.audit.record(&t, "user", "delete", "microfrontend", &id, "");
+    c.audit
+        .record(&t, "user", "delete", "microfrontend", &id, "");
     crate::persist::persist(&c);
     Json(json!({ "ok": true }))
 }
@@ -658,7 +873,11 @@ async fn mfe_delete(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims
 // Conformance
 // ==========================================================================
 
-async fn conformance_get(State(c): State<Arc<CloudState>>, headers: HeaderMap, claims: Claims) -> Json<Value> {
+async fn conformance_get(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Claims,
+) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     Json(json!(c.enterprise.conformance_policy(&t)))
 }
@@ -680,7 +899,14 @@ async fn conformance_put(
         return Err(forbid("Conformance"));
     }
     let p = c.enterprise.set_conformance_policy(&t, b);
-    c.audit.record(&t, "user", "update", "conformance", &t, &format!("{} required rules", p.required.len()));
+    c.audit.record(
+        &t,
+        "user",
+        "update",
+        "conformance",
+        &t,
+        &format!("{} required rules", p.required.len()),
+    );
     crate::persist::persist(&c);
     Ok(Json(json!(p)))
 }
@@ -713,38 +939,64 @@ async fn conformance_run(
         .max_by_key(|d| d.created_at_ms)
         .cloned();
     let dep_id = dep.as_ref().map(|d| d.id.to_string()).unwrap_or_default();
-    let has_production = deployments.iter().any(|d| d.project == b.project && d.production);
+    let has_production = deployments
+        .iter()
+        .any(|d| d.project == b.project && d.production);
     let settings = c.projects.get_masked(&b.project);
     let fw = settings.build.framework.clone();
     let waf_rules = c.waf.rules().len();
-    let preview_protected = c.projects.preview_protected(&b.project) || c.enterprise.protection(&b.project).mode != "off";
+    let preview_protected = c.projects.preview_protected(&b.project)
+        || c.enterprise.protection(&b.project).mode != "off";
     // Sensitive env hygiene: every env var whose name looks secret-ish (KEY,
     // SECRET, TOKEN, PASSWORD) must be flagged `sensitive` (→ masked/encrypted).
     let env_sensitive_ok = settings.env.iter().all(|e| {
         let k = e.key.to_uppercase();
-        let secretish = k.contains("SECRET") || k.contains("TOKEN") || k.contains("PASSWORD") || k.ends_with("_KEY") || k.contains("APIKEY");
+        let secretish = k.contains("SECRET")
+            || k.contains("TOKEN")
+            || k.contains("PASSWORD")
+            || k.ends_with("_KEY")
+            || k.contains("APIKEY");
         !secretish || e.sensitive
     });
 
     let eval = |rule: &str| -> (bool, String) {
         match rule {
-            "https-only" => (true, "All deployments served over HTTPS with HSTS by the gateway".into()),
+            "https-only" => (
+                true,
+                "All deployments served over HTTPS with HSTS by the gateway".into(),
+            ),
             "env-no-plaintext-secrets" => (
                 env_sensitive_ok,
-                if env_sensitive_ok { "Secret env values are masked/encrypted".into() } else { "Plaintext secret values detected in env".into() },
+                if env_sensitive_ok {
+                    "Secret env values are masked/encrypted".into()
+                } else {
+                    "Plaintext secret values detected in env".into()
+                },
             ),
             "firewall-enabled" => (waf_rules > 0, format!("{waf_rules} WAF rule(s) active")),
             "preview-protected" => (
                 preview_protected,
-                if preview_protected { "Preview/deployment access protection enabled".into() } else { "No deployment access protection".into() },
+                if preview_protected {
+                    "Preview/deployment access protection enabled".into()
+                } else {
+                    "No deployment access protection".into()
+                },
             ),
             "has-production" => (
                 has_production,
-                if has_production { "Healthy production deployment present".into() } else { "No production deployment".into() },
+                if has_production {
+                    "Healthy production deployment present".into()
+                } else {
+                    "No production deployment".into()
+                },
             ),
             "pinned-runtime" => (
                 !fw.is_empty() && fw != "unknown",
-                if !fw.is_empty() && fw != "unknown" { format!("Framework pinned: {fw}") } else { "Framework/runtime not detected".into() },
+                if !fw.is_empty() && fw != "unknown" {
+                    format!("Framework pinned: {fw}")
+                } else {
+                    "Framework/runtime not detected".into()
+                },
             ),
             _ => (false, "unknown rule".into()),
         }
@@ -754,7 +1006,13 @@ async fn conformance_run(
         .iter()
         .map(|(id, title)| {
             let (passed, detail) = eval(id);
-            ConformanceResult { rule: id.to_string(), title: title.to_string(), passed, required: required(id), detail }
+            ConformanceResult {
+                rule: id.to_string(),
+                title: title.to_string(),
+                passed,
+                required: required(id),
+                detail,
+            }
         })
         .collect();
     let total = results.len().max(1);
@@ -769,6 +1027,13 @@ async fn conformance_run(
         ran_ms: now_ms(),
     };
     c.enterprise.put_report(report.clone());
-    c.audit.record(&t, "user", "run", "conformance", &b.project, &format!("score {}", report.score));
+    c.audit.record(
+        &t,
+        "user",
+        "run",
+        "conformance",
+        &b.project,
+        &format!("score {}", report.score),
+    );
     Ok(Json(json!(report)))
 }

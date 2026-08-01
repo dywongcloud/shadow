@@ -35,24 +35,141 @@ pub struct FrameworkPreset {
 
 /// The preset catalog. A representative subset of Vercel's 35+; extend freely.
 pub const PRESETS: &[FrameworkPreset] = &[
-    FrameworkPreset { slug: "nextjs", name: "Next.js", install_command: "npm install", build_command: "next build", dev_command: "next dev", output_dir: ".next", primitive: Primitive::Hybrid, emits_build_output: true },
+    FrameworkPreset {
+        slug: "nextjs",
+        name: "Next.js",
+        install_command: "npm install",
+        build_command: "next build",
+        dev_command: "next dev",
+        output_dir: ".next",
+        primitive: Primitive::Hybrid,
+        emits_build_output: true,
+    },
     // OpenNext: builds a Next.js app into `.open-next/` (server functions +
     // `assets/`). We run it with the `node` wrapper so the server function is a
     // standalone HTTP server on $PORT (see git.rs), giving it Fluid compute.
-    FrameworkPreset { slug: "opennext", name: "OpenNext", install_command: "npm install", build_command: "open-next build", dev_command: "next dev", output_dir: ".open-next", primitive: Primitive::Hybrid, emits_build_output: false },
+    FrameworkPreset {
+        slug: "opennext",
+        name: "OpenNext",
+        install_command: "npm install",
+        build_command: "open-next build",
+        dev_command: "next dev",
+        output_dir: ".open-next",
+        primitive: Primitive::Hybrid,
+        emits_build_output: false,
+    },
     // vinext: Cloudflare's Vite reimplementation of the Next.js API. `vinext build`
     // emits a Nitro `.output/` (server + public); `vinext start` serves it on $PORT.
-    FrameworkPreset { slug: "vinext", name: "vinext", install_command: "npm install", build_command: "vinext build", dev_command: "vinext dev", output_dir: ".output", primitive: Primitive::Hybrid, emits_build_output: false },
-    FrameworkPreset { slug: "nuxtjs", name: "Nuxt", install_command: "npm install", build_command: "nuxt build", dev_command: "nuxt dev", output_dir: ".output", primitive: Primitive::Hybrid, emits_build_output: true },
-    FrameworkPreset { slug: "sveltekit", name: "SvelteKit", install_command: "npm install", build_command: "vite build", dev_command: "vite dev", output_dir: ".svelte-kit", primitive: Primitive::Hybrid, emits_build_output: true },
-    FrameworkPreset { slug: "remix", name: "Remix", install_command: "npm install", build_command: "remix vite:build", dev_command: "remix vite:dev", output_dir: "build", primitive: Primitive::Hybrid, emits_build_output: true },
-    FrameworkPreset { slug: "astro", name: "Astro", install_command: "npm install", build_command: "astro build", dev_command: "astro dev", output_dir: "dist", primitive: Primitive::Hybrid, emits_build_output: false },
-    FrameworkPreset { slug: "gatsby", name: "Gatsby", install_command: "npm install", build_command: "gatsby build", dev_command: "gatsby develop", output_dir: "public", primitive: Primitive::Static, emits_build_output: false },
-    FrameworkPreset { slug: "vite", name: "Vite", install_command: "npm install", build_command: "vite build", dev_command: "vite", output_dir: "dist", primitive: Primitive::Static, emits_build_output: false },
-    FrameworkPreset { slug: "create-react-app", name: "Create React App", install_command: "npm install", build_command: "react-scripts build", dev_command: "react-scripts start", output_dir: "build", primitive: Primitive::Static, emits_build_output: false },
-    FrameworkPreset { slug: "vue", name: "Vue", install_command: "npm install", build_command: "vue-cli-service build", dev_command: "vue-cli-service serve", output_dir: "dist", primitive: Primitive::Static, emits_build_output: false },
-    FrameworkPreset { slug: "node", name: "Node.js Server", install_command: "npm install", build_command: "npm run build", dev_command: "npm start", output_dir: ".", primitive: Primitive::Serverless, emits_build_output: false },
-    FrameworkPreset { slug: "static", name: "Static", install_command: "", build_command: "", dev_command: "", output_dir: ".", primitive: Primitive::Static, emits_build_output: false },
+    FrameworkPreset {
+        slug: "vinext",
+        name: "vinext",
+        install_command: "npm install",
+        build_command: "vinext build",
+        dev_command: "vinext dev",
+        output_dir: ".output",
+        primitive: Primitive::Hybrid,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "nuxtjs",
+        name: "Nuxt",
+        install_command: "npm install",
+        build_command: "nuxt build",
+        dev_command: "nuxt dev",
+        output_dir: ".output",
+        primitive: Primitive::Hybrid,
+        emits_build_output: true,
+    },
+    FrameworkPreset {
+        slug: "sveltekit",
+        name: "SvelteKit",
+        install_command: "npm install",
+        build_command: "vite build",
+        dev_command: "vite dev",
+        output_dir: ".svelte-kit",
+        primitive: Primitive::Hybrid,
+        emits_build_output: true,
+    },
+    FrameworkPreset {
+        slug: "remix",
+        name: "Remix",
+        install_command: "npm install",
+        build_command: "remix vite:build",
+        dev_command: "remix vite:dev",
+        output_dir: "build",
+        primitive: Primitive::Hybrid,
+        emits_build_output: true,
+    },
+    FrameworkPreset {
+        slug: "astro",
+        name: "Astro",
+        install_command: "npm install",
+        build_command: "astro build",
+        dev_command: "astro dev",
+        output_dir: "dist",
+        primitive: Primitive::Hybrid,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "gatsby",
+        name: "Gatsby",
+        install_command: "npm install",
+        build_command: "gatsby build",
+        dev_command: "gatsby develop",
+        output_dir: "public",
+        primitive: Primitive::Static,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "vite",
+        name: "Vite",
+        install_command: "npm install",
+        build_command: "vite build",
+        dev_command: "vite",
+        output_dir: "dist",
+        primitive: Primitive::Static,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "create-react-app",
+        name: "Create React App",
+        install_command: "npm install",
+        build_command: "react-scripts build",
+        dev_command: "react-scripts start",
+        output_dir: "build",
+        primitive: Primitive::Static,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "vue",
+        name: "Vue",
+        install_command: "npm install",
+        build_command: "vue-cli-service build",
+        dev_command: "vue-cli-service serve",
+        output_dir: "dist",
+        primitive: Primitive::Static,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "node",
+        name: "Node.js Server",
+        install_command: "npm install",
+        build_command: "npm run build",
+        dev_command: "npm start",
+        output_dir: ".",
+        primitive: Primitive::Serverless,
+        emits_build_output: false,
+    },
+    FrameworkPreset {
+        slug: "static",
+        name: "Static",
+        install_command: "",
+        build_command: "",
+        dev_command: "",
+        output_dir: ".",
+        primitive: Primitive::Static,
+        emits_build_output: false,
+    },
 ];
 
 pub fn preset(slug: &str) -> Option<&'static FrameworkPreset> {
@@ -149,7 +266,11 @@ pub fn detect_package_manager(repo: &Path) -> PackageManagerDetection {
         )
     });
 
-    PackageManagerDetection { manager, source, conflict_warning }
+    PackageManagerDetection {
+        manager,
+        source,
+        conflict_warning,
+    }
 }
 
 /// Detect the JS package manager from `package.json#packageManager` (Corepack)
@@ -210,7 +331,11 @@ pub fn detect(repo: &Path) -> &'static FrameworkPreset {
     //    still has `next` as a dependency and a `next.config.*`, so they'd
     //    otherwise be misdetected as plain Next.js. Check their marker deps/files
     //    first. `open-next.config.*` is unique to OpenNext; `vinext` is a dep.
-    for f in ["open-next.config.ts", "open-next.config.js", "open-next.config.mjs"] {
+    for f in [
+        "open-next.config.ts",
+        "open-next.config.js",
+        "open-next.config.mjs",
+    ] {
         if repo.join(f).exists() {
             return preset("opennext").unwrap();
         }
@@ -228,13 +353,20 @@ pub fn detect(repo: &Path) -> &'static FrameworkPreset {
 
     // 1) Config-file markers (cheapest, most reliable).
     let markers: &[(&str, &str)] = &[
-        ("next.config.js", "nextjs"), ("next.config.mjs", "nextjs"), ("next.config.ts", "nextjs"),
-        ("nuxt.config.js", "nuxtjs"), ("nuxt.config.ts", "nuxtjs"),
+        ("next.config.js", "nextjs"),
+        ("next.config.mjs", "nextjs"),
+        ("next.config.ts", "nextjs"),
+        ("nuxt.config.js", "nuxtjs"),
+        ("nuxt.config.ts", "nuxtjs"),
         ("svelte.config.js", "sveltekit"),
-        ("astro.config.mjs", "astro"), ("astro.config.js", "astro"), ("astro.config.ts", "astro"),
-        ("gatsby-config.js", "gatsby"), ("gatsby-config.ts", "gatsby"),
+        ("astro.config.mjs", "astro"),
+        ("astro.config.js", "astro"),
+        ("astro.config.ts", "astro"),
+        ("gatsby-config.js", "gatsby"),
+        ("gatsby-config.ts", "gatsby"),
         ("remix.config.js", "remix"),
-        ("vite.config.js", "vite"), ("vite.config.ts", "vite"),
+        ("vite.config.js", "vite"),
+        ("vite.config.ts", "vite"),
         ("vue.config.js", "vue"),
     ];
     for (file, slug) in markers {
@@ -249,15 +381,33 @@ pub fn detect(repo: &Path) -> &'static FrameworkPreset {
     if let Ok(pkg) = std::fs::read_to_string(repo.join("package.json")) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
             let dep = |name: &str| has_dep(&v, name);
-            if dep("next") { return preset("nextjs").unwrap(); }
-            if dep("nuxt") || dep("nuxt3") { return preset("nuxtjs").unwrap(); }
-            if dep("@sveltejs/kit") { return preset("sveltekit").unwrap(); }
-            if dep("@remix-run/dev") { return preset("remix").unwrap(); }
-            if dep("astro") { return preset("astro").unwrap(); }
-            if dep("gatsby") { return preset("gatsby").unwrap(); }
-            if dep("react-scripts") { return preset("create-react-app").unwrap(); }
-            if dep("vite") { return preset("vite").unwrap(); }
-            if dep("@vue/cli-service") { return preset("vue").unwrap(); }
+            if dep("next") {
+                return preset("nextjs").unwrap();
+            }
+            if dep("nuxt") || dep("nuxt3") {
+                return preset("nuxtjs").unwrap();
+            }
+            if dep("@sveltejs/kit") {
+                return preset("sveltekit").unwrap();
+            }
+            if dep("@remix-run/dev") {
+                return preset("remix").unwrap();
+            }
+            if dep("astro") {
+                return preset("astro").unwrap();
+            }
+            if dep("gatsby") {
+                return preset("gatsby").unwrap();
+            }
+            if dep("react-scripts") {
+                return preset("create-react-app").unwrap();
+            }
+            if dep("vite") {
+                return preset("vite").unwrap();
+            }
+            if dep("@vue/cli-service") {
+                return preset("vue").unwrap();
+            }
             // A server start script => treat as a Node serverless app.
             if v.get("scripts").and_then(|s| s.get("start")).is_some() {
                 return preset("node").unwrap();
@@ -306,7 +456,10 @@ pub fn plan_build(
         .unwrap_or_else(|| detect(repo).clone());
     let pm = package_manager(repo);
     let pick = |ov: Option<&str>, default: &str| {
-        ov.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(default).to_string()
+        ov.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(default)
+            .to_string()
     };
     // Default install command follows the package manager; framework binary build
     // commands (e.g. "next build") resolve via node_modules/.bin, while "npm run …"
@@ -343,7 +496,10 @@ mod tests {
 
     #[test]
     fn detects_nextjs_from_dependency() {
-        let dir = repo_with(&[("package.json", r#"{"dependencies":{"next":"14.0.0","react":"18"}}"#)]);
+        let dir = repo_with(&[(
+            "package.json",
+            r#"{"dependencies":{"next":"14.0.0","react":"18"}}"#,
+        )]);
         let p = detect(&dir);
         assert_eq!(p.slug, "nextjs");
         assert_eq!(p.primitive, Primitive::Hybrid);
@@ -357,7 +513,10 @@ mod tests {
         let dir = repo_with(&[
             ("next.config.js", "module.exports = {}"),
             ("open-next.config.ts", "export default {}"),
-            ("package.json", r#"{"dependencies":{"next":"14","@opennextjs/aws":"3"}}"#),
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"14","@opennextjs/aws":"3"}}"#,
+            ),
         ]);
         let p = detect(&dir);
         assert_eq!(p.slug, "opennext");
@@ -370,7 +529,10 @@ mod tests {
     fn detects_opennext_from_dep_only() {
         let dir = repo_with(&[
             ("next.config.js", "module.exports = {}"),
-            ("package.json", r#"{"dependencies":{"next":"14","open-next":"2"}}"#),
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"14","open-next":"2"}}"#,
+            ),
         ]);
         assert_eq!(detect(&dir).slug, "opennext");
         let _ = fs::remove_dir_all(&dir);
@@ -381,7 +543,10 @@ mod tests {
         // vinext also carries next.config + a `next` dep; the `vinext` dep wins.
         let dir = repo_with(&[
             ("next.config.js", "module.exports = {}"),
-            ("package.json", r#"{"dependencies":{"next":"16","vinext":"0.1"}}"#),
+            (
+                "package.json",
+                r#"{"dependencies":{"next":"16","vinext":"0.1"}}"#,
+            ),
         ]);
         let p = detect(&dir);
         assert_eq!(p.slug, "vinext");
@@ -391,7 +556,10 @@ mod tests {
 
     #[test]
     fn detects_vite_static() {
-        let dir = repo_with(&[("vite.config.ts", "export default {}"), ("package.json", "{}")]);
+        let dir = repo_with(&[
+            ("vite.config.ts", "export default {}"),
+            ("package.json", "{}"),
+        ]);
         assert_eq!(detect(&dir).slug, "vite");
         let _ = fs::remove_dir_all(&dir);
     }
@@ -454,9 +622,17 @@ mod tests {
         let d = detect_package_manager(&dir);
         assert_eq!(d.manager, "pnpm");
         assert_eq!(d.source, PackageManagerSource::Corepack);
-        let warning = d.conflict_warning.expect("must warn about the conflicting yarn.lock");
-        assert!(warning.contains("yarn.lock"), "warning should name the conflicting file: {warning}");
-        assert!(std::path::Path::new(&dir).join("yarn.lock").exists(), "must never delete the conflicting lockfile");
+        let warning = d
+            .conflict_warning
+            .expect("must warn about the conflicting yarn.lock");
+        assert!(
+            warning.contains("yarn.lock"),
+            "warning should name the conflicting file: {warning}"
+        );
+        assert!(
+            std::path::Path::new(&dir).join("yarn.lock").exists(),
+            "must never delete the conflicting lockfile"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -479,7 +655,9 @@ mod tests {
         let d = detect_package_manager(&dir);
         assert_eq!(d.manager, "bun");
         assert_eq!(d.source, PackageManagerSource::BunLock);
-        let warning = d.conflict_warning.expect("must warn about the conflicting pnpm-lock.yaml");
+        let warning = d
+            .conflict_warning
+            .expect("must warn about the conflicting pnpm-lock.yaml");
         assert!(warning.contains("pnpm-lock.yaml"));
         let _ = fs::remove_dir_all(&dir);
     }
@@ -492,9 +670,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
 
         // Recognized JSON but an unknown manager name → also falls through.
-        let dir = repo_with(&[("package.json", r#"{"packageManager":"deno@1.0.0"}"#), ("yarn.lock", "")]);
+        let dir = repo_with(&[
+            ("package.json", r#"{"packageManager":"deno@1.0.0"}"#),
+            ("yarn.lock", ""),
+        ]);
         assert_eq!(package_manager(&dir), "yarn");
         let _ = fs::remove_dir_all(&dir);
     }
-
 }

@@ -72,7 +72,13 @@ async fn concurrency_reuse_autoscale_and_saturation() {
     };
     let fluid = test_fluid(400);
     let key = func_key("dpl-test", "api");
-    fluid.register(key.clone(), func(2, 2, 0, &py), "default".into(), ".".into(), "personal".into());
+    fluid.register(
+        key.clone(),
+        func(2, 2, 0, &py),
+        "default".into(),
+        ".".into(),
+        "personal".into(),
+    );
 
     // Two leases pack onto ONE instance (in-function concurrency = 2).
     let l1 = fluid.lease(&key).await.expect("lease 1");
@@ -83,7 +89,11 @@ async fn concurrency_reuse_autoscale_and_saturation() {
 
     // Third lease saturates instance 1 -> cold-start instance 2.
     let l3 = fluid.lease(&key).await.expect("lease 3");
-    assert_ne!(l3.cell_id(), l1.cell_id(), "3rd req should be a new instance");
+    assert_ne!(
+        l3.cell_id(),
+        l1.cell_id(),
+        "3rd req should be a new instance"
+    );
     assert_eq!(fluid.stats()[0].instances, 2);
 
     // Fourth fills instance 2; now both instances are full at max_instances=2.
@@ -110,14 +120,24 @@ async fn cost_meter_shows_savings_under_concurrency() {
     let fluid = test_fluid(3000);
     let key = func_key("dpl-cost", "api");
     // One instance, up to 5 concurrent requests.
-    fluid.register(key.clone(), func(5, 1, 0, &py), "default".into(), ".".into(), "personal".into());
+    fluid.register(
+        key.clone(),
+        func(5, 1, 0, &py),
+        "default".into(),
+        ".".into(),
+        "personal".into(),
+    );
 
     // 5 concurrent requests all packed onto a single instance.
     let mut leases = Vec::new();
     for _ in 0..5 {
         leases.push(fluid.lease(&key).await.expect("lease"));
     }
-    assert_eq!(fluid.stats()[0].instances, 1, "all 5 should share 1 instance");
+    assert_eq!(
+        fluid.stats()[0].instances,
+        1,
+        "all 5 should share 1 instance"
+    );
 
     tokio::time::sleep(Duration::from_millis(250)).await;
     drop(leases); // each records ~250ms of active time
@@ -145,7 +165,13 @@ async fn mark_dead_reaps_and_reroutes() {
     };
     let fluid = test_fluid(2000);
     let key = func_key("dpl-dead", "api");
-    fluid.register(key.clone(), func(2, 3, 0, &py), "default".into(), ".".into(), "personal".into());
+    fluid.register(
+        key.clone(),
+        func(2, 3, 0, &py),
+        "default".into(),
+        ".".into(),
+        "personal".into(),
+    );
 
     let l1 = fluid.lease(&key).await.expect("lease 1");
     let cid1 = l1.cell_id().clone();
@@ -173,7 +199,13 @@ async fn scales_to_zero_when_idle() {
     let fluid = test_fluid(400);
     let key = func_key("dpl-test2", "api");
     // min_instances = 0 -> can scale fully to zero.
-    fluid.register(key.clone(), func(4, 3, 0, &py), "default".into(), ".".into(), "personal".into());
+    fluid.register(
+        key.clone(),
+        func(4, 3, 0, &py),
+        "default".into(),
+        ".".into(),
+        "personal".into(),
+    );
 
     let l = fluid.lease(&key).await.expect("lease");
     assert_eq!(fluid.stats()[0].instances, 1);
@@ -199,14 +231,33 @@ async fn scales_to_zero_when_idle() {
 async fn register_tags_pool_tenant_and_normalizes_empty() {
     let fluid = test_fluid(100);
     let ka = func_key("dpl-acme", "api");
-    fluid.register(ka.clone(), func(1, 1, 0, "python"), "img".into(), ".".into(), "acme".into());
+    fluid.register(
+        ka.clone(),
+        func(1, 1, 0, "python"),
+        "img".into(),
+        ".".into(),
+        "acme".into(),
+    );
     assert_eq!(fluid.tenant_of(&ka).as_deref(), Some("acme"));
 
     let kp = func_key("dpl-blank", "api");
-    fluid.register(kp.clone(), func(1, 1, 0, "python"), "img".into(), ".".into(), String::new());
-    assert_eq!(fluid.tenant_of(&kp).as_deref(), Some("personal"), "empty tenant => personal");
+    fluid.register(
+        kp.clone(),
+        func(1, 1, 0, "python"),
+        "img".into(),
+        ".".into(),
+        String::new(),
+    );
+    assert_eq!(
+        fluid.tenant_of(&kp).as_deref(),
+        Some("personal"),
+        "empty tenant => personal"
+    );
 
-    assert!(fluid.stats().iter().any(|s| s.key == ka && s.tenant == "acme"));
+    assert!(fluid
+        .stats()
+        .iter()
+        .any(|s| s.key == ka && s.tenant == "acme"));
 }
 
 /// A per-tenant instance quota caps ONE tenant's total live instances across all
@@ -234,14 +285,30 @@ async fn per_tenant_instance_quota_is_isolated() {
     );
     // concurrency=1 so each held lease pins its own instance.
     let ka = func_key("dpl-alpha", "api");
-    fluid.register(ka.clone(), func(1, 10, 0, &py), "default".into(), ".".into(), "alpha".into());
+    fluid.register(
+        ka.clone(),
+        func(1, 10, 0, &py),
+        "default".into(),
+        ".".into(),
+        "alpha".into(),
+    );
     let kb = func_key("dpl-beta", "api");
-    fluid.register(kb.clone(), func(1, 10, 0, &py), "default".into(), ".".into(), "beta".into());
+    fluid.register(
+        kb.clone(),
+        func(1, 10, 0, &py),
+        "default".into(),
+        ".".into(),
+        "beta".into(),
+    );
 
     // alpha brings up its 2 allowed instances and holds them.
     let _l1 = fluid.lease(&ka).await.expect("alpha lease 1");
     let _l2 = fluid.lease(&ka).await.expect("alpha lease 2");
-    assert_eq!(fluid.tenant_live_instances("alpha"), 2, "alpha should hold 2 live instances");
+    assert_eq!(
+        fluid.tenant_live_instances("alpha"),
+        2,
+        "alpha should hold 2 live instances"
+    );
 
     // A 3rd alpha instance is over quota -> refused (backpressure -> timeout).
     assert!(
@@ -251,6 +318,9 @@ async fn per_tenant_instance_quota_is_isolated() {
 
     // beta has its OWN budget and must not be starved by alpha's saturation.
     let lb = fluid.lease(&kb).await;
-    assert!(lb.is_ok(), "beta was starved by alpha's quota (cross-tenant interference)");
+    assert!(
+        lb.is_ok(),
+        "beta was starved by alpha's quota (cross-tenant interference)"
+    );
     assert_eq!(fluid.tenant_live_instances("beta"), 1);
 }
