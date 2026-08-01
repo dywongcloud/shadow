@@ -51,7 +51,42 @@ export function useRunNode() {
     };
     port.start();
     port.postMessage({ type: "status" });
+
+    // Page Lifecycle: tell the worker whether THIS tab can currently promise
+    // foreground reliability, so it can report "suspended" honestly instead
+    // of claiming "online" while every connected tab is hidden/frozen/gone.
+    // The SharedWorker itself is not subject to page lifecycle (it keeps the
+    // real connection alive across a bfcache entry, which is the point of a
+    // shared owner) — only the STATUS communicated to the user changes.
+    const reportVisibility = () => {
+      const visible = document.visibilityState === "visible";
+      port.postMessage({ type: "visibility", visible });
+    };
+    const onPageHide = (e: PageTransitionEvent) => {
+      // persisted=true: entering bfcache, may resume — report hidden, keep
+      // the worker connection running. persisted=false: this tab is truly
+      // going away — best-effort tell the worker so a last-tab-closed
+      // detection isn't the only signal (real close is unload-adjacent and
+      // unreliable to detect from the worker side alone).
+      port.postMessage({ type: "visibility", visible: false, unloading: !e.persisted });
+    };
+    const onPageShow = () => reportVisibility();
+    document.addEventListener("visibilitychange", reportVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    // freeze/resume (Page Lifecycle API) — narrower than visibilitychange on
+    // browsers that support it (e.g. a visible-but-discarded background tab).
+    document.addEventListener("freeze", reportVisibility);
+    document.addEventListener("resume", reportVisibility);
+    reportVisibility();
+
     return () => {
+      document.removeEventListener("visibilitychange", reportVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
+      document.removeEventListener("freeze", reportVisibility);
+      document.removeEventListener("resume", reportVisibility);
+      port.postMessage({ type: "visibility", visible: false, unloading: true });
       port.close();
       portRef.current = null;
     };

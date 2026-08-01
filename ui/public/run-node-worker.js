@@ -17,6 +17,12 @@ const PROTOCOL_VERSION = 0; // must match hive_browser_proto::BROWSER_PROTOCOL_V
 const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease window
 
 const ports = [];
+// Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any
+// single tab's page-lifecycle state, so the CONNECTION stays up across a
+// bfcache entry — only the status this worker reports changes, honestly
+// reflecting whether any connected tab can currently promise foreground
+// reliability rather than claiming "online" while every tab is hidden/frozen.
+const portVisibility = new Map();
 let node = null;
 let renewTimer = null;
 let closing = false;
@@ -82,7 +88,13 @@ function scheduleRenew(addrJson, endpointId) {
     if (closing || !node) return;
     try {
       await admitOnce(addrJson, endpointId);
-      if (status.admission !== "granted") setStatus({ admission: "granted", lifecycle: "online", lastError: null });
+      // Derive lifecycle from CURRENT visibility rather than hardcoding
+      // "online" — a background renewal tick must not un-suspend a node
+      // whose tabs are all still hidden.
+      const lifecycle = anyVisible() ? "online" : "suspended";
+      if (status.admission !== "granted" || status.lifecycle !== lifecycle) {
+        setStatus({ admission: "granted", lifecycle, lastError: null });
+      }
     } catch (e) {
       setStatus({ admission: "denied", lifecycle: "degraded", lastError: String((e && e.message) || e) });
     }
@@ -118,13 +130,41 @@ async function start(msg) {
     node = n;
     const endpointId = node.nodeId();
     const addrJson = node.addrJson();
-    setStatus({ endpointId, relay: msg.relay, lifecycle: "online" });
+    setStatus({ endpointId, relay: msg.relay, lifecycle: anyVisible() ? "online" : "suspended" });
     await admitOnce(addrJson, endpointId);
     setStatus({ admission: "granted", lastError: null });
     scheduleRenew(addrJson, endpointId);
   } catch (e) {
     setStatus({ lifecycle: "error", admission: "denied", lastError: String((e && e.message) || e) });
     node = null;
+  }
+}
+
+function anyVisible() {
+  if (portVisibility.size === 0) return true; // no reports yet — assume foreground
+  for (const visible of portVisibility.values()) if (visible) return true;
+  return false;
+}
+
+function onPortVisibility(port, msg) {
+  if (msg.unloading) {
+    portVisibility.delete(port);
+    const idx = ports.indexOf(port);
+    if (idx !== -1) ports.splice(idx, 1);
+    // No tab left that can observe or control this node — release it rather
+    // than run headless forever with no way for a user to ever stop it.
+    if (ports.length === 0 && (node || status.lifecycle === "starting")) {
+      stop();
+    }
+    return;
+  }
+  portVisibility.set(port, !!msg.visible);
+  // Only toggle between online/suspended — never override starting/error/
+  // stopped, which are driven by the connect/admit lifecycle itself.
+  if (status.lifecycle === "online" && !anyVisible()) {
+    setStatus({ lifecycle: "suspended" });
+  } else if (status.lifecycle === "suspended" && anyVisible()) {
+    setStatus({ lifecycle: "online" });
   }
 }
 
@@ -167,6 +207,7 @@ self.onconnect = (event) => {
     if (msg.type === "start") start(msg);
     else if (msg.type === "stop") stop();
     else if (msg.type === "geoConsent") setStatus({ geoConsent: msg.value });
+    else if (msg.type === "visibility") onPortVisibility(port, msg);
     else if (msg.type === "status") {
       try {
         port.postMessage({ type: "status", status });
