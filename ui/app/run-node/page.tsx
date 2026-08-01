@@ -229,7 +229,9 @@ export default function RunNodePage() {
       <section className="rounded-lg border border-border bg-card p-4">
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-medium text-fg">Status</h2>
-          <span className="text-sm font-medium text-fg">{lifecycleLabel(status.lifecycle)}</span>
+          <span className="text-sm font-medium text-fg" role="status" aria-live="polite">
+            {lifecycleLabel(status.lifecycle)}
+          </span>
         </div>
         <dl className="grid grid-cols-2 gap-y-1.5 text-xs">
           <dt className="text-muted">Node id</dt>
@@ -240,7 +242,7 @@ export default function RunNodePage() {
           <dd className="text-secondary">{status.admission}</dd>
         </dl>
         {status.lastError && (
-          <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500">
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{status.lastError}</span>
           </div>

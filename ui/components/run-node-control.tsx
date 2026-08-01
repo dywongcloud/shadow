@@ -32,6 +32,9 @@ export function RunNodeControl() {
       {(status.lifecycle === "degraded" || status.lifecycle === "error") && (
         <span className="absolute right-1 top-1.5 h-1.5 w-1.5 rounded-full bg-amber-500" aria-hidden="true" />
       )}
+      {/* Announces lifecycle changes to screen readers even when this control
+          isn't focused — the visible label/icon alone only helps sighted users. */}
+      <span className="sr-only" role="status" aria-live="polite">{`Run a node: ${label}`}</span>
     </Link>
   );
 }
@@ -42,7 +45,7 @@ function visual(state: ReturnType<typeof useRunNode>["status"]["lifecycle"]) {
     case "online":
       return { icon: <RadioTower className="h-4 w-4" />, tone: "text-emerald-500", label };
     case "starting":
-      return { icon: <RotateCw className="h-4 w-4 animate-spin" />, tone: "text-blue-500", label };
+      return { icon: <RotateCw className="h-4 w-4 motion-safe:animate-spin" />, tone: "text-blue-500", label };
     case "degraded":
     case "suspended":
       return { icon: <TriangleAlert className="h-4 w-4" />, tone: "text-amber-500", label };
