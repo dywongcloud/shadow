@@ -1434,7 +1434,7 @@ pub async fn fetch(
     }
     // HTTP-over-SSH (bootstrap + fallback).
     let url = format!("{peer}{path}");
-    let req = if method == hive_p2p::GOSSIP_POST {
+    let mut req = if method == hive_p2p::GOSSIP_POST {
         cloud
             .http
             .post(&url)
@@ -1443,6 +1443,27 @@ pub async fn fetch(
     } else {
         cloud.http.get(&url)
     };
+    // Live-witnessed real bug (bn-impl-mesh-admission investigation): this path
+    // is a plain, unauthenticated reqwest::Client call, but the receiving
+    // node's admin router (main.rs) wraps EVERY mutation in auth::require_auth
+    // once HIVE_JWT_SECRET is set -- the DOCUMENTED normal production posture.
+    // POST /v1/nodes/announce (and any other gossip mutation reached only via
+    // this HTTP fallback, before an iroh mapping exists to use the auth-free
+    // iroh gossip path instead) 401'd unconditionally, silently disabling the
+    // "bootstrap + fallback" this comment promises on any JWT-enforced node.
+    // Mint a short-lived mesh-internal token via the SAME mechanism
+    // db_replicate.rs's send_mirrored already uses for exactly this class of
+    // node-to-node call, and present it as a normal Bearer -- the receiving
+    // handlers on this path (node_announce, nodes) don't read claims at all,
+    // so any validly-signed token clears require_auth's gate without granting
+    // any tenant-scoped privilege. A no-op when HIVE_JWT_SECRET is unset
+    // (issue() returns Err, so no header is added -- matching dev/single-node
+    // behavior exactly as before).
+    if method == hive_p2p::GOSSIP_POST {
+        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, 60) {
+            req = req.header("authorization", format!("Bearer {tok}"));
+        }
+    }
     match req.timeout(Duration::from_secs(4)).send().await {
         Ok(r) if r.status().is_success() => r.bytes().await.ok().map(|b| b.to_vec()),
         _ => None,

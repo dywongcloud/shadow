@@ -286,7 +286,17 @@ fn send_mirrored(
                     .header("x-hive-mirror", "1")
                     .header("content-type", content_type.clone());
                 if let Ok(tok) = crate::auth::issue("mesh-internal", &team, "service", false, 60) {
-                    rb = rb.header("x-hive-mirror-tok", tok);
+                    rb = rb.header("x-hive-mirror-tok", tok.clone());
+                    // Also present as a normal Bearer: auth::require_auth (main.rs)
+                    // wraps this ENTIRE router in a mutation gate that only ever
+                    // looks at Authorization/hive_jwt-cookie -- x-hive-mirror-tok
+                    // alone never reached write_scope()'s own (correct) check on any
+                    // JWT-enforced node, a real bug live-witnessed via the identical
+                    // pattern in gossip::fetch's HTTP bootstrap fallback (see its
+                    // comment). Reusing the SAME already-signed token here (not a
+                    // second issue() call) keeps write_scope's x-hive-mirror-tok
+                    // parse and this Bearer parse verifying byte-identical claims.
+                    rb = rb.header("authorization", format!("Bearer {tok}"));
                 }
                 rb.body(body.clone())
                     .timeout(std::time::Duration::from_secs(10))
