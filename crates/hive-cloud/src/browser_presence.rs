@@ -87,14 +87,41 @@ impl PresenceSnapshot {
     }
 }
 
+/// Bounded, tenant-free counters (bn-p2p-observability) — global aggregates
+/// only, same posture as browser_admission.rs's counters.
+#[derive(Default, Serialize)]
+pub struct BrowserPresenceCounters {
+    pub upserts_total: u64,
+    pub clears_total: u64,
+    pub expirations_total: u64,
+}
+
+#[derive(Default)]
+struct PresenceCounterCells {
+    upserts_total: std::sync::atomic::AtomicU64,
+    clears_total: std::sync::atomic::AtomicU64,
+    expirations_total: std::sync::atomic::AtomicU64,
+}
+
 pub struct BrowserPresenceStore {
     inner: Mutex<PresenceSnapshot>,
+    counters: PresenceCounterCells,
 }
 
 impl BrowserPresenceStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(PresenceSnapshot::new()),
+            counters: PresenceCounterCells::default(),
+        }
+    }
+
+    pub fn stats(&self) -> BrowserPresenceCounters {
+        use std::sync::atomic::Ordering::Relaxed;
+        BrowserPresenceCounters {
+            upserts_total: self.counters.upserts_total.load(Relaxed),
+            clears_total: self.counters.clears_total.load(Relaxed),
+            expirations_total: self.counters.expirations_total.load(Relaxed),
         }
     }
 
@@ -123,6 +150,9 @@ impl BrowserPresenceStore {
         record.revision = revision;
         state.tombstones.remove(&record.endpoint_id);
         state.active.insert(record.endpoint_id.clone(), record.clone());
+        self.counters
+            .upserts_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         record
     }
 
@@ -132,6 +162,9 @@ impl BrowserPresenceStore {
         let revision = state.next_version();
         state.tombstones.insert(endpoint_id.to_string(), revision);
         state.prune_tombstones(hive_core::now_ms());
+        self.counters
+            .clears_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(record)
     }
 
@@ -156,6 +189,9 @@ impl BrowserPresenceStore {
             }
         }
         state.prune_tombstones(now);
+        self.counters
+            .expirations_total
+            .fetch_add(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
         removed
     }
 

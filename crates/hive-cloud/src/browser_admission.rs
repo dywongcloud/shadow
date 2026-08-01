@@ -90,14 +90,48 @@ impl BrowserAdmissionSnapshot {
     }
 }
 
+/// Bounded, tenant-free counters (bn-p2p-observability): global aggregates
+/// only, never a per-tenant/per-endpoint breakdown, so exposing them can
+/// never leak cardinality or identify any specific browser peer.
+#[derive(Default, Serialize)]
+pub struct BrowserAdmissionCounters {
+    pub admissions_total: u64,
+    pub renewals_total: u64,
+    pub revocations_total: u64,
+    pub expirations_total: u64,
+    pub denials_total: u64,
+}
+
+#[derive(Default)]
+struct AdmissionCounterCells {
+    admissions_total: std::sync::atomic::AtomicU64,
+    renewals_total: std::sync::atomic::AtomicU64,
+    revocations_total: std::sync::atomic::AtomicU64,
+    expirations_total: std::sync::atomic::AtomicU64,
+    denials_total: std::sync::atomic::AtomicU64,
+}
+
 pub struct BrowserAdmissionStore {
     inner: Mutex<BrowserAdmissionSnapshot>,
+    counters: AdmissionCounterCells,
 }
 
 impl BrowserAdmissionStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(BrowserAdmissionSnapshot::new()),
+            counters: AdmissionCounterCells::default(),
+        }
+    }
+
+    pub fn stats(&self) -> BrowserAdmissionCounters {
+        use std::sync::atomic::Ordering::Relaxed;
+        BrowserAdmissionCounters {
+            admissions_total: self.counters.admissions_total.load(Relaxed),
+            renewals_total: self.counters.renewals_total.load(Relaxed),
+            revocations_total: self.counters.revocations_total.load(Relaxed),
+            expirations_total: self.counters.expirations_total.load(Relaxed),
+            denials_total: self.counters.denials_total.load(Relaxed),
         }
     }
 
@@ -129,11 +163,13 @@ impl BrowserAdmissionStore {
     }
 
     fn put(&self, mut record: BrowserAdmission) -> Result<Option<BrowserAdmission>, &'static str> {
+        use std::sync::atomic::Ordering::Relaxed;
         let mut state = self.inner.lock();
         if let Some(existing) = state.active.get(&record.endpoint_id) {
             if existing.expires_ms > hive_core::now_ms()
                 && (existing.tenant != record.tenant || existing.subject != record.subject)
             {
+                self.counters.denials_total.fetch_add(1, Relaxed);
                 return Err("browser endpoint is owned by another active session");
             }
         }
@@ -141,7 +177,13 @@ impl BrowserAdmissionStore {
         record.revision = revision;
         state.tombstones.remove(&record.endpoint_id);
         let endpoint_id = record.endpoint_id.clone();
-        Ok(state.active.insert(endpoint_id, record))
+        let old = state.active.insert(endpoint_id, record);
+        if old.is_some() {
+            self.counters.renewals_total.fetch_add(1, Relaxed);
+        } else {
+            self.counters.admissions_total.fetch_add(1, Relaxed);
+        }
+        Ok(old)
     }
 
     fn revoke(&self, tenant: &str, endpoint_id: &str) -> Option<BrowserAdmission> {
@@ -154,6 +196,9 @@ impl BrowserAdmissionStore {
         let revision = state.next_version();
         state.tombstones.insert(endpoint_id.to_string(), revision);
         state.prune_tombstones(hive_core::now_ms());
+        self.counters
+            .revocations_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Some(record)
     }
 
@@ -177,6 +222,9 @@ impl BrowserAdmissionStore {
             }
         }
         state.prune_tombstones(hive_core::now_ms());
+        self.counters
+            .revocations_total
+            .fetch_add(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
         removed
     }
 
@@ -201,6 +249,9 @@ impl BrowserAdmissionStore {
             }
         }
         state.prune_tombstones(now);
+        self.counters
+            .expirations_total
+            .fetch_add(removed.len() as u64, std::sync::atomic::Ordering::Relaxed);
         removed
     }
 
@@ -266,6 +317,19 @@ pub fn routes() -> Router<Arc<CloudState>> {
             "/v1/browser/admissions/:endpoint_id",
             get(get_admission).delete(revoke_admission),
         )
+        .route("/v1/browser/stats", get(browser_stats))
+}
+
+/// Bounded, tenant-free operational counters (bn-p2p-observability): global
+/// aggregates only across BOTH browser stores, never a per-tenant or
+/// per-endpoint breakdown, so this endpoint structurally cannot leak
+/// cardinality or identify any specific browser peer or its location.
+async fn browser_stats(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {
+    crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    Ok(Json(json!({
+        "admissions": cloud.browser_admissions.stats(),
+        "presence": cloud.browser_presence.stats(),
+    })))
 }
 
 fn claims_required(claims: Claims) -> Result<crate::auth::Claims, (StatusCode, String)> {
