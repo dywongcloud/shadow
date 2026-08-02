@@ -113,10 +113,21 @@ async function admitOnce(addrJson, endpointId) {
   });
 }
 
+// Single-in-flight-dial fencing (bn-p2p-reconnect-state): the scheduled
+// renewal tick and a network-restore event are two INDEPENDENT triggers that
+// can both decide to call admitOnce around the same moment (a network drop
+// recovering right as the 60s timer also fires). The backend admission
+// endpoint is itself idempotent (a fresh grant simply replaces the old one),
+// so two concurrent requests were never a CORRECTNESS bug, but they're a real
+// wasted-request race with no reason to exist — this makes it structurally
+// impossible instead of merely harmless.
+let renewInFlight = false;
+
 function scheduleRenew(addrJson, endpointId) {
   if (renewTimer) clearInterval(renewTimer);
   renewTimer = setInterval(async () => {
-    if (closing || !node) return;
+    if (closing || !node || renewInFlight) return;
+    renewInFlight = true;
     try {
       await admitOnce(addrJson, endpointId);
       // Derive lifecycle from CURRENT visibility rather than hardcoding
@@ -142,6 +153,8 @@ function scheduleRenew(addrJson, endpointId) {
       // on the same schedule — the next tick may hit an already-upgraded
       // node or a transient failure may simply clear.
       setStatus({ admission: "denied", lifecycle: "degraded", protocolMismatch: mismatch, lastError: message });
+    } finally {
+      renewInFlight = false;
     }
   }, RENEW_INTERVAL_MS);
 }
@@ -230,9 +243,13 @@ function onNetworkChange(online) {
   // scheduled tick — retry the admission right away so a real reconnect is
   // fast, not just eventually-correct. Reuses scheduleRenew's own retry
   // machinery for the SUBSEQUENT tick rather than duplicating it; this is
-  // only the one immediate out-of-band attempt.
+  // only the one immediate out-of-band attempt. Guarded by the SAME
+  // renewInFlight fence the scheduled tick uses, so this can never race a
+  // tick that's already mid-flight — it just skips (the next scheduled tick,
+  // or the next network event, covers it; nothing is lost, only deduped).
   const endpointId = status.endpointId;
-  if (node && session && !closing && endpointId) {
+  if (node && session && !closing && endpointId && !renewInFlight) {
+    renewInFlight = true;
     admitOnce(node.addrJson(), endpointId)
       .then(() => {
         const lifecycle = anyVisible() ? "online" : "suspended";
@@ -246,6 +263,9 @@ function onNetworkChange(online) {
           protocolMismatch: classifyAdmissionError(message),
           lastError: message,
         });
+      })
+      .finally(() => {
+        renewInFlight = false;
       });
   }
 }
