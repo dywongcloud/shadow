@@ -39,6 +39,33 @@
   --green: 145 65% 49%;
 }
 
+/* High-contrast mode (bn-ui-accessibility): the OS-level `forced-colors`
+   media feature (Windows High Contrast) already overrides colors
+   unconditionally and needs no help here — this targets the OTHER real
+   signal, `prefers-contrast: more` (macOS "Increase contrast" / a browser
+   accessibility setting), which forced-colors does NOT cover. Overrides
+   only the LOW-CONTRAST tokens (border/border-strong/muted/secondary — the
+   ones deliberately subtle by design for the normal theme) toward the
+   extremes; foreground/background/accent are already near-maximum contrast
+   in both themes and are left untouched. Composes with `.dark` via normal
+   CSS cascade (both selectors can match at once), never a separate
+   duplicated theme to keep in sync.
+*/
+@media (prefers-contrast: more) {
+  :root {
+    --secondary: 0 0% 20%;
+    --muted: 0 0% 30%;
+    --border: 0 0% 60%;
+    --border-strong: 0 0% 40%;
+  }
+  .dark {
+    --secondary: 0 0% 85%;
+    --muted: 0 0% 75%;
+    --border: 0 0% 45%;
+    --border-strong: 0 0% 60%;
+  }
+}
+
 /* De-zoom ~13%, plus an additional 5% default zoom-out on top: rem-based
    spacing & type scale down proportionally so the whole dashboard reads
    sleeker / less zoomed-in. (87.5% * 0.95 = 83.125%, 90% * 0.95 = 85.5%.) */
