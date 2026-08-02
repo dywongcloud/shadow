@@ -322,7 +322,11 @@ export default function RunNodePage() {
             </button>
           </div>
         )}
-        {geoError && <div className="mt-2 text-xs text-red-500">{geoError}</div>}
+        {geoError && (
+          <div role="alert" className="mt-2 text-xs text-red-500">
+            {geoError}
+          </div>
+        )}
       </section>
 
       <section className="rounded-lg border border-border bg-card p-4">
