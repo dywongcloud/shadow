@@ -7,6 +7,7 @@
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::{IntoResponse, Response},
     routing::get,
     Json, Router,
 };
@@ -21,6 +22,50 @@ use crate::state::CloudState;
 
 type Claims = Option<axum::Extension<crate::auth::Claims>>;
 type ApiResult = Result<Json<Value>, (StatusCode, String)>;
+type AdmissionResult = Result<Json<Value>, AdmissionFailure>;
+
+#[derive(Debug, Serialize)]
+struct AdmissionError {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(Debug)]
+struct AdmissionFailure {
+    status: StatusCode,
+    error: AdmissionError,
+}
+
+impl AdmissionFailure {
+    fn terminal(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            error: AdmissionError {
+                code,
+                message: message.into(),
+                retryable: false,
+            },
+        }
+    }
+
+    fn retryable(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            error: AdmissionError {
+                code,
+                message: message.into(),
+                retryable: true,
+            },
+        }
+    }
+}
+
+impl IntoResponse for AdmissionFailure {
+    fn into_response(self) -> Response {
+        (self.status, Json(json!({ "error": self.error }))).into_response()
+    }
+}
 
 const DEFAULT_LEASE_SECS: u64 = 120;
 const MIN_LEASE_SECS: u64 = 30;
@@ -416,8 +461,10 @@ fn claims_required(claims: Claims) -> Result<crate::auth::Claims, (StatusCode, S
     ))
 }
 
-fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, (StatusCode, String)> {
-    let claims = claims_required(claims)?;
+fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, AdmissionFailure> {
+    let claims = claims_required(claims).map_err(|(_, message)| {
+        AdmissionFailure::retryable(StatusCode::UNAUTHORIZED, "session_required", message)
+    })?;
     let now = hive_core::now_ms() / 1_000;
     let max_age = std::env::var("HIVE_BROWSER_SESSION_MAX_AGE_SECS")
         .ok()
@@ -432,17 +479,19 @@ fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, (StatusCode,
         || claims.sub.starts_with("key:")
         || claims.role == "service"
     {
-        return Err((
+        return Err(AdmissionFailure::terminal(
             StatusCode::FORBIDDEN,
-            "browser admission requires a fresh interactive user session".into(),
+            "interactive_session_required",
+            "browser admission requires a fresh interactive user session",
         ));
     }
     let iat = claims.iat as u64;
     let exp = claims.exp as u64;
     if exp <= now || iat > now.saturating_add(skew) || now.saturating_sub(iat) > max_age {
-        return Err((
+        return Err(AdmissionFailure::retryable(
             StatusCode::UNAUTHORIZED,
-            "browser admission session is expired or not fresh".into(),
+            "session_stale",
+            "browser admission session is expired or not fresh",
         ));
     }
     Ok(claims)
@@ -460,7 +509,7 @@ fn verify_proof_of_possession(
     endpoint_id: &str,
     challenge_ms: u64,
     signature_hex: &str,
-) -> Result<(), (StatusCode, String)> {
+) -> Result<(), AdmissionFailure> {
     let window_ms = std::env::var("HIVE_BROWSER_POP_WINDOW_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -469,22 +518,25 @@ fn verify_proof_of_possession(
     let now = hive_core::now_ms();
     let age = now.abs_diff(challenge_ms);
     if age > window_ms {
-        return Err((
+        return Err(AdmissionFailure::retryable(
             StatusCode::UNAUTHORIZED,
-            "browser admission proof-of-possession challenge is stale".into(),
+            "proof_challenge_stale",
+            "browser admission proof-of-possession challenge is stale",
         ));
     }
     let public_key: iroh::PublicKey = endpoint_id.parse().map_err(|_| {
-        (
+        AdmissionFailure::terminal(
             StatusCode::BAD_REQUEST,
-            "browser endpoint id is not a valid ed25519 public key".into(),
+            "endpoint_id_invalid",
+            "browser endpoint id is not a valid ed25519 public key",
         )
     })?;
     let mut sig_bytes = [0u8; 64];
     hex::decode_to_slice(signature_hex, &mut sig_bytes).map_err(|_| {
-        (
+        AdmissionFailure::terminal(
             StatusCode::UNAUTHORIZED,
-            "browser admission proof-of-possession signature is not valid hex".into(),
+            "proof_signature_invalid",
+            "browser admission proof-of-possession signature is not valid hex",
         )
     })?;
     let signature = iroh::Signature::from_bytes(&sig_bytes);
@@ -492,9 +544,10 @@ fn verify_proof_of_possession(
     public_key
         .verify(message.as_bytes(), &signature)
         .map_err(|_| {
-            (
+            AdmissionFailure::terminal(
                 StatusCode::UNAUTHORIZED,
-                "browser admission proof-of-possession signature does not verify — caller does not control this endpoint's key".into(),
+                "proof_signature_invalid",
+                "browser admission proof-of-possession signature does not verify — caller does not control this endpoint's key",
             )
         })
 }
@@ -503,7 +556,7 @@ fn validate_request(
     cloud: &Arc<CloudState>,
     claims: &crate::auth::Claims,
     request: &AdmissionRequest,
-) -> Result<(String, u64), (StatusCode, String)> {
+) -> Result<(String, u64), AdmissionFailure> {
     // Range check, not exact-match (bn-p2p-version-negotiation): the two
     // failure directions need distinct client-facing signals. A durably
     // outdated client (below the server's floor) needs a forced reload — no
@@ -514,33 +567,41 @@ fn validate_request(
     // worker pattern-matches on; changing them is a breaking client change.
     match hive_browser_proto::protocol_fit(request.protocol_version) {
         hive_browser_proto::ProtocolFit::TooOld => {
-            return Err((
+            return Err(AdmissionFailure::terminal(
                 StatusCode::UPGRADE_REQUIRED,
-                "protocol_too_old: this browser bundle is outdated; reload to update".into(),
+                "protocol_too_old",
+                "protocol_too_old: this browser bundle is outdated; reload to update",
             ));
         }
         hive_browser_proto::ProtocolFit::TooNew => {
-            return Err((
+            return Err(AdmissionFailure::retryable(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "protocol_too_new: this node hasn't rolled forward to your protocol version yet; retrying will reach an upgraded node".into(),
+                "protocol_too_new",
+                "protocol_too_new: this node hasn't rolled forward to your protocol version yet; retrying will reach an upgraded node",
             ));
         }
         hive_browser_proto::ProtocolFit::Supported => {}
     }
     if request.addr_json.len() > MAX_ADDR_JSON_BYTES {
-        return Err((
+        return Err(AdmissionFailure::terminal(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "browser endpoint address is too large".into(),
+            "endpoint_address_too_large",
+            "browser endpoint address is too large",
         ));
     }
-    let endpoint_id = hive_p2p::endpoint_id_from_addr_json(&request.addr_json).ok_or((
-        StatusCode::BAD_REQUEST,
-        "browser endpoint address is malformed".into(),
-    ))?;
+    let endpoint_id =
+        hive_p2p::endpoint_id_from_addr_json(&request.addr_json).ok_or_else(|| {
+            AdmissionFailure::terminal(
+                StatusCode::BAD_REQUEST,
+                "endpoint_address_malformed",
+                "browser endpoint address is malformed",
+            )
+        })?;
     if endpoint_id != request.endpoint_id {
-        return Err((
+        return Err(AdmissionFailure::terminal(
             StatusCode::BAD_REQUEST,
-            "browser endpoint id does not match its signed address".into(),
+            "endpoint_id_mismatch",
+            "browser endpoint id does not match its signed address",
         ));
     }
     verify_proof_of_possession(&endpoint_id, request.challenge_ms, &request.signature)?;
@@ -550,22 +611,25 @@ fn validate_request(
         || request.function.is_empty()
         || request.function.len() > 256
     {
-        return Err((
+        return Err(AdmissionFailure::terminal(
             StatusCode::BAD_REQUEST,
-            "invalid browser function target".into(),
+            "function_target_invalid",
+            "invalid browser function target",
         ));
     }
     if request.scope == BrowserScope::Public && !matches!(claims.role.as_str(), "owner" | "admin") {
-        return Err((
+        return Err(AdmissionFailure::terminal(
             StatusCode::FORBIDDEN,
-            "public browser serving requires a team owner or admin".into(),
+            "public_scope_forbidden",
+            "public browser serving requires a team owner or admin",
         ));
     }
     let tenant = crate::admin::norm(&claims.tenant).to_string();
     if !deployment_serves(cloud, &tenant, &request.deployment, &request.function) {
-        return Err((
+        return Err(AdmissionFailure::retryable(
             StatusCode::NOT_FOUND,
-            "no ready deployment function exists in this tenant".into(),
+            "deployment_not_ready",
+            "no ready deployment function exists in this tenant",
         ));
     }
     let now = hive_core::now_ms();
@@ -578,9 +642,10 @@ fn validate_request(
         .saturating_add(requested.saturating_mul(1_000))
         .min(token_expiry);
     if expires_ms <= now.saturating_add(MIN_LEASE_SECS.saturating_mul(1_000)) {
-        return Err((
+        return Err(AdmissionFailure::retryable(
             StatusCode::UNAUTHORIZED,
-            "platform session expires before the minimum browser lease".into(),
+            "session_lease_too_short",
+            "platform session expires before the minimum browser lease",
         ));
     }
     Ok((tenant, expires_ms))
@@ -613,7 +678,7 @@ async fn admit(
     State(cloud): State<Arc<CloudState>>,
     claims: Claims,
     Json(request): Json<AdmissionRequest>,
-) -> ApiResult {
+) -> AdmissionResult {
     let claims = fresh_user_claims(claims)?;
     let (tenant, expires_ms) = validate_request(&cloud, &claims, &request)?;
     let issued_ms = hive_core::now_ms();
@@ -634,7 +699,9 @@ async fn admit(
     let old = cloud
         .browser_admissions
         .put(record.clone())
-        .map_err(|message| (StatusCode::CONFLICT, message.into()))?;
+        .map_err(|message| {
+            AdmissionFailure::terminal(StatusCode::CONFLICT, "endpoint_conflict", message)
+        })?;
     record = cloud
         .browser_admissions
         .get(&record.tenant, &record.endpoint_id, issued_ms)
@@ -651,7 +718,11 @@ async fn admit(
         cloud
             .browser_admissions
             .revoke(&record.tenant, &record.endpoint_id);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, error.into()));
+        return Err(AdmissionFailure::retryable(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "gateway_unavailable",
+            error,
+        ));
     }
     Ok(Json(json!({ "admission": record })))
 }

@@ -82,6 +82,13 @@ export class BrowserNode {
      */
     nodeId(): string;
     /**
+     * Remove one configured relay at runtime. iroh's home-relay actor migrates
+     * to another configured relay and `setAddressHandler` reports the new
+     * dialable address. The final relay is structurally non-removable: leaving
+     * a live node with no possible transport is never a valid state.
+     */
+    removeRelay(relay_url: string): Promise<boolean>;
+    /**
      * Revoke one endpoint/asset capability; pooled connections re-read it on
      * every chunk, so revocation also stops a transfer already in progress.
      */
@@ -107,6 +114,14 @@ export class BrowserNode {
      * path fired, readable from the page after a peer connects.
      */
     servedCount(): bigint;
+    /**
+     * Subscribe to the endpoint's live dialable address. The callback receives
+     * `{online, relays, addrJson}` immediately and whenever iroh changes the
+     * connected home-relay set. An offline update has `online:false`, an empty
+     * relay list, and an empty addrJson; callers must never keep advertising a
+     * previous address through that state.
+     */
+    setAddressHandler(handler: Function): void;
     /**
      * Register the trusted local reader used by [`Op::AssetGet`]. Registration
      * grants nobody; each caller still needs an exact endpoint/digest scope.
@@ -206,10 +221,12 @@ export interface InitOutput {
     readonly browsernode_grantInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly browsernode_invokeOn: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
     readonly browsernode_nodeId: (a: number) => [number, number];
+    readonly browsernode_removeRelay: (a: number, b: number, c: number) => any;
     readonly browsernode_revokeAsset: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly browsernode_revokeInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly browsernode_secretHex: (a: number) => [number, number];
     readonly browsernode_servedCount: (a: number) => bigint;
+    readonly browsernode_setAddressHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setAssetHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
     readonly browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];

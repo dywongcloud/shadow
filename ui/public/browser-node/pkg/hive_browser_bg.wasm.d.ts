@@ -12,10 +12,12 @@ export const browsernode_grantAsset: (a: number, b: number, c: number, d: number
 export const browsernode_grantInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
 export const browsernode_invokeOn: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
 export const browsernode_nodeId: (a: number) => [number, number];
+export const browsernode_removeRelay: (a: number, b: number, c: number) => any;
 export const browsernode_revokeAsset: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
 export const browsernode_revokeInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
 export const browsernode_secretHex: (a: number) => [number, number];
 export const browsernode_servedCount: (a: number) => bigint;
+export const browsernode_setAddressHandler: (a: number, b: any) => [number, number];
 export const browsernode_setAssetHandler: (a: number, b: any) => [number, number];
 export const browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
 export const browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];

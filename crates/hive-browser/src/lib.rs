@@ -20,7 +20,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use iroh::{Endpoint, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Watcher as _,
+};
+use n0_future::StreamExt;
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
@@ -31,6 +35,10 @@ use wasm_bindgen_futures::JsFuture;
 /// wire. `Rc<RefCell<>>`, not `Arc<Mutex<>>` — wasm32 in a browser tab is
 /// single-threaded, and `js_sys::Function` isn't `Send` anyway.
 type InvokeHandler = Rc<RefCell<Option<js_sys::Function>>>;
+
+/// Live endpoint-address observer registered by the trusted worker. The callback
+/// receives one JSON object whenever iroh's connected home-relay set changes.
+type AddressHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
 /// Trusted local asset reader:
 /// `(digest: string, offset: number, maxLen: number) => Promise<{total, bytes}>`.
@@ -86,7 +94,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    3
+    4
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -94,9 +102,10 @@ pub fn wasm_bundle_version() -> u32 {
 #[wasm_bindgen]
 pub struct BrowserNode {
     ep: Endpoint,
-    /// The relay URL this node was booted against (reported in status; the live
-    /// home-relay is negotiated asynchronously and not needed for display).
-    relay: String,
+    /// Trusted worker callback for live iroh address/home-relay updates.
+    address_handler: AddressHandler,
+    /// Canonical configured relay URLs. Runtime removal refuses the final entry.
+    configured_relays: Rc<RefCell<BTreeSet<String>>>,
     /// Count of echo requests served so far — surfaced to the page as a liveness
     /// signal that the inbound accept path actually fired.
     served: Arc<std::sync::atomic::AtomicU64>,
@@ -121,6 +130,7 @@ impl Drop for BrowserNode {
         // witnessed drain use the explicit async `close()` before `free()`.
         self.invoke.borrow_mut().take();
         self.asset.borrow_mut().take();
+        self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
         if !self.closed.replace(true) {
@@ -136,6 +146,63 @@ struct Status {
     relay: String,
     served: u64,
     addr_json: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddressStatus {
+    online: bool,
+    relays: Vec<String>,
+    addr_json: String,
+}
+
+fn address_status(addr: EndpointAddr) -> AddressStatus {
+    let relays = addr
+        .addrs
+        .iter()
+        .filter_map(|transport| match transport {
+            TransportAddr::Relay(url) => Some(url.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let online = !relays.is_empty();
+    let addr_json = if online {
+        serde_json::to_string(&addr).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    AddressStatus {
+        online,
+        relays,
+        addr_json,
+    }
+}
+
+fn emit_address(handler: &AddressHandler, addr: EndpointAddr) {
+    let Some(callback) = handler.borrow().as_ref().cloned() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string(&address_status(addr)) else {
+        tracing::warn!("browser address status could not be serialized");
+        return;
+    };
+    if let Err(error) = callback.call1(&JsValue::NULL, &JsValue::from_str(&json)) {
+        tracing::warn!(?error, "browser address handler threw");
+    }
+}
+
+fn spawn_address_loop(ep: Endpoint, handler: AddressHandler) {
+    let mut addresses = ep.watch_addr().stream();
+    let closed = ep.closed();
+    n0_future::task::spawn(async move {
+        closed
+            .run_until(async move {
+                while let Some(addr) = addresses.next().await {
+                    emit_address(&handler, addr);
+                }
+            })
+            .await;
+    });
 }
 
 #[wasm_bindgen]
@@ -166,6 +233,9 @@ impl BrowserNode {
         if relays.is_empty() {
             return Err(JsError::new("relay_urls must name at least one relay"));
         }
+        let configured_relays = Rc::new(RefCell::new(
+            relays.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
+        ));
         let map = RelayMap::from_iter(relays);
 
         // Minimal preset (no n0 pkarr/DNS baked in) + our own relay map, so the
@@ -209,6 +279,7 @@ impl BrowserNode {
 
         let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let invoke: InvokeHandler = Rc::new(RefCell::new(None));
+        let address_handler: AddressHandler = Rc::new(RefCell::new(None));
         let asset: AssetHandler = Rc::new(RefCell::new(None));
         let grants: InvokerGrants = Rc::new(RefCell::new(BTreeMap::new()));
         let asset_grants: AssetGrants = Rc::new(RefCell::new(BTreeMap::new()));
@@ -221,14 +292,12 @@ impl BrowserNode {
             grants.clone(),
             asset_grants.clone(),
         );
+        spawn_address_loop(ep.clone(), address_handler.clone());
 
         Ok(BrowserNode {
             ep,
-            // iroh's Endpoint exposes no live "which relay did I actually land
-            // on" readback (same constraint noted in hive-p2p's relay_map_from_
-            // env), so this reports the full CONFIGURED set rather than
-            // guessing at a single "the" relay — honest about what's known.
-            relay: relay_urls.clone(),
+            address_handler,
+            configured_relays,
             served,
             invoke,
             asset,
@@ -297,6 +366,49 @@ impl BrowserNode {
         serde_json::to_string(&addr).map_err(|e| JsError::new(&format!("addr serialize: {e}")))
     }
 
+    /// Subscribe to the endpoint's live dialable address. The callback receives
+    /// `{online, relays, addrJson}` immediately and whenever iroh changes the
+    /// connected home-relay set. An offline update has `online:false`, an empty
+    /// relay list, and an empty addrJson; callers must never keep advertising a
+    /// previous address through that state.
+    #[wasm_bindgen(js_name = setAddressHandler)]
+    pub fn set_address_handler(&self, handler: js_sys::Function) -> Result<(), JsError> {
+        self.ensure_open()?;
+        if !handler.is_function() {
+            return Err(JsError::new("address handler must be a function"));
+        }
+        *self.address_handler.borrow_mut() = Some(handler);
+        emit_address(&self.address_handler, self.ep.addr());
+        Ok(())
+    }
+
+    /// Remove one configured relay at runtime. iroh's home-relay actor migrates
+    /// to another configured relay and `setAddressHandler` reports the new
+    /// dialable address. The final relay is structurally non-removable: leaving
+    /// a live node with no possible transport is never a valid state.
+    #[wasm_bindgen(js_name = removeRelay)]
+    pub async fn remove_relay(&self, relay_url: String) -> Result<bool, JsError> {
+        self.ensure_open()?;
+        let relay = relay_url
+            .parse::<RelayUrl>()
+            .map_err(|e| JsError::new(&format!("bad relay url {relay_url:?}: {e}")))?;
+        let canonical = relay.to_string();
+        {
+            let configured = self.configured_relays.borrow();
+            if !configured.contains(&canonical) {
+                return Ok(false);
+            }
+            if configured.len() == 1 {
+                return Err(JsError::new("refusing to remove the final configured relay"));
+            }
+        }
+        let removed = self.ep.remove_relay(&relay).await.is_some();
+        if removed {
+            self.configured_relays.borrow_mut().remove(&canonical);
+        }
+        Ok(removed)
+    }
+
     /// How many inbound echo requests this node has served — proof the accept
     /// path fired, readable from the page after a peer connects.
     #[wasm_bindgen(js_name = servedCount)]
@@ -307,15 +419,12 @@ impl BrowserNode {
     /// One JSON blob of everything the status UI needs.
     #[wasm_bindgen(js_name = statusJson)]
     pub fn status_json(&self) -> String {
+        let address = address_status(self.ep.addr());
         serde_json::to_string(&Status {
             node_id: self.ep.id().to_string(),
-            relay: self.relay.clone(),
+            relay: address.relays.join(","),
             served: self.served_count(),
-            // Status is a display surface, not a dial surface: an un-ready node
-            // should still render its id/relay/counters rather than throwing the
-            // whole status blob away, so the undialable case degrades to an
-            // empty string HERE only. `addrJson` itself still refuses.
-            addr_json: self.addr_json().unwrap_or_default(),
+            addr_json: address.addr_json,
         })
         .unwrap_or_default()
     }
@@ -439,6 +548,7 @@ impl BrowserNode {
     pub async fn close(&self) {
         self.invoke.borrow_mut().take();
         self.asset.borrow_mut().take();
+        self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
         if !self.closed.replace(true) {

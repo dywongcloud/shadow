@@ -28,7 +28,7 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 3; // v3: BrowserNode gained signAdmission() for proof-of-possession
+const WASM_BUNDLE_VERSION = 4; // v4: BrowserNode exposes live iroh address/home-relay changes
 
 const ports = [];
 // Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any
@@ -98,10 +98,11 @@ let status = {
 // rejections with a stable marker (see crates/hive-cloud/src/browser_admission.rs
 // validate_request) so the two directions get distinct client treatment
 // instead of both looking like a generic admission failure.
-function classifyAdmissionError(message) {
-  if (typeof message !== "string") return "none";
-  if (message.startsWith("protocol_too_old")) return "outdated";
-  if (message.startsWith("protocol_too_new")) return "server_upgrading";
+function classifyAdmissionError(error) {
+  const code = error && typeof error === "object" ? error.code : null;
+  const message = String((error && error.message) || error || "");
+  if (code === "protocol_too_old" || message.startsWith("protocol_too_old")) return "outdated";
+  if (code === "protocol_too_new" || message.startsWith("protocol_too_new")) return "server_upgrading";
   // Same remedy as "outdated" (a reload re-fetches the wasm bundle fresh) --
   // distinct root cause (a stale LOCAL cache, not the fleet's protocol
   // floor), same UI treatment either way.
@@ -121,12 +122,23 @@ function classifyAdmissionError(message) {
 // as a permanent failure would stop retrying right before a self-heal that was
 // about to happen. Exists so the UI can show a calm "reconnecting" state
 // instead of the same alarming red error every other unclassified failure gets.
-function isSessionStaleError(message) {
-  return (
-    typeof message === "string" &&
-    (message.includes("session is expired or not fresh") ||
-      message.includes("requires a fresh interactive user session"))
-  );
+function isSessionStaleError(error) {
+  const code = error && typeof error === "object" ? error.code : null;
+  const message = String((error && error.message) || error || "");
+  if (code) {
+    return code === "session_required" || code === "session_stale" || code === "session_lease_too_short";
+  }
+  return message.includes("session is expired or not fresh") || message.includes("requires a fresh interactive user session");
+}
+
+function isTerminalAdmissionError(error) {
+  if (error && typeof error === "object" && typeof error.retryable === "boolean") {
+    return !error.retryable;
+  }
+  // Backward-compatible during a rolling deploy: old nodes return plain text.
+  // Only the already-stable too-old marker is terminal without structured
+  // metadata; every other old response keeps retrying rather than guessing.
+  return classifyAdmissionError(error) === "outdated";
 }
 
 function broadcast() {
@@ -188,7 +200,18 @@ async function callApi(method, path, team, body) {
     });
     if (!r.ok) {
       const text = await r.text().catch(() => "");
-      throw new Error(text || `${method} ${path} -> ${r.status}`);
+      let payload = null;
+      try {
+        payload = text ? JSON.parse(text) : null;
+      } catch {
+        // Pre-structured-error nodes return plain text during rollout.
+      }
+      const detail = payload && payload.error && typeof payload.error === "object" ? payload.error : null;
+      const error = new Error((detail && detail.message) || text || `${method} ${path} -> ${r.status}`);
+      error.code = detail && typeof detail.code === "string" ? detail.code : null;
+      error.retryable = detail && typeof detail.retryable === "boolean" ? detail.retryable : null;
+      error.status = r.status;
+      throw error;
     }
     return await r.json();
   } finally {
@@ -219,109 +242,112 @@ async function admitOnce(addrJson, endpointId) {
   });
 }
 
-// Single-in-flight-dial fencing (bn-p2p-reconnect-state): the scheduled
-// renewal tick and a network-restore event are two INDEPENDENT triggers that
-// can both decide to call admitOnce around the same moment (a network drop
-// recovering right as the 60s timer also fires). The backend admission
-// endpoint is itself idempotent (a fresh grant simply replaces the old one),
-// so two concurrent requests were never a CORRECTNESS bug, but they're a real
-// wasted-request race with no reason to exist — this makes it structurally
-// impossible instead of merely harmless.
-let renewInFlight = false;
+// One renewal spine owns every admission write: periodic lease refresh,
+// browser-network restoration, and iroh home-relay/address migration. The
+// attempt reads currentAddrJson at execution time; boot's first address is
+// never captured forever.
+let renewInFlightEpoch = null;
+let renewKickPending = false;
+let currentAddrJson = null;
+let admittedAddrJson = null;
 
 // Decorrelated-jitter retry backoff (bn-p2p-reconnect-state, cross-checked
 // against reconnecting-websocket/socket.io/node-retry/iroh's own relay
-// actor.rs): sleepN = min(CAP, uniform(BASE, sleepN-1*3)). AWS's own
-// comparison of jitter strategies ranks decorrelated the fastest-completing
-// of the jittered options and unjittered backoff the outright loser — a
-// FLAT retry interval on every failure (the previous behavior) is exactly
-// the unjittered case. CAP is deliberately smaller than the general
-// reconnect ladder would use: it exists so several retries still fit inside
-// the lease window instead of burning most of it waiting out one full
-// RENEW_INTERVAL_MS after a single transient failure.
+// actor.rs): sleepN = min(CAP, uniform(BASE, sleepN-1*3)).
 const RENEW_BACKOFF_BASE_MS = 250;
 const RENEW_BACKOFF_CAP_MS = 5_000;
+let renewBackoffMs = RENEW_BACKOFF_BASE_MS;
 
 function nextDecorrelatedJitterMs(prevMs) {
   const hi = Math.max(RENEW_BACKOFF_BASE_MS, prevMs * 3);
   return Math.min(RENEW_BACKOFF_CAP_MS, RENEW_BACKOFF_BASE_MS + Math.random() * (hi - RENEW_BACKOFF_BASE_MS));
 }
 
-function scheduleRenew(addrJson, endpointId) {
+function scheduleRenew(delayMs) {
   if (renewTimer) clearTimeout(renewTimer);
   const myEpoch = epoch;
-  let backoffMs = RENEW_BACKOFF_BASE_MS;
+  renewTimer = setTimeout(() => renewNow(myEpoch), delayMs);
+}
 
-  async function tick() {
-    if (closing || !node || myEpoch !== epoch) return; // session over — stop rescheduling
-    if (renewInFlight) {
-      // onNetworkChange's out-of-band admit is currently in flight — don't
-      // duplicate it, but this self-rescheduling chain must keep going or it
-      // dies silently (unlike the old setInterval, nothing else re-fires
-      // this tick).
-      renewTimer = setTimeout(tick, RENEW_BACKOFF_BASE_MS);
-      return;
+function kickRenew() {
+  renewKickPending = true;
+  if (renewInFlightEpoch === epoch) return;
+  renewKickPending = false;
+  scheduleRenew(0);
+}
+
+async function renewNow(myEpoch) {
+  if (closing || !node || !session || myEpoch !== epoch) return "stale";
+  if (!networkOnline) return "offline";
+  if (renewInFlightEpoch === myEpoch) {
+    renewKickPending = true;
+    return "pending";
+  }
+  if (!currentAddrJson) {
+    if (status.lifecycle !== "degraded" || status.relay !== null) {
+      setStatus({ lifecycle: "degraded", relay: null, lastError: "No browser relay is connected — reconnecting automatically." });
     }
-    renewInFlight = true;
-    const renewalTeam = session && session.team;
-    try {
-      await admitOnce(addrJson, endpointId);
-      if (myEpoch !== epoch) {
-        // stop() ran while this renewal's POST was in flight — it already
-        // revoked whatever admission existed BEFORE this call, but this call
-        // itself just re-created/refreshed one afterward. Undo it, same as
-        // start()'s own stale-epoch handling, or the user sees "stopped"
-        // while a live grant for this endpoint quietly lives out its lease.
-        await discardStaleAttempt(null, endpointId, renewalTeam);
-        return;
-      }
-      backoffMs = RENEW_BACKOFF_BASE_MS; // ladder resets on any success
-      // Derive lifecycle from CURRENT visibility rather than hardcoding
-      // "online" — a background renewal tick must not un-suspend a node
-      // whose tabs are all still hidden.
-      const lifecycle = anyVisible() ? "online" : "suspended";
-      if (
-        status.admission !== "granted" ||
-        status.lifecycle !== lifecycle ||
-        status.protocolMismatch !== "none" ||
-        status.sessionStale
-      ) {
-        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", sessionStale: false, lastError: null });
-      }
-      renewTimer = setTimeout(tick, RENEW_INTERVAL_MS);
-    } catch (e) {
-      if (myEpoch !== epoch) return;
-      const message = String((e && e.message) || e);
-      const mismatch = classifyAdmissionError(message);
-      if (mismatch === "outdated") {
-        // No retry will ever succeed against this server's floor — stop
-        // spending renewal cycles on a doomed request and let the UI prompt
-        // a reload instead of silently failing every 60s forever.
-        setStatus({ admission: "denied", lifecycle: "error", protocolMismatch: mismatch, lastError: message });
-        return; // terminal — no reschedule
-      }
-      const sessionStale = isSessionStaleError(message);
-      // "server_upgrading" (transient), a stale platform session (also
-      // transient — see isSessionStaleError's doc), and any other failure all
-      // keep retrying,
-      // now on the jittered ladder instead of waiting a full
-      // RENEW_INTERVAL_MS — the next attempt may hit an already-upgraded
-      // node or a transient failure may simply clear.
-      setStatus({
-        admission: "denied",
-        lifecycle: "degraded",
-        protocolMismatch: mismatch,
-        sessionStale,
-        lastError: message,
-      });
-      backoffMs = nextDecorrelatedJitterMs(backoffMs);
-      renewTimer = setTimeout(tick, backoffMs);
-    } finally {
-      renewInFlight = false;
-    }
+    renewBackoffMs = nextDecorrelatedJitterMs(renewBackoffMs);
+    scheduleRenew(renewBackoffMs);
+    return "offline";
   }
 
-  renewTimer = setTimeout(tick, RENEW_INTERVAL_MS);
+  const attemptedAddr = currentAddrJson;
+  const endpointId = status.endpointId;
+  const renewalTeam = session.team;
+  renewInFlightEpoch = myEpoch;
+  renewKickPending = false;
+  let nextDelay = null;
+  let outcome = "retrying";
+  try {
+    await admitOnce(attemptedAddr, endpointId);
+    if (myEpoch !== epoch) {
+      await discardStaleAttempt(null, endpointId, renewalTeam);
+      return "stale";
+    }
+    admittedAddrJson = attemptedAddr;
+    renewBackoffMs = RENEW_BACKOFF_BASE_MS;
+    const lifecycle = anyVisible() ? "online" : "suspended";
+    setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", sessionStale: false, lastError: null });
+    nextDelay = RENEW_INTERVAL_MS;
+    outcome = "success";
+  } catch (error) {
+    if (myEpoch !== epoch) return "stale";
+    const message = String((error && error.message) || error);
+    const mismatch = classifyAdmissionError(error);
+    const sessionStale = isSessionStaleError(error);
+    const terminal = isTerminalAdmissionError(error);
+    setStatus({
+      admission: "denied",
+      lifecycle: terminal ? "error" : "degraded",
+      protocolMismatch: mismatch,
+      sessionStale,
+      lastError: message,
+    });
+    if (terminal) {
+      const doomed = node;
+      node = null;
+      currentAddrJson = null;
+      admittedAddrJson = null;
+      await discardStaleAttempt(doomed, endpointId, renewalTeam);
+      outcome = "terminal";
+    } else {
+      renewBackoffMs = nextDecorrelatedJitterMs(renewBackoffMs);
+      nextDelay = renewBackoffMs;
+    }
+  } finally {
+    if (renewInFlightEpoch === myEpoch) renewInFlightEpoch = null;
+    if (myEpoch === epoch && node) {
+      if (currentAddrJson !== attemptedAddr) renewKickPending = true;
+      if (renewKickPending) {
+        renewKickPending = false;
+        scheduleRenew(RENEW_BACKOFF_BASE_MS);
+      } else if (nextDelay !== null) {
+        scheduleRenew(nextDelay);
+      }
+    }
+  }
+  return outcome;
 }
 
 // Discard a boot this epoch no longer owns: close/free a real node if one was
@@ -401,9 +427,44 @@ async function orderRelaysByLatency(relayUrlsCsv) {
   return [...reachable, ...unreachable].map((t) => t.url).join(",");
 }
 
+function onAddressChange(owner, myEpoch, json) {
+  if (myEpoch !== epoch || node !== owner || closing) return;
+  let update;
+  try {
+    update = JSON.parse(json);
+  } catch {
+    setStatus({ lifecycle: "degraded", relay: null, lastError: "Browser relay status was malformed — reconnecting automatically." });
+    return;
+  }
+  const relays = Array.isArray(update.relays) ? update.relays.filter((relay) => typeof relay === "string") : [];
+  const nextAddr = update.online === true && typeof update.addrJson === "string" && update.addrJson ? update.addrJson : null;
+  const changed = nextAddr !== currentAddrJson;
+  currentAddrJson = nextAddr;
+  if (!nextAddr || relays.length === 0) {
+    admittedAddrJson = null;
+    setStatus({
+      lifecycle: "degraded",
+      relay: null,
+      lastError: "No browser relay is connected — reconnecting automatically.",
+    });
+    return;
+  }
+  const relay = relays.join(",");
+  if (changed || admittedAddrJson !== nextAddr) {
+    setStatus({ lifecycle: "degraded", relay, lastError: null });
+    kickRenew();
+  } else if (status.relay !== relay) {
+    setStatus({ relay });
+  }
+}
+
 async function start(msg) {
   if (node || status.lifecycle === "starting") return;
   const myEpoch = ++epoch;
+  currentAddrJson = null;
+  admittedAddrJson = null;
+  renewKickPending = false;
+  renewBackoffMs = RENEW_BACKOFF_BASE_MS;
   session = {
     deployment: msg.deployment,
     fn: msg.fn,
@@ -414,7 +475,6 @@ async function start(msg) {
   };
   setStatus({ lifecycle: "starting", lastError: null, admission: "pending", sessionStale: false });
   let booted = null;
-  let admittedEndpointId = null;
   try {
     const orderedRelay = await orderRelaysByLatency(msg.relay);
     if (myEpoch !== epoch) return; // stop() ran during the relay probe
@@ -452,40 +512,29 @@ async function start(msg) {
       return;
     }
     const endpointId = n.nodeId();
-    const addrJson = n.addrJson();
     // Publish the node + endpointId ONLY once this epoch is confirmed still
-    // current — everything above this line touched only locals, so a stale
-    // epoch up to here has nothing to unpublish.
+    // current. setAddressHandler synchronously emits iroh's current address,
+    // then keeps the same callback alive for every relay migration.
     node = n;
-    setStatus({ endpointId, relay: orderedRelay, lifecycle: anyVisible() ? "online" : "suspended" });
-    await admitOnce(addrJson, endpointId);
-    admittedEndpointId = endpointId;
+    setStatus({ endpointId, relay: null, lifecycle: "starting" });
+    n.setAddressHandler((json) => onAddressChange(n, myEpoch, json));
+  } catch (error) {
     if (myEpoch !== epoch) {
-      // stop() ran after we published `node` but before we could confirm the
-      // admission — undo both: revoke the grant we just created and close
-      // the node stop() itself never got to see, then leave `node`/`status`
-      // alone (stop() already reset them to stopped/none).
-      node = null;
-      await discardStaleAttempt(booted, admittedEndpointId, msg.team);
+      await discardStaleAttempt(booted, null, msg.team);
       return;
     }
-    setStatus({ admission: "granted", protocolMismatch: "none", sessionStale: false, lastError: null });
-    scheduleRenew(addrJson, endpointId);
-  } catch (e) {
-    if (myEpoch !== epoch) {
-      // A stale attempt failing is not this epoch's error to report.
-      await discardStaleAttempt(booted, admittedEndpointId, msg.team);
-      return;
-    }
-    const message = String((e && e.message) || e);
+    const message = String((error && error.message) || error);
+    node = null;
+    currentAddrJson = null;
+    admittedAddrJson = null;
+    if (booted) await discardStaleAttempt(booted, null, msg.team);
     setStatus({
       lifecycle: "error",
       admission: "denied",
-      protocolMismatch: classifyAdmissionError(message),
-      sessionStale: isSessionStaleError(message),
+      protocolMismatch: classifyAdmissionError(error),
+      sessionStale: isSessionStaleError(error),
       lastError: message,
     });
-    node = null;
   }
 }
 
@@ -521,54 +570,16 @@ function onNetworkChange(online) {
   networkOnline = online;
   if (wasOnline === online) return;
   if (!online) {
-    // A dropped network can't promise service regardless of what the
-    // scheduled renewal timer still believes — degrade immediately rather
-    // than waiting for the next tick's request to time out first.
+    if (renewTimer) clearTimeout(renewTimer);
+    renewTimer = null;
     if (status.lifecycle === "online" || status.lifecycle === "suspended") {
-      setStatus({ lifecycle: "degraded" });
+      setStatus({ lifecycle: "degraded", lastError: "Network unavailable — reconnecting automatically." });
     }
     return;
   }
-  // Network restored: don't wait up to RENEW_INTERVAL_MS for the next
-  // scheduled tick — retry the admission right away so a real reconnect is
-  // fast, not just eventually-correct. Reuses scheduleRenew's own retry
-  // machinery for the SUBSEQUENT tick rather than duplicating it; this is
-  // only the one immediate out-of-band attempt. Guarded by the SAME
-  // renewInFlight fence the scheduled tick uses, so this can never race a
-  // tick that's already mid-flight — it just skips (the next scheduled tick,
-  // or the next network event, covers it; nothing is lost, only deduped).
-  const endpointId = status.endpointId;
-  if (node && session && !closing && endpointId && !renewInFlight) {
-    renewInFlight = true;
-    const myEpoch = epoch;
-    const networkTeam = session.team;
-    admitOnce(node.addrJson(), endpointId)
-      .then(() => {
-        if (myEpoch !== epoch) {
-          // stop() ran while this POST was in flight and already revoked
-          // whatever admission existed before it — this call just
-          // re-created one afterward. Undo it, same reasoning as
-          // scheduleRenew's identical stale-success case.
-          return discardStaleAttempt(null, endpointId, networkTeam);
-        }
-        const lifecycle = anyVisible() ? "online" : "suspended";
-        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", sessionStale: false, lastError: null });
-      })
-      .catch((e) => {
-        if (myEpoch !== epoch) return;
-        const message = String((e && e.message) || e);
-        setStatus({
-          admission: "denied",
-          lifecycle: "degraded",
-          protocolMismatch: classifyAdmissionError(message),
-          sessionStale: isSessionStaleError(message),
-          lastError: message,
-        });
-      })
-      .finally(() => {
-        renewInFlight = false;
-      });
-  }
+  // The same renewal spine handles this as relay migration and periodic refresh;
+  // an in-flight older trigger records a pending kick instead of dropping it.
+  if (node && session && !closing && currentAddrJson) kickRenew();
 }
 
 function onPortVisibility(port, msg) {
@@ -616,6 +627,9 @@ async function stop() {
   closing = true;
   if (renewTimer) clearTimeout(renewTimer);
   renewTimer = null;
+  renewKickPending = false;
+  currentAddrJson = null;
+  admittedAddrJson = null;
   const endpointId = status.endpointId;
   const team = session && session.team;
   if (node) {

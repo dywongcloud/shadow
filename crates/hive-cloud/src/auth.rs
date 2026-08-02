@@ -204,7 +204,14 @@ pub async fn require_auth(
         || path == "/v1/git/webhook"
         || path == "/v1/billing/webhook"
         || path == "/v1/zkauth/register"
-        || path == "/v1/zkauth/preview-proof";
+        || path == "/v1/zkauth/preview-proof"
+        // This exact collection POST still fails closed in `admit()` via
+        // `fresh_user_claims`. Letting it reach that gate is what gives a
+        // missing/expired browser session the same structured
+        // `{error:{code,retryable}}` contract as every other admission denial;
+        // the middleware already inserted verified claims above when present.
+        // Item DELETE/accept routes remain protected here.
+        || path == "/v1/browser/admissions";
     if !is_mutation || open {
         return next.run(req).await;
     }
