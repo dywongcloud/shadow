@@ -99,45 +99,127 @@ export function useRunNode() {
   // BroadcastChannel the lock-holding tab is listening on. Callers never need
   // to know which.
   const sendRef = useRef<(msg: object) => void>(() => {});
+  // Stable per-TAB (not per-worker) identity (bn-ui-sharedworker-owner, the
+  // multi-tab-visibility item): under the Web Locks fallback several tabs
+  // share ONE real transport to the worker (`self`, owned by whichever tab
+  // won the lock) — tagging this tab's own control/visibility messages with
+  // an id lets the worker track each tab's contribution independently
+  // instead of every message colliding on the single shared channel. Lazily
+  // created once per hook mount; SSR has no `crypto`, so it's created only
+  // when first needed (inside the client-only effect below), never here.
+  const tabIdRef = useRef<string | null>(null);
+  function tabId(): string {
+    if (!tabIdRef.current) {
+      tabIdRef.current =
+        typeof crypto !== "undefined" && "randomUUID" in crypto
+          ? crypto.randomUUID()
+          : `tab-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+    return tabIdRef.current;
+  }
+  // Worker crash recovery (bn-ui-sharedworker-owner, the row's last remaining
+  // item): a background worker dying mid-session — an OOM reclaim, a wasm
+  // panic that takes the whole global scope with it, anything short of the
+  // owning tab itself closing (already handled by Web Locks re-election / a
+  // fresh SharedWorker connection) — previously had no detector at all; the
+  // node would just silently stop responding until a human noticed and
+  // manually reloaded. lastHeartbeatMs is bumped on EVERY inbound status
+  // message (the one chokepoint every transport already funnels through —
+  // same "count where every caller converges" reasoning as this repo's own
+  // request-cancellation guidance), so a live worker's periodic broadcasts
+  // (and this hook's own watchdog pings, below) both count as proof of life.
+  // Seeded 0 (not Date.now()) -- calling an impure function as a useRef
+  // initializer runs during render, which react-hooks/purity correctly flags.
+  // The real timestamp is stamped in the connection effect below instead,
+  // which runs post-render; a 0 default briefly read by the watchdog before
+  // that effect commits would just look "very stale", never worse than a
+  // harmless, no-op-on-a-fresh-mount reconnect attempt.
+  const lastHeartbeatRef = useRef<number>(0);
+  const reconnectRef = useRef<() => void>(() => {});
 
   const applyIncomingStatus = useCallback((raw: RunNodeStatus & { abiVersion?: number }) => {
+    lastHeartbeatRef.current = Date.now();
     // hostAbiStale is derived HERE, not carried by the worker: the worker can
     // only report its OWN abiVersion, never whether it's stale relative to
     // what THIS page build expects. Absent entirely means a pre-versioning
     // worker instance (still running from before this field existed) — also
     // stale by definition.
     const hostAbiStale = (raw.abiVersion ?? 0) < HOST_ABI_VERSION;
-    setStatusState((prev) => applyStatus(prev, { ...raw, hostAbiStale }));
+    setStatusState((prev) => applyStatus(prev, { ...raw, hostAbiStale, tabCount: raw.tabCount ?? 1 }));
   }, []);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    lastHeartbeatRef.current = Date.now();
 
     if (hasSharedWorker) {
       let worker: SharedWorker;
-      try {
-        worker = new SharedWorker(WORKER_URL, { type: "module", name: "shadw-run-node" });
-      } catch {
-        // Real, pre-existing eslint react-hooks/set-state-in-effect violation,
-        // fixed while touching this file for the host-ABI-versioning change
-        // above: a setState call synchronous within the effect body risks
-        // cascading renders per the rule's own rationale. queueMicrotask defers
-        // it by one microtask turn (functionally instantaneous, no visible
-        // delay) without changing behavior -- this DOES need to set state (a
-        // SharedWorker constructor throwing despite the capability check
-        // passing is a real runtime failure the UI must reflect), so the fix is
-        // deferral, not removal.
-        queueMicrotask(() => setSupported(false));
-        return;
-      }
-      const port = worker.port;
-      sendRef.current = (msg) => port.postMessage(msg);
-      port.onmessage = (e: MessageEvent) => {
-        const msg = e.data;
-        if (msg && msg.type === "status") applyIncomingStatus(msg.status);
+      // Definite-assignment assertion: `port` is written inside connect()/wire()
+      // (nested functions, so TS's linear control-flow analysis can't see the
+      // assignment from here) but is always assigned before reportVisibility/
+      // onPageHide/cleanup below ever run — `if (!connect()) return;`
+      // guarantees connect() succeeded (and therefore wire() assigned `port`)
+      // before any of those closures are even registered.
+      let port!: MessagePort;
+      let reconnecting = false;
+
+      const wire = (p: MessagePort) => {
+        sendRef.current = (msg) => p.postMessage(msg);
+        p.onmessage = (e: MessageEvent) => {
+          const msg = e.data;
+          if (msg && msg.type === "status") applyIncomingStatus(msg.status);
+        };
+        p.start();
+        p.postMessage({ type: "status" });
       };
-      port.start();
-      port.postMessage({ type: "status" });
+
+      const connect = (): boolean => {
+        try {
+          worker = new SharedWorker(WORKER_URL, { type: "module", name: "shadw-run-node" });
+        } catch {
+          // Real, pre-existing eslint react-hooks/set-state-in-effect violation,
+          // fixed while touching this file for the host-ABI-versioning change
+          // above: a setState call synchronous within the effect body risks
+          // cascading renders per the rule's own rationale. queueMicrotask defers
+          // it by one microtask turn (functionally instantaneous, no visible
+          // delay) without changing behavior -- this DOES need to set state (a
+          // SharedWorker constructor throwing despite the capability check
+          // passing is a real runtime failure the UI must reflect), so the fix is
+          // deferral, not removal.
+          queueMicrotask(() => setSupported(false));
+          return false;
+        }
+        port = worker.port;
+        wire(port);
+        // Worker crash recovery (bn-ui-sharedworker-owner): an ErrorEvent on
+        // the SharedWorker object itself (distinct from the port) is the
+        // browser's own signal that the shared worker's global scope threw
+        // uncaught — reconnect immediately rather than waiting out the
+        // watchdog's slower silence-based detection below.
+        worker.onerror = () => reconnectRef.current();
+        return true;
+      };
+
+      if (!connect()) return;
+
+      reconnectRef.current = () => {
+        if (reconnecting) return;
+        reconnecting = true;
+        try {
+          port.close();
+        } catch {
+          /* already gone */
+        }
+        // Optimistic reset: don't let the watchdog re-trigger on its very
+        // next tick before this fresh connection has had a chance to prove
+        // itself — the `new SharedWorker(...)` call below either attaches to
+        // the same still-alive process (a transient in-worker error) or the
+        // browser spins up a fresh one (the process genuinely died); either
+        // way a real status response lands within one heartbeat interval.
+        lastHeartbeatRef.current = Date.now();
+        connect();
+        reconnecting = false;
+      };
 
       // Page Lifecycle: tell the worker whether THIS tab can currently promise
       // foreground reliability, so it can report "suspended" honestly instead
@@ -176,6 +258,7 @@ export function useRunNode() {
         port.postMessage({ type: "visibility", visible: false, unloading: true });
         port.close();
         sendRef.current = () => {};
+        reconnectRef.current = () => {};
       };
     }
 
@@ -192,6 +275,7 @@ export function useRunNode() {
       let dedicatedWorker: Worker | null = null;
       let releaseLock: (() => void) | null = null;
       let cancelled = false;
+      const myTabId = tabId();
 
       // Every tab (owner or not) mirrors relayed status immediately — cheap,
       // and correct even for the owner tab itself (its own relayed broadcast
@@ -199,26 +283,61 @@ export function useRunNode() {
       // directly, and applyStatus's generation fencing drops the duplicate).
       statusChannel.onmessage = (e: MessageEvent) => applyIncomingStatus(e.data);
 
-      navigator.locks.request("shadw-run-node-owner", { mode: "exclusive" }, () => {
-        if (cancelled) return;
-        return new Promise<void>((resolve) => {
-          releaseLock = resolve;
-          dedicatedWorker = new Worker(WORKER_URL, { type: "module" });
-          const worker = dedicatedWorker;
-          worker.onmessage = (e: MessageEvent) => {
-            const msg = e.data;
-            if (msg && msg.type === "status") {
-              applyIncomingStatus(msg.status);
-              statusChannel.postMessage(msg.status);
-            }
-          };
-          worker.postMessage({ type: "status" });
-          // Owner handoff replay: this fresh worker boots at lifecycle
-          // "stopped" with no memory of anything — if the LAST thing this
-          // origin was doing was running a node (persisted by start(),
-          // cleared by stop()), replay it now instead of silently staying
-          // stopped until a human notices and re-clicks Start. Harmless
-          // no-op on a normal first-ever start (nothing persisted yet).
+      // Page Lifecycle (bn-ui-sharedworker-owner, the row's 2nd remaining
+      // item): previously wired ONLY for the SharedWorker branch above —
+      // under this fallback neither the owner tab nor any observer tab ever
+      // reported visibility, so online<->suspended toggling never happened
+      // here at all. Every tab (owner or not) reports through `sendRef`,
+      // which already resolves to whichever transport is live for THIS tab
+      // (direct to the worker once owned, controlChannel otherwise) — tagged
+      // with this tab's own id so several tabs sharing the owner's single
+      // real `self` channel are tracked independently by the worker's
+      // per-tabId onPortVisibility path instead of colliding on one key.
+      const reportVisibility = () => {
+        const visible = document.visibilityState === "visible";
+        sendRef.current({ type: "visibility", tabId: myTabId, visible });
+      };
+      const onPageHide = (e: PageTransitionEvent) => {
+        sendRef.current({ type: "visibility", tabId: myTabId, visible: false, unloading: !e.persisted });
+      };
+      const onPageShow = () => reportVisibility();
+
+      const wireOwnerWorker = (worker: Worker) => {
+        worker.onmessage = (e: MessageEvent) => {
+          const msg = e.data;
+          if (msg && msg.type === "status") {
+            applyIncomingStatus(msg.status);
+            statusChannel.postMessage(msg.status);
+          }
+        };
+        // Worker crash recovery (bn-ui-sharedworker-owner, the row's 3rd
+        // remaining item): mirrors the SharedWorker branch's onerror handler
+        // above — only the OWNER tab can see this (only it holds the real
+        // Worker reference), and only the owner can act on it (spawn a
+        // replacement). A non-owner tab has nothing to reconnect itself; if
+        // the owner TAB is what died (not just its worker), that's already
+        // covered by the Web Locks re-election electing a different tab.
+        worker.onerror = () => reconnectRef.current();
+        worker.postMessage({ type: "status" });
+        // Forward control messages non-owner tabs couldn't send directly.
+        controlChannel.onmessage = (e: MessageEvent) => worker.postMessage(e.data);
+        sendRef.current = (msg) => worker.postMessage(msg);
+        reportVisibility(); // this tab's own visibility, now that it owns a direct channel
+      };
+
+      const spawnOwnerWorker = (replay: boolean) => {
+        const worker = new Worker(WORKER_URL, { type: "module" });
+        dedicatedWorker = worker;
+        wireOwnerWorker(worker);
+        // Owner handoff replay: this fresh worker boots at lifecycle
+        // "stopped" with no memory of anything — if the LAST thing this
+        // origin was doing was running a node (persisted by start(),
+        // cleared by stop()), replay it now instead of silently staying
+        // stopped until a human notices and re-clicks Start. Harmless
+        // no-op on a normal first-ever start (nothing persisted yet), and
+        // the SAME replay a genuine crash-recovery restart needs — a worker
+        // that died mid-session should come back serving the same thing.
+        if (replay) {
           const last = readLastStart();
           if (last) {
             worker.postMessage({
@@ -231,9 +350,26 @@ export function useRunNode() {
               team: currentTeam(),
             });
           }
-          // Forward control messages non-owner tabs couldn't send directly.
-          controlChannel.onmessage = (e: MessageEvent) => worker.postMessage(e.data);
-          sendRef.current = (msg) => worker.postMessage(msg);
+        }
+      };
+
+      reconnectRef.current = () => {
+        if (!dedicatedWorker) return; // not the owner — nothing here to restart
+        const dead = dedicatedWorker;
+        try {
+          dead.terminate();
+        } catch {
+          /* already gone */
+        }
+        lastHeartbeatRef.current = Date.now(); // same optimistic-reset reasoning as the SharedWorker branch
+        spawnOwnerWorker(true);
+      };
+
+      navigator.locks.request("shadw-run-node-owner", { mode: "exclusive" }, () => {
+        if (cancelled) return;
+        return new Promise<void>((resolve) => {
+          releaseLock = resolve;
+          spawnOwnerWorker(true);
         });
       });
 
@@ -245,10 +381,24 @@ export function useRunNode() {
         sendRef.current = (msg) => controlChannel.postMessage(msg);
       }
 
+      document.addEventListener("visibilitychange", reportVisibility);
+      window.addEventListener("pagehide", onPageHide);
+      window.addEventListener("pageshow", onPageShow);
+      document.addEventListener("freeze", reportVisibility);
+      document.addEventListener("resume", reportVisibility);
+      reportVisibility();
+
       return () => {
+        document.removeEventListener("visibilitychange", reportVisibility);
+        window.removeEventListener("pagehide", onPageHide);
+        window.removeEventListener("pageshow", onPageShow);
+        document.removeEventListener("freeze", reportVisibility);
+        document.removeEventListener("resume", reportVisibility);
+        sendRef.current({ type: "visibility", tabId: myTabId, visible: false, unloading: true });
         cancelled = true;
         statusChannel.close();
         controlChannel.close();
+        reconnectRef.current = () => {};
         if (dedicatedWorker) {
           const worker = dedicatedWorker;
           // Give the worker a chance to see this as its last connection and
@@ -279,6 +429,31 @@ export function useRunNode() {
     // dependency array — including them would be redundant, never wrong.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [applyIncomingStatus]);
+
+  // Worker crash recovery watchdog (bn-ui-sharedworker-owner, the row's last
+  // remaining item): periodically pings whatever transport is currently live
+  // and, if no status response — direct or relayed, both flow through
+  // applyIncomingStatus which bumps lastHeartbeatRef — has landed within
+  // HEARTBEAT_TIMEOUT_MS, treats the worker as gone and reconnects via
+  // reconnectRef (assigned by whichever branch of the connection effect
+  // above is active). A separate effect, same reasoning as the network
+  // online/offline effect below: no cleanup dependency on which transport is
+  // active, it only needs sendRef/reconnectRef to exist. The timeout is
+  // deliberately generous relative to the interval — a legitimately busy
+  // worker (mid cold-boot wasm init, a slow admission round-trip) must never
+  // be mistaken for a crash and torn down mid-operation.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const HEARTBEAT_INTERVAL_MS = 15_000;
+    const HEARTBEAT_TIMEOUT_MS = 45_000;
+    const id = setInterval(() => {
+      sendRef.current({ type: "status" });
+      if (Date.now() - lastHeartbeatRef.current > HEARTBEAT_TIMEOUT_MS) {
+        reconnectRef.current();
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, []);
 
   const start = useCallback((args: StartArgs) => {
     persistLastStart(args);

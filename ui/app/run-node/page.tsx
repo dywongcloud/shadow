@@ -343,6 +343,14 @@ export default function RunNodePage() {
           <dd className="truncate font-mono text-secondary">{status.relay ?? "—"}</dd>
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
+          {status.tabCount > 1 && (
+            <>
+              <dt className="text-muted">Tabs</dt>
+              <dd className="text-secondary">
+                {status.tabCount} tabs open — this node keeps running as long as any of them is
+              </dd>
+            </>
+          )}
         </dl>
         {status.hostAbiStale ? (
           <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">

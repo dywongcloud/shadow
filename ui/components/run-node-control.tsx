@@ -16,12 +16,18 @@ export function RunNodeControl() {
   if (!supported) return null; // no SharedWorker in this browser — nothing to show here
 
   const { icon, tone, label } = visual(status.lifecycle);
+  // Multi-tab dedup UI (bn-ui-sharedworker-owner): surfaced here too, not
+  // just on the full /run-node page — this is the control most users will
+  // actually glance at, and "why does Stop here not really stop it" is
+  // exactly the confusion a tab count heads off.
+  const tabSuffix = status.tabCount > 1 ? ` (${status.tabCount} tabs)` : "";
+  const fullLabel = `Run a node — ${label}${tabSuffix}`;
 
   return (
     <Link
       href="/run-node"
-      aria-label={`Run a node — ${label}`}
-      title={`Run a node — ${label}`}
+      aria-label={fullLabel}
+      title={fullLabel}
       className="relative flex h-8 items-center gap-1.5 rounded-md px-2 text-secondary hover:bg-subtle hover:text-fg"
     >
       <span className={tone} aria-hidden="true">{icon}</span>
@@ -34,7 +40,7 @@ export function RunNodeControl() {
       )}
       {/* Announces lifecycle changes to screen readers even when this control
           isn't focused — the visible label/icon alone only helps sighted users. */}
-      <span className="sr-only" role="status" aria-live="polite">{`Run a node: ${label}`}</span>
+      <span className="sr-only" role="status" aria-live="polite">{`Run a node: ${label}${tabSuffix}`}</span>
     </Link>
   );
 }

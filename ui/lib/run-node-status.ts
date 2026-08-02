@@ -50,6 +50,11 @@ export interface RunNodeStatus {
   hostAbiStale: boolean;
   lastError: string | null;
   updatedMs: number;
+  /** Multi-tab dedup UI (bn-ui-sharedworker-owner): distinct tabs currently
+   *  attached to the owning worker, real vs. assumed-just-this-one. Defaults
+   *  to 1 for a pre-tabCount worker instance (absent on the wire) so an old
+   *  running worker never renders as "0 tabs". */
+  tabCount: number;
 }
 
 export function initialRunNodeStatus(): RunNodeStatus {
@@ -64,6 +69,7 @@ export function initialRunNodeStatus(): RunNodeStatus {
     hostAbiStale: false,
     lastError: null,
     updatedMs: 0,
+    tabCount: 1,
   };
 }
 

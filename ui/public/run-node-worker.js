@@ -84,6 +84,9 @@ let status = {
   protocolMismatch: "none",
   lastError: null,
   updatedMs: Date.now(),
+  // Multi-tab dedup UI (bn-ui-sharedworker-owner): how many distinct tabs are
+  // currently attached, real vs. assumed-just-this-one. See currentTabCount().
+  tabCount: 1,
 };
 
 // bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
@@ -102,7 +105,7 @@ function classifyAdmissionError(message) {
 }
 
 function broadcast() {
-  status = { ...status, version: status.version + 1, updatedMs: Date.now() };
+  status = { ...status, version: status.version + 1, updatedMs: Date.now(), tabCount: currentTabCount() };
   // A crashed/force-closed tab never sends `unloading` (that's a normal
   // pagehide/beforeunload path, which a crash skips entirely), so a
   // postMessage throw here is the ONLY signal such a port is gone. Previously
@@ -452,6 +455,20 @@ function anyVisible() {
   return false;
 }
 
+// Multi-tab dedup UI (bn-ui-sharedworker-owner, the row's 3rd remaining item):
+// a real per-tab count, not a guess. In SharedWorker mode `ports` already
+// holds one real MessagePort per connected tab and portVisibility is keyed by
+// those same port objects, so the two naturally agree. Under the Web Locks
+// fallback only ONE real transport exists (`self`, owned by the winning tab)
+// but every tab -- owner and observers alike -- now tags its own visibility
+// reports with a stable per-tab id (see onPortVisibility below), so
+// portVisibility.size is the true distinct-tab count there instead of always
+// reading 1. Falls back to ports.length (never 0 — this worker itself implies
+// at least one attached tab) before any report has arrived yet.
+function currentTabCount() {
+  return portVisibility.size > 0 ? portVisibility.size : Math.max(ports.length, 1);
+}
+
 // Reconnect machine (bn-p2p-reconnect-state, one real slice of it): a tab
 // reports real `online`/`offline` window events here (a Worker/SharedWorker
 // has no `navigator.onLine` visibility of its own — it only knows what a
@@ -514,7 +531,20 @@ function onNetworkChange(online) {
 }
 
 function onPortVisibility(port, msg) {
-  if (msg.unloading) {
+  // Web Locks fallback fan-in (bn-ui-sharedworker-owner): several tabs share
+  // ONE real transport (`self`, owned by the tab that won the lock) — the
+  // owner's own visibility reports and every non-owner observer's reports
+  // (relayed through the owner's controlChannel forward) all arrive here as
+  // the SAME `port` argument. Tagging each report with the sending tab's own
+  // stable id lets them be tracked independently in portVisibility instead of
+  // colliding on one key and losing every-but-the-last tab's signal. This
+  // path NEVER touches `ports` or calls stop() — losing one observer's
+  // visibility is not the same as the owner's actual connection to the worker
+  // going away (that untagged case, below, is unchanged from before).
+  if (msg.tabId) {
+    if (msg.unloading) portVisibility.delete(msg.tabId);
+    else portVisibility.set(msg.tabId, !!msg.visible);
+  } else if (msg.unloading) {
     portVisibility.delete(port);
     const idx = ports.indexOf(port);
     if (idx !== -1) ports.splice(idx, 1);
@@ -522,16 +552,21 @@ function onPortVisibility(port, msg) {
     // than run headless forever with no way for a user to ever stop it.
     if (ports.length === 0 && (node || status.lifecycle === "starting")) {
       stop();
+      return;
     }
-    return;
+  } else {
+    portVisibility.set(port, !!msg.visible);
   }
-  portVisibility.set(port, !!msg.visible);
   // Only toggle between online/suspended — never override starting/error/
   // stopped, which are driven by the connect/admit lifecycle itself.
   if (status.lifecycle === "online" && !anyVisible()) {
     setStatus({ lifecycle: "suspended" });
   } else if (status.lifecycle === "suspended" && anyVisible()) {
     setStatus({ lifecycle: "online" });
+  } else {
+    // Neither transition applies (e.g. tabCount changed but visibility
+    // didn't) — still worth a broadcast so tabCount stays live in the UI.
+    broadcast();
   }
 }
 
