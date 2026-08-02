@@ -94,6 +94,14 @@ struct FunctionPool {
     instance_ms_retired: u64,
     /// Instances reaped because they became unreachable (health/nack).
     dead_reaped: u64,
+    /// Requests served by a donated browser node instead of fleet compute
+    /// (`fluid-gateway::try_browser`'s success path never calls `lease()`, so
+    /// without this counter browser-served traffic is invisible to billing).
+    browser_requests: u64,
+    /// Sum of per-request active durations for browser-served requests —
+    /// tracked alongside `browser_requests` for a future distinct rate, kept
+    /// separate from `served_ms_sum` since it isn't fleet instance-time.
+    browser_served_ms: u64,
     /// Keep-warm failure backoff: the autoscaler won't attempt to warm this
     /// pool again until `now_ms()` reaches this. Prevents a pool whose cold
     /// starts keep failing (e.g. host out of locks/processes) from retrying
@@ -190,6 +198,12 @@ pub struct FunctionStats {
     pub savings_pct: f64,
     /// Instances reaped as unhealthy/unreachable and replaced.
     pub dead_reaped: u64,
+    /// Requests served by a donated browser node instead of fleet compute.
+    #[serde(default)]
+    pub browser_requests: u64,
+    /// Sum of active durations for browser-served requests.
+    #[serde(default)]
+    pub browser_ms: u64,
     // ---- Active CPU pricing (Vercel Fluid convention) -------------------------
     // Fluid bills the ACTIVE CPU time used (ms) plus the PROVISIONED MEMORY
     // (GB-hrs) — NOT idle wall-time. While an instance waits on I/O (DB, API, LLM)
@@ -486,6 +500,8 @@ impl Fluid {
                 served_ms_sum: 0,
                 instance_ms_retired: 0,
                 dead_reaped: 0,
+                browser_requests: 0,
+                browser_served_ms: 0,
                 warm_backoff_until_ms: 0,
                 warm_fail_streak: 0,
                 last_warm_ok_ms: 0,
@@ -629,6 +645,8 @@ impl Fluid {
                     max_instances: p.cfg.max_instances,
                     tenant: p.tenant.clone(),
                     requests: p.requests,
+                    browser_requests: p.browser_requests,
+                    browser_ms: p.browser_served_ms,
                     traditional_ms,
                     fluid_ms,
                     savings_pct,
@@ -1095,6 +1113,18 @@ impl Fluid {
                 inst.last_active_ms = now_ms();
                 inst.requests_served += 1;
             }
+        }
+    }
+
+    /// Called by `fluid-gateway::try_browser` on a successful browser-served
+    /// response — the ONLY metering chokepoint for that path, since it never
+    /// calls `lease()` and so never reaches `release()` above. No-op if the
+    /// pool is unknown (a browser target can outlive the pool that would
+    /// otherwise back it, e.g. before any fleet cold start has ever run).
+    pub fn record_browser_request(&self, key: &str, active_ms: u64) {
+        if let Some(pool) = self.registry.lock().get_mut(key) {
+            pool.browser_requests += 1;
+            pool.browser_served_ms += active_ms;
         }
     }
 

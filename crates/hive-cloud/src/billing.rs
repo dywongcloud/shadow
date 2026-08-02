@@ -162,6 +162,13 @@ pub struct RateCard {
     pub waf_per_million_cents: f64,
     /// Serverless GPU instance-time, cents per GPU-hour (Tesla T4 class).
     pub gpu_hr_cents: f64,
+    /// Requests served by a donated browser node, cents per million. 0.0 by
+    /// design (bn-impl-billing-metering): Cloudflare/Salad precedent is to
+    /// bill only platform-consumed resources, and an owner's own browser
+    /// serving their own app consumes none. Kept as a real rate-card field
+    /// (not omitted) so pricing it later is a config change, not a schema
+    /// migration.
+    pub browser_per_million_cents: f64,
 }
 
 pub const RATE_CARD: RateCard = RateCard {
@@ -170,6 +177,7 @@ pub const RATE_CARD: RateCard = RateCard {
     requests_per_million_cents: 200.0, // $2.00 / M requests
     waf_per_million_cents: 60.0,       // $0.60 / M blocked
     gpu_hr_cents: 60.0,                // $0.60 / GPU-hr (T4 class)
+    browser_per_million_cents: 0.0,    // uncharged today, see field doc
 };
 
 /// Cumulative usage counters for a tenant (as measured from live metrics).
@@ -185,6 +193,11 @@ pub struct UsageTotals {
     /// unit). `serde(default)` keeps persisted pre-GPU snapshots loading.
     #[serde(default)]
     pub gpu_ms: u64,
+    /// Requests served by a donated browser node — counted separately from
+    /// `requests` so it's visible in the UI/quota ahead of any pricing
+    /// decision, never silently folded into the billed fleet-request count.
+    #[serde(default)]
+    pub browser_requests: u64,
 }
 
 impl RateCard {
@@ -195,6 +208,7 @@ impl RateCard {
             + (u.requests as f64 / 1_000_000.0) * self.requests_per_million_cents
             + (u.blocked as f64 / 1_000_000.0) * self.waf_per_million_cents
             + (u.gpu_ms as f64 / 3_600_000.0) * self.gpu_hr_cents
+            + (u.browser_requests as f64 / 1_000_000.0) * self.browser_per_million_cents
     }
 }
 
@@ -522,6 +536,7 @@ impl BillingStore {
                 requests: sub(current.requests, st.last.requests),
                 blocked: sub(current.blocked, st.last.blocked),
                 gpu_ms: sub(current.gpu_ms, st.last.gpu_ms),
+                browser_requests: sub(current.browser_requests, st.last.browser_requests),
             };
             st.last = current;
             (delta, st.frac_cents)
@@ -1084,6 +1099,7 @@ mod tests {
             requests: 1_000_000,
             blocked: 0,
             gpu_ms: 0,
+            browser_requests: 0,
         };
         let c = RATE_CARD.cost_cents(&u);
         assert!((c - (12.8 + 1.06 + 200.0)).abs() < 1e-6, "got {c}");

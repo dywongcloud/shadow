@@ -3539,6 +3539,15 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                     .mem_gb_hr_milli
                     .saturating_add((s.memory_gb_hrs * 1000.0) as u64);
                 t.requests = t.requests.saturating_add(s.requests);
+                // Counted SEPARATELY from `t.requests`, never folded in: the
+                // bn-impl-billing-metering design decision is NO per-invocation
+                // charge for owner-served browser traffic (Cloudflare/Salad
+                // precedent -- bill only platform-consumed resources). This
+                // counter exists so quota/UI have real numbers ahead of any
+                // future distinct rate; RateCard.browser_per_million_cents is
+                // 0.0 today, not omitted, so pricing it later needs no schema
+                // migration.
+                t.browser_requests = t.browser_requests.saturating_add(s.browser_requests);
                 if s.gpu {
                     // GPU is held for the instance's entire life — meter its
                     // wall-time (fluid_ms), not just active CPU.

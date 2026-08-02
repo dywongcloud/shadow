@@ -2212,10 +2212,18 @@ async fn try_browser(
         "bodyBase64": base64_encode(body),
     })
     .to_string();
+    let invoke_started = now_ms();
     let result = invoker(target.clone(), request).await;
     let failure = match result {
         Ok(bytes) => match browser_response(&bytes) {
-            Ok(response) => return BrowserAttempt::Response(response),
+            Ok(response) => {
+                // The ONLY metering chokepoint for browser-served traffic:
+                // this path never calls gw.fluid.lease(), so release() (which
+                // increments FunctionPool::requests) never runs for it.
+                gw.fluid
+                    .record_browser_request(&key, now_ms().saturating_sub(invoke_started));
+                return BrowserAttempt::Response(response);
+            }
             Err(message) => BrowserInvokeFailure {
                 sent: true,
                 message,
