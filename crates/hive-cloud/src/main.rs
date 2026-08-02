@@ -97,6 +97,33 @@ use hive_edge::{
 
 use state::CloudState;
 
+/// The embedded relay's `AccessControl` (bn-p2p-revocation-latency) — see the
+/// doc comment at its construction site (in `main`, right before the relay is
+/// spawned) for why it's denylist-shaped and why `cloud` is a deferred cell.
+#[derive(Debug)]
+struct BrowserRelayAccess {
+    cloud: Arc<std::sync::OnceLock<std::sync::Weak<CloudState>>>,
+}
+
+impl iroh_relay::server::AccessControl for BrowserRelayAccess {
+    async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> iroh_relay::server::Access {
+        let Some(cloud) = self.cloud.get().and_then(|w| w.upgrade()) else {
+            // Either CloudState isn't constructed yet (a connection landing in
+            // the narrow startup window) or it has already been dropped
+            // (shutdown) — fail open, matching this relay's existing
+            // best-effort convention.
+            return iroh_relay::server::Access::Allow;
+        };
+        let endpoint_id = request.endpoint_id().to_string();
+        if cloud.browser_admissions.is_denied(&endpoint_id, hive_core::now_ms()) {
+            return iroh_relay::server::Access::Deny {
+                reason: Some("browser admission revoked".to_string()),
+            };
+        }
+        iroh_relay::server::Access::Allow
+    }
+}
+
 // Heap profiling, Linux only. jemalloc replaces the system allocator so a heap
 // profile can be taken from a LIVE node, which is the capability whose absence
 // left the 2026-07 fc-sanjose OOM (RSS ~12.9GB anon before the kernel killed
@@ -410,8 +437,27 @@ async fn main() -> anyhow::Result<()> {
         std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
         relay_port,
     );
+    // Deny revoked browser endpoints AT THE RELAY (bn-p2p-revocation-latency):
+    // routing-layer revocation (`fluid_gateway`'s browser target removal)
+    // stops NEW invocations from picking a revoked target, but a revoked
+    // endpoint could still reconnect and sit on the relay indefinitely. This
+    // is a real `AccessControl` (iroh-relay 1.0.2's `RelayConfig.access`,
+    // `Arc<dyn DynAccessControl>`, default `AllowAll`) keyed on the
+    // handshake-PROVEN `EndpointId`, denylist-shaped so it never affects
+    // fleet-mesh peers relaying through this SAME server (only endpoint_ids
+    // this node's OWN `browser_admissions` store has explicitly revoked are
+    // ever denied — everyone else, including every fleet node, is Allow).
+    // `CloudState` doesn't exist yet at this point in boot, so the impl reads
+    // through a `Weak` cell filled in once it does (`browser_relay_access_cell`
+    // below) — until then it fails OPEN (Allow), matching this whole relay
+    // block's existing best-effort/fail-open convention.
+    let browser_relay_access_cell: Arc<std::sync::OnceLock<std::sync::Weak<CloudState>>> =
+        Arc::new(std::sync::OnceLock::new());
     let mut embedded_relay_cfg = iroh_relay::server::ServerConfig::default();
     let mut relay_cfg = iroh_relay::server::RelayConfig::new(relay_bind);
+    relay_cfg.access = Arc::new(BrowserRelayAccess {
+        cloud: browser_relay_access_cell.clone(),
+    });
     // PER-CLIENT INGRESS RATE LIMIT. This relay is PUBLIC-FACING on :3340 on
     // every node and previously ran with `Limits::default()`, i.e. none at all.
     // n0's own guidance is blunt that a relay has finite bandwidth and finite
@@ -603,6 +649,12 @@ async fn main() -> anyhow::Result<()> {
         hive,
         sandbox_fc,
     );
+    // Fill the embedded relay's deferred AccessControl cell now that
+    // CloudState finally exists (it was constructed and wired into the relay
+    // config well before this point — see the relay-spawn block above).
+    // `Weak` deliberately: the AccessControl impl must never be the thing
+    // keeping CloudState alive.
+    let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
 
     // `--acme-txt-selftest` seed (see the arg's doc comment).
     if let Some((fqdn, value)) = args

@@ -42,6 +42,23 @@ let renewTimer = null;
 let closing = false;
 let session = null; // { deployment, fn, digest, scope, team, relay }
 
+// Epoch fencing (bn-p2p-reconnect-state, bn-p2p-resurrection-after-stop):
+// start()'s async boot (wasm init + BrowserNode.boot, seconds on a cold
+// fetch), the scheduled renewal tick, and the network-restore admit all
+// re-check `closing`/`node` only BEFORE their await, never after — so a
+// stop() that lands while any of them is in flight is invisible to the
+// continuation that resumes afterward, and it can resurrect a node the user
+// just explicitly cancelled (repro: click Start, click Stop within the init
+// window). `closing` alone can't fence this: it is cleared back to `false`
+// at the end of stop() itself, so a start() continuation checking it after
+// stop() has already finished sees `closing === false` again and proceeds
+// anyway. `epoch` is bumped by EVERY start()/stop() call and captured by
+// value before each async gap; any continuation whose captured epoch no
+// longer matches the live counter is stale and must undo whatever it just
+// created (close a booted node, revoke an admission) instead of publishing
+// it.
+let epoch = 0;
+
 let status = {
   version: 0,
   abiVersion: HOST_ABI_VERSION,
@@ -125,11 +142,13 @@ let renewInFlight = false;
 
 function scheduleRenew(addrJson, endpointId) {
   if (renewTimer) clearInterval(renewTimer);
+  const myEpoch = epoch;
   renewTimer = setInterval(async () => {
-    if (closing || !node || renewInFlight) return;
+    if (closing || !node || renewInFlight || myEpoch !== epoch) return;
     renewInFlight = true;
     try {
       await admitOnce(addrJson, endpointId);
+      if (myEpoch !== epoch) return; // stop() (or a new start()) ran mid-renewal
       // Derive lifecycle from CURRENT visibility rather than hardcoding
       // "online" — a background renewal tick must not un-suspend a node
       // whose tabs are all still hidden.
@@ -138,6 +157,7 @@ function scheduleRenew(addrJson, endpointId) {
         setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
       }
     } catch (e) {
+      if (myEpoch !== epoch) return;
       const message = String((e && e.message) || e);
       const mismatch = classifyAdmissionError(message);
       if (mismatch === "outdated") {
@@ -159,8 +179,34 @@ function scheduleRenew(addrJson, endpointId) {
   }, RENEW_INTERVAL_MS);
 }
 
+// Discard a boot this epoch no longer owns: close/free a real node if one was
+// created, best-effort revoke an admission if one was already granted. Never
+// touches `node`/`status` — a newer epoch may already own those.
+async function discardStaleAttempt(bootedNode, admittedEndpointId, team) {
+  if (admittedEndpointId && team) {
+    try {
+      await callApi("DELETE", `/v1/browser/admissions/${encodeURIComponent(admittedEndpointId)}`, team);
+    } catch {
+      /* best-effort — the lease also expires on its own */
+    }
+  }
+  if (bootedNode) {
+    try {
+      await bootedNode.close();
+    } catch {
+      /* already gone */
+    }
+    try {
+      bootedNode.free();
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 async function start(msg) {
   if (node || status.lifecycle === "starting") return;
+  const myEpoch = ++epoch;
   session = {
     deployment: msg.deployment,
     fn: msg.fn,
@@ -170,8 +216,11 @@ async function start(msg) {
     relay: msg.relay,
   };
   setStatus({ lifecycle: "starting", lastError: null, admission: "pending" });
+  let booted = null;
+  let admittedEndpointId = null;
   try {
     await init();
+    if (myEpoch !== epoch) return; // stop() ran during wasm init
     // Check the ACTUAL loaded module's version, not just an assumption from
     // the URL/cache key — catches a stale service-worker-cached .wasm binary
     // paired with fresh JS glue, which a filename/URL check alone can't see.
@@ -185,6 +234,10 @@ async function start(msg) {
     // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
     // the persisted seed so the reported id is stable across reloads.
     const scratch = await BrowserNode.boot(msg.relay, null, null);
+    if (myEpoch !== epoch) {
+      await discardStaleAttempt(scratch, null, msg.team);
+      return;
+    }
     const { seedHex, created } = await loadOrCreateSeed(scratch.secretHex());
     let n;
     if (created) {
@@ -194,14 +247,37 @@ async function start(msg) {
       scratch.free();
       n = await BrowserNode.boot(msg.relay, msg.discovery || null, seedHex);
     }
+    booted = n;
+    if (myEpoch !== epoch) {
+      await discardStaleAttempt(booted, null, msg.team);
+      return;
+    }
+    const endpointId = n.nodeId();
+    const addrJson = n.addrJson();
+    // Publish the node + endpointId ONLY once this epoch is confirmed still
+    // current — everything above this line touched only locals, so a stale
+    // epoch up to here has nothing to unpublish.
     node = n;
-    const endpointId = node.nodeId();
-    const addrJson = node.addrJson();
     setStatus({ endpointId, relay: msg.relay, lifecycle: anyVisible() ? "online" : "suspended" });
     await admitOnce(addrJson, endpointId);
+    admittedEndpointId = endpointId;
+    if (myEpoch !== epoch) {
+      // stop() ran after we published `node` but before we could confirm the
+      // admission — undo both: revoke the grant we just created and close
+      // the node stop() itself never got to see, then leave `node`/`status`
+      // alone (stop() already reset them to stopped/none).
+      node = null;
+      await discardStaleAttempt(booted, admittedEndpointId, msg.team);
+      return;
+    }
     setStatus({ admission: "granted", protocolMismatch: "none", lastError: null });
     scheduleRenew(addrJson, endpointId);
   } catch (e) {
+    if (myEpoch !== epoch) {
+      // A stale attempt failing is not this epoch's error to report.
+      await discardStaleAttempt(booted, admittedEndpointId, msg.team);
+      return;
+    }
     const message = String((e && e.message) || e);
     setStatus({
       lifecycle: "error",
@@ -250,12 +326,15 @@ function onNetworkChange(online) {
   const endpointId = status.endpointId;
   if (node && session && !closing && endpointId && !renewInFlight) {
     renewInFlight = true;
+    const myEpoch = epoch;
     admitOnce(node.addrJson(), endpointId)
       .then(() => {
+        if (myEpoch !== epoch) return; // stop() (or a new start()) ran meanwhile
         const lifecycle = anyVisible() ? "online" : "suspended";
         setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
       })
       .catch((e) => {
+        if (myEpoch !== epoch) return;
         const message = String((e && e.message) || e);
         setStatus({
           admission: "denied",
@@ -293,6 +372,7 @@ function onPortVisibility(port, msg) {
 }
 
 async function stop() {
+  epoch++; // fences every in-flight start()/renew continuation from this point on
   closing = true;
   if (renewTimer) clearInterval(renewTimer);
   renewTimer = null;

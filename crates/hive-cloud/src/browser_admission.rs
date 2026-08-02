@@ -29,6 +29,15 @@ const DEFAULT_SESSION_MAX_AGE_SECS: u64 = 300;
 const DEFAULT_CLOCK_SKEW_SECS: u64 = 30;
 const TOMBSTONE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_ADDR_JSON_BYTES: usize = 16 * 1024;
+/// How long an explicit revoke also denies the endpoint at the RELAY layer
+/// (bn-p2p-revocation-latency's relay-AccessControl half). Deliberately much
+/// shorter than `TOMBSTONE_RETENTION_MS`: this is a network-level block on
+/// reconnecting, not the admission-store's own bookkeeping retention, and it
+/// must not outlive any plausible legitimate re-admission — a permanently
+/// denylisted endpoint_id that the SAME browser later re-uses (a fresh tab
+/// reload keeps its persisted identity) would be denied forever with no
+/// recovery path.
+const RELAY_DENYLIST_RETENTION_MS: u64 = 10 * 60 * 1_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserAdmission {
@@ -67,6 +76,13 @@ struct BrowserAdmissionSnapshot {
     version: u64,
     active: BTreeMap<String, BrowserAdmission>,
     tombstones: BTreeMap<String, u64>,
+    /// EXPLICIT revocations only (endpoint_id -> revoked-at ms) -- unlike
+    /// `tombstones` above, a plain lease `expire()` never writes here.
+    /// Conflating the two would deny relay-level reconnection for every
+    /// browser node whose lease simply ran out (the overwhelmingly common,
+    /// expected case), not just the ones an operator actually revoked.
+    #[serde(default)]
+    denylist: BTreeMap<String, u64>,
 }
 
 impl BrowserAdmissionSnapshot {
@@ -75,6 +91,7 @@ impl BrowserAdmissionSnapshot {
             version: hive_core::now_ms().max(1),
             active: BTreeMap::new(),
             tombstones: BTreeMap::new(),
+            denylist: BTreeMap::new(),
         }
     }
 
@@ -86,6 +103,8 @@ impl BrowserAdmissionSnapshot {
     fn prune_tombstones(&mut self, now: u64) {
         let floor = now.saturating_sub(TOMBSTONE_RETENTION_MS);
         self.tombstones.retain(|_, revision| *revision >= floor);
+        let deny_floor = now.saturating_sub(RELAY_DENYLIST_RETENTION_MS);
+        self.denylist.retain(|_, revoked_at| *revoked_at >= deny_floor);
     }
 }
 
@@ -99,6 +118,10 @@ pub struct BrowserAdmissionCounters {
     pub revocations_total: u64,
     pub expirations_total: u64,
     pub denials_total: u64,
+    /// Live size of the relay-level denylist (bn-p2p-revocation-latency) —
+    /// bounded (self-prunes on `RELAY_DENYLIST_RETENTION_MS`) and tenant-free,
+    /// same shape as every other counter here.
+    pub relay_denylist_size: usize,
 }
 
 #[derive(Default)]
@@ -125,12 +148,17 @@ impl BrowserAdmissionStore {
 
     pub fn stats(&self) -> BrowserAdmissionCounters {
         use std::sync::atomic::Ordering::Relaxed;
+        let mut state = self.inner.lock();
+        state.prune_tombstones(hive_core::now_ms());
+        let relay_denylist_size = state.denylist.len();
+        drop(state);
         BrowserAdmissionCounters {
             admissions_total: self.counters.admissions_total.load(Relaxed),
             renewals_total: self.counters.renewals_total.load(Relaxed),
             revocations_total: self.counters.revocations_total.load(Relaxed),
             expirations_total: self.counters.expirations_total.load(Relaxed),
             denials_total: self.counters.denials_total.load(Relaxed),
+            relay_denylist_size,
         }
     }
 
@@ -159,6 +187,17 @@ impl BrowserAdmissionStore {
             .active
             .get(endpoint_id)
             .is_some_and(|record| record.expires_ms > now)
+    }
+
+    /// Explicit-revocation check for the embedded relay's `AccessControl`
+    /// (bn-p2p-revocation-latency) -- deliberately NOT `endpoint_active`'s
+    /// negation. A browser between leases (renewal hasn't landed yet, or it
+    /// simply isn't currently admitted to anything) is not "denied"; only an
+    /// endpoint an operator actually revoked is.
+    pub fn is_denied(&self, endpoint_id: &str, now: u64) -> bool {
+        let mut state = self.inner.lock();
+        state.prune_tombstones(now);
+        state.denylist.contains_key(endpoint_id)
     }
 
     fn put(&self, mut record: BrowserAdmission) -> Result<Option<BrowserAdmission>, &'static str> {
@@ -194,6 +233,7 @@ impl BrowserAdmissionStore {
         let record = state.active.remove(endpoint_id)?;
         let revision = state.next_version();
         state.tombstones.insert(endpoint_id.to_string(), revision);
+        state.denylist.insert(endpoint_id.to_string(), hive_core::now_ms());
         state.prune_tombstones(hive_core::now_ms());
         self.counters
             .revocations_total
@@ -213,11 +253,13 @@ impl BrowserAdmissionStore {
             return Vec::new();
         }
         let revision = state.next_version();
+        let now = hive_core::now_ms();
         let mut removed = Vec::with_capacity(ids.len());
         for id in ids {
             if let Some(record) = state.active.remove(&id) {
                 removed.push(record);
-                state.tombstones.insert(id, revision);
+                state.tombstones.insert(id.clone(), revision);
+                state.denylist.insert(id, now);
             }
         }
         state.prune_tombstones(hive_core::now_ms());
