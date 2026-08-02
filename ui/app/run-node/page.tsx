@@ -367,6 +367,23 @@ export default function RunNodePage() {
             </>
           )}
         </dl>
+        {status.lifecycle === "suspended" && (
+          // Background/suspension honesty (bn-ui-mobile-lifecycle): "suspended"
+          // means every tab that could observe this node is currently hidden —
+          // the underlying admission is still held (so a backgrounded tab
+          // brought back to the foreground resumes instantly), but no traffic is
+          // actually being served right now. On mobile especially, a backgrounded
+          // browser tab is not a reliable long-running server: the OS can freeze
+          // or fully discard it at any time with no further warning from this
+          // page, so this never claims "still working in the background" — the
+          // one thing this feature must not promise where the platform can't
+          // actually provide it.
+          <div className="mt-3 rounded-md bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400" role="status">
+            Not currently serving — every tab is in the background. Traffic resumes the instant you bring one back to
+            the foreground, but a backgrounded browser tab (especially on mobile) can be frozen or fully closed by
+            the OS at any time with no warning here.
+          </div>
+        )}
         {status.hostAbiStale ? (
           <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
