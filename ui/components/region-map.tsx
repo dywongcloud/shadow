@@ -215,6 +215,7 @@ export function RegionMap({
   const satelliteOverflow = Math.max(0, satellites.length - placedSatellites.length);
 
   return (
+    <>
     <svg
       viewBox={`0 0 ${GW} ${GH}`}
       className="block w-full text-slate-300 dark:text-slate-700"
@@ -271,7 +272,16 @@ export function RegionMap({
       {/* Browser-node satellites — deliberately smaller, a diamond glyph (never
           a circle, so it can never be mistaken for a trusted fleet marker even
           at a glance), and animated only under prefers-reduced-motion:no-preference. */}
-      {placedSatellites.map((s, i) => (
+      {placedSatellites.map((s, i) => {
+        // Color-independent state encoding (bn-ui-accessibility): online vs
+        // degraded/suspended was previously ONLY a fill-color difference
+        // (sky-400 vs slate-400) — indistinguishable for some color-vision
+        // deficiencies. A dashed ring (the same non-color technique already
+        // used for the GPU badge above) gives sighted users a second,
+        // color-independent cue; the sr-only list and <title> already cover
+        // the same state in TEXT for screen readers.
+        const degraded = s.state === "degraded" || s.state === "suspended";
+        return (
         <g key={`sat-${s.id}-${i}`} opacity={0.9}>
           <circle cx={s.x} cy={s.y} r={1.1} fill={s.color} opacity={0.18} className="motion-safe:animate-pulse" />
           <rect
@@ -284,11 +294,23 @@ export function RegionMap({
             strokeWidth={0.12}
             transform={`rotate(45 ${s.x} ${s.y})`}
           />
+          {degraded && (
+            <circle
+              cx={s.x}
+              cy={s.y}
+              r={1.4}
+              fill="none"
+              stroke={s.color}
+              strokeWidth={0.15}
+              strokeDasharray="0.35 0.3"
+            />
+          )}
           <title>
             {(s.label || s.id) + " · browser node (low-trust)" + (s.state ? ` · ${s.state}` : "")}
           </title>
         </g>
-      ))}
+        );
+      })}
       {/* Honest overflow indicator: the aria-label above already reports the
           TRUE satellite count, but nothing previously told a sighted user
           their on-map count was capped. Placed in the bottom-right corner in
@@ -308,5 +330,28 @@ export function RegionMap({
         </text>
       )}
     </svg>
+    {/* Per-satellite screen-reader summaries (bn-ui-accessibility): the SVG
+        markers above carry a <title> each, but <title> only surfaces on mouse
+        hover / a screen reader's own SVG-traversal mode — nothing here is
+        keyboard-focusable, so a keyboard/screen-reader user had NO way to
+        discover individual satellites at all, only the single aggregate
+        aria-label on the whole map. Making all 300 rendered satellite <g>s
+        individually tab-focusable would be its own regression (300 tab stops
+        to get past the map), so this follows the standard "text alternative
+        for a dense visualization" pattern instead: a visually-hidden list,
+        reachable by a screen reader's normal content-browsing mode without
+        consuming any Tab stops, covering the FULL satellite set (not capped
+        by MAX_RENDERED_SATELLITES — a text list has none of the SVG
+        rendering-cost concern that cap exists for). */}
+    {satellites.length > 0 && (
+      <ul className="sr-only">
+        {satellites.map((s, i) => (
+          <li key={`sat-sr-${s.id}-${i}`}>
+            {(s.label || s.id) + " · browser node (low-trust)" + (s.state ? ` · ${s.state}` : "")}
+          </li>
+        ))}
+      </ul>
+    )}
+    </>
   );
 }
