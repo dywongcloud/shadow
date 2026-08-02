@@ -89,11 +89,30 @@ function classifyAdmissionError(message) {
 
 function broadcast() {
   status = { ...status, version: status.version + 1, updatedMs: Date.now() };
+  // A crashed/force-closed tab never sends `unloading` (that's a normal
+  // pagehide/beforeunload path, which a crash skips entirely), so a
+  // postMessage throw here is the ONLY signal such a port is gone. Previously
+  // swallowed with a comment claiming lazy pruning existed elsewhere — it
+  // didn't, so a dead port sat in `ports` forever, `ports.length===0` never
+  // became true, and the last-tab auto-stop in onPortVisibility could never
+  // fire. Collected during the loop (never splice while iterating) and
+  // pruned the same way an explicit `unloading` message does.
+  const dead = [];
   for (const p of ports) {
     try {
       p.postMessage({ type: "status", status });
     } catch {
-      /* a port whose page has gone away — harmless, pruned lazily below */
+      dead.push(p);
+    }
+  }
+  if (dead.length) {
+    for (const p of dead) {
+      portVisibility.delete(p);
+      const idx = ports.indexOf(p);
+      if (idx !== -1) ports.splice(idx, 1);
+    }
+    if (ports.length === 0 && (node || status.lifecycle === "starting")) {
+      stop();
     }
   }
 }

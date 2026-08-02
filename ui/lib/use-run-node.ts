@@ -7,6 +7,45 @@ import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus
 const WORKER_URL = "/run-node-worker.js";
 const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || "";
 
+// Web-Locks-fallback owner handoff (bn-ui-sharedworker-owner): unlike a real
+// SharedWorker (which outlives any single tab), a Web Locks re-election spawns
+// a BRAND NEW dedicated Worker with no memory of what was running before —
+// the crashed/closed owner's node silently never comes back unless something
+// tells the fresh worker to start again. Persisted (not just in-memory) so it
+// survives the owner tab actually closing, which is exactly the case that
+// needs it. `relay`/`team` are deliberately NOT persisted here — they're
+// re-derived fresh (RELAY from env, team via currentTeam()) at replay time
+// rather than trusting a stale snapshot.
+const LAST_START_KEY = "hive_run_node_last_start";
+function persistLastStart(args: StartArgs) {
+  try {
+    localStorage.setItem(
+      LAST_START_KEY,
+      JSON.stringify({ deployment: args.deployment, fn: args.fn, digest: args.digest, scope: args.scope ?? "team" }),
+    );
+  } catch {
+    /* storage unavailable/full — replay-on-handoff just won't happen */
+  }
+}
+function readLastStart(): StartArgs | null {
+  try {
+    const raw = localStorage.getItem(LAST_START_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.deployment !== "string") return null;
+    return parsed as StartArgs;
+  } catch {
+    return null;
+  }
+}
+function clearLastStart() {
+  try {
+    localStorage.removeItem(LAST_START_KEY);
+  } catch {
+    /* ignore */
+  }
+}
+
 export interface StartArgs {
   deployment: string;
   fn: string;
@@ -156,6 +195,24 @@ export function useRunNode() {
             }
           };
           worker.postMessage({ type: "status" });
+          // Owner handoff replay: this fresh worker boots at lifecycle
+          // "stopped" with no memory of anything — if the LAST thing this
+          // origin was doing was running a node (persisted by start(),
+          // cleared by stop()), replay it now instead of silently staying
+          // stopped until a human notices and re-clicks Start. Harmless
+          // no-op on a normal first-ever start (nothing persisted yet).
+          const last = readLastStart();
+          if (last) {
+            worker.postMessage({
+              type: "start",
+              relay: RELAY,
+              deployment: last.deployment,
+              fn: last.fn,
+              digest: last.digest,
+              scope: last.scope ?? "team",
+              team: currentTeam(),
+            });
+          }
           // Forward control messages non-owner tabs couldn't send directly.
           controlChannel.onmessage = (e: MessageEvent) => worker.postMessage(e.data);
           sendRef.current = (msg) => worker.postMessage(msg);
@@ -174,7 +231,23 @@ export function useRunNode() {
         cancelled = true;
         statusChannel.close();
         controlChannel.close();
-        if (dedicatedWorker) (dedicatedWorker as Worker).terminate();
+        if (dedicatedWorker) {
+          const worker = dedicatedWorker;
+          // Give the worker a chance to see this as its last connection and
+          // self-stop (releasing its backend admission) via the SAME
+          // unloading-visibility path the SharedWorker branch above already
+          // uses (connectPort/onPortVisibility in run-node-worker.js is
+          // shared code, not a reimplementation) — a bare terminate() with no
+          // signal leaves the admission to live out its full lease
+          // unnecessarily. Bounded: stop() does an awaited network DELETE,
+          // which terminate() would otherwise cut off mid-flight regardless.
+          try {
+            worker.postMessage({ type: "visibility", visible: false, unloading: true });
+          } catch {
+            /* already gone */
+          }
+          setTimeout(() => worker.terminate(), 500);
+        }
         releaseLock?.();
         sendRef.current = () => {};
       };
@@ -190,6 +263,7 @@ export function useRunNode() {
   }, [applyIncomingStatus]);
 
   const start = useCallback((args: StartArgs) => {
+    persistLastStart(args);
     sendRef.current({
       type: "start",
       relay: RELAY,
@@ -221,6 +295,7 @@ export function useRunNode() {
   }, []);
 
   const stop = useCallback(() => {
+    clearLastStart();
     sendRef.current({ type: "stop" });
   }, []);
 
