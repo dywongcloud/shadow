@@ -775,6 +775,22 @@ async fn main() -> anyhow::Result<()> {
                     })
             })
         }));
+        // Team-scoped browser targets (bn-team-scoped-browser-targets-never-served):
+        // resolve the CALLER's authenticated tenant from the same headers
+        // auth::require_auth already accepts (Bearer / hive_jwt cookie / a
+        // dashboard API key) so try_browser can gate a Team-scoped target to
+        // members of its own owning tenant, never a public/anonymous caller.
+        // Public-scoped targets never call this at all.
+        {
+            let cloud_for_resolver = cloud.clone();
+            gw.set_browser_claims_resolver(std::sync::Arc::new(move |headers| {
+                let token = crate::auth::extract_token(headers)?;
+                crate::auth::verify(&token)
+                    .ok()
+                    .or_else(|| crate::auth::api_key_claims(&cloud_for_resolver, &token))
+                    .map(|claims| crate::admin::norm(&claims.tenant).to_string())
+            }));
+        }
         // Live relay-set tracker (dynamic-hive-relay-urls-list): kept alongside
         // `mesh`, synced on an interval by `spawn_relay_sync_loop` below.
         *cloud.relay_set.write() = Some(hive_p2p::RelaySet::new(ep.clone()));

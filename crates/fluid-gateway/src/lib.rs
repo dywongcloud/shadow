@@ -79,10 +79,19 @@ pub struct BrowserInvokeFailure {
 pub type BrowserInvokeFuture =
     Pin<Box<dyn Future<Output = Result<Vec<u8>, BrowserInvokeFailure>> + Send>>;
 pub type BrowserInvoker = Arc<dyn Fn(BrowserTarget, String) -> BrowserInvokeFuture + Send + Sync>;
+/// Resolves the caller's authenticated tenant from the request's own headers
+/// (platform JWT bearer / cookie / API key — whichever hive-cloud's own
+/// `auth` module already accepts elsewhere), or `None` if unauthenticated.
+/// fluid-gateway has no knowledge of hive-cloud's Clerk/platform-JWT auth
+/// system (it's the lower-level, generic crate hive-cloud embeds, never the
+/// other way — see `rum`'s doc comment above for the same asymmetry), so this
+/// is injected exactly like `BrowserInvoker` rather than implemented here.
+pub type BrowserClaimsResolver = Arc<dyn Fn(&HeaderMap) -> Option<String> + Send + Sync>;
 
 #[derive(Default)]
 struct BrowserRoutes {
     invoker: Option<BrowserInvoker>,
+    claims_resolver: Option<BrowserClaimsResolver>,
     by_function: HashMap<String, Vec<BrowserTarget>>,
     circuit_until: HashMap<String, u64>,
 }
@@ -164,6 +173,14 @@ impl Gateway {
 
     pub fn set_browser_invoker(&self, invoker: BrowserInvoker) {
         self.browser.write().invoker = Some(invoker);
+    }
+
+    /// Wires the caller-tenant resolver used to gate `BrowserScope::Team`
+    /// targets in `try_browser` — see `BrowserClaimsResolver`'s doc comment.
+    /// `Public`-scoped targets are unaffected: they remain reachable by any
+    /// caller regardless of whether this is ever set.
+    pub fn set_browser_claims_resolver(&self, resolver: BrowserClaimsResolver) {
+        self.browser.write().claims_resolver = Some(resolver);
     }
 
     /// Insert or replace the one target owned by an endpoint for a function.
@@ -2129,12 +2146,27 @@ async fn try_browser(
         let Some(targets) = browser.by_function.get(&key) else {
             return BrowserAttempt::None;
         };
+        // Team-scoped targets require the CALLER to be an authenticated
+        // member of the owning tenant — resolved once here (only matters if
+        // a Team-scoped candidate actually exists below) rather than per
+        // candidate, since it's the same answer for every one of them. `None`
+        // (no resolver wired, or the caller presented no valid session) means
+        // no Team-scoped target is reachable; Public-scoped targets are
+        // completely unaffected either way.
+        let caller_tenant = browser
+            .claims_resolver
+            .as_ref()
+            .and_then(|resolve| resolve(headers));
         let target = targets.iter().find(|target| {
             let circuit = format!("{}:{}", target.endpoint_id, target.digest);
+            let scope_ok = match target.scope {
+                BrowserScope::Public => true,
+                BrowserScope::Team => caller_tenant.as_deref() == Some(target.tenant.as_str()),
+            };
             target.tenant == dep.tenant
                 && target.deployment == dep.id.as_str()
                 && target.function == name
-                && target.scope == BrowserScope::Public
+                && scope_ok
                 && target.expires_ms > now
                 && browser.circuit_until.get(&circuit).copied().unwrap_or(0) <= now
         });
