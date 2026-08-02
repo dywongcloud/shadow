@@ -171,7 +171,9 @@ export function useRunNode() {
     // worker instance (still running from before this field existed) — also
     // stale by definition.
     const hostAbiStale = (raw.abiVersion ?? 0) < HOST_ABI_VERSION;
-    setStatusState((prev) => applyStatus(prev, { ...raw, hostAbiStale, tabCount: raw.tabCount ?? 1 }));
+    setStatusState((prev) =>
+      applyStatus(prev, { ...raw, hostAbiStale, tabCount: raw.tabCount ?? 1, sessionStale: !!raw.sessionStale }),
+    );
   }, []);
 
   useEffect(() => {

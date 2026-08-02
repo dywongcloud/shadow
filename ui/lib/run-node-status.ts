@@ -48,6 +48,14 @@ export interface RunNodeStatus {
    *  own background worker. A plain page reload does NOT fix this (the
    *  SharedWorker instance persists across it); every tab must close first. */
   hostAbiStale: boolean;
+  /** bn-p2p-reconnect-state (auth-renewal input): true while the last
+   *  admission/renewal attempt failed specifically because THIS TAB's
+   *  platform session is stale, not because of the node's own identity or
+   *  wire protocol. Self-clears on the next successful renewal; never
+   *  terminal — a background session-cookie refresh (e.g. Clerk) can make
+   *  the very next retry succeed with no page reload needed, unlike
+   *  protocolMismatch === "outdated". */
+  sessionStale: boolean;
   lastError: string | null;
   updatedMs: number;
   /** Multi-tab dedup UI (bn-ui-sharedworker-owner): distinct tabs currently
@@ -67,6 +75,7 @@ export function initialRunNodeStatus(): RunNodeStatus {
     geoConsent: "undecided",
     protocolMismatch: "none",
     hostAbiStale: false,
+    sessionStale: false,
     lastError: null,
     updatedMs: 0,
     tabCount: 1,

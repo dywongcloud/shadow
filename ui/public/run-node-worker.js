@@ -87,6 +87,11 @@ let status = {
   // Multi-tab dedup UI (bn-ui-sharedworker-owner): how many distinct tabs are
   // currently attached, real vs. assumed-just-this-one. See currentTabCount().
   tabCount: 1,
+  // Auth-renewal input (bn-p2p-reconnect-state): true while the last renewal
+  // failed specifically because this tab's PLATFORM session (not the node's
+  // own identity/protocol) is stale — see isSessionStaleError. Self-clears on
+  // the next successful renewal; never blocks retry (see that function's doc).
+  sessionStale: false,
 };
 
 // bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
@@ -102,6 +107,26 @@ function classifyAdmissionError(message) {
   // floor), same UI treatment either way.
   if (message.startsWith("wasm_bundle_stale")) return "outdated";
   return "none";
+}
+
+// bn-p2p-reconnect-state (auth-renewal input): the backend's fresh_user_claims
+// rejects a renewal once this tab's PLATFORM session (not the browser-node's
+// own identity or protocol version) has aged past HIVE_BROWSER_SESSION_MAX_AGE_SECS
+// or genuinely expired. Distinct from classifyAdmissionError's protocol-version
+// concerns on purpose — this is auth staleness, unrelated to wire compatibility.
+// Deliberately NOT terminal like "outdated": callApi uses `credentials:
+// "same-origin"`, so if the platform's own session-cookie refresh (e.g. Clerk's
+// background token rotation) updates the cookie before this tab's next retry,
+// the very next renewal attempt succeeds with no reload needed — treating this
+// as a permanent failure would stop retrying right before a self-heal that was
+// about to happen. Exists so the UI can show a calm "reconnecting" state
+// instead of the same alarming red error every other unclassified failure gets.
+function isSessionStaleError(message) {
+  return (
+    typeof message === "string" &&
+    (message.includes("session is expired or not fresh") ||
+      message.includes("requires a fresh interactive user session"))
+  );
 }
 
 function broadcast() {
@@ -255,8 +280,13 @@ function scheduleRenew(addrJson, endpointId) {
       // "online" — a background renewal tick must not un-suspend a node
       // whose tabs are all still hidden.
       const lifecycle = anyVisible() ? "online" : "suspended";
-      if (status.admission !== "granted" || status.lifecycle !== lifecycle || status.protocolMismatch !== "none") {
-        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
+      if (
+        status.admission !== "granted" ||
+        status.lifecycle !== lifecycle ||
+        status.protocolMismatch !== "none" ||
+        status.sessionStale
+      ) {
+        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", sessionStale: false, lastError: null });
       }
       renewTimer = setTimeout(tick, RENEW_INTERVAL_MS);
     } catch (e) {
@@ -270,11 +300,20 @@ function scheduleRenew(addrJson, endpointId) {
         setStatus({ admission: "denied", lifecycle: "error", protocolMismatch: mismatch, lastError: message });
         return; // terminal — no reschedule
       }
-      // "server_upgrading" (transient) and any other failure keep retrying,
+      const sessionStale = isSessionStaleError(message);
+      // "server_upgrading" (transient), a stale platform session (also
+      // transient — see isSessionStaleError's doc), and any other failure all
+      // keep retrying,
       // now on the jittered ladder instead of waiting a full
       // RENEW_INTERVAL_MS — the next attempt may hit an already-upgraded
       // node or a transient failure may simply clear.
-      setStatus({ admission: "denied", lifecycle: "degraded", protocolMismatch: mismatch, lastError: message });
+      setStatus({
+        admission: "denied",
+        lifecycle: "degraded",
+        protocolMismatch: mismatch,
+        sessionStale,
+        lastError: message,
+      });
       backoffMs = nextDecorrelatedJitterMs(backoffMs);
       renewTimer = setTimeout(tick, backoffMs);
     } finally {
@@ -373,7 +412,7 @@ async function start(msg) {
     team: msg.team,
     relay: msg.relay,
   };
-  setStatus({ lifecycle: "starting", lastError: null, admission: "pending" });
+  setStatus({ lifecycle: "starting", lastError: null, admission: "pending", sessionStale: false });
   let booted = null;
   let admittedEndpointId = null;
   try {
@@ -430,7 +469,7 @@ async function start(msg) {
       await discardStaleAttempt(booted, admittedEndpointId, msg.team);
       return;
     }
-    setStatus({ admission: "granted", protocolMismatch: "none", lastError: null });
+    setStatus({ admission: "granted", protocolMismatch: "none", sessionStale: false, lastError: null });
     scheduleRenew(addrJson, endpointId);
   } catch (e) {
     if (myEpoch !== epoch) {
@@ -443,6 +482,7 @@ async function start(msg) {
       lifecycle: "error",
       admission: "denied",
       protocolMismatch: classifyAdmissionError(message),
+      sessionStale: isSessionStaleError(message),
       lastError: message,
     });
     node = null;
@@ -512,7 +552,7 @@ function onNetworkChange(online) {
           return discardStaleAttempt(null, endpointId, networkTeam);
         }
         const lifecycle = anyVisible() ? "online" : "suspended";
-        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
+        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", sessionStale: false, lastError: null });
       })
       .catch((e) => {
         if (myEpoch !== epoch) return;
@@ -521,6 +561,7 @@ function onNetworkChange(online) {
           admission: "denied",
           lifecycle: "degraded",
           protocolMismatch: classifyAdmissionError(message),
+          sessionStale: isSessionStaleError(message),
           lastError: message,
         });
       })
@@ -603,6 +644,7 @@ async function stop() {
     lifecycle: "stopped",
     admission: "none",
     protocolMismatch: "none",
+    sessionStale: false,
     endpointId: null,
     relay: null,
     lastError: null,

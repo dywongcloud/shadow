@@ -410,6 +410,14 @@ export default function RunNodePage() {
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>This node hasn&apos;t finished a rolling upgrade yet — retrying automatically, no action needed.</span>
           </div>
+        ) : status.sessionStale ? (
+          // Auth-renewal input (bn-p2p-reconnect-state): calm, not alarming —
+          // this self-heals the moment the platform session cookie refreshes
+          // in the background, unlike protocolMismatch === "outdated" above.
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-600 dark:text-amber-400" role="status">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>Waiting for your platform session to refresh before this node can renew — retrying automatically, no action needed.</span>
+          </div>
         ) : (
           status.lastError && (
             <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
