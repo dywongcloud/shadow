@@ -197,6 +197,32 @@ export function useRunNode() {
         };
         p.start();
         p.postMessage({ type: "status" });
+        // Owner handoff replay (bn-ui-mobile-lifecycle, OS-process-kill item):
+        // the Web Locks fallback branch below has always done this, but this
+        // SharedWorker branch never did -- if the browser's whole SharedWorker
+        // process is reclaimed under memory pressure (real on mobile Chrome,
+        // and the reason the Locks fallback exists at all; also reachable on
+        // desktop under genuine OOM), the NEXT `new SharedWorker(...)` this
+        // page issues (on reload, or via reconnectRef's crash-recovery retry
+        // above) spawns a genuinely fresh worker with no memory of anything,
+        // and it would otherwise sit at "stopped" until a human noticed.
+        // Harmless when the worker is already alive and running: the worker's
+        // own `start()` guard (`if (node || status.lifecycle === "starting")
+        // return;`) makes a replay against an ALREADY-running node a no-op,
+        // so every ordinary tab connecting to an already-live SharedWorker
+        // (the common case) costs one ignored message, never a duplicate boot.
+        const last = readLastStart();
+        if (last) {
+          p.postMessage({
+            type: "start",
+            relay: RELAY,
+            deployment: last.deployment,
+            fn: last.fn,
+            digest: last.digest,
+            scope: last.scope ?? "team",
+            team: currentTeam(),
+          });
+        }
       };
 
       const connect = (): boolean => {
