@@ -285,14 +285,14 @@ export default function RunNodePage() {
           <div className="flex gap-2">
             <button
               onClick={() => decideGeo("denied")}
-              className="flex-1 rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium text-fg hover:bg-subtle"
+              className="min-h-11 flex-1 rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium text-fg hover:bg-subtle"
             >
               Don&apos;t share
             </button>
             <button
               ref={geoShareBtnRef}
               onClick={() => decideGeo("granted")}
-              className="flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90"
+              className="min-h-11 flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90"
             >
               Share approximate location
             </button>
@@ -316,7 +316,7 @@ export default function RunNodePage() {
                 setCoords(null);
                 setLocatedMs(null);
               }}
-              className="text-link hover:underline"
+              className="-m-2 min-h-11 min-w-11 p-2 text-link hover:underline"
             >
               Reset
             </button>
@@ -359,7 +359,7 @@ export default function RunNodePage() {
               <div>This browser bundle is outdated and can no longer connect. Reload to update.</div>
               <button
                 onClick={() => window.location.reload()}
-                className="mt-2 rounded-md bg-red-500 px-2.5 py-1 text-xs font-medium text-white hover:opacity-90"
+                className="mt-2 min-h-11 rounded-md bg-red-500 px-2.5 py-1 text-xs font-medium text-white hover:opacity-90"
               >
                 Reload now
               </button>
@@ -383,14 +383,14 @@ export default function RunNodePage() {
             <button
               onClick={() => start({ deployment, fn, digest, scope })}
               disabled={!canStart || !supported}
-              className="flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+              className="min-h-11 flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Start
             </button>
           ) : (
             <button
               onClick={onStop}
-              className="flex-1 rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium text-fg hover:bg-subtle"
+              className="min-h-11 flex-1 rounded-md border border-border-strong px-3 py-1.5 text-sm font-medium text-fg hover:bg-subtle"
             >
               Stop
             </button>
