@@ -86,7 +86,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    2
+    3
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -243,6 +243,26 @@ impl BrowserNode {
     #[wasm_bindgen(js_name = nodeId)]
     pub fn node_id(&self) -> String {
         self.ep.id().to_string()
+    }
+
+    /// Proof-of-possession signature for admission (bn-p2p-heartbeat-lease):
+    /// signs `"{this node's endpoint_id}:{challenge_ms}"` with this node's
+    /// OWN ed25519 secret key, returning 128 hex chars. `challenge_ms` is the
+    /// caller's own current-time claim (no separate server round trip to
+    /// fetch a nonce) — the backend rejects a signature whose challenge_ms is
+    /// outside a tight freshness window, bounding replay of a captured
+    /// signature to that window rather than forever. Borrowed from
+    /// Folding@home's admission-binding pattern (research:
+    /// volunteer-compute-trust-admission-models) — without this, an admission
+    /// request naming ANY endpoint_id is accepted on the CALLER's platform
+    /// auth alone, with nothing proving the caller actually controls that
+    /// endpoint's private key.
+    #[wasm_bindgen(js_name = signAdmission)]
+    pub fn sign_admission(&self, challenge_ms: String) -> String {
+        let endpoint_id = self.ep.id().to_string();
+        let message = format!("{endpoint_id}:{challenge_ms}");
+        let sig = self.ep.secret_key().sign(message.as_bytes());
+        bytes_to_hex(&sig.to_bytes())
     }
 
     /// The raw 32-byte ed25519 seed, as 64 hex chars — the ONLY way key

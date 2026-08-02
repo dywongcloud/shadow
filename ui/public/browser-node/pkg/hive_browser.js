@@ -286,6 +286,36 @@ export class BrowserNode {
         }
     }
     /**
+     * Proof-of-possession signature for admission (bn-p2p-heartbeat-lease):
+     * signs `"{this node's endpoint_id}:{challenge_ms}"` with this node's
+     * OWN ed25519 secret key, returning 128 hex chars. `challenge_ms` is the
+     * caller's own current-time claim (no separate server round trip to
+     * fetch a nonce) — the backend rejects a signature whose challenge_ms is
+     * outside a tight freshness window, bounding replay of a captured
+     * signature to that window rather than forever. Borrowed from
+     * Folding@home's admission-binding pattern (research:
+     * volunteer-compute-trust-admission-models) — without this, an admission
+     * request naming ANY endpoint_id is accepted on the CALLER's platform
+     * auth alone, with nothing proving the caller actually controls that
+     * endpoint's private key.
+     * @param {string} challenge_ms
+     * @returns {string}
+     */
+    signAdmission(challenge_ms) {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const ptr0 = passStringToWasm0(challenge_ms, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.browsernode_signAdmission(this.__wbg_ptr, ptr0, len0);
+            deferred2_0 = ret[0];
+            deferred2_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
      * One JSON blob of everything the status UI needs.
      * @returns {string}
      */

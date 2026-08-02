@@ -2512,6 +2512,7 @@ dependencies = [
  "fluid-tunnel",
  "futures",
  "guardian-db",
+ "hex",
  "hickory-resolver",
  "hive-backend",
  "hive-browser-proto",

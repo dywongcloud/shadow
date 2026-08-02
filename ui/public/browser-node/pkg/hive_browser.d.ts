@@ -121,6 +121,21 @@ export class BrowserNode {
      */
     setInvokeHandler(handler: Function): void;
     /**
+     * Proof-of-possession signature for admission (bn-p2p-heartbeat-lease):
+     * signs `"{this node's endpoint_id}:{challenge_ms}"` with this node's
+     * OWN ed25519 secret key, returning 128 hex chars. `challenge_ms` is the
+     * caller's own current-time claim (no separate server round trip to
+     * fetch a nonce) — the backend rejects a signature whose challenge_ms is
+     * outside a tight freshness window, bounding replay of a captured
+     * signature to that window rather than forever. Borrowed from
+     * Folding@home's admission-binding pattern (research:
+     * volunteer-compute-trust-admission-models) — without this, an admission
+     * request naming ANY endpoint_id is accepted on the CALLER's platform
+     * auth alone, with nothing proving the caller actually controls that
+     * endpoint's private key.
+     */
+    signAdmission(challenge_ms: string): string;
+    /**
      * One JSON blob of everything the status UI needs.
      */
     statusJson(): string;
@@ -197,6 +212,7 @@ export interface InitOutput {
     readonly browsernode_servedCount: (a: number) => bigint;
     readonly browsernode_setAssetHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
+    readonly browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];
     readonly browsernode_statusJson: (a: number) => [number, number];
     readonly on_load: () => void;
     readonly wasmBundleVersion: () => number;

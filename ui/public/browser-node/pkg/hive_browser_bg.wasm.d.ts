@@ -18,6 +18,7 @@ export const browsernode_secretHex: (a: number) => [number, number];
 export const browsernode_servedCount: (a: number) => bigint;
 export const browsernode_setAssetHandler: (a: number, b: any) => [number, number];
 export const browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
+export const browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];
 export const browsernode_statusJson: (a: number) => [number, number];
 export const on_load: () => void;
 export const wasmBundleVersion: () => number;

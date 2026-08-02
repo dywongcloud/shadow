@@ -65,6 +65,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 ring = "0.17"
 base64 = "0.22"
+# Browser-admission proof-of-possession signature decoding (bn-p2p-heartbeat-
+# lease) — already in the tree transitively (iroh/rustls/etc all pull it),
+# made direct here for the same reason base64/ring above are.
+hex = "0.4"
 # MX resolution for the direct-MX SMS fallback (carrier email-to-SMS gateways).
 # Already in the tree via iroh; pinned to that version so no new graph pull.
 hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }

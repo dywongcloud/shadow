@@ -28,7 +28,7 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 2; // v2: BrowserNode.boot()'s relay param is now a comma-separated list
+const WASM_BUNDLE_VERSION = 3; // v3: BrowserNode gained signAdmission() for proof-of-possession
 
 const ports = [];
 // Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any
@@ -138,6 +138,14 @@ async function callApi(method, path, team, body) {
 
 async function admitOnce(addrJson, endpointId) {
   const { deployment, fn, digest, scope, team } = session;
+  // Proof-of-possession (bn-p2p-heartbeat-lease): prove THIS call controls
+  // endpointId's private key, not just that the caller has a valid platform
+  // session -- without this an admission naming any endpoint_id was accepted
+  // on platform auth alone. challengeMs is this tab's own clock, no separate
+  // nonce round trip; the backend bounds replay to a tight freshness window
+  // around it (see verify_proof_of_possession's HIVE_BROWSER_POP_WINDOW_MS).
+  const challengeMs = Date.now();
+  const signature = node.signAdmission(String(challengeMs));
   await callApi("POST", "/v1/browser/admissions", team, {
     endpoint_id: endpointId,
     addr_json: addrJson,
@@ -146,6 +154,8 @@ async function admitOnce(addrJson, endpointId) {
     digest,
     scope: scope || "team",
     protocol_version: PROTOCOL_VERSION,
+    challenge_ms: challengeMs,
+    signature,
   });
 }
 

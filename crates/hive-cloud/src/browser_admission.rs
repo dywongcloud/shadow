@@ -345,6 +345,23 @@ struct AdmissionRequest {
     #[serde(default)]
     scope: BrowserScope,
     protocol_version: u16,
+    /// Proof-of-possession (bn-p2p-heartbeat-lease): the caller's own
+    /// current-time claim, ms since epoch, signed together with
+    /// `endpoint_id` — see `signature` below. `#[serde(default)]` so an
+    /// older worker (pre-dating this field) still deserializes; it is then
+    /// rejected by `validate_request`'s freshness/signature check below,
+    /// not by a deserialize failure that would look like a generic 400.
+    #[serde(default)]
+    challenge_ms: u64,
+    /// 128 hex chars: `hive_browser::BrowserNode::signAdmission`'s ed25519
+    /// signature over `"{endpoint_id}:{challenge_ms}"`, proving the caller
+    /// actually controls the private key for `endpoint_id` — without this,
+    /// an admission naming ANY endpoint_id was accepted on the caller's
+    /// platform auth alone, with nothing proving they control that
+    /// endpoint's key (volunteer-compute-trust-admission-models research,
+    /// borrowed from Folding@home's assignment-signature pattern).
+    #[serde(default)]
+    signature: String,
 }
 
 pub fn routes() -> Router<Arc<CloudState>> {
@@ -417,6 +434,57 @@ fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, (StatusCode,
     Ok(claims)
 }
 
+/// Proof-of-possession (bn-p2p-heartbeat-lease): reject an admission whose
+/// `challenge_ms` is stale (bounds replay of a captured signature to this
+/// window, rather than forever — there is no separate nonce round trip, so
+/// this freshness window IS the replay defense) or whose signature does not
+/// verify against `endpoint_id`'s own public key (the endpoint_id string
+/// literally IS the ed25519 public key, hex-encoded — see
+/// `hive_p2p::endpoint_id_from_addr_json`, which `validate_request` already
+/// uses to derive it).
+fn verify_proof_of_possession(
+    endpoint_id: &str,
+    challenge_ms: u64,
+    signature_hex: &str,
+) -> Result<(), (StatusCode, String)> {
+    let window_ms = std::env::var("HIVE_BROWSER_POP_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    let now = hive_core::now_ms();
+    let age = now.abs_diff(challenge_ms);
+    if age > window_ms {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "browser admission proof-of-possession challenge is stale".into(),
+        ));
+    }
+    let public_key: iroh::PublicKey = endpoint_id.parse().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "browser endpoint id is not a valid ed25519 public key".into(),
+        )
+    })?;
+    let mut sig_bytes = [0u8; 64];
+    hex::decode_to_slice(signature_hex, &mut sig_bytes).map_err(|_| {
+        (
+            StatusCode::UNAUTHORIZED,
+            "browser admission proof-of-possession signature is not valid hex".into(),
+        )
+    })?;
+    let signature = iroh::Signature::from_bytes(&sig_bytes);
+    let message = format!("{endpoint_id}:{challenge_ms}");
+    public_key
+        .verify(message.as_bytes(), &signature)
+        .map_err(|_| {
+            (
+                StatusCode::UNAUTHORIZED,
+                "browser admission proof-of-possession signature does not verify — caller does not control this endpoint's key".into(),
+            )
+        })
+}
+
 fn validate_request(
     cloud: &Arc<CloudState>,
     claims: &crate::auth::Claims,
@@ -461,6 +529,7 @@ fn validate_request(
             "browser endpoint id does not match its signed address".into(),
         ));
     }
+    verify_proof_of_possession(&endpoint_id, request.challenge_ms, &request.signature)?;
     if !hive_browser_proto::valid_function_digest(&request.digest)
         || request.deployment.is_empty()
         || request.deployment.len() > 256
