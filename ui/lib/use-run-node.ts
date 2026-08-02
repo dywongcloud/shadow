@@ -201,6 +201,25 @@ export function useRunNode() {
     });
   }, []);
 
+  // Reconnect machine (bn-p2p-reconnect-state, one real slice of it): real
+  // network drop/restore events, reported through the SAME sendRef used by
+  // every other control action — works unchanged whether the SharedWorker or
+  // Web Locks fallback path is live, since both assign sendRef.current to
+  // whatever the correct live transport is. A separate effect (not folded
+  // into the connection effect above) because it has no cleanup dependency
+  // on which transport is active; it just needs sendRef to exist.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const report = () => sendRef.current({ type: "network", online: navigator.onLine });
+    window.addEventListener("online", report);
+    window.addEventListener("offline", report);
+    report();
+    return () => {
+      window.removeEventListener("online", report);
+      window.removeEventListener("offline", report);
+    };
+  }, []);
+
   const stop = useCallback(() => {
     sendRef.current({ type: "stop" });
   }, []);

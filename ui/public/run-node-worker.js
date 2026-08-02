@@ -206,6 +206,50 @@ function anyVisible() {
   return false;
 }
 
+// Reconnect machine (bn-p2p-reconnect-state, one real slice of it): a tab
+// reports real `online`/`offline` window events here (a Worker/SharedWorker
+// has no `navigator.onLine` visibility of its own — it only knows what a
+// connected tab tells it, same reasoning as the existing visibility
+// reporting above). Starts true (optimistic) since the worker may boot
+// before any tab's first report arrives.
+let networkOnline = true;
+function onNetworkChange(online) {
+  const wasOnline = networkOnline;
+  networkOnline = online;
+  if (wasOnline === online) return;
+  if (!online) {
+    // A dropped network can't promise service regardless of what the
+    // scheduled renewal timer still believes — degrade immediately rather
+    // than waiting for the next tick's request to time out first.
+    if (status.lifecycle === "online" || status.lifecycle === "suspended") {
+      setStatus({ lifecycle: "degraded" });
+    }
+    return;
+  }
+  // Network restored: don't wait up to RENEW_INTERVAL_MS for the next
+  // scheduled tick — retry the admission right away so a real reconnect is
+  // fast, not just eventually-correct. Reuses scheduleRenew's own retry
+  // machinery for the SUBSEQUENT tick rather than duplicating it; this is
+  // only the one immediate out-of-band attempt.
+  const endpointId = status.endpointId;
+  if (node && session && !closing && endpointId) {
+    admitOnce(node.addrJson(), endpointId)
+      .then(() => {
+        const lifecycle = anyVisible() ? "online" : "suspended";
+        setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
+      })
+      .catch((e) => {
+        const message = String((e && e.message) || e);
+        setStatus({
+          admission: "denied",
+          lifecycle: "degraded",
+          protocolMismatch: classifyAdmissionError(message),
+          lastError: message,
+        });
+      });
+  }
+}
+
 function onPortVisibility(port, msg) {
   if (msg.unloading) {
     portVisibility.delete(port);
@@ -282,6 +326,7 @@ function connectPort(port) {
     else if (msg.type === "stop") stop();
     else if (msg.type === "geoConsent") setStatus({ geoConsent: msg.value });
     else if (msg.type === "visibility") onPortVisibility(port, msg);
+    else if (msg.type === "network") onNetworkChange(!!msg.online);
     else if (msg.type === "status") {
       try {
         port.postMessage({ type: "status", status });
