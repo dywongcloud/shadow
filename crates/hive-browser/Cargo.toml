@@ -58,6 +58,13 @@ tracing = "0.1"
 tracing-wasm = "0.2"
 console_error_panic_hook = "0.1"
 
+# ws_stream_wasm 0.7.5 waits until after WebSocket Open to select
+# binaryType and install onmessage. Firefox can receive an iroh relay's first
+# frame before then as a Blob or before any receiver exists, hanging bootstrap.
+# The local patch orders both before Open; see vendor/ws_stream_wasm/SHADW_PATCH.md.
+[patch.crates-io]
+ws_stream_wasm = { path = "../../vendor/ws_stream_wasm" }
+
 [profile.release]
 opt-level = "s"
 lto = true

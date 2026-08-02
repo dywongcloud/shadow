@@ -41,8 +41,8 @@ export const ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d
 export const wasm_bindgen__convert__closures_____invoke__h0908a51f6b61a600: (a: number, b: number, c: any) => [number, number];
 export const wasm_bindgen__convert__closures_____invoke__h40609ae72e5a0370: (a: number, b: number, c: any, d: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__h65751fdee90535b7: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__hf42dcc60313e6275: (a: number, b: number, c: any) => void;
-export const wasm_bindgen__convert__closures_____invoke__hfdd9e855e91b810c: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h743eb17756c0e51e: (a: number, b: number, c: any) => void;
+export const wasm_bindgen__convert__closures_____invoke__h3d4e2eac2fad058b: (a: number, b: number, c: any) => void;
 export const wasm_bindgen__convert__closures_____invoke__habd8d9d2a2106490: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h0d78351b17b6d108: (a: number, b: number) => void;
 export const wasm_bindgen__convert__closures_____invoke__h2b85946bfc7620d7: (a: number, b: number) => void;

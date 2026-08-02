@@ -1,0 +1,31 @@
+[package]
+name = "ws_stream_wasm"
+version = "0.7.5"
+edition = "2024"
+license = "Unlicense"
+repository = "https://github.com/najamelan/ws_stream_wasm"
+publish = false
+build = "build.rs"
+
+[features]
+default = ["not_ci"]
+not_ci = []
+tokio_io = ["async_io_stream/tokio_io"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+async_io_stream = { version = "0.3", features = ["map_pharos"] }
+futures = { version = "0.3", default-features = false }
+js-sys = "0.3"
+log = "0.4"
+pharos = "0.5"
+send_wrapper = "0.6"
+thiserror = "2"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["BinaryType", "Blob", "console", "MessageEvent", "WebSocket", "CloseEvent", "DomException"] }
+
+[build-dependencies]
+rustc_version = "0.4"
