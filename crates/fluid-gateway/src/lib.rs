@@ -94,6 +94,15 @@ struct BrowserRoutes {
     claims_resolver: Option<BrowserClaimsResolver>,
     by_function: HashMap<String, Vec<BrowserTarget>>,
     circuit_until: HashMap<String, u64>,
+    /// Per-endpoint invocation quota (bn-p2p-heartbeat-lease): a fixed
+    /// window `(window_start_ms, count_in_window)` keyed on `endpoint_id`.
+    /// An admitted-but-unrevoked browser has an unbounded invoke rate today
+    /// otherwise — a lease bounds HOW LONG it can be invoked, never how
+    /// OFTEN, and that's a real abuse surface a compromised or careless
+    /// caller can hit (volunteer-compute-trust-admission-models research:
+    /// borrowed from BOINC's `max_results_day`-style throttle, quota-shaped
+    /// rather than a binary revoke).
+    invoke_quota: HashMap<String, (u64, u32)>,
 }
 
 pub struct Gateway {
@@ -229,6 +238,7 @@ impl Gateway {
         browser
             .circuit_until
             .retain(|key, _| !key.starts_with(endpoint_id));
+        browser.invoke_quota.remove(endpoint_id);
         removed
     }
 
@@ -2138,6 +2148,21 @@ async fn try_browser(
 ) -> BrowserAttempt {
     let key = func_key(dep.id.as_str(), name);
     let now = now_ms();
+    let quota_window_ms = std::env::var("HIVE_BROWSER_INVOKE_QUOTA_WINDOW_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(60_000);
+    // 10 req/s average sustained over the window — generous for a real
+    // owner-served app, well below what would meaningfully burden a single
+    // browser tab, and the actual protection this exists for: an
+    // admitted-but-unrevoked endpoint otherwise has NO invoke-rate bound at
+    // all for the rest of its lease.
+    let quota_max = std::env::var("HIVE_BROWSER_INVOKE_QUOTA_PER_WINDOW")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(600);
     let (target, invoker) = {
         let browser = gw.browser.read();
         let Some(invoker) = browser.invoker.clone() else {
@@ -2163,18 +2188,40 @@ async fn try_browser(
                 BrowserScope::Public => true,
                 BrowserScope::Team => caller_tenant.as_deref() == Some(target.tenant.as_str()),
             };
+            let quota_ok = browser
+                .invoke_quota
+                .get(&target.endpoint_id)
+                .is_none_or(|(window_start, count)| {
+                    now.saturating_sub(*window_start) >= quota_window_ms || *count < quota_max
+                });
             target.tenant == dep.tenant
                 && target.deployment == dep.id.as_str()
                 && target.function == name
                 && scope_ok
                 && target.expires_ms > now
                 && browser.circuit_until.get(&circuit).copied().unwrap_or(0) <= now
+                && quota_ok
         });
         let Some(target) = target.cloned() else {
             return BrowserAttempt::None;
         };
         (target, invoker)
     };
+    // Record this invocation against the endpoint's quota window — a brief
+    // separate write lock, same pattern as the circuit-opening write below
+    // (never held across the actual network invoke).
+    {
+        let mut browser = gw.browser.write();
+        let entry = browser
+            .invoke_quota
+            .entry(target.endpoint_id.clone())
+            .or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= quota_window_ms {
+            *entry = (now, 1);
+        } else {
+            entry.1 += 1;
+        }
+    }
 
     let forwarded: HashMap<String, String> = headers
         .iter()
