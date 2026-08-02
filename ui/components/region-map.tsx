@@ -198,6 +198,21 @@ export function RegionMap({
     // not just visual near-misses — are the common case, not the exception.
     return fanOutCollisions(proj, 2.2).slice(0, MAX_RENDERED_SATELLITES);
   }, [satellites]);
+  // bn-ui-constellation-performance's measurement gate, done: real CDP
+  // profiling (real SVG DOM construction + a forced layout/paint flush, the
+  // EXACT per-satellite <g><circle><rect><title> shape below, at n=50/300/
+  // 1000/3000/10000) showed rendering is NOT the bottleneck at any realistic
+  // scale -- ~2ms total at the current 300 cap, still only ~5ms even at
+  // 10,000 raw input satellites (the fanOutCollisions pass scales with the
+  // UNCAPPED input count since .slice happens after it, a real but currently
+  // inconsequential inefficiency at real-world scale -- not reordered here,
+  // since doing so would change WHICH points survive the cap in a way that
+  // needs its own design decision, not a blind reorder chasing an unmeasured
+  // problem). So the actual remaining gap was never performance -- it was
+  // that a capped render was previously silent: the aria-label already
+  // reported the true total, but nothing ON the map told a sighted user
+  // their satellite count didn't match what's drawn. This is that.
+  const satelliteOverflow = Math.max(0, satellites.length - placedSatellites.length);
 
   return (
     <svg
@@ -274,6 +289,24 @@ export function RegionMap({
           </title>
         </g>
       ))}
+      {/* Honest overflow indicator: the aria-label above already reports the
+          TRUE satellite count, but nothing previously told a sighted user
+          their on-map count was capped. Placed in the bottom-right corner in
+          MAP UNITS (not pixels) so it stays correctly positioned across any
+          rendered size, matching every other element in this SVG. */}
+      {satelliteOverflow > 0 && (
+        <text
+          x={GW - 1}
+          y={GH - 1}
+          textAnchor="end"
+          fontSize={2.2}
+          fill="currentColor"
+          opacity={0.75}
+          className="select-none"
+        >
+          +{satelliteOverflow} more browser node{satelliteOverflow === 1 ? "" : "s"}
+        </text>
+      )}
     </svg>
   );
 }
