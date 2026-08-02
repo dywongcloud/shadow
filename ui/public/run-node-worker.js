@@ -140,15 +140,53 @@ async function admitOnce(addrJson, endpointId) {
 // impossible instead of merely harmless.
 let renewInFlight = false;
 
+// Decorrelated-jitter retry backoff (bn-p2p-reconnect-state, cross-checked
+// against reconnecting-websocket/socket.io/node-retry/iroh's own relay
+// actor.rs): sleepN = min(CAP, uniform(BASE, sleepN-1*3)). AWS's own
+// comparison of jitter strategies ranks decorrelated the fastest-completing
+// of the jittered options and unjittered backoff the outright loser — a
+// FLAT retry interval on every failure (the previous behavior) is exactly
+// the unjittered case. CAP is deliberately smaller than the general
+// reconnect ladder would use: it exists so several retries still fit inside
+// the lease window instead of burning most of it waiting out one full
+// RENEW_INTERVAL_MS after a single transient failure.
+const RENEW_BACKOFF_BASE_MS = 250;
+const RENEW_BACKOFF_CAP_MS = 5_000;
+
+function nextDecorrelatedJitterMs(prevMs) {
+  const hi = Math.max(RENEW_BACKOFF_BASE_MS, prevMs * 3);
+  return Math.min(RENEW_BACKOFF_CAP_MS, RENEW_BACKOFF_BASE_MS + Math.random() * (hi - RENEW_BACKOFF_BASE_MS));
+}
+
 function scheduleRenew(addrJson, endpointId) {
-  if (renewTimer) clearInterval(renewTimer);
+  if (renewTimer) clearTimeout(renewTimer);
   const myEpoch = epoch;
-  renewTimer = setInterval(async () => {
-    if (closing || !node || renewInFlight || myEpoch !== epoch) return;
+  let backoffMs = RENEW_BACKOFF_BASE_MS;
+
+  async function tick() {
+    if (closing || !node || myEpoch !== epoch) return; // session over — stop rescheduling
+    if (renewInFlight) {
+      // onNetworkChange's out-of-band admit is currently in flight — don't
+      // duplicate it, but this self-rescheduling chain must keep going or it
+      // dies silently (unlike the old setInterval, nothing else re-fires
+      // this tick).
+      renewTimer = setTimeout(tick, RENEW_BACKOFF_BASE_MS);
+      return;
+    }
     renewInFlight = true;
+    const renewalTeam = session && session.team;
     try {
       await admitOnce(addrJson, endpointId);
-      if (myEpoch !== epoch) return; // stop() (or a new start()) ran mid-renewal
+      if (myEpoch !== epoch) {
+        // stop() ran while this renewal's POST was in flight — it already
+        // revoked whatever admission existed BEFORE this call, but this call
+        // itself just re-created/refreshed one afterward. Undo it, same as
+        // start()'s own stale-epoch handling, or the user sees "stopped"
+        // while a live grant for this endpoint quietly lives out its lease.
+        await discardStaleAttempt(null, endpointId, renewalTeam);
+        return;
+      }
+      backoffMs = RENEW_BACKOFF_BASE_MS; // ladder resets on any success
       // Derive lifecycle from CURRENT visibility rather than hardcoding
       // "online" — a background renewal tick must not un-suspend a node
       // whose tabs are all still hidden.
@@ -156,6 +194,7 @@ function scheduleRenew(addrJson, endpointId) {
       if (status.admission !== "granted" || status.lifecycle !== lifecycle || status.protocolMismatch !== "none") {
         setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
       }
+      renewTimer = setTimeout(tick, RENEW_INTERVAL_MS);
     } catch (e) {
       if (myEpoch !== epoch) return;
       const message = String((e && e.message) || e);
@@ -164,19 +203,22 @@ function scheduleRenew(addrJson, endpointId) {
         // No retry will ever succeed against this server's floor — stop
         // spending renewal cycles on a doomed request and let the UI prompt
         // a reload instead of silently failing every 60s forever.
-        clearInterval(renewTimer);
-        renewTimer = null;
         setStatus({ admission: "denied", lifecycle: "error", protocolMismatch: mismatch, lastError: message });
-        return;
+        return; // terminal — no reschedule
       }
-      // "server_upgrading" (transient) and any other failure keep retrying
-      // on the same schedule — the next tick may hit an already-upgraded
+      // "server_upgrading" (transient) and any other failure keep retrying,
+      // now on the jittered ladder instead of waiting a full
+      // RENEW_INTERVAL_MS — the next attempt may hit an already-upgraded
       // node or a transient failure may simply clear.
       setStatus({ admission: "denied", lifecycle: "degraded", protocolMismatch: mismatch, lastError: message });
+      backoffMs = nextDecorrelatedJitterMs(backoffMs);
+      renewTimer = setTimeout(tick, backoffMs);
     } finally {
       renewInFlight = false;
     }
-  }, RENEW_INTERVAL_MS);
+  }
+
+  renewTimer = setTimeout(tick, RENEW_INTERVAL_MS);
 }
 
 // Discard a boot this epoch no longer owns: close/free a real node if one was
@@ -327,9 +369,16 @@ function onNetworkChange(online) {
   if (node && session && !closing && endpointId && !renewInFlight) {
     renewInFlight = true;
     const myEpoch = epoch;
+    const networkTeam = session.team;
     admitOnce(node.addrJson(), endpointId)
       .then(() => {
-        if (myEpoch !== epoch) return; // stop() (or a new start()) ran meanwhile
+        if (myEpoch !== epoch) {
+          // stop() ran while this POST was in flight and already revoked
+          // whatever admission existed before it — this call just
+          // re-created one afterward. Undo it, same reasoning as
+          // scheduleRenew's identical stale-success case.
+          return discardStaleAttempt(null, endpointId, networkTeam);
+        }
         const lifecycle = anyVisible() ? "online" : "suspended";
         setStatus({ admission: "granted", lifecycle, protocolMismatch: "none", lastError: null });
       })
@@ -374,7 +423,7 @@ function onPortVisibility(port, msg) {
 async function stop() {
   epoch++; // fences every in-flight start()/renew continuation from this point on
   closing = true;
-  if (renewTimer) clearInterval(renewTimer);
+  if (renewTimer) clearTimeout(renewTimer);
   renewTimer = null;
   const endpointId = status.endpointId;
   const team = session && session.team;
