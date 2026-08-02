@@ -89,6 +89,28 @@ function bytesToHex(bytes) {
 }
 
 /**
+ * Best-effort persistent-storage request (bn-ui-mobile-lifecycle's
+ * permission-flows item): without this, the browser can silently evict
+ * this origin's IndexedDB-stored identity record under storage pressure —
+ * mobile eviction heuristics are tighter than desktop's — quietly
+ * regenerating a "new" node identity on next boot, exactly the continuity
+ * this whole module exists to provide. Many browsers auto-grant based on
+ * site-engagement heuristics with no visible prompt; some show one either
+ * way. Never blocks or fails identity load/creation: an unsupported API or
+ * a denied/ignored request just leaves the pre-existing eviction risk
+ * unchanged, never regressed.
+ */
+async function requestPersistentStorage() {
+  try {
+    if (navigator.storage?.persist) {
+      await navigator.storage.persist();
+    }
+  } catch {
+    /* best-effort — never block identity load/creation on this */
+  }
+}
+
+/**
  * Load the persisted seed (hex) if one exists, else generate a fresh
  * non-extractable wrapping key, wrap `freshSeedHex` under it, persist, and
  * return `freshSeedHex` back. `freshSeedHex` is only used on first boot (the
@@ -98,6 +120,7 @@ function bytesToHex(bytes) {
  * establishes an identity, false on every subsequent load.
  */
 export async function loadOrCreateSeed(freshSeedHex) {
+  await requestPersistentStorage();
   const db = await openDb();
   try {
     const existing = await idbGet(db, RECORD_ID);
