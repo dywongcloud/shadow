@@ -13,22 +13,43 @@
 //! behavior on the next accepted stream isn't needed — one process per
 //! reply shape, matching how the actual test drives this: start, invoke
 //! once, kill, restart with a different reply file for the next case).
+//!
+//! Set `HIVE_FAKE_BROWSER_DROP_AFTER_READ=1` to read and log the complete
+//! request, then reset the stream without writing a response. This is the
+//! red-capable live witness for `BROWSER_EXECUTION_UNCERTAIN`: the platform
+//! has proof the mutation bytes reached browser-owned execution but no proof
+//! whether that execution committed before the response path failed.
 
-use hive_p2p::BROWSER_ALPN;
 use hive_browser_proto::{check_len, split_request};
+use hive_p2p::BROWSER_ALPN;
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let reply_path = std::env::var("HIVE_FAKE_BROWSER_REPLY_FILE")
         .expect("HIVE_FAKE_BROWSER_REPLY_FILE must name a file containing the raw reply bytes");
     let reply = std::fs::read(&reply_path)?;
+    let drop_after_read = std::env::var("HIVE_FAKE_BROWSER_DROP_AFTER_READ")
+        .map(|value| matches!(value.as_str(), "1" | "true"))
+        .unwrap_or(false);
 
     let ep = hive_p2p::bind_full(None, &[], &[], false).await?;
     ep.online().await;
-    println!(
-        "FAKE_BROWSER_ADDR_JSON:{}",
-        hive_p2p::addr_json(&ep).unwrap_or_default()
-    );
+    let addr_json = hive_p2p::addr_json(&ep).unwrap_or_default();
+    let endpoint_id = hive_p2p::endpoint_id_from_addr_json(&addr_json)
+        .ok_or_else(|| anyhow::anyhow!("fake browser addr has no endpoint id"))?;
+    let challenge_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as u64;
+    let message = format!("{endpoint_id}:{challenge_ms}");
+    let signature = to_hex(&ep.secret_key().sign(message.as_bytes()).to_bytes());
+    println!("FAKE_BROWSER_ADDR_JSON:{addr_json}");
+    println!("FAKE_BROWSER_ENDPOINT_ID:{endpoint_id}");
+    println!("FAKE_BROWSER_ADMISSION_CHALLENGE_MS:{challenge_ms}");
+    println!("FAKE_BROWSER_ADMISSION_SIGNATURE:{signature}");
 
     loop {
         eprintln!("fake_browser_peer: waiting for a connection...");
@@ -37,7 +58,10 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("fake_browser_peer: incoming connection, awaiting handshake...");
                 match incoming.await {
                     Ok(conn) => {
-                        eprintln!("fake_browser_peer: handshake complete, alpn={:?}", conn.alpn());
+                        eprintln!(
+                            "fake_browser_peer: handshake complete, alpn={:?}",
+                            conn.alpn()
+                        );
                         conn
                     }
                     Err(e) => {
@@ -94,18 +118,29 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     };
-                    eprintln!("fake_browser_peer: got op={op:?}, payload_len={}", payload.len());
+                    eprintln!(
+                        "fake_browser_peer: got op={op:?}, payload_len={}",
+                        payload.len()
+                    );
                     eprintln!(
                         "fake_browser_peer: payload={}",
                         String::from_utf8_lossy(payload)
                     );
+                    if drop_after_read {
+                        eprintln!("fake_browser_peer: resetting stream after full request read");
+                        let _ = send.reset(0u8.into());
+                        return;
+                    }
                     // Reply verbatim with the configured bytes regardless of op —
                     // the test controls op-specific behavior via which reply file
                     // it starts this process with. encode_reply matches the
                     // real wire format (le length, no op byte on the reply).
                     let framed = hive_browser_proto::encode_reply(&reply);
                     match send.write_all(&framed).await {
-                        Ok(()) => eprintln!("fake_browser_peer: wrote {} framed reply bytes", framed.len()),
+                        Ok(()) => eprintln!(
+                            "fake_browser_peer: wrote {} framed reply bytes",
+                            framed.len()
+                        ),
                         Err(e) => {
                             eprintln!("fake_browser_peer: failed writing reply: {e}");
                             return;
