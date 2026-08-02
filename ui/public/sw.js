@@ -56,11 +56,18 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // App CODE (JS/CSS/source-maps): NETWORK-FIRST. The freshest build always wins
-  // when online; the cache is only an offline fallback. This stops a stale cached
-  // bundle from rendering an outdated UI when chunk URLs aren't content-hashed
-  // (e.g. on the dev/preview server).
-  const isCode = /\.(?:js|css|map)$/.test(url.pathname);
+  // App CODE (JS/CSS/source-maps/WASM): NETWORK-FIRST. The freshest build always
+  // wins when online; the cache is only an offline fallback. This stops a stale
+  // cached bundle from rendering an outdated UI when chunk URLs aren't
+  // content-hashed (e.g. on the dev/preview server). .wasm is explicitly
+  // included here (bn-ui-pwa-install-offline: a prior pass claimed this file
+  // already covered install/offline/caching for /run-node, but the wasm bundle
+  // -- the actual thing "Run a node" cannot function without -- previously
+  // matched NEITHER this branch nor the media one below, so it got no caching
+  // or offline-fallback treatment at all) — network-first is doubly correct
+  // for it specifically, since this session's OWN wasmBundleVersion check
+  // exists precisely to catch a stale wasm bundle paired with fresh JS glue.
+  const isCode = /\.(?:js|css|map|wasm)$/.test(url.pathname);
   if (isCode) {
     event.respondWith(
       caches.open(STATIC_CACHE).then(async (cache) => {
