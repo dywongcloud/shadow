@@ -39,7 +39,7 @@ function presenceState(lifecycle: string): PresenceState | null {
 }
 
 export default function RunNodePage() {
-  const { status, supported, start, stop, setGeoConsent } = useRunNode();
+  const { status, supported, start, stop, setGeoConsent, dataSaverBlocked } = useRunNode();
   const [deployment, setDeployment] = useState("");
   const [fn, setFn] = useState("");
   const [digest, setDigest] = useState("");
@@ -201,7 +201,8 @@ export default function RunNodePage() {
     }
   }
 
-  const canStart = deployment.trim() && fn.trim() && digest.trim() && status.lifecycle === "stopped";
+  const canStart =
+    deployment.trim() && fn.trim() && digest.trim() && status.lifecycle === "stopped" && !dataSaverBlocked;
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -209,6 +210,20 @@ export default function RunNodePage() {
         <RadioTower className="h-6 w-6 text-fg" />
         <h1 className="text-xl font-semibold text-fg">Run a node</h1>
       </div>
+
+      {dataSaverBlocked && (
+        <div
+          role="alert"
+          className="mb-5 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400"
+        >
+          <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>
+            Data Saver is on for this connection. Donating capacity would relay other tenants&apos; traffic over
+            data you&apos;ve asked your device to conserve, so &quot;Run a node&quot; won&apos;t start (or has been
+            stopped) until it&apos;s turned off.
+          </span>
+        </div>
+      )}
 
       {!supported && (
         <div className="mb-5 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">

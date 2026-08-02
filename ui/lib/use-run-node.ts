@@ -76,8 +76,34 @@ export interface StartArgs {
  *  (navbar control + the /run-node page open in another tab) share the SAME
  *  worker instance — the browser's own SharedWorker semantics give us the
  *  "exactly one owner" property for free; this hook is just a typed port. */
+/** Network Information API's `saveData` flag (bn-ui-mobile-lifecycle's
+ *  network-policy item): the one broadly-supported, EXPLICIT signal a user
+ *  actually chose ("Data Saver" in Chrome/Android settings) — unlike
+ *  `effectiveType`/`downlink`, which are heuristic estimates that vary
+ *  minute to minute and would make this policy flap. Deliberately does NOT
+ *  attempt battery-based policy: the Battery Status API this row's text
+ *  names has been removed from Firefox/Safari and is fingerprinting-gated
+ *  even in Chrome, so a battery check would only ever fire on a shrinking
+ *  slice of browsers while silently no-op'ing everywhere else — a real
+ *  signal with universal support beats a nominally-broader one with none.
+ *  `navigator.connection` itself is Chromium-only; every read here is
+ *  optional-chained and this returns `false` (never block) where it's
+ *  absent, matching every other progressive-feature-detection pattern in
+ *  this file (hasSharedWorker/hasLocksFallback above). */
+function dataSaverActive(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const nav = navigator as Navigator & { connection?: { saveData?: boolean; addEventListener?: (type: string, listener: () => void) => void; removeEventListener?: (type: string, listener: () => void) => void } };
+  return !!nav.connection?.saveData;
+}
+
 export function useRunNode() {
   const [status, setStatusState] = useState<RunNodeStatus>(initialRunNodeStatus());
+  // Network policy (bn-ui-mobile-lifecycle): distinct from `status.lastError`
+  // (a worker-reported failure) — this is a CLIENT-SIDE policy refusal that
+  // never reaches the worker at all, so it needs its own state rather than
+  // overloading RunNodeStatus's wire shape with a field the worker itself
+  // has no way to produce.
+  const [dataSaverBlocked, setDataSaverBlocked] = useState(() => dataSaverActive());
   // Environment capability check as a lazy initializer (runs once, during
   // this component's own render) rather than an effect-time setState — SSR
   // has no `window`/`SharedWorker`, so it starts `true` there and the real
@@ -455,7 +481,47 @@ export function useRunNode() {
     return () => clearInterval(id);
   }, []);
 
+  // Network policy (bn-ui-mobile-lifecycle): watch for Data Saver turning ON
+  // WHILE a node is running, not just at start-gate time — a user can enable
+  // it from OS settings mid-session without this tab ever reloading. Auto-
+  // stops rather than merely degrading the displayed status: continuing to
+  // relay OTHER tenants' invocation traffic over a connection the user has
+  // explicitly told the OS to conserve is the one case this feature must
+  // never do silently, matching the row's own "never promising continuous
+  // serving where the platform cannot provide it" framing — here inverted to
+  // "never CONSUMING what the user asked to conserve," the donor-side
+  // analogue of the same honesty requirement.
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof navigator === "undefined") return;
+    const nav = navigator as Navigator & {
+      connection?: {
+        saveData?: boolean;
+        addEventListener?: (type: string, listener: () => void) => void;
+        removeEventListener?: (type: string, listener: () => void) => void;
+      };
+    };
+    const conn = nav.connection;
+    if (!conn?.addEventListener) return; // Network Information API unsupported — nothing to watch
+    const onChange = () => {
+      const active = !!conn.saveData;
+      setDataSaverBlocked(active);
+      if (active) {
+        clearLastStart(); // don't let owner-handoff replay resurrect a node this policy just stopped
+        sendRef.current({ type: "stop" });
+      }
+    };
+    conn.addEventListener("change", onChange);
+    return () => conn.removeEventListener?.("change", onChange);
+  }, []);
+
   const start = useCallback((args: StartArgs) => {
+    if (dataSaverActive()) {
+      // Refuse at the source rather than starting then immediately being
+      // stopped by the change-listener above — Data Saver already being on
+      // BEFORE the user clicks Start never fires a "change" event to catch.
+      setDataSaverBlocked(true);
+      return;
+    }
     persistLastStart(args);
     sendRef.current({
       type: "start",
@@ -496,5 +562,5 @@ export function useRunNode() {
     sendRef.current({ type: "geoConsent", value });
   }, []);
 
-  return { status, supported, start, stop, setGeoConsent };
+  return { status, supported, start, stop, setGeoConsent, dataSaverBlocked };
 }
