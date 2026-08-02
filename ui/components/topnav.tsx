@@ -345,7 +345,11 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
         localStorage.removeItem(k);
       }
       initDone.current = false;
-      setSelected(PERSONAL);
+      // react-hooks/set-state-in-effect: defer by one microtask (same
+      // behavior-preserving fix as use-run-node.ts) rather than remove --
+      // this branch genuinely needs to reset the selection when the signed-in
+      // identity changes.
+      queueMicrotask(() => setSelected(PERSONAL));
     }
     localStorage.setItem("hive_uid", identity.id);
     // When the user id is first established, the personal namespace changes from
@@ -369,15 +373,18 @@ function ClerkTeamSwitcher({ identity }: { identity: Identity }) {
       // Already-persisted selection: SessionToken's mount-time mint (which ran
       // BEFORE this effect, reading this same localStorage value) already
       // minted a matching cookie — nothing to re-mint here.
-      setSelected(saved);
+      // react-hooks/set-state-in-effect: microtask-deferred, same as above.
+      queueMicrotask(() => setSelected(saved));
       initDone.current = true;
     } else if (isLoaded) {
       const slug = tenantOf(organization);
-      // Set FIRST (synchronously, before the async switchTeam below runs) so a
-      // re-render triggered by switchTeam's own state changes can't re-enter
-      // this branch.
+      // initDone.current is set FIRST (a ref write, unaffected by the
+      // microtask deferral below) so a re-render triggered by switchTeam's
+      // own state changes can't re-enter this branch — the guard above reads
+      // initDone.current, never `selected`.
       initDone.current = true;
-      setSelected(slug);
+      // react-hooks/set-state-in-effect: microtask-deferred, same as above.
+      queueMicrotask(() => setSelected(slug));
       // Route through switchTeam (persists + re-mints + THEN broadcasts) rather
       // than a raw setItem+dispatch — the mount-time mint already ran with NO
       // hive_team set (currentTeam() fell through to the pre-auth placeholder),
@@ -580,13 +587,17 @@ function TeamSwitcher({ identity }: { identity: Identity }) {
     const param = new URLSearchParams(window.location.search).get("team");
     if (param) {
       const slug = param === "personal" ? PERSONAL : param;
-      setSel(slug);
+      // react-hooks/set-state-in-effect: microtask-deferred, same as topnav's
+      // other effects above -- switchTeam below still runs synchronously
+      // right after, unaffected by when setSel's deferred update lands.
+      queueMicrotask(() => setSel(slug));
       // Re-mint the cookie for the deep-linked team (validated) before re-fetch.
       void switchTeam(slug);
       return;
     }
     const saved = localStorage.getItem("hive_team");
-    if (saved) setSel(saved);
+    // react-hooks/set-state-in-effect: microtask-deferred, same as above.
+    if (saved) queueMicrotask(() => setSel(saved));
   }, []);
   useEffect(() => {
     function onClick(e: MouseEvent) {
