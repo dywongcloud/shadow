@@ -60,7 +60,21 @@ let session = null; // { deployment, fn, digest, scope, team, relay }
 let epoch = 0;
 
 let status = {
-  version: 0,
+  // Seeded from wall-clock time, not 0 (bn-ui-sharedworker-owner): a fresh
+  // worker booted by Web Locks owner handoff has no way to know what
+  // version number surviving tabs' OWN applyStatus (generation-fenced,
+  // run-node-status.ts) is currently holding — starting at 0 meant every
+  // subsequent status update from the new owner was silently dropped by
+  // every surviving tab until this worker's own small integer counter
+  // eventually climbed back past their old high-water mark (a real,
+  // previously-measured "prolonged but self-healing" stall, not a
+  // permanent one, but still a real multi-status-update gap). Date.now()
+  // only moves forward, so a fresh worker's version is virtually always
+  // already ahead of a same-origin worker's prior counter (a normal
+  // integer increment would need decades to reach a Date.now()-scale
+  // value), fixing the stall to be effectively instant instead of merely
+  // eventual.
+  version: Date.now(),
   abiVersion: HOST_ABI_VERSION,
   lifecycle: "stopped",
   endpointId: null,
