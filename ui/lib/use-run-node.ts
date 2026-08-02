@@ -5,20 +5,25 @@ import { currentTeam } from "./api";
 import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
 
 const WORKER_URL = "/run-node-worker.js";
-// bn-impl-relay-tls: a real WSS relay now exists (deployed + live-witnessed
-// 2026-08-01 across fc-bangkok/fc-virginia/fc-sanjose) -- before this, an
-// unset NEXT_PUBLIC_HIVE_BROWSER_RELAY meant `boot()` always received an
-// empty string, which fails RelayUrl parsing immediately (see
+// bn-impl-relay-tls: real WSS relays now exist (deployed + live-witnessed
+// 2026-08-01 on fc-bangkok/fc-virginia/fc-sanjose) -- before this, an unset
+// NEXT_PUBLIC_HIVE_BROWSER_RELAY meant `boot()` always received an empty
+// string, which fails RelayUrl parsing immediately (see
 // crates/hive-browser/src/lib.rs's `boot`), so a browser node was never
 // actually functional in any deployment that hadn't separately configured
-// this var. Falls back to one real, working relay so it functions
-// out of the box; NEXT_PUBLIC_HIVE_BROWSER_RELAY still overrides it when set
-// (e.g. to point a specific deployment at a geographically closer relay).
-// Real multi-relay failover (picking the nearest/healthiest of several) is
-// tracked separately (bn-p2p-relay-failover) -- the wasm boot() API itself
-// only accepts one relay URL today, a Rust+wasm-level change beyond this file.
-const DEFAULT_RELAY = "https://fc-sanjose.relay.shadw.app:3343";
-const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || DEFAULT_RELAY;
+// this var. `BrowserNode.boot()` now takes a COMMA-SEPARATED relay list
+// (same convention as the fleet's own HIVE_RELAY_URLS) and builds a real
+// iroh RelayMap covering all of them, so this hands all 3 real relays by
+// default -- iroh's own relay-client picks and fails over between entries in
+// a RelayMap on its own; this is real multi-relay coverage, not just one
+// static URL. NEXT_PUBLIC_HIVE_BROWSER_RELAY still overrides the whole list
+// when set (e.g. a deployment that wants to pin to a subset).
+const DEFAULT_RELAYS = [
+  "https://fc-sanjose.relay.shadw.app:3343",
+  "https://fc-bangkok.relay.shadw.app:3343",
+  "https://fc-virginia.relay.shadw.app:3343",
+].join(",");
+const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || DEFAULT_RELAYS;
 
 // Web-Locks-fallback owner handoff (bn-ui-sharedworker-owner): unlike a real
 // SharedWorker (which outlives any single tab), a Web Locks re-election spawns

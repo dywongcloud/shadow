@@ -34,13 +34,16 @@ export class BrowserNode {
      */
     assetOn(peer_addr_json: string, digest: string): Promise<Uint8Array>;
     /**
-     * Boot a node: bind an endpoint against `relay_url` (must be `wss://` from
-     * an https page — plain `ws://` is mixed-content-blocked), optionally wire
-     * a pkarr `discovery_url` for publish+resolve, and restore identity from
-     * `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a fresh
-     * one. Spawns the `hive/browser/0` accept loop before returning.
+     * Boot a node: bind an endpoint against `relay_urls` (comma-separated,
+     * same convention as the fleet's own `HIVE_RELAY_URLS` — see
+     * `hive_p2p::relay_map_from_env` — so a caller can hand multiple relays
+     * for failover instead of pinning to one; each must be `wss://` from an
+     * https page, plain `ws://` is mixed-content-blocked), optionally wire a
+     * pkarr `discovery_url` for publish+resolve, and restore identity from
+     * `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a
+     * fresh one. Spawns the `hive/browser/0` accept loop before returning.
      */
-    static boot(relay_url: string, discovery_url?: string | null, secret_hex?: string | null): Promise<BrowserNode>;
+    static boot(relay_urls: string, discovery_url?: string | null, secret_hex?: string | null): Promise<BrowserNode>;
     /**
      * Clear every execution capability and gracefully close the iroh endpoint.
      * Idempotent and awaitable; unlike wasm-bindgen's generated `free()`, this

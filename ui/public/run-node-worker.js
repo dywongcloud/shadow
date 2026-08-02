@@ -28,7 +28,7 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 1;
+const WASM_BUNDLE_VERSION = 2; // v2: BrowserNode.boot()'s relay param is now a comma-separated list
 
 const ports = [];
 // Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any

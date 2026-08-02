@@ -86,7 +86,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    1
+    2
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -140,21 +140,33 @@ struct Status {
 
 #[wasm_bindgen]
 impl BrowserNode {
-    /// Boot a node: bind an endpoint against `relay_url` (must be `wss://` from
-    /// an https page — plain `ws://` is mixed-content-blocked), optionally wire
-    /// a pkarr `discovery_url` for publish+resolve, and restore identity from
-    /// `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a fresh
-    /// one. Spawns the `hive/browser/0` accept loop before returning.
+    /// Boot a node: bind an endpoint against `relay_urls` (comma-separated,
+    /// same convention as the fleet's own `HIVE_RELAY_URLS` — see
+    /// `hive_p2p::relay_map_from_env` — so a caller can hand multiple relays
+    /// for failover instead of pinning to one; each must be `wss://` from an
+    /// https page, plain `ws://` is mixed-content-blocked), optionally wire a
+    /// pkarr `discovery_url` for publish+resolve, and restore identity from
+    /// `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a
+    /// fresh one. Spawns the `hive/browser/0` accept loop before returning.
     #[wasm_bindgen]
     pub async fn boot(
-        relay_url: String,
+        relay_urls: String,
         discovery_url: Option<String>,
         secret_hex: Option<String>,
     ) -> Result<BrowserNode, JsError> {
-        let relay: RelayUrl = relay_url
-            .parse()
-            .map_err(|e| JsError::new(&format!("bad relay url {relay_url:?}: {e}")))?;
-        let map = RelayMap::from_iter([relay.clone()]);
+        let relays: Vec<RelayUrl> = relay_urls
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<RelayUrl>()
+                    .map_err(|e| JsError::new(&format!("bad relay url {s:?}: {e}")))
+            })
+            .collect::<Result<_, _>>()?;
+        if relays.is_empty() {
+            return Err(JsError::new("relay_urls must name at least one relay"));
+        }
+        let map = RelayMap::from_iter(relays);
 
         // Minimal preset (no n0 pkarr/DNS baked in) + our own relay map, so the
         // browser only ever talks to the relay we hand it.
@@ -212,7 +224,11 @@ impl BrowserNode {
 
         Ok(BrowserNode {
             ep,
-            relay: relay.to_string(),
+            // iroh's Endpoint exposes no live "which relay did I actually land
+            // on" readback (same constraint noted in hive-p2p's relay_map_from_
+            // env), so this reports the full CONFIGURED set rather than
+            // guessing at a single "the" relay — honest about what's known.
+            relay: relay_urls.clone(),
             served,
             invoke,
             asset,
