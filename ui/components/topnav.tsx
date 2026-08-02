@@ -111,7 +111,19 @@ export function TopNav() {
   const workflowsSeg = pathname === "/workflows" || pathname.startsWith("/workflows/");
 
   return (
-    <header className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur">
+    <header
+      className="sticky top-0 z-30 border-b border-border bg-bg/85 backdrop-blur"
+      // bn-ui-mobile-lifecycle: the root layout sets viewport-fit=cover +
+      // apple-mobile-web-app-status-bar-style=black-translucent (app/layout.tsx),
+      // which is what lets an installed iOS PWA extend content under the
+      // notch/status-bar in the first place -- but without THIS, a sticky
+      // top-0 header (this one) renders its own content underneath that
+      // status bar/notch with nothing pushing it down, exactly the classic
+      // "content hidden behind the notch" PWA bug. env() resolves to 0 on
+      // any device with no notch/inset (desktop, older phones), so this is a
+      // no-op everywhere except where it's actually needed.
+      style={{ paddingTop: "env(safe-area-inset-top)" }}
+    >
       {/* Row 1: brand + team switcher + account */}
       <div className="mx-auto flex h-[52px] max-w-[1400px] items-center justify-between px-4 sm:px-6">
         <div className="flex min-w-0 items-center gap-2 text-sm">

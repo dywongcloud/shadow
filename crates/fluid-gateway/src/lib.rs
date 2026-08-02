@@ -2179,9 +2179,22 @@ async fn try_browser(
     let forwarded: HashMap<String, String> = headers
         .iter()
         .filter(|(name, _)| {
+            // authorization/cookie/proxy-authorization MUST NOT reach the
+            // browser tab: Team-scoped targets are admittable by any
+            // authenticated member (no owner/admin gate), so forwarding the
+            // caller's live bearer JWT / hive_ API key handed it straight to
+            // a low-trust peer -- an in-tenant privilege escalation. Every
+            // other header is fine to forward as request context.
             !matches!(
                 name.as_str(),
-                "connection" | "content-length" | "host" | "transfer-encoding" | "upgrade"
+                "connection"
+                    | "content-length"
+                    | "host"
+                    | "transfer-encoding"
+                    | "upgrade"
+                    | "authorization"
+                    | "cookie"
+                    | "proxy-authorization"
             )
         })
         .filter_map(|(name, value)| {

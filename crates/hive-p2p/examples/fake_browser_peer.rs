@@ -95,6 +95,10 @@ async fn main() -> anyhow::Result<()> {
                         }
                     };
                     eprintln!("fake_browser_peer: got op={op:?}, payload_len={}", payload.len());
+                    eprintln!(
+                        "fake_browser_peer: payload={}",
+                        String::from_utf8_lossy(payload)
+                    );
                     // Reply verbatim with the configured bytes regardless of op —
                     // the test controls op-specific behavior via which reply file
                     // it starts this process with. encode_reply matches the
