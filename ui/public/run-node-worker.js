@@ -293,6 +293,58 @@ async function discardStaleAttempt(bootedNode, admittedEndpointId, team) {
   }
 }
 
+// Health/latency-aware relay ordering (bn-p2p-relay-failover): iroh's own
+// RelayMap can carry several relays, but nothing upstream of it knows which
+// one is actually CLOSEST to this browser -- a fixed config order (as
+// deployed: sanjose, bangkok, virginia) is not a proximity order (measured
+// live from a US-west-coast vantage: sanjose ~120ms, virginia ~360ms,
+// bangkok ~880ms -- bangkok, listed SECOND, is actually the slowest of the
+// three). Probes each relay's real HTTPS port with a short timeout and
+// returns the SAME urls sorted fastest-first; a relay that fails/times out
+// is dropped from the front of the list but not lost entirely (appended
+// after the successful ones, in original order) -- still worth trying if
+// every faster one is also down, never silently removed. Falls back to the
+// UNCHANGED original string if every probe fails (offline, or every relay
+// genuinely down) -- boot() gets the same list either way, just possibly
+// unordered, which is exactly today's pre-existing behavior, never worse.
+const RELAY_PROBE_TIMEOUT_MS = 3_000;
+
+async function orderRelaysByLatency(relayUrlsCsv) {
+  const urls = relayUrlsCsv
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (urls.length <= 1) return relayUrlsCsv;
+  const timed = await Promise.all(
+    urls.map(async (url) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), RELAY_PROBE_TIMEOUT_MS);
+      const started = performance.now();
+      try {
+        // mode:"no-cors" is load-bearing: this is a cross-origin fetch (the
+        // relay is not a CORS-enabled API, it never sends Access-Control-
+        // Allow-Origin) and the DEFAULT "cors" mode throws on a response
+        // with no CORS headers -- discovered live, every probe silently
+        // failed and this function always fell back to the unordered
+        // original list until this fix. no-cors still requires the server
+        // to actually respond before the promise settles, so elapsed time
+        // is a real latency measurement even though the (opaque) response
+        // body/status can't be read.
+        await fetch(url, { method: "GET", mode: "no-cors", signal: controller.signal });
+        return { url, ms: performance.now() - started };
+      } catch {
+        return { url, ms: null };
+      } finally {
+        clearTimeout(timer);
+      }
+    }),
+  );
+  const reachable = timed.filter((t) => t.ms !== null).sort((a, b) => a.ms - b.ms);
+  const unreachable = timed.filter((t) => t.ms === null);
+  if (reachable.length === 0) return relayUrlsCsv; // every probe failed — leave order unchanged
+  return [...reachable, ...unreachable].map((t) => t.url).join(",");
+}
+
 async function start(msg) {
   if (node || status.lifecycle === "starting") return;
   const myEpoch = ++epoch;
@@ -308,6 +360,8 @@ async function start(msg) {
   let booted = null;
   let admittedEndpointId = null;
   try {
+    const orderedRelay = await orderRelaysByLatency(msg.relay);
+    if (myEpoch !== epoch) return; // stop() ran during the relay probe
     await init();
     if (myEpoch !== epoch) return; // stop() ran during wasm init
     // Check the ACTUAL loaded module's version, not just an assumption from
@@ -322,7 +376,7 @@ async function start(msg) {
     // Identity persistence (bn-impl-key-persistence): boot a throwaway node
     // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
     // the persisted seed so the reported id is stable across reloads.
-    const scratch = await BrowserNode.boot(msg.relay, null, null);
+    const scratch = await BrowserNode.boot(orderedRelay, null, null);
     if (myEpoch !== epoch) {
       await discardStaleAttempt(scratch, null, msg.team);
       return;
@@ -334,7 +388,7 @@ async function start(msg) {
     } else {
       await scratch.close();
       scratch.free();
-      n = await BrowserNode.boot(msg.relay, msg.discovery || null, seedHex);
+      n = await BrowserNode.boot(orderedRelay, msg.discovery || null, seedHex);
     }
     booted = n;
     if (myEpoch !== epoch) {
@@ -347,7 +401,7 @@ async function start(msg) {
     // current — everything above this line touched only locals, so a stale
     // epoch up to here has nothing to unpublish.
     node = n;
-    setStatus({ endpointId, relay: msg.relay, lifecycle: anyVisible() ? "online" : "suspended" });
+    setStatus({ endpointId, relay: orderedRelay, lifecycle: anyVisible() ? "online" : "suspended" });
     await admitOnce(addrJson, endpointId);
     admittedEndpointId = endpointId;
     if (myEpoch !== epoch) {
