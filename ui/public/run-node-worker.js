@@ -122,18 +122,36 @@ function setStatus(patch) {
   broadcast();
 }
 
+// DIAL_DEADLINE from the reconnect-machine design (bn-p2p-reconnect-state):
+// callApi previously had no client-side timeout at all, relying entirely on
+// the browser's own (much longer, and not something this code controls) TCP/
+// fetch timeout -- a hung admission request could block the reconnect chain
+// far longer than any of the backoff/jitter timing around it was designed
+// for. AbortController is the standard fetch-timeout primitive; a timeout
+// abort surfaces as a real thrown error (name "AbortError"), which the
+// existing catch/classifyAdmissionError paths already handle like any other
+// admitOnce failure -- no special-casing needed there.
+const DIAL_DEADLINE_MS = 10_000;
+
 async function callApi(method, path, team, body) {
-  const r = await fetch(`/cloud${path}`, {
-    method,
-    credentials: "same-origin",
-    headers: { "content-type": "application/json", "x-hive-team": team },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(text || `${method} ${path} -> ${r.status}`);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DIAL_DEADLINE_MS);
+  try {
+    const r = await fetch(`/cloud${path}`, {
+      method,
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", "x-hive-team": team },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(text || `${method} ${path} -> ${r.status}`);
+    }
+    return await r.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return r.json();
 }
 
 async function admitOnce(addrJson, endpointId) {
