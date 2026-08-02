@@ -224,6 +224,20 @@ impl BrowserAdmissionStore {
         Ok(old)
     }
 
+    /// Fast-path relay deny applied by a follower echoing a leader's revoke
+    /// (bn-p2p-revocation-latency, `fanout_revoke`/`mesh_revoke_echo` below) --
+    /// deliberately independent of `revoke()`'s full active/tombstone/version
+    /// mutation. Touching this node's own wall-clock-anchored version counter
+    /// as if IT made the authoritative decision could race ahead of a leader
+    /// whose clock lags by even a few ms, causing a later genuinely-
+    /// authoritative leader snapshot to be rejected by `adopt()`'s version
+    /// check. The narrower operation (denylist only) is safe regardless.
+    fn mark_denied(&self, endpoint_id: &str, now: u64) {
+        let mut state = self.inner.lock();
+        state.denylist.insert(endpoint_id.to_string(), now);
+        state.prune_tombstones(now);
+    }
+
     fn revoke(&self, tenant: &str, endpoint_id: &str) -> Option<BrowserAdmission> {
         let mut state = self.inner.lock();
         let record = state.active.get(endpoint_id)?;
@@ -717,8 +731,54 @@ async fn revoke_admission(
         ));
     }
     cloud.browser_admissions.revoke(&tenant, &endpoint_id);
+    fanout_revoke(&cloud, &endpoint_id);
     remove_endpoint(&cloud, &endpoint_id).await;
     Ok(Json(json!({ "ok": true, "revoked": endpoint_id })))
+}
+
+/// Fan the fast-path revoke echo to every OTHER healthy peer reachable over
+/// the mesh (bn-p2p-revocation-latency's remaining item) -- shrinks the
+/// window a revoked endpoint can still route through / reconnect to a
+/// follower's relay from the ~60s periodic store_sync snapshot-pull interval
+/// down to one mesh round trip. Best-effort and backgrounded: the caller
+/// (revoke_admission/revoke_team) already applied the authoritative change
+/// locally and is about to return to ITS caller, so a peer this misses
+/// (partition, no gossiped iroh address yet) simply catches up on the next
+/// periodic pull -- this is a latency optimization layered on top of an
+/// already-correct mechanism, never a replacement for it.
+fn fanout_revoke(cloud: &Arc<CloudState>, endpoint_id: &str) {
+    let targets: Vec<(String, String)> = cloud
+        .registry
+        .nodes()
+        .iter()
+        .filter(|n| n.healthy && n.name != cloud.node_name)
+        .filter_map(|n| Some((n.peer_id.clone()?, n.iroh_addr.clone()?)))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let cloud = cloud.clone();
+    let endpoint_id = endpoint_id.to_string();
+    tokio::spawn(async move {
+        let path = format!("/v1/browser/admissions/mesh-revoke/{endpoint_id}");
+        for (id, addr) in targets {
+            let ok =
+                crate::gossip::request_to(&cloud, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 5)
+                    .await
+                    .is_some();
+            tracing::debug!(endpoint_id = %endpoint_id, node = %id, ok, "browser admission revoke echo");
+        }
+    });
+}
+
+/// Receiving side of `fanout_revoke`'s echo, dispatched via
+/// `gossip::dispatch`'s `/v1/browser/admissions/mesh-revoke/:endpoint_id`
+/// POST arm. See `BrowserAdmissionStore::mark_denied` for why this touches
+/// ONLY the relay denylist + gateway routing, never the versioned
+/// active/tombstone state.
+pub async fn mesh_revoke_echo(cloud: &Arc<CloudState>, endpoint_id: &str) {
+    cloud.browser_admissions.mark_denied(endpoint_id, hive_core::now_ms());
+    remove_endpoint(cloud, endpoint_id).await;
 }
 
 fn routing_identity_changed(old: &BrowserAdmission, new: &BrowserAdmission) -> bool {
@@ -760,6 +820,7 @@ pub async fn revoke_team(cloud: &Arc<CloudState>, tenant: &str) -> usize {
     let tenant = crate::admin::norm(tenant).to_string();
     let removed = cloud.browser_admissions.revoke_team(&tenant);
     for record in &removed {
+        fanout_revoke(cloud, &record.endpoint_id);
         remove_endpoint(cloud, &record.endpoint_id).await;
     }
     removed.len()

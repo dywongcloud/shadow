@@ -197,6 +197,28 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 crate::browser_admission::mesh_list(cloud, &tenant)
             }
         }
+        // Fast-path revoke echo (bn-p2p-revocation-latency): the leader fans
+        // this out right after a real revoke so every follower applies the
+        // relay-deny + routing-removal side effects within one mesh round
+        // trip instead of waiting up to the ~60s periodic store_sync
+        // snapshot pull. No tenant check here -- the leader already made and
+        // validated the authoritative decision; a follower just echoes it
+        // for this specific endpoint_id. Never touches versioned
+        // active/tombstone state (see mark_denied's doc), so it cannot race
+        // or corrupt this follower's own later adopt() ordering.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/browser/admissions/mesh-revoke/") =>
+        {
+            let endpoint_id = p
+                .trim_start_matches("/v1/browser/admissions/mesh-revoke/")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            if !endpoint_id.is_empty() {
+                crate::browser_admission::mesh_revoke_echo(cloud, endpoint_id).await;
+            }
+            Vec::new()
+        }
         // Coarse browser presence first-read leader fallback (constellation
         // satellites) — tenant-scoped the same way as the admissions list arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/presence") => {
