@@ -499,7 +499,9 @@ fn parse_ipam_conflict(net: &Option<serde_json::Value>, stderr: &str) -> Option<
 /// node and every cold start surfaced to users as 503 CAPACITY_EXHAUSTED —
 /// which reads as "you need more capacity" when the truth is "the host's lock
 /// pool leaked". This is the signal that the pool, not capacity, is the problem.
-fn is_lock_exhaustion(stderr: &str) -> bool {
+/// Shared with `mock.rs`, whose container path is the SAME real podman on a
+/// `HIVE_FORCE_MOCK=1` node, so both must classify the fault identically.
+pub(crate) fn is_lock_exhaustion(stderr: &str) -> bool {
     let e = stderr.to_lowercase();
     e.contains("num_locks") || (e.contains("allocating lock") && e.contains("allocation failed"))
 }
@@ -1209,10 +1211,25 @@ pub(crate) async fn podman_run_container(
             .env("PATH", path_env)
             .output()
             .await;
-        anyhow::bail!(
-            "{bin} run failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        // STILL lock-exhausted after the self-heal above ran (it reclaimed
+        // nothing, or the retry hit the same wall): the pool is genuinely full of
+        // LIVE objects, which is a per-HOST resource fault with exactly one
+        // remedy — raise `num_locks` and `podman system renumber`. It is not
+        // capacity: the node can have terabytes free and still be here, and
+        // reporting CAPACITY_EXHAUSTED sent an operator looking for space that
+        // was never the problem.
+        if !apple && is_lock_exhaustion(stderr) {
+            anyhow::bail!(
+                "node cannot start containers: podman's lock pool is exhausted and nothing was \
+                 reclaimable — raise `num_locks` in containers.conf then run `podman system \
+                 renumber` on this node (a config change alone is inert). Not an application \
+                 fault and not host disk/memory capacity ({}). {bin} run failed: {stderr}",
+                hive_core::fault::NODE_LOCK_POOL_EXHAUSTED
+            );
+        }
+        anyhow::bail!("{bin} run failed: {stderr}");
     }
     // Wait for the container's port to accept connections (image pull + boot).
     // Budget is env-tunable (`HIVE_CONTAINER_READY_SECS`, default 180) — a heavy
@@ -1258,7 +1275,17 @@ pub(crate) async fn podman_run_container(
                 .env("PATH", path_env)
                 .output()
                 .await;
-            anyhow::bail!("container {name} exited before listening on {func_addr}: {logs}");
+            // The container STARTED and then exited before listening — the
+            // "exited before listening on 127.0.0.1:PORT" shape `fluid-compute`
+            // circuits on. An APP fault, and marked as one: the circuit only
+            // opens on the third consecutive failure, so unmarked the first two
+            // reported CAPACITY_EXHAUSTED and blamed the host.
+            anyhow::bail!(
+                "the deployment's own container {name} exited before listening on {func_addr} — \
+                 check this deployment's logs, entrypoint and required env; the node started the \
+                 container fine ({}). Container logs: {logs}",
+                hive_core::fault::DEPLOYMENT_START_FAILED
+            );
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     }

@@ -122,7 +122,8 @@ Adopt upstream iroh-blobs' CI leak guard verbatim:
 Endpoint construction: **not** `presets::N0` — a custom builder wiring
 `PkarrPublisher::builder(<shadw pkarr relay URL>)` + `PkarrResolver::builder(...)` (both
 constructors verified present in 1.0.2; in the browser both publish and resolve go over
-HTTPS, so that pkarr relay must be HTTPS-reachable), relay map pointed at our `wss://` relays,
+HTTPS, so that pkarr relay must be HTTPS-reachable), relay map pointed at our `https://`
+RelayUrls (iroh derives `wss://…/relay` internally; callers must not pass a WebSocket URL),
 `.alpns()` for the inbound ALPNs, `.secret_key()` from §2.2. Inbound accept via
 `Router::builder(endpoint).accept(ALPN, handler).spawn()` — the ProtocolHandler path is
 shared, un-cfg'd code proven in the browser by n0's own examples.

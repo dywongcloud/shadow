@@ -89,8 +89,11 @@ export interface SatelliteMarker {
   ageMs?: number;
 }
 
-const SATELLITE_ONLINE_COLOR = "#38bdf8"; // sky-400 — distinct from every fleet/badge color above
-const SATELLITE_DEGRADED_COLOR = "#94a3b8"; // slate-400 — visually recedes vs. a live fleet node
+// Exported so the /network constellation (MeshDiagram in app/network/page.tsx)
+// renders browser peers in the exact same two hues — one meaning per color
+// fleet-wide, the same discipline as GPU_COLOR above.
+export const SATELLITE_ONLINE_COLOR = "#38bdf8"; // sky-400 — distinct from every fleet/badge color above
+export const SATELLITE_DEGRADED_COLOR = "#94a3b8"; // slate-400 — visually recedes vs. a live fleet node
 
 function satelliteColor(state?: string): string {
   return state === "degraded" || state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR;

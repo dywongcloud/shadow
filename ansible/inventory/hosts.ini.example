@@ -24,10 +24,21 @@ fc_pvm
 bkk-example ansible_host=203.0.113.10 ansible_user=root hive_name=fc-example1 hive_region=example-region hive_public_ip=203.0.113.10
 
 [fc_pvm]
-# cloud VMs without hardware KVM -- see roles/pvm_firecracker/README.md
-# for the hard fsgsbase requirement before adding a host here.
+# cloud VMs without hardware KVM -- see roles/pvm_firecracker/README.md.
+# fsgsbase/rdtscp are NOT a requirement for adding a host here: the patch
+# series turns both into soft runtime fallbacks, and preflight only logs which
+# path a host will use.
+#
+# pvm_skip=true excludes a host from the pvm_firecracker role ENTIRELY (no
+# kernel build, no patching, no REBOOT, no microVM smoke test). Set it in
+# inventory rather than relying on a hand-shaped --limit, because this role
+# reboots and an exclusion you have to remember is one you will eventually
+# forget. Use it for a host that must not be rebooted, one that is down, or one
+# with a known-bad PVM kernel (a real case: a host where booting a microVM
+# hard-resets the machine).
 va-example  ansible_host=203.0.113.20 ansible_user=root hive_name=fc-example2 hive_region=example-region-2 hive_public_ip=203.0.113.20
 sj-example  ansible_host=203.0.113.21 ansible_user=root hive_name=fc-example3 hive_region=example-region-2 hive_public_ip=203.0.113.21
+# fr-example  ansible_host=203.0.113.22 ansible_user=root hive_name=fc-example4 hive_region=example-region-3 hive_public_ip=203.0.113.22 pvm_skip=true
 
 [platform:vars]
 ansible_python_interpreter=/usr/bin/python3

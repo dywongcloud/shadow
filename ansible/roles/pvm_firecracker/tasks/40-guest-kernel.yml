@@ -15,6 +15,12 @@
     force: false
     update: "{{ pvm_git_update | bool }}"
 
+# Same single-owner checkout 30-host-kernel.yml imports. Idempotent when that
+# stage already ran this play, and required when `--tags guest_kernel` runs
+# standalone: without it the patch dir would be whatever a previous run left
+# behind (or absent), which is the frozen-checkout failure again.
+- import_tasks: 25-patch-series.yml
+
 # Fetched on the CONTROL host, then pushed -- not pulled by the target.
 # Some fleet networks cannot reach raw.githubusercontent.com at all: the TLS
 # handshake is reset mid-ClientHello (witnessed on fc-frankfurt, a Tencent
@@ -43,19 +49,95 @@
   ansible.builtin.set_fact:
     guest_kernel_tree: "{{ guest_kernel_src }}"
 
-- name: Apply fsgsbase/rdtscp fallback patches to the guest tree (only if host masks either)
+# Applied UNCONDITIONALLY and FATALLY, with the same declared patch set, fuzz and
+# already-applied detection as the host tree -- see the long comment in
+# 30-host-kernel.yml for the measured `git apply`-vs-GNU-patch reasoning, why the
+# 6.12->7.1 forward-port is excluded (it targets vanilla torvalds v7.1, not
+# pvm-612), and why the old `_has_fsgsbase`/`_has_rdtscp` gate voided the series
+# on 7 of 8 fleet hosts.
+#
+# The guest tree needs this patch MORE than the host tree does, which is the real
+# reason it cannot be gated: 0001x86pvmvdsogetcpulslfallback.patch is a GUEST-side
+# fix. It gates the guest vDSO's `getcpu()` RDTSCP arm on X86_FEATURE_PVM_RDTSCP
+# (set only when the guest is PVM *and* the host exposes RDTSCP) instead of on
+# "is a PVM guest" alone -- without it, a guest whose host lacks RDTSCP still gets
+# RDTSCP patched into its vDSO and faults in user space on the first getcpu().
+# Patching one tree and not the other is also how the host `kvm_pvm` and guest
+# `vmlinux` drift apart, which this role's README documents as an instant
+# triple-fault.
+#
+# Marker keyed on the series sha so a future `pvm_patch_branch` bump re-applies.
+- name: Apply the PVM patch series ({{ pvm_patch_branch[:9] }}) to the guest tree
   ansible.builtin.shell:
     chdir: "{{ guest_kernel_tree }}"
     cmd: |
-      set -uo pipefail
-      shopt -s nullglob
-      for p in {{ pvm_patch_dir }}/patches/*.patch; do
-        git apply --3way "$p" 2>/dev/null || echo "skip: $(basename "$p")"
+      set -euo pipefail
+      applied=0; skipped=0
+      for name in {{ pvm_patch_files | map('quote') | join(' ') }}; do
+        p="{{ pvm_patch_dir }}/patches/$name"
+        if [ ! -f "$p" ]; then
+          echo "FATAL: declared patch missing from the series: $name" >&2
+          exit 1
+        fi
+        if patch -p1 -R --dry-run --fuzz={{ pvm_patch_fuzz }} --force \
+             --no-backup-if-mismatch -i "$p" >/dev/null 2>&1; then
+          echo "already applied, skipping: $name"
+          skipped=$((skipped+1))
+          continue
+        fi
+        if ! patch -p1 --dry-run --fuzz={{ pvm_patch_fuzz }} --forward \
+               --no-backup-if-mismatch -i "$p" >/dev/null 2>&1; then
+          echo "FATAL: $name does not apply to {{ pvm_base_branch }} (context drift)." >&2
+          echo "--- dry-run diagnostics ---" >&2
+          patch -p1 --dry-run --fuzz={{ pvm_patch_fuzz }} --forward \
+            --no-backup-if-mismatch -i "$p" >&2 || true
+          exit 1
+        fi
+        patch -p1 --fuzz={{ pvm_patch_fuzz }} --forward \
+          --no-backup-if-mismatch -i "$p"
+        echo "applied: $name"
+        applied=$((applied+1))
       done
-      touch .hive_patches_applied
+      echo "series {{ pvm_patch_branch }}: applied=$applied already-present=$skipped"
+      touch .hive_patches_applied-{{ pvm_patch_branch }}
   args:
-    creates: "{{ guest_kernel_tree }}/.hive_patches_applied"
-  when: not (_has_fsgsbase | default(true)) or not (_has_rdtscp | default(true))
+    creates: "{{ guest_kernel_tree }}/.hive_patches_applied-{{ pvm_patch_branch }}"
+  register: _guest_patches
+
+- name: Show guest patch-series application result
+  ansible.builtin.debug:
+    var: _guest_patches.stdout_lines
+  when: _guest_patches.stdout_lines is defined
+
+# Prove the patch's EFFECT is in the guest tree, not just that patch(1) exited 0.
+# Nothing downstream would otherwise notice an unpatched guest kernel until a
+# guest faulted in user space on getcpu().
+- name: Verify the PVM_RDTSCP fallback is present in the guest tree
+  ansible.builtin.command:
+    cmd: git grep -c "X86_FEATURE_PVM_RDTSCP" -- {{ item }}
+    chdir: "{{ guest_kernel_tree }}"
+  loop:
+    - arch/x86/include/asm/cpufeatures.h
+    - arch/x86/include/asm/segment.h
+    - arch/x86/kernel/cpu/common.c
+  register: _guest_pvm_rdtscp
+  changed_when: false
+  failed_when: _guest_pvm_rdtscp.rc != 0
+
+- name: Check the guest tree for leftover conflict markers
+  ansible.builtin.command:
+    cmd: git grep -l -E '^(<<<<<<< |>>>>>>> )' -- 'arch/*' 'include/*' 'virt/*' 'mm/*'
+    chdir: "{{ guest_kernel_tree }}"
+  register: _guest_conflicts
+  changed_when: false
+  failed_when: false
+
+- name: Assert the guest tree has no conflict markers
+  ansible.builtin.assert:
+    that: _guest_conflicts.stdout | trim | length == 0
+    fail_msg: >-
+      Conflict markers found in the guest kernel tree -- it will not compile:
+      {{ _guest_conflicts.stdout_lines | default([]) }}
 
 - name: "Configure guest kernel (FC-ready virtio/ext4/serial built-in, PVM_GUEST=y)"
   ansible.builtin.shell:

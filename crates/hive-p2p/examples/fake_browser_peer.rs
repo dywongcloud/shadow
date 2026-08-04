@@ -35,6 +35,16 @@ async fn main() -> anyhow::Result<()> {
     let drop_after_read = std::env::var("HIVE_FAKE_BROWSER_DROP_AFTER_READ")
         .map(|value| matches!(value.as_str(), "1" | "true"))
         .unwrap_or(false);
+    let reply_delay_ms = std::env::var("HIVE_FAKE_BROWSER_REPLY_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let read_delay_ms = std::env::var("HIVE_FAKE_BROWSER_READ_DELAY_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let reply_mode = std::env::var("HIVE_FAKE_BROWSER_REPLY_MODE")
+        .unwrap_or_else(|_| "normal".to_string());
 
     let ep = hive_p2p::bind_full(None, &[], &[], false).await?;
     ep.online().await;
@@ -80,12 +90,17 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
         let reply = reply.clone();
+        let reply_mode = reply_mode.clone();
         tokio::spawn(async move {
             eprintln!("fake_browser_peer: entering accept_bi loop");
             while let Ok((mut send, mut recv)) = conn.accept_bi().await {
                 eprintln!("fake_browser_peer: accepted a bi-stream");
                 let reply = reply.clone();
+                let reply_mode = reply_mode.clone();
                 tokio::spawn(async move {
+                    if read_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(read_delay_ms)).await;
+                    }
                     // Wire framing is [u32 LITTLE-endian len][...] per
                     // hive-browser-proto::{check_len,encode_request} -- reusing
                     // the real check_len/split_request here (not a hand-rolled
@@ -126,28 +141,62 @@ async fn main() -> anyhow::Result<()> {
                         "fake_browser_peer: payload={}",
                         String::from_utf8_lossy(payload)
                     );
+                    let mut trailing = [0u8; 1];
+                    match recv.read(&mut trailing).await {
+                        Ok(None) => {}
+                        Ok(Some(_)) => {
+                            eprintln!("fake_browser_peer: request has trailing bytes");
+                            let _ = send.reset(hive_browser_proto::reset::MALFORMED_PAYLOAD.into());
+                            let _ = recv.stop(hive_browser_proto::reset::MALFORMED_PAYLOAD.into());
+                            return;
+                        }
+                        Err(error) => {
+                            eprintln!("fake_browser_peer: request EOF failed: {error}");
+                            return;
+                        }
+                    }
+                    if reply_delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(reply_delay_ms)).await;
+                    }
                     if drop_after_read {
                         eprintln!("fake_browser_peer: resetting stream after full request read");
                         let _ = send.reset(0u8.into());
                         return;
                     }
                     // Reply verbatim with the configured bytes regardless of op —
-                    // the test controls op-specific behavior via which reply file
-                    // it starts this process with. encode_reply matches the
-                    // real wire format (le length, no op byte on the reply).
+                    // the diagnostic controls malformed/truncated variants with
+                    // HIVE_FAKE_BROWSER_REPLY_MODE.
                     let framed = hive_browser_proto::encode_reply(&reply);
-                    match send.write_all(&framed).await {
+                    let bytes = match reply_mode.as_str() {
+                        "normal" | "trailing" => framed.as_slice(),
+                        "prefix-truncated" => &framed[..framed.len().min(2)],
+                        "body-truncated" => &framed[..(4 + reply.len() / 2).min(framed.len())],
+                        mode => {
+                            eprintln!("fake_browser_peer: unknown reply mode {mode}");
+                            return;
+                        }
+                    };
+                    match send.write_all(bytes).await {
                         Ok(()) => eprintln!(
-                            "fake_browser_peer: wrote {} framed reply bytes",
-                            framed.len()
+                            "fake_browser_peer: wrote {} reply bytes in mode {}",
+                            bytes.len(),
+                            reply_mode
                         ),
                         Err(e) => {
                             eprintln!("fake_browser_peer: failed writing reply: {e}");
                             return;
                         }
                     }
-                    let _ = send.finish();
-                    eprintln!("fake_browser_peer: reply complete");
+                    if reply_mode == "trailing" {
+                        if let Err(error) = send.write_all(&[0xa5]).await {
+                            eprintln!("fake_browser_peer: failed writing trailing byte: {error}");
+                            return;
+                        }
+                    }
+                    match send.finish() {
+                        Ok(()) => eprintln!("fake_browser_peer: reply complete"),
+                        Err(error) => eprintln!("fake_browser_peer: reply finish failed: {error}"),
+                    }
                 });
             }
             eprintln!("fake_browser_peer: accept_bi loop ended (connection closed)");

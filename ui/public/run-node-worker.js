@@ -10,7 +10,6 @@
 // consent on the main thread and posts coordinates in only via the
 // `presence` control message; this worker never decides consent policy.
 
-import init, { BrowserNode, wasmBundleVersion } from "./browser-node/pkg/hive_browser.js";
 import { loadOrCreateSeed } from "./browser-node/identity.js";
 
 const PROTOCOL_VERSION = 0; // must match hive_browser_proto::BROWSER_PROTOCOL_VERSION
@@ -28,7 +27,29 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 4; // v4: BrowserNode exposes live iroh address/home-relay changes
+const WASM_BUNDLE_VERSION = 13; // v13: EOF-only stream completion, semaphore backpressure
+const WASM_MODULE_URL = new URL(
+  `./browser-node/pkg/hive_browser.js?v=${WASM_BUNDLE_VERSION}`,
+  import.meta.url,
+);
+const WASM_BINARY_URL = new URL(
+  `./browser-node/pkg/hive_browser_bg.wasm?v=${WASM_BUNDLE_VERSION}`,
+  import.meta.url,
+);
+let browserModulePromise = null;
+
+function loadBrowserModule() {
+  if (browserModulePromise) return browserModulePromise;
+  const pending = import(WASM_MODULE_URL.href).then(async (module) => {
+    await module.default(WASM_BINARY_URL);
+    return module;
+  });
+  browserModulePromise = pending;
+  pending.catch(() => {
+    if (browserModulePromise === pending) browserModulePromise = null;
+  });
+  return pending;
+}
 
 const ports = [];
 // Per-port visibility (bn-p2p-bfcache-lifecycle): a SharedWorker outlives any
@@ -478,7 +499,7 @@ async function start(msg) {
   try {
     const orderedRelay = await orderRelaysByLatency(msg.relay);
     if (myEpoch !== epoch) return; // stop() ran during the relay probe
-    await init();
+    const { BrowserNode, wasmBundleVersion } = await loadBrowserModule();
     if (myEpoch !== epoch) return; // stop() ran during wasm init
     // Check the ACTUAL loaded module's version, not just an assumption from
     // the URL/cache key — catches a stale service-worker-cached .wasm binary
@@ -493,6 +514,7 @@ async function start(msg) {
     // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
     // the persisted seed so the reported id is stable across reloads.
     const scratch = await BrowserNode.boot(orderedRelay, null, null);
+    booted = scratch;
     if (myEpoch !== epoch) {
       await discardStaleAttempt(scratch, null, msg.team);
       return;
@@ -504,6 +526,7 @@ async function start(msg) {
     } else {
       await scratch.close();
       scratch.free();
+      booted = null;
       n = await BrowserNode.boot(orderedRelay, msg.discovery || null, seedHex);
     }
     booted = n;

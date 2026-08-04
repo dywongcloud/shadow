@@ -134,6 +134,22 @@ struct FunctionPool {
     /// arriving request found the window already expired and paid the full
     /// startup cost again. The gate has to outlast the failure it is guarding.
     circuit_probe_after_ms: u64,
+    /// The `hive_core::fault` marker of the most recent cold-start failure, when
+    /// that failure was a NODE fault (missing rootfs/kernel, no hypervisor,
+    /// exhausted lock pool) rather than anything about this deployment.
+    ///
+    /// Load-bearing for honest reporting, not observability. A node fault fails
+    /// EVERY cold start, so the pool's `warm_fail_streak` crosses the circuit
+    /// threshold and the circuit's own message then tells the user to "check the
+    /// deployment's logs, entrypoint and required env" — blaming their app for a
+    /// host the operator has to reprovision. Witnessed on fc-sanjose-cvm-2: a
+    /// missing `default.ext4` produced 13 failed cold starts, and the user-visible
+    /// code alternated between CAPACITY_EXHAUSTED and DEPLOYMENT_CIRCUIT_OPEN,
+    /// neither of which named the real fault. Carrying the marker through the
+    /// circuit bail keeps the node fault visible for as long as it is the cause.
+    /// Cleared by any successful start, so a genuinely broken app circuits
+    /// normally.
+    last_node_fault: Option<&'static str>,
     /// Dynamic per-instance safe-concurrency ceiling. `None` = use
     /// `cfg.max_concurrency`. A pressure monitor LOWERS this (CPU-heavy / event-loop
     /// lag / memory pressure) so the scheduler scales out earlier instead of piling
@@ -356,6 +372,11 @@ impl Drop for ColdStartGuard {
         if !self.armed {
             return;
         }
+        // A NODE fault (missing rootfs/kernel, no hypervisor, empty lock pool)
+        // fails every cold start for every deployment on this node. Remember it
+        // on the pool so the circuit that these failures are about to open still
+        // names the node instead of telling the user to check their entrypoint.
+        let node_fault = self.error.as_deref().and_then(node_fault_marker);
         let mut streak = 0u32;
         if let Some(p) = self.fluid.registry.lock().get_mut(&self.key) {
             p.provisioning = p.provisioning.saturating_sub(1);
@@ -363,6 +384,26 @@ impl Drop for ColdStartGuard {
             p.warm_backoff_until_ms = now_ms() + (1000u64 << p.warm_fail_streak.min(6));
             p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
             streak = p.warm_fail_streak;
+            // Only overwrite on a fault we could classify: an abandoned cold
+            // start (error = None) says nothing about the node, and must not
+            // erase a real node fault an earlier attempt proved.
+            //
+            // A cold start that failed for some OTHER reason DOES clear it: the
+            // artifact/hypervisor checks are the first thing `provision` does, so
+            // getting past them and dying later proves the node fault is gone.
+            // Witnessed live: after the missing `default.ext4` was restored, the
+            // half-open probe booted the microVM and then failed on the app
+            // itself — and without this the pool kept reporting the stale
+            // NODE_IMAGE_MISSING, blaming a node the operator had already fixed.
+            // That is the original bug pointed the other way, so it clears here.
+            // The failure direction is deliberate: clearing too eagerly costs one
+            // request the sharper label (the next attempt re-records it), while
+            // keeping it too long mislabels a healthy node indefinitely.
+            if let Some(marker) = node_fault {
+                p.last_node_fault = Some(marker);
+            } else if self.error.is_some() {
+                p.last_node_fault = None;
+            }
         }
         // The line to read first when a deployment will not start: it names the
         // streak driving the circuit and whether the caller waited for the answer.
@@ -370,10 +411,31 @@ impl Drop for ColdStartGuard {
             func = %self.key,
             fail_streak = streak,
             abandoned = self.error.is_none(),
+            node_fault = node_fault.unwrap_or(""),
             error = self.error.as_deref().unwrap_or("caller gave up before the cold start finished"),
             "cold start failed"
         );
     }
+}
+
+/// The `hive_core::fault` marker a backend error carries, if any.
+///
+/// These markers are how a NODE fault survives the type erasure of the lease
+/// path: everything reaching here is a flat `anyhow` string, and whatever this
+/// does not recognise is reported to the user as capacity exhaustion. Keep it in
+/// step with `fluid-gateway::classify_lease_error`, which maps the same markers
+/// onto public `FailureClass` codes.
+fn node_fault_marker(es: &str) -> Option<&'static str> {
+    for marker in [
+        hive_core::fault::NODE_IMAGE_MISSING,
+        hive_core::fault::NODE_BACKEND_UNAVAILABLE,
+        hive_core::fault::NODE_LOCK_POOL_EXHAUSTED,
+    ] {
+        if es.contains(marker) {
+            return Some(marker);
+        }
+    }
+    None
 }
 
 /// CPU thresholds (% of a cell's allocated vCPU budget) for the adaptive
@@ -507,6 +569,7 @@ impl Fluid {
                 last_warm_ok_ms: 0,
                 crash_streak: 0,
                 circuit_probe_after_ms: 0,
+                last_node_fault: None,
                 safe_concurrency,
                 nack_concurrency: 0,
                 nack_quota: 0,
@@ -702,6 +765,30 @@ impl Fluid {
             }
             // Only with NO live instance: a pool serving traffic is never circuited.
             if p.instances.is_empty() {
+                // A NODE fault fails every cold start here, so the streaks below
+                // are ALSO crossed on a node whose rootfs is missing — and the
+                // deployment-blaming text would then be the user's only clue.
+                // Report the node fault first, with its marker intact so the
+                // gateway classifies it as a node fault rather than as a circuit
+                // (which would name the app) or as capacity (which would name the
+                // host's space). This is the second half of the fc-sanjose-cvm-2
+                // outage: 13 failed cold starts flipped the visible code between
+                // CAPACITY_EXHAUSTED and DEPLOYMENT_CIRCUIT_OPEN while the actual
+                // fault was one absent file.
+                if let Some(marker) = p.last_node_fault {
+                    if p.warm_fail_streak >= CRASH_CIRCUIT_THRESHOLD
+                        && now_ms() < p.circuit_probe_after_ms
+                    {
+                        let n = p.warm_fail_streak;
+                        anyhow::bail!(
+                            "function '{key}' cannot start because THIS NODE is broken — {n} \
+                             consecutive cold starts failed with a node provisioning fault \
+                             ({marker}); the node's cell artifacts / hypervisor / container lock \
+                             pool need an operator, and no change to this deployment will help. \
+                             See the node's `cold start failed` logs for the exact missing path"
+                        );
+                    }
+                }
                 // (a) Instances come up and then die on their own.
                 if p.crash_streak >= CRASH_CIRCUIT_THRESHOLD {
                     let n = p.crash_streak;
@@ -778,6 +865,9 @@ impl Fluid {
                             p.warm_fail_streak = 0;
                             p.warm_backoff_until_ms = 0;
                             p.circuit_probe_after_ms = 0;
+                            // The node clearly CAN boot a cell now, so whatever
+                            // node fault an earlier attempt recorded is stale.
+                            p.last_node_fault = None;
                         }
                         return Ok(Lease {
                             fluid: self.clone(),
@@ -1310,6 +1400,9 @@ impl Fluid {
                             pool.warm_fail_streak = 0;
                             pool.warm_backoff_until_ms = 0;
                             pool.circuit_probe_after_ms = 0;
+                            // A launch the backend accepted proves the node's
+                            // artifacts + hypervisor are usable again.
+                            pool.last_node_fault = None;
                             pool.last_warm_ok_ms = now_ms();
                         }
                         debug!(func = %key, "warm instance ready");

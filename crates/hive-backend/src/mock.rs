@@ -418,10 +418,24 @@ impl CellBackend for MockBackend {
                     .env("PATH", path_env)
                     .output()
                     .await;
-                anyhow::bail!(
-                    "{bin} run failed: {}",
-                    String::from_utf8_lossy(&status.stderr).trim()
-                );
+                let stderr = String::from_utf8_lossy(&status.stderr);
+                let stderr = stderr.trim();
+                // This path runs REAL podman on a `HIVE_FORCE_MOCK=1` node (that
+                // is why fc-frankfurt is on it), so lock-pool exhaustion here has
+                // to classify exactly as it does in `podman_run_container` —
+                // otherwise the same host fault reports NODE_LOCK_POOL_EXHAUSTED
+                // on one node and CAPACITY_EXHAUSTED on another.
+                if !apple && crate::is_lock_exhaustion(stderr) {
+                    anyhow::bail!(
+                        "node cannot start containers: podman's lock pool is exhausted and \
+                         nothing was reclaimable — raise `num_locks` in containers.conf then run \
+                         `podman system renumber` on this node (a config change alone is inert). \
+                         Not an application fault and not host disk/memory capacity ({}). {bin} \
+                         run failed: {stderr}",
+                        hive_core::fault::NODE_LOCK_POOL_EXHAUSTED
+                    );
+                }
+                anyhow::bail!("{bin} run failed: {stderr}");
             }
             self.containers
                 .lock()
@@ -622,7 +636,18 @@ async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Result<()> {
             }
         }
     }
-    anyhow::bail!("function did not become ready on {addr}: {last}")
+    // The single chokepoint both mock start paths (container + child process)
+    // wait on, so marking it here covers both. An APP fault: the cell started
+    // and the deployment's own process never accepted a connection. Unmarked it
+    // reported CAPACITY_EXHAUSTED until the pool's circuit opened on the third
+    // consecutive failure, blaming the host for the app's boot.
+    anyhow::bail!(
+        "the deployment's own process never listened on {addr} within {}s — check this \
+         deployment's logs, entrypoint and required env; the node started the cell fine ({}). \
+         Last connect error: {last}",
+        timeout.as_secs(),
+        hive_core::fault::DEPLOYMENT_START_FAILED
+    )
 }
 
 /// Run a single shell step, streaming stdout/stderr lines to `sink`.

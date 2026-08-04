@@ -731,10 +731,18 @@ impl CellBackend for FirecrackerBackend {
             });
         }
 
+        // No hypervisor on this node — a NODE fault, not capacity. On this fleet
+        // the usual cause is the documented PVM one: `kvm_pvm` refuses to load
+        // while host PTI is active, so `/dev/kvm` silently disappears and every
+        // cold start here fails identically until the node is fixed.
         anyhow::ensure!(
             self.is_supported(),
-            "firecracker backend unavailable: need Linux + /dev/kvm + {} (run inside the Lima VM)",
-            self.cfg.firecracker_bin.display()
+            "node cannot run microVMs: the firecracker backend is unavailable (needs Linux + \
+             /dev/kvm + {}) — this node needs its hypervisor reprovisioned (on a PVM host check \
+             that `pti=off` is in effect and `kvm_pvm` is loaded). Not an application fault and \
+             not host capacity ({})",
+            self.cfg.firecracker_bin.display(),
+            hive_core::fault::NODE_BACKEND_UNAVAILABLE
         );
         // Self-manage disk before allocating multi-GB overlays: GC orphans + refuse
         // if still critically low, so we never boot into a near-full filesystem.
@@ -772,12 +780,34 @@ impl CellBackend for FirecrackerBackend {
                 self.rootfs_for(&self.cfg.base_image)
             }
         };
+        // A missing base rootfs is a NODE PROVISIONING fault: this node cannot
+        // boot ANY microVM until an operator puts the image back, and no amount
+        // of retrying, scaling, or fixing the app changes that. Name the absent
+        // path and the remedy, and carry `fault::NODE_IMAGE_MISSING` so the
+        // gateway reports NODE_IMAGE_MISSING instead of blaming host capacity —
+        // the fc-sanjose-cvm-2 outage was exactly this error read as
+        // CAPACITY_EXHAUSTED on a node with 923 GB free.
         anyhow::ensure!(
             base.exists(),
-            "rootfs missing for image '{}' and base '{}': {}",
+            "node is missing its base rootfs image: {} does not exist (image '{}', base '{}') — \
+             this node needs its base rootfs reprovisioned; no microVM can boot here until it is \
+             restored. Not an application fault and not host capacity ({})",
+            base.display(),
             spec.image,
             self.cfg.base_image,
-            base.display()
+            hive_core::fault::NODE_IMAGE_MISSING
+        );
+        // Same class, different artifact: the kernel is loaded by firecracker
+        // itself, so without this check the boot fails later as an opaque
+        // "firecracker API PUT /boot-source failed" and lands right back in the
+        // capacity catch-all.
+        anyhow::ensure!(
+            self.cfg.kernel_image.exists(),
+            "node is missing its guest kernel image: {} does not exist — this node needs its \
+             boot artifacts reprovisioned; no microVM can boot here until it is restored. Not an \
+             application fault and not host capacity ({})",
+            self.cfg.kernel_image.display(),
+            hive_core::fault::NODE_IMAGE_MISSING
         );
         reflink_or_copy(&base, &overlay).await?;
         // Give the guest working DNS for outbound fetch (per-cell overlay only).
@@ -1108,7 +1138,18 @@ impl CellBackend for FirecrackerBackend {
             let frame = read_frame(&mut stream).await?;
             match serde_json::from_slice::<AgentEvent>(&frame)? {
                 AgentEvent::FunctionReady => break,
-                AgentEvent::FunctionError(e) => anyhow::bail!("function failed to start: {e}"),
+                // The microVM booted and the in-guest agent ran the app, which
+                // then failed to come up — an APP fault (bad entrypoint, missing
+                // env, never bound its port). Marked so the gateway reports the
+                // deployment instead of the host: unmarked, the first two of
+                // these were published as CAPACITY_EXHAUSTED before the pool's
+                // circuit had opened.
+                AgentEvent::FunctionError(e) => anyhow::bail!(
+                    "the deployment's own process failed to start inside its cell: {e} — check \
+                     this deployment's logs, entrypoint and required env; the node booted the \
+                     cell fine ({})",
+                    hive_core::fault::DEPLOYMENT_START_FAILED
+                ),
                 _ => continue,
             }
         }

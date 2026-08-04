@@ -42,7 +42,7 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 wasm-bindgen = "=0.2.125"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
-web-sys = { version = "0.3", features = ["console", "Window"] }
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "TextEncoder", "console", "Window"] }
 
 # n0-future::task::spawn instead of tokio::spawn — there is no tokio reactor on
 # wasm; iroh itself uses this shim. tokio is sync-only here (full/net pull mio,

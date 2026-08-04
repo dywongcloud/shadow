@@ -26,6 +26,13 @@
   changed_when: false
 
 - name: Check FSGSBASE / RDTSCP presence (informational only, not a hard requirement)
+  # INFORMATIONAL ONLY -- these facts must never gate work again. They used to
+  # gate the patch application in 30/40-*-kernel.yml, which voided the whole
+  # series on 7 of the 8 fc_pvm hosts (both flags measured present on va, va2,
+  # sj2, sp, fr, cvmsj1, cvmsj2; only va3 reads 0/0). The patch series is not
+  # conditional on the BUILD host's flags: X86_FEATURE_PVM_RDTSCP is a runtime
+  # gate evaluated inside the built kernel, so it is always wanted. Keep these
+  # for the operator-facing note below and for nothing else.
   ansible.builtin.set_fact:
     _has_fsgsbase: "{{ 'fsgsbase' in cpuflags.stdout }}"
     _has_rdtscp: "{{ 'rdtscp' in cpuflags.stdout }}"

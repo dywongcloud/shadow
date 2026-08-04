@@ -34,6 +34,15 @@
 - name: Firecracker (PVM, no hardware KVM)
   hosts: fc_pvm
   become: true
+  # ONE HOST AT A TIME. This role REBOOTS into a freshly-built custom kernel;
+  # without `serial` ansible runs the play's linear strategy across every
+  # fc_pvm host in lockstep, so the reboot task fires on ALL of them together
+  # and a kernel that fails to boot takes the whole group down at once instead
+  # of one node. Same reason platform-only.yml:14 is serial -- except the blast
+  # radius here is larger, because a bad kernel needs console access to
+  # recover, not a service restart. A failure on host N stops the roll before
+  # host N+1, which is the entire point.
+  serial: 1
   roles:
     - role: pvm_firecracker
       tags: [firecracker, pvm_firecracker]

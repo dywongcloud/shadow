@@ -308,6 +308,19 @@ pub struct BillingAccount {
     pub period_start_ms: u64,
     pub period_end_ms: u64,
     pub updated_ms: u64,
+    /// Operator-set tier FLOOR. While `Some(plan)`, no automatic path may move
+    /// this tenant below that plan — not the free-plan checkout shortcut, not a
+    /// Stripe `customer.subscription.deleted`, not a period rollover.
+    ///
+    /// A one-shot grant is not durable, and that cost real money and real
+    /// downtime: the platform owner was granted `enterprise` on 2026-07-18, a
+    /// user-initiated free-plan checkout silently reverted only the BILLING
+    /// half to `hobby` on 2026-07-25, and the account sat quota-locked
+    /// (`can_deploy` denied, balance -42030 cents) while `c.teams` still read
+    /// `enterprise`. Only an explicit operator call sets or clears this, so a
+    /// downgrade event can no longer undo a grant.
+    #[serde(default)]
+    pub tier_locked_plan: Option<String>,
 }
 
 impl BillingAccount {
@@ -326,10 +339,22 @@ impl BillingAccount {
             period_start_ms: now,
             period_end_ms: now + MONTH_MS,
             updated_ms: now,
+            tier_locked_plan: None,
         }
     }
     pub fn remaining_included(&self) -> u64 {
         self.included_cents.saturating_sub(self.used_cents)
+    }
+}
+
+/// Rank a plan id so a tier floor can be compared. Unknown ids rank lowest,
+/// matching `plan_spec`'s fail-toward-hobby behaviour.
+pub fn plan_rank(plan: &str) -> u8 {
+    match plan {
+        "enterprise" => 3,
+        "pro" => 2,
+        "hobby" => 1,
+        _ => 0,
     }
 }
 
@@ -420,7 +445,18 @@ impl BillingStore {
             acc.period_start_ms = now;
             acc.period_end_ms = now + MONTH_MS;
             acc.used_cents = 0;
-            acc.included_cents = plan_spec(&acc.plan).included_cents;
+            // Re-derive the allowance from the EFFECTIVE plan, i.e. never below
+            // an operator tier floor. Without this a locked tenant whose stored
+            // plan was downgraded before the lock existed would have the lower
+            // allowance re-applied every month, re-arming `can_deploy`'s block.
+            let effective = match acc.tier_locked_plan.as_deref() {
+                Some(f) if plan_rank(f) > plan_rank(&acc.plan) => {
+                    acc.plan = f.to_string();
+                    f
+                }
+                _ => acc.plan.as_str(),
+            };
+            acc.included_cents = plan_spec(effective).included_cents;
             acc.updated_ms = now;
             Some(closing)
         } else {
@@ -625,12 +661,63 @@ impl BillingStore {
         e
     }
 
+    /// Set (or clear, with `None`) a tenant's operator tier FLOOR, and raise the
+    /// live plan to it immediately so the lock and the served tier can never
+    /// disagree. Operator-only by construction: the only caller is the admin
+    /// grant path, so no user-reachable route can lift or lower it.
+    pub fn set_tier_lock(&self, tenant: &str, floor: Option<&str>) -> BillingAccount {
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        {
+            let mut m = self.accounts.write();
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
+            acc.tier_locked_plan = floor.map(|s| s.to_string());
+            acc.updated_ms = now_ms();
+        }
+        // Raising to the floor goes through set_plan so the ledger records the
+        // change and `included_cents` is re-derived from the plan spec.
+        match floor {
+            Some(f) if plan_rank(f) > plan_rank(&self.account(tenant).plan) => {
+                self.set_plan(tenant, f)
+            }
+            _ => self.account(tenant),
+        }
+    }
+
     pub fn set_plan(&self, tenant: &str, plan: &str) -> BillingAccount {
         let tenant = if tenant.is_empty() {
             "personal"
         } else {
             tenant
         };
+        // Honour the operator-set tier FLOOR. Every automatic downgrade path in
+        // the platform (free-plan checkout shortcut, Stripe
+        // `customer.subscription.deleted`, checkout confirmation) funnels
+        // through here, so enforcing it at this ONE chokepoint is what makes
+        // the lock unbypassable rather than something each caller must
+        // remember. `set_tier_lock` is the only way past it.
+        let locked = self
+            .accounts
+            .read()
+            .get(tenant)
+            .and_then(|a| a.tier_locked_plan.clone());
+        let mut plan = plan;
+        if let Some(floor) = locked.as_deref() {
+            if plan_rank(plan) < plan_rank(floor) {
+                tracing::warn!(
+                    tenant,
+                    attempted = plan,
+                    floor,
+                    "refusing tier downgrade below operator-set floor"
+                );
+                plan = floor;
+            }
+        }
         let spec = plan_spec(plan);
         {
             let mut m = self.accounts.write();

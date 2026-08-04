@@ -1,29 +1,65 @@
 ---
-- import_tasks: 00-preflight.yml
-  tags: [always, preflight]
+# `pvm_skip` (see defaults/main.yml) is honored BEFORE anything else, including
+# preflight. This role builds kernels and REBOOTS, so an excluded host must be
+# excluded structurally -- expressed once in inventory -- not by remembering to
+# shape a `--limit` correctly on every invocation. A whole-role no-op is the
+# only exclusion that is safe to forget about.
+- name: Note this host is excluded from the PVM role (pvm_skip)
+  ansible.builtin.debug:
+    msg: >-
+      pvm_skip is set for {{ inventory_hostname }} -- skipping the ENTIRE
+      pvm_firecracker role (no build, no patch, no reboot, no smoke test).
+      Unset it in inventory (or pass -e pvm_skip=false) to include this host.
+  when: pvm_skip | bool
 
-- import_tasks: 10-packages.yml
-  tags: [packages]
+- name: Provision PVM + Firecracker
+  when: not (pvm_skip | bool)
+  block:
+    - import_tasks: 00-preflight.yml
+      tags: [always, preflight]
 
-- import_tasks: 20-firecracker.yml
-  tags: [firecracker]
+    - import_tasks: 10-packages.yml
+      tags: [packages]
 
-- import_tasks: 30-host-kernel.yml
-  tags: [host_kernel]
-  when: not (pvm_already_provisioned | default(false))
+    - import_tasks: 20-firecracker.yml
+      tags: [firecracker]
 
-- import_tasks: 40-guest-kernel.yml
-  tags: [guest_kernel]
-  when: not (pvm_already_provisioned | default(false))
+    - import_tasks: 30-host-kernel.yml
+      tags: [host_kernel]
+      when: not (pvm_already_provisioned | default(false))
 
-- import_tasks: 50-rootfs.yml
-  tags: [rootfs]
-  when: not (pvm_already_provisioned | default(false))
+    - import_tasks: 40-guest-kernel.yml
+      tags: [guest_kernel]
+      when: not (pvm_already_provisioned | default(false))
 
-- import_tasks: 60-boot.yml
-  tags: [boot]
-  when: not (pvm_already_provisioned | default(false))
+    - import_tasks: 50-rootfs.yml
+      tags: [rootfs]
+      when: not (pvm_already_provisioned | default(false))
 
-- import_tasks: 70-smoke-test.yml
-  tags: [smoke_test]
-  when: pvm_run_smoke_test | bool
+    - import_tasks: 60-boot.yml
+      tags: [boot]
+      when: not (pvm_already_provisioned | default(false))
+
+    # Guarded by `pvm_already_provisioned` like every other stage, which it
+    # previously was NOT. Booting a microVM HARD-RESETS the host on an
+    # unproven PVM kernel (fc-frankfurt, 3 resets, docs/blocked-work.md:76-80),
+    # so an idempotent re-run against a healthy traffic-carrying node -- which
+    # correctly skips 30/40/50/60 as no-ops -- must not then reset it to prove
+    # something already proven. This is bring-up-only work, and on an
+    # already-provisioned host there is nothing left to bring up.
+    - import_tasks: 70-smoke-test.yml
+      tags: [smoke_test]
+      when:
+        - pvm_run_smoke_test | bool
+        - not (pvm_already_provisioned | default(false))
+
+    - name: Note the microVM smoke test was skipped on an already-provisioned host
+      ansible.builtin.debug:
+        msg: >-
+          Skipping the microVM smoke test: this host already runs a PVM kernel
+          with /dev/kvm present. The smoke test boots a real microVM, which
+          hard-resets the host if the PVM switcher is broken -- it is
+          bring-up-only, run before a node carries traffic.
+      when:
+        - pvm_run_smoke_test | bool
+        - pvm_already_provisioned | default(false)

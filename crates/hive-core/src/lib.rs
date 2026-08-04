@@ -16,7 +16,7 @@ pub mod proto;
 pub mod state;
 pub mod time;
 
-pub use error::{HiveError, Result};
+pub use error::{fault, HiveError, Result};
 pub use ids::{BoxId, CellId, HiveId, JobId};
 pub use job::{BuildJob, ResourceSpec};
 pub use proto::*;

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use iroh::{
@@ -101,8 +101,8 @@ pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
 pub use hive_browser_proto::BROWSER_ALPN;
 
 use hive_browser_proto::{
-    check_len, encode_invoke, encode_reply, encode_request, reset as browser_reset, split_request,
-    Op, BROWSER_MAX_FRAME,
+    check_len, encode_invoke, encode_request, reset as browser_reset, Op, BROWSER_MAX_ECHO,
+    BROWSER_MAX_FRAME, FUNCTION_DIGEST_LEN,
 };
 
 /// Concurrently-served `hive/browser/0` connections — SEPARATE from
@@ -115,6 +115,116 @@ fn max_browser_conns() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(128)
+}
+
+const BROWSER_MAX_ACTIVE_STREAMS: usize = 32;
+const BROWSER_MAX_STREAMS_PER_ENDPOINT: usize = 8;
+const BROWSER_MAX_STREAMS_PER_CONNECTION: usize = 8;
+const BROWSER_MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
+const BROWSER_MAX_INFLIGHT_BYTES: usize = 32 << 20;
+const BROWSER_MAX_OUTBOUND_TRUNKS: usize = 128;
+const BROWSER_MAX_OUTBOUND_WAITERS: usize = 256;
+const BROWSER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_STREAM_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const BROWSER_CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn max_browser_outbound_trunks() -> usize {
+    std::env::var("HIVE_P2P_BROWSER_OUTBOUND_TRUNKS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(BROWSER_MAX_OUTBOUND_TRUNKS)
+}
+
+type BrowserCounts = Arc<std::sync::Mutex<HashMap<String, usize>>>;
+
+struct BrowserCountGuard {
+    key: String,
+    counts: BrowserCounts,
+}
+
+impl BrowserCountGuard {
+    fn acquire(counts: BrowserCounts, key: String, limit: usize) -> Option<Self> {
+        let mut current = counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count = current.entry(key.clone()).or_default();
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        drop(current);
+        Some(Self { key, counts })
+    }
+}
+
+impl Drop for BrowserCountGuard {
+    fn drop(&mut self) {
+        let mut current = self
+            .counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let remove = current.get_mut(&self.key).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            current.remove(&self.key);
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BrowserInboundResources {
+    streams: Arc<tokio::sync::Semaphore>,
+    bytes: Arc<tokio::sync::Semaphore>,
+    peer_streams: BrowserCounts,
+    peer_connections: BrowserCounts,
+}
+
+impl BrowserInboundResources {
+    fn new() -> Self {
+        Self {
+            streams: Arc::new(tokio::sync::Semaphore::new(BROWSER_MAX_ACTIVE_STREAMS)),
+            bytes: Arc::new(tokio::sync::Semaphore::new(BROWSER_MAX_INFLIGHT_BYTES)),
+            peer_streams: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            peer_connections: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+struct BrowserConnectionActivity {
+    active: usize,
+    idle_since: Option<Instant>,
+}
+
+struct BrowserConnectionStreamGuard {
+    activity: Arc<std::sync::Mutex<BrowserConnectionActivity>>,
+}
+
+impl BrowserConnectionStreamGuard {
+    fn acquire(activity: Arc<std::sync::Mutex<BrowserConnectionActivity>>) -> Self {
+        let mut state = activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active += 1;
+        state.idle_since = None;
+        drop(state);
+        Self { activity }
+    }
+}
+
+impl Drop for BrowserConnectionStreamGuard {
+    fn drop(&mut self) {
+        let mut state = self
+            .activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.idle_since = Some(Instant::now());
+        }
+    }
 }
 
 /// First byte on every hive-p2p bi stream selects how the owner handles it:
@@ -815,6 +925,216 @@ impl std::fmt::Display for BrowserInvokeError {
 
 impl std::error::Error for BrowserInvokeError {}
 
+struct BrowserSlot {
+    epoch: u64,
+    state: BrowserSlotState,
+    last_used: Instant,
+}
+
+#[derive(Clone)]
+enum BrowserSlotState {
+    Vacant,
+    Dialing(Arc<BrowserDial>),
+    Ready(Arc<BrowserTrunk>),
+}
+
+struct BrowserDial {
+    state: std::sync::atomic::AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl BrowserDial {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::atomic::AtomicUsize::new(0),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    async fn wait(&self) -> bool {
+        loop {
+            let notified = self.notify.notified();
+            let state = self.state.load(Ordering::Acquire);
+            if state != 0 {
+                return state == 2;
+            }
+            notified.await;
+        }
+    }
+
+    fn finish(&self, fenced: bool) {
+        self.state
+            .store(if fenced { 2 } else { 1 }, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+}
+
+struct BrowserTrunk {
+    conn: Connection,
+    streams: Arc<tokio::sync::Semaphore>,
+    active: std::sync::atomic::AtomicUsize,
+    last_used: std::sync::Mutex<Instant>,
+}
+
+impl BrowserTrunk {
+    fn new(conn: Connection) -> Arc<Self> {
+        Arc::new(Self {
+            conn,
+            streams: Arc::new(tokio::sync::Semaphore::new(
+                BROWSER_MAX_STREAMS_PER_CONNECTION,
+            )),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            last_used: std::sync::Mutex::new(Instant::now()),
+        })
+    }
+
+    fn last_used(&self) -> Instant {
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn release(&self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+        *self
+            .last_used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+    }
+
+    fn close(&self, code: u32, reason: &'static [u8]) {
+        self.streams.close();
+        self.conn.close(code.into(), reason);
+    }
+}
+
+enum BrowserAcquireError {
+    Failed(BrowserInvokeError),
+    Retryable { error: BrowserInvokeError, epoch: u64 },
+    Fenced,
+}
+
+struct BrowserAcquired {
+    epoch: u64,
+    trunk: Arc<BrowserTrunk>,
+}
+
+enum BrowserAcquireAction {
+    Ready { epoch: u64, trunk: Arc<BrowserTrunk> },
+    Wait(Arc<BrowserDial>),
+    Dial { epoch: u64, dial: Arc<BrowserDial> },
+}
+
+struct BrowserStreamLease {
+    trunk: Arc<BrowserTrunk>,
+    _stream: tokio::sync::OwnedSemaphorePermit,
+    _global: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl BrowserStreamLease {
+    async fn acquire(
+        trunk: Arc<BrowserTrunk>,
+        global: Arc<tokio::sync::Semaphore>,
+    ) -> std::result::Result<Self, BrowserInvokeError> {
+        let stream = tokio::time::timeout(
+            BROWSER_STREAM_WAIT_TIMEOUT,
+            trunk.streams.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| BrowserInvokeError::new(false, "browser trunk stream wait timed out"))?
+        .map_err(|_| BrowserInvokeError::new(false, "browser trunk was closed"))?;
+        trunk.active.fetch_add(1, Ordering::AcqRel);
+        *trunk
+            .last_used
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
+        let global = match tokio::time::timeout(
+            BROWSER_STREAM_WAIT_TIMEOUT,
+            global.acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => {
+                trunk.release();
+                return Err(BrowserInvokeError::new(
+                    false,
+                    "browser global stream pool was closed",
+                ));
+            }
+            Err(_) => {
+                trunk.release();
+                return Err(BrowserInvokeError::new(
+                    false,
+                    "browser global stream wait timed out",
+                ));
+            }
+        };
+        Ok(Self {
+            trunk,
+            _stream: stream,
+            _global: global,
+        })
+    }
+}
+
+impl Drop for BrowserStreamLease {
+    fn drop(&mut self) {
+        self.trunk.release();
+    }
+}
+
+struct BrowserRequestGuard {
+    send: Option<iroh::endpoint::SendStream>,
+    recv: Option<iroh::endpoint::RecvStream>,
+    _lease: BrowserStreamLease,
+    armed: bool,
+}
+
+impl BrowserRequestGuard {
+    fn new(lease: BrowserStreamLease) -> Self {
+        Self {
+            send: None,
+            recv: None,
+            _lease: lease,
+            armed: true,
+        }
+    }
+
+    fn attach(
+        &mut self,
+        send: iroh::endpoint::SendStream,
+        recv: iroh::endpoint::RecvStream,
+    ) {
+        self.send = Some(send);
+        self.recv = Some(recv);
+    }
+
+    fn close(&mut self, code: u32) {
+        if !self.armed {
+            return;
+        }
+        if let Some(send) = self.send.as_mut() {
+            let _ = send.reset(code.into());
+        }
+        if let Some(recv) = self.recv.as_mut() {
+            let _ = recv.stop(code.into());
+        }
+        self.armed = false;
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BrowserRequestGuard {
+    fn drop(&mut self) {
+        self.close(browser_reset::DEADLINE_EXCEEDED);
+    }
+}
+
 /// Bounded, tenant-free observability for [`BrowserPool`] (bn-p2p-observability)
 /// — global aggregates only, same posture as hive-cloud's browser admission/
 /// presence counters (never per-endpoint, which would leak which specific
@@ -877,7 +1197,10 @@ fn avg_ms(sum: &std::sync::atomic::AtomicU64, samples: &std::sync::atomic::Atomi
 /// `hive/tunnel/0` trunk cannot carry browser streams.
 pub struct BrowserPool {
     ep: Endpoint,
-    trunks: Mutex<HashMap<String, Connection>>,
+    trunks: Mutex<HashMap<String, BrowserSlot>>,
+    global_streams: Arc<tokio::sync::Semaphore>,
+    waiters: Arc<tokio::sync::Semaphore>,
+    next_epoch: AtomicU64,
     counters: BrowserPoolCounterCells,
 }
 
@@ -886,6 +1209,13 @@ impl BrowserPool {
         Arc::new(Self {
             ep,
             trunks: Mutex::new(HashMap::new()),
+            global_streams: Arc::new(tokio::sync::Semaphore::new(
+                BROWSER_MAX_ACTIVE_STREAMS,
+            )),
+            waiters: Arc::new(tokio::sync::Semaphore::new(
+                BROWSER_MAX_OUTBOUND_WAITERS,
+            )),
+            next_epoch: AtomicU64::new(1),
             counters: BrowserPoolCounterCells::default(),
         })
     }
@@ -909,62 +1239,296 @@ impl BrowserPool {
         }
     }
 
+    pub async fn trunk_count(&self) -> usize {
+        self.trunks
+            .lock()
+            .await
+            .values()
+            .filter(|slot| matches!(&slot.state, BrowserSlotState::Ready(_)))
+            .count()
+    }
+
     async fn acquire(
         &self,
         endpoint_id: &str,
         addr_json: &str,
-    ) -> std::result::Result<Connection, BrowserInvokeError> {
-        let addr: EndpointAddr =
-            serde_json::from_str(addr_json).map_err(|e| BrowserInvokeError::new(false, e))?;
+        expected_epoch: Option<u64>,
+    ) -> std::result::Result<BrowserAcquired, BrowserAcquireError> {
+        let addr: EndpointAddr = serde_json::from_str(addr_json)
+            .map_err(|error| BrowserAcquireError::Failed(BrowserInvokeError::new(false, error)))?;
         let key = addr.id.to_string();
         if key != endpoint_id {
-            return Err(BrowserInvokeError::new(
+            return Err(BrowserAcquireError::Failed(BrowserInvokeError::new(
                 false,
                 "browser address identity does not match serving target",
-            ));
+            )));
         }
-        {
-            let trunks = self.trunks.lock().await;
-            if let Some(conn) = trunks.get(&key) {
-                if conn.close_reason().is_none() {
-                    return Ok(conn.clone());
+        let mut epoch_guard = expected_epoch;
+        loop {
+            let action = {
+                let mut trunks = self.trunks.lock().await;
+                let existing = trunks
+                    .get(&key)
+                    .map(|slot| (slot.epoch, slot.state.clone()));
+                if epoch_guard.is_none() {
+                    epoch_guard = existing.as_ref().map(|(epoch, _)| *epoch);
+                }
+                if let Some(expected) = epoch_guard {
+                    if existing.as_ref().map(|(epoch, _)| *epoch) != Some(expected) {
+                        return Err(BrowserAcquireError::Fenced);
+                    }
+                }
+                match existing {
+                    Some((epoch, BrowserSlotState::Ready(trunk)))
+                        if trunk.conn.close_reason().is_none() =>
+                    {
+                        BrowserAcquireAction::Ready { epoch, trunk }
+                    }
+                    Some((_, BrowserSlotState::Dialing(dial))) => {
+                        BrowserAcquireAction::Wait(dial)
+                    }
+                    Some((epoch, BrowserSlotState::Ready(trunk))) => {
+                        trunk.close(0, b"dead browser trunk replaced");
+                        self.counters
+                            .trunk_evictions_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        let dial = BrowserDial::new();
+                        let slot = trunks.get_mut(&key).expect("browser slot is present");
+                        slot.state = BrowserSlotState::Dialing(dial.clone());
+                        slot.last_used = Instant::now();
+                        BrowserAcquireAction::Dial { epoch, dial }
+                    }
+                    Some((epoch, BrowserSlotState::Vacant)) => {
+                        let dial = BrowserDial::new();
+                        let slot = trunks.get_mut(&key).expect("browser slot is present");
+                        slot.state = BrowserSlotState::Dialing(dial.clone());
+                        slot.last_used = Instant::now();
+                        BrowserAcquireAction::Dial { epoch, dial }
+                    }
+                    None => {
+                        if trunks.len() >= max_browser_outbound_trunks() {
+                            let victim = trunks
+                                .iter()
+                                .filter_map(|(victim_key, slot)| match &slot.state {
+                                    BrowserSlotState::Vacant => {
+                                        Some((slot.last_used, victim_key.clone()))
+                                    }
+                                    BrowserSlotState::Ready(trunk)
+                                        if trunk.active.load(Ordering::Acquire) == 0 =>
+                                    {
+                                        Some((trunk.last_used(), victim_key.clone()))
+                                    }
+                                    _ => None,
+                                })
+                                .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+                                .map(|(_, victim_key)| victim_key);
+                            let Some(victim) = victim else {
+                                return Err(BrowserAcquireError::Failed(
+                                    BrowserInvokeError::new(
+                                        false,
+                                        "browser trunk pool is at active capacity",
+                                    ),
+                                ));
+                            };
+                            if let Some(slot) = trunks.remove(&victim) {
+                                if let BrowserSlotState::Ready(trunk) = slot.state {
+                                    trunk.close(0, b"browser trunk capacity eviction");
+                                    self.counters
+                                        .trunk_evictions_total
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                        let epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
+                        epoch_guard = Some(epoch);
+                        let dial = BrowserDial::new();
+                        trunks.insert(
+                            key.clone(),
+                            BrowserSlot {
+                                epoch,
+                                state: BrowserSlotState::Dialing(dial.clone()),
+                                last_used: Instant::now(),
+                            },
+                        );
+                        BrowserAcquireAction::Dial { epoch, dial }
+                    }
+                }
+            };
+            match action {
+                BrowserAcquireAction::Ready { epoch, trunk } => {
+                    return Ok(BrowserAcquired { epoch, trunk });
+                }
+                BrowserAcquireAction::Wait(dial) => {
+                    let _waiter = self
+                        .waiters
+                        .clone()
+                        .try_acquire_owned()
+                        .map_err(|_| {
+                            BrowserAcquireError::Failed(BrowserInvokeError::new(
+                                false,
+                                "browser dial waiter pool is full",
+                            ))
+                        })?;
+                    let fenced = tokio::time::timeout(
+                        connect_budget() + Duration::from_secs(1),
+                        dial.wait(),
+                    )
+                    .await
+                    .map_err(|_| {
+                        BrowserAcquireError::Failed(BrowserInvokeError::new(
+                            false,
+                            "browser dial wait timed out",
+                        ))
+                    })?;
+                    if fenced {
+                        return Err(BrowserAcquireError::Fenced);
+                    }
+                }
+                BrowserAcquireAction::Dial { epoch, dial } => {
+                    self.counters
+                        .dial_attempts_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    let dial_t0 = Instant::now();
+                    let connected = match tokio::time::timeout(
+                        connect_budget(),
+                        self.ep.connect(addr.clone(), BROWSER_ALPN),
+                    )
+                    .await
+                    {
+                        Ok(Ok(conn)) => Ok(conn),
+                        Ok(Err(error)) => Err(BrowserInvokeError::new(false, error)),
+                        Err(_) => Err(BrowserInvokeError::new(
+                            false,
+                            "browser connect timed out",
+                        )),
+                    };
+                    match connected {
+                        Ok(conn) => {
+                            self.counters
+                                .dial_latency_ms_sum
+                                .fetch_add(dial_t0.elapsed().as_millis() as u64, Ordering::Relaxed);
+                            self.counters
+                                .dial_latency_samples
+                                .fetch_add(1, Ordering::Relaxed);
+                            let trunk = BrowserTrunk::new(conn.clone());
+                            let mut trunks = self.trunks.lock().await;
+                            let current = trunks.get(&key).is_some_and(|slot| {
+                                slot.epoch == epoch
+                                    && matches!(
+                                        &slot.state,
+                                        BrowserSlotState::Dialing(current)
+                                            if Arc::ptr_eq(current, &dial)
+                                    )
+                            });
+                            if !current {
+                                drop(trunks);
+                                conn.close(
+                                    browser_reset::FORBIDDEN.into(),
+                                    b"browser dial fenced",
+                                );
+                                dial.finish(true);
+                                return Err(BrowserAcquireError::Fenced);
+                            }
+                            let slot = trunks.get_mut(&key).expect("browser slot is present");
+                            slot.state = BrowserSlotState::Ready(trunk.clone());
+                            slot.last_used = Instant::now();
+                            drop(trunks);
+                            dial.finish(false);
+                            return Ok(BrowserAcquired { epoch, trunk });
+                        }
+                        Err(error) => {
+                            self.counters
+                                .dial_failures_total
+                                .fetch_add(1, Ordering::Relaxed);
+                            let mut trunks = self.trunks.lock().await;
+                            let current = trunks.get(&key).is_some_and(|slot| {
+                                slot.epoch == epoch
+                                    && matches!(
+                                        &slot.state,
+                                        BrowserSlotState::Dialing(current)
+                                            if Arc::ptr_eq(current, &dial)
+                                    )
+                            });
+                            if current {
+                                let slot = trunks.get_mut(&key).expect("browser slot is present");
+                                slot.state = BrowserSlotState::Vacant;
+                                slot.last_used = Instant::now();
+                            }
+                            drop(trunks);
+                            dial.finish(!current);
+                            if !current {
+                                return Err(BrowserAcquireError::Fenced);
+                            }
+                            return Err(BrowserAcquireError::Retryable { error, epoch });
+                        }
+                    }
                 }
             }
         }
-        use std::sync::atomic::Ordering::Relaxed;
-        self.counters.dial_attempts_total.fetch_add(1, Relaxed);
-        let dial_t0 = std::time::Instant::now();
-        let conn = tokio::time::timeout(connect_budget(), self.ep.connect(addr, BROWSER_ALPN))
-            .await
-            .map_err(|_| {
-                self.counters.dial_failures_total.fetch_add(1, Relaxed);
-                BrowserInvokeError::new(false, "browser connect timed out")
-            })?
-            .map_err(|e| {
-                self.counters.dial_failures_total.fetch_add(1, Relaxed);
-                BrowserInvokeError::new(false, e)
-            })?;
-        self.counters
-            .dial_latency_ms_sum
-            .fetch_add(dial_t0.elapsed().as_millis() as u64, Relaxed);
-        self.counters.dial_latency_samples.fetch_add(1, Relaxed);
-        self.trunks.lock().await.insert(key, conn.clone());
-        Ok(conn)
     }
 
-    async fn evict(&self, endpoint_id: &str) {
-        if let Some(conn) = self.trunks.lock().await.remove(endpoint_id) {
-            conn.close(0u32.into(), b"browser trunk evicted");
+    async fn epoch_current(&self, endpoint_id: &str, epoch: u64) -> bool {
+        self.trunks
+            .lock()
+            .await
+            .get(endpoint_id)
+            .is_some_and(|slot| slot.epoch == epoch)
+    }
+
+    async fn evict_if(&self, endpoint_id: &str, expected: &Arc<BrowserTrunk>) {
+        let mut trunks = self.trunks.lock().await;
+        let current = trunks.get(endpoint_id).is_some_and(|slot| {
+            matches!(
+                &slot.state,
+                BrowserSlotState::Ready(trunk) if Arc::ptr_eq(trunk, expected)
+            )
+        });
+        let removed = if current {
+            let slot = trunks
+                .get_mut(endpoint_id)
+                .expect("browser slot is present");
+            slot.last_used = Instant::now();
+            match std::mem::replace(&mut slot.state, BrowserSlotState::Vacant) {
+                BrowserSlotState::Ready(trunk) => Some(trunk),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        drop(trunks);
+        if let Some(trunk) = removed {
+            trunk.close(0, b"browser trunk evicted");
             self.counters
                 .trunk_evictions_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// Close a revoked browser's pooled connection immediately. Future invokes
     /// cannot reuse a capability-bearing connection after admission removal.
     pub async fn close_endpoint(&self, endpoint_id: &str) {
-        self.evict(endpoint_id).await;
+        let state = {
+            let mut trunks = self.trunks.lock().await;
+            let Some(slot) = trunks.get_mut(endpoint_id) else {
+                return;
+            };
+            slot.epoch = self.next_epoch.fetch_add(1, Ordering::AcqRel);
+            slot.last_used = Instant::now();
+            std::mem::replace(&mut slot.state, BrowserSlotState::Vacant)
+        };
+        match state {
+            BrowserSlotState::Ready(trunk) => {
+                trunk.close(
+                    browser_reset::FORBIDDEN,
+                    b"browser endpoint revoked",
+                );
+                self.counters
+                    .trunk_evictions_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            BrowserSlotState::Dialing(dial) => dial.finish(true),
+            BrowserSlotState::Vacant => {}
+        }
     }
 
     /// Invoke a digest-pinned browser artifact. Executable source is never sent:
@@ -1016,72 +1580,250 @@ impl BrowserPool {
         digest: &str,
         request_json: &str,
     ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
-        let payload =
-            encode_invoke(digest, request_json).map_err(|e| BrowserInvokeError::new(false, e))?;
-        let frame = encode_request(Op::Invoke, &payload);
-        if frame.len().saturating_sub(4) > BROWSER_MAX_FRAME {
+        if request_json.len() > BROWSER_MAX_FRAME - 1 - FUNCTION_DIGEST_LEN {
             return Err(BrowserInvokeError::new(
                 false,
                 "browser request frame too large",
             ));
         }
-
+        let payload =
+            encode_invoke(digest, request_json).map_err(|e| BrowserInvokeError::new(false, e))?;
+        let frame = encode_request(Op::Invoke, &payload);
+        let mut epoch = None;
         let mut attempt = 0u8;
-        let (mut send, mut recv) = loop {
+        let mut io = loop {
             attempt += 1;
             if attempt > 1 {
                 self.counters
                     .invoke_redials_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    .fetch_add(1, Ordering::Relaxed);
             }
-            let conn = match self.acquire(endpoint_id, addr_json).await {
-                Ok(conn) => conn,
-                Err(_error) if attempt < 2 => {
-                    self.evict(endpoint_id).await;
+            let acquired = match self.acquire(endpoint_id, addr_json, epoch).await {
+                Ok(acquired) => acquired,
+                Err(BrowserAcquireError::Fenced) => {
+                    return Err(BrowserInvokeError::new(
+                        false,
+                        "browser endpoint closed during dial",
+                    ))
+                }
+                Err(BrowserAcquireError::Retryable {
+                    epoch: failed_epoch,
+                    ..
+                }) if attempt < 2 => {
+                    epoch = Some(failed_epoch);
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(BrowserAcquireError::Retryable { error, .. })
+                | Err(BrowserAcquireError::Failed(error)) => return Err(error),
             };
-            match tokio::time::timeout(open_budget(), conn.open_bi()).await {
-                Ok(Ok(streams)) => break streams,
-                Ok(Err(error)) if attempt < 2 => {
-                    self.evict(endpoint_id).await;
-                    tracing::debug!(endpoint_id, %error, "browser stream open failed; redialing");
+            epoch = Some(acquired.epoch);
+            let trunk = acquired.trunk;
+            let lease = BrowserStreamLease::acquire(
+                trunk.clone(),
+                self.global_streams.clone(),
+            )
+            .await?;
+            if !self.epoch_current(endpoint_id, acquired.epoch).await {
+                drop(lease);
+                return Err(BrowserInvokeError::new(
+                    false,
+                    "browser endpoint closed before stream open",
+                ));
+            }
+            let mut request = BrowserRequestGuard::new(lease);
+            match tokio::time::timeout(open_budget(), trunk.conn.open_bi()).await {
+                Ok(Ok((send, recv))) => {
+                    request.attach(send, recv);
+                    break request;
                 }
-                Ok(Err(error)) => return Err(BrowserInvokeError::new(false, error)),
-                Err(_) if attempt < 2 => self.evict(endpoint_id).await,
+                Ok(Err(error)) => {
+                    let current = self.epoch_current(endpoint_id, acquired.epoch).await;
+                    if attempt < 2 && current {
+                        request.close(browser_reset::HANDLER_FAILED);
+                        drop(request);
+                        self.evict_if(endpoint_id, &trunk).await;
+                        tracing::debug!(endpoint_id, %error, "browser stream open failed; redialing");
+                        continue;
+                    }
+                    request.close(browser_reset::HANDLER_FAILED);
+                    if !current {
+                        return Err(BrowserInvokeError::new(
+                            false,
+                            "browser endpoint closed during stream open",
+                        ));
+                    }
+                    return Err(BrowserInvokeError::new(false, error));
+                }
                 Err(_) => {
+                    let current = self.epoch_current(endpoint_id, acquired.epoch).await;
+                    if attempt < 2 && current {
+                        request.close(browser_reset::DEADLINE_EXCEEDED);
+                        drop(request);
+                        self.evict_if(endpoint_id, &trunk).await;
+                        continue;
+                    }
+                    request.close(browser_reset::DEADLINE_EXCEEDED);
+                    if !current {
+                        return Err(BrowserInvokeError::new(
+                            false,
+                            "browser endpoint closed during stream open",
+                        ));
+                    }
                     return Err(BrowserInvokeError::new(
                         false,
                         "browser stream open timed out",
-                    ))
+                    ));
                 }
             }
         };
 
-        // A short write cannot form a complete frame, so the browser cannot
-        // dispatch it. Once write_all succeeds the full frame may execute even
-        // if finish or the reply subsequently fails.
-        send.write_all(&frame)
-            .await
-            .map_err(|e| BrowserInvokeError::new(false, e))?;
+        let write = tokio::time::timeout(
+            BROWSER_READ_TIMEOUT,
+            io.send
+                .as_mut()
+                .expect("browser send stream is present")
+                .write_all(&frame),
+        )
+        .await;
+        match write {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                io.close(browser_reset::HANDLER_FAILED);
+                return Err(BrowserInvokeError::new(true, error));
+            }
+            Err(_) => {
+                io.close(browser_reset::DEADLINE_EXCEEDED);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    "browser request write timed out",
+                ));
+            }
+        }
         self.counters
             .bytes_sent_total
-            .fetch_add(frame.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        send.finish()
-            .map_err(|e| BrowserInvokeError::new(true, e))?;
+            .fetch_add(frame.len() as u64, Ordering::Relaxed);
+        if let Err(error) = io
+            .send
+            .as_mut()
+            .expect("browser send stream is present")
+            .finish()
+        {
+            io.close(browser_reset::HANDLER_FAILED);
+            return Err(BrowserInvokeError::new(true, error));
+        }
+        let stopped = tokio::time::timeout(
+            BROWSER_READ_TIMEOUT,
+            io.send
+                .as_mut()
+                .expect("browser send stream is present")
+                .stopped(),
+        )
+        .await;
+        match stopped {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(code))) => {
+                let reset = u32::try_from(code.into_inner())
+                    .unwrap_or(browser_reset::HANDLER_FAILED);
+                io.close(reset);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    format!("browser peer stopped request with code {reset}"),
+                ));
+            }
+            Ok(Err(error)) => {
+                io.close(browser_reset::HANDLER_FAILED);
+                return Err(BrowserInvokeError::new(true, error));
+            }
+            Err(_) => {
+                io.close(browser_reset::DEADLINE_EXCEEDED);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    "browser request acknowledgement timed out",
+                ));
+            }
+        }
 
         let mut len = [0u8; 4];
-        tokio::time::timeout(firstbyte_budget(), recv.read_exact(&mut len))
-            .await
-            .map_err(|_| BrowserInvokeError::new(true, "browser reply timed out"))?
-            .map_err(|e| BrowserInvokeError::new(true, e))?;
-        let n = check_len(len).map_err(|e| BrowserInvokeError::new(true, e))?;
+        let prefix = tokio::time::timeout(
+            firstbyte_budget(),
+            io.recv
+                .as_mut()
+                .expect("browser receive stream is present")
+                .read_exact(&mut len),
+        )
+        .await;
+        match prefix {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                io.close(browser_reset::MALFORMED_PAYLOAD);
+                return Err(BrowserInvokeError::new(true, error));
+            }
+            Err(_) => {
+                io.close(browser_reset::DEADLINE_EXCEEDED);
+                return Err(BrowserInvokeError::new(true, "browser reply timed out"));
+            }
+        }
+        let n = match check_len(len) {
+            Ok(n) => n,
+            Err(error) => {
+                io.close(error.reset_code());
+                return Err(BrowserInvokeError::new(true, error));
+            }
+        };
         let mut reply = vec![0u8; n];
-        tokio::time::timeout(idle_budget(), recv.read_exact(&mut reply))
-            .await
-            .map_err(|_| BrowserInvokeError::new(true, "browser reply body timed out"))?
-            .map_err(|e| BrowserInvokeError::new(true, e))?;
+        let body = tokio::time::timeout(
+            idle_budget(),
+            io.recv
+                .as_mut()
+                .expect("browser receive stream is present")
+                .read_exact(&mut reply),
+        )
+        .await;
+        match body {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                io.close(browser_reset::MALFORMED_PAYLOAD);
+                return Err(BrowserInvokeError::new(true, error));
+            }
+            Err(_) => {
+                io.close(browser_reset::DEADLINE_EXCEEDED);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    "browser reply body timed out",
+                ));
+            }
+        }
+        let mut trailing = [0u8; 1];
+        let eof = tokio::time::timeout(
+            idle_budget(),
+            io.recv
+                .as_mut()
+                .expect("browser receive stream is present")
+                .read(&mut trailing),
+        )
+        .await;
+        match eof {
+            Ok(Ok(None)) => {}
+            Ok(Ok(Some(_))) => {
+                io.close(browser_reset::MALFORMED_PAYLOAD);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    "browser reply contains trailing bytes",
+                ));
+            }
+            Ok(Err(error)) => {
+                io.close(browser_reset::MALFORMED_PAYLOAD);
+                return Err(BrowserInvokeError::new(true, error));
+            }
+            Err(_) => {
+                io.close(browser_reset::DEADLINE_EXCEEDED);
+                return Err(BrowserInvokeError::new(
+                    true,
+                    "browser reply EOF timed out",
+                ));
+            }
+        }
+        io.disarm();
         Ok(reply)
     }
 }
@@ -2263,6 +3005,7 @@ pub async fn serve_tunnels_full(
         0 => None,
         n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
     };
+    let browser_resources = BrowserInboundResources::new();
     while let Some(incoming) = ep.accept().await {
         // Unknown/fragmented ClientHello classification consumes the low-trust
         // browser budget. Letting it consume the fleet budget would give a
@@ -2305,6 +3048,7 @@ pub async fn serve_tunnels_full(
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
         let browser_admission = browser_admission.clone();
+        let browser_resources = browser_resources.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let conn = match incoming.await {
@@ -2325,7 +3069,18 @@ pub async fn serve_tunnels_full(
                     );
                     return;
                 }
-                serve_browser_conn(conn).await;
+                let Some(_peer_connection) = BrowserCountGuard::acquire(
+                    browser_resources.peer_connections.clone(),
+                    remote_id.clone(),
+                    BROWSER_MAX_CONNECTIONS_PER_ENDPOINT,
+                ) else {
+                    conn.close(
+                        browser_reset::OVERLOADED.into(),
+                        b"browser peer connection limit reached",
+                    );
+                    return;
+                };
+                serve_browser_conn(conn, remote_id, browser_resources).await;
                 return;
             }
             if conn.alpn() == HIVE_ALPN {
@@ -2429,45 +3184,171 @@ async fn serve_fleet_conn(
 /// The reply carries NO op byte. Echoing the request frame back verbatim — as
 /// this did before the op byte existed — hands the caller the op byte as the
 /// first character of the reply body, which silently corrupts every echo.
-async fn serve_browser_conn(conn: Connection) {
-    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+fn reject_browser_stream(
+    send: &mut iroh::endpoint::SendStream,
+    recv: &mut iroh::endpoint::RecvStream,
+    code: u32,
+) {
+    let _ = send.reset(code.into());
+    let _ = recv.stop(code.into());
+}
+
+async fn write_browser_reply(
+    send: &mut iroh::endpoint::SendStream,
+    payload: &[u8],
+) -> std::result::Result<(), ()> {
+    send.write_all(&(payload.len() as u32).to_le_bytes())
+        .await
+        .map_err(|_| ())?;
+    send.write_all(payload).await.map_err(|_| ())
+}
+
+async fn serve_browser_conn(
+    conn: Connection,
+    remote_id: String,
+    resources: BrowserInboundResources,
+) {
+    let connection_streams = Arc::new(tokio::sync::Semaphore::new(
+        BROWSER_MAX_STREAMS_PER_CONNECTION,
+    ));
+    let connection_activity = Arc::new(std::sync::Mutex::new(BrowserConnectionActivity {
+        active: 0,
+        idle_since: Some(Instant::now()),
+    }));
+    loop {
+        let wait = {
+            let activity = connection_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if activity.active > 0 {
+                BROWSER_CONNECTION_IDLE_TIMEOUT
+            } else {
+                BROWSER_CONNECTION_IDLE_TIMEOUT.saturating_sub(
+                    activity
+                        .idle_since
+                        .map(|since| since.elapsed())
+                        .unwrap_or_default(),
+                )
+            }
+        };
+        let (mut send, mut recv) = match tokio::time::timeout(wait, conn.accept_bi()).await {
+            Ok(Ok(streams)) => streams,
+            Ok(Err(_)) => break,
+            Err(_) => {
+                let idle = {
+                    let activity = connection_activity
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    activity.active == 0
+                        && activity
+                            .idle_since
+                            .is_some_and(|since| since.elapsed() >= BROWSER_CONNECTION_IDLE_TIMEOUT)
+                };
+                if idle {
+                    conn.close(
+                        browser_reset::DEADLINE_EXCEEDED.into(),
+                        b"browser connection idle",
+                    );
+                    break;
+                }
+                continue;
+            }
+        };
+        let peer_stream = BrowserCountGuard::acquire(
+            resources.peer_streams.clone(),
+            remote_id.clone(),
+            BROWSER_MAX_STREAMS_PER_ENDPOINT,
+        );
+        let permits = resources
+            .streams
+            .clone()
+            .try_acquire_owned()
+            .ok()
+            .zip(connection_streams.clone().try_acquire_owned().ok())
+            .zip(peer_stream);
+        let Some(((stream_permit, connection_permit), peer_permit)) = permits else {
+            reject_browser_stream(&mut send, &mut recv, browser_reset::OVERLOADED);
+            continue;
+        };
+        let connection_activity =
+            BrowserConnectionStreamGuard::acquire(connection_activity.clone());
+        let resources = resources.clone();
         tokio::spawn(async move {
-            let mut lenb = [0u8; 4];
-            if recv.read_exact(&mut lenb).await.is_err() {
-                return;
-            }
-            let len = match check_len(lenb) {
-                Ok(n) => n,
-                Err(e) => {
-                    tracing::warn!(error = %e, "browser stream refused");
-                    let _ = send.reset(e.reset_code().into());
+            let _stream_permit = stream_permit;
+            let _connection_permit = connection_permit;
+            let _peer_permit = peer_permit;
+            let _connection_activity = connection_activity;
+            let request = tokio::time::timeout(BROWSER_READ_TIMEOUT, async {
+                let mut lenb = [0u8; 4];
+                recv.read_exact(&mut lenb)
+                    .await
+                    .map_err(|_| browser_reset::MALFORMED_PAYLOAD)?;
+                let len = check_len(lenb).map_err(|error| error.reset_code())?;
+                if len == 0 {
+                    return Err(browser_reset::MALFORMED_PAYLOAD);
+                }
+                let mut opb = [0u8; 1];
+                recv.read_exact(&mut opb)
+                    .await
+                    .map_err(|_| browser_reset::MALFORMED_PAYLOAD)?;
+                let op = Op::from_byte(opb[0]).map_err(|error| error.reset_code())?;
+                if op != Op::Echo {
+                    return Err(browser_reset::NO_HANDLER);
+                }
+                if len - 1 > BROWSER_MAX_ECHO {
+                    return Err(browser_reset::FRAME_TOO_LARGE);
+                }
+                let bytes = u32::try_from(len - 1).map_err(|_| browser_reset::FRAME_TOO_LARGE)?;
+                let byte_permit = resources
+                    .bytes
+                    .clone()
+                    .try_acquire_many_owned(bytes)
+                    .map_err(|_| browser_reset::OVERLOADED)?;
+                let mut payload = vec![0u8; len - 1];
+                recv.read_exact(&mut payload)
+                    .await
+                    .map_err(|_| browser_reset::MALFORMED_PAYLOAD)?;
+                let mut trailing = [0u8; 1];
+                match recv.read(&mut trailing).await {
+                    Ok(None) => {}
+                    Ok(Some(_)) | Err(_) => return Err(browser_reset::MALFORMED_PAYLOAD),
+                }
+                Ok::<_, u32>((payload, byte_permit))
+            })
+            .await;
+            let (payload, _byte_permit) = match request {
+                Ok(Ok(request)) => request,
+                Ok(Err(code)) => {
+                    reject_browser_stream(&mut send, &mut recv, code);
+                    return;
+                }
+                Err(_) => {
+                    reject_browser_stream(&mut send, &mut recv, browser_reset::DEADLINE_EXCEEDED);
                     return;
                 }
             };
-            let mut buf = vec![0u8; len];
-            if recv.read_exact(&mut buf).await.is_err() {
-                return;
-            }
-            let (op, payload) = match split_request(&buf) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!(error = %e, "browser stream refused");
-                    let _ = send.reset(e.reset_code().into());
-                    return;
-                }
-            };
-            match op {
-                Op::Echo => {
-                    if send.write_all(&encode_reply(payload)).await.is_ok() {
-                        let _ = send.finish();
+            match tokio::time::timeout(
+                BROWSER_READ_TIMEOUT,
+                write_browser_reply(&mut send, &payload),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    if send.finish().is_err() {
+                        reject_browser_stream(
+                            &mut send,
+                            &mut recv,
+                            browser_reset::HANDLER_FAILED,
+                        );
                     }
                 }
-                // A fleet node has no browser function runtime or demand-side
-                // asset store to hand these to. Refuse LOUDLY with the shared
-                // "understood but unserved" code rather than replying empty.
-                Op::Invoke | Op::AssetGet => {
-                    tracing::debug!(?op, "browser op refused: no handler on a fleet node");
-                    let _ = send.reset(browser_reset::NO_HANDLER.into());
+                Ok(Err(())) => reject_browser_stream(
+                    &mut send,
+                    &mut recv,
+                    browser_reset::HANDLER_FAILED,
+                ),
+                Err(_) => {
+                    reject_browser_stream(&mut send, &mut recv, browser_reset::DEADLINE_EXCEEDED)
                 }
             }
         });

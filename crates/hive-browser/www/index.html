@@ -58,7 +58,7 @@
   async function boot() {
     await init();
 
-    const relay = params.get('relay') || 'wss://127.0.0.1:3341';
+    const relay = params.get('relay') || 'http://127.0.0.1:3341';
     const discovery = params.get('discovery') || '';
 
     $('s-status').textContent = `connecting to ${relay}…`;
@@ -87,8 +87,16 @@
         frameUrl: params.get('function-frame') || undefined,
         blake3: blake3Hex,
         ops: harness ? {
-          1: async value => value,
-          2: async value => new TextEncoder().encode(String(value)).buffer,
+          1: {
+            handler: async value => value,
+            effect: 'read',
+            abi: 'hive-browser/identity-json-v1',
+          },
+          2: {
+            handler: async value => new TextEncoder().encode(String(value)).buffer,
+            effect: 'read',
+            abi: 'hive-browser/utf8-array-buffer-v1',
+          },
         } : {},
       });
       runtime.attach(node);

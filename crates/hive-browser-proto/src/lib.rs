@@ -81,6 +81,11 @@ pub const fn protocol_fit(client_version: u16) -> ProtocolFit {
 /// sides check against this before allocating.
 pub const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
 
+/// Echo is a diagnostic liveness operation, not a bulk transfer path. Keeping
+/// its payload smaller than function/asset frames prevents unauthenticated Echo
+/// traffic from monopolizing browser memory and response bandwidth.
+pub const BROWSER_MAX_ECHO: usize = 64 << 10; // 64 KiB
+
 /// Stream reset codes. Shared so a reset means the same thing on both sides
 /// instead of each end inventing its own numbering.
 pub mod reset {
@@ -102,6 +107,12 @@ pub mod reset {
     /// Kept distinct from [`NO_HANDLER`] so callers cannot confuse policy with a
     /// deployment/runtime fault.
     pub const FORBIDDEN: u32 = 7;
+    /// This browser node has no bounded connection or stream slot available.
+    /// Callers may retry after another operation releases its Drop-owned permit.
+    pub const OVERLOADED: u32 = 8;
+    /// The peer did not finish a handshake/frame or a local async handler did
+    /// not settle within the browser node's explicit deadline.
+    pub const DEADLINE_EXCEEDED: u32 = 9;
 }
 
 /// Functions and assets share iroh's canonical lowercase BLAKE3 text form.
@@ -116,6 +127,11 @@ pub const ASSET_DIGEST_LEN: usize = BLAKE3_DIGEST_LEN;
 /// the per-frame allocation cap.
 pub const ASSET_REPLY_META_LEN: usize = 8;
 pub const ASSET_CHUNK_MAX: usize = BROWSER_MAX_FRAME - ASSET_REPLY_META_LEN;
+
+/// Maximum complete asset returned by the browser-facing whole-object API.
+/// `assetOn` returns one JavaScript `Uint8Array`, so accepting a peer-declared
+/// multi-gigabyte total would turn bounded chunks into an unbounded allocation.
+pub const BROWSER_MAX_ASSET: usize = 64 << 20; // 64 MiB
 
 /// The op selector: the first byte of every request payload.
 ///

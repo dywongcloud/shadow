@@ -38,3 +38,43 @@ pub mod anyhow_like {
 }
 
 pub type Result<T> = std::result::Result<T, HiveError>;
+
+/// Stable markers a backend embeds in its `anyhow` error text so the gateway can
+/// classify a lease failure by CAUSE instead of by catch-all.
+///
+/// The lease path erases types: every backend fault reaches
+/// `fluid-gateway::classify_lease_error` as a flat `anyhow::Error` string, and
+/// anything that string does not name is reported to the user as
+/// `CAPACITY_EXHAUSTED`. That is how a missing base rootfs on fc-sanjose-cvm-2
+/// was published as "the host is out of capacity" while the node held 923 GB
+/// free. These markers are the contract between the two crates — the ONLY thing
+/// keeping the classifier off substring-matching prose that a later reword
+/// silently breaks — so treat each as public API: keep it in the error text, and
+/// keep the matching arm in the classifier.
+///
+/// Both crates depend on `hive-core` and neither depends on the other, so this is
+/// the single place both can name.
+pub mod fault {
+    /// A cell artifact this NODE must have is absent (per-image rootfs, shared
+    /// base rootfs, guest kernel). Operator remedy: reprovision the node's
+    /// images. Not app breakage, not host exhaustion.
+    pub const NODE_IMAGE_MISSING: &str = "NodeImageMissing";
+    /// This NODE's isolation backend cannot run cells at all (no `/dev/kvm`, no
+    /// firecracker binary, wrong OS).
+    pub const NODE_BACKEND_UNAVAILABLE: &str = "NodeBackendUnavailable";
+    /// This NODE's container lock pool is empty and nothing was reclaimable, so
+    /// no container can start here until `num_locks` is raised + renumbered.
+    pub const NODE_LOCK_POOL_EXHAUSTED: &str = "NodeLockPoolExhausted";
+    /// The DEPLOYMENT's own process never reached a listening state — it exited,
+    /// or it never bound its port inside the start budget. An app fault: bad
+    /// entrypoint, missing env, a crash on boot.
+    ///
+    /// Distinct from the node markers above, and needed even though the pool
+    /// circuits on a streak of these: the circuit only opens on the THIRD
+    /// failure, so without a marker the first two were published as
+    /// `CAPACITY_EXHAUSTED` — the exact "blames the host for an app-level fault"
+    /// case the failure taxonomy exists to prevent. Witnessed live: a microVM
+    /// whose function never bound its port reported CAPACITY_EXHAUSTED on a node
+    /// with a healthy rootfs and free disk.
+    pub const DEPLOYMENT_START_FAILED: &str = "DeploymentStartFailed";
+}

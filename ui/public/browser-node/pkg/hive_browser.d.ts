@@ -29,27 +29,28 @@ export class BrowserNode {
     addrJson(): string;
     /**
      * Pull a complete BLAKE3-addressed asset in bounded chunks. Every reply
-     * repeats the immutable total length; the final assembled bytes are hashed
-     * before any caller can persist them.
+     * repeats the immutable total length. Bytes land directly in one capped JS
+     * buffer while BLAKE3 is updated incrementally, so wasm never retains a
+     * second whole-asset copy.
      */
     assetOn(peer_addr_json: string, digest: string): Promise<Uint8Array>;
     /**
      * Boot a node: bind an endpoint against `relay_urls` (comma-separated,
      * same convention as the fleet's own `HIVE_RELAY_URLS` — see
      * `hive_p2p::relay_map_from_env` — so a caller can hand multiple relays
-     * for failover instead of pinning to one; each must be `wss://` from an
-     * https page, plain `ws://` is mixed-content-blocked), optionally wire a
+     * for failover instead of pinning to one; each must be `http://` or
+     * `https://` — iroh derives the relay's `ws://`/`wss://` transport),
+     * optionally wire a
      * pkarr `discovery_url` for publish+resolve, and restore identity from
      * `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a
      * fresh one. Spawns the `hive/browser/0` accept loop before returning.
      */
     static boot(relay_urls: string, discovery_url?: string | null, secret_hex?: string | null): Promise<BrowserNode>;
     /**
-     * Clear every execution capability and gracefully close the iroh endpoint.
-     * Idempotent and awaitable; unlike wasm-bindgen's generated `free()`, this
-     * waits for QUIC close notifications. An invocation already inside a JS
-     * Promise may finish; no not-yet-started invocation can begin after grants
-     * are cleared.
+     * Clear every capability, abort and drain the platform-owned Rust task tree,
+     * then gracefully close the iroh endpoint. JavaScript handlers receive an
+     * AbortSignal; noncooperative Promises remain counted against the fixed
+     * handler pool until they actually settle.
      */
     close(): Promise<void>;
     /**
@@ -249,12 +250,12 @@ export interface InitOutput {
     readonly ring_core_0_17_14__bn_mul_mont: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h0908a51f6b61a600: (a: number, b: number, c: any) => [number, number];
     readonly wasm_bindgen__convert__closures_____invoke__h40609ae72e5a0370: (a: number, b: number, c: any, d: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h65751fdee90535b7: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h743eb17756c0e51e: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h3d4e2eac2fad058b: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__habd8d9d2a2106490: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h298a6bff5b0691a5: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha389886adaf6862d: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h20d1c682fa714cd2: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hac8c55c6b76aac63: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h0d78351b17b6d108: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h2b85946bfc7620d7: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__ha40077c21a1fc6d0: (a: number, b: number) => void;
     readonly wasm_bindgen__convert__closures_____invoke__h100cfb892b577986: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;

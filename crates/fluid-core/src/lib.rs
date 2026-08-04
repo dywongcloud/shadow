@@ -1685,6 +1685,39 @@ pub enum FailureClass {
     CapacityExhausted,
     /// A deployment's circuit breaker is open (crash-looping). 503.
     DeploymentCircuitOpen,
+    /// THIS NODE is missing a cell artifact it must have to boot anything: the
+    /// per-image rootfs, the shared base rootfs, or the guest kernel. 503.
+    ///
+    /// A NODE PROVISIONING fault — neither an app fault nor a lack of capacity,
+    /// and the only remedy is an operator reprovisioning the node's images.
+    /// Deliberately distinct from [`FailureClass::CapacityExhausted`], which is
+    /// where it used to land: witnessed on fc-sanjose-cvm-2, a missing
+    /// `/var/lib/hive/rootfs/default.ext4` was reported as CAPACITY_EXHAUSTED on
+    /// a node with 923 GB free disk and 2046 free podman locks, which sent the
+    /// operator hunting a capacity problem that did not exist. Also distinct from
+    /// [`FailureClass::DeploymentCircuitOpen`]: the missing rootfs failed every
+    /// cold start, so the pool circuited too and the user-visible code alternated
+    /// between two labels that both named the wrong thing.
+    NodeImageMissing,
+    /// THIS NODE's isolation backend cannot run cells at all — no `/dev/kvm`, no
+    /// firecracker binary, wrong OS. 503.
+    ///
+    /// Split from [`FailureClass::NodeImageMissing`] because the remedy is
+    /// different: the artifacts are fine and the HYPERVISOR is not there. On this
+    /// fleet that is usually the documented PVM failure mode (`kvm_pvm` refuses
+    /// to load while host PTI is active, so `/dev/kvm` silently disappears), not
+    /// anything a copy of the rootfs would fix.
+    NodeBackendUnavailable,
+    /// THIS NODE's container lock pool is exhausted and nothing was reclaimable,
+    /// so NO container can start here until an operator resizes it. 503.
+    ///
+    /// podman takes one lock from a fixed per-HOST pool (`num_locks`, default
+    /// 2048) per container AND per volume, so a leak starves every tenant on the
+    /// node. Reported as CAPACITY_EXHAUSTED it reads as "you need more capacity"
+    /// when the truth is "this host's lock pool has to be renumbered" — the
+    /// self-heal already reclaims what it safely can, and this class is what is
+    /// left when it reclaimed nothing.
+    NodeLockPoolExhausted,
     /// No healthy peer in the mesh can serve this deployment. 503.
     NoHealthyPeer,
     /// No healthy node in the deployment's configured region(s). 503.
@@ -1720,6 +1753,9 @@ impl FailureClass {
             FailureClass::TenantThrottled => 429,
             FailureClass::CapacityExhausted
             | FailureClass::DeploymentCircuitOpen
+            | FailureClass::NodeImageMissing
+            | FailureClass::NodeBackendUnavailable
+            | FailureClass::NodeLockPoolExhausted
             | FailureClass::NoHealthyPeer
             | FailureClass::NoHealthyRegion => 503,
             FailureClass::RuntimeTunnelFailed
@@ -1735,6 +1771,9 @@ impl FailureClass {
             FailureClass::TenantThrottled => "TENANT_THROTTLED",
             FailureClass::CapacityExhausted => "CAPACITY_EXHAUSTED",
             FailureClass::DeploymentCircuitOpen => "DEPLOYMENT_CIRCUIT_OPEN",
+            FailureClass::NodeImageMissing => "NODE_IMAGE_MISSING",
+            FailureClass::NodeBackendUnavailable => "NODE_BACKEND_UNAVAILABLE",
+            FailureClass::NodeLockPoolExhausted => "NODE_LOCK_POOL_EXHAUSTED",
             FailureClass::NoHealthyPeer => "NO_HEALTHY_PEER",
             FailureClass::NoHealthyRegion => "NO_HEALTHY_REGION",
             FailureClass::RuntimeTunnelFailed => "RUNTIME_TUNNEL_FAILED",

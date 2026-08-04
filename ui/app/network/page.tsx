@@ -4,6 +4,8 @@ import { useState } from "react";
 import { Globe2, Server, Share2, ShieldCheck, Database, Network } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type NodeInfo, type AnycastTable, type RateLimitStats } from "@/lib/api";
+import { SATELLITE_ONLINE_COLOR, SATELLITE_DEGRADED_COLOR } from "@/components/region-map";
+import type { BrowserPresence } from "@/lib/run-node-client";
 import { timeAgo } from "@/lib/utils";
 
 interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
@@ -14,6 +16,11 @@ export default function NetworkPage() {
   // The previous /v1/overview poll here was never read anywhere — deleted.
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 10000);
   const { data: cluster } = usePoll<ClusterStatus>("/v1/cluster", 10000);
+  // Low-trust browser-node presence — a SEPARATE feed from `/v1/nodes`, never
+  // merged into the fleet node list or capacity totals anywhere on this page
+  // (same discipline as the /regions constellation satellites).
+  const { data: presenceFeed } = usePoll<{ presence: BrowserPresence[] }>("/v1/browser/presence", 8000);
+  const presence = presenceFeed?.presence ?? [];
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
   return (
@@ -41,12 +48,18 @@ export default function NetworkPage() {
                 cubes blue with no legend entry is just an unexplained color. */}
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#3b82f6]" /> GPU</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#9ca3af]" /> unhealthy</span>
+            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — never counted as fleet capacity">
+              <span className="inline-block h-2 w-2 rotate-45 rounded-[1px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node
+            </span>
           </div>
         </div>
-        <MeshDiagram nodes={nodes ?? []} />
+        <MeshDiagram nodes={nodes ?? []} presence={presence} />
         <p className="mt-2 text-center text-xs text-muted">
           Every node runs a gateway + Fluid pool, fully meshed over iroh QUIC. The function tunnel protocol
           rides those streams, so a gateway on one node can serve an instance on any other, anywhere reachable.
+          {presence.length > 0 && (
+            <> Orbiting satellites are admitted browser nodes — low-trust edge peers attached over the relay, never fleet capacity.</>
+          )}
         </p>
       </Card>
 
@@ -122,9 +135,12 @@ function fmtMem(mb?: number): string {
 /**
  * P2P mesh map: nodes evenly on a circle, fully connected by curved orbital wire
  * lines (blue in light mode, white in dark — see the `stroke-*` classes), each
- * node a 3D green isometric cube with its name below. Pure SVG, theme-aware, no deps.
+ * node a 3D green isometric cube with its name below. Admitted browser nodes
+ * (the separate low-trust presence feed) orbit further out as small diamonds,
+ * anchored beside their relay fleet node when identifiable. Pure SVG,
+ * theme-aware, no deps.
  */
-function MeshDiagram({ nodes }: { nodes: NodeInfo[] }) {
+function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: BrowserPresence[] }) {
   const W = 760;
   const H = 560;
   const cx = W / 2;
@@ -177,6 +193,51 @@ function MeshDiagram({ nodes }: { nodes: NodeInfo[] }) {
     }
   }
 
+  // Browser-node satellites: admitted low-trust edge peers from the SEPARATE
+  // presence feed, rendered as small diamonds on an outer orbit — never cubes,
+  // never counted as fleet nodes or capacity. Unlike the geographic /regions
+  // map there is no location-sharing requirement here: this diagram is
+  // topological, so a browser that declined geo sharing is still a member of
+  // the p2p network and still gets a satellite. Placement is deterministic
+  // (stable lexical endpoint_id order) so a presence refresh doesn't reshuffle
+  // the ring: a satellite anchors beside the fleet node whose relay it is
+  // attached through when that relay is identifiable from relay_hint, fans out
+  // in a small arc when several share one relay, and otherwise distributes
+  // evenly around the ring. Rendered count is honestly capped.
+  const SAT_ORBIT = R + 62;
+  const MAX_SATELLITES = 150;
+  const sortedPresence = [...presence].sort((a, b) => (a.endpoint_id < b.endpoint_id ? -1 : a.endpoint_id > b.endpoint_id ? 1 : 0));
+  const satellites = sortedPresence.slice(0, MAX_SATELLITES);
+  const satelliteOverflow = sortedPresence.length - satellites.length;
+  const hostOf = (u?: string | null): string => {
+    if (!u) return "";
+    try { return new URL(u).hostname; } catch { return ""; }
+  };
+  const nodeAngle = (i: number) => -Math.PI / 2 + (i * 2 * Math.PI) / n;
+  const anchorOf = satellites.map((p) => {
+    const hintHost = hostOf(p.relay_hint);
+    if (!hintHost) return -1;
+    return nodes.findIndex((nd) => hostOf(nd.relay_url) === hintHost || (Boolean(nd.name) && hintHost.includes(nd.name)));
+  });
+  const anchoredTotal = new Map<number, number>();
+  anchorOf.forEach((i) => { if (i >= 0) anchoredTotal.set(i, (anchoredTotal.get(i) ?? 0) + 1); });
+  const anchoredSeen = new Map<number, number>();
+  const unanchoredTotal = anchorOf.filter((i) => i < 0).length;
+  let unanchoredSeen = 0;
+  const satPos = satellites.map((p, k) => {
+    let a: number;
+    const ai = anchorOf[k];
+    if (ai >= 0) {
+      const seen = anchoredSeen.get(ai) ?? 0;
+      anchoredSeen.set(ai, seen + 1);
+      const m = anchoredTotal.get(ai) ?? 1;
+      a = nodeAngle(ai) + (seen - (m - 1) / 2) * 0.14;
+    } else {
+      a = -Math.PI / 2 + ((unanchoredSeen++ + 0.5) * 2 * Math.PI) / Math.max(1, unanchoredTotal);
+    }
+    return { p, x: cx + SAT_ORBIT * Math.cos(a), y: cy + SAT_ORBIT * Math.sin(a) };
+  });
+
   return (
     <svg viewBox={`0 0 ${W} ${H}`} className="mx-auto block w-full" style={{ maxHeight: 540 }} preserveAspectRatio="xMidYMid meet">
       {/*
@@ -220,6 +281,29 @@ function MeshDiagram({ nodes }: { nodes: NodeInfo[] }) {
           </text>
         </g>
       ))}
+      {/* browser-node satellites — small diamonds on an outer orbit, in the
+          shared low-trust hues exported from region-map.tsx, with a hover
+          title carrying label + state; degraded/suspended reads as slate. */}
+      {satPos.map(({ p, x, y }) => (
+        <g key={p.endpoint_id} transform={`translate(${x.toFixed(1)} ${y.toFixed(1)})`}>
+          <rect
+            x={-4}
+            y={-4}
+            width={8}
+            height={8}
+            rx={1}
+            transform="rotate(45)"
+            fill={p.state === "degraded" || p.state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR}
+            fillOpacity={0.9}
+          />
+          <title>{`${p.display_label || p.endpoint_id} · browser node (low-trust)${p.state ? ` · ${p.state}` : ""}`}</title>
+        </g>
+      ))}
+      {satelliteOverflow > 0 && (
+        <text x={W - 8} y={H - 10} textAnchor="end" style={{ fontSize: 11 }} className="fill-neutral-500 dark:fill-neutral-400">
+          {`+${satelliteOverflow} more browser node${satelliteOverflow === 1 ? "" : "s"} not drawn`}
+        </text>
+      )}
     </svg>
   );
 }

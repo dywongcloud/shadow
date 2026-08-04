@@ -183,7 +183,7 @@ export class BrowserNodeCompat {
       const bytes = files.get(path);
       if (!bytes) throw new Error(`ENOENT: ${path}`);
       return payload?.encoding ? decoder.decode(bytes) : bytes.slice().buffer;
-    });
+    }, { effect: "read", abi: "hive.node-compat.fs-read/v1" });
   }
 
   async pin(source, files = {}, options = {}) {
@@ -191,14 +191,10 @@ export class BrowserNodeCompat {
     const mounted = new Map();
     for (const [path, value] of Object.entries(files)) mounted.set(normalizePath(path), encoder.encode(String(value)));
     const wrapper = `async function(request, ops) { return (${guestMain.toString()})(request, ops, ${JSON.stringify(source)}); }`;
-    const digest = this.blake3(encoder.encode(wrapper));
+    const sourceDigest = this.blake3(encoder.encode(wrapper));
+    const allowedOps = [...new Set([...(options.allowedOps || []), OP_FS_READ])];
+    const digest = await this.runtime.pin(sourceDigest, wrapper, { ...options, allowedOps });
     this.mounts.set(digest, mounted);
-    try {
-      await this.runtime.pin(digest, wrapper, { ...options, allowedOps: [...new Set([...(options.allowedOps || []), OP_FS_READ])] });
-    } catch (error) {
-      this.mounts.delete(digest);
-      throw error;
-    }
     return digest;
   }
 

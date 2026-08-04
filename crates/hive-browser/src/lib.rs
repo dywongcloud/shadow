@@ -17,20 +17,23 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iroh::{
+    endpoint::{Connection, QuicTransportConfig, RecvStream, SendStream, VarInt},
     Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     Watcher as _,
 };
-use n0_future::StreamExt;
+use n0_future::{time::Instant, StreamExt};
 use serde::Serialize;
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::JsFuture;
 
 /// The registered edge-function invoke handler: a JS callback
-/// `(codeDigest: string, requestJson: string) => Promise<string>` that resolves
+/// `(codeDigest: string, requestJson: string, signal: AbortSignal) => Promise<string>` that resolves
 /// the digest to a LOCALLY pinned artifact. Executable source never crosses the
 /// wire. `Rc<RefCell<>>`, not `Arc<Mutex<>>` — wasm32 in a browser tab is
 /// single-threaded, and `js_sys::Function` isn't `Send` anyway.
@@ -41,7 +44,7 @@ type InvokeHandler = Rc<RefCell<Option<js_sys::Function>>>;
 type AddressHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
 /// Trusted local asset reader:
-/// `(digest: string, offset: number, maxLen: number) => Promise<{total, bytes}>`.
+/// `(digest: string, offset: number, maxLen: number, signal: AbortSignal) => Promise<{total, bytes}>`.
 type AssetHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
 /// Exact execution scopes granted to each TLS-authenticated iroh endpoint.
@@ -49,6 +52,897 @@ type AssetHandler = Rc<RefCell<Option<js_sys::Function>>>;
 /// revocation applies to existing pooled QUIC connections.
 type InvokerGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
 type AssetGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
+type PeerConnections = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
+type PeerStreams = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
+
+const MAX_PENDING_CONNECTIONS: usize = 16;
+const MAX_CONNECTIONS_PER_ENDPOINT: usize = 4;
+const MAX_ACTIVE_STREAMS: usize = 32;
+const MAX_STREAMS_PER_ENDPOINT: usize = 8;
+const MAX_STREAMS_PER_CONNECTION: usize = 8;
+const MAX_ACTIVE_ECHO: usize = 4;
+const MAX_ACTIVE_HANDLERS: usize = 32;
+const MAX_OUTBOUND_CONNECTIONS: usize = 16;
+const MAX_ACTIVE_OUTBOUND_STREAMS: usize = 32;
+const MAX_OUTBOUND_DIAL_WAITERS: usize = 32;
+const MAX_INFLIGHT_ASSET_BYTES: usize = 128 << 20;
+const RELAY_ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
+const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const STREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTBOUND_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+const OUTBOUND_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
+const BROWSER_STREAM_WINDOW: u32 = (BROWSER_MAX_FRAME + 4) as u32;
+const BROWSER_CONNECTION_WINDOW: u32 = BROWSER_STREAM_WINDOW * MAX_STREAMS_PER_CONNECTION as u32;
+static HANDLER_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_ACTIVE_HANDLERS);
+
+struct PeerConnectionGuard {
+    endpoint_id: EndpointId,
+    counts: PeerConnections,
+}
+
+impl PeerConnectionGuard {
+    fn acquire(counts: PeerConnections, endpoint_id: EndpointId) -> Option<Self> {
+        let mut current = counts.borrow_mut();
+        let count = current.entry(endpoint_id.clone()).or_default();
+        if *count >= MAX_CONNECTIONS_PER_ENDPOINT {
+            return None;
+        }
+        *count += 1;
+        drop(current);
+        Some(Self {
+            endpoint_id,
+            counts,
+        })
+    }
+}
+
+impl Drop for PeerConnectionGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.borrow_mut();
+        let remove = counts.get_mut(&self.endpoint_id).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            counts.remove(&self.endpoint_id);
+        }
+    }
+}
+
+struct PeerStreamGuard {
+    endpoint_id: EndpointId,
+    counts: PeerStreams,
+}
+
+impl PeerStreamGuard {
+    fn acquire(counts: PeerStreams, endpoint_id: EndpointId) -> Option<Self> {
+        let mut current = counts.borrow_mut();
+        let count = current.entry(endpoint_id.clone()).or_default();
+        if *count >= MAX_STREAMS_PER_ENDPOINT {
+            return None;
+        }
+        *count += 1;
+        drop(current);
+        Some(Self {
+            endpoint_id,
+            counts,
+        })
+    }
+}
+
+impl Drop for PeerStreamGuard {
+    fn drop(&mut self) {
+        let mut counts = self.counts.borrow_mut();
+        let remove = counts.get_mut(&self.endpoint_id).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            counts.remove(&self.endpoint_id);
+        }
+    }
+}
+
+struct ConnectionActivity {
+    active: usize,
+    idle_since: Option<Instant>,
+}
+
+struct ConnectionStreamGuard {
+    activity: Rc<RefCell<ConnectionActivity>>,
+}
+
+impl ConnectionStreamGuard {
+    fn acquire(activity: Rc<RefCell<ConnectionActivity>>) -> Self {
+        let mut state = activity.borrow_mut();
+        state.active += 1;
+        state.idle_since = None;
+        drop(state);
+        Self { activity }
+    }
+}
+
+impl Drop for ConnectionStreamGuard {
+    fn drop(&mut self) {
+        let mut state = self.activity.borrow_mut();
+        state.active = state.active.saturating_sub(1);
+        if state.active == 0 {
+            state.idle_since = Some(Instant::now());
+        }
+    }
+}
+
+struct RelayMutationGuard {
+    active: Rc<Cell<bool>>,
+}
+
+impl RelayMutationGuard {
+    fn acquire(active: Rc<Cell<bool>>) -> Option<Self> {
+        if active.replace(true) {
+            None
+        } else {
+            Some(Self { active })
+        }
+    }
+}
+
+impl Drop for RelayMutationGuard {
+    fn drop(&mut self) {
+        self.active.set(false);
+    }
+}
+
+#[derive(Clone)]
+struct TaskGroup {
+    handles: Rc<RefCell<BTreeMap<u64, n0_future::task::AbortHandle>>>,
+    closing: Rc<Cell<bool>>,
+    next_id: Rc<Cell<u64>>,
+}
+
+struct TaskGuard {
+    id: u64,
+    handles: Rc<RefCell<BTreeMap<u64, n0_future::task::AbortHandle>>>,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.handles.borrow_mut().remove(&self.id);
+    }
+}
+
+impl TaskGroup {
+    fn new() -> Self {
+        Self {
+            handles: Rc::new(RefCell::new(BTreeMap::new())),
+            closing: Rc::new(Cell::new(false)),
+            next_id: Rc::new(Cell::new(1)),
+        }
+    }
+
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        if self.closing.get() {
+            return;
+        }
+        let id = self.next_id.get();
+        self.next_id.set(id.wrapping_add(1).max(1));
+        let guard = TaskGuard {
+            id,
+            handles: self.handles.clone(),
+        };
+        let handle = n0_future::task::spawn(async move {
+            let _guard = guard;
+            future.await;
+        });
+        self.handles.borrow_mut().insert(id, handle.abort_handle());
+    }
+
+    fn abort_all(&self) {
+        self.closing.set(true);
+        for handle in self.handles.borrow().values() {
+            handle.abort();
+        }
+    }
+
+    async fn shutdown(&self) {
+        self.abort_all();
+        let drained = n0_future::time::timeout(Duration::from_secs(1), async {
+            while !self.handles.borrow().is_empty() {
+                n0_future::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                remaining = self.handles.borrow().len(),
+                "browser task drain timed out"
+            );
+            self.handles.borrow_mut().clear();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct OutboundPool {
+    inner: Rc<OutboundPoolInner>,
+}
+
+struct OutboundPoolInner {
+    ep: Endpoint,
+    tasks: TaskGroup,
+    state: RefCell<OutboundPoolState>,
+}
+
+struct OutboundPoolState {
+    closed: bool,
+    next_generation: u64,
+    active_streams: usize,
+    entries: BTreeMap<EndpointId, OutboundPoolEntry>,
+}
+
+struct OutboundPoolEntry {
+    generation: u64,
+    connection: Option<Connection>,
+    dialing: bool,
+    waiters: Vec<tokio::sync::oneshot::Sender<Result<Connection, String>>>,
+    stream_slots: Arc<tokio::sync::Semaphore>,
+    active_streams: usize,
+    last_used: Instant,
+}
+
+struct OutboundConnectionLease {
+    pool: OutboundPool,
+    endpoint_id: EndpointId,
+    connection: Connection,
+    _stream_slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+enum OutboundAcquirePlan {
+    Ready {
+        endpoint_id: EndpointId,
+        connection: Connection,
+    },
+    Wait {
+        endpoint_id: EndpointId,
+        receiver: tokio::sync::oneshot::Receiver<Result<Connection, String>>,
+    },
+    Dial {
+        endpoint_id: EndpointId,
+        generation: u64,
+        addr: EndpointAddr,
+        receiver: tokio::sync::oneshot::Receiver<Result<Connection, String>>,
+    },
+}
+
+impl OutboundPool {
+    fn new(ep: Endpoint, tasks: TaskGroup) -> Self {
+        Self {
+            inner: Rc::new(OutboundPoolInner {
+                ep,
+                tasks,
+                state: RefCell::new(OutboundPoolState {
+                    closed: false,
+                    next_generation: 1,
+                    active_streams: 0,
+                    entries: BTreeMap::new(),
+                }),
+            }),
+        }
+    }
+
+    async fn acquire(&self, peer_addr_json: &str) -> Result<OutboundConnectionLease, JsError> {
+        let addr: EndpointAddr = serde_json::from_str(peer_addr_json)
+            .map_err(|error| JsError::new(&format!("bad peer addr_json: {error}")))?;
+        let endpoint_id = addr.id.clone();
+        let plan = {
+            let mut state = self.inner.state.borrow_mut();
+            if state.closed {
+                return Err(JsError::new("browser node is closed"));
+            }
+            if state.active_streams >= MAX_ACTIVE_OUTBOUND_STREAMS {
+                return Err(JsError::new("browser outbound stream limit reached"));
+            }
+
+            let dead = state
+                .entries
+                .iter()
+                .filter(|(_, entry)| {
+                    !entry.dialing
+                        && entry.active_streams == 0
+                        && entry
+                            .connection
+                            .as_ref()
+                            .is_some_and(|connection| connection.close_reason().is_some())
+                })
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>();
+            for id in dead {
+                if let Some(entry) = state.entries.remove(&id) {
+                    entry.stream_slots.close();
+                }
+            }
+
+            let ready = state.entries.get(&endpoint_id).and_then(|entry| {
+                entry
+                    .connection
+                    .as_ref()
+                    .filter(|connection| connection.close_reason().is_none())
+                    .cloned()
+            });
+            if let Some(connection) = ready {
+                OutboundAcquirePlan::Ready {
+                    endpoint_id,
+                    connection,
+                }
+            } else if state
+                .entries
+                .get(&endpoint_id)
+                .is_some_and(|entry| entry.dialing)
+            {
+                let entry = state
+                    .entries
+                    .get_mut(&endpoint_id)
+                    .expect("dialing outbound entry is present");
+                if entry.waiters.len() >= MAX_OUTBOUND_DIAL_WAITERS {
+                    return Err(JsError::new("browser outbound dial waiter limit reached"));
+                }
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                entry.waiters.push(sender);
+                OutboundAcquirePlan::Wait {
+                    endpoint_id,
+                    receiver,
+                }
+            } else {
+                if state.entries.len() >= MAX_OUTBOUND_CONNECTIONS {
+                    let oldest_idle = state
+                        .entries
+                        .iter()
+                        .filter(|(_, entry)| {
+                            !entry.dialing
+                                && entry.active_streams == 0
+                                && entry.connection.is_some()
+                        })
+                        .min_by(|(_, a), (_, b)| {
+                            a.last_used
+                                .partial_cmp(&b.last_used)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|(id, _)| id.clone());
+                    let Some(oldest_idle) = oldest_idle else {
+                        return Err(JsError::new("browser outbound connection limit reached"));
+                    };
+                    if let Some(entry) = state.entries.remove(&oldest_idle) {
+                        entry.stream_slots.close();
+                        if let Some(connection) = entry.connection {
+                            connection.close(
+                                proto_reset::OVERLOADED.into(),
+                                b"browser outbound pool evicted",
+                            );
+                        }
+                    }
+                }
+                let generation = state.next_generation;
+                state.next_generation = state.next_generation.wrapping_add(1).max(1);
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                state.entries.insert(
+                    endpoint_id.clone(),
+                    OutboundPoolEntry {
+                        generation,
+                        connection: None,
+                        dialing: true,
+                        waiters: vec![sender],
+                        stream_slots: Arc::new(tokio::sync::Semaphore::new(
+                            MAX_STREAMS_PER_CONNECTION,
+                        )),
+                        active_streams: 0,
+                        last_used: Instant::now(),
+                    },
+                );
+                OutboundAcquirePlan::Dial {
+                    endpoint_id,
+                    generation,
+                    addr,
+                    receiver,
+                }
+            }
+        };
+
+        match plan {
+            OutboundAcquirePlan::Ready {
+                endpoint_id,
+                connection,
+            } => self.claim(endpoint_id, connection).await,
+            OutboundAcquirePlan::Wait {
+                endpoint_id,
+                receiver,
+            } => {
+                let connection = receiver
+                    .await
+                    .map_err(|_| JsError::new("browser outbound dial cancelled"))?
+                    .map_err(|error| JsError::new(&error))?;
+                self.claim(endpoint_id, connection).await
+            }
+            OutboundAcquirePlan::Dial {
+                endpoint_id,
+                generation,
+                addr,
+                receiver,
+            } => {
+                self.start_dial(endpoint_id.clone(), generation, addr);
+                let connection = receiver
+                    .await
+                    .map_err(|_| JsError::new("browser outbound dial cancelled"))?
+                    .map_err(|error| JsError::new(&error))?;
+                self.claim(endpoint_id, connection).await
+            }
+        }
+    }
+
+    fn start_dial(&self, endpoint_id: EndpointId, generation: u64, addr: EndpointAddr) {
+        let ep = self.inner.ep.clone();
+        let pool = self.clone();
+        self.inner.tasks.spawn(async move {
+            let result =
+                match n0_future::time::timeout(HANDSHAKE_TIMEOUT, ep.connect(addr, BROWSER_ALPN))
+                    .await
+                {
+                    Ok(Ok(connection)) => Ok(connection),
+                    Ok(Err(error)) => Err(format!("connect failed: {error}")),
+                    Err(_) => Err("browser outbound connect deadline exceeded".into()),
+                };
+            pool.finish_dial(endpoint_id, generation, result);
+        });
+    }
+
+    fn finish_dial(
+        &self,
+        endpoint_id: EndpointId,
+        generation: u64,
+        mut result: Result<Connection, String>,
+    ) {
+        let waiters = {
+            let mut state = self.inner.state.borrow_mut();
+            let closed = state.closed;
+            let Some(entry) = state.entries.get_mut(&endpoint_id) else {
+                if let Ok(connection) = result {
+                    connection.close(
+                        proto_reset::DEADLINE_EXCEEDED.into(),
+                        b"stale browser outbound dial",
+                    );
+                }
+                return;
+            };
+            if closed || entry.generation != generation {
+                if let Ok(connection) = result {
+                    connection.close(
+                        proto_reset::DEADLINE_EXCEEDED.into(),
+                        b"stale browser outbound dial",
+                    );
+                }
+                return;
+            }
+            entry.dialing = false;
+            if result
+                .as_ref()
+                .is_ok_and(|connection| connection.close_reason().is_some())
+            {
+                result = Err("browser outbound connection closed during dial".into());
+            }
+            if let Ok(connection) = &result {
+                entry.connection = Some(connection.clone());
+                entry.last_used = Instant::now();
+            }
+            let waiters = std::mem::take(&mut entry.waiters);
+            if result.is_err() {
+                entry.stream_slots.close();
+                state.entries.remove(&endpoint_id);
+            }
+            waiters
+        };
+        for waiter in waiters {
+            let _ = waiter.send(result.clone());
+        }
+    }
+
+    async fn claim(
+        &self,
+        endpoint_id: EndpointId,
+        connection: Connection,
+    ) -> Result<OutboundConnectionLease, JsError> {
+        let stable_id = connection.stable_id();
+        let stream_slots = {
+            let state = self.inner.state.borrow();
+            if state.closed {
+                return Err(JsError::new("browser node is closed"));
+            }
+            if state.active_streams >= MAX_ACTIVE_OUTBOUND_STREAMS {
+                return Err(JsError::new("browser outbound stream limit reached"));
+            }
+            let Some(entry) = state.entries.get(&endpoint_id) else {
+                return Err(JsError::new("browser outbound connection became stale"));
+            };
+            let matches = entry
+                .connection
+                .as_ref()
+                .is_some_and(|current| current.stable_id() == stable_id);
+            if !matches || connection.close_reason().is_some() {
+                return Err(JsError::new("browser outbound connection became stale"));
+            }
+            entry.stream_slots.clone()
+        };
+        let stream_slot =
+            n0_future::time::timeout(OUTBOUND_STREAM_OPEN_TIMEOUT, stream_slots.acquire_owned())
+                .await
+                .map_err(|_| JsError::new("browser outbound stream-slot deadline exceeded"))?
+                .map_err(|_| JsError::new("browser outbound stream pool is closed"))?;
+
+        let mut state = self.inner.state.borrow_mut();
+        if state.closed {
+            return Err(JsError::new("browser node is closed"));
+        }
+        if state.active_streams >= MAX_ACTIVE_OUTBOUND_STREAMS {
+            return Err(JsError::new("browser outbound stream limit reached"));
+        }
+        let matches = state.entries.get(&endpoint_id).is_some_and(|entry| {
+            entry
+                .connection
+                .as_ref()
+                .is_some_and(|current| current.stable_id() == stable_id)
+        });
+        if !matches || connection.close_reason().is_some() {
+            return Err(JsError::new("browser outbound connection became stale"));
+        }
+        state.active_streams += 1;
+        let entry = state
+            .entries
+            .get_mut(&endpoint_id)
+            .expect("claimed outbound entry is present");
+        entry.active_streams += 1;
+        entry.last_used = Instant::now();
+        drop(state);
+        Ok(OutboundConnectionLease {
+            pool: self.clone(),
+            endpoint_id,
+            connection,
+            _stream_slot: stream_slot,
+        })
+    }
+
+    fn release(&self, endpoint_id: &EndpointId, stable_id: usize) {
+        let mut state = self.inner.state.borrow_mut();
+        let (released, remove) = if let Some(entry) = state.entries.get_mut(endpoint_id) {
+            let matches = entry
+                .connection
+                .as_ref()
+                .is_some_and(|connection| connection.stable_id() == stable_id);
+            if matches {
+                entry.active_streams = entry.active_streams.saturating_sub(1);
+                entry.last_used = Instant::now();
+                let remove = entry
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.close_reason().is_some());
+                (true, remove)
+            } else {
+                (false, false)
+            }
+        } else {
+            (false, false)
+        };
+        if released {
+            state.active_streams = state.active_streams.saturating_sub(1);
+        }
+        if remove {
+            if let Some(entry) = state.entries.remove(endpoint_id) {
+                entry.stream_slots.close();
+            }
+        }
+    }
+
+    fn evict(&self, endpoint_id: &EndpointId, stable_id: usize, reason: &'static [u8]) {
+        let removed = {
+            let mut state = self.inner.state.borrow_mut();
+            let matches = state.entries.get(endpoint_id).is_some_and(|entry| {
+                entry
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.stable_id() == stable_id)
+            });
+            if matches {
+                let active_streams = state
+                    .entries
+                    .get(endpoint_id)
+                    .map(|entry| entry.active_streams)
+                    .unwrap_or_default();
+                state.active_streams = state.active_streams.saturating_sub(active_streams);
+                state.entries.remove(endpoint_id)
+            } else {
+                None
+            }
+        };
+        if let Some(entry) = removed {
+            entry.stream_slots.close();
+            if let Some(connection) = entry.connection {
+                connection.close(proto_reset::DEADLINE_EXCEEDED.into(), reason);
+            }
+            for waiter in entry.waiters {
+                let _ = waiter.send(Err("browser outbound connection evicted".into()));
+            }
+        }
+    }
+
+    fn close_all(&self) {
+        let entries = {
+            let mut state = self.inner.state.borrow_mut();
+            if state.closed {
+                return;
+            }
+            state.closed = true;
+            state.next_generation = state.next_generation.wrapping_add(1).max(1);
+            state.active_streams = 0;
+            std::mem::take(&mut state.entries)
+        };
+        for (_, entry) in entries {
+            entry.stream_slots.close();
+            if let Some(connection) = entry.connection {
+                connection.close(
+                    proto_reset::DEADLINE_EXCEEDED.into(),
+                    b"browser node closing",
+                );
+            }
+            for waiter in entry.waiters {
+                let _ = waiter.send(Err("browser node is closed".into()));
+            }
+        }
+    }
+
+    fn connection_count(&self) -> usize {
+        self.inner
+            .state
+            .borrow()
+            .entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .connection
+                    .as_ref()
+                    .is_some_and(|connection| connection.close_reason().is_none())
+            })
+            .count()
+    }
+}
+
+impl Drop for OutboundConnectionLease {
+    fn drop(&mut self) {
+        self.pool
+            .release(&self.endpoint_id, self.connection.stable_id());
+    }
+}
+
+struct AssetReservation {
+    bytes: Rc<Cell<usize>>,
+    reserved: usize,
+}
+
+impl AssetReservation {
+    fn acquire(bytes: Rc<Cell<usize>>, reserved: usize) -> Option<Self> {
+        let next = bytes.get().checked_add(reserved)?;
+        if next > MAX_INFLIGHT_ASSET_BYTES {
+            return None;
+        }
+        bytes.set(next);
+        Some(Self { bytes, reserved })
+    }
+}
+
+impl Drop for AssetReservation {
+    fn drop(&mut self) {
+        let current = self.bytes.get();
+        debug_assert!(current >= self.reserved);
+        self.bytes.set(current.saturating_sub(self.reserved));
+    }
+}
+
+struct OutboundRequestGuard {
+    _lease: OutboundConnectionLease,
+    send: Option<SendStream>,
+    recv: Option<RecvStream>,
+    armed: bool,
+}
+
+impl OutboundRequestGuard {
+    fn new(lease: OutboundConnectionLease, send: SendStream, recv: RecvStream) -> Self {
+        Self {
+            _lease: lease,
+            send: Some(send),
+            recv: Some(recv),
+            armed: true,
+        }
+    }
+
+    fn finish_success(&mut self) {
+        self.armed = false;
+    }
+
+    fn cancel(&mut self, code: u32) {
+        if !self.armed {
+            return;
+        }
+        if let Some(send) = self.send.as_mut() {
+            let _ = send.reset(code.into());
+        }
+        if let Some(recv) = self.recv.as_mut() {
+            let _ = recv.stop(code.into());
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for OutboundRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel(proto_reset::DEADLINE_EXCEEDED);
+        }
+    }
+}
+
+struct HandlerAbortGuard {
+    controller: Option<web_sys::AbortController>,
+}
+
+impl HandlerAbortGuard {
+    fn new() -> Result<Self, u32> {
+        let controller =
+            web_sys::AbortController::new().map_err(|_| proto_reset::HANDLER_FAILED)?;
+        Ok(Self {
+            controller: Some(controller),
+        })
+    }
+
+    fn signal(&self) -> web_sys::AbortSignal {
+        self.controller
+            .as_ref()
+            .expect("handler abort guard is armed")
+            .signal()
+    }
+
+    fn abort(&mut self) {
+        if let Some(controller) = self.controller.take() {
+            controller.abort();
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.controller.take();
+    }
+}
+
+impl Drop for HandlerAbortGuard {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+fn js_result_u32(value: &JsValue, key: &str) -> Result<u32, u32> {
+    let number = js_sys::Reflect::get(value, &JsValue::from_str(key))
+        .map_err(|_| proto_reset::HANDLER_FAILED)?
+        .as_f64()
+        .ok_or(proto_reset::HANDLER_FAILED)?;
+    if !number.is_finite() || number < 0.0 || number.fract() != 0.0 || number > u32::MAX as f64 {
+        return Err(proto_reset::HANDLER_FAILED);
+    }
+    Ok(number as u32)
+}
+
+fn bounded_utf8(value: JsValue) -> Result<Vec<u8>, u32> {
+    if !value.is_string() {
+        return Err(proto_reset::HANDLER_FAILED);
+    }
+    let source: js_sys::JsString = value.unchecked_into();
+    let source_units = source.length();
+    if source_units as usize > BROWSER_MAX_FRAME {
+        return Err(proto_reset::FRAME_TOO_LARGE);
+    }
+    let encoder = web_sys::TextEncoder::new().map_err(|_| proto_reset::HANDLER_FAILED)?;
+    let encode_into = js_sys::Reflect::get(encoder.as_ref(), &JsValue::from_str("encodeInto"))
+        .and_then(|value| value.dyn_into::<js_sys::Function>())
+        .map_err(|_| proto_reset::HANDLER_FAILED)?;
+    let destination = js_sys::Uint8Array::new_with_length(BROWSER_MAX_FRAME as u32);
+    let progress = encode_into
+        .call2(encoder.as_ref(), source.as_ref(), destination.as_ref())
+        .map_err(|_| proto_reset::HANDLER_FAILED)?;
+    let read = js_result_u32(&progress, "read")?;
+    let written = js_result_u32(&progress, "written")?;
+    if written as usize > BROWSER_MAX_FRAME {
+        return Err(proto_reset::HANDLER_FAILED);
+    }
+    if read != source_units {
+        return Err(proto_reset::FRAME_TOO_LARGE);
+    }
+    Ok(destination.subarray(0, written).to_vec())
+}
+
+async fn write_outbound_with_progress(
+    send: &mut SendStream,
+    mut payload: &[u8],
+) -> Result<(), String> {
+    while !payload.is_empty() {
+        match n0_future::time::timeout(OUTBOUND_IO_IDLE_TIMEOUT, send.write(payload)).await {
+            Ok(Ok(written)) if written > 0 => payload = &payload[written..],
+            Ok(Ok(_)) => return Err("outbound write made no progress".into()),
+            Ok(Err(error)) => return Err(format!("write request: {error}")),
+            Err(_) => return Err("browser outbound write idle deadline exceeded".into()),
+        }
+    }
+    Ok(())
+}
+
+async fn read_outbound_with_progress(
+    recv: &mut RecvStream,
+    mut payload: &mut [u8],
+    stage: &'static str,
+) -> Result<(), String> {
+    while !payload.is_empty() {
+        match n0_future::time::timeout(OUTBOUND_IO_IDLE_TIMEOUT, recv.read(payload)).await {
+            Ok(Ok(Some(read))) if read > 0 => payload = &mut payload[read..],
+            Ok(Ok(_)) => return Err(format!("{stage}: stream ended before frame completed")),
+            Ok(Err(error)) => return Err(format!("{stage}: {error}")),
+            Err(_) => return Err(format!("{stage}: idle deadline exceeded")),
+        }
+    }
+    Ok(())
+}
+
+async fn read_outbound_eof(recv: &mut RecvStream) -> Result<(), (u32, String)> {
+    let mut trailing = [0u8; 1];
+    match n0_future::time::timeout(OUTBOUND_IO_IDLE_TIMEOUT, recv.read(&mut trailing)).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(_))) => Err((
+            proto_reset::MALFORMED_PAYLOAD,
+            "reply frame contains trailing bytes".into(),
+        )),
+        Ok(Err(error)) => Err((
+            proto_reset::DEADLINE_EXCEEDED,
+            format!("read reply eof: {error}"),
+        )),
+        Err(_) => Err((
+            proto_reset::DEADLINE_EXCEEDED,
+            "read reply eof: idle deadline exceeded".into(),
+        )),
+    }
+}
+
+async fn write_reply(send: &mut SendStream, payload: &[u8]) -> Result<(), ()> {
+    send.write_all(&(payload.len() as u32).to_le_bytes())
+        .await
+        .map_err(|_| ())?;
+    send.write_all(payload).await.map_err(|_| ())
+}
+
+fn reject_stream(send: &mut SendStream, recv: &mut RecvStream, code: u32) {
+    let _ = send.reset(code.into());
+    let _ = recv.stop(code.into());
+}
+
+enum HandlerWait {
+    Completed(Result<Vec<u8>, u32>),
+    Cancelled,
+}
+
+fn watch_handler(
+    future: impl Future<Output = Result<Vec<u8>, u32>> + 'static,
+    permit: tokio::sync::SemaphorePermit<'static>,
+) -> tokio::sync::oneshot::Receiver<Result<Vec<u8>, u32>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    n0_future::task::spawn(async move {
+        let _permit = permit;
+        let _ = tx.send(future.await);
+    });
+    rx
+}
 
 /// The browser node's dedicated ALPN, plus the rest of the wire contract.
 /// Intentionally distinct from `hive/tunnel/0` (the fleet data/control ALPN) so
@@ -63,9 +957,10 @@ type AssetGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
 pub use hive_browser_proto::BROWSER_ALPN;
 
 use hive_browser_proto::{
-    check_len, encode_asset_get, encode_asset_reply, encode_invoke, encode_reply, encode_request,
+    check_len, encode_asset_get, encode_asset_reply, encode_invoke, encode_request,
     reset as proto_reset, split_asset_get, split_asset_reply, split_invoke, valid_blake3_digest,
-    valid_function_digest, Op, ASSET_CHUNK_MAX,
+    valid_function_digest, Op, ASSET_CHUNK_MAX, BROWSER_MAX_ASSET, BROWSER_MAX_ECHO,
+    BROWSER_MAX_FRAME,
 };
 
 #[wasm_bindgen(start)]
@@ -94,7 +989,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    4
+    13
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -106,6 +1001,9 @@ pub struct BrowserNode {
     address_handler: AddressHandler,
     /// Canonical configured relay URLs. Runtime removal refuses the final entry.
     configured_relays: Rc<RefCell<BTreeSet<String>>>,
+    /// Single-writer guard for async relay-set mutations. Acquired before the
+    /// first await so overlapping wasm exports cannot both pass a stale count.
+    relay_mutation: Rc<Cell<bool>>,
     /// Count of echo requests served so far — surfaced to the page as a liveness
     /// signal that the inbound accept path actually fired.
     served: Arc<std::sync::atomic::AtomicU64>,
@@ -120,6 +1018,12 @@ pub struct BrowserNode {
     asset_grants: AssetGrants,
     /// Synchronous idempotency flag for the async close path.
     closed: Rc<Cell<bool>>,
+    /// Abortable ownership for every platform-spawned Rust task.
+    tasks: TaskGroup,
+    /// Canonical EndpointId-keyed reusable outbound QUIC trunks.
+    outbound_pool: OutboundPool,
+    /// Bytes reserved by complete outbound asset destinations.
+    asset_bytes: Rc<Cell<usize>>,
 }
 
 impl Drop for BrowserNode {
@@ -133,6 +1037,8 @@ impl Drop for BrowserNode {
         self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
+        self.outbound_pool.close_all();
+        self.tasks.abort_all();
         if !self.closed.replace(true) {
             let ep = self.ep.clone();
             n0_future::task::spawn(async move { ep.close().await });
@@ -145,6 +1051,7 @@ struct Status {
     node_id: String,
     relay: String,
     served: u64,
+    outbound_connections: usize,
     addr_json: String,
 }
 
@@ -191,10 +1098,10 @@ fn emit_address(handler: &AddressHandler, addr: EndpointAddr) {
     }
 }
 
-fn spawn_address_loop(ep: Endpoint, handler: AddressHandler) {
+fn spawn_address_loop(ep: Endpoint, handler: AddressHandler, tasks: TaskGroup) {
     let mut addresses = ep.watch_addr().stream();
     let closed = ep.closed();
-    n0_future::task::spawn(async move {
+    tasks.spawn(async move {
         closed
             .run_until(async move {
                 while let Some(addr) = addresses.next().await {
@@ -210,8 +1117,9 @@ impl BrowserNode {
     /// Boot a node: bind an endpoint against `relay_urls` (comma-separated,
     /// same convention as the fleet's own `HIVE_RELAY_URLS` — see
     /// `hive_p2p::relay_map_from_env` — so a caller can hand multiple relays
-    /// for failover instead of pinning to one; each must be `wss://` from an
-    /// https page, plain `ws://` is mixed-content-blocked), optionally wire a
+    /// for failover instead of pinning to one; each must be `http://` or
+    /// `https://` — iroh derives the relay's `ws://`/`wss://` transport),
+    /// optionally wire a
     /// pkarr `discovery_url` for publish+resolve, and restore identity from
     /// `secret_hex` (32-byte ed25519 seed, hex) if given — else generate a
     /// fresh one. Spawns the `hive/browser/0` accept loop before returning.
@@ -226,6 +1134,13 @@ impl BrowserNode {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|s| {
+                let parsed = url::Url::parse(s)
+                    .map_err(|e| JsError::new(&format!("bad relay url {s:?}: {e}")))?;
+                if !matches!(parsed.scheme(), "http" | "https") {
+                    return Err(JsError::new(&format!(
+                        "bad relay url {s:?}: scheme must be http or https (iroh derives ws/wss)"
+                    )));
+                }
                 s.parse::<RelayUrl>()
                     .map_err(|e| JsError::new(&format!("bad relay url {s:?}: {e}")))
             })
@@ -234,15 +1149,25 @@ impl BrowserNode {
             return Err(JsError::new("relay_urls must name at least one relay"));
         }
         let configured_relays = Rc::new(RefCell::new(
-            relays.iter().map(ToString::to_string).collect::<BTreeSet<_>>(),
+            relays
+                .iter()
+                .map(ToString::to_string)
+                .collect::<BTreeSet<_>>(),
         ));
         let map = RelayMap::from_iter(relays);
+        let relay_mutation = Rc::new(Cell::new(false));
 
         // Minimal preset (no n0 pkarr/DNS baked in) + our own relay map, so the
         // browser only ever talks to the relay we hand it.
+        let transport = QuicTransportConfig::builder()
+            .max_concurrent_bidi_streams(VarInt::from_u32(MAX_ACTIVE_STREAMS as u32))
+            .stream_receive_window(VarInt::from_u32(BROWSER_STREAM_WINDOW))
+            .receive_window(VarInt::from_u32(BROWSER_CONNECTION_WINDOW))
+            .build();
         let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
             .relay_mode(RelayMode::Custom(map))
-            .alpns(vec![BROWSER_ALPN.to_vec()]);
+            .alpns(vec![BROWSER_ALPN.to_vec()])
+            .transport_config(transport);
 
         // Identity: restore a persisted seed if the page gave us one, else the
         // caller is expected to read `secret back out` via a later export. A
@@ -275,7 +1200,13 @@ impl BrowserNode {
         // information available", blaming the caller for this node's
         // un-readiness. `browser_echo_native.rs` hit exactly this and carries
         // the same `online()` call for the same reason.
-        ep.online().await;
+        if n0_future::time::timeout(RELAY_ONLINE_TIMEOUT, ep.online())
+            .await
+            .is_err()
+        {
+            ep.close().await;
+            return Err(JsError::new("browser relay online deadline exceeded"));
+        }
 
         let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let invoke: InvokeHandler = Rc::new(RefCell::new(None));
@@ -284,6 +1215,9 @@ impl BrowserNode {
         let grants: InvokerGrants = Rc::new(RefCell::new(BTreeMap::new()));
         let asset_grants: AssetGrants = Rc::new(RefCell::new(BTreeMap::new()));
         let closed = Rc::new(Cell::new(false));
+        let tasks = TaskGroup::new();
+        let outbound_pool = OutboundPool::new(ep.clone(), tasks.clone());
+        let asset_bytes = Rc::new(Cell::new(0));
         spawn_accept_loop(
             ep.clone(),
             served.clone(),
@@ -291,19 +1225,24 @@ impl BrowserNode {
             asset.clone(),
             grants.clone(),
             asset_grants.clone(),
+            tasks.clone(),
         );
-        spawn_address_loop(ep.clone(), address_handler.clone());
+        spawn_address_loop(ep.clone(), address_handler.clone(), tasks.clone());
 
         Ok(BrowserNode {
             ep,
             address_handler,
             configured_relays,
+            relay_mutation,
             served,
             invoke,
             asset,
             grants,
             asset_grants,
             closed,
+            tasks,
+            outbound_pool,
+            asset_bytes,
         })
     }
 
@@ -389,6 +1328,11 @@ impl BrowserNode {
     #[wasm_bindgen(js_name = removeRelay)]
     pub async fn remove_relay(&self, relay_url: String) -> Result<bool, JsError> {
         self.ensure_open()?;
+        let Some(_mutation) = RelayMutationGuard::acquire(self.relay_mutation.clone()) else {
+            return Err(JsError::new(
+                "another relay mutation is already in progress",
+            ));
+        };
         let relay = relay_url
             .parse::<RelayUrl>()
             .map_err(|e| JsError::new(&format!("bad relay url {relay_url:?}: {e}")))?;
@@ -399,7 +1343,9 @@ impl BrowserNode {
                 return Ok(false);
             }
             if configured.len() == 1 {
-                return Err(JsError::new("refusing to remove the final configured relay"));
+                return Err(JsError::new(
+                    "refusing to remove the final configured relay",
+                ));
             }
         }
         let removed = self.ep.remove_relay(&relay).await.is_some();
@@ -424,6 +1370,7 @@ impl BrowserNode {
             node_id: self.ep.id().to_string(),
             relay: address.relays.join(","),
             served: self.served_count(),
+            outbound_connections: self.outbound_pool.connection_count(),
             addr_json: address.addr_json,
         })
         .unwrap_or_default()
@@ -435,6 +1382,11 @@ impl BrowserNode {
     /// accept loop's inbound path.
     #[wasm_bindgen(js_name = echoTo)]
     pub async fn echo_to(&self, peer_addr_json: String, msg: String) -> Result<String, JsError> {
+        if msg.len() > BROWSER_MAX_ECHO {
+            return Err(JsError::new(&format!(
+                "echo payload exceeds the {BROWSER_MAX_ECHO}-byte diagnostic cap"
+            )));
+        }
         let reply = self
             .request(peer_addr_json, Op::Echo, msg.as_bytes())
             .await?;
@@ -539,11 +1491,10 @@ impl BrowserNode {
         Ok(removed)
     }
 
-    /// Clear every execution capability and gracefully close the iroh endpoint.
-    /// Idempotent and awaitable; unlike wasm-bindgen's generated `free()`, this
-    /// waits for QUIC close notifications. An invocation already inside a JS
-    /// Promise may finish; no not-yet-started invocation can begin after grants
-    /// are cleared.
+    /// Clear every capability, abort and drain the platform-owned Rust task tree,
+    /// then gracefully close the iroh endpoint. JavaScript handlers receive an
+    /// AbortSignal; noncooperative Promises remain counted against the fixed
+    /// handler pool until they actually settle.
     #[wasm_bindgen(js_name = close)]
     pub async fn close(&self) {
         self.invoke.borrow_mut().take();
@@ -551,7 +1502,9 @@ impl BrowserNode {
         self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
+        self.outbound_pool.close_all();
         if !self.closed.replace(true) {
+            self.tasks.shutdown().await;
             self.ep.close().await;
         } else {
             self.ep.closed().await;
@@ -584,8 +1537,9 @@ impl BrowserNode {
     }
 
     /// Pull a complete BLAKE3-addressed asset in bounded chunks. Every reply
-    /// repeats the immutable total length; the final assembled bytes are hashed
-    /// before any caller can persist them.
+    /// repeats the immutable total length. Bytes land directly in one capped JS
+    /// buffer while BLAKE3 is updated incrementally, so wasm never retains a
+    /// second whole-asset copy.
     #[wasm_bindgen(js_name = assetOn)]
     pub async fn asset_on(
         &self,
@@ -594,38 +1548,73 @@ impl BrowserNode {
     ) -> Result<js_sys::Uint8Array, JsError> {
         self.ensure_open()?;
         validate_asset_digest(&digest)?;
-        let mut out = Vec::new();
+        let mut out = None;
+        let mut _reservation = None;
         let mut total = None;
+        let mut received = 0usize;
+        let mut hasher = blake3::Hasher::new();
         loop {
-            let payload = encode_asset_get(&digest, out.len() as u64, ASSET_CHUNK_MAX)
+            let payload = encode_asset_get(&digest, received as u64, ASSET_CHUNK_MAX)
                 .map_err(|e| JsError::new(&format!("bad asset request: {e}")))?;
             let reply = self
                 .request(peer_addr_json.clone(), Op::AssetGet, &payload)
                 .await?;
             let (reply_total, chunk) = split_asset_reply(&reply)
                 .map_err(|e| JsError::new(&format!("bad asset reply: {e}")))?;
-            if total.replace(reply_total).is_some_and(|known| known != reply_total) {
-                return Err(JsError::new("asset length changed during transfer"));
+            let reply_total = usize::try_from(reply_total)
+                .map_err(|_| JsError::new("asset length exceeds this browser's address space"))?;
+            if reply_total > BROWSER_MAX_ASSET {
+                return Err(JsError::new(&format!(
+                    "asset length {reply_total} exceeds the {BROWSER_MAX_ASSET}-byte browser cap"
+                )));
             }
-            let next = out.len().checked_add(chunk.len()).ok_or_else(|| {
-                JsError::new("asset length overflow")
-            })?;
-            if next as u64 > reply_total || (chunk.is_empty() && next as u64 != reply_total) {
+            match total {
+                Some(known) if known != reply_total => {
+                    return Err(JsError::new("asset length changed during transfer"));
+                }
+                None => {
+                    let reservation = AssetReservation::acquire(
+                        self.asset_bytes.clone(),
+                        reply_total,
+                    )
+                    .ok_or_else(|| {
+                        JsError::new(&format!(
+                            "asset memory budget exhausted ({MAX_INFLIGHT_ASSET_BYTES} bytes in flight)"
+                        ))
+                    })?;
+                    total = Some(reply_total);
+                    out = Some(js_sys::Uint8Array::new_with_length(reply_total as u32));
+                    _reservation = Some(reservation);
+                }
+                _ => {}
+            }
+            let next = received
+                .checked_add(chunk.len())
+                .ok_or_else(|| JsError::new("asset length overflow"))?;
+            if next > reply_total || (chunk.is_empty() && next != reply_total) {
                 return Err(JsError::new("asset peer returned an inconsistent range"));
             }
-            out.extend_from_slice(chunk);
-            if out.len() as u64 == reply_total {
+            out.as_ref()
+                .expect("asset destination is initialized with its total")
+                .subarray(received as u32, next as u32)
+                .copy_from(chunk);
+            hasher.update(chunk);
+            received = next;
+            if received == reply_total {
                 break;
             }
         }
-        if blake3::hash(&out).to_hex().as_str() != digest {
+        if hasher.finalize().to_hex().as_str() != digest {
             return Err(JsError::new("asset BLAKE3 mismatch"));
         }
-        Ok(js_sys::Uint8Array::from(out.as_slice()))
+        Ok(out.expect("asset peer supplied a first reply"))
     }
 
-    /// Shared request/response plumbing for both public methods above: dial,
-    /// send `[u32 total_len][op][op_payload]`, read back `[u32 len][bytes]`.
+    /// Shared request/response plumbing for every outbound op. Dial, stream-open,
+    /// write, and reply phases each have their own bounded idle deadline, so a
+    /// large frame making progress is not cancelled by a transfer-size-blind
+    /// whole-request timer. Once a stream exists, its Drop guard sends explicit
+    /// DEADLINE_EXCEEDED cancellation on timeout or caller-future abandonment.
     async fn request(
         &self,
         peer_addr_json: String,
@@ -633,41 +1622,104 @@ impl BrowserNode {
         op_payload: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         self.ensure_open()?;
-        let addr: iroh::EndpointAddr = serde_json::from_str(&peer_addr_json)
-            .map_err(|e| JsError::new(&format!("bad peer addr_json: {e}")))?;
-        let conn = self
-            .ep
-            .connect(addr, BROWSER_ALPN)
-            .await
-            .map_err(|e| JsError::new(&format!("connect failed: {e}")))?;
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| JsError::new(&format!("open_bi failed: {e}")))?;
-        // One write of one pre-built frame, not three writes of its pieces: the
-        // header/op/payload split is the protocol's business, not this call's.
-        // Writer speaks first — open_bi is lazy, the peer never sees the stream
-        // until bytes arrive.
-        send.write_all(&encode_request(op, op_payload))
-            .await
-            .map_err(|e| JsError::new(&format!("write request: {e}")))?;
-        send.finish()
-            .map_err(|e| JsError::new(&format!("finish: {e}")))?;
-        // The peer replies with plain [u32 len][bytes] — no op byte on the way
-        // back, since the caller already knows what it asked for.
+        if op_payload.len() > BROWSER_MAX_FRAME - 1 {
+            return Err(JsError::new(&format!(
+                "request payload exceeds the {}-byte op payload cap",
+                BROWSER_MAX_FRAME - 1
+            )));
+        }
+        let frame = encode_request(op, op_payload);
+        let mut retried_open = false;
+        let (lease, send, recv) = loop {
+            let lease = self.outbound_pool.acquire(&peer_addr_json).await?;
+            match n0_future::time::timeout(OUTBOUND_STREAM_OPEN_TIMEOUT, lease.connection.open_bi())
+                .await
+            {
+                Ok(Ok((send, recv))) => break (lease, send, recv),
+                Ok(Err(_)) if !retried_open => {
+                    let endpoint_id = lease.endpoint_id.clone();
+                    let stable_id = lease.connection.stable_id();
+                    self.outbound_pool.evict(
+                        &endpoint_id,
+                        stable_id,
+                        b"browser outbound stream open failed",
+                    );
+                    drop(lease);
+                    retried_open = true;
+                }
+                Ok(Err(error)) => {
+                    return Err(JsError::new(&format!("open_bi failed: {error}")));
+                }
+                Err(_) => {
+                    return Err(JsError::new(
+                        "browser outbound stream-open deadline exceeded",
+                    ));
+                }
+            }
+        };
+        let mut io = OutboundRequestGuard::new(lease, send, recv);
+        if let Err(error) = write_outbound_with_progress(
+            io.send.as_mut().expect("outbound send stream is present"),
+            &frame,
+        )
+        .await
+        {
+            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            return Err(JsError::new(&error));
+        }
+        if let Err(error) = io
+            .send
+            .as_mut()
+            .expect("outbound send stream is present")
+            .finish()
+        {
+            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            return Err(JsError::new(&format!("finish: {error}")));
+        }
         let mut lenb = [0u8; 4];
-        recv.read_exact(&mut lenb)
-            .await
-            .map_err(|e| JsError::new(&format!("read reply len: {e}")))?;
-        let len = check_len(lenb).map_err(|e| {
-            conn.close(e.reset_code().into(), b"bad reply frame");
-            JsError::new(&format!("reply frame: {e}"))
-        })?;
+        if let Err(error) = read_outbound_with_progress(
+            io.recv
+                .as_mut()
+                .expect("outbound receive stream is present"),
+            &mut lenb,
+            "read reply len",
+        )
+        .await
+        {
+            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            return Err(JsError::new(&error));
+        }
+        let len = match check_len(lenb) {
+            Ok(len) => len,
+            Err(error) => {
+                io.cancel(error.reset_code());
+                return Err(JsError::new(&format!("reply frame: {error}")));
+            }
+        };
         let mut reply = vec![0u8; len];
-        recv.read_exact(&mut reply)
-            .await
-            .map_err(|e| JsError::new(&format!("read reply body: {e}")))?;
-        conn.close(0u32.into(), b"done");
+        if let Err(error) = read_outbound_with_progress(
+            io.recv
+                .as_mut()
+                .expect("outbound receive stream is present"),
+            &mut reply,
+            "read reply body",
+        )
+        .await
+        {
+            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            return Err(JsError::new(&error));
+        }
+        if let Err((code, error)) = read_outbound_eof(
+            io.recv
+                .as_mut()
+                .expect("outbound receive stream is present"),
+        )
+        .await
+        {
+            io.cancel(code);
+            return Err(JsError::new(&error));
+        }
+        io.finish_success();
         Ok(reply)
     }
 }
@@ -681,6 +1733,26 @@ impl BrowserNode {
 /// There is deliberately no "unknown op falls back to echo" arm: that would
 /// answer a future protocol version's request with its own raw bytes and look
 /// like success to the caller.
+async fn read_with_progress_deadline(recv: &mut RecvStream, mut out: &mut [u8]) -> Result<(), u32> {
+    while !out.is_empty() {
+        match n0_future::time::timeout(STREAM_READ_IDLE_TIMEOUT, recv.read(out)).await {
+            Ok(Ok(Some(read))) if read > 0 => out = &mut out[read..],
+            Ok(Ok(_)) | Ok(Err(_)) => return Err(proto_reset::MALFORMED_PAYLOAD),
+            Err(_) => return Err(proto_reset::DEADLINE_EXCEEDED),
+        }
+    }
+    Ok(())
+}
+
+async fn read_eof_with_progress_deadline(recv: &mut RecvStream) -> Result<(), u32> {
+    let mut trailing = [0u8; 1];
+    match n0_future::time::timeout(STREAM_READ_IDLE_TIMEOUT, recv.read(&mut trailing)).await {
+        Ok(Ok(None)) => Ok(()),
+        Ok(Ok(Some(_))) | Ok(Err(_)) => Err(proto_reset::MALFORMED_PAYLOAD),
+        Err(_) => Err(proto_reset::DEADLINE_EXCEEDED),
+    }
+}
+
 fn spawn_accept_loop(
     ep: Endpoint,
     served: Arc<std::sync::atomic::AtomicU64>,
@@ -688,113 +1760,304 @@ fn spawn_accept_loop(
     asset: AssetHandler,
     grants: InvokerGrants,
     asset_grants: AssetGrants,
+    tasks: TaskGroup,
 ) {
-    n0_future::task::spawn(async move {
+    let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_CONNECTIONS));
+    let stream_slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_STREAMS));
+    let echo_slots = Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_ECHO));
+    let peer_connections: PeerConnections = Rc::new(RefCell::new(BTreeMap::new()));
+    let peer_streams: PeerStreams = Rc::new(RefCell::new(BTreeMap::new()));
+    let connection_tasks = tasks.clone();
+    tasks.spawn(async move {
         while let Some(incoming) = ep.accept().await {
+            let Ok(connection_slot) = connection_slots.clone().try_acquire_owned() else {
+                tracing::warn!("browser connection refused: node connection limit reached");
+                incoming.refuse();
+                continue;
+            };
             let served = served.clone();
             let invoke = invoke.clone();
             let asset = asset.clone();
             let grants = grants.clone();
             let asset_grants = asset_grants.clone();
-            n0_future::task::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "browser accept: handshake failed");
+            let stream_slots = stream_slots.clone();
+            let echo_slots = echo_slots.clone();
+            let peer_connections = peer_connections.clone();
+            let peer_streams = peer_streams.clone();
+            let stream_tasks = connection_tasks.clone();
+            connection_tasks.spawn(async move {
+                let _connection_slot = connection_slot;
+                let conn = match n0_future::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
+                    Ok(Ok(conn)) => conn,
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "browser accept: handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::warn!("browser accept: handshake deadline exceeded");
                         return;
                     }
                 };
-                // Only our own ALPN reaches here (the endpoint advertises just
-                // one), but be explicit: refuse anything else loudly.
                 if conn.alpn() != BROWSER_ALPN {
                     conn.close(proto_reset::UNEXPECTED_ALPN.into(), b"unexpected alpn");
                     return;
                 }
                 let remote_id = conn.remote_id();
-                while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                let Some(_peer_connection) =
+                    PeerConnectionGuard::acquire(peer_connections, remote_id.clone())
+                else {
+                    conn.close(
+                        proto_reset::OVERLOADED.into(),
+                        b"browser peer connection limit reached",
+                    );
+                    return;
+                };
+                let connection_stream_slots =
+                    Arc::new(tokio::sync::Semaphore::new(MAX_STREAMS_PER_CONNECTION));
+                let connection_activity = Rc::new(RefCell::new(ConnectionActivity {
+                    active: 0,
+                    idle_since: Some(Instant::now()),
+                }));
+                loop {
+                    let wait = {
+                        let activity = connection_activity.borrow();
+                        if activity.active > 0 {
+                            CONNECTION_IDLE_TIMEOUT
+                        } else {
+                            CONNECTION_IDLE_TIMEOUT.saturating_sub(
+                                activity
+                                    .idle_since
+                                    .map(|since| since.elapsed())
+                                    .unwrap_or_default(),
+                            )
+                        }
+                    };
+                    let (mut send, mut recv) =
+                        match n0_future::time::timeout(wait, conn.accept_bi()).await {
+                            Ok(Ok(streams)) => streams,
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                let idle = {
+                                    let activity = connection_activity.borrow();
+                                    activity.active == 0
+                                        && activity.idle_since.is_some_and(|since| {
+                                            since.elapsed() >= CONNECTION_IDLE_TIMEOUT
+                                        })
+                                };
+                                if idle {
+                                    conn.close(
+                                        proto_reset::DEADLINE_EXCEEDED.into(),
+                                        b"browser connection idle",
+                                    );
+                                    break;
+                                }
+                                continue;
+                            }
+                        };
+                    let peer_stream =
+                        PeerStreamGuard::acquire(peer_streams.clone(), remote_id.clone());
+                    let permits = stream_slots
+                        .clone()
+                        .try_acquire_owned()
+                        .ok()
+                        .zip(connection_stream_slots.clone().try_acquire_owned().ok())
+                        .zip(peer_stream);
+                    let Some(((node_stream_slot, connection_stream_slot), peer_stream)) = permits
+                    else {
+                        reject_stream(&mut send, &mut recv, proto_reset::OVERLOADED);
+                        continue;
+                    };
                     let served = served.clone();
                     let invoke = invoke.clone();
                     let asset = asset.clone();
                     let grants = grants.clone();
                     let asset_grants = asset_grants.clone();
-                    n0_future::task::spawn(async move {
-                        let mut lenb = [0u8; 4];
-                        if recv.read_exact(&mut lenb).await.is_err() {
-                            return;
+                    let remote_id = remote_id.clone();
+                    let echo_slots = echo_slots.clone();
+                    let stream_conn = conn.clone();
+                    let connection_activity =
+                        ConnectionStreamGuard::acquire(connection_activity.clone());
+                    stream_tasks.spawn(async move {
+                        let _node_stream_slot = node_stream_slot;
+                        let _connection_stream_slot = connection_stream_slot;
+                        let _peer_stream = peer_stream;
+                        let _connection_activity = connection_activity;
+                        let request = async {
+                            let mut lenb = [0u8; 4];
+                            read_with_progress_deadline(&mut recv, &mut lenb).await?;
+                            let len = check_len(lenb).map_err(|error| error.reset_code())?;
+                            if len == 0 {
+                                return Err(proto_reset::MALFORMED_PAYLOAD);
+                            }
+                            let mut opb = [0u8; 1];
+                            read_with_progress_deadline(&mut recv, &mut opb).await?;
+                            let op = Op::from_byte(opb[0]).map_err(|error| error.reset_code())?;
+                            if op == Op::Echo && len - 1 > BROWSER_MAX_ECHO {
+                                return Err(proto_reset::FRAME_TOO_LARGE);
+                            }
+                            let endpoint_granted = match op {
+                                Op::Echo => true,
+                                Op::Invoke => grants.borrow().contains_key(&remote_id),
+                                Op::AssetGet => asset_grants.borrow().contains_key(&remote_id),
+                            };
+                            if !endpoint_granted {
+                                return Err(proto_reset::FORBIDDEN);
+                            }
+                            let mut payload = vec![0u8; len - 1];
+                            read_with_progress_deadline(&mut recv, &mut payload).await?;
+                            read_eof_with_progress_deadline(&mut recv).await?;
+                            Ok::<(Op, Vec<u8>), u32>((op, payload))
                         }
-                        let len = match check_len(lenb) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                tracing::warn!(error = %e, "browser stream refused");
-                                let _ = send.reset(e.reset_code().into());
+                        .await;
+
+                        let (op, payload) = match request {
+                            Ok(request) => request,
+                            Err(code) => {
+                                reject_stream(&mut send, &mut recv, code);
                                 return;
                             }
                         };
-                        if len == 0 {
-                            let _ = send.reset(proto_reset::MALFORMED_PAYLOAD.into());
-                            return;
-                        }
-                        // Read the op BEFORE allocating the caller-controlled
-                        // remainder. A completely ungranted endpoint gets one
-                        // cheap FORBIDDEN reset instead of a 1 MiB allocation.
-                        let mut opb = [0u8; 1];
-                        if recv.read_exact(&mut opb).await.is_err() {
-                            return;
-                        }
-                        let op = match Op::from_byte(opb[0]) {
-                            Ok(op) => op,
-                            Err(e) => {
-                                tracing::warn!(error = %e, remote = %remote_id, "browser stream refused");
-                                let _ = send.reset(e.reset_code().into());
-                                return;
-                            }
-                        };
-                        let endpoint_granted = match op {
-                            Op::Echo => true,
-                            Op::Invoke => grants.borrow().contains_key(&remote_id),
-                            Op::AssetGet => asset_grants.borrow().contains_key(&remote_id),
-                        };
-                        if !endpoint_granted {
-                            tracing::warn!(remote = %remote_id, ?op, "browser operation forbidden");
-                            let _ = send.reset(proto_reset::FORBIDDEN.into());
-                            return;
-                        }
-                        let mut payload = vec![0u8; len - 1];
-                        if recv.read_exact(&mut payload).await.is_err() {
-                            return;
-                        }
-                        let reply = match op {
-                            Op::Echo => payload,
-                            Op::Invoke => {
-                                match run_invoke(&invoke, &grants, remote_id, &payload).await {
-                                    Ok(bytes) => bytes,
-                                    Err(code) => {
-                                        let _ = send.reset(code.into());
-                                        return;
-                                    }
+
+                        let echo_permit = if op == Op::Echo {
+                            match echo_slots.clone().try_acquire_owned() {
+                                Ok(permit) => Some(permit),
+                                Err(_) => {
+                                    reject_stream(&mut send, &mut recv, proto_reset::OVERLOADED);
+                                    return;
                                 }
                             }
-                            Op::AssetGet => {
-                                match run_asset(
-                                    &asset,
-                                    &asset_grants,
-                                    remote_id,
-                                    &payload,
+                        } else {
+                            None
+                        };
+                        let _echo_permit = echo_permit;
+                        let out = if op == Op::Echo {
+                            Ok(payload)
+                        } else {
+                            let permit = match HANDLER_SLOTS.try_acquire() {
+                                Ok(permit) => permit,
+                                Err(_) => {
+                                    reject_stream(&mut send, &mut recv, proto_reset::OVERLOADED);
+                                    return;
+                                }
+                            };
+                            let mut abort = match HandlerAbortGuard::new() {
+                                Ok(abort) => abort,
+                                Err(code) => {
+                                    reject_stream(&mut send, &mut recv, code);
+                                    return;
+                                }
+                            };
+                            let signal = abort.signal();
+                            let handler = match op {
+                                Op::Invoke => {
+                                    let invoke = invoke.clone();
+                                    let grants = grants.clone();
+                                    let remote_id = remote_id.clone();
+                                    let (code_digest, request_json) =
+                                        match parse_invoke_owned(&payload, &remote_id) {
+                                            Ok(request) => request,
+                                            Err(code) => {
+                                                reject_stream(&mut send, &mut recv, code);
+                                                return;
+                                            }
+                                        };
+                                    drop(payload);
+                                    watch_handler(
+                                        async move {
+                                            run_invoke(
+                                                &invoke,
+                                                &grants,
+                                                remote_id,
+                                                code_digest,
+                                                request_json,
+                                                signal,
+                                            )
+                                            .await
+                                        },
+                                        permit,
+                                    )
+                                }
+                                Op::AssetGet => {
+                                    let asset = asset.clone();
+                                    let asset_grants = asset_grants.clone();
+                                    let remote_id = remote_id.clone();
+                                    let payload = payload;
+                                    watch_handler(
+                                        async move {
+                                            run_asset(
+                                                &asset,
+                                                &asset_grants,
+                                                remote_id,
+                                                &payload,
+                                                signal,
+                                            )
+                                            .await
+                                        },
+                                        permit,
+                                    )
+                                }
+                                Op::Echo => unreachable!(),
+                            };
+                            let handler_wait = async {
+                                match n0_future::time::timeout(HANDLER_TIMEOUT, handler).await {
+                                    Ok(Ok(result)) => HandlerWait::Completed(result),
+                                    Ok(Err(_)) => {
+                                        HandlerWait::Completed(Err(proto_reset::HANDLER_FAILED))
+                                    }
+                                    Err(_) => HandlerWait::Cancelled,
+                                }
+                            };
+                            let peer_wait = async {
+                                n0_future::future::race(
+                                    async {
+                                        let _ = send.stopped().await;
+                                    },
+                                    async {
+                                        stream_conn.closed().await;
+                                    },
                                 )
-                                .await
-                                {
-                                    Ok(bytes) => bytes,
-                                    Err(code) => {
-                                        let _ = send.reset(code.into());
-                                        return;
-                                    }
+                                .await;
+                                HandlerWait::Cancelled
+                            };
+                            match n0_future::future::race(handler_wait, peer_wait).await {
+                                HandlerWait::Completed(result) => {
+                                    abort.disarm();
+                                    result
+                                }
+                                HandlerWait::Cancelled => {
+                                    abort.abort();
+                                    Err(proto_reset::DEADLINE_EXCEEDED)
                                 }
                             }
                         };
-                        if send.write_all(&encode_reply(&reply)).await.is_ok() {
-                            let _ = send.finish();
-                            served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let out = match out {
+                            Ok(out) => out,
+                            Err(code) => {
+                                reject_stream(&mut send, &mut recv, code);
+                                return;
+                            }
+                        };
+                        if out.len() > BROWSER_MAX_FRAME {
+                            reject_stream(&mut send, &mut recv, proto_reset::FRAME_TOO_LARGE);
+                            return;
                         }
+                        match n0_future::time::timeout(
+                            STREAM_WRITE_TIMEOUT,
+                            write_reply(&mut send, &out),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(())) => return,
+                            Err(_) => {
+                                reject_stream(&mut send, &mut recv, proto_reset::DEADLINE_EXCEEDED);
+                                return;
+                            }
+                        }
+                        if send.finish().is_err() {
+                            return;
+                        }
+                        served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     });
                 }
             });
@@ -807,26 +2070,31 @@ fn spawn_accept_loop(
 /// `Err` is the reset code to refuse the stream with, so each distinguishable
 /// failure reaches the caller as a distinct code instead of collapsing into an
 /// empty reply. Authorization is re-read at the final synchronous point before
-/// `Function::call2`; pooled connections never cache a grant.
+/// `Function::call3`; pooled connections never cache a grant.
 ///
 /// The handler and grant `Rc`s are NOT borrowed across the await. `RefCell` has
 /// no async awareness, so keeping either borrow alive over `JsFuture` would
 /// panic on concurrent invoke/grant/revoke activity.
+fn parse_invoke_owned(payload: &[u8], remote_id: &EndpointId) -> Result<(String, String), u32> {
+    let (code_digest, request_json) = split_invoke(payload).map_err(|error| {
+        tracing::warn!(error = %error, remote = %remote_id, "browser invoke: bad payload");
+        error.reset_code()
+    })?;
+    Ok((code_digest.to_owned(), request_json.to_owned()))
+}
+
 async fn run_invoke(
     invoke: &InvokeHandler,
     grants: &InvokerGrants,
     remote_id: EndpointId,
-    payload: &[u8],
+    code_digest: String,
+    request_json: String,
+    signal: web_sys::AbortSignal,
 ) -> Result<Vec<u8>, u32> {
-    let (code_digest, request_json) = split_invoke(payload).map_err(|e| {
-        tracing::warn!(error = %e, remote = %remote_id, "browser invoke: bad payload");
-        e.reset_code()
-    })?;
-
     let allowed = grants
         .borrow()
         .get(&remote_id)
-        .is_some_and(|scopes| scopes.contains(code_digest));
+        .is_some_and(|scopes| scopes.contains(&code_digest));
     if !allowed {
         tracing::warn!(remote = %remote_id, digest = code_digest, "browser invoke forbidden");
         return Err(proto_reset::FORBIDDEN);
@@ -839,15 +2107,17 @@ async fn run_invoke(
     };
 
     let ret = handler
-        .call2(
+        .call3(
             &JsValue::NULL,
-            &JsValue::from_str(code_digest),
-            &JsValue::from_str(request_json),
+            &JsValue::from_str(&code_digest),
+            &JsValue::from_str(&request_json),
+            signal.as_ref(),
         )
         .map_err(|e| {
             tracing::warn!(error = ?e, "browser invoke: handler threw");
             proto_reset::HANDLER_FAILED
         })?;
+    drop(request_json);
 
     // The handler may be sync or async; `Promise::resolve` normalises both, so
     // a handler returning a plain string is not a silent failure.
@@ -858,11 +2128,15 @@ async fn run_invoke(
             proto_reset::HANDLER_FAILED
         })?;
 
-    let Some(text) = resolved.as_string() else {
-        tracing::warn!("browser invoke: handler resolved with a non-string");
-        return Err(proto_reset::HANDLER_FAILED);
-    };
-    Ok(text.into_bytes())
+    let allowed = grants
+        .borrow()
+        .get(&remote_id)
+        .is_some_and(|scopes| scopes.contains(&code_digest));
+    if !allowed {
+        tracing::warn!(remote = %remote_id, digest = code_digest, "browser invoke revoked while handler was running");
+        return Err(proto_reset::FORBIDDEN);
+    }
+    bounded_utf8(resolved)
 }
 
 async fn run_asset(
@@ -870,6 +2144,7 @@ async fn run_asset(
     grants: &AssetGrants,
     remote_id: EndpointId,
     payload: &[u8],
+    signal: web_sys::AbortSignal,
 ) -> Result<Vec<u8>, u32> {
     let (digest, offset, max_len) = split_asset_get(payload).map_err(|e| {
         tracing::warn!(error = %e, remote = %remote_id, "browser asset: bad payload");
@@ -889,17 +2164,25 @@ async fn run_asset(
     let Some(handler) = handler.borrow().clone() else {
         return Err(proto_reset::NO_HANDLER);
     };
+    let args = js_sys::Array::new();
+    args.push(&JsValue::from_str(digest));
+    args.push(&JsValue::from_f64(offset as f64));
+    args.push(&JsValue::from_f64(max_len as f64));
+    args.push(signal.as_ref());
     let value = handler
-        .call3(
-            &JsValue::NULL,
-            &JsValue::from_str(digest),
-            &JsValue::from_f64(offset as f64),
-            &JsValue::from_f64(max_len as f64),
-        )
+        .apply(&JsValue::NULL, &args)
         .map_err(|_| proto_reset::HANDLER_FAILED)?;
     let resolved = JsFuture::from(js_sys::Promise::resolve(&value))
         .await
         .map_err(|_| proto_reset::HANDLER_FAILED)?;
+    let allowed = grants
+        .borrow()
+        .get(&remote_id)
+        .is_some_and(|scopes| scopes.contains(digest));
+    if !allowed {
+        tracing::warn!(remote = %remote_id, digest, "browser asset revoked while handler was running");
+        return Err(proto_reset::FORBIDDEN);
+    }
     let total = js_sys::Reflect::get(&resolved, &JsValue::from_str("total"))
         .ok()
         .and_then(|v| v.as_f64())

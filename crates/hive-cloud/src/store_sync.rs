@@ -130,6 +130,45 @@ pub static REGISTRY: &[SyncedStore] = &[
         },
     },
     SyncedStore {
+        name: "billing",
+        // The OTHER half of a tenant's tier. `teams` has been replicated here
+        // for a long time while `billing` was not, and that asymmetry is exactly
+        // how ONE logical fact ended up with two per-node values: measured live
+        // 2026-08-03, `teams.plan` was unanimously `enterprise` across all 8
+        // nodes while `billing.plan` read `hobby` on 7 and `enterprise` on 1 (a
+        // 13-day-stale holdout) for the SAME tenant — and the leader held the
+        // wrong half, so the owner account was quota-locked out of deploying.
+        //
+        // Reads were patched over at runtime by `proxy_billing_read` forwarding
+        // to the billing authority, but that proxy falls back to the node's own
+        // stale row on failure, and every INTERNAL consumer (`can_deploy`, quota
+        // checks, metering) reads the local row unconditionally with no proxy at
+        // all. Replicating it converges the halves by the same leader-pull
+        // mechanism `teams` already uses instead of relying on a read-path patch.
+        snapshot: |c| {
+            let (accounts, ledger) = c.billing.snapshot();
+            let by_tenant: std::collections::BTreeMap<String, crate::billing::BillingAccount> =
+                accounts.into_iter().map(|a| (a.tenant.clone(), a)).collect();
+            enc(&(by_tenant, ledger))
+        },
+        adopt: |c, b| {
+            let (by_tenant, ledger): (
+                std::collections::BTreeMap<String, crate::billing::BillingAccount>,
+                Vec<crate::billing::LedgerEntry>,
+            ) = serde_json::from_slice(b).ok()?;
+            // Authoritative-empty is NOT meaningful here: a leader with zero
+            // billing accounts is indistinguishable from one that has not
+            // loaded yet, and adopting that would wipe every tenant's tier and
+            // balance fleet-wide. Decline, exactly as `teams` does.
+            if by_tenant.is_empty() {
+                return None;
+            }
+            let n = by_tenant.len();
+            c.billing.load(by_tenant.into_values().collect(), ledger);
+            Some(n)
+        },
+    },
+    SyncedStore {
         name: "projects",
         // HashMap<String, ProjectSettings> → sorted BTreeMap for deterministic
         // bytes, same shape as `teams`. Confirmed-real gap: `ProjectStore` is

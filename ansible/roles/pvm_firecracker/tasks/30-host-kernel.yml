@@ -3,10 +3,14 @@
 # so all the cloud VM's drivers (virtio, ext4, ...) are retained, plus CONFIG_KVM_PVM.
 
 # The kernel is the virt-pvm/linux pvm-612 BASE (a complete, buildable tree
-# already carrying PVM) -- NOT the patch repo, whose `kernel/` dir is a
-# GitHub-Pages browsing tree missing .S/.h files (live-witnessed: the build
-# fails "No rule to make target arch/x86/lib/clear_page_64.o"). The patch repo
-# only supplies patches/, applied on top for hosts that MASK fsgsbase/rdtscp.
+# already carrying PVM) -- NOT the patch repo's `kernel/` dir. That dir is a
+# GitHub-Pages browsing tree; it was ALSO missing ~1362 `.S` files (a
+# case-insensitive `*.s` gitignore rule dropped them), which is what made a
+# build from it fail "No rule to make target arch/x86/lib/clear_page_64.o".
+# The missing files were restored in the series' own history (6c1beb91b), so
+# that dir is no longer truncated -- but it remains a browsing copy and the
+# base clone remains the thing that gets built. The patch repo supplies
+# patches/, applied on top of the base below.
 - name: Clone the PVM base kernel ({{ pvm_base_branch }})
   ansible.builtin.git:
     repo: "{{ pvm_base_repo }}"
@@ -17,37 +21,144 @@
     force: false
     update: "{{ pvm_git_update | bool }}"
 
-- name: Clone the PVM patch repo (patches/ only)
-  ansible.builtin.git:
-    repo: "{{ pvm_patch_repo }}"
-    dest: "{{ pvm_patch_dir }}"
-    version: "{{ pvm_patch_branch }}"
-    depth: 1
-    single_branch: true
-    force: false
-    update: "{{ pvm_git_update | bool }}"
+# Single owner of the patch checkout + its sha/non-emptiness asserts, shared
+# with 40-guest-kernel.yml so both trees provably get the SAME series revision.
+- import_tasks: 25-patch-series.yml
 
 - name: Set host_kernel_tree fact
   ansible.builtin.set_fact:
     host_kernel_tree: "{{ host_kernel_src }}"
 
-# Only needed when the host CPU hides fsgsbase or rdtscp from guest CPUID.
-# A host exposing both (checked in 00-preflight) builds the base as-is; the
-# 6.12-vintage patches also frequently don't context-match a maintained
-# pvm-612 HEAD, so this is best-effort (--3way, non-fatal) not a hard gate.
-- name: Apply fsgsbase/rdtscp fallback patches (only if the host masks either)
+# Apply the patch series UNCONDITIONALLY. There is no CPU-flag gate.
+#
+# This used to be gated on `when: not _has_fsgsbase or not _has_rdtscp`, which
+# was both wrong about the series and self-defeating: live-measured /proc/cpuinfo
+# shows BOTH flags present on va, va2, sj2, sp, fr, cvmsj1 and cvmsj2 (only va3
+# reads 0/0), so the apply SKIPPED on 7 of 8 hosts -- confirmed by
+# `.hive_patches_applied` being ABSENT on fr/sj2/sp. A host that HAS both flags
+# still needs the patch: X86_FEATURE_PVM_RDTSCP makes the guest vDSO's getcpu()
+# gate its RDTSCP arm on the HOST's RDTSCP rather than on "is a PVM guest", so
+# the flags of the machine running ansible were never the right question.
+#
+# WHICH patches apply is `pvm_patch_files` (see defaults/main.yml), NOT a
+# `*.patch` glob. The series' two files target DIFFERENT base kernels -- the
+# 6.12->7.1 forward-port is for vanilla torvalds v7.1 and CREATES the PVM tree as
+# new files, so against pvm-612 (which already has PVM) it is a category error
+# producing 276 errors, not a patch to force. Globbing is what would apply it.
+# 25-patch-series.yml asserts the declared set covers the series exactly, so an
+# upstream patch appearing or disappearing fails loudly instead of silently
+# changing what gets built.
+#
+# Failure is FATAL, not a logged "skip". The old form ended each apply with
+# `|| echo "skip ..."`, so a context mismatch was non-fatal AND silent while the
+# later `kvm-pvm.ko` assert still passed -- the role could ship an entirely
+# unpatched kernel that looked patched, which is the worst available outcome
+# because it is indistinguishable from success. `set -e` plus an explicit
+# `exit 1` per patch makes a mismatch stop the play.
+#
+# Per patch, in this order, all three behaviours MEASURED against the real base:
+#   1. `patch -p1 -R --dry-run` succeeds -> already applied, skip (idempotent
+#      re-run). Uses the same fuzz as the forward apply, so the detector cannot
+#      disagree with the applier.
+#   2. `patch -p1 --dry-run --fuzz=N` succeeds -> apply for real (`--forward`
+#      refuses an already-applied patch rather than prompting).
+#   3. neither -> genuine drift. FAIL LOUD with the dry-run diagnostics.
+#
+# GNU `patch` with fuzz, not `git apply`, and the difference is load-bearing:
+# `git apply` has ZERO fuzz, and pvm-612 has since gained upstream's cpufeatures
+# annotations (`/* "tdx_guest" ... */`) inside this patch's context window, so
+# `git apply` rejects all three files on a CORRECT patch. GNU patch at
+# `--fuzz=3` applies it and lands it in exactly the right place -- verified by
+# diffing all three resulting files against the series' own already-patched
+# reference tree (kernel/ at 415c6a449): BYTE-IDENTICAL. `--3way` is not used
+# either: verified non-atomic, it can write CONFLICT MARKERS into the tree and
+# still return 1, and a kernel tree containing `<<<<<<< ours` does not compile --
+# a repair path that corrupts the tree it was meant to fix is worse than a clean
+# stop. `--no-backup-if-mismatch` keeps `.orig`/`.rej` files out of the source
+# tree (they break the kernel build's own file globs).
+#
+# The marker is keyed on the SERIES SHA, so bumping `pvm_patch_branch` is not a
+# no-op on an already-marked tree (an unkeyed `.hive_patches_applied` claimed
+# "patched" for any series, which is what made a bump undeployable).
+- name: Apply the PVM patch series ({{ pvm_patch_branch[:9] }}) to the host tree
   ansible.builtin.shell:
     chdir: "{{ host_kernel_tree }}"
     cmd: |
-      set -uo pipefail
-      shopt -s nullglob
-      for p in {{ pvm_patch_dir }}/patches/*.patch; do
-        git apply --3way "$p" 2>/dev/null || echo "skip (context mismatch or already present): $(basename "$p")"
+      set -euo pipefail
+      applied=0; skipped=0
+      for name in {{ pvm_patch_files | map('quote') | join(' ') }}; do
+        p="{{ pvm_patch_dir }}/patches/$name"
+        if [ ! -f "$p" ]; then
+          echo "FATAL: declared patch missing from the series: $name" >&2
+          exit 1
+        fi
+        if patch -p1 -R --dry-run --fuzz={{ pvm_patch_fuzz }} --force \
+             --no-backup-if-mismatch -i "$p" >/dev/null 2>&1; then
+          echo "already applied, skipping: $name"
+          skipped=$((skipped+1))
+          continue
+        fi
+        if ! patch -p1 --dry-run --fuzz={{ pvm_patch_fuzz }} --forward \
+               --no-backup-if-mismatch -i "$p" >/dev/null 2>&1; then
+          echo "FATAL: $name does not apply to {{ pvm_base_branch }} (context drift)." >&2
+          echo "--- dry-run diagnostics ---" >&2
+          patch -p1 --dry-run --fuzz={{ pvm_patch_fuzz }} --forward \
+            --no-backup-if-mismatch -i "$p" >&2 || true
+          exit 1
+        fi
+        patch -p1 --fuzz={{ pvm_patch_fuzz }} --forward \
+          --no-backup-if-mismatch -i "$p"
+        echo "applied: $name"
+        applied=$((applied+1))
       done
-      touch .hive_patches_applied
+      echo "series {{ pvm_patch_branch }}: applied=$applied already-present=$skipped"
+      touch .hive_patches_applied-{{ pvm_patch_branch }}
   args:
-    creates: "{{ host_kernel_tree }}/.hive_patches_applied"
-  when: not (_has_fsgsbase | default(true)) or not (_has_rdtscp | default(true))
+    creates: "{{ host_kernel_tree }}/.hive_patches_applied-{{ pvm_patch_branch }}"
+  register: _host_patches
+
+- name: Show host patch-series application result
+  ansible.builtin.debug:
+    var: _host_patches.stdout_lines
+  when: _host_patches.stdout_lines is defined
+
+# Prove the patch's EFFECT is in the tree, not merely that a patch command
+# exited 0. This is the assert the old code most needed and never had: the
+# `kvm-pvm.ko` check downstream passes on a completely unpatched kernel, so
+# "patched" was never actually verified anywhere. Fuzzy application makes this
+# stricter than an exit code -- fuzz means the hunk moved, so confirm the symbol
+# really landed in all three files it must land in.
+- name: Verify the PVM_RDTSCP fallback is present in the host tree
+  ansible.builtin.command:
+    cmd: git grep -c "X86_FEATURE_PVM_RDTSCP" -- {{ item }}
+    chdir: "{{ host_kernel_tree }}"
+  loop:
+    - arch/x86/include/asm/cpufeatures.h
+    - arch/x86/include/asm/segment.h
+    - arch/x86/kernel/cpu/common.c
+  register: _host_pvm_rdtscp
+  changed_when: false
+  failed_when: _host_pvm_rdtscp.rc != 0
+
+# A kernel tree carrying conflict markers cannot compile, and the compile is
+# ~30 minutes away -- fail here instead of there, where the cause would be
+# unrecognisable. Cheap belt-and-braces: the apply path above is designed not
+# to produce them. `failed_when: false` because git grep exits 1 on NO match,
+# which is the good case.
+- name: Check the host tree for leftover conflict markers
+  ansible.builtin.command:
+    cmd: git grep -l -E '^(<<<<<<< |>>>>>>> )' -- 'arch/*' 'include/*' 'virt/*' 'mm/*'
+    chdir: "{{ host_kernel_tree }}"
+  register: _host_conflicts
+  changed_when: false
+  failed_when: false
+
+- name: Assert the host tree has no conflict markers
+  ansible.builtin.assert:
+    that: _host_conflicts.stdout | trim | length == 0
+    fail_msg: >-
+      Conflict markers found in the host kernel tree -- it will not compile:
+      {{ _host_conflicts.stdout_lines | default([]) }}
 
 - name: Configure host kernel (running config + PVM + build fixes)
   ansible.builtin.shell:

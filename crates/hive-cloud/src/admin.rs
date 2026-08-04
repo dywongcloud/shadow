@@ -10835,6 +10835,18 @@ struct BillingGrantReq {
     plan: String,
     #[serde(default)]
     note: String,
+    /// Pin this tenant's tier FLOOR so no automatic path can downgrade below it.
+    /// `"enterprise"` locks at enterprise; `""` clears the lock; omitted leaves
+    /// any existing lock untouched.
+    ///
+    /// A grant without this is not durable, and that is not hypothetical: the
+    /// 2026-07-18 owner grant of `enterprise` was silently reverted to `hobby`
+    /// by a user-initiated free-plan checkout on 2026-07-25, and the 2026-07-29
+    /// remediation passed `plan=""` so the `!req.plan.is_empty()` guard below
+    /// skipped `apply_plan_everywhere` entirely — credits were added and the
+    /// tier was never restored, leaving the account quota-locked.
+    #[serde(default)]
+    lock_tier: Option<String>,
 }
 
 /// Operator-only: comp an account with prepaid credits and/or switch its plan
@@ -10870,6 +10882,28 @@ async fn billing_grant(
     };
     if !req.plan.is_empty() {
         apply_plan_everywhere(&c, t, &req.plan);
+    }
+    // Apply the tier lock AFTER any plan change, so a grant that both switches
+    // the plan and locks it lands in the right order. `set_tier_lock` also
+    // raises the live plan to the floor, which is what repairs an account whose
+    // stored plan was downgraded before the lock existed.
+    if let Some(lock) = req.lock_tier.as_deref() {
+        let floor = lock.trim();
+        if !floor.is_empty() && crate::billing::plan_spec(floor).id != floor {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("unknown lock_tier '{floor}'"),
+            ));
+        }
+        let floor_opt = if floor.is_empty() { None } else { Some(floor) };
+        c.billing.set_tier_lock(t, floor_opt);
+        // Keep the teams half in step: the lock raises the billing plan, and
+        // the two halves must never disagree (that split is what produced a
+        // tenant reading `enterprise` for features while quota-capped as
+        // `hobby`).
+        if let Some(f) = floor_opt {
+            apply_plan_everywhere(&c, t, f);
+        }
     }
     let acc = if req.credit_cents > 0 {
         c.billing.add_credits(t, req.credit_cents, &note)

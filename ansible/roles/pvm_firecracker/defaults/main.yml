@@ -19,8 +19,77 @@ firecracker_version: "main"
 pvm_base_repo: "https://github.com/virt-pvm/linux"
 pvm_base_branch: "pvm-612"
 pvm_patch_repo: "https://github.com/dywongcloud/pvm-no-fsgsbase-rdtscp"
-pvm_patch_branch: "main"
+# IMMUTABLE SHA, never a branch name. `main` was a MUTABLE ref carrying no
+# identity: the checkout could not be distinguished from any other, so the
+# `.hive_patches_applied` marker (see 30-host-kernel.yml) claimed "patched"
+# for whatever `main` happened to be at clone time, and a later patch bump
+# was a no-op on an already-marked tree. A sha makes "which patches" a fact.
+#
+# MUST be the full 40 characters. Live-measured against this exact remote:
+#   git fetch --depth 1 <repo> 415c6a449                    -> fatal: couldn't find remote ref
+#   git fetch --depth 1 <repo> 415c6a44913e2e1b5f996959... -> ok
+# git's wire protocol resolves only full object names, so an abbreviated pin
+# fails the CLONE, not merely the verification.
+#
+# 415c6a449 = merge of PR #2. Ancestry (verified): 91048d1a7 (gitignore
+# hardening + CI) <- 4d5cd0e54 (KVM shadow-paging UAF, CVE-2026-53359) <-
+# f26f0130a (FSGSBASE/RDTSCP fallbacks) <- 6c1beb91b (restore ~1362 `.S`
+# assembly stubs a case-insensitive `*.s` gitignore rule had dropped) <-
+# 14901fef2.
+pvm_patch_branch: "415c6a44913e2e1b5f996959dfe75fb24082a4db"
 pvm_patch_dir: "{{ build_root }}/pvm-patches"    # where the patch repo is cloned
+
+# WHICH patches from the series apply to `pvm_base_branch`, in apply order.
+#
+# The series is NOT a flat stack of fixes over one base -- MEASURED, and this is
+# the single most important fact about it. The two patch files target DIFFERENT
+# kernels, so "apply patches/*.patch" is not a well-defined operation:
+#
+#   0001x86pvmvdsogetcpulslfallback.patch  -> pvm-612 (this role's base). Adds
+#     X86_FEATURE_PVM_RDTSCP so the guest vDSO's getcpu() only patches in the
+#     RDTSCP arm when the host actually has RDTSCP. Applies here.
+#
+#   pvm6.12to7.1complete.patch            -> torvalds/linux v7.1. NOT pvm-612.
+#     Verified by blob identity, which is exact, not a guess: its `a/` (pre-image)
+#     hashes ARE v7.1's files -- arch/x86/Kconfig f3f7cb01d69d, arch/x86/kvm/mmu/
+#     mmu.c f0144ae8d891, arch/x86/entry/entry_64.S 42447b1e1dff all match v7.1
+#     and none match pvm-612. It is the 6.12->7.1 FORWARD-PORT: it CREATES
+#     arch/x86/kvm/pvm/{pvm.c,pvm.h,host_mmu.c} and arch/x86/kernel/pvm.c as new
+#     files (12 `new file mode` headers), i.e. it ADDS PVM to a vanilla v7.1 tree.
+#     `git apply --check` against a pristine v7.1 checkout exits 0; against
+#     pvm-612 it produces 276 errors and GNU patch reports "Reversed (or
+#     previously applied) patch detected", because pvm-612 ALREADY HAS PVM.
+#     Applying it here is a category error, not a context mismatch.
+#     The patch repo's own notes agree verbatim (skills/references/
+#     runtime-fixes.md:161-167): it "applies cleanly ... against a pristine
+#     torvalds/linux v7.1 checkout" and "targets a base this repo hasn't yet
+#     moved to". Moving this role to a v7.1 base is a separate, deliberate
+#     migration -- it is NOT a patch bump, and it must not happen implicitly.
+#
+# So this list is the base<->series contract, declared rather than discovered by
+# globbing. It is deliberately NOT a "skip" mechanism: 25-patch-series.yml
+# asserts the declared set EQUALS the set of *.patch files on disk, so adding or
+# removing a patch upstream FAILS THE PLAY until someone reviews it against the
+# base. That is what makes a future series bump loud instead of a silent no-op --
+# the same failure the sha pin and the sha-keyed marker close from other angles.
+pvm_patch_files:
+  - "0001x86pvmvdsogetcpulslfallback.patch"
+# Patch files present in the series that deliberately do NOT apply to this base.
+# Declared explicitly (not silently ignored) so the equality assert above still
+# accounts for every file, and so the reason travels with the exclusion.
+pvm_patch_files_excluded:
+  - "pvm6.12to7.1complete.patch"    # targets torvalds v7.1, not pvm-612 -- see above
+# Fuzz for the GNU-patch apply in 30/40-*-kernel.yml. NOT cosmetic: `pvm-612` is
+# a MAINTAINED branch, and it has since taken upstream's cpufeatures annotation
+# churn (`/* "tdx_guest" ... */`, `/* "fsgsbase" ... */`) INSIDE the context
+# window of 0001x86pvmvdsogetcpulslfallback.patch. `git apply` has zero fuzz and
+# therefore rejects all three files of a perfectly correct patch; GNU patch at
+# fuzz 3 applies it and lands it in the right place -- verified by diffing the
+# three resulting files against the series' own already-patched reference tree
+# (`kernel/` at 415c6a449): byte-identical. The apply is still followed by an
+# explicit assert that the patch's EFFECT (X86_FEATURE_PVM_RDTSCP) is present in
+# all three files, so fuzz can never mean "landed somewhere harmless".
+pvm_patch_fuzz: 3
 # The guest config is still the vanilla virt-pvm base config -- the fallback
 # patch series changes runtime capability gating, not guest Kconfig options.
 pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-guest-6.12.33.config"
@@ -40,6 +109,26 @@ pvm_guest_config_url: "https://raw.githubusercontent.com/virt-pvm/misc/main/pvm-
 # Set true when you deliberately want to pull upstream movement:
 #   ansible-playbook ... -e '{"pvm_git_update": true}'
 pvm_git_update: false
+# The PATCH repo is exempt from the above, and deliberately so.
+#
+# `pvm_git_update: false` froze /root/pvm-build/pvm-patches at 14901fef2 on
+# fr, sj2 and sp (live-verified), so every re-run re-applied the OLD series
+# and no patch bump could ever reach a provisioned host -- the checkout was
+# pinned by whatever `main` resolved to on first clone, which is the exact
+# failure the sha pin above exists to prevent. A pin is only a pin if the
+# checkout is actually moved onto it.
+#
+# Split from `pvm_git_update` rather than folded into it because the two
+# guard different costs. `pvm_git_update` protects the ~4.4 GB base kernel
+# and Firecracker clones (a full re-fetch, and the github.com reachability
+# problem documented above); this one moves a ~280 MB patch checkout onto an
+# IMMUTABLE ref, which is idempotent by construction -- once HEAD is the
+# pinned sha, ansible's git module fetches and resets to the same object and
+# reports no change. Nothing about it can drift, so there is no
+# reproducibility reason to leave it off, and leaving it off is what made the
+# pin decorative. Set false ONLY to provision a host that genuinely cannot
+# reach github.com and whose patch checkout is already at the pinned sha.
+pvm_patch_git_update: true
 # Control-host cache for the above. The config is fetched here once and PUSHED
 # to targets, because some fleet egress paths cannot reach
 # raw.githubusercontent.com at all (TLS reset mid-ClientHello) -- see
@@ -66,7 +155,40 @@ fc_target: "x86_64-unknown-linux-gnu"     # gnu build => empty seccomp filter, n
 # ---------- Behaviour toggles ----------
 pvm_reboot: true                          # reboot into the PVM kernel at the end
 pvm_set_default_kernel: true              # make the PVM kernel the persistent default
-pvm_run_smoke_test: true                  # boot a microVM and prove it after reboot
+# Boot a real microVM to prove the host. OFF by default, deliberately: this is
+# the single most dangerous task in the role.
+#
+# A microVM boot on an unproven PVM kernel does not fail politely -- it
+# HARD-RESETS THE WHOLE HOST, taking every tenant on it. Reproduced 3 times on
+# fc-frankfurt on 2026-07-31 (docs/blocked-work.md
+# "pvm-switcher-real-guest-transition-crashes-host", full analysis in
+# docs/pvm-upstream-report.md §8: `switcher_return_from_guest+0x18/0x74`
+# faulting on the `int3` landing pad inside `FILL_RETURN_BUFFER`).
+#
+# It defaulted to true AND ran outside the `pvm_already_provisioned` guard (see
+# tasks/main.yml), so a routine re-run against an ALREADY-PROVISIONED,
+# traffic-carrying host -- a re-run that correctly skipped every build step as
+# a no-op -- still fired the host-resetting microVM boot. `KVM_CREATE_VM`
+# succeeding does NOT imply a microVM boots (AGENTS.md); the boot is a
+# SEPARATE gate and must be opted into per host, at bring-up, before the node
+# joins the mesh:
+#   ansible-playbook ... --limit <new-node> -e pvm_run_smoke_test=true
+pvm_run_smoke_test: false
+
+# Per-host opt-out, honored in tasks/main.yml as a whole-role `when:` guard.
+# Set as a host var in inventory/hosts.ini, or per invocation with
+# `-e pvm_skip=true`. Set on a host, this role does NOTHING: no build, no
+# patch, no reboot (the reboot is inline in tasks/60-boot.yml, inside the same
+# guarded block), no smoke test.
+#
+# This exists because the role REBOOTS, so "just don't target it" has to be
+# expressible in inventory rather than remembered in a --limit each time. Two
+# live reasons right now:
+#   * fr (fc-frankfurt) -- host-resetting microVM crash, see above and
+#     docs/blocked-work.md:76-80. Stays excluded until that row clears.
+#   * cvmsj1 / cvmsj2 (fc-sanjose-cvm-1/-2) -- hard-down after a host reset;
+#     a reboot roll cannot help a host that is not answering.
+pvm_skip: false
 
 # ---------- microVM smoke-test settings ----------
 vm_vcpus: 2

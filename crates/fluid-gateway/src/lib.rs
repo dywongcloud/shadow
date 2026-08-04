@@ -2448,20 +2448,60 @@ async fn proxy_function(
 
 /// Classify a `Fluid::lease` error into a stable public [`FailureClass`] (#18).
 /// A tenant hitting its cross-pool instance quota is a 429 (back off, you're
-/// throttled); any other lease failure (concurrency saturation, cold-start cap,
-/// provisioning failure) is a 503 capacity problem. Coupled to the `NackReason`
-/// Debug name surfaced by `fluid-compute`'s `bail!("... ({reason:?})")` — the
-/// `classify_lease_error_*` tests lock that contract so a format change can't
-/// silently downgrade quota throttles to generic capacity errors.
+/// throttled); a broken deployment circuits; a NODE that is missing artifacts or
+/// a hypervisor, or whose container lock pool is empty, names itself as a node
+/// fault; only genuine saturation / cold-start-cap failures are a 503 capacity
+/// problem. Coupled to the `NackReason` Debug name surfaced by `fluid-compute`'s
+/// `bail!("... ({reason:?})")` and to the `hive_core::fault` markers backends
+/// embed — the `classify_lease_error_*` tests lock that contract so a format
+/// change can't silently downgrade quota throttles to generic capacity errors.
+///
+/// The `else` arm is a CATCH-ALL, and every fault that reaches it is published to
+/// the user as "the host is out of capacity". That is a lie for anything that is
+/// not saturation, so a new backend failure mode belongs in a class of its own
+/// with its own `hive_core::fault` marker — never left to fall through here.
 fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
     if es.contains("TenantQuota") {
         fluid_core::FailureClass::TenantThrottled
-    } else if es.contains("DeploymentCircuitOpen") {
+    } else if es.contains(hive_core::fault::NODE_IMAGE_MISSING) {
+        // THIS NODE is missing a base/per-image rootfs or its guest kernel. Not
+        // the app, not capacity — witnessed on fc-sanjose-cvm-2, where a missing
+        // `/var/lib/hive/rootfs/default.ext4` was published as
+        // CAPACITY_EXHAUSTED while the node held 923 GB free and 2046 free
+        // podman locks, and the operator went looking for space. Checked BEFORE
+        // the circuit arm below because the failing cold starts ALSO open the
+        // pool's circuit, so both markers can be live on the same error — and of
+        // the two only the node fault names the remedy.
+        fluid_core::FailureClass::NodeImageMissing
+    } else if es.contains(hive_core::fault::NODE_BACKEND_UNAVAILABLE) {
+        // No `/dev/kvm` / no firecracker binary on this node.
+        fluid_core::FailureClass::NodeBackendUnavailable
+    } else if es.contains(hive_core::fault::NODE_LOCK_POOL_EXHAUSTED) {
+        // podman's per-HOST lock pool is empty with nothing reclaimable: a host
+        // resource fault whose only remedy is `num_locks` + `podman system
+        // renumber`, which no amount of free disk or memory substitutes for.
+        fluid_core::FailureClass::NodeLockPoolExhausted
+    } else if es.contains("DeploymentCircuitOpen")
+        || es.contains(hive_core::fault::DEPLOYMENT_START_FAILED)
+    {
         // The DEPLOYMENT is broken (its instances keep exiting right after start),
         // not the host. Reporting this as CAPACITY_EXHAUSTED sent users hunting a
         // platform capacity problem that did not exist while their container was
         // dying on a missing env var.
+        //
+        // `DEPLOYMENT_START_FAILED` joins it because the circuit only opens on the
+        // THIRD consecutive failure: witnessed live, the first two failures of an
+        // app that never bound its port still reported CAPACITY_EXHAUSTED. Same
+        // class, same remedy (read the app's logs), so the very first one now says
+        // so instead of blaming the host.
         fluid_core::FailureClass::DeploymentCircuitOpen
+    } else if es.contains("no such function") {
+        // The pool is not registered on this node at all, so no cold start was
+        // ever attempted and no capacity was ever consumed. It used to report
+        // CAPACITY_EXHAUSTED, which points an operator at the host while the
+        // truth is that this node has no such deployment (mid-deploy
+        // registration, an unregistered pool, a stale mesh route).
+        fluid_core::FailureClass::DeploymentNotFound
     } else {
         fluid_core::FailureClass::CapacityExhausted
     }
