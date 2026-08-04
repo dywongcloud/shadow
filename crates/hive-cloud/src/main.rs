@@ -13,6 +13,7 @@ mod auth;
 mod billing;
 mod browser_admission;
 mod browser_artifacts;
+mod browser_db;
 mod browser_presence;
 mod cluster;
 mod compose;
@@ -927,6 +928,17 @@ async fn main() -> anyhow::Result<()> {
                     crate::browser_admission::endpoint_admitted(&cloud, &endpoint_id).await
                 })
             });
+        // Browser-replicated database exchange (bn-browser-fleet-crr-exchange):
+        // the fleet half of `Op::CrrSync` — per-request grant re-check against
+        // this node's own replicated admission view, capped apply/export
+        // against the per-project replica file. See browser_db.rs.
+        // HIVE_BROWSER_DB_LISTEN=0 disables the serve arm (rollout/ops knob):
+        // `Op::CrrSync` then gets NO_HANDLER — exactly how a pre-change
+        // binary refuses it (never a fake grant, never a crash).
+        let browser_crr = std::env::var("HIVE_BROWSER_DB_LISTEN")
+            .ok()
+            .filter(|v| v.trim() == "0")
+            .map_or_else(|| Some(crate::browser_db::crr_sync_handler(&cloud)), |_| None);
         tokio::spawn(hive_p2p::serve_tunnels_full(
             ep,
             gateway_addr,
@@ -936,6 +948,7 @@ async fn main() -> anyhow::Result<()> {
             join_handler,
             Some(raw_resolver),
             Some(browser_admission),
+            browser_crr,
         ));
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }
@@ -1212,6 +1225,11 @@ async fn main() -> anyhow::Result<()> {
     // Every node (the store is per-host), guarded against empty/mostly-orphaned
     // keep-sets — see browser_artifacts::gc.
     browser_artifacts::spawn_gc_loop(cloud.clone());
+    // Browser-replicated databases (bn-browser-fleet-crr-exchange): per project
+    // with a `browser_db` opt-in, keep the fleet replica file (+ its spec-
+    // derived schema) present, and reap inert replicas only past the 30-day
+    // grace window with the blast-radius guards — see browser_db.rs.
+    browser_db::spawn_reconcile(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone()).layer(

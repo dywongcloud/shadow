@@ -2519,6 +2519,7 @@ dependencies = [
  "hive-browser-proto",
  "hive-controlplane",
  "hive-core",
+ "hive-crsql",
  "hive-edge",
  "hive-p2p",
  "hive-wg",

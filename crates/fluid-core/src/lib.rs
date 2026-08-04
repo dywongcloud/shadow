@@ -845,6 +845,35 @@ pub struct BrowserDbPolicy {
     /// tenant data regardless of the toggle.
     #[serde(default, skip_serializing_if = "is_false")]
     pub public_read: bool,
+    /// The database's schema as an ordered list of tables to create and
+    /// upgrade to CRRs. cr-sqlite v0.17 does NOT replicate schema inside
+    /// `crsql_changes`, so both replica halves (the fleet replica file and
+    /// every browser OPFS copy) must create the same tables out-of-band —
+    /// carrying the DDL in the spec is how every side derives it from the
+    /// SAME server-replicated source (admission's `db` capability block hands
+    /// it to the browser verbatim; the fleet reconcile applies it to the
+    /// replica file). Author each `ddl` idempotent (`CREATE TABLE IF NOT
+    /// EXISTS`); the platform runs it and then `crsql_as_crr(name)` on every
+    /// replica it touches. An opted-in deployment with an EMPTY schema can
+    /// still sync — no tracked tables means exports are simply empty until a
+    /// later deploy adds tables (loud apply errors, never silent divergence).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schema: Vec<BrowserDbTable>,
+}
+
+/// One CRR-tracked table of a [`BrowserDbPolicy`]'s schema: the table `name`
+/// (validated identifier-shaped at resolve time) plus the idempotent DDL that
+/// creates it. `name` is what `crsql_as_crr` upgrades; `ddl` runs verbatim
+/// first. Splitting the two (instead of parsing the DDL for its table name)
+/// keeps the platform's `as_crr` call explicit and the validation trivial.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDbTable {
+    /// Base table name — `[A-Za-z_][A-Za-z0-9_]*` only (the same identifier
+    /// rule the browser worker's `as-crr` op enforces).
+    pub name: String,
+    /// Idempotent DDL creating the table (`CREATE TABLE IF NOT EXISTS ...`).
+    /// Executed verbatim against each replica before `crsql_as_crr(name)`.
+    pub ddl: String,
 }
 
 /// A [`BrowserDbPolicy`] after resolution: every cap concrete (defaults
@@ -854,6 +883,10 @@ pub struct ResolvedBrowserDbPolicy {
     pub max_bytes: u64,
     pub max_value_bytes: u64,
     pub public_read: bool,
+    /// The schema subset that survived validation (identifier-shaped table
+    /// name, non-empty DDL), in declared order. Rejected entries produced a
+    /// note — they never silently vanish.
+    pub schema: Vec<BrowserDbTable>,
     /// Human-readable notes for the build log — values the platform ceilings
     /// (or internal consistency) clamped.
     pub notes: Vec<String>,
@@ -897,10 +930,34 @@ impl BrowserDbPolicy {
             ));
             max_value_bytes = max_bytes;
         }
+        let mut schema = Vec::with_capacity(self.schema.len());
+        for table in &self.schema {
+            let valid_name = {
+                let mut chars = table.name.chars();
+                matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+            };
+            if !valid_name {
+                notes.push(format!(
+                    "schema table {:?} skipped — name must match [A-Za-z_][A-Za-z0-9_]*",
+                    table.name
+                ));
+                continue;
+            }
+            if table.ddl.trim().is_empty() {
+                notes.push(format!(
+                    "schema table {:?} skipped — ddl is empty (author CREATE TABLE IF NOT EXISTS)",
+                    table.name
+                ));
+                continue;
+            }
+            schema.push(table.clone());
+        }
         ResolvedBrowserDbPolicy {
             max_bytes,
             max_value_bytes,
             public_read: self.public_read,
+            schema,
             notes,
         }
     }

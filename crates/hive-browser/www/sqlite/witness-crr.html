@@ -1,0 +1,260 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>browser↔fleet CRR exchange witness</title>
+<!--
+Live witness harness for bn-browser-fleet-crr-exchange. Driven over CDP by
+witness-crr.mjs (never standalone): this page boots a REAL BrowserNode
+(wasm) against a real relay, admits against a real local hive-cloud
+(enforced JWT), opens REAL sqlite workers against OPFS, and runs the sync
+session loop against the fleet's Op::CrrSync handler. Every scenario step
+is an async method on window.witness; the driver evaluates them and reads
+structured results back.
+
+Query params: api, token, relay, deployment (default project to admit on
+load), function. The endpoint seed persists in localStorage so a reload
+keeps the endpoint identity (re-admission is then a renewal).
+-->
+<body>browser↔fleet CRR witness — see window.witness</body>
+<script type="module">
+import init, { BrowserNode, wasmBundleVersion } from '../pkg/hive_browser.js';
+import { WorkerClient, BrowserDbSync, makeCrrSyncResponder } from './sync-client.js';
+import { encodeCrrSyncRequest, splitCrrSyncReply, encodeBatch, fromHex } from './hcb1.js';
+
+const params = new URLSearchParams(location.search);
+const API = params.get('api');
+const TOKEN = params.get('token');
+const RELAY = params.get('relay');
+const FN = params.get('function') || 'api';
+
+let node = null;
+const dbs = new Map(); // deployment -> { worker, wc, sync, capability }
+let idCounter = 1000;
+
+const W = {
+  log: [],
+  ready: false,
+  version: null,
+  note(entry) { W.log.push({ t: Date.now(), ...entry }); },
+};
+window.witness = W;
+
+async function apiFetch(path, opts = {}) {
+  const resp = await fetch(`${API}${path}`, {
+    ...opts,
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}`, ...(opts.headers ?? {}) },
+  });
+  const body = await resp.json().catch(() => null);
+  return { status: resp.status, body };
+}
+
+W.bootNode = async () => {
+  if (node) return { nodeId: node.nodeId() };
+  await init();
+  W.version = wasmBundleVersion();
+  const seed = localStorage.getItem('witness-seed') || null;
+  node = await BrowserNode.boot(RELAY, '', seed || undefined);
+  if (!seed) localStorage.setItem('witness-seed', node.secretHex());
+  return { nodeId: node.nodeId() };
+};
+
+W.admitDb = async (deployment) => {
+  await W.bootNode();
+  W.note({ step: 'admit-begin', deployment });
+  const challenge = Date.now();
+  const signature = node.signAdmission(String(challenge));
+  const res = await apiFetch('/v1/browser/admissions', {
+    method: 'POST',
+    body: JSON.stringify({
+      endpoint_id: node.nodeId(),
+      addr_json: node.addrJson(),
+      deployment,
+      function: FN,
+      protocol_version: 0,
+      challenge_ms: challenge,
+      signature,
+      lease_secs: 180,
+      scope: 'team',
+    }),
+  });
+  if (res.status !== 200) throw new Error(`admission failed ${res.status}: ${JSON.stringify(res.body)}`);
+  W.note({ step: 'admit-ok', deployment });
+  const capability = res.body.capability;
+  if (!capability.db) throw new Error('admission capability carries no db block');
+  const worker = new Worker('./sqlite-worker.js', { type: 'module' });
+  const wc = new WorkerClient(worker);
+  worker.onerror = (e) => W.note({ step: 'worker-error', deployment, error: String(e.message ?? e) });
+  const sync = new BrowserDbSync(wc, node, capability.db);
+  // A previous page load's worker may still be draining its OPFS sync access
+  // handles (one pool per origin can hold /hive-crsql at a time); ride out
+  // the release window, but only for that exact error — everything else is
+  // terminal and typed.
+  let opened;
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      opened = await sync.open();
+      break;
+    } catch (err) {
+      if (!/NoModificationAllowedError/.test(String(err?.message ?? err)) || attempt === 6) throw err;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+  W.note({ step: 'worker-opened', deployment, persisted: opened.persisted });
+  const responder = makeCrrSyncResponder(wc, capability.db);
+  node.setCrrSyncHandler(async (bytes, signal) => {
+    // One handler slot per node; route to the db named by the CURRENT
+    // admission record (the exchange re-checks the grant server-side).
+    return responder(bytes, signal);
+  });
+  for (const p of capability.db.sync_peers ?? []) node.grantCrrSync(p.endpoint_id);
+  const entry = { worker, wc, sync, capability, opened, admission: res.body.admission };
+  dbs.set(deployment, entry);
+  // idCounter must survive a page reload: seed it from the replica, not from
+  // page state (a reload resets module state to 1000 and the next insert
+  // collides with an already-synced row's PK).
+  try {
+    const maxRows = await wc.call('exec', { sql: 'SELECT COALESCE(MAX(id), 1000) FROM items' });
+    idCounter = Number(maxRows.rows?.[0]?.[0] ?? 1000);
+  } catch { idCounter = 1000; }
+  W.note({ step: 'admit', deployment, db: capability.db, persisted: opened.persisted });
+  return { db: capability.db, persisted: opened.persisted, admission: res.body.admission };
+};
+
+const db = (deployment) => {
+  const entry = dbs.get(deployment);
+  if (!entry) throw new Error(`no admitted db for deployment ${deployment}`);
+  return entry;
+};
+
+W.write = async (deployment, label) => {
+  const id = ++idCounter;
+  await db(deployment).sync.write(`INSERT INTO items (id, label) VALUES (${id}, '${label}')`);
+  return { id };
+};
+
+W.writeSized = async (deployment, bytes) => {
+  const id = ++idCounter;
+  await db(deployment).sync.write(`INSERT INTO items (id, label) VALUES (${id}, zeroblob(${bytes}))`);
+  return { id, bytes };
+};
+
+W.rows = async (deployment) => {
+  const r = await db(deployment).wc.call('exec', {
+    sql: "SELECT id, CASE WHEN typeof(label) = 'blob' THEN printf('blob:%d', length(label)) ELSE label END FROM items ORDER BY id",
+  });
+  return r.rows;
+};
+
+W.state = async (deployment) => db(deployment).sync.state();
+W.ack = (deployment) => ({ ...db(deployment).sync.ack });
+W.endpointId = () => node.nodeId();
+
+W.sync = async (deployment) => {
+  const reports = await db(deployment).sync.syncAll();
+  W.note({ step: 'sync', deployment, reports });
+  return reports;
+};
+
+// Hand-crafted gap: export the browser's PENDING batches (since the real
+// push cursor, one batch per commit so there ARE multiple), DROP the first,
+// push the rest over the real wire op — the fleet must refuse with a typed
+// sync-gap and hold no partial state.
+W.gapProbe = async (deployment) => {
+  const { wc, sync, capability } = db(deployment);
+  const exported = await wc.call('sync-export', {
+    since: sync.ack, maxValueBytes: capability.db.max_value_bytes, maxBatchChanges: 1,
+  });
+  if (exported.batches.length < 2) throw new Error(`need >=2 pending batches for a gap probe, have ${exported.batches.length}`);
+  const state = await sync.state();
+  const watermarks = state.watermarks.map((w) => [fromHex(w.siteId), BigInt(w.version)]);
+  const peer = capability.db.sync_peers[0];
+  const request = encodeCrrSyncRequest({ dbFile: capability.db.db_file, pushMore: false, watermarks, batches: exported.batches.slice(1).map(fromHex) });
+  const replyBytes = await node.crrSyncOn(peer.addr_json, request);
+  const reply = splitCrrSyncReply(replyBytes);
+  W.note({ step: 'gap-probe', status: reply.status, message: reply.message });
+  return { status: reply.status, message: reply.message, batchesSent: exported.batches.length - 1 };
+};
+
+// Hand-crafted oversized-value push (the glue's own export filter would skip
+// it, so this drives the FLEET's typed refusal directly): one batch whose
+// val exceeds max_value_bytes, chaining from the fleet's current ack.
+W.oversizedProbe = async (deployment, bytes) => {
+  const { wc, sync, capability } = db(deployment);
+  const state = await sync.state();
+  const siteHex = state.siteId;
+  const since = BigInt(sync.ack[siteHex] ?? 0);
+  const batch = {
+    site_id: fromHex(siteHex),
+    since_db_version: since,
+    changes: [{
+      table: 'items',
+      pk: Uint8Array.of(1, 9, 255),
+      cid: 'label',
+      val: { tag: 4, blob: new Uint8Array(bytes) },
+      col_version: 1n,
+      db_version: since + 1n,
+      site_id: fromHex(siteHex),
+      cl: 1n, seq: 0n, ts: String(Date.now()),
+    }],
+  };
+  const watermarks = state.watermarks.map((w) => [fromHex(w.siteId), BigInt(w.version)]);
+  const peer = capability.db.sync_peers[0];
+  const request = encodeCrrSyncRequest({ dbFile: capability.db.db_file, pushMore: false, watermarks, batches: [encodeBatch(batch)] });
+  const replyBytes = await node.crrSyncOn(peer.addr_json, request);
+  const reply = splitCrrSyncReply(replyBytes);
+  W.note({ step: 'oversized-probe', status: reply.status, message: reply.message });
+  return { status: reply.status, message: reply.message };
+};
+
+// Hand-crafted stale-grant probe: the request names a db_file that does NOT
+// match the endpoint's live grant — the fleet must refuse with FORBIDDEN
+// before any decode, and no replica may change. This is the wire-level guard
+// against a stale capability contaminating another project's replica.
+W.wrongDbProbe = async (deployment, wrongDbFile) => {
+  const { sync, capability } = db(deployment);
+  const state = await sync.state();
+  const watermarks = state.watermarks.map((w) => [fromHex(w.siteId), BigInt(w.version)]);
+  const peer = capability.db.sync_peers[0];
+  const request = encodeCrrSyncRequest({ dbFile: wrongDbFile, pushMore: false, watermarks, batches: [] });
+  try {
+    await node.crrSyncOn(peer.addr_json, request);
+    return { refused: false };
+  } catch (err) {
+    return { refused: true, error: String(err?.message ?? err) };
+  }
+};
+
+W.wipe = async (deployment) => {
+  await db(deployment).wc.call('wipe');
+  W.note({ step: 'wipe', deployment });
+  return { wiped: true };
+};
+
+// After a wipe, reopen the same db file and report its watermark state —
+// the proof the replica is actually gone (a fresh file has no sites).
+W.reopenState = async (deployment) => {
+  const entry = db(deployment);
+  await entry.wc.call('open', { db: entry.capability.db.db_file });
+  const state = await entry.sync.state();
+  W.note({ step: 'reopen-state', deployment, state });
+  return state;
+};
+
+W.revoke = async () => {
+  const res = await apiFetch(`/v1/browser/admissions/${node.nodeId()}`, { method: 'DELETE' });
+  W.note({ step: 'revoke', status: res.status });
+  return { status: res.status, body: res.body };
+};
+
+// Auto-boot on load so a page reload (the persistence witness) lands ready.
+const defaultDeployment = params.get('deployment');
+(async () => {
+  try {
+    await W.admitDb(defaultDeployment);
+    W.ready = true;
+  } catch (err) {
+    const rendered = err?.message ?? err;
+    const detail = (() => { try { return JSON.stringify(err, Object.getOwnPropertyNames(err)); } catch { return String(err); } })();
+    W.note({ step: 'boot-failed', error: String(rendered), detail, stack: String(err?.stack ?? '') });
+  }
+})();
+</script>

@@ -29,7 +29,7 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 13; // v13: EOF-only stream completion, semaphore backpressure
+const WASM_BUNDLE_VERSION = 14; // v14: Op::CrrSync browser-replicated database exchange (setCrrSyncHandler/grantCrrSync/revokeCrrSync + outbound crrSyncOn)
 const WASM_MODULE_URL = new URL(
   `./browser-node/pkg/hive_browser.js?v=${WASM_BUNDLE_VERSION}`,
   import.meta.url,

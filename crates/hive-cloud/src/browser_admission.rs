@@ -99,6 +99,47 @@ pub struct BrowserAdmission {
     #[serde(default)]
     pub scope: BrowserScope,
     pub protocol_version: u16,
+    /// The server-derived browser-DATABASE grant (bn-browser-fleet-crr-exchange)
+    /// — present only when the admitted deployment's descriptor carries a
+    /// `browser_db` block (and, for Public scope, `public_read: true`). This
+    /// is the replicated grant the CRR exchange re-checks
+    /// (`browser_db::resolve_round_grant`); `serde(default)` keeps
+    /// pre-upgrade snapshots parsing — absent means NO db capability, the
+    /// designed mid-rollout direction (never wrong capability).
+    #[serde(default)]
+    pub db: Option<BrowserDbGrant>,
+}
+
+/// The replicated half of a database grant (contract §3: "grants ride the
+/// admission, server-derived and tenant-pinned, dying with the admission
+/// lease"). Every field is resolved from the deployment descriptor at
+/// admit/renewal time — never from donor input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDbGrant {
+    /// The project the database belongs to (database identity IS the
+    /// project; the grant is resolved against this exact deployment).
+    pub project: String,
+    pub access: BrowserDbAccess,
+    /// Caps resolved from the spec at issue time — the exchange re-resolves
+    /// the LIVE spec per request; these are the snapshot the donor
+    /// reconciles its own enforcement from.
+    pub max_bytes: u64,
+    pub max_value_bytes: u64,
+    /// Platform-templated replica name (`browser_db::replica_file_name`) —
+    /// the browser opens exactly this OPFS file and nothing derived from any
+    /// other input.
+    pub db_file: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserDbAccess {
+    /// Team scope: the browser may push its changes AND pull fleet changes —
+    /// the whole point of a CRR is browsers as writers.
+    ReadWrite,
+    /// Public scope (only with `public_read: true`): export only; the fleet
+    /// applies nothing originating from this grant.
+    ReadOnly,
 }
 
 impl BrowserAdmission {
@@ -232,6 +273,20 @@ impl BrowserAdmissionStore {
             .active
             .get(endpoint_id)
             .is_some_and(|record| record.expires_ms > now)
+    }
+
+    /// The LIVE record for an endpoint regardless of tenant — the CRR
+    /// exchange's re-check view (`browser_db::resolve_round_grant`). The
+    /// endpoint id is the QUIC-authenticated identity, so this leaks nothing
+    /// the caller doesn't already prove; tenant pinning is re-checked by the
+    /// caller against the record's own fields.
+    pub fn live_for_endpoint(&self, endpoint_id: &str, now: u64) -> Option<BrowserAdmission> {
+        self.inner
+            .lock()
+            .active
+            .get(endpoint_id)
+            .filter(|record| record.expires_ms > now)
+            .cloned()
     }
 
     /// Explicit-revocation check for the embedded relay's `AccessControl`
@@ -722,6 +777,30 @@ async fn admit(
 ) -> AdmissionResult {
     let claims = fresh_user_claims(claims)?;
     let (tenant, expires_ms, descriptor) = validate_request(&cloud, &claims, &request)?;
+    // Server-derived DATABASE grant (bn-browser-fleet-crr-exchange): present
+    // only when the admitted deployment's descriptor carries a `browser_db`
+    // block — resolved from the same replicated deployment state as the
+    // function descriptor, never from donor input. Public scope gets a grant
+    // only with `public_read: true`, and even then read-only. Its absence is
+    // not an error: function-serving admissions without a database opt-in
+    // simply carry no `db` capability.
+    let db_capability = crate::browser_db::db_descriptor_for(&cloud, &tenant, &request.deployment)
+        .and_then(|(project, spec)| {
+            let resolved = spec.resolve();
+            let access = match request.scope {
+                BrowserScope::Team => BrowserDbAccess::ReadWrite,
+                BrowserScope::Public if resolved.public_read => BrowserDbAccess::ReadOnly,
+                BrowserScope::Public => return None,
+            };
+            let grant = BrowserDbGrant {
+                db_file: crate::browser_db::replica_file_name(&project),
+                project,
+                access,
+                max_bytes: resolved.max_bytes,
+                max_value_bytes: resolved.max_value_bytes,
+            };
+            Some((grant, resolved))
+        });
     let issued_ms = hive_core::now_ms();
     // Captured BEFORE `put` clears it (bn-relay-denylist-restart-friction):
     // whether this endpoint carried a stale relay-denylist entry (a `stop()`'s
@@ -749,6 +828,9 @@ async fn admit(
         revision: 0,
         scope: request.scope,
         protocol_version: request.protocol_version,
+        db: db_capability
+            .as_ref()
+            .map(|(grant, _)| grant.clone()),
     };
     let old = cloud
         .browser_admissions
@@ -794,7 +876,14 @@ async fn admit(
     // and artifact rotation take effect on the same response, never piecemeal.
     Ok(Json(json!({
         "admission": record,
-        "capability": capability_json(&cloud, &descriptor.artifact, expires_ms),
+        "capability": capability_json(
+            &cloud,
+            &descriptor.artifact,
+            expires_ms,
+            db_capability
+                .as_ref()
+                .map(|(grant, resolved)| (record.tenant.as_str(), grant, resolved)),
+        ),
     })))
 }
 
@@ -817,8 +906,9 @@ fn capability_json(
     cloud: &Arc<CloudState>,
     artifact: &fluid_core::BrowserArtifact,
     expires_ms: u64,
+    db: Option<(&str, &BrowserDbGrant, &fluid_core::ResolvedBrowserDbPolicy)>,
 ) -> Value {
-    json!({
+    let mut out = json!({
         "version": 1,
         "artifact_url": format!("/v1/browser/artifacts/{}", artifact.policy_digest),
         "policy_digest": artifact.policy_digest,
@@ -831,7 +921,15 @@ fn capability_json(
         "allowed_ops": artifact.allowed_ops,
         "trusted_callers": trusted_caller_ids(cloud),
         "expires_ms": expires_ms,
-    })
+    });
+    // The `db` section is part of the SAME atomic capability snapshot
+    // (bn-browser-fleet-crr-exchange): the donor reconciles its OPFS replica
+    // name, caps, schema and sync peers from exactly this — present only when
+    // the admission carries a database grant at all.
+    if let Some((tenant, grant, resolved)) = db {
+        out["db"] = crate::browser_db::capability_db_json(cloud, tenant, grant, resolved, expires_ms);
+    }
+    out
 }
 
 /// The fleet EndpointIds currently allowed to originate BrowserPool invokes

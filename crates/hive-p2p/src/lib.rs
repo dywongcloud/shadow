@@ -101,8 +101,8 @@ pub const HIVE_ALPN: &[u8] = b"hive/tunnel/0";
 pub use hive_browser_proto::BROWSER_ALPN;
 
 use hive_browser_proto::{
-    check_len, encode_invoke, encode_request, reset as browser_reset, Op, BROWSER_MAX_ECHO,
-    BROWSER_MAX_FRAME, FUNCTION_DIGEST_LEN,
+    check_len_for, encode_invoke, encode_request, reset as browser_reset, Op,
+    BROWSER_MAX_CRR_FRAME, BROWSER_MAX_ECHO, BROWSER_MAX_FRAME, FUNCTION_DIGEST_LEN,
 };
 
 /// Concurrently-served `hive/browser/0` connections — SEPARATE from
@@ -332,6 +332,24 @@ pub type JoinHandler = Arc<
 pub type BrowserAdmissionHandler = Arc<
     dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
         + Send
+        + Sync,
+>;
+
+/// Serves one `Op::CrrSync` request against the fleet's replica of the
+/// caller's browser-replicated database (bn-browser-fleet-crr-exchange):
+/// `(remote_id, request payload) -> reply payload`, where `remote_id` is the
+/// QUIC connection's authenticated browser identity. hive-cloud installs the
+/// real implementation (grant re-check against its own replicated admission
+/// view, replica open, capped apply/export); `Err(code)` is the stream reset
+/// code to refuse with, so protocol faults stay distinct from sync-domain
+/// refusals (which travel inside an Ok reply's status byte).
+pub type BrowserCrrHandler = Arc<
+    dyn Fn(
+            String,
+            Vec<u8>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Vec<u8>, u32>> + Send>,
+        > + Send
         + Sync,
 >;
 
@@ -1164,6 +1182,14 @@ struct BrowserPoolCounterCells {
     /// honest, already-available signal, not a stand-in pretending to be more.
     trunk_evictions_total: std::sync::atomic::AtomicU64,
     invoke_redials_total: std::sync::atomic::AtomicU64,
+    /// CRR sync rounds (bn-browser-fleet-crr-exchange) counted SEPARATELY from
+    /// function invokes: same trunk/request plumbing, different op, and an
+    /// operator must be able to see database replication without it
+    /// disappearing into invoke traffic. Tenant-free global aggregates, same
+    /// posture as every counter above.
+    crr_attempts_total: std::sync::atomic::AtomicU64,
+    crr_successes_total: std::sync::atomic::AtomicU64,
+    crr_failures_total: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Default, serde::Serialize)]
@@ -1180,6 +1206,9 @@ pub struct BrowserPoolCounters {
     pub bytes_received_total: u64,
     pub trunk_evictions_total: u64,
     pub invoke_redials_total: u64,
+    pub crr_attempts_total: u64,
+    pub crr_successes_total: u64,
+    pub crr_failures_total: u64,
 }
 
 fn avg_ms(sum: &std::sync::atomic::AtomicU64, samples: &std::sync::atomic::AtomicU64) -> f64 {
@@ -1236,6 +1265,9 @@ impl BrowserPool {
             bytes_received_total: c.bytes_received_total.load(Relaxed),
             trunk_evictions_total: c.trunk_evictions_total.load(Relaxed),
             invoke_redials_total: c.invoke_redials_total.load(Relaxed),
+            crr_attempts_total: c.crr_attempts_total.load(Relaxed),
+            crr_successes_total: c.crr_successes_total.load(Relaxed),
+            crr_failures_total: c.crr_failures_total.load(Relaxed),
         }
     }
 
@@ -1589,6 +1621,57 @@ impl BrowserPool {
         let payload =
             encode_invoke(digest, request_json).map_err(|e| BrowserInvokeError::new(false, e))?;
         let frame = encode_request(Op::Invoke, &payload);
+        self.request_op(endpoint_id, addr_json, Op::Invoke, frame)
+            .await
+    }
+
+    /// One CRR anti-entropy round against an admitted browser's replica
+    /// (bn-browser-fleet-crr-exchange) — the fleet-INITIATED direction of the
+    /// exchange. The browser serves these via its own inbound `Op::CrrSync`
+    /// handler, the same op it uses when it initiates; `payload` is a verbatim
+    /// `hive_browser_proto::encode_crr_sync_request` frame built by the caller
+    /// (hive-cloud owns the watermarks/batches; this pool only knows frames).
+    pub async fn crr_sync(
+        &self,
+        endpoint_id: &str,
+        addr_json: &str,
+        payload: &[u8],
+    ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.counters.crr_attempts_total.fetch_add(1, Relaxed);
+        if payload.len() > BROWSER_MAX_CRR_FRAME - 1 {
+            self.counters.crr_failures_total.fetch_add(1, Relaxed);
+            return Err(BrowserInvokeError::new(
+                false,
+                "browser crr sync frame too large",
+            ));
+        }
+        let frame = encode_request(Op::CrrSync, payload);
+        let result = self
+            .request_op(endpoint_id, addr_json, Op::CrrSync, frame)
+            .await;
+        match &result {
+            Ok(_) => {
+                self.counters.crr_successes_total.fetch_add(1, Relaxed);
+            }
+            Err(_) => {
+                self.counters.crr_failures_total.fetch_add(1, Relaxed);
+            }
+        }
+        result
+    }
+
+    /// Shared request/response plumbing for every outbound op on a browser
+    /// trunk: acquire (with one redial), one bounded bi stream, one framed
+    /// request, then one framed reply whose declared length is checked against
+    /// the OP's own cap ([`check_len_for`]) before any allocation.
+    async fn request_op(
+        &self,
+        endpoint_id: &str,
+        addr_json: &str,
+        op: Op,
+        frame: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, BrowserInvokeError> {
         let mut epoch = None;
         let mut attempt = 0u8;
         let mut io = loop {
@@ -1763,7 +1846,7 @@ impl BrowserPool {
                 return Err(BrowserInvokeError::new(true, "browser reply timed out"));
             }
         }
-        let n = match check_len(len) {
+        let n = match check_len_for(op, len) {
             Ok(n) => n,
             Err(error) => {
                 io.close(error.reset_code());
@@ -2977,6 +3060,7 @@ pub async fn serve_tunnels_with_join(
         join,
         None,
         None,
+        None,
     )
     .await
 }
@@ -2996,6 +3080,7 @@ pub async fn serve_tunnels_full(
     join: Option<JoinHandler>,
     raw_resolver: Option<RawTargetResolver>,
     browser_admission: Option<BrowserAdmissionHandler>,
+    browser_crr: Option<BrowserCrrHandler>,
 ) {
     let conn_limit = match max_inbound_conns() {
         0 => None,
@@ -3048,6 +3133,7 @@ pub async fn serve_tunnels_full(
         let join = join.clone();
         let raw_resolver = raw_resolver.clone();
         let browser_admission = browser_admission.clone();
+        let browser_crr = browser_crr.clone();
         let browser_resources = browser_resources.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -3080,7 +3166,7 @@ pub async fn serve_tunnels_full(
                     );
                     return;
                 };
-                serve_browser_conn(conn, remote_id, browser_resources).await;
+                serve_browser_conn(conn, remote_id, browser_resources, browser_crr).await;
                 return;
             }
             if conn.alpn() == HIVE_ALPN {
@@ -3207,6 +3293,7 @@ async fn serve_browser_conn(
     conn: Connection,
     remote_id: String,
     resources: BrowserInboundResources,
+    crr_handler: Option<BrowserCrrHandler>,
 ) {
     let connection_streams = Arc::new(tokio::sync::Semaphore::new(
         BROWSER_MAX_STREAMS_PER_CONNECTION,
@@ -3273,6 +3360,8 @@ async fn serve_browser_conn(
         let connection_activity =
             BrowserConnectionStreamGuard::acquire(connection_activity.clone());
         let resources = resources.clone();
+        let crr_handler = crr_handler.clone();
+        let remote_id = remote_id.clone();
         tokio::spawn(async move {
             let _stream_permit = stream_permit;
             let _connection_permit = connection_permit;
@@ -3283,8 +3372,8 @@ async fn serve_browser_conn(
                 recv.read_exact(&mut lenb)
                     .await
                     .map_err(|_| browser_reset::MALFORMED_PAYLOAD)?;
-                let len = check_len(lenb).map_err(|error| error.reset_code())?;
-                if len == 0 {
+                let declared = u32::from_le_bytes(lenb) as usize;
+                if declared == 0 {
                     return Err(browser_reset::MALFORMED_PAYLOAD);
                 }
                 let mut opb = [0u8; 1];
@@ -3292,11 +3381,24 @@ async fn serve_browser_conn(
                     .await
                     .map_err(|_| browser_reset::MALFORMED_PAYLOAD)?;
                 let op = Op::from_byte(opb[0]).map_err(|error| error.reset_code())?;
-                if op != Op::Echo {
-                    return Err(browser_reset::NO_HANDLER);
+                // Per-op cap BEFORE the payload allocation (bn-browser-fleet-
+                // crr-exchange: CrrSync frames may exceed BROWSER_MAX_FRAME up
+                // to BROWSER_MAX_CRR_FRAME; Echo keeps its tighter cap).
+                let len = check_len_for(op, lenb).map_err(|error| error.reset_code())?;
+                if len == 0 {
+                    return Err(browser_reset::MALFORMED_PAYLOAD);
                 }
-                if len - 1 > BROWSER_MAX_ECHO {
-                    return Err(browser_reset::FRAME_TOO_LARGE);
+                match op {
+                    Op::Echo if len - 1 > BROWSER_MAX_ECHO => {
+                        return Err(browser_reset::FRAME_TOO_LARGE);
+                    }
+                    Op::Echo | Op::CrrSync => {}
+                    // This ALPN's fleet side serves liveness (Echo) and the DB
+                    // exchange (CrrSync); function invoke / asset pull are
+                    // served by the BROWSER half, never to it.
+                    Op::Invoke | Op::AssetGet => {
+                        return Err(browser_reset::NO_HANDLER);
+                    }
                 }
                 let bytes = u32::try_from(len - 1).map_err(|_| browser_reset::FRAME_TOO_LARGE)?;
                 let byte_permit = resources
@@ -3313,10 +3415,10 @@ async fn serve_browser_conn(
                     Ok(None) => {}
                     Ok(Some(_)) | Err(_) => return Err(browser_reset::MALFORMED_PAYLOAD),
                 }
-                Ok::<_, u32>((payload, byte_permit))
+                Ok::<_, u32>((op, payload, byte_permit))
             })
             .await;
-            let (payload, _byte_permit) = match request {
+            let (op, payload, _byte_permit) = match request {
                 Ok(Ok(request)) => request,
                 Ok(Err(code)) => {
                     reject_browser_stream(&mut send, &mut recv, code);
@@ -3327,9 +3429,46 @@ async fn serve_browser_conn(
                     return;
                 }
             };
+            let reply = match op {
+                Op::Echo => payload,
+                Op::CrrSync => {
+                    let Some(handler) = crr_handler else {
+                        reject_browser_stream(&mut send, &mut recv, browser_reset::NO_HANDLER);
+                        return;
+                    };
+                    // The handler re-checks the grant, opens the replica, and
+                    // does bounded disk IO; 30s is generous for local work and
+                    // still refuses a wedged handler explicitly.
+                    match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        handler(remote_id.clone(), payload),
+                    )
+                    .await
+                    {
+                        Ok(Ok(reply)) => reply,
+                        Ok(Err(code)) => {
+                            reject_browser_stream(&mut send, &mut recv, code);
+                            return;
+                        }
+                        Err(_) => {
+                            reject_browser_stream(
+                                &mut send,
+                                &mut recv,
+                                browser_reset::DEADLINE_EXCEEDED,
+                            );
+                            return;
+                        }
+                    }
+                }
+                Op::Invoke | Op::AssetGet => unreachable!("filtered above"),
+            };
+            if reply.len() > op.frame_cap() {
+                reject_browser_stream(&mut send, &mut recv, browser_reset::HANDLER_FAILED);
+                return;
+            }
             match tokio::time::timeout(
                 BROWSER_READ_TIMEOUT,
-                write_browser_reply(&mut send, &payload),
+                write_browser_reply(&mut send, &reply),
             )
             .await
             {

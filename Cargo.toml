@@ -86,6 +86,7 @@ hive-wg = { path = "crates/hive-wg" }
 hive-edge = { path = "crates/hive-edge" }
 hive-p2p = { path = "crates/hive-p2p" }
 hive-browser-proto = { path = "crates/hive-browser-proto" }
+hive-crsql = { path = "crates/hive-crsql" }
 hive-zkauth = { path = "crates/hive-zkauth" }
 
 # Local fork of guardian-db 0.18.0 (vendor/guardian-db): its Iroh endpoint was

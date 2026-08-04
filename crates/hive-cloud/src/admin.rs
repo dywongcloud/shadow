@@ -310,6 +310,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_admission::routes())
         // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
         .merge(crate::browser_artifacts::routes())
+        // ---- Browser-replicated database exchange (fleet-initiated pull) ----
+        .merge(crate::browser_db::routes())
         // ---- Coarse browser presence (constellation satellites) ----
         .merge(crate::browser_presence::routes())
         // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,

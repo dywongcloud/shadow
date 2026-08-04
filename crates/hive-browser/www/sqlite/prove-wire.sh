@@ -47,3 +47,29 @@ echo "== 3/4 native peer A: apply b.json, dump a-final.json"
 echo "== 4/4 compare: ten-column wire agreement incl. ts + row convergence"
 node wire-proof-node.mjs compare \
   "$WORK/a.json" "$WORK/b.json" "$WORK/a-final.json" "$WORK/b-final.json"
+
+# bn-browser-fleet-crr-exchange extension: the canonical HCB1 batch frames the
+# exchange actually rides, proven across the SAME two runtimes — the browser
+# glue's hcb1.js against hive_crsql's ChangeBatch::encode/decode.
+echo "== 5/8 HCB1: native export -> JS decode+re-encode -> byte-compare"
+(cd "$REPO_ROOT" && cargo run -q -p hive-crsql --example wire_proof -- \
+  export-hcb1 "$OLDPWD/$WORK/a.db" "$OLDPWD/$WORK/a.hcb1.hex")
+node hcb1-proof-node.mjs roundtrip "$WORK/a.hcb1.hex" "$WORK/a.hcb1.roundtrip.hex"
+cmp "$WORK/a.hcb1.hex" "$WORK/a.hcb1.roundtrip.hex" || {
+  echo "WIRE_PROOF_FAIL: hcb1.js round-trip mutated Rust-encoded frames" >&2
+  exit 1
+}
+
+echo "== 6/8 HCB1: JS encode from the wasm export -> native decode/re-encode/apply"
+node hcb1-proof-node.mjs emit "$WORK/b.json" "$WORK/b.hcb1.hex"
+rm -f "$WORK/c.db"
+(cd "$REPO_ROOT" && cargo run -q -p hive-crsql --example wire_proof -- \
+  apply-hcb1 "$OLDPWD/$WORK/c.db" "$OLDPWD/$WORK/b.hcb1.hex" "$OLDPWD/$WORK/b.hcb1.rust.hex")
+cmp "$WORK/b.hcb1.hex" "$WORK/b.hcb1.rust.hex" || {
+  echo "WIRE_PROOF_FAIL: hive-crsql re-encode mutated JS-encoded frames" >&2
+  exit 1
+}
+
+echo "== 7/8 HCB1: byte-identical both directions"
+
+echo "== 8/8 HCB1 wire agreement proven"

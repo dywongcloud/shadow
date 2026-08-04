@@ -21,6 +21,7 @@ hive-edge = { workspace = true }
 hive-wg = { workspace = true }
 hive-p2p = { workspace = true }
 hive-browser-proto = { workspace = true }
+hive-crsql = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }

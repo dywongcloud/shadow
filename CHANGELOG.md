@@ -1,5 +1,45 @@
 # Changelog
 
+## (pending) — Browser↔fleet live CRR exchange (browser_db databases replicate for real)
+
+A project that opts in via a fluid.json top-level `browser_db` block now gets a
+REAL replicated database, not just a contract: browsers holding a live,
+server-derived grant sync divergent writes both ways against a per-project
+fleet replica over one new `Op::CrrSync` op on the existing `hive/browser/0`
+ALPN, riding the repaired hive-crsql seam (per-origin-site durable watermarks,
+HCB1 canonical batches, gap/replay, transactional apply). Each request/reply
+pair is a full bidirectional anti-entropy round: the request carries the
+sender's watermarks (the responder's export selector) plus its push batches;
+the reply carries a typed apply status (ok / sync-gap / quota-exceeded /
+value-too-large / read-only / batch-refused), the responder's post-apply
+watermarks (the acknowledgement the sender persists as its push cursor), and
+the responder's bounded export — `more` means re-request, and the freshly
+applied watermarks ARE the resume cursor. Both directions of initiation work:
+browser-dialed rounds (wasm `crrSyncOn` → hive-p2p `serve_browser_conn` →
+`browser_db::sync_round`) and fleet-dialed pulls (`BrowserPool::crr_sync`,
+exposed for operators as `POST /v1/browser/dbs/sync/:endpoint_id`, metadata
+only — DB bytes never leave the CRR protocol). Grants ride the admission: a
+server-derived `db` capability block (`tenant, project, access, max_bytes,
+max_value_bytes, db_file, schema, sync_peers, expires_ms`) plus a replicated
+`BrowserAdmission.db` grant the exchange re-checks on EVERY request against
+its own admission view AND the live descriptor (Public scope additionally
+requires the live spec's `public_read`; foreign-tenant/unknown/block-removed
+are the identical refusal). Caps enforce with typed refusal + whole-batch
+rollback, never truncation; `BrowserDbPolicy.schema` (`{name, ddl}`) is how
+both halves derive schema cr-sqlite doesn't replicate. Replica files are
+platform-templated (`$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(
+project)}.db`), GC'd with the browser_artifacts blast-radius guards and a
+30-day inert grace. Witnessed live on a real two-process setup (local
+hive-cloud with enforced JWT + embedded relay, real Chrome tab running the
+sqlite DedicatedWorker against OPFS): bidirectional convergence both ways
+through the wire op, fleet-initiated pull, reload resuming from durable
+watermarks with zero re-push, hand-crafted gap refused typed with no partial
+state, oversized/quota pushes refused typed with rollback, revocation cutting
+replication + OPFS wipe, and the pre-change-binary refusal contrast
+(`HIVE_BROWSER_DB_LISTEN=0` → NO_HANDLER). See
+`docs/browser-db-contract.md` and AGENTS.md's browser-replicated-databases
+section.
+
 ## (pending) — Auto-deploy webhook-less git projects by polling the tracked branch
 
 `git push` silently never deployed for any project imported as a plain public

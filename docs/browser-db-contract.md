@@ -42,7 +42,11 @@ A project gets a browser database ONLY by opting in through a **top-level**
   "browser_db": {
     "max_bytes": 134217728,
     "max_value_bytes": 2097152,
-    "public_read": false
+    "public_read": false,
+    "schema": [
+      { "name": "items",
+        "ddl": "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY NOT NULL, label TEXT);" }
+    ]
   }
 }
 ```
@@ -55,6 +59,7 @@ platform default, over-ceiling clamps with a build-log note):
 | `max_bytes`       | u64  | 64 MiB    | 1 GiB       | Per-replica total size cap, enforced on BOTH the browser OPFS copy and every fleet-side replica file. |
 | `max_value_bytes` | u64  | 1 MiB     | 16 MiB      | Single change-value payload cap (one `crsql_changes` `val`), enforced at the sync boundary in both directions. |
 | `public_read`     | bool | `false`   | —           | Allow PUBLIC-scope admissions a READ-ONLY replica (§3). |
+| `schema`          | list | `[]`      | —           | `{name, ddl}` per CRR-tracked table. cr-sqlite v0.17 does NOT replicate schema inside `crsql_changes`, so both replica halves derive it from THIS spec: the fleet reconcile applies each `ddl` + `crsql_as_crr(name)` to the replica file; the admission `db` capability hands the same list to the browser verbatim. `name` must be identifier-shaped (`[A-Za-z_][A-Za-z0-9_]*`); author each `ddl` idempotent. Empty schema = no tracked tables (exports are empty; applies of unknown tables fail loudly, never silently diverge). |
 
 Validation discipline — the same as `BrowserPolicy`'s, one level up:
 
@@ -116,8 +121,13 @@ tenant-pinned, short-leased, server-derived, and they die with the admission.
   carries `browser_db`, the admit/renewal response's capability block gains a
   server-derived `db` section, one atomic snapshot with the rest of the
   capability: `{ tenant, project, access, max_bytes, max_value_bytes,
-  db_file, expires_ms }`. `db_file` is the platform-derived replica name (§6);
-  `access` is `read_write` or `read_only`; `expires_ms` is the admission's own
+  db_file, schema, sync_peers, expires_ms }`. `db_file` is the
+  platform-derived replica name (§6); `access` is `read_write` or
+  `read_only`; `schema` is the spec's table list verbatim (the browser's
+  only schema source — §1); `sync_peers` is the small list of healthy fleet
+  `{endpoint_id, addr_json}` the browser may dial for sync rounds (the
+  `trusted_callers` discipline: server-derived from the live registry,
+  health-filtered, never client input); `expires_ms` is the admission's own
   expiry. The admission record's `db` field is the replicated grant the
   exchange checks.
 - **Tenant pinning.** The grant's tenant is the authenticated session's tenant
@@ -239,9 +249,15 @@ component**; names are constructed from a platform-owned template.
   precisely why the name is platform-derived and grant-scoped rather than
   anything the page supplies.
 - **Authorization of file access:** the exchange derives the file name from
-  the GRANT it resolved (tenant+project → template), never from a wire-supplied
-  name or path. There is no request field that names a file — the same rule as
-  the artifact GET validating its digest before it ever becomes a path
+  the GRANT it resolved (tenant+project → template), never from a
+  wire-supplied name or path. The sync request carries a `db_file` field,
+  but it is a grant IDENTIFIER, not a path: the browser echoes the name its
+  own server-derived capability carried, the fleet compares it against the
+  name it derived from the live grant, and a mismatch is the same refusal
+  as no grant (a stale capability — the endpoint re-admitted to a different
+  deployment — can never contaminate another project's replica). Only the
+  server-derived name ever reaches the filesystem — the same rule as the
+  artifact GET validating its digest before it ever becomes a path
   component.
 - **Database identity vs file name:** the CRR identity of a replica is its
   `crsql_site_id` INSIDE the file, and convergence is by per-site watermarks —
@@ -282,20 +298,35 @@ component**; names are constructed from a platform-owned template.
 fluid-gateway's `view_of`); `BrowserDbPolicy::resolve()` →
 `ResolvedBrowserDbPolicy`; platform constants
 `BROWSER_DB_MAX_BYTES_DEFAULT/MAX`, `BROWSER_DB_VALUE_MAX_BYTES_DEFAULT/MAX`.
-No existing type changed shape; pre-upgrade peers serialize and parse exactly
-as before.
+The exchange row added one additive field: `BrowserDbPolicy.schema:
+Vec<BrowserDbTable>` (`{name, ddl}`, default empty — §1; validated at
+`resolve()`, never hard-failed). No pre-existing type changed shape;
+pre-upgrade peers serialize and parse exactly as before.
 
 ## 9. Deliberately deferred
 
-To the exchange row (bn-browser-fleet-crr-exchange): the wire transport/ALPN
-and stream discipline; sync scheduling and fleet-fleet replication topology;
-the admission record + capability `db` block implementation; the build-path
-wiring that resolves the block and logs `notes`; the replica GC loop and its
-env knobs; the browser-side glue that maps the capability to worker `open` /
-`changes-since` / `apply` calls and enforces OPFS-side caps.
+Landed with the exchange row (bn-browser-fleet-crr-exchange): the wire
+transport (one `Op::CrrSync` op on the existing `hive/browser/0` ALPN, both
+directions of initiation — browser-dialed rounds via the wasm `crrSyncOn`,
+fleet-dialed rounds via `hive_p2p::BrowserPool::crr_sync`); the admission
+record + capability `db` block; the fleet reconcile/GC loop and its env
+knobs (`HIVE_BROWSER_DB_RECONCILE_SECS`,
+`HIVE_BROWSER_DB_INERT_GRACE_SECS`, `HIVE_BROWSER_DB_GC_GRACE_SECS`,
+`HIVE_BROWSER_DB_GC_MAX_REAP_FRACTION`); the browser-side glue
+(`www/sqlite/hcb1.js`, `sync-client.js`, the worker's
+`sync-state`/`sync-export`/`sync-apply`/`wipe` ops) that maps the capability
+to worker calls and enforces the OPFS-side caps; the build-path resolution
+of the block. Sync cadence in v1 is caller-driven (the glue syncs on write
+and on demand; there is no server-pushed invalidation yet — a fleet-side
+writer is only ever picked up on the next browser-initiated round).
+Fleet-fleet replica convergence flows through browser carriers (a Team
+browser that synced node A's changes pushes them to node B's replica on its
+next round — per-site watermarks make this exactly the same protocol); a
+direct fleet↔fleet arm is a later row, not a correctness hole, because the
+contract's system of record only ever converges THROUGH granted writers.
 
 Beyond the exchange row: direct server-function database access (injected
 DSN / host op), per-tenant aggregate fleet quota and billing treatment,
-multiple named databases per project, dashboard surfacing, and any cross-
-project sharing. None of these are needed to implement the exchange, and each
-changes this contract when it lands.
+multiple named databases per project, dashboard surfacing, server-pushed
+sync scheduling, and any cross-project sharing. None of these are needed to
+implement the exchange, and each changes this contract when it lands.

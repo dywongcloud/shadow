@@ -54,6 +54,13 @@ export class BrowserNode {
      */
     close(): Promise<void>;
     /**
+     * Outbound CRR sync round: dial `peer_addr_json` (a fleet node from the
+     * admission capability's server-derived peer set), send one encoded
+     * `Op::CrrSync` request, return the reply frame verbatim. The glue
+     * (sqlite-worker side) owns all CRR semantics; this is pure transport.
+     */
+    crrSyncOn(peer_addr_json: string, request: Uint8Array): Promise<Uint8Array>;
+    /**
      * Outbound test: dial `peer_addr_json` on `hive/browser/0`, send `msg` as
      * an [`Op::Echo`] request, and return the echoed reply. Proves the browser
      * node's OUTBOUND path (browser → relay → peer) in addition to the
@@ -64,6 +71,12 @@ export class BrowserNode {
      * Grant one authenticated endpoint permission to pull one exact asset.
      */
     grantAsset(endpoint_id: string, digest: string): boolean;
+    /**
+     * Grant one TLS-authenticated fleet endpoint permission to run CRR sync
+     * rounds against this node's replica. Boot-empty: nothing may sync until
+     * the admission capability's server-derived peer set is granted.
+     */
+    grantCrrSync(endpoint_id: string): boolean;
     /**
      * Grant one TLS-authenticated iroh endpoint permission to invoke exactly
      * one pinned code digest. The boot-empty map is the execution boundary;
@@ -94,6 +107,11 @@ export class BrowserNode {
      * every chunk, so revocation also stops a transfer already in progress.
      */
     revokeAsset(endpoint_id: string, digest: string): boolean;
+    /**
+     * Revoke one endpoint's sync grant. Existing pooled connections re-read
+     * the set per request, so revocation also stops a session in progress.
+     */
+    revokeCrrSync(endpoint_id: string): boolean;
     /**
      * Revoke one exact endpoint/digest scope. Idempotent: a valid but absent
      * scope returns `false`; malformed IDs/digests throw without mutation.
@@ -128,6 +146,15 @@ export class BrowserNode {
      * grants nobody; each caller still needs an exact endpoint/digest scope.
      */
     setAssetHandler(handler: Function): void;
+    /**
+     * Register the trusted local responder for inbound [`Op::CrrSync`]
+     * requests (bn-browser-fleet-crr-exchange): `(requestBytes, signal) =>
+     * Promise<Uint8Array>` — the sqlite-worker glue decodes the round,
+     * applies/exports against the OPFS replica, and returns the reply frame.
+     * Installing a handler grants nobody; each caller still needs an exact
+     * endpoint grant via `grantCrrSync`.
+     */
+    setCrrSyncHandler(handler: Function): void;
     /**
      * Register the trusted resolver called for every authorized
      * [`Op::Invoke`] request. `handler` is
@@ -217,18 +244,22 @@ export interface InitOutput {
     readonly browsernode_assetOn: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly browsernode_boot: (a: number, b: number, c: number, d: number, e: number, f: number) => any;
     readonly browsernode_close: (a: number) => any;
+    readonly browsernode_crrSyncOn: (a: number, b: number, c: number, d: any) => any;
     readonly browsernode_echoTo: (a: number, b: number, c: number, d: number, e: number) => any;
     readonly browsernode_grantAsset: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly browsernode_grantCrrSync: (a: number, b: number, c: number) => [number, number, number];
     readonly browsernode_grantInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly browsernode_invokeOn: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => any;
     readonly browsernode_nodeId: (a: number) => [number, number];
     readonly browsernode_removeRelay: (a: number, b: number, c: number) => any;
     readonly browsernode_revokeAsset: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+    readonly browsernode_revokeCrrSync: (a: number, b: number, c: number) => [number, number, number];
     readonly browsernode_revokeInvoker: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
     readonly browsernode_secretHex: (a: number) => [number, number];
     readonly browsernode_servedCount: (a: number) => bigint;
     readonly browsernode_setAddressHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setAssetHandler: (a: number, b: any) => [number, number];
+    readonly browsernode_setCrrSyncHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
     readonly browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];
     readonly browsernode_statusJson: (a: number) => [number, number];

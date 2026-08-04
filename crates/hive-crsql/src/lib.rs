@@ -62,6 +62,11 @@
 use rusqlite::Connection;
 use std::path::PathBuf;
 
+/// Re-exported so consumers (hive-cloud's browser_db exchange) can name the
+/// connection type in signatures without pinning their own rusqlite version —
+/// one SQLite build links into the fleet binary, not two.
+pub use rusqlite;
+
 /// Resolves the loadable extension path (WITHOUT platform suffix — SQLite's
 /// own `sqlite3_load_extension` appends `.dylib`/`.so`/`.dll` itself, and
 /// passing one explicitly makes the lookup silently fail on the wrong
@@ -164,6 +169,22 @@ pub struct Change {
 /// larger than this still travels as one oversize batch so its changes apply
 /// atomically.
 pub const DEFAULT_MAX_BATCH_CHANGES: usize = 256;
+
+/// The canonical payload-size measure of one change's `val` — the number the
+/// sync boundary's `max_value_bytes` cap is enforced against on BOTH sides
+/// (docs/browser-db-contract.md §4), so the fleet and the browser worker must
+/// agree byte-for-byte: the value's HCB1 wire cost — 1 tag byte plus payload
+/// (integer/real: 8; text/blob: a 4-byte length + the bytes; null: tag only).
+/// The browser half (`www/sqlite/hcb1.js`) carries this exact formula; change
+/// it here and it must change there, same discipline as the HCB1 layout.
+pub fn val_payload_bytes(val: &rusqlite::types::Value) -> u64 {
+    match val {
+        rusqlite::types::Value::Null => 1,
+        rusqlite::types::Value::Integer(_) | rusqlite::types::Value::Real(_) => 9,
+        rusqlite::types::Value::Text(s) => 5 + s.len() as u64,
+        rusqlite::types::Value::Blob(b) => 5 + b.len() as u64,
+    }
+}
 
 /// One bounded, deterministically-ordered unit of sync: changes from exactly
 /// ONE origin site, ascending by `(db_version, seq)`, chained to the

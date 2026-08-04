@@ -573,6 +573,63 @@ The contract the browser↔fleet CRR exchange implements is
   precedent), and no owner-proxy HTTP arm serves DB bytes: a file copy is not
   a merge.
 
+The exchange itself (bn-browser-fleet-crr-exchange, landed):
+
+- **One `Op::CrrSync` op on the existing `hive/browser/0` ALPN carries whole
+  bidirectional rounds.** Request = the sender's per-site watermarks (the
+  responder's export selector) + its outbound HCB1 batches; reply = a typed
+  apply status (ok / sync-gap / quota-exceeded / value-too-large /
+  read-only / batch-refused), the responder's watermarks AFTER apply (the
+  acknowledgement the sender persists as its push cursor), and the
+  responder's bounded export — `more` means re-request, and the requester's
+  freshly applied watermarks ARE the resume cursor (no cursor state to
+  lose). Sync-domain refusals are reply STATUSES; protocol faults stay
+  stream reset codes. The op gets its own 4 MiB frame cap
+  (`BROWSER_MAX_CRR_FRAME`, checked per-op before allocation on both
+  halves); every other op keeps 1 MiB.
+- **The fleet re-checks the grant on EVERY request against its own
+  replicated admission view** (`browser_db::resolve_round_grant`): live
+  admission + `db` grant on the record + the deployment descriptor STILL
+  carrying the block, and for Public scope the LIVE spec still saying
+  `public_read`. Unknown project, foreign tenant and block-removed are the
+  identical FORBIDDEN — no existence leak. Tenant+project+file are derived
+  server-side from the QUIC-authenticated endpoint's admission; the
+  request's `db_file` field is a grant IDENTIFIER only (the browser echoes
+  its capability's name; the fleet compares it against its own
+  server-derived name and refuses a mismatch — a stale capability can never
+  contaminate another project's replica, and the wire value never becomes a
+  path).
+- **cr-sqlite v0.17 does not replicate schema — both halves derive it from
+  the spec.** `BrowserDbPolicy.schema` (`{name, ddl}` per table) rides the
+  deployment record and is handed to the browser verbatim in the capability;
+  the fleet reconcile applies the same DDL + `crsql_as_crr(name)` (which is
+  idempotent) to the replica file. `val_payload_bytes` (hive-crsql and
+  `hcb1.js`) is ONE formula with two implementations, same discipline as the
+  HCB1 layout and the policy digest — the cap check must agree byte-for-byte
+  on both sides.
+- **The browser's push cursor is a non-CRR `hive_sync_meta` table INSIDE the
+  OPFS file** (the fleet's acknowledged watermarks per site), so a tab
+  reload resumes incrementally — witnessed: after reload, zero re-push and
+  zero re-apply before the next write. Revocation cuts replication at the
+  op-level re-check (already-open connections included), then the browser
+  wipes its OPFS replica (the worker's `wipe` op → the VFS's own `xDelete`).
+- **Fleet-fleet convergence flows through browser carriers in v1** (a Team
+  browser that synced node A's changes pushes them to node B's replica —
+  per-site watermarks make it the same protocol); a direct fleet↔fleet arm
+  and server-pushed scheduling are deliberate follow-ups, not correctness
+  holes.
+- **Replica GC keeps the blast-radius guards** (`browser_artifacts::gc`
+  verbatim): empty keep-set refuses the pass, reap set over
+  `HIVE_BROWSER_DB_GC_MAX_REAP_FRACTION` (0.5) refuses, only files past BOTH
+  `HIVE_BROWSER_DB_INERT_GRACE_SECS` (30 days, the block-removed/project-
+  deleted retention) and `HIVE_BROWSER_DB_GC_GRACE_SECS` (600) reap.
+- **Env that matters:** `HIVE_BROWSER_DB_LISTEN=0` disables the serve arm
+  (rollout/ops: `Op::CrrSync` then gets NO_HANDLER — exactly a pre-change
+  binary's refusal class); `HIVE_BROWSER_DB_RECONCILE_SECS` (30);
+  `HIVE_CRSQL_EXTENSION_PATH` points at the packaged cr-sqlite extension on
+  fleet nodes (the vendored build is the local-dev default; a missing
+  extension is a loud WARN + refused rounds, never a boot failure).
+
 ## Tenant volume isolation (verified, keep it this way)
 
 - **A project name can never become a host path, and that is load-bearing.**

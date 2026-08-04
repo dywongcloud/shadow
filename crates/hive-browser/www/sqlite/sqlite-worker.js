@@ -27,6 +27,19 @@
 // opfs-sahpool VFS, which the official sqlite.org wasm build cannot provide
 // here because crsql must be statically linked in).
 //
+// SQL EXECUTION LAYER (bn-browser-fleet-crr-exchange, hard-won): every SQL
+// call goes through SYNCHRONOUS `Module.ccall` primitives -- the exact
+// pattern wire-proof-node.mjs runs under Node -- never wa-sqlite's async
+// API. Two independent failure modes forced this: (1) the pinned
+// `sqlite3.prepare_v2` takes a C-string POINTER, not a JS string, and fails
+// opaquely ("not an error") on a JS string; (2) wa-sqlite's async
+// (Asyncify) call machinery intermittently never resumes for the extension
+// calls under AccessHandlePoolVFS (`SELECT crsql_as_crr(...)` committed its
+// work but the continuation never fired). Synchronous ccall has neither
+// problem, and the VFS's xRead/xWrite are synchronous by design
+// (FileSystemSyncAccessHandle), so nothing needs Asyncify. wa-sqlite is
+// used ONLY for what genuinely needs it: VFS registration and open/close.
+//
 // Message protocol (structured-clone JSON, versioned envelope):
 //   -> { proto: 'hive-sqlite-worker/1', id, op: 'open',  db?: string }
 //   <- { proto, id, op: 'opened', persisted: true|false|'unknown', quota?, usage? }
@@ -34,12 +47,23 @@
 //   -> { proto, id, op: 'exec', sql }                         (no params -- literal SQL only)
 //   <- { proto, id, op: 'rows', rows: [][] }
 //   <- { proto, id, op: 'sql-error', name, message }
-//   -> { proto, id, op: 'as-crr', table }
+//   -> { proto, id, op: 'as-crr', table }                    <- { proto, id, op: 'rows', rows: [] }
 //   -> { proto, id, op: 'set-ts', ts }        (per-transaction u64 decimal string; see hive_crsql::set_ts)
+//                                                                <- { proto, id, op: 'rows', rows: [] }
 //   -> { proto, id, op: 'changes-since', since: number }
 //   <- { proto, id, op: 'changes', changes: WireChange[] }  (ten-column v0.17 wire, see wire-proof-node.mjs)
 //   -> { proto, id, op: 'apply', changes: WireChange[] }
 //   <- { proto, id, op: 'applied', count }
+//   -- CRR exchange ops (bn-browser-fleet-crr-exchange; HCB1 batches as hex,
+//      semantics mirror hive_crsql's seam exactly, see the section below):
+//   -> { proto, id, op: 'sync-state' }
+//   <- { proto, id, op: 'sync-state', siteId, watermarks: [{siteId, version}] }
+//   -> { proto, id, op: 'sync-export', since: {siteHex: version}, maxValueBytes, maxBatchChanges? }
+//   <- { proto, id, op: 'sync-batches', batches: [hex], skippedOversized, firstOversized }
+//   -> { proto, id, op: 'sync-apply', batches: [hex], maxValueBytes, maxBytes }
+//   <- { proto, id, op: 'sync-apply-done', outcomes: [{status: 'applied'|'replay'|'gap'|'value-too-large'|'quota-exceeded', ...}] }
+//   -> { proto, id, op: 'wipe' }          (revocation consequence: close + destroy the OPFS association)
+//   <- { proto, id, op: 'wiped' }
 // Every reply carries the request's id; failures are 'sql-error' replies to
 // the failing op, never a thrown-away promise. Ops before a successful
 // 'opened' get an immediate 'sql-error' -- the worker never hangs a caller.
@@ -47,13 +71,26 @@
 import SQLiteESMFactory from './crsqlite-sync.mjs';
 import * as SQLite from './wa-sqlite/sqlite-api.js';
 import { AccessHandlePoolVFS } from './wa-sqlite/examples/AccessHandlePoolVFS.js';
+import {
+  encodeBatch, decodeBatch, valPayloadBytes, toHex as hcbToHex, fromHex as hcbFromHex,
+} from './hcb1.js';
 
 const PROTO = 'hive-sqlite-worker/1';
 const OPFS_DIR = '/hive-crsql'; // AccessHandlePoolVFS owns this whole flat OPFS directory
 const DEFAULT_DB = 'main.db';
+// The seam's export chunk bound (hive_crsql::DEFAULT_MAX_BATCH_CHANGES) — the
+// contract names it so the exchange never invents a second one.
+const MAX_BATCH_CHANGES = 256;
 
-let sqlite3 = null;
+const SQLITE_ROW = 100, SQLITE_DONE = 101;
+const SQLITE_INTEGER = 1, SQLITE_FLOAT = 2, SQLITE_TEXT = 3, SQLITE_BLOB = 4, SQLITE_NULL = 5;
+const SQLITE_TRANSIENT = -1; // sqlite copies the bound value during the call
+
+let module = null; // the emscripten module (raw ccall surface)
+let sqlite3 = null; // wa-sqlite Factory handle — VFS registration/open/close ONLY
 let db = null;
+let vfs = null;
+let dbName = null;
 
 function reply(id, op, fields) {
   self.postMessage({ proto: PROTO, id, op, ...fields });
@@ -67,6 +104,97 @@ function errorReply(id, op, err) {
     name: String(err?.name ?? 'Error'),
     message: String(err?.message ?? err),
   });
+}
+
+// ---- synchronous SQL primitives (see the header note) ----------------------
+
+function ccall(name, argTypes, args, ret = 'number') {
+  return module.ccall(name, ret, argTypes, args);
+}
+
+function errmsg() {
+  return ccall('sqlite3_errmsg', ['number'], [db], 'string');
+}
+
+// Literal single-statement SQL with no result rows needed (DDL, scalar
+// extension calls, tx control). For row-returning SQL use queryAll.
+function execSql(sql) {
+  const errPtr = module._malloc(4);
+  module.setValue(errPtr, 0, 'i32');
+  const rc = ccall('sqlite3_exec', ['number', 'string', 'number', 'number', 'number'], [db, sql, 0, 0, errPtr]);
+  if (rc !== 0) {
+    const msgPtr = module.getValue(errPtr, 'i32');
+    const msg = msgPtr ? module.UTF8ToString(msgPtr) : errmsg();
+    module._free(errPtr);
+    throw new Error(`sqlite exec rc=${rc}: ${msg} :: ${JSON.stringify(sql)}`);
+  }
+  module._free(errPtr);
+}
+
+function prepareStmt(sql) {
+  const out = module._malloc(4);
+  module.setValue(out, 0, 'i32');
+  const rc = ccall('sqlite3_prepare_v2', ['number', 'string', 'number', 'number', 'number'], [db, sql, -1, out, 0]);
+  if (rc !== 0) {
+    const msg = errmsg();
+    module._free(out);
+    throw new Error(`prepare rc=${rc}: ${msg} :: ${JSON.stringify(sql)}`);
+  }
+  const stmt = module.getValue(out, 'i32');
+  module._free(out);
+  if (!stmt) throw new Error(`prepare produced no statement: ${JSON.stringify(sql)}`);
+  return stmt;
+}
+
+function columnValue(stmt, i) {
+  const t = ccall('sqlite3_column_type', ['number', 'number'], [stmt, i]);
+  if (t === SQLITE_TEXT) return ccall('sqlite3_column_text', ['number', 'number'], [stmt, i], 'string');
+  if (t === SQLITE_INTEGER) return ccall('sqlite3_column_int64', ['number', 'number'], [stmt, i]);
+  if (t === SQLITE_FLOAT) return ccall('sqlite3_column_double', ['number', 'number'], [stmt, i]);
+  if (t === SQLITE_BLOB) {
+    const n = ccall('sqlite3_column_bytes', ['number', 'number'], [stmt, i]);
+    const p = ccall('sqlite3_column_blob', ['number', 'number'], [stmt, i]);
+    return new Uint8Array(module.HEAPU8.buffer, p, n).slice();
+  }
+  return null; // SQLITE_NULL (and anything unexpected — never fabricate a value)
+}
+
+function queryAll(sql, bind) {
+  const stmt = prepareStmt(sql);
+  const rows = [];
+  try {
+    bind && bind(stmt);
+    let rc;
+    while ((rc = ccall('sqlite3_step', ['number'], [stmt])) === SQLITE_ROW) {
+      const ncol = ccall('sqlite3_column_count', ['number'], [stmt]);
+      const row = [];
+      for (let i = 0; i < ncol; i++) row.push(columnValue(stmt, i));
+      rows.push(row);
+    }
+    if (rc !== SQLITE_DONE) throw new Error(`step rc=${rc}: ${JSON.stringify(sql)}`);
+  } finally {
+    ccall('sqlite3_finalize', ['number'], [stmt]);
+  }
+  return rows;
+}
+
+function bindText(stmt, idx, s) {
+  ccall('sqlite3_bind_text', ['number', 'number', 'string', 'number', 'number'], [stmt, idx, s, -1, SQLITE_TRANSIENT]);
+}
+function bindBlob(stmt, idx, bytes) {
+  const p = module._malloc(bytes.length || 1);
+  module.HEAPU8.set(bytes, p);
+  ccall('sqlite3_bind_blob', ['number', 'number', 'number', 'number', 'number'], [stmt, idx, p, bytes.length, SQLITE_TRANSIENT]);
+  module._free(p); // SQLITE_TRANSIENT copied it during bind
+}
+function bindInt(stmt, idx, v) {
+  ccall('sqlite3_bind_int64', ['number', 'number', 'number'], [stmt, idx, v]);
+}
+function bindDouble(stmt, idx, v) {
+  ccall('sqlite3_bind_double', ['number', 'number', 'number'], [stmt, idx, v]);
+}
+function bindNull(stmt, idx) {
+  ccall('sqlite3_bind_null', ['number', 'number'], [stmt, idx]);
 }
 
 async function requestPersistence() {
@@ -88,10 +216,9 @@ async function storageEstimate() {
   }
 }
 
-async function open(id, dbName) {
+async function open(id, name) {
   const persisted = await requestPersistence();
 
-  let module, vfs;
   try {
     module = await SQLiteESMFactory();
     sqlite3 = SQLite.Factory(module);
@@ -103,7 +230,8 @@ async function open(id, dbName) {
     vfs = new AccessHandlePoolVFS(OPFS_DIR);
     await vfs.isReady;
     sqlite3.vfs_register(vfs, true);
-    db = await sqlite3.open_v2(dbName ?? DEFAULT_DB);
+    dbName = name ?? DEFAULT_DB;
+    db = await sqlite3.open_v2(dbName);
   } catch (err) {
     db = null;
     errorReply(id, 'open-error', err);
@@ -115,88 +243,65 @@ async function open(id, dbName) {
 }
 
 async function exec(id, sql) {
-  const rows = [];
-  await sqlite3.exec(db, sql, (row) => {
-    rows.push(row);
-  });
-  reply(id, 'rows', { rows });
+  reply(id, 'rows', { rows: queryAll(sql) });
 }
 
-// Prepare/bind/step-to-DONE/finalize for the scalar SQL ops (as-crr, set-ts)
-// -- the pinned API's exec() takes no bind parameters.
-async function execScalar(sql, bind) {
-  const prepared = await sqlite3.prepare_v2(db, sql);
-  if (!prepared) throw new Error(`prepare produced no statement: ${JSON.stringify(sql)}`);
-  const stmt = prepared.stmt;
-  try {
-    bind && (await bind(stmt));
-    let rc;
-    while ((rc = await sqlite3.step(stmt)) === SQLite.SQLITE_ROW) { /* discard result rows */ }
-    if (rc !== SQLite.SQLITE_DONE) throw new Error(`step rc=${rc}: ${JSON.stringify(sql)}`);
-  } finally {
-    await sqlite3.finalize(stmt);
-  }
+// The scalar extension ops (as-crr, set-ts) via the synchronous exec path.
+// execSql takes no bind parameters, so call sites interpolate ONLY
+// pre-validated values: as-crr's table name is regex-checked to a bare
+// identifier first, set-ts's value to decimal digits — no free text ever
+// reaches this interpolation. These ops REPLY with an empty 'rows' like
+// 'exec' — a silent success is indistinguishable from a hung op to the
+// caller (that exact confusion cost a debugging round here).
+async function execScalar(id, sql) {
+  execSql(sql);
+  reply(id, 'rows', { rows: [] });
 }
 
 // The ten-column crsql_changes v0.17 wire, vtab declared order -- identical
 // shape to hive_crsql::Change and wire-proof-node.mjs's dump (pk/site_id as
 // hex, val tagged). Any change here is a wire break against the fleet.
 async function changesSince(id, since) {
-  const changes = [];
-  const prepared = await sqlite3.prepare_v2(
-    db,
+  const rows = queryAll(
     'SELECT "table","pk","cid","val","col_version","db_version","site_id","cl","seq","ts"' +
-    ' FROM crsql_changes WHERE db_version > ?1');
-  if (!prepared) throw new Error('prepare produced no statement for crsql_changes read');
-  const stmt = prepared.stmt;
-  try {
-    await sqlite3.bind_int(stmt, 1, since | 0);
-    while (await sqlite3.step(stmt) === SQLite.SQLITE_ROW) {
-      const [table, pk, cid, val, col_version, db_version, site_id, cl, seq, ts] =
-        sqlite3.row(stmt);
-      changes.push({
-        table,
-        pk: toHex(pk),
-        cid,
-        val: taggedVal(val),
-        col_version, db_version,
-        site_id: toHex(site_id),
-        cl, seq, ts,
-      });
-    }
-  } finally {
-    await sqlite3.finalize(stmt);
-  }
+    ' FROM crsql_changes WHERE db_version > ?1',
+    (stmt) => bindInt(stmt, 1, since | 0));
+  const changes = rows.map(([table, pk, cid, val, col_version, db_version, site_id, cl, seq, ts]) => ({
+    table,
+    pk: toHex(pk),
+    cid,
+    val: taggedVal(val),
+    col_version, db_version,
+    site_id: toHex(site_id),
+    cl, seq, ts,
+  }));
   reply(id, 'changes', { changes });
 }
 
 async function applyChanges(id, changes) {
-  const prepared = await sqlite3.prepare_v2(
-    db,
+  const stmt = prepareStmt(
     'INSERT INTO crsql_changes ("table","pk","cid","val","col_version","db_version","site_id","cl","seq","ts")' +
     ' VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)');
-  if (!prepared) throw new Error('prepare produced no statement for crsql_changes insert');
-  const stmt = prepared.stmt;
   let count = 0;
   try {
     for (const c of changes) {
-      await sqlite3.bind_text(stmt, 1, c.table);
-      await sqlite3.bind_blob(stmt, 2, fromHex(c.pk));
-      await sqlite3.bind_text(stmt, 3, c.cid);
-      await bindVal(stmt, 4, c.val);
-      await sqlite3.bind_int(stmt, 5, c.col_version);
-      await sqlite3.bind_int(stmt, 6, c.db_version);
-      await sqlite3.bind_blob(stmt, 7, fromHex(c.site_id));
-      await sqlite3.bind_int(stmt, 8, c.cl);
-      await sqlite3.bind_int(stmt, 9, c.seq);
-      await sqlite3.bind_text(stmt, 10, c.ts);
-      const rc = await sqlite3.step(stmt);
-      if (rc !== SQLite.SQLITE_DONE) throw new Error(`crsql_changes insert rc=${rc}`);
+      bindText(stmt, 1, c.table);
+      bindBlob(stmt, 2, fromHex(c.pk));
+      bindText(stmt, 3, c.cid);
+      bindVal(stmt, 4, c.val);
+      bindInt(stmt, 5, c.col_version);
+      bindInt(stmt, 6, c.db_version);
+      bindBlob(stmt, 7, fromHex(c.site_id));
+      bindInt(stmt, 8, c.cl);
+      bindInt(stmt, 9, c.seq);
+      bindText(stmt, 10, c.ts);
+      const rc = ccall('sqlite3_step', ['number'], [stmt]);
+      if (rc !== SQLITE_DONE) throw new Error(`crsql_changes insert rc=${rc}`);
       count++;
-      await sqlite3.reset(stmt);
+      ccall('sqlite3_reset', ['number'], [stmt]);
     }
   } finally {
-    await sqlite3.finalize(stmt);
+    ccall('sqlite3_finalize', ['number'], [stmt]);
   }
   reply(id, 'applied', { count });
 }
@@ -216,13 +321,241 @@ function taggedVal(v) {
   if (typeof v === 'number') return Number.isInteger(v) ? { Integer: v } : { Real: v };
   return { Text: String(v) };
 }
-async function bindVal(stmt, idx, v) {
-  if ('Null' in v) return sqlite3.bind_null(stmt, idx);
-  if ('Integer' in v) return sqlite3.bind_int(stmt, idx, v.Integer);
-  if ('Real' in v) return sqlite3.bind_double(stmt, idx, v.Real);
-  if ('Text' in v) return sqlite3.bind_text(stmt, idx, v.Text);
-  if ('Blob' in v) return sqlite3.bind_blob(stmt, idx, fromHex(v.Blob));
+function bindVal(stmt, idx, v) {
+  if ('Null' in v) return bindNull(stmt, idx);
+  if ('Integer' in v) return bindInt(stmt, idx, v.Integer);
+  if ('Real' in v) return bindDouble(stmt, idx, v.Real);
+  if ('Text' in v) return bindText(stmt, idx, v.Text);
+  if ('Blob' in v) return bindBlob(stmt, idx, fromHex(v.Blob));
   throw new Error(`bad wire val ${JSON.stringify(v)}`);
+}
+
+// ---- CRR exchange ops (bn-browser-fleet-crr-exchange) ----------------------
+// The worker half of the browser↔fleet sync: it owns the OPFS replica and
+// speaks HCB1 batches (hcb1.js, byte-identical to hive_crsql's canonical
+// form); the page-side glue (sync-client.js) owns the wire transport. The
+// semantics here mirror hive_crsql's seam EXACTLY — per-origin-site durable
+// watermarks from crsql_db_versions, gap/replay, one transaction per batch —
+// this is the second implementation of the same contract, not a new one.
+
+// Wire versions are Numbers at the SQL boundary (bind/row APIs take f64) and
+// BigInt inside HCB1 frames; conversions happen at exactly those two seams.
+// A db_version past 2^53 is outside anything a browser replica can produce.
+
+function watermarkForSite(siteBytes) {
+  const rows = queryAll(
+    'SELECT db_version FROM crsql_db_versions WHERE site_id = ?1',
+    (stmt) => bindBlob(stmt, 1, siteBytes));
+  return rows.length ? Number(rows[0][0]) : 0;
+}
+
+function dbBytes() {
+  const pages = queryAll('PRAGMA page_count');
+  const size = queryAll('PRAGMA page_size');
+  return Number(pages[0][0]) * Number(size[0][0]);
+}
+
+// -> { proto, id, op: 'sync-state' }
+// <- { proto, id, op: 'sync-state', siteId, watermarks: [{siteId, version}] }
+async function syncState(id) {
+  const siteRows = queryAll('SELECT crsql_site_id()');
+  const siteId = siteRows.length ? toHex(siteRows[0][0]) : null;
+  const rows = queryAll(
+    'SELECT site_id, db_version FROM crsql_db_versions ORDER BY site_id ASC');
+  reply(id, 'sync-state', {
+    siteId,
+    watermarks: rows.map(([site, version]) => ({ siteId: toHex(site), version: Number(version) })),
+  });
+}
+
+// The worker's taggedVal ({Null}/{Integer}/{Real}/{Text}/{Blob:hex}) -> the
+// hcb1 val tag form. Both directions of the conversion stay inside this file.
+function hcbVal(v) {
+  if ('Null' in v) return { tag: 0 };
+  if ('Integer' in v) return { tag: 1, int: BigInt(v.Integer) };
+  if ('Real' in v) return { tag: 2, real: v.Real };
+  if ('Text' in v) return { tag: 3, text: v.Text };
+  return { tag: 4, blob: fromHex(v.Blob) };
+}
+
+// -> { proto, id, op: 'sync-export', since: {siteHex: version}, maxValueBytes }
+// <- { proto, id, op: 'sync-batches', batches: [hcb1 hex], skippedOversized,
+//      firstOversized: {table, pk} | null }
+// Per-site bounded export with the seam's chunking (never split one origin
+// db_version across batches) and the value cap applied at the EXPORT
+// boundary: an oversized value stays local, loudly — never truncated.
+async function syncExport(id, since, maxValueBytes, maxBatchChanges) {
+  const chunkBound = maxBatchChanges > 0 ? maxBatchChanges : MAX_BATCH_CHANGES;
+  const batches = [];
+  let skippedOversized = 0;
+  let firstOversized = null;
+  const sites = queryAll(
+    'SELECT site_id, db_version FROM crsql_db_versions ORDER BY site_id ASC');
+  for (const [siteBlob, version] of sites) {
+    const siteHex = toHex(siteBlob);
+    const sinceV = Number(since?.[siteHex] ?? 0);
+    if (Number(version) <= sinceV) continue;
+    const rows = queryAll(
+      'SELECT "table","pk","cid","val","col_version","db_version","site_id","cl","seq","ts"' +
+      ' FROM crsql_changes WHERE site_id = ?1 AND db_version > ?2 ORDER BY db_version, seq ASC',
+      (stmt) => {
+        bindBlob(stmt, 1, siteBlob);
+        bindInt(stmt, 2, sinceV);
+      });
+    const changes = [];
+    for (const [table, pk, cid, val, col_version, db_version, site_id, cl, seq, ts] of rows) {
+      const change = {
+        table, pk, cid,
+        val: hcbVal(taggedVal(val)),
+        col_version: BigInt(col_version), db_version: BigInt(db_version),
+        site_id, cl: BigInt(cl), seq: BigInt(seq), ts,
+      };
+      if (valPayloadBytes(change.val) > maxValueBytes) {
+        skippedOversized++;
+        if (!firstOversized) firstOversized = { table, pk: toHex(pk) };
+        continue;
+      }
+      changes.push(change);
+    }
+    let cur = [];
+    let batchSince = BigInt(sinceV);
+    let groupEndV = null;
+    const close = () => {
+      if (!cur.length) return;
+      batches.push(hcbToHex(encodeBatch({ site_id: siteBlob, since_db_version: batchSince, changes: cur })));
+      batchSince = cur[cur.length - 1].db_version;
+      cur = [];
+    };
+    for (const c of changes) {
+      const newGroup = groupEndV !== c.db_version;
+      if (newGroup && cur.length > 0 && cur.length >= chunkBound) close();
+      groupEndV = c.db_version;
+      cur.push(c);
+    }
+    close();
+  }
+  reply(id, 'sync-batches', { batches, skippedOversized, firstOversized });
+}
+
+// -> { proto, id, op: 'sync-apply', batches: [hcb1 hex], maxValueBytes, maxBytes }
+// <- { proto, id, op: 'sync-apply-done', outcomes: [...] }
+// The seam's apply_batch semantics, one transaction per batch: watermark
+// read, gap/replay checks, capped inserts, COMMIT — any failure ROLLBACKs the
+// whole batch (never a half-applied batch, never a truncation). Stops at the
+// first non-ok outcome; the caller re-requests from its durable watermarks.
+async function syncApply(id, batchesHex, maxValueBytes, maxBytes) {
+  const outcomes = [];
+  for (const hex of batchesHex ?? []) {
+    const batch = decodeBatch(hcbFromHex(hex));
+    const outcome = applyOneBatch(batch, maxValueBytes, maxBytes);
+    outcomes.push(outcome);
+    if (outcome.status !== 'applied' && outcome.status !== 'replay') break;
+  }
+  reply(id, 'sync-apply-done', { outcomes });
+}
+
+function applyOneBatch(batch, maxValueBytes, maxBytes) {
+  const siteHex = toHex(batch.site_id);
+  if (!batch.site_id.length) throw new Error('batch site_id must be non-empty');
+  for (const c of batch.changes) {
+    if (toHex(c.site_id) !== siteHex)
+      throw new Error('mixed-site batch refused: change site differs from batch site');
+  }
+  execSql('BEGIN IMMEDIATE');
+  const rollback = () => { try { execSql('ROLLBACK'); } catch { /* already out */ } };
+  try {
+    const w = watermarkForSite(batch.site_id);
+    const batchMax = batch.changes.length
+      ? batch.changes.reduce((m, c) => (c.db_version > m ? c.db_version : m), batch.changes[0].db_version)
+      : null;
+    const since = Number(batch.since_db_version);
+    if (batchMax === null || Number(batchMax) <= w) {
+      if (since > w) {
+        rollback();
+        return { status: 'gap', siteId: siteHex, watermark: w, batchSince: since };
+      }
+      rollback(); // nothing to write; replay is a deterministic no-op
+      return { status: 'replay', siteId: siteHex, at: w, skipped: batch.changes.length };
+    }
+    if (since > w) {
+      rollback();
+      return { status: 'gap', siteId: siteHex, watermark: w, batchSince: since };
+    }
+    for (const c of batch.changes) {
+      if (valPayloadBytes(c.val) > maxValueBytes) {
+        rollback();
+        return { status: 'value-too-large', siteId: siteHex, table: c.table, pk: toHex(c.pk), maxValueBytes };
+      }
+    }
+    const size = dbBytes();
+    const estimate = batch.changes.reduce((n, c) => n + valPayloadBytes(c.val) + 64, 0);
+    if (size >= maxBytes || size + estimate > maxBytes) {
+      rollback();
+      return { status: 'quota-exceeded', siteId: siteHex, size, maxBytes };
+    }
+    const stmt = prepareStmt(
+      'INSERT INTO crsql_changes ("table","pk","cid","val","col_version","db_version","site_id","cl","seq","ts")' +
+      ' VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)');
+    let applied = 0;
+    try {
+      for (const c of batch.changes) {
+        if (Number(c.db_version) <= w) continue; // overlap prefix: already merged
+        bindText(stmt, 1, c.table);
+        bindBlob(stmt, 2, c.pk);
+        bindText(stmt, 3, c.cid);
+        bindHcbVal(stmt, 4, c.val);
+        bindInt(stmt, 5, Number(c.col_version));
+        bindInt(stmt, 6, Number(c.db_version));
+        bindBlob(stmt, 7, c.site_id);
+        bindInt(stmt, 8, Number(c.cl));
+        bindInt(stmt, 9, Number(c.seq));
+        bindText(stmt, 10, c.ts);
+        const rc = ccall('sqlite3_step', ['number'], [stmt]);
+        if (rc !== SQLITE_DONE) throw new Error(`crsql_changes insert rc=${rc}`);
+        applied++;
+        ccall('sqlite3_reset', ['number'], [stmt]);
+      }
+    } finally {
+      ccall('sqlite3_finalize', ['number'], [stmt]);
+    }
+    const to = watermarkForSite(batch.site_id);
+    execSql('COMMIT');
+    return { status: 'applied', siteId: siteHex, from: w, to, count: applied };
+  } catch (err) {
+    rollback();
+    throw err;
+  }
+}
+
+function bindHcbVal(stmt, idx, v) {
+  if (v.tag === 0) return bindNull(stmt, idx);
+  if (v.tag === 1) return bindInt(stmt, idx, Number(v.int));
+  if (v.tag === 2) return bindDouble(stmt, idx, v.real);
+  if (v.tag === 3) return bindText(stmt, idx, v.text);
+  return bindBlob(stmt, idx, v.blob);
+}
+
+// -> { proto, id, op: 'wipe' }
+// <- { proto, id, op: 'wiped' }
+// The contract's revocation consequence (§5): close the replica and destroy
+// its OPFS association (the VFS's own xDelete — the same call SQLite itself
+// makes to delete a database). After this the replica is GONE: a later
+// 'open' starts from an empty file with a fresh site id (safe by
+// construction — a wiped CRR peer re-syncs from watermark 0).
+async function wipe(id) {
+  if (db) {
+    try { ccall('sqlite3_close_v2', ['number'], [db]); } catch { /* closing is best-effort here */ }
+    db = null;
+  }
+  if (vfs && dbName) vfs.xDelete(dbName, 1);
+  // Release the pool's sync access handles too: a later 'open' builds a NEW
+  // pool, and Chrome refuses createSyncAccessHandle while ANY earlier handle
+  // on the same file is still open (NoModificationAllowedError).
+  if (vfs) {
+    try { await vfs.close(); } catch { /* best-effort */ }
+    vfs = null;
+  }
+  reply(id, 'wiped', {});
 }
 
 self.onmessage = (ev) => {
@@ -243,10 +576,17 @@ self.onmessage = (ev) => {
       case 'as-crr':
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(msg.table ?? ''))
           throw new Error(`as-crr: refusing non-identifier table name ${JSON.stringify(msg.table)}`);
-        return execScalar('SELECT crsql_as_crr(?1)', (stmt) => sqlite3.bind_text(stmt, 1, msg.table));
-      case 'set-ts': return execScalar('SELECT crsql_set_ts(?1)', (stmt) => sqlite3.bind_text(stmt, 1, String(msg.ts)));
+        return execScalar(id, `SELECT crsql_as_crr('${msg.table}')`);
+      case 'set-ts':
+        if (!/^[0-9]+$/.test(String(msg.ts ?? '')))
+          throw new Error(`set-ts: refusing non-decimal ts ${JSON.stringify(msg.ts)}`);
+        return execScalar(id, `SELECT crsql_set_ts('${String(msg.ts)}')`);
       case 'changes-since': return changesSince(id, msg.since ?? 0);
       case 'apply': return applyChanges(id, msg.changes ?? []);
+      case 'sync-state': return syncState(id);
+      case 'sync-export': return syncExport(id, msg.since ?? {}, msg.maxValueBytes ?? (1 << 20), msg.maxBatchChanges ?? 0);
+      case 'sync-apply': return syncApply(id, msg.batches ?? [], msg.maxValueBytes ?? (1 << 20), msg.maxBytes ?? (64 << 20));
+      case 'wipe': return wipe(id);
       default: throw new Error(`unknown op ${JSON.stringify(msg.op)}`);
     }
   };

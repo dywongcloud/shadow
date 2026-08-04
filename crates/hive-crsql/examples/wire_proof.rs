@@ -216,9 +216,71 @@ fn main() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        // HCB1 canonical-frame proof (bn-browser-fleet-crr-exchange): export
+        // every batch this db would send, ENCODED, one hex line per batch.
+        // The JS side (hcb1-proof-node.mjs) decodes+re-encodes each line and
+        // the two files must compare byte-identical — the JS HCB1
+        // implementation against the Rust one on real exports.
+        Some("export-hcb1") => {
+            let db = args.get(2).context("usage: export-hcb1 <db> <out.hex>")?;
+            let out = args.get(3).context("usage: export-hcb1 <db> <out.hex>")?;
+            let conn = hive_crsql::open(db)?;
+            let mut lines = String::new();
+            let mut total = 0usize;
+            for (site, _) in hive_crsql::known_sites(&conn)? {
+                for batch in
+                    hive_crsql::changes_since_site(&conn, &site, 0, hive_crsql::DEFAULT_MAX_BATCH_CHANGES)?
+                {
+                    lines.push_str(&hex(&batch.encode()));
+                    lines.push('\n');
+                    total += 1;
+                }
+            }
+            std::fs::write(out, lines)?;
+            println!("export-hcb1: {total} batch(es) encoded");
+            Ok(())
+        }
+        // The fleet-side consume half of that proof: decode each JS-encoded
+        // hex line with the REAL `ChangeBatch::decode`, re-encode for the
+        // byte-compare, and apply the batches to this db for real.
+        Some("apply-hcb1") => {
+            let db = args
+                .get(2)
+                .context("usage: apply-hcb1 <db> <in.hex> <reencoded.hex>")?;
+            let input = args
+                .get(3)
+                .context("usage: apply-hcb1 <db> <in.hex> <reencoded.hex>")?;
+            let out = args
+                .get(4)
+                .context("usage: apply-hcb1 <db> <in.hex> <reencoded.hex>")?;
+            let conn = hive_crsql::open(db)?;
+            // The receiving replica needs the same schema the export came
+            // from (cr-sqlite v0.17 does not replicate schema inside
+            // crsql_changes; the exchange carries it in the spec).
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY NOT NULL, label TEXT);",
+            )?;
+            hive_crsql::as_crr(&conn, "items")?;
+            let text = std::fs::read_to_string(input)?;
+            let mut batches = Vec::new();
+            let mut lines = String::new();
+            for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                let batch = hive_crsql::ChangeBatch::decode(&unhex(line)?)?;
+                lines.push_str(&hex(&batch.encode()));
+                lines.push('\n');
+                batches.push(batch);
+            }
+            std::fs::write(out, lines)?;
+            let outcomes = hive_crsql::apply_batches(&conn, &batches)?;
+            for o in &outcomes {
+                println!("apply-hcb1: {o:?}");
+            }
+            println!("apply-hcb1: applied {} batch(es) from JS-encoded frames", outcomes.len());
+            Ok(())
+        }
         other => {
             anyhow::bail!(
-                "unknown subcommand {other:?}; want export-a | apply-final (see prove-wire.sh)"
+                "unknown subcommand {other:?}; want export-a | apply-final | export-hcb1 | apply-hcb1 (see prove-wire.sh)"
             )
         }
     }

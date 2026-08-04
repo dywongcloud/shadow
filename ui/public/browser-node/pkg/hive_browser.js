@@ -104,6 +104,21 @@ export class BrowserNode {
         return ret;
     }
     /**
+     * Outbound CRR sync round: dial `peer_addr_json` (a fleet node from the
+     * admission capability's server-derived peer set), send one encoded
+     * `Op::CrrSync` request, return the reply frame verbatim. The glue
+     * (sqlite-worker side) owns all CRR semantics; this is pure transport.
+     * @param {string} peer_addr_json
+     * @param {Uint8Array} request
+     * @returns {Promise<Uint8Array>}
+     */
+    crrSyncOn(peer_addr_json, request) {
+        const ptr0 = passStringToWasm0(peer_addr_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browsernode_crrSyncOn(this.__wbg_ptr, ptr0, len0, request);
+        return ret;
+    }
+    /**
      * Outbound test: dial `peer_addr_json` on `hive/browser/0`, send `msg` as
      * an [`Op::Echo`] request, and return the echoed reply. Proves the browser
      * node's OUTBOUND path (browser → relay → peer) in addition to the
@@ -132,6 +147,22 @@ export class BrowserNode {
         const ptr1 = passStringToWasm0(digest, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
         const ret = wasm.browsernode_grantAsset(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+    /**
+     * Grant one TLS-authenticated fleet endpoint permission to run CRR sync
+     * rounds against this node's replica. Boot-empty: nothing may sync until
+     * the admission capability's server-derived peer set is granted.
+     * @param {string} endpoint_id
+     * @returns {boolean}
+     */
+    grantCrrSync(endpoint_id) {
+        const ptr0 = passStringToWasm0(endpoint_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browsernode_grantCrrSync(this.__wbg_ptr, ptr0, len0);
         if (ret[2]) {
             throw takeFromExternrefTable0(ret[1]);
         }
@@ -226,6 +257,21 @@ export class BrowserNode {
         return ret[0] !== 0;
     }
     /**
+     * Revoke one endpoint's sync grant. Existing pooled connections re-read
+     * the set per request, so revocation also stops a session in progress.
+     * @param {string} endpoint_id
+     * @returns {boolean}
+     */
+    revokeCrrSync(endpoint_id) {
+        const ptr0 = passStringToWasm0(endpoint_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.browsernode_revokeCrrSync(this.__wbg_ptr, ptr0, len0);
+        if (ret[2]) {
+            throw takeFromExternrefTable0(ret[1]);
+        }
+        return ret[0] !== 0;
+    }
+    /**
      * Revoke one exact endpoint/digest scope. Idempotent: a valid but absent
      * scope returns `false`; malformed IDs/digests throw without mutation.
      * Existing connections re-read this map for every invoke stream.
@@ -296,6 +342,21 @@ export class BrowserNode {
      */
     setAssetHandler(handler) {
         const ret = wasm.browsernode_setAssetHandler(this.__wbg_ptr, handler);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * Register the trusted local responder for inbound [`Op::CrrSync`]
+     * requests (bn-browser-fleet-crr-exchange): `(requestBytes, signal) =>
+     * Promise<Uint8Array>` — the sqlite-worker glue decodes the round,
+     * applies/exports against the OPFS replica, and returns the reply frame.
+     * Installing a handler grants nobody; each caller still needs an exact
+     * endpoint grant via `grantCrrSync`.
+     * @param {Function} handler
+     */
+    setCrrSyncHandler(handler) {
+        const ret = wasm.browsernode_setCrrSyncHandler(this.__wbg_ptr, handler);
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
@@ -766,6 +827,16 @@ function __wbg_get_imports() {
             const ret = result;
             return ret;
         },
+        __wbg_instanceof_Uint8Array_f080092dc70f5d58: function(arg0) {
+            let result;
+            try {
+                result = arg0 instanceof Uint8Array;
+            } catch (_) {
+                result = false;
+            }
+            const ret = result;
+            return ret;
+        },
         __wbg_isArray_145a34fd0a38d37b: function(arg0) {
             const ret = Array.isArray(arg0);
             return ret;
@@ -1114,42 +1185,42 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1693, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1700, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h298a6bff5b0691a5);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3411, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3418, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0908a51f6b61a600);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1093, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1100, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__ha389886adaf6862d);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 2196, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 2203, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h20d1c682fa714cd2);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1623, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1630, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hac8c55c6b76aac63);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1839, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1846, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0d78351b17b6d108);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1870, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1877, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__ha40077c21a1fc6d0);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3384, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3391, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h100cfb892b577986);
             return ret;
         },

@@ -25,6 +25,7 @@
 
 extern crate alloc;
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 /// ALPN for browser-tab peers — a dedicated, low-trust surface, structurally
@@ -85,6 +86,17 @@ pub const BROWSER_MAX_FRAME: usize = 1 << 20; // 1 MiB
 /// its payload smaller than function/asset frames prevents unauthenticated Echo
 /// traffic from monopolizing browser memory and response bandwidth.
 pub const BROWSER_MAX_ECHO: usize = 64 << 10; // 64 KiB
+
+/// Frame cap for [`Op::CrrSync`] — deliberately larger than
+/// [`BROWSER_MAX_FRAME`] because one CRR change value may legally be up to the
+/// deployment's `max_value_bytes` (platform default 1 MiB), and a batch of
+/// bounded changes plus the watermark advertisement must fit alongside it.
+/// This is still a hard memory-safety line: both sides check it BEFORE
+/// allocating the payload buffer, and it sits far below the
+/// `max_value_bytes` CEILING (16 MiB) on purpose — a tenant that raises the
+/// value cap past what a frame can carry gets a typed sync refusal naming the
+/// value, never a silent truncation (docs/browser-db-contract.md §4).
+pub const BROWSER_MAX_CRR_FRAME: usize = 4 << 20; // 4 MiB
 
 /// Stream reset codes. Shared so a reset means the same thing on both sides
 /// instead of each end inventing its own numbering.
@@ -150,11 +162,32 @@ pub enum Op {
     /// Pull one range of an exact BLAKE3-addressed asset. This is a scoped,
     /// demand-side cache fill, not a general browser CDN serving primitive.
     AssetGet = 2,
+    /// One browser↔fleet CRR anti-entropy round (docs/browser-db-contract.md):
+    /// the payload is [`encode_crr_sync_request`]'s shape, carrying the
+    /// sender's per-site watermarks plus its outbound HCB1 change batches; the
+    /// reply ([`encode_crr_sync_reply`]'s shape) carries a typed status, the
+    /// responder's watermarks (the apply acknowledgement), and the responder's
+    /// own export batches. Sync-domain refusals (gap, quota, read-only) are
+    /// reply statuses; PROTOCOL faults (malformed frames, missing grant, no
+    /// handler) stay stream reset codes.
+    CrrSync = 3,
 }
 
 impl Op {
     pub const fn as_byte(self) -> u8 {
         self as u8
+    }
+
+    /// The frame cap that applies to requests carrying this op — checked after
+    /// the op byte is read but BEFORE the declared payload is allocated.
+    /// [`crate::check_len`] remains the floor shared by the original three
+    /// ops; `CrrSync` gets [`BROWSER_MAX_CRR_FRAME`] for the reason documented
+    /// there.
+    pub const fn frame_cap(self) -> usize {
+        match self {
+            Op::Echo | Op::Invoke | Op::AssetGet => BROWSER_MAX_FRAME,
+            Op::CrrSync => BROWSER_MAX_CRR_FRAME,
+        }
     }
 
     /// Parse an op byte. `Err` carries the unrecognised byte so the refusal can
@@ -164,6 +197,7 @@ impl Op {
             0 => Ok(Op::Echo),
             1 => Ok(Op::Invoke),
             2 => Ok(Op::AssetGet),
+            3 => Ok(Op::CrrSync),
             other => Err(ProtoError::UnknownOp(other)),
         }
     }
@@ -185,6 +219,9 @@ pub enum ProtoError {
     /// An asset range request was truncated, non-canonical, empty, or larger
     /// than a reply frame can carry.
     MalformedAsset,
+    /// A `CrrSync` request or reply payload was truncated, non-canonical, over
+    /// a bound, or carried trailing bytes.
+    MalformedCrrSync,
 }
 
 impl ProtoError {
@@ -197,7 +234,8 @@ impl ProtoError {
             ProtoError::EmptyFrame
             | ProtoError::MalformedInvoke
             | ProtoError::InvalidFunctionDigest
-            | ProtoError::MalformedAsset => reset::MALFORMED_PAYLOAD,
+            | ProtoError::MalformedAsset
+            | ProtoError::MalformedCrrSync => reset::MALFORMED_PAYLOAD,
         }
     }
 }
@@ -219,6 +257,7 @@ impl core::fmt::Display for ProtoError {
                 "function digest must be {FUNCTION_DIGEST_LEN} lowercase hex bytes"
             ),
             ProtoError::MalformedAsset => write!(f, "malformed asset range payload"),
+            ProtoError::MalformedCrrSync => write!(f, "malformed crr sync payload"),
         }
     }
 }
@@ -230,6 +269,19 @@ impl core::error::Error for ProtoError {}
 pub const fn check_len(len_le: [u8; 4]) -> Result<usize, ProtoError> {
     let len = u32::from_le_bytes(len_le) as usize;
     if len > BROWSER_MAX_FRAME {
+        return Err(ProtoError::FrameTooLarge(len));
+    }
+    Ok(len)
+}
+
+/// Per-op variant of [`check_len`]: the cap is the op's own
+/// ([`Op::frame_cap`]), so a `CrrSync` frame may legally exceed
+/// [`BROWSER_MAX_FRAME`] while an `Echo` of the same size is still refused.
+/// The op byte is read before the payload is allocated, so this check still
+/// lands before any length-derived allocation.
+pub const fn check_len_for(op: Op, len_le: [u8; 4]) -> Result<usize, ProtoError> {
+    let len = u32::from_le_bytes(len_le) as usize;
+    if len > op.frame_cap() {
         return Err(ProtoError::FrameTooLarge(len));
     }
     Ok(len)
@@ -352,4 +404,312 @@ pub fn split_asset_reply(payload: &[u8]) -> Result<(u64, &[u8]), ProtoError> {
     let mut total = [0u8; 8];
     total.copy_from_slice(&payload[..ASSET_REPLY_META_LEN]);
     Ok((u64::from_le_bytes(total), &payload[ASSET_REPLY_META_LEN..]))
+}
+
+// ---------------------------------------------------------------------------
+// CRR sync op (bn-browser-fleet-crr-exchange)
+// ---------------------------------------------------------------------------
+//
+// One bidirectional anti-entropy round between a browser replica and a fleet
+// replica (docs/browser-db-contract.md; the CRR semantics themselves are
+// hive-crsql's contract — per-origin-site durable watermarks, HCB1 canonical
+// batches, gap/replay, transactional apply — named here, never redefined).
+// Both directions ride ONE request/reply pair so a round costs one round trip:
+//
+// * Request: the sender's per-site watermarks (what it durably holds — the
+//   responder's export selector) plus its outbound HCB1 batches (every site
+//   the responder advertised it is missing, chunked so the frame fits; more
+//   chunks follow in later rounds while `push_more` is set).
+// * Reply: a typed status for the APPLY half, the responder's watermarks
+//   AFTER any apply (the acknowledgement the sender persists as its
+//   push-cursor), and the responder's own export batches, bounded so the
+//   reply frame fits — `more` set means the sender re-requests (its freshly
+//   applied watermarks are the continuation cursor; there is no separate
+//   cursor state to lose).
+//
+// Framing mirrors the Invoke/AssetGet discipline exactly: explicit lengths,
+// big-endian integers (HCB1's own convention), exact-EOF consume, trailing-
+// byte rejection, every count/length bounded before allocation.
+
+/// `CrrSync` payload version. Bump on any shape change; peers refuse a version
+/// they do not know rather than misparse it.
+pub const CRR_SYNC_VERSION: u8 = 1;
+
+/// Largest site-id blob carried on the wire (crsql site ids are 16 bytes;
+/// HCB1 permits up to 255 — the wire admits a little headroom, never
+/// unbounded).
+pub const CRR_SITE_ID_MAX: usize = 64;
+/// Bound on the watermark advertisement (one entry per known origin site).
+pub const CRR_MAX_WATERMARKS: usize = 1024;
+/// Bound on batches per frame. Wire size is the real limit (the frame cap);
+/// this exists so a corrupt count cannot drive a huge pre-allocation.
+pub const CRR_MAX_BATCHES: usize = 4096;
+/// Bound on the reply's diagnostic message.
+pub const CRR_MAX_MESSAGE: usize = 2048;
+/// Bound on the request's `db_file` grant identifier (a platform-templated
+/// replica name, never a path).
+pub const CRR_MAX_DB_FILE: usize = 256;
+
+/// Request flag: the sender has MORE push batches than fit this frame; the
+/// responder should expect follow-up rounds before the push stream is done.
+pub const CRR_FLAG_PUSH_MORE: u8 = 1;
+/// Reply flag: the responder's export was truncated to fit the frame; the
+/// requester re-requests (its applied watermarks are the resume cursor).
+pub const CRR_FLAG_MORE: u8 = 1;
+
+/// The APPLY half's typed outcome — sync-domain refusals travel IN the reply
+/// (the requester needs the detail: where to resume, what was refused),
+/// while protocol faults stay stream reset codes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CrrStatus {
+    /// Every presented batch applied (or replayed as a no-op).
+    Ok = 0,
+    /// A presented batch chained from AHEAD of the responder's durable
+    /// watermark — an intermediate batch is missing (hive-crsql `SyncGap`).
+    /// Nothing from that batch was written; re-export from the watermark the
+    /// reply carries for that site.
+    SyncGap = 1,
+    /// Applying a presented batch would push the replica past the spec's
+    /// `max_bytes` — the batch rolled back whole, never truncated.
+    QuotaExceeded = 2,
+    /// A presented change's `val` payload exceeds the spec's
+    /// `max_value_bytes`; the whole batch was refused. The message names the
+    /// first offending table/pk.
+    ValueTooLarge = 3,
+    /// The grant behind this request is read-only (Public-scope admission):
+    /// no presented batch was applied. The export half is still served.
+    ReadOnly = 4,
+    /// A presented HCB1 batch decoded but is unusable on this wire (e.g. an
+    /// empty site id or an out-of-order payload that passed HCB1's own
+    /// checks) — refused whole.
+    BatchRefused = 5,
+}
+
+impl CrrStatus {
+    pub const fn as_byte(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_byte(b: u8) -> Result<Self, ProtoError> {
+        match b {
+            0 => Ok(CrrStatus::Ok),
+            1 => Ok(CrrStatus::SyncGap),
+            2 => Ok(CrrStatus::QuotaExceeded),
+            3 => Ok(CrrStatus::ValueTooLarge),
+            4 => Ok(CrrStatus::ReadOnly),
+            5 => Ok(CrrStatus::BatchRefused),
+            _ => Err(ProtoError::MalformedCrrSync),
+        }
+    }
+}
+
+/// Decoded `Op::CrrSync` request body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrrSyncRequest {
+    /// The grant identifier the sender is syncing for: the platform-templated
+    /// replica name from its admission capability (`hive-browserdb-<tag>.db`).
+    /// The responder NEVER opens this value — it compares it against the name
+    /// derived from its own server-resolved grant and refuses a mismatch
+    /// (a stale capability can never contaminate a different project's
+    /// replica; contract §6's "no wire field names a file" is preserved by
+    /// opening only the server-derived name).
+    pub db_file: String,
+    /// `CRR_FLAG_PUSH_MORE` while the sender's push stream continues.
+    pub push_more: bool,
+    /// The sender's durable per-site watermarks: `(site_id, db_version)`.
+    pub watermarks: Vec<(Vec<u8>, i64)>,
+    /// Outbound HCB1 batches (verbatim `hive-crsql` `ChangeBatch::encode`
+    /// frames), applied in order by the responder.
+    pub batches: Vec<Vec<u8>>,
+}
+
+/// Decoded `Op::CrrSync` reply body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrrSyncReply {
+    /// The apply half's typed outcome (see [`CrrStatus`]).
+    pub status: CrrStatus,
+    /// The responder has more export batches than fit this frame.
+    pub more: bool,
+    /// Human/operator diagnostic for non-Ok statuses (site hex, table/pk,
+    /// watermark numbers); empty on Ok. Bounded by [`CRR_MAX_MESSAGE`].
+    pub message: String,
+    /// The responder's durable per-site watermarks AFTER any apply — the
+    /// acknowledgement the requester persists as its push cursor.
+    pub watermarks: Vec<(Vec<u8>, i64)>,
+    /// The responder's export batches for the requester, in apply order.
+    pub batches: Vec<Vec<u8>>,
+}
+
+fn push_watermarks(out: &mut Vec<u8>, watermarks: &[(Vec<u8>, i64)]) {
+    out.extend_from_slice(&(watermarks.len() as u32).to_be_bytes());
+    for (site, version) in watermarks {
+        out.push(site.len() as u8);
+        out.extend_from_slice(site);
+        out.extend_from_slice(&version.to_be_bytes());
+    }
+}
+
+fn push_batches(out: &mut Vec<u8>, batches: &[Vec<u8>]) {
+    out.extend_from_slice(&(batches.len() as u32).to_be_bytes());
+    for batch in batches {
+        out.extend_from_slice(&(batch.len() as u32).to_be_bytes());
+        out.extend_from_slice(batch);
+    }
+}
+
+/// Cursor over a payload slice: exact-EOF consume, every take bounds-checked,
+/// trailing bytes rejected by the callers.
+struct CrrCursor<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> CrrCursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], ProtoError> {
+        if self.b.len() - self.at < n {
+            return Err(ProtoError::MalformedCrrSync);
+        }
+        let s = &self.b[self.at..self.at + n];
+        self.at += n;
+        Ok(s)
+    }
+
+    fn u8(&mut self) -> Result<u8, ProtoError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, ProtoError> {
+        Ok(u16::from_be_bytes(self.take(2)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+    }
+
+    fn u32(&mut self) -> Result<u32, ProtoError> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+    }
+
+    fn i64(&mut self) -> Result<i64, ProtoError> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().map_err(|_| ProtoError::MalformedCrrSync)?))
+    }
+
+    fn watermarks(&mut self) -> Result<Vec<(Vec<u8>, i64)>, ProtoError> {
+        let count = self.u32()? as usize;
+        if count > CRR_MAX_WATERMARKS {
+            return Err(ProtoError::MalformedCrrSync);
+        }
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let site_len = self.u8()? as usize;
+            if site_len == 0 || site_len > CRR_SITE_ID_MAX {
+                return Err(ProtoError::MalformedCrrSync);
+            }
+            let site = self.take(site_len)?.to_vec();
+            let version = self.i64()?;
+            out.push((site, version));
+        }
+        Ok(out)
+    }
+
+    fn batches(&mut self) -> Result<Vec<Vec<u8>>, ProtoError> {
+        let count = self.u32()? as usize;
+        if count > CRR_MAX_BATCHES {
+            return Err(ProtoError::MalformedCrrSync);
+        }
+        let mut out = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let len = self.u32()? as usize;
+            if len > BROWSER_MAX_CRR_FRAME {
+                return Err(ProtoError::MalformedCrrSync);
+            }
+            out.push(self.take(len)?.to_vec());
+        }
+        Ok(out)
+    }
+
+    fn finish(self) -> Result<(), ProtoError> {
+        if self.at != self.b.len() {
+            return Err(ProtoError::MalformedCrrSync);
+        }
+        Ok(())
+    }
+}
+
+/// Build an [`Op::CrrSync`] request payload.
+pub fn encode_crr_sync_request(request: &CrrSyncRequest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(64 + request.batches.iter().map(Vec::len).sum::<usize>());
+    out.push(CRR_SYNC_VERSION);
+    out.push(if request.push_more { CRR_FLAG_PUSH_MORE } else { 0 });
+    let db_file = request.db_file.as_bytes();
+    let db_file = &db_file[..db_file.len().min(CRR_MAX_DB_FILE)];
+    out.extend_from_slice(&(db_file.len() as u16).to_be_bytes());
+    out.extend_from_slice(db_file);
+    push_watermarks(&mut out, &request.watermarks);
+    push_batches(&mut out, &request.batches);
+    out
+}
+
+/// Inverse of [`encode_crr_sync_request`]. A hostile peer controls every byte
+/// here: every length is bounded before allocation and trailing bytes refuse.
+pub fn split_crr_sync_request(payload: &[u8]) -> Result<CrrSyncRequest, ProtoError> {
+    let mut cur = CrrCursor { b: payload, at: 0 };
+    if cur.u8()? != CRR_SYNC_VERSION {
+        return Err(ProtoError::MalformedCrrSync);
+    }
+    let flags = cur.u8()?;
+    let db_len = cur.u16()? as usize;
+    if db_len == 0 || db_len > CRR_MAX_DB_FILE {
+        return Err(ProtoError::MalformedCrrSync);
+    }
+    let db_file = String::from_utf8(cur.take(db_len)?.to_vec())
+        .map_err(|_| ProtoError::MalformedCrrSync)?;
+    let watermarks = cur.watermarks()?;
+    let batches = cur.batches()?;
+    cur.finish()?;
+    Ok(CrrSyncRequest {
+        db_file,
+        push_more: flags & CRR_FLAG_PUSH_MORE != 0,
+        watermarks,
+        batches,
+    })
+}
+
+/// Build an [`Op::CrrSync`] reply payload.
+pub fn encode_crr_sync_reply(reply: &CrrSyncReply) -> Vec<u8> {
+    let message = reply.message.as_bytes();
+    let message = &message[..message.len().min(CRR_MAX_MESSAGE)];
+    let mut out = Vec::with_capacity(64 + reply.batches.iter().map(Vec::len).sum::<usize>());
+    out.push(CRR_SYNC_VERSION);
+    out.push(reply.status.as_byte());
+    out.push(if reply.more { CRR_FLAG_MORE } else { 0 });
+    out.extend_from_slice(&(message.len() as u16).to_be_bytes());
+    out.extend_from_slice(message);
+    push_watermarks(&mut out, &reply.watermarks);
+    push_batches(&mut out, &reply.batches);
+    out
+}
+
+/// Inverse of [`encode_crr_sync_reply`]; same hostile-input discipline as
+/// [`split_crr_sync_request`].
+pub fn split_crr_sync_reply(payload: &[u8]) -> Result<CrrSyncReply, ProtoError> {
+    let mut cur = CrrCursor { b: payload, at: 0 };
+    if cur.u8()? != CRR_SYNC_VERSION {
+        return Err(ProtoError::MalformedCrrSync);
+    }
+    let status = CrrStatus::from_byte(cur.u8()?)?;
+    let flags = cur.u8()?;
+    let msg_len = cur.u16()? as usize;
+    if msg_len > CRR_MAX_MESSAGE {
+        return Err(ProtoError::MalformedCrrSync);
+    }
+    let message = String::from_utf8(cur.take(msg_len)?.to_vec())
+        .map_err(|_| ProtoError::MalformedCrrSync)?;
+    let watermarks = cur.watermarks()?;
+    let batches = cur.batches()?;
+    cur.finish()?;
+    Ok(CrrSyncReply {
+        status,
+        more: flags & CRR_FLAG_MORE != 0,
+        message,
+        watermarks,
+        batches,
+    })
 }

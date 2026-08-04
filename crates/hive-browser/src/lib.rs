@@ -47,11 +47,25 @@ type AddressHandler = Rc<RefCell<Option<js_sys::Function>>>;
 /// `(digest: string, offset: number, maxLen: number, signal: AbortSignal) => Promise<{total, bytes}>`.
 type AssetHandler = Rc<RefCell<Option<js_sys::Function>>>;
 
+/// Trusted local CRR sync responder (bn-browser-fleet-crr-exchange):
+/// `(requestBytes: Uint8Array, signal: AbortSignal) => Promise<Uint8Array>`.
+/// The JS side (the sqlite-worker glue) decodes the `Op::CrrSync` request,
+/// runs the worker's watermark/export/apply ops against the OPFS replica, and
+/// returns the encoded reply. The wasm half knows only frames — CRR semantics
+/// live in the glue and in `hive-crsql` on the fleet side.
+type CrrSyncHandler = Rc<RefCell<Option<js_sys::Function>>>;
+
 /// Exact execution scopes granted to each TLS-authenticated iroh endpoint.
 /// Empty at boot and shared (not snapshotted) across connection/stream tasks so
 /// revocation applies to existing pooled QUIC connections.
 type InvokerGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
 type AssetGrants = Rc<RefCell<BTreeMap<EndpointId, BTreeSet<String>>>>;
+/// Endpoints permitted to drive `Op::CrrSync` against this node's replica.
+/// Scopeless by construction: a CrrSync request names no resource — the grant
+/// the FLEET resolved (server-side, from the admission) already pins the one
+/// database this node replicates, so the only question here is "may this
+/// exact fleet endpoint run a sync round at all".
+type CrrSyncGrants = Rc<RefCell<BTreeSet<EndpointId>>>;
 type PeerConnections = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
 type PeerStreams = Rc<RefCell<BTreeMap<EndpointId, usize>>>;
 
@@ -74,7 +88,12 @@ const STREAM_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTBOUND_STREAM_OPEN_TIMEOUT: Duration = Duration::from_secs(60);
 const OUTBOUND_IO_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDLER_TIMEOUT: Duration = Duration::from_secs(10);
-const BROWSER_STREAM_WINDOW: u32 = (BROWSER_MAX_FRAME + 4) as u32;
+/// One full maximum-size frame per stream (bn-browser-fleet-crr-exchange: the
+/// largest op is CrrSync's 4 MiB frame, so the receive window must cover it —
+/// QUIC flow control would still deliver a bigger frame piecemeal, but every
+/// receiver here already reads incrementally and a window matched to the
+/// frame keeps one round from degenerating into window-update round trips).
+const BROWSER_STREAM_WINDOW: u32 = (BROWSER_MAX_CRR_FRAME + 4) as u32;
 const BROWSER_CONNECTION_WINDOW: u32 = BROWSER_STREAM_WINDOW * MAX_STREAMS_PER_CONNECTION as u32;
 static HANDLER_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_ACTIVE_HANDLERS);
@@ -972,10 +991,10 @@ fn watch_handler(
 pub use hive_browser_proto::BROWSER_ALPN;
 
 use hive_browser_proto::{
-    check_len, encode_asset_get, encode_asset_reply, encode_invoke, encode_request,
+    check_len_for, encode_asset_get, encode_asset_reply, encode_invoke, encode_request,
     reset as proto_reset, split_asset_get, split_asset_reply, split_invoke, valid_blake3_digest,
-    valid_function_digest, Op, ASSET_CHUNK_MAX, BROWSER_MAX_ASSET, BROWSER_MAX_ECHO,
-    BROWSER_MAX_FRAME,
+    valid_function_digest, Op, ASSET_CHUNK_MAX, BROWSER_MAX_ASSET, BROWSER_MAX_CRR_FRAME,
+    BROWSER_MAX_ECHO, BROWSER_MAX_FRAME,
 };
 
 #[wasm_bindgen(start)]
@@ -1004,7 +1023,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    13
+    14
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -1026,11 +1045,15 @@ pub struct BrowserNode {
     invoke: InvokeHandler,
     /// Demand-side asset reader; serving remains disabled until explicitly set.
     asset: AssetHandler,
+    /// Inbound CRR sync responder; `Op::CrrSync` refuses NO_HANDLER until set.
+    crr_sync: CrrSyncHandler,
     /// Boot-empty, typed endpoint → pinned-code-digest execution scopes.
     grants: InvokerGrants,
     /// Separate endpoint → asset-digest scopes. A function grant can never read
     /// an asset accidentally, even when both identifiers are 64 hex bytes.
     asset_grants: AssetGrants,
+    /// Endpoints allowed to run CRR sync rounds against this node's replica.
+    crr_sync_grants: CrrSyncGrants,
     /// Synchronous idempotency flag for the async close path.
     closed: Rc<Cell<bool>>,
     /// Abortable ownership for every platform-spawned Rust task.
@@ -1049,9 +1072,11 @@ impl Drop for BrowserNode {
         // witnessed drain use the explicit async `close()` before `free()`.
         self.invoke.borrow_mut().take();
         self.asset.borrow_mut().take();
+        self.crr_sync.borrow_mut().take();
         self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
+        self.crr_sync_grants.borrow_mut().clear();
         self.outbound_pool.close_all();
         self.tasks.abort_all();
         if !self.closed.replace(true) {
@@ -1227,8 +1252,10 @@ impl BrowserNode {
         let invoke: InvokeHandler = Rc::new(RefCell::new(None));
         let address_handler: AddressHandler = Rc::new(RefCell::new(None));
         let asset: AssetHandler = Rc::new(RefCell::new(None));
+        let crr_sync: CrrSyncHandler = Rc::new(RefCell::new(None));
         let grants: InvokerGrants = Rc::new(RefCell::new(BTreeMap::new()));
         let asset_grants: AssetGrants = Rc::new(RefCell::new(BTreeMap::new()));
+        let crr_sync_grants: CrrSyncGrants = Rc::new(RefCell::new(BTreeSet::new()));
         let closed = Rc::new(Cell::new(false));
         let tasks = TaskGroup::new();
         let outbound_pool = OutboundPool::new(ep.clone(), tasks.clone());
@@ -1238,8 +1265,10 @@ impl BrowserNode {
             served.clone(),
             invoke.clone(),
             asset.clone(),
+            crr_sync.clone(),
             grants.clone(),
             asset_grants.clone(),
+            crr_sync_grants.clone(),
             tasks.clone(),
         );
         spawn_address_loop(ep.clone(), address_handler.clone(), tasks.clone());
@@ -1252,8 +1281,10 @@ impl BrowserNode {
             served,
             invoke,
             asset,
+            crr_sync,
             grants,
             asset_grants,
+            crr_sync_grants,
             closed,
             tasks,
             outbound_pool,
@@ -1514,9 +1545,11 @@ impl BrowserNode {
     pub async fn close(&self) {
         self.invoke.borrow_mut().take();
         self.asset.borrow_mut().take();
+        self.crr_sync.borrow_mut().take();
         self.address_handler.borrow_mut().take();
         self.grants.borrow_mut().clear();
         self.asset_grants.borrow_mut().clear();
+        self.crr_sync_grants.borrow_mut().clear();
         self.outbound_pool.close_all();
         if !self.closed.replace(true) {
             self.tasks.shutdown().await;
@@ -1625,6 +1658,63 @@ impl BrowserNode {
         Ok(out.expect("asset peer supplied a first reply"))
     }
 
+    /// Register the trusted local responder for inbound [`Op::CrrSync`]
+    /// requests (bn-browser-fleet-crr-exchange): `(requestBytes, signal) =>
+    /// Promise<Uint8Array>` — the sqlite-worker glue decodes the round,
+    /// applies/exports against the OPFS replica, and returns the reply frame.
+    /// Installing a handler grants nobody; each caller still needs an exact
+    /// endpoint grant via `grantCrrSync`.
+    #[wasm_bindgen(js_name = setCrrSyncHandler)]
+    pub fn set_crr_sync_handler(&self, handler: js_sys::Function) -> Result<(), JsError> {
+        self.ensure_open()?;
+        if !handler.is_function() {
+            return Err(JsError::new("crr sync handler must be a function"));
+        }
+        *self.crr_sync.borrow_mut() = Some(handler);
+        Ok(())
+    }
+
+    /// Grant one TLS-authenticated fleet endpoint permission to run CRR sync
+    /// rounds against this node's replica. Boot-empty: nothing may sync until
+    /// the admission capability's server-derived peer set is granted.
+    #[wasm_bindgen(js_name = grantCrrSync)]
+    pub fn grant_crr_sync(&self, endpoint_id: String) -> Result<bool, JsError> {
+        self.ensure_open()?;
+        let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+        Ok(self.crr_sync_grants.borrow_mut().insert(endpoint_id))
+    }
+
+    /// Revoke one endpoint's sync grant. Existing pooled connections re-read
+    /// the set per request, so revocation also stops a session in progress.
+    #[wasm_bindgen(js_name = revokeCrrSync)]
+    pub fn revoke_crr_sync(&self, endpoint_id: String) -> Result<bool, JsError> {
+        self.ensure_open()?;
+        let endpoint_id = parse_endpoint_id(&endpoint_id)?;
+        Ok(self.crr_sync_grants.borrow_mut().remove(&endpoint_id))
+    }
+
+    /// Outbound CRR sync round: dial `peer_addr_json` (a fleet node from the
+    /// admission capability's server-derived peer set), send one encoded
+    /// `Op::CrrSync` request, return the reply frame verbatim. The glue
+    /// (sqlite-worker side) owns all CRR semantics; this is pure transport.
+    #[wasm_bindgen(js_name = crrSyncOn)]
+    pub async fn crr_sync_on(
+        &self,
+        peer_addr_json: String,
+        request: js_sys::Uint8Array,
+    ) -> Result<js_sys::Uint8Array, JsError> {
+        self.ensure_open()?;
+        let payload = request.to_vec();
+        if payload.len() > BROWSER_MAX_CRR_FRAME - 1 {
+            return Err(JsError::new(&format!(
+                "crr sync payload exceeds the {}-byte op payload cap",
+                BROWSER_MAX_CRR_FRAME - 1
+            )));
+        }
+        let reply = self.request(peer_addr_json, Op::CrrSync, &payload).await?;
+        Ok(js_sys::Uint8Array::from(reply.as_slice()))
+    }
+
     /// Shared request/response plumbing for every outbound op. Dial, stream-open,
     /// write, and reply phases each have their own bounded idle deadline, so a
     /// large frame making progress is not cancelled by a transfer-size-blind
@@ -1637,10 +1727,10 @@ impl BrowserNode {
         op_payload: &[u8],
     ) -> Result<Vec<u8>, JsError> {
         self.ensure_open()?;
-        if op_payload.len() > BROWSER_MAX_FRAME - 1 {
+        if op_payload.len() > op.frame_cap() - 1 {
             return Err(JsError::new(&format!(
                 "request payload exceeds the {}-byte op payload cap",
-                BROWSER_MAX_FRAME - 1
+                op.frame_cap() - 1
             )));
         }
         let frame = encode_request(op, op_payload);
@@ -1704,7 +1794,7 @@ impl BrowserNode {
             io.cancel(code);
             return Err(JsError::new(&error));
         }
-        let len = match check_len(lenb) {
+        let len = match check_len_for(op, lenb) {
             Ok(len) => len,
             Err(error) => {
                 io.cancel(error.reset_code());
@@ -1773,8 +1863,10 @@ fn spawn_accept_loop(
     served: Arc<std::sync::atomic::AtomicU64>,
     invoke: InvokeHandler,
     asset: AssetHandler,
+    crr_sync: CrrSyncHandler,
     grants: InvokerGrants,
     asset_grants: AssetGrants,
+    crr_sync_grants: CrrSyncGrants,
     tasks: TaskGroup,
 ) {
     let connection_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_CONNECTIONS));
@@ -1793,8 +1885,10 @@ fn spawn_accept_loop(
             let served = served.clone();
             let invoke = invoke.clone();
             let asset = asset.clone();
+            let crr_sync = crr_sync.clone();
             let grants = grants.clone();
             let asset_grants = asset_grants.clone();
+            let crr_sync_grants = crr_sync_grants.clone();
             let stream_slots = stream_slots.clone();
             let echo_slots = echo_slots.clone();
             let peer_connections = peer_connections.clone();
@@ -1885,8 +1979,10 @@ fn spawn_accept_loop(
                     let served = served.clone();
                     let invoke = invoke.clone();
                     let asset = asset.clone();
+                    let crr_sync = crr_sync.clone();
                     let grants = grants.clone();
                     let asset_grants = asset_grants.clone();
+                    let crr_sync_grants = crr_sync_grants.clone();
                     let remote_id = remote_id.clone();
                     let echo_slots = echo_slots.clone();
                     let stream_conn = conn.clone();
@@ -1900,13 +1996,21 @@ fn spawn_accept_loop(
                         let request = async {
                             let mut lenb = [0u8; 4];
                             read_with_progress_deadline(&mut recv, &mut lenb).await?;
-                            let len = check_len(lenb).map_err(|error| error.reset_code())?;
-                            if len == 0 {
+                            let declared = u32::from_le_bytes(lenb) as usize;
+                            if declared == 0 {
                                 return Err(proto_reset::MALFORMED_PAYLOAD);
                             }
                             let mut opb = [0u8; 1];
                             read_with_progress_deadline(&mut recv, &mut opb).await?;
                             let op = Op::from_byte(opb[0]).map_err(|error| error.reset_code())?;
+                            // Per-op cap before the payload allocation:
+                            // CrrSync frames may exceed BROWSER_MAX_FRAME up
+                            // to BROWSER_MAX_CRR_FRAME (bn-browser-fleet-crr-
+                            // exchange); Echo keeps its tighter cap.
+                            let len = check_len_for(op, lenb).map_err(|error| error.reset_code())?;
+                            if len == 0 {
+                                return Err(proto_reset::MALFORMED_PAYLOAD);
+                            }
                             if op == Op::Echo && len - 1 > BROWSER_MAX_ECHO {
                                 return Err(proto_reset::FRAME_TOO_LARGE);
                             }
@@ -1914,6 +2018,7 @@ fn spawn_accept_loop(
                                 Op::Echo => true,
                                 Op::Invoke => grants.borrow().contains_key(&remote_id),
                                 Op::AssetGet => asset_grants.borrow().contains_key(&remote_id),
+                                Op::CrrSync => crr_sync_grants.borrow().contains(&remote_id),
                             };
                             if !endpoint_granted {
                                 return Err(proto_reset::FORBIDDEN);
@@ -2011,6 +2116,25 @@ fn spawn_accept_loop(
                                         permit,
                                     )
                                 }
+                                Op::CrrSync => {
+                                    let crr_sync = crr_sync.clone();
+                                    let crr_sync_grants = crr_sync_grants.clone();
+                                    let remote_id = remote_id.clone();
+                                    let payload = payload;
+                                    watch_handler(
+                                        async move {
+                                            run_crr_sync(
+                                                &crr_sync,
+                                                &crr_sync_grants,
+                                                remote_id,
+                                                payload,
+                                                signal,
+                                            )
+                                            .await
+                                        },
+                                        permit,
+                                    )
+                                }
                                 Op::Echo => unreachable!(),
                             };
                             let handler_wait = async {
@@ -2052,7 +2176,7 @@ fn spawn_accept_loop(
                                 return;
                             }
                         };
-                        if out.len() > BROWSER_MAX_FRAME {
+                        if out.len() > op.frame_cap() {
                             reject_stream(&mut send, &mut recv, proto_reset::FRAME_TOO_LARGE);
                             return;
                         }
@@ -2224,6 +2348,59 @@ async fn run_asset(
         return Err(proto_reset::HANDLER_FAILED);
     }
     encode_asset_reply(total as u64, &chunk).map_err(|e| e.reset_code())
+}
+
+/// Run one inbound [`Op::CrrSync`] payload against the trusted local glue
+/// (bn-browser-fleet-crr-exchange). Same authorization discipline as
+/// [`run_invoke`]: the grant set is re-read at the synchronous points
+/// bracketing the await, never borrowed across it, so a revocation mid-round
+/// is honored. The handler gets the request frame verbatim and returns the
+/// reply frame verbatim — CRR semantics live in the JS glue and in
+/// `hive-crsql` on the fleet side, never in this transport half.
+async fn run_crr_sync(
+    handler: &CrrSyncHandler,
+    grants: &CrrSyncGrants,
+    remote_id: EndpointId,
+    payload: Vec<u8>,
+    signal: web_sys::AbortSignal,
+) -> Result<Vec<u8>, u32> {
+    if !grants.borrow().contains(&remote_id) {
+        tracing::warn!(remote = %remote_id, "browser crr sync forbidden");
+        return Err(proto_reset::FORBIDDEN);
+    }
+    let Some(handler) = handler.borrow().clone() else {
+        tracing::warn!("browser crr sync: no handler registered (call setCrrSyncHandler first)");
+        return Err(proto_reset::NO_HANDLER);
+    };
+    let args = js_sys::Array::new();
+    args.push(&js_sys::Uint8Array::from(payload.as_slice()));
+    args.push(signal.as_ref());
+    let value = handler
+        .apply(&JsValue::NULL, &args)
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "browser crr sync: handler threw");
+            proto_reset::HANDLER_FAILED
+        })?;
+    drop(payload);
+    let resolved = JsFuture::from(js_sys::Promise::resolve(&value))
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = ?e, "browser crr sync: handler rejected");
+            proto_reset::HANDLER_FAILED
+        })?;
+    if !grants.borrow().contains(&remote_id) {
+        tracing::warn!(remote = %remote_id, "browser crr sync revoked while handler was running");
+        return Err(proto_reset::FORBIDDEN);
+    }
+    if !resolved.is_instance_of::<js_sys::Uint8Array>() {
+        tracing::warn!("browser crr sync: handler did not resolve to a Uint8Array");
+        return Err(proto_reset::HANDLER_FAILED);
+    }
+    let out = js_sys::Uint8Array::new(&resolved).to_vec();
+    if out.len() > BROWSER_MAX_CRR_FRAME {
+        return Err(proto_reset::FRAME_TOO_LARGE);
+    }
+    Ok(out)
 }
 
 /// Parse the cryptographic endpoint identity used by iroh's completed TLS
