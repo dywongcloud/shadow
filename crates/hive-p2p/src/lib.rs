@@ -353,6 +353,52 @@ pub type BrowserCrrHandler = Arc<
         + Sync,
 >;
 
+/// Receives a browser connection's FRAMED byte totals as each op stream
+/// completes: `(endpoint_id, inbound_bytes, outbound_bytes)`, where
+/// `endpoint_id` is the QUIC-authenticated browser identity (hive-cloud maps
+/// it to the admission's tenant — the crate itself stays tenant-free).
+/// "Framed" means exactly the bytes of this ALPN's wire contract: the u32 LE
+/// length prefix, the op byte, and the payload — never transport overhead.
+/// Bytes are reported at the stage they provably moved: a fully-read request
+/// counts inbound even when the stream is then refused, a fully-written
+/// request counts outbound even when the reply never arrives. Synchronous by
+/// design: recording is pure in-memory arithmetic and must never block (or be
+/// dropped mid-await by) the stream task that calls it.
+pub type BrowserMeterHandler = Arc<dyn Fn(String, u64, u64) + Send + Sync>;
+
+/// The installed browser byte meter (bn-impl-relay-byte-metering). Process-
+/// global like `VERIFY_COUNTERS`: both metering boundaries — the inbound
+/// `serve_browser_conn` accept path and the outbound `BrowserPool` op path —
+/// reach it without growing `serve_tunnels_full`'s parameter list again.
+/// `None` (the default) makes metering a compiled-in no-op, so witness
+/// harnesses and embedders that never install a handler pay one RwLock read.
+static BROWSER_METER: std::sync::RwLock<Option<BrowserMeterHandler>> =
+    std::sync::RwLock::new(None);
+
+/// Install (or clear) the process-global [`BrowserMeterHandler`]. hive-cloud
+/// installs its per-tenant recorder once at boot, next to the admission
+/// handler registration. NOT part of any trust boundary: the handler observes
+/// byte counts, it can never influence whether a stream is served.
+pub fn set_browser_meter(meter: Option<BrowserMeterHandler>) {
+    if let Ok(mut slot) = BROWSER_METER.write() {
+        *slot = meter;
+    }
+}
+
+/// Report one completed stage of a browser op stream to the installed meter
+/// (if any). Never fails, never blocks the caller meaningfully, and never
+/// attributes: attribution is the handler's job (it owns the endpoint→tenant
+/// join against the admission store).
+fn meter_browser_bytes(endpoint_id: &str, inbound: u64, outbound: u64) {
+    let meter = BROWSER_METER
+        .read()
+        .ok()
+        .and_then(|slot| slot.as_ref().cloned());
+    if let Some(meter) = meter {
+        meter(endpoint_id.to_string(), inbound, outbound);
+    }
+}
+
 /// Transport a [`RawTarget`] speaks. Kebab-case wire strings ("tcp"/"udp") so
 /// the handshake JSON matches `fluid_core::ServiceProtocol`'s serde convention
 /// (this crate deliberately does not depend on fluid-core; the mapping is done
@@ -1785,6 +1831,9 @@ impl BrowserPool {
         self.counters
             .bytes_sent_total
             .fetch_add(frame.len() as u64, Ordering::Relaxed);
+        // Metered at the stage the bytes provably moved: the full request
+        // frame is on the wire even if the reply below never arrives.
+        meter_browser_bytes(endpoint_id, 0, frame.len() as u64);
         if let Err(error) = io
             .send
             .as_mut()
@@ -1907,6 +1956,8 @@ impl BrowserPool {
             }
         }
         io.disarm();
+        // The reply's framed total: u32 LE prefix + body, fully read.
+        meter_browser_bytes(endpoint_id, 4 + reply.len() as u64, 0);
         Ok(reply)
     }
 }

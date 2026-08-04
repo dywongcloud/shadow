@@ -9,6 +9,33 @@
 // exist in a worker context. The page captures + quantizes-for-display
 // consent on the main thread and posts coordinates in only via the
 // `presence` control message; this worker never decides consent policy.
+//
+// bn-run-node-db-sync-wiring: this worker also owns the browser-replicated
+// database lane (the "db lane" section below). When the admission capability
+// carries a server-derived `db` block, it keeps the project's OPFS cr-sqlite
+// replica converged with the fleet. Hosting constraint, measured live (Chrome,
+// 2026-08): a SharedWorker global scope has NO `Worker` constructor at all
+// (ReferenceError), and FileSystemSyncAccessHandle is DedicatedWorker-only —
+// so in the SharedWorker context the sqlite worker is brokered by a connected
+// page over this control protocol:
+//   worker -> page : { type: "dbWorkerRequest", requestId }   (one page at a time)
+//   page -> worker : { type: "dbWorkerPort", requestId } + transfer [port]
+//     The page constructs
+//       new Worker("<origin>/browser-node/sqlite/sqlite-worker.js", { type: "module" }),
+//     bridges a MessageChannel to it both ways, and transfers the channel's
+//     other end here. The page MUST terminate its bridge worker on
+//     { type: "dbWorkerDone", requestId } (sent before this side drops the
+//     port) and on its own unload — an orphaned sqlite worker holds the OPFS
+//     access-handle pool and blocks the next open with
+//     NoModificationAllowedError.
+// In the dedicated-worker context (the Web Locks fallback) `Worker` exists and
+// the lane nests directly — no page involvement.
+// Page control ops added by the lane (replies on the originating port):
+//   { type: "dbExec", id, sql }    write-class SQL; read_write grants only;
+//                                  replies { type: "dbExecResult", id, ok, rows?|error? }
+//   { type: "dbQuery", id, sql }   read-class SQL under any live grant; same reply
+//   { type: "dbSyncNow", id }      runs a sync round now; replies
+//                                  { type: "dbSyncResult", id, ok, reports?|error? }
 
 import { loadOrCreateSeed } from "./browser-node/identity.js";
 import { WorkerFunctionRuntime } from "./browser-node/worker-function-runtime.js";
@@ -139,6 +166,13 @@ let status = {
   // artifact digests, live invoker-grant count and served-invoke total of the
   // worker's QuickJS lane. null while no function runtime is running.
   functions: null,
+  // bn-run-node-db-sync-wiring introspection (additive on the wire, like
+  // functions above; the ui/lib/run-node-status.ts typed mirror is owned
+  // elsewhere): { project, dbFile, access, state, persisted, peers,
+  // lastSyncMs, sites, siteVersion, error }. null unless the admitted
+  // project's capability carries a server-derived `db` block — the dashboard
+  // renders nothing then.
+  db: null,
 };
 
 // bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
@@ -211,6 +245,7 @@ function broadcast() {
       portVisibility.delete(p);
       const idx = ports.indexOf(p);
       if (idx !== -1) ports.splice(idx, 1);
+      notePortRemoved(p); // the db lane re-brokers if this page held its sqlite worker
     }
     if (ports.length === 0 && (node || status.lifecycle === "starting")) {
       stop();
@@ -530,6 +565,647 @@ function teardownFunctionLane(owner = node) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// bn-run-node-db-sync-wiring: the browser-replicated database lane.
+//
+// When the admission capability carries a server-derived `db` block
+// (docs/browser-db-contract.md §3), this worker keeps the project's OPFS
+// cr-sqlite replica converged with the fleet: it spawns (or brokers — see the
+// file header) the sqlite DedicatedWorker from the deployed assets, opens the
+// replica persist-first, applies the spec schema idempotently, serves
+// fleet-initiated rounds through the node's setCrrSyncHandler arm, and runs
+// the BrowserDbSync session loop against the granted sync_peers on a fixed
+// cadence plus after every local write. The lane NEVER fails an admission:
+// every failure lands in status.db.error instead (the function lane is the
+// admission's purpose; the database is additive).
+//
+// Retention (contract §5), keyed on the ADMISSION, never on a sync refusal:
+//   * stop() — the local revoke: best-effort final push while the grant is
+//     still live, then wipe the OPFS replica.
+//   * terminal admission failure (denied, e.g. deployment_not_ready) → wipe.
+//   * a successful renewal whose capability LOST the db block → grant gone →
+//     wipe.
+//   * a refused sync round (relay denylist / expired lease) → SEAL the lane
+//     and kick the renewal spine: a fresh admission resumes incrementally
+//     from the replica's durable watermarks; renewals that keep failing leave
+//     it sealed. A sync refusal alone NEVER wipes — a transient dial failure
+//     is indistinguishable from revocation at that layer.
+// ---------------------------------------------------------------------------
+
+const DB_SYNC_INTERVAL_MS = 30_000; // a converged round is one small frame per peer
+const DB_WORKER_BROKER_TIMEOUT_MS = 6_000; // per page asked, sequentially
+const DB_RESPAWN_BASE_MS = 5_000;
+const DB_RESPAWN_CAP_MS = 60_000;
+const DB_WORKER_URL = new URL("./browser-node/sqlite/sqlite-worker.js", import.meta.url);
+
+let dbLane = null;
+// shape: {
+//   capability, client, sync, responder, makeCrrSyncResponder,
+//   endpoint, nested, brokerPort, brokerRequestId, requestSeq, pendingBroker,
+//   grantedPeers, state ("opening"|"idle"|"syncing"|"error"), sealed,
+//   persisted, lastSyncMs, sites, siteVersion, error,
+//   syncTimer, syncInFlight, syncKickPending, syncWaiters,
+//   respawnTimer, respawnDelayMs, schemaKey, openSettled, wipeOnOpen,
+// }
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Validate the capability's `db` block into a local shape. Absent = null (the
+// project is not opted in — normal). Malformed = thrown, landing in
+// status.db.error: the block is server-derived, so a bad shape is a platform
+// bug to surface, never client input to sanitize silently.
+function normalizeDbCapability(capability) {
+  const db = capability && capability.db;
+  if (db === undefined || db === null) return null;
+  if (typeof db !== "object") throw new Error("capability db block is not an object");
+  // The platform-derived replica name (contract §6) — a bare file name from
+  // the platform template, never a path; it becomes an OPFS file name below.
+  if (typeof db.db_file !== "string" || !/^hive-browserdb-[a-z0-9._-]+\.db$/.test(db.db_file)) {
+    throw new Error("capability db.db_file is not the platform-derived replica name");
+  }
+  if (db.access !== "read_write" && db.access !== "read_only") {
+    throw new Error(`capability db.access ${JSON.stringify(db.access)} is unsupported`);
+  }
+  if (typeof db.project !== "string" || !db.project) {
+    throw new Error("capability db.project must be a non-empty string");
+  }
+  for (const key of ["max_bytes", "max_value_bytes"]) {
+    if (!Number.isSafeInteger(db[key]) || db[key] <= 0) {
+      throw new Error(`capability db.${key} must be a positive integer`);
+    }
+  }
+  const schema = Array.isArray(db.schema) ? db.schema : [];
+  for (const table of schema) {
+    if (!table || typeof table !== "object" || typeof table.ddl !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(table.name || "")) {
+      throw new Error("capability db.schema carries a malformed table entry");
+    }
+  }
+  // sync_peers is server-derived from the live registry (health-filtered
+  // fleet EndpointIds); filter to the exact shape anyway — a malformed entry
+  // must never reach grantCrrSync/crrSyncOn.
+  const peers = (Array.isArray(db.sync_peers) ? db.sync_peers : [])
+    .filter((p) => p && typeof p === "object" && DIGEST_RE.test(p.endpoint_id || "") && typeof p.addr_json === "string" && p.addr_json.length > 0 && p.addr_json.length <= 8192)
+    .map((p) => ({ endpoint_id: p.endpoint_id, addr_json: p.addr_json }));
+  return {
+    tenant: typeof db.tenant === "string" ? db.tenant : "",
+    project: db.project,
+    access: db.access,
+    max_bytes: db.max_bytes,
+    max_value_bytes: db.max_value_bytes,
+    db_file: db.db_file,
+    schema,
+    sync_peers: peers,
+    expires_ms: Number.isSafeInteger(db.expires_ms) ? db.expires_ms : 0,
+  };
+}
+
+function dbSchemaKey(dbCap) {
+  return JSON.stringify([dbCap.schema, dbCap.max_bytes, dbCap.max_value_bytes, dbCap.access]);
+}
+
+// One status object, rebuilt from the lane on every transition; null while no
+// lane exists (a project without a browser_db block never sets it, and the
+// dashboard renders nothing). The JSON compare avoids a broadcast per
+// transition when nothing actually changed.
+function updateDbStatus() {
+  const summary = dbLane
+    ? {
+        project: dbLane.capability.project,
+        dbFile: dbLane.capability.db_file,
+        access: dbLane.capability.access,
+        state: dbLane.sealed && dbLane.state !== "error" ? "sealed" : dbLane.state,
+        persisted: dbLane.persisted,
+        peers: dbLane.capability.sync_peers.length,
+        lastSyncMs: dbLane.lastSyncMs,
+        sites: dbLane.sites,
+        siteVersion: dbLane.siteVersion,
+        error: dbLane.error,
+      }
+    : null;
+  if (JSON.stringify(status.db ?? null) === JSON.stringify(summary)) return;
+  setStatus({ db: summary });
+}
+
+// A db-lane failure when no lane exists yet (a malformed db block, a spawn
+// that never got far enough): still surfaced, never hidden — but never
+// failing the admission itself.
+function noteDbLaneError(error) {
+  const message = String((error && error.message) || error).slice(0, 300);
+  if (dbLane) {
+    dbLane.state = "error";
+    dbLane.error = message;
+    updateDbStatus();
+  } else {
+    setStatus({
+      db: {
+        project: null, dbFile: null, access: null, state: "error", persisted: null,
+        peers: 0, lastSyncMs: null, sites: 0, siteVersion: 0, error: message,
+      },
+    });
+  }
+}
+
+// Spawn-or-broker the sqlite DedicatedWorker endpoint. Measured live (Chrome,
+// 2026-08): a SharedWorker global scope has NO `Worker` constructor at all
+// (ReferenceError: Worker is not defined) while a dedicated worker nests
+// fine — feature detection, not context sniffing.
+async function acquireDbWorkerEndpoint(lane, myEpoch) {
+  if (typeof Worker === "function") {
+    const worker = new Worker(DB_WORKER_URL, { type: "module" });
+    lane.nested = true;
+    return worker;
+  }
+  // SharedWorker: broker through connected pages, one at a time, visible tabs
+  // first — never a broadcast (every answering page builds a real sqlite
+  // worker; sequential asks leave at most one bridge alive).
+  let lastError = null;
+  const candidates = [...ports].sort(
+    (a, b) => Number(portVisibility.get(b) ?? true) - Number(portVisibility.get(a) ?? true),
+  );
+  for (const port of candidates) {
+    if (myEpoch !== epoch || dbLane !== lane) throw new Error("db lane superseded during worker broker");
+    try {
+      // onDbWorkerPort records the answering port as lane.brokerPort.
+      return await requestBrokeredDbWorker(lane, port);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("no connected page could broker the database worker");
+}
+
+function requestBrokeredDbWorker(lane, port) {
+  return new Promise((resolve, reject) => {
+    const requestId = ++lane.requestSeq;
+    const timer = setTimeout(() => {
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(new Error("page did not broker the database worker in time"));
+    }, DB_WORKER_BROKER_TIMEOUT_MS);
+    lane.pendingBroker = {
+      requestId,
+      resolve: (endpoint) => { clearTimeout(timer); resolve(endpoint); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    };
+    try {
+      port.postMessage({ type: "dbWorkerRequest", requestId });
+    } catch (error) {
+      clearTimeout(timer);
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(error);
+    }
+  });
+}
+
+function onDbWorkerPort(port, msg, transferred) {
+  const lane = dbLane;
+  const endpoint = transferred && transferred[0];
+  const pending = lane && lane.pendingBroker;
+  if (!lane || !pending || msg.requestId !== pending.requestId) {
+    // Stale or unsolicited answer — close the end so neither side dangles.
+    try {
+      if (endpoint) endpoint.close();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  lane.pendingBroker = null;
+  if (!endpoint) {
+    pending.reject(new Error("dbWorkerPort arrived without a transferred port"));
+    return;
+  }
+  if (typeof endpoint.start === "function") endpoint.start();
+  lane.brokerPort = port;
+  lane.brokerRequestId = msg.requestId;
+  pending.resolve(endpoint);
+}
+
+function teardownDbEndpoint(lane) {
+  if (lane.syncTimer) {
+    clearInterval(lane.syncTimer);
+    lane.syncTimer = null;
+  }
+  if (lane.respawnTimer) {
+    clearTimeout(lane.respawnTimer);
+    lane.respawnTimer = null;
+  }
+  if (lane.pendingBroker) {
+    lane.pendingBroker.reject(new Error("db lane torn down"));
+    lane.pendingBroker = null;
+  }
+  if (!lane.nested && lane.brokerPort) {
+    // Tell the brokering page to terminate its sqlite worker NOW — an orphan
+    // holds the OPFS access-handle pool and blocks the next open.
+    try {
+      lane.brokerPort.postMessage({ type: "dbWorkerDone", requestId: lane.brokerRequestId });
+    } catch {
+      /* page already gone */
+    }
+  }
+  lane.brokerPort = null;
+  if (lane.endpoint) {
+    if (lane.nested) {
+      try {
+        lane.endpoint.terminate();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      try {
+        lane.endpoint.close();
+      } catch {
+        /* ignore */
+      }
+    }
+    lane.endpoint = null;
+  }
+  lane.client = null;
+  lane.sync = null;
+  lane.responder = null;
+}
+
+function reconcileDbPeerGrants(owner, lane) {
+  const desired = new Set(lane.capability.sync_peers.map((p) => p.endpoint_id));
+  for (const id of lane.grantedPeers) {
+    if (desired.has(id)) continue;
+    try {
+      owner.revokeCrrSync(id);
+    } catch {
+      /* node already closed */
+    }
+  }
+  for (const id of desired) {
+    try {
+      owner.grantCrrSync(id);
+    } catch {
+      /* node already closed */
+    }
+  }
+  lane.grantedPeers = desired;
+}
+
+function revokeDbPeerGrants(owner, lane) {
+  for (const id of lane.grantedPeers) {
+    try {
+      owner.revokeCrrSync(id);
+    } catch {
+      /* node already closed */
+    }
+  }
+  lane.grantedPeers = new Set();
+}
+
+async function startDbLane(dbCap, myEpoch) {
+  const owner = node;
+  if (!owner) return;
+  const lane = {
+    capability: dbCap, client: null, sync: null, responder: null, makeCrrSyncResponder: null,
+    endpoint: null, nested: false, brokerPort: null, brokerRequestId: 0,
+    requestSeq: 0, pendingBroker: null, grantedPeers: new Set(),
+    state: "opening", sealed: false, persisted: null,
+    lastSyncMs: null, sites: 0, siteVersion: 0, error: null,
+    syncTimer: null, syncInFlight: false, syncKickPending: false, syncWaiters: [],
+    respawnTimer: null, respawnDelayMs: DB_RESPAWN_BASE_MS, schemaKey: dbSchemaKey(dbCap),
+    openSettled: null, wipeOnOpen: false,
+  };
+  dbLane = lane;
+  updateDbStatus();
+  try {
+    // Dynamic import: a missing or partial deployed sqlite set must degrade
+    // the db lane honestly, never break the whole run-node worker.
+    const syncClient = await import("./browser-node/sqlite/sync-client.js");
+    lane.makeCrrSyncResponder = syncClient.makeCrrSyncResponder;
+    lane.endpoint = await acquireDbWorkerEndpoint(lane, myEpoch);
+    if (myEpoch !== epoch || node !== owner || dbLane !== lane) {
+      teardownDbEndpoint(lane);
+      return;
+    }
+    lane.client = new syncClient.WorkerClient(lane.endpoint);
+    lane.sync = new syncClient.BrowserDbSync(lane.client, owner, dbCap);
+    // A just-closed previous worker's OPFS sync access handles drain
+    // asynchronously (one pool per origin owns /hive-crsql at a time) — ride
+    // out the release window, but only for that exact error (the
+    // witness-crr.html precedent).
+    const openAttempt = (async () => {
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        try {
+          return await lane.sync.open();
+        } catch (error) {
+          if (!/NoModificationAllowedError/.test(String((error && error.message) || error)) || attempt === 6) throw error;
+          await sleep(1_000);
+        }
+      }
+      throw new Error("unreachable");
+    })();
+    lane.openSettled = openAttempt.catch(() => {}); // never rejects: stopDbLane only waits on it
+    const opened = await openAttempt;
+    if (myEpoch !== epoch || node !== owner || dbLane !== lane) {
+      // stop() landed mid-open — the replica now exists; honor the wipe the
+      // stop requested before releasing the endpoint.
+      if (lane.wipeOnOpen) {
+        try {
+          await lane.client.call("wipe");
+        } catch {
+          /* best effort */
+        }
+      }
+      teardownDbEndpoint(lane);
+      return;
+    }
+    lane.persisted = opened && opened.persisted !== undefined ? opened.persisted : "unknown";
+    lane.responder = lane.makeCrrSyncResponder(lane.client, dbCap);
+    owner.setCrrSyncHandler((bytes, signal) => {
+      if (dbLane !== lane || !lane.responder) {
+        return Promise.reject(new Error("this browser node holds no live db grant"));
+      }
+      return lane.responder(bytes, signal);
+    });
+    reconcileDbPeerGrants(owner, lane);
+    lane.state = "idle";
+    lane.respawnDelayMs = DB_RESPAWN_BASE_MS;
+    updateDbStatus();
+    lane.syncTimer = setInterval(() => runDbSync(lane), DB_SYNC_INTERVAL_MS);
+    runDbSync(lane); // the initial convergence round — async, reports into status
+  } catch (error) {
+    if (dbLane !== lane) {
+      teardownDbEndpoint(lane);
+      return;
+    }
+    lane.state = "error";
+    lane.error = String((error && error.message) || error).slice(0, 300);
+    updateDbStatus();
+    scheduleDbRespawn(lane);
+  }
+}
+
+// Rebuild the sqlite worker endpoint (brokered page died, nested worker
+// crashed, open failed) WITHOUT touching the replica: the OPFS file and its
+// durable watermarks survive, so the respawned lane resumes incrementally.
+function scheduleDbRespawn(lane, delayMs) {
+  if (dbLane !== lane) return;
+  if (lane.respawnTimer) clearTimeout(lane.respawnTimer);
+  const delay = delayMs ?? lane.respawnDelayMs;
+  lane.respawnDelayMs = Math.min(lane.respawnDelayMs * 2, DB_RESPAWN_CAP_MS);
+  const myEpoch = epoch;
+  const capability = lane.capability;
+  lane.respawnTimer = setTimeout(() => {
+    if (dbLane !== lane || myEpoch !== epoch || !node) return;
+    teardownDbEndpoint(lane);
+    if (dbLane === lane) dbLane = null;
+    startDbLane(capability, myEpoch);
+  }, delay);
+}
+
+// Expiry/offline semantics (contract §5): the replica is SEALED — no exchange
+// until a successful renewal re-grants. Never wiped on these paths.
+function sealDbLane() {
+  const lane = dbLane;
+  if (!lane) return;
+  lane.sealed = true;
+  updateDbStatus();
+}
+
+// Every lane teardown funnels here: stop() (local revoke — final push, then
+// wipe), terminal admission failure / a lost db block (wipe, no push — the
+// grant is already gone server-side), and the defensive epoch clear (neither).
+// `owner` is the node the peer grants were applied to.
+async function stopDbLane({ wipe, finalPush, owner = node }) {
+  const lane = dbLane;
+  if (!lane) return;
+  dbLane = null;
+  updateDbStatus();
+  if (owner) revokeDbPeerGrants(owner, lane);
+  // The inbound responder arm rejects from here on (its setCrrSyncHandler
+  // closure checks dbLane !== lane); nothing more to uninstall.
+  if (finalPush && lane.sync && lane.client && networkOnline) {
+    try {
+      await lane.sync.syncAll();
+    } catch {
+      /* best-effort final push — the wipe below is unconditional */
+    }
+  }
+  if (wipe) {
+    if (!lane.client && lane.state === "opening") {
+      // stop() raced the initial open: give it a bounded moment to settle so
+      // the replica it may have just created can still be wiped here; the
+      // post-open stale branch in startDbLane honors wipeOnOpen otherwise.
+      lane.wipeOnOpen = true;
+      await Promise.race([lane.openSettled || Promise.resolve(), sleep(3_000)]);
+    }
+    if (lane.client) {
+      try {
+        await lane.client.call("wipe");
+      } catch {
+        /* the replica may already be gone */
+      }
+    }
+  }
+  teardownDbEndpoint(lane);
+}
+
+// One reconcile per successful admission/renewal, after the function lane's
+// own reconcile: start on a fresh grant, adopt the renewed capability on an
+// existing lane, wipe on a lost one. A db-lane failure is caught by the
+// caller (renewNow) into status.db — never an admission failure.
+async function reconcileDbLane(capability, myEpoch) {
+  const dbCap = normalizeDbCapability(capability);
+  if (!dbCap) {
+    if (dbLane) await stopDbLane({ wipe: true, finalPush: false });
+    else if (status.db) setStatus({ db: null });
+    return;
+  }
+  if (dbLane && dbLane.capability.db_file !== dbCap.db_file) {
+    // A different project's grant replaced this one within one admission
+    // lifetime — the old project's grant is gone, so its replica is wiped
+    // before the new one opens (§5).
+    await stopDbLane({ wipe: true, finalPush: false });
+  }
+  if (!dbLane) {
+    await startDbLane(dbCap, myEpoch);
+    return;
+  }
+  // Same database, renewed grant: adopt the fresh capability (caps/schema/
+  // peers may have moved across a redeploy), reconcile peer grants, unseal.
+  const lane = dbLane;
+  const wasSealed = lane.sealed;
+  lane.sealed = false;
+  lane.capability = dbCap;
+  if (lane.sync) lane.sync.cap = dbCap;
+  if (lane.client && lane.makeCrrSyncResponder) {
+    lane.responder = lane.makeCrrSyncResponder(lane.client, dbCap);
+  }
+  const owner = node;
+  if (owner) reconcileDbPeerGrants(owner, lane);
+  if (lane.schemaKey !== dbSchemaKey(dbCap) && lane.client) {
+    lane.schemaKey = dbSchemaKey(dbCap);
+    // Idempotent by contract (§1): CREATE TABLE IF NOT EXISTS + crsql_as_crr.
+    for (const table of dbCap.schema) {
+      await lane.client.call("exec", { sql: table.ddl });
+      await lane.client.call("as-crr", { table: table.name });
+    }
+  }
+  updateDbStatus();
+  if (wasSealed) kickDbSync(); // re-admitted: resume from the durable watermarks
+}
+
+function kickDbSync() {
+  const lane = dbLane;
+  if (!lane) return;
+  if (lane.syncInFlight) {
+    lane.syncKickPending = true;
+    return;
+  }
+  runDbSync(lane);
+}
+
+// One coalesced sync pass over the granted peers. Waiters (the dbSyncNow
+// control op) receive the raw per-peer session reports; the periodic caller
+// ignores them.
+async function runDbSync(lane) {
+  if (dbLane !== lane || !lane.sync) return null;
+  if (lane.sealed || !networkOnline) return null;
+  if (lane.syncInFlight) {
+    lane.syncKickPending = true;
+    return null;
+  }
+  lane.syncInFlight = true;
+  lane.state = "syncing";
+  updateDbStatus();
+  let reports = null;
+  try {
+    reports = await lane.sync.syncAll();
+    if (dbLane !== lane) return reports;
+    if (reports.some((r) => r.forbidden)) {
+      // The fleet refused a round: the grant is revoked or the lease lapsed.
+      // SEAL and let the renewal spine's re-admission verdict decide
+      // resume-vs-stay-sealed (contract §5) — a sync refusal alone never
+      // wipes; a transient dial failure looks identical at this layer.
+      lane.error = "the fleet refused a sync round — the db grant was revoked or the lease lapsed; sealed until re-admission";
+      lane.state = "idle";
+      sealDbLane();
+      kickRenew();
+      return reports;
+    }
+    lane.lastSyncMs = Date.now();
+    lane.error = null;
+    const state = await lane.sync.state();
+    if (dbLane !== lane) return reports;
+    lane.sites = state.watermarks.length;
+    const own = state.watermarks.find((w) => w.siteId === state.siteId);
+    lane.siteVersion = own ? own.version : 0;
+    lane.state = "idle";
+    updateDbStatus();
+    return reports;
+  } catch (error) {
+    if (dbLane !== lane) return reports;
+    lane.state = "error";
+    lane.error = String((error && error.message) || error).slice(0, 300);
+    updateDbStatus();
+    // A thrown op (e.g. WorkerClient's 30s timeout) means the endpoint is
+    // likely dead — a brokered page vanished or the nested worker crashed.
+    scheduleDbRespawn(lane);
+    return reports;
+  } finally {
+    if (dbLane === lane) {
+      lane.syncInFlight = false;
+      const waiters = lane.syncWaiters;
+      lane.syncWaiters = [];
+      for (const resolve of waiters) resolve(reports);
+      if (lane.syncKickPending) {
+        lane.syncKickPending = false;
+        runDbSync(lane);
+      }
+    }
+  }
+}
+
+// The page that brokered the current sqlite worker is gone — its
+// DedicatedWorker died with it. Re-broker from a surviving page (the OPFS
+// replica and its watermarks are unaffected; the open retry rides out the
+// handle drain).
+function notePortRemoved(port) {
+  const lane = dbLane;
+  if (!lane) return;
+  if (lane.pendingBroker) {
+    try {
+      lane.pendingBroker.reject(new Error("brokering page disconnected"));
+    } catch {
+      /* already settled */
+    }
+    lane.pendingBroker = null;
+  }
+  if (lane.brokerPort !== port) return;
+  lane.brokerPort = null;
+  if (lane.endpoint) {
+    try {
+      lane.endpoint.close();
+    } catch {
+      /* already dead with the page */
+    }
+    lane.endpoint = null;
+  }
+  if (lane.state !== "error") {
+    lane.state = "opening";
+    updateDbStatus();
+  }
+  scheduleDbRespawn(lane, 1_500);
+}
+
+// Page control ops. dbExec is write-class (read_write grants only) and syncs
+// on write (contract §5's unsynced-writes mitigation); dbQuery is read-class
+// under any live grant. Both reply on the originating port.
+async function handleDbExec(port, msg, writeClass) {
+  const reply = (ok, fields) => {
+    try {
+      port.postMessage({ type: "dbExecResult", id: msg.id, ok, ...fields });
+    } catch {
+      /* tab gone */
+    }
+  };
+  const lane = dbLane;
+  if (!lane || !lane.sync || lane.state === "opening") {
+    return reply(false, { error: "no live database lane — this target has no browser_db grant, or it is still opening" });
+  }
+  if (lane.sealed) {
+    return reply(false, { error: "the database grant is sealed (admission not currently granted) — it resumes on re-admission" });
+  }
+  if (writeClass && lane.capability.access !== "read_write") {
+    return reply(false, { error: "the database grant is read-only" });
+  }
+  try {
+    if (writeClass) {
+      const r = await lane.sync.write(String(msg.sql));
+      kickDbSync();
+      reply(true, { rows: r.rows ?? [] });
+    } else {
+      const rows = await lane.sync.readRows(String(msg.sql));
+      reply(true, { rows });
+    }
+  } catch (error) {
+    reply(false, { error: String((error && error.message) || error).slice(0, 300) });
+  }
+}
+
+async function handleDbSyncNow(port, msg) {
+  const id = msg.id;
+  const reply = (ok, fields) => {
+    try {
+      port.postMessage({ type: "dbSyncResult", id, ok, ...fields });
+    } catch {
+      /* tab gone */
+    }
+  };
+  const lane = dbLane;
+  if (!lane || !lane.sync || lane.sealed) {
+    return reply(false, { error: lane && lane.sealed ? "the database grant is sealed" : "no live database lane" });
+  }
+  const reportsPromise = new Promise((resolve) => lane.syncWaiters.push(resolve));
+  kickDbSync();
+  const reports = await Promise.race([reportsPromise, sleep(60_000).then(() => "timeout")]);
+  if (reports === "timeout") return reply(false, { error: "sync round did not finish within 60s" });
+  reply(true, { reports });
+}
+
 // One renewal spine owns every admission write: periodic lease refresh,
 // browser-network restoration, and iroh home-relay/address migration. The
 // attempt reads currentAddrJson at execution time; boot's first address is
@@ -600,6 +1276,16 @@ async function renewNow(myEpoch) {
     // are left untouched.
     await reconcileCapability(admitResult && admitResult.capability, myEpoch);
     if (myEpoch !== epoch) return "stale";
+    // The db lane rides the same renewal spine: start on a fresh grant,
+    // adopt the renewed capability, wipe on a lost block. It NEVER fails the
+    // admission — a db-lane failure lands in status.db and retries on its own
+    // schedule.
+    try {
+      await reconcileDbLane(admitResult && admitResult.capability, myEpoch);
+    } catch (dbError) {
+      noteDbLaneError(dbError);
+    }
+    if (myEpoch !== epoch) return "stale";
     admittedAddrJson = attemptedAddr;
     renewBackoffMs = RENEW_BACKOFF_BASE_MS;
     const lifecycle = anyVisible() ? "online" : "suspended";
@@ -625,9 +1311,16 @@ async function renewNow(myEpoch) {
       currentAddrJson = null;
       admittedAddrJson = null;
       teardownFunctionLane(doomed);
+      // Terminal denial (e.g. deployment_not_ready / forbidden) is treated as
+      // revocation (contract §5): wipe the replica, no final push — the grant
+      // is already gone server-side.
+      await stopDbLane({ wipe: true, finalPush: false, owner: doomed });
       await discardStaleAttempt(doomed, endpointId, renewalTeam);
       outcome = "terminal";
     } else {
+      // Non-terminal: the lease may lapse while renewals fail — the replica
+      // is SEALED (no exchange) until a renewal re-grants, never wiped.
+      sealDbLane();
       renewBackoffMs = nextDecorrelatedJitterMs(renewBackoffMs);
       nextDelay = renewBackoffMs;
     }
@@ -757,6 +1450,11 @@ function onAddressChange(owner, myEpoch, json) {
 async function start(msg) {
   if (node || status.lifecycle === "starting") return;
   const myEpoch = ++epoch;
+  // Defensive: no db lane may outlive its epoch (stop() tears it down; this
+  // fences a future path that forgets — two lanes would fight over the
+  // origin's single OPFS access-handle pool). Never wipes here: an orphaned
+  // lane's replica is the admission lifecycle's call, not this fence's.
+  if (dbLane) await stopDbLane({ wipe: false, finalPush: false });
   currentAddrJson = null;
   admittedAddrJson = null;
   renewKickPending = false;
@@ -902,6 +1600,9 @@ function onNetworkChange(online) {
     if (status.lifecycle === "online" || status.lifecycle === "suspended") {
       setStatus({ lifecycle: "degraded", lastError: "Network unavailable — reconnecting automatically." });
     }
+    // The db replica seals while offline (no exchange possible); the renewal
+    // on network restore unseals it.
+    sealDbLane();
     return;
   }
   // The same renewal spine handles this as relay migration and periodic refresh;
@@ -927,6 +1628,7 @@ function onPortVisibility(port, msg) {
     portVisibility.delete(port);
     const idx = ports.indexOf(port);
     if (idx !== -1) ports.splice(idx, 1);
+    notePortRemoved(port); // the db lane re-brokers if this page held its sqlite worker
     // No tab left that can observe or control this node — release it rather
     // than run headless forever with no way for a user to ever stop it.
     if (ports.length === 0 && (node || status.lifecycle === "starting")) {
@@ -963,6 +1665,11 @@ async function stop() {
     // Revoke every invoker grant + close every runner BEFORE the admission
     // DELETE and the node close (which itself clears the wasm grant map).
     teardownFunctionLane(node);
+    // The db lane's local revoke (contract §5): best-effort final push while
+    // the grant is still live, then wipe the OPFS replica — all BEFORE the
+    // admission DELETE (the fleet re-checks the grant on every round) and
+    // before the node closes (the push needs the transport).
+    await stopDbLane({ wipe: true, finalPush: true });
     try {
       if (endpointId && team) {
         await callApi("DELETE", `/v1/browser/admissions/${encodeURIComponent(endpointId)}`, team);
@@ -982,6 +1689,10 @@ async function stop() {
     }
     node = null;
   }
+  // A lane without a node shouldn't exist (the lane dies with its epoch) —
+  // fence it anyway, without a wipe: stop()'s wipe path above is the one that
+  // had transport + a live grant for the final push.
+  if (dbLane) await stopDbLane({ wipe: false, finalPush: false });
   session = null;
   closing = false;
   setStatus({
@@ -994,6 +1705,7 @@ async function stop() {
     relay: null,
     lastError: null,
     functions: null,
+    db: null,
   });
 }
 
@@ -1014,6 +1726,12 @@ function connectPort(port) {
     else if (msg.type === "geoConsent") setStatus({ geoConsent: msg.value });
     else if (msg.type === "visibility") onPortVisibility(port, msg);
     else if (msg.type === "network") onNetworkChange(!!msg.online);
+    // The db lane's page-broker handshake + control ops
+    // (bn-run-node-db-sync-wiring; see the file header for the contract).
+    else if (msg.type === "dbWorkerPort") onDbWorkerPort(port, msg, e.ports);
+    else if (msg.type === "dbExec") handleDbExec(port, msg, true);
+    else if (msg.type === "dbQuery") handleDbExec(port, msg, false);
+    else if (msg.type === "dbSyncNow") handleDbSyncNow(port, msg);
     else if (msg.type === "status") {
       try {
         port.postMessage({ type: "status", status });
@@ -1026,6 +1744,13 @@ function connectPort(port) {
   // DedicatedWorkerGlobalScope's `self` — messages already flow once
   // onmessage is assigned.
   if (typeof port.start === "function") port.start();
+  // A fresh page connection is a fresh potential broker: a db lane stuck in
+  // "error" because no page could host its sqlite worker retries promptly
+  // instead of waiting out the respawn backoff. ("opening" needs no kick —
+  // the broker handshake has its own timeout into the error path.)
+  if (dbLane && dbLane.state === "error" && !dbLane.nested && !dbLane.endpoint) {
+    scheduleDbRespawn(dbLane, 250);
+  }
   try {
     port.postMessage({ type: "status", status });
   } catch {

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MapPin, RadioTower, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
-import { lifecycleLabel } from "@/lib/run-node-status";
+import { lifecycleLabel, type RunNodeStatus } from "@/lib/run-node-status";
 import { upsertPresence, clearPresence, type PresenceState } from "@/lib/run-node-client";
 import { usePoll, type Deployment } from "@/lib/api";
 import { resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
@@ -47,8 +47,42 @@ function presenceState(lifecycle: string): PresenceState | null {
   return null; // "stopped" — no presence record while stopped
 }
 
+// bn-run-node-db-sync-wiring: the worker's additive db-lane status field.
+// Present only while the admitted project's capability carries a
+// server-derived `db` block (a fluid.json top-level browser_db opt-in) — the
+// typed mirror in lib/run-node-status.ts is owned by another row, so this
+// page widens the type locally, the same way the field rides the wire.
+type DbLaneStatus = {
+  project: string | null;
+  dbFile: string | null;
+  access: "read_write" | "read_only" | null;
+  state: "opening" | "idle" | "syncing" | "sealed" | "error";
+  persisted: boolean | "unknown" | null;
+  peers: number;
+  lastSyncMs: number | null;
+  sites: number;
+  siteVersion: number;
+  error: string | null;
+};
+
+function dbLaneStateLabel(db: DbLaneStatus): string {
+  switch (db.state) {
+    case "opening":
+      return "opening local replica…";
+    case "syncing":
+      return "syncing…";
+    case "sealed":
+      return "sealed — resumes on re-admission";
+    case "error":
+      return "error";
+    case "idle":
+      return db.lastSyncMs ? `last synced ${Math.max(0, Math.round((Date.now() - db.lastSyncMs) / 1000))}s ago` : "idle";
+  }
+}
+
 export default function RunNodePage() {
   const { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError } = useRunNode();
+  const dbStatus = (status as RunNodeStatus & { db?: DbLaneStatus | null }).db ?? null;
   // Eligible serve targets come from the same authenticated /deployments list
   // the rest of the dashboard polls — served locally with leader/owner
   // fallback server-side (admin_ingress + the /cloud proxy), so this page
@@ -450,6 +484,29 @@ export default function RunNodePage() {
           <dd className="truncate font-mono text-secondary">{status.relay ?? "—"}</dd>
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
+          {dbStatus && (
+            <>
+              <dt className="text-muted">Database</dt>
+              <dd className="text-secondary">
+                {dbStatus.project ?? "unknown"} · {dbStatus.access === "read_write" ? "read-write" : "read-only"} ·{" "}
+                {dbLaneStateLabel(dbStatus)}
+                {dbStatus.state !== "error" && dbStatus.state !== "opening" && (
+                  <>
+                    {" "}· v{dbStatus.siteVersion} across {dbStatus.sites} site{dbStatus.sites === 1 ? "" : "s"},{" "}
+                    {dbStatus.peers} sync peer{dbStatus.peers === 1 ? "" : "s"}
+                  </>
+                )}
+                {dbStatus.persisted === false && (
+                  <>
+                    {" "}·{" "}
+                    <span className="text-amber-600 dark:text-amber-400">
+                      browser storage not persistent — the local copy can be evicted
+                    </span>
+                  </>
+                )}
+              </dd>
+            </>
+          )}
           {status.tabCount > 1 && (
             <>
               <dt className="text-muted">Tabs</dt>
@@ -459,6 +516,12 @@ export default function RunNodePage() {
             </>
           )}
         </dl>
+        {dbStatus?.error && (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500" role="alert">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>Database sync: {dbStatus.error}</span>
+          </div>
+        )}
         {status.lifecycle === "suspended" && (
           // Background/suspension honesty (bn-ui-mobile-lifecycle): "suspended"
           // means every tab that could observe this node is currently hidden —

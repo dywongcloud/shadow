@@ -239,11 +239,43 @@ export function useRunNode() {
       let port!: MessagePort;
       let reconnecting = false;
 
+      // db-worker broker (bn-dashboard-db-worker-broker-hook): a SharedWorker
+      // global scope has no `Worker` constructor, so the run-node worker's db
+      // lane asks a connected page to host the sqlite DedicatedWorker and
+      // bridge a MessageChannel to it (protocol spec in run-node-worker.js's
+      // header). One broker per page — a fresh request supersedes; the worker
+      // re-asks another page if this one dies (OPFS + watermarks survive).
+      let dbBridge: { worker: Worker; requestId: string } | null = null;
+      const endDbBridge = (requestId?: string) => {
+        if (!dbBridge) return;
+        if (requestId !== undefined && dbBridge.requestId !== requestId) return;
+        dbBridge.worker.terminate();
+        dbBridge = null;
+      };
+
       const wire = (p: MessagePort) => {
         sendRef.current = (msg) => p.postMessage(msg);
         p.onmessage = (e: MessageEvent) => {
           const msg = e.data;
           if (msg && msg.type === "status") applyIncomingStatus(msg.status);
+          else if (msg && msg.type === "dbWorkerRequest") {
+            endDbBridge();
+            try {
+              const w = new Worker("/browser-node/sqlite/sqlite-worker.js", { type: "module" });
+              const chan = new MessageChannel();
+              // Two-way bridge: everything the worker posts to its end goes to
+              // the sqlite worker and vice versa (plain JSON envelopes only).
+              chan.port1.onmessage = (ev) => w.postMessage(ev.data);
+              w.onmessage = (ev) => chan.port1.postMessage(ev.data);
+              dbBridge = { worker: w, requestId: msg.requestId };
+              p.postMessage({ type: "dbWorkerPort", requestId: msg.requestId }, [chan.port2]);
+            } catch {
+              // Unanswered request: the worker's own timeout surfaces an
+              // honest status.db error — never pretend a broker exists.
+            }
+          } else if (msg && msg.type === "dbWorkerDone") {
+            endDbBridge(msg.requestId);
+          }
         };
         p.start();
         p.postMessage({ type: "status" });
@@ -346,6 +378,7 @@ export function useRunNode() {
         window.removeEventListener("pageshow", onPageShow);
         document.removeEventListener("freeze", reportVisibility);
         document.removeEventListener("resume", reportVisibility);
+        endDbBridge();
         port.postMessage({ type: "visibility", visible: false, unloading: true });
         port.close();
         sendRef.current = () => {};

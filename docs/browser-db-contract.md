@@ -207,6 +207,30 @@ pretends a vanished tab's unsynced writes survive.
   new cap stop accepting applies (typed quota refusal) until they fit; nothing
   is deleted to force compliance.
 
+**How the production run-node worker applies those rules**
+(bn-run-node-db-sync-wiring, `ui/public/run-node-worker.js`): the db lane
+rides the admission renewal spine — it never keys a destructive action off a
+sync refusal alone, because a transient dial failure is indistinguishable
+from revocation at that layer. Concretely: `stop()` is the local revoke
+(best-effort final push while the grant is live, then wipe); a terminal
+admission denial or a successful renewal whose capability lost the `db`
+block wipes without a push (the grant is already gone server-side); a
+refused sync round or a failed non-terminal renewal SEALS the lane and kicks
+re-admission — resume is incremental from the durable watermarks. Sync
+cadence in the production worker is the exchange glue's on-write kick plus a
+30s periodic round against the granted `sync_peers` (a converged round is
+one small frame per peer), with fleet-initiated rounds served through the
+node's responder arm at any time. Hosting constraint, measured live: a
+SharedWorker has no `Worker` constructor (Chrome, 2026-08), so the sqlite
+DedicatedWorker is page-brokered over the worker's control protocol
+(`dbWorkerRequest`/`dbWorkerPort`/`dbWorkerDone`) in that context and nested
+directly in the dedicated-worker fallback; the OPFS replica survives the
+broker dying (page reload) and is re-opened with watermark resume. Lane
+state is surfaced on the worker status object (`db`: project, access, state,
+persisted, peers, lastSyncMs, sites/siteVersion, error) and rendered as a
+single status line on the dashboard's `/run-node` page — nothing renders
+when the admitted project has no `browser_db` block.
+
 **Fleet side (one replica file per participating node, §6):**
 
 - **Redeploy keeping the block** → same database (identity is the project);
@@ -316,9 +340,11 @@ knobs (`HIVE_BROWSER_DB_RECONCILE_SECS`,
 (`www/sqlite/hcb1.js`, `sync-client.js`, the worker's
 `sync-state`/`sync-export`/`sync-apply`/`wipe` ops) that maps the capability
 to worker calls and enforces the OPFS-side caps; the build-path resolution
-of the block. Sync cadence in v1 is caller-driven (the glue syncs on write
-and on demand; there is no server-pushed invalidation yet — a fleet-side
-writer is only ever picked up on the next browser-initiated round).
+of the block. Sync cadence is caller-driven at the glue level (sync-client.js
+syncs when told; there is no server-pushed invalidation yet — a fleet-side
+writer is only ever picked up on the next browser-initiated round); the
+production run-node worker drives it on write, on a 30s periodic round, and
+on demand (`dbSyncNow`) — see §5.
 Fleet-fleet replica convergence flows through browser carriers (a Team
 browser that synced node A's changes pushes them to node B's replica on its
 next round — per-site watermarks make this exactly the same protocol); a
@@ -327,6 +353,8 @@ contract's system of record only ever converges THROUGH granted writers.
 
 Beyond the exchange row: direct server-function database access (injected
 DSN / host op), per-tenant aggregate fleet quota and billing treatment,
-multiple named databases per project, dashboard surfacing, server-pushed
+multiple named databases per project, richer dashboard management UI (a
+single honest status line on `/run-node` landed with the production wiring,
+§5), server-pushed
 sync scheduling, and any cross-project sharing. None of these are needed to
 implement the exchange, and each changes this contract when it lands.

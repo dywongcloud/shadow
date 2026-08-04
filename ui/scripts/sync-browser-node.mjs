@@ -7,7 +7,7 @@
 // (hive-browser not yet built) is a WARN, never a build failure: the dashboard
 // still builds and serves everything else; "Run a node" degrades to its own
 // explicit unsupported-browser/missing-bundle state at runtime.
-import { existsSync, mkdirSync, readdirSync, copyFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, copyFileSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -40,4 +40,47 @@ for (const f of ["identity.js", "artifact-policy.js", "worker-function-runtime.j
     console.warn(`[sync-browser-node] ${src} missing — the worker QuickJS lane will fail to load until it exists.`);
   }
 }
+
+// The browser-replicated database lane (bn-run-node-db-sync-wiring): when the
+// admission capability carries a `db` block, run-node-worker.js spawns the
+// sqlite DedicatedWorker from these deployed assets. The set is the exact
+// runtime import graph of sqlite-worker.js + sync-client.js (crsqlite-sync.mjs
+// loads crsqlite-sync.wasm relative to its own import.meta.url, so both must
+// land in the same directory) — every file the worker can reach, nothing
+// more. crsqlite-sync.{mjs,wasm} are build artifacts of
+// crates/hive-browser/www/sqlite/build-sqlite.sh; the rest are hand-written
+// sources. A missing source is a WARN, never a build failure — the same
+// discipline as pkg/ above (the db lane reports its own honest error at
+// runtime; "Run a node" itself still works).
+const SQLITE_SET = [
+  "sqlite/sqlite-worker.js",
+  "sqlite/sync-client.js",
+  "sqlite/hcb1.js",
+  "sqlite/crsqlite-sync.mjs",
+  "sqlite/crsqlite-sync.wasm",
+  "sqlite/wa-sqlite/sqlite-api.js",
+  "sqlite/wa-sqlite/sqlite-constants.js",
+  "sqlite/wa-sqlite/VFS.js",
+  "sqlite/wa-sqlite/examples/AccessHandlePoolVFS.js",
+];
+let sqliteSynced = 0;
+for (const rel of SQLITE_SET) {
+  const src = join(srcRoot, rel);
+  const dest = join(destRoot, rel);
+  if (!existsSync(src)) {
+    console.warn(`[sync-browser-node] ${src} missing — the browser-db lane will report unavailable until it exists (run crates/hive-browser/www/sqlite/build-sqlite.sh first).`);
+    continue;
+  }
+  mkdirSync(dirname(dest), { recursive: true });
+  copyFileSync(src, dest);
+  // Byte-verify every shipped file: a truncated or partial copy would only
+  // surface later as an opaque import/wasm failure inside a user's browser,
+  // so the sync refuses to be silent about it.
+  if (!readFileSync(src).equals(readFileSync(dest))) {
+    console.error(`[sync-browser-node] byte mismatch after copy: ${rel}`);
+    process.exit(1);
+  }
+  sqliteSynced++;
+}
 console.log(`[sync-browser-node] synced ${srcPkg} -> ${destPkg}`);
+console.log(`[sync-browser-node] synced sqlite set (${sqliteSynced}/${SQLITE_SET.length} files) -> ${join(destRoot, "sqlite")}`);

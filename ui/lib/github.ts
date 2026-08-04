@@ -2,6 +2,7 @@ import * as composio from "./composio";
 import type { CommitResult, CreateRepoResult, GhRepo, GithubConnectionDetail } from "./composio";
 import { getGithubAppToken, githubAppConfigured, readTokenBundle, updateBundleMeta } from "./github-app";
 import * as rest from "./github-rest";
+import { installationAuthConfigured, installationTokenForRepo, listAppInstallations } from "./github-installation";
 
 /**
  * GitHub facade — the ONE import for everything GitHub in the dashboard.
@@ -31,6 +32,27 @@ export interface GithubDetail extends GithubConnectionDetail {
   provider?: "github-app" | "composio";
   /** Where to install/configure the App for org access (app provider only). */
   installUrl?: string;
+  /**
+   * WHAT the connection state is derived from: "user-token" = the per-browser
+   * encrypted cookie (a cache — fast, and carries the user's own login);
+   * "installation" = the App's REAL installation record, asked of GitHub
+   * server-to-server with the App's own identity (the same source the node's
+   * webhook/token-resolution path uses) — authoritative, browser-independent;
+   * "composio" = the legacy managed OAuth connection.
+   */
+  via?: "user-token" | "installation" | "composio";
+  /**
+   * The backend installation-record probe, when app server-to-server auth is
+   * in play: "present" (≥1 installation — the record answered CONNECTED),
+   * "none" (the record answered: not installed anywhere), "error" (the probe
+   * could not be answered — state is genuinely UNKNOWN, see
+   * `installationError`; never silently treated as either connected or not),
+   * "unconfigured" (no GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY on the dashboard).
+   */
+  installationState?: "present" | "none" | "error" | "unconfigured";
+  installationError?: string;
+  /** Accounts (logins) the App is installed on, when installationState==="present". */
+  installations?: string[];
 }
 
 export async function githubConnectionDetail(entity: string): Promise<GithubDetail> {
@@ -63,11 +85,56 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
       hasOrgScope: hasOrg,
       live,
       provider: "github-app",
+      via: "user-token",
       installUrl,
     };
   }
+
+  // No usable per-browser cookie (fresh browser, expired, different machine).
+  // The cookie was NEVER the source of truth — ask GitHub's REAL installation
+  // record server-to-server with the App's own identity (the SAME source the
+  // node's webhook/token-resolution path uses — see github-installation.ts).
+  // A valid installation means CONNECTED regardless of any browser's cookies.
+  let installationState: GithubDetail["installationState"];
+  let installationError: string | undefined;
+  if (installationAuthConfigured()) {
+    const inst = await listAppInstallations();
+    if (inst.ok && inst.installations.length > 0) {
+      const accounts = inst.installations.map((i) => i.account_login).filter((l): l is string => !!l);
+      const hasOrg = inst.installations.some((i) => i.account_type === "Organization");
+      const slug = inst.installations.find((i) => i.app_slug)?.app_slug;
+      return {
+        configured: true,
+        connected: true,
+        entity,
+        login: accounts[0] ?? null,
+        scopes: [],
+        hasPrivateAccess: true,
+        hasOrgScope: hasOrg,
+        live: true,
+        provider: "github-app",
+        via: "installation",
+        installationState: "present",
+        installations: accounts,
+        installUrl: slug ? `https://github.com/apps/${slug}/installations/new` : "https://github.com/settings/installations",
+      };
+    }
+    installationState = inst.ok ? "none" : "error";
+    if (!inst.ok) installationError = inst.error;
+    // Fall through to Composio — the App record says not-installed (or the
+    // probe failed); a legacy managed connection may still exist.
+  } else {
+    installationState = "unconfigured";
+  }
+
   const d = await composio.githubConnectionDetail(entity);
-  return { ...d, provider: d.connected || d.scopes.length ? "composio" : undefined };
+  return {
+    ...d,
+    provider: d.connected || d.scopes.length ? "composio" : undefined,
+    via: d.connected || d.scopes.length ? "composio" : undefined,
+    installationState,
+    ...(installationError ? { installationError } : {}),
+  };
 }
 
 export async function githubStatus(entity: string): Promise<{ connected: boolean; configured: boolean }> {
@@ -111,13 +178,52 @@ export async function createRepo(
   return composio.createRepo(entity, opts);
 }
 
+/**
+ * The credential a GitOps WRITE runs under, in preference order:
+ *   1. the request's user-to-server cookie token (user-attributed, when a
+ *      signed-in browser is actually present);
+ *   2. an installation token minted with the App's OWN server-to-server
+ *      identity for `owner/repo` — the same credential the node's webhook
+ *      path uses, so a write triggered without any browser session (or from a
+ *      browser whose cookie is absent/stale) still APPLIES instead of
+ *      silently no-op'ing on "not connected";
+ *   3. null → the caller falls back to the legacy Composio connection.
+ *
+ * `appError` carries a REAL failure of the app-credential path (bad key,
+ * GitHub 401, transport) so the caller can surface it loudly when no other
+ * credential exists — a broken app credential must never read as a benign
+ * skip. "App not installed on this repo" is NOT an error and returns {}.
+ */
+async function resolveWriterToken(
+  owner: string,
+  repo: string
+): Promise<{ token?: string; appError?: string }> {
+  const userToken = await getGithubAppToken();
+  if (userToken) return { token: userToken };
+  if (!installationAuthConfigured()) return {};
+  const r = await installationTokenForRepo(owner, repo);
+  if (r.ok) return r.token ? { token: r.token } : {};
+  return { appError: r.error };
+}
+
+/** composio result, upgraded to the app-credential error when that's the real
+ *  failure and Composio has nothing to offer (unconfigured, or its own write
+ *  failed too) — the loud error wins over a silent/generic one. */
+function writerFallback(
+  r: CommitResult & { ok: boolean },
+  appError?: string
+): CommitResult {
+  if (r.ok || !appError) return r;
+  return { ok: false, error: `github-app installation token failed (${appError}); fallback: ${r.error || "unavailable"}` };
+}
+
 export async function commitFile(
   entity: string,
   opts: { owner: string; repo: string; path: string; content: string; message: string; branch?: string }
 ): Promise<CommitResult> {
-  const token = await getGithubAppToken();
+  const { token, appError } = await resolveWriterToken(opts.owner, opts.repo);
   if (token) return rest.ghCommitFile(token, opts);
-  return composio.commitFile(entity, opts);
+  return writerFallback(await composio.commitFile(entity, opts), appError);
 }
 
 export async function commitFiles(
@@ -134,9 +240,9 @@ export async function commitFiles(
     managedPrefixes?: string[];
   }
 ): Promise<CommitResult> {
-  const token = await getGithubAppToken();
+  const { token, appError } = await resolveWriterToken(opts.owner, opts.repo);
   if (token) return rest.ghCommitFiles(token, opts);
-  return composio.commitFiles(entity, opts);
+  return writerFallback(await composio.commitFiles(entity, opts), appError);
 }
 
 export async function createRepoWebhook(
@@ -146,9 +252,9 @@ export async function createRepoWebhook(
   url: string,
   secret?: string
 ): Promise<{ ok: boolean; error?: string }> {
-  const token = await getGithubAppToken();
+  const { token, appError } = await resolveWriterToken(owner, repo);
   if (token) return rest.ghCreateWebhook(token, owner, repo, url, secret);
-  return composio.createRepoWebhook(entity, owner, repo, url, secret);
+  return writerFallback(await composio.createRepoWebhook(entity, owner, repo, url, secret), appError);
 }
 
 export async function setRepoVariable(
@@ -158,9 +264,9 @@ export async function setRepoVariable(
   name: string,
   value: string
 ): Promise<{ ok: boolean; error?: string }> {
-  const token = await getGithubAppToken();
+  const { token, appError } = await resolveWriterToken(owner, repo);
   if (token) return rest.ghSetRepoVariable(token, owner, repo, name, value);
-  return composio.setRepoVariable(entity, owner, repo, name, value);
+  return writerFallback(await composio.setRepoVariable(entity, owner, repo, name, value), appError);
 }
 
 /**
