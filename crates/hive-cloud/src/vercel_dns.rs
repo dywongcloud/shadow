@@ -21,6 +21,12 @@
 //!    ~10–12s to flip health — don't double-punish).
 //!  * **Never publish empty**: if the desired set is empty, keep last-known-good,
 //!    log loudly, and raise an incident instead.
+//!  * **Never dark**: a managed name must never end a pass serving NEITHER
+//!    addresses NOR delegation. Delegation transitions are restore-on-failure
+//!    transactions whose restores are VERIFIED, an account-wide create block
+//!    (witnessed 2026-08-04: Vercel fair-use 402s every create while deletes
+//!    keep working) skips every delete-before-create step outright, and a
+//!    violation opens a Major incident.
 //!  * Exponential backoff on 429/5xx from the Vercel API.
 //!
 //! Regional/latency steering stays inside `edge.rs` (`order_candidates`) after
@@ -414,6 +420,41 @@ pub fn desired_geo_delegation(
     (out, managed)
 }
 
+/// Two-sided damping for the api-label delegation decision — the same
+/// constants `publishable` applies to node health, applied here to the one
+/// decision whose wrong flip can strand the api name dark. Engagement waits
+/// for `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive at-floor passes (a
+/// one-pass attestation blip never starts a cutover), and disengagement waits
+/// for `UNHEALTHY_PASSES_BEFORE_WITHDRAW` consecutive zero-declaration passes
+/// (a one-pass registry-view blip never plans the NS deletes).
+#[derive(Default)]
+pub struct DelegationDamping {
+    /// Consecutive passes with >=2 PROVEN api-capable nameservers.
+    ready: u32,
+    /// Consecutive below-floor passes with ZERO api-capable declarations.
+    undeclared: u32,
+}
+
+/// The api-label delegation decision for one pass. Mirrors the geo path's
+/// below-floor HOLD: while the proven-capable set is short, whatever is
+/// published stays published — stale-but-answering beats dark, always.
+#[derive(Debug, PartialEq)]
+pub enum ApiDelegation {
+    /// Publish this NS set on `api` (>=2 proven api-capable nameservers,
+    /// stable for `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive passes).
+    Delegate(Vec<DesiredRecord>),
+    /// Change NOTHING on the `api` name this pass: a delegation is (or may
+    /// be) published but the capable set is below the floor, so the name is
+    /// left exactly as it is — the reconciler neither manages it nor desires
+    /// its flat set (child address records would veto a later NS
+    /// re-creation). Loud: the caller logs and incidents the hold.
+    Hold,
+    /// No delegation needs protecting: manage `api` and desire the flat A
+    /// set — the pre-cutover behaviour, and the shape that also drives a TRUE
+    /// disengagement's NS deletes through the phase-0 transaction.
+    Flat,
+}
+
 /// NS-only delegation for the `api` label in the PLATFORM zone, handing the
 /// API host to the fleet's own geo/health-aware nameservers instead of the
 /// flat round-robin A set `desired_platform` publishes.
@@ -426,17 +467,39 @@ pub fn desired_geo_delegation(
 /// * **Eligibility additionally requires the gossiped `dns_api` capability** —
 ///   an older binary answers the deploy zone but would NXDOMAIN
 ///   `api.{platform}`, so it must never be named here. Seer's own apex NS/SOA
-///   for the api zone applies the identical filter (`apex_ns_names(_, true)`),
-///   keeping parent and child in agreement.
+///   for the api zone applies the same capability filter
+///   (`apex_ns_names(_, true)`); the parent set is deliberately STRICTER (it
+///   also demands peer attestation, below) — same shape as the geo path,
+///   where the delegation the parent publishes is the reachability gate.
 ///
-/// Same `>=2` nameserver floor: below two, returns nothing and the caller
-/// keeps publishing the flat A set — the safe, self-healing fallback both
-/// before the fleet rolls this capability and if the capable set ever shrinks.
-pub fn desired_api_delegation(nodes: &[PublishNode], apps_domain: &str) -> Vec<DesiredRecord> {
+/// Eligibility is PROOF, not configuration, exactly like the geo path: a node
+/// enters the NS set only when peers have proven it answers DNS
+/// (`PublishNode::dns_validated`), never on its own `dns_ns` claim. And the
+/// below-floor behaviour is the geo path's HOLD, not a disengagement —
+/// live-witnessed 2026-08-04: a publishable-set dip below the floor was
+/// treated as a true disengagement, so the pass DELETED six published NS
+/// records while Vercel was 402-ing every create, leaving `api.shadw.cloud`
+/// serving neither addresses nor delegation.
+///
+/// `declared` is computed from the UNDAMPED registry view (any node with
+/// `dns_ns && dns_api`) so an unhealthy-but-present fleet still counts as
+/// declaring. `delegated_now` is whether the platform zone published NS on
+/// `api` at the last successful reconcile (`None` = not yet observed — the
+/// safe-direction answer, Hold: a freshly-elected leader must never plan NS
+/// deletes on its first pass).
+pub fn desired_api_delegation(
+    nodes: &[PublishNode],
+    apps_domain: &str,
+    declared: bool,
+    delegated_now: Option<bool>,
+    damping: &mut DelegationDamping,
+) -> ApiDelegation {
     let apps = apps_domain.trim().trim_matches('.');
     let mut out: Vec<DesiredRecord> = nodes
         .iter()
-        .filter(|n| n.dns_ns && n.dns_api && (n.ip4.is_some() || n.ip6.is_some()))
+        .filter(|n| {
+            n.dns_ns && n.dns_api && n.dns_validated && (n.ip4.is_some() || n.ip6.is_some())
+        })
         .map(|n| DesiredRecord {
             name: "api".into(),
             rtype: "NS".into(),
@@ -444,11 +507,44 @@ pub fn desired_api_delegation(nodes: &[PublishNode], apps_domain: &str) -> Vec<D
             ttl: 300,
         })
         .collect();
-    if out.len() < 2 {
-        return Vec::new();
-    }
     out.sort_by(|a, b| a.value.cmp(&b.value));
-    out
+    // Below the floor there is nothing safe to CHANGE unless nothing is
+    // delegated: a published (or unobserved) delegation is held untouched,
+    // otherwise the flat A set keeps serving — the safe, self-healing
+    // fallback both before the fleet rolls this capability and if the
+    // capable set ever shrinks for real.
+    let below_floor = |delegated_now: Option<bool>| {
+        if delegated_now != Some(false) {
+            ApiDelegation::Hold
+        } else {
+            ApiDelegation::Flat
+        }
+    };
+    if out.len() >= 2 {
+        damping.undeclared = 0;
+        damping.ready = damping.ready.saturating_add(1);
+        if damping.ready >= HEALTHY_PASSES_BEFORE_REPUBLISH {
+            return ApiDelegation::Delegate(out);
+        }
+        // Capable but not yet STABLE: a cutover started on a one-pass
+        // attestation blip is the most dangerous write this reconciler owns.
+        return below_floor(delegated_now);
+    }
+    damping.ready = 0;
+    if declared {
+        // The fleet still DECLARES api-serving nameservers but cannot
+        // currently PROVE two: never plan a disengagement on a proof dip.
+        damping.undeclared = 0;
+        return below_floor(delegated_now);
+    }
+    // Nobody even DECLARES the capability (fleet rolled back / capability
+    // removed): a true disengagement — damped, so a one-pass registry blip
+    // never plans the NS deletes.
+    damping.undeclared = damping.undeclared.saturating_add(1);
+    if damping.undeclared >= UNHEALTHY_PASSES_BEFORE_WITHDRAW {
+        return ApiDelegation::Flat;
+    }
+    below_floor(delegated_now)
 }
 
 /// True for an immutable per-commit alias like `myapp-c7416ec` — a URL minted
@@ -641,7 +737,7 @@ pub fn desired_platform(
     relay_ips: &[String],
     discovery_ips: &[String],
     dashboard: bool,    // publish apex + www too (nodes reverse-proxy the dashboard)
-    delegate_api: bool, // `api` is NS-delegated to Seer this pass → no flat A set for it
+    delegate_api: bool, // withhold api's flat A set: NS-delegated to Seer, or HELD below the floor (see desired_api_delegation)
 ) -> Vec<DesiredRecord> {
     let mut out = Vec::new();
     // `api` = developer/API-key surface, `admin` = ops/admin console surface,
@@ -837,6 +933,16 @@ pub struct ReconcilerStats {
     /// nameservers were proven (see `desired_geo_delegation`). A number that
     /// keeps climbing means the zone is running on last-known-good NS records.
     pub geo_delegation_holds: AtomicU64,
+    /// Passes that HELD the `api` label exactly as published because the
+    /// proven api-capable set dropped below the floor (see
+    /// `desired_api_delegation`). The api counterpart of `geo_delegation_holds`.
+    pub api_delegation_holds: AtomicU64,
+    /// Disengagement NS-deletes / delegation cutovers SKIPPED while the
+    /// create-health circuit was open (Vercel refusing creates account-wide
+    /// while still allowing deletes). A climbing counter means the reconciler
+    /// is deliberately leaving delegations in place rather than stranding
+    /// names dark.
+    pub create_circuit_skips: AtomicU64,
     /// Delegation cutovers completed by the never-dark transaction (flat
     /// addresses removed AND the full NS set confirmed created, same pass).
     pub delegation_cutovers: AtomicU64,
@@ -863,6 +969,8 @@ pub static STATS: ReconcilerStats = ReconcilerStats {
     geo_ns_validated: AtomicU64::new(0),
     geo_ns_unproven: AtomicU64::new(0),
     geo_delegation_holds: AtomicU64::new(0),
+    api_delegation_holds: AtomicU64::new(0),
+    create_circuit_skips: AtomicU64::new(0),
     delegation_cutovers: AtomicU64::new(0),
     delegation_cutover_rollbacks: AtomicU64::new(0),
     acme_orphans_swept: AtomicU64::new(0),
@@ -998,7 +1106,10 @@ pub fn publishable(nodes: &[NodeView], damping: &mut PublishDamping) -> Vec<Publ
 /// dark for ~90 minutes) — so both transitions are sequenced explicitly:
 /// cutovers run as restore-on-failure transactions, and disengagement deletes
 /// NS BEFORE the flat addresses are re-created (with a symmetric NS restore
-/// when those address creates fail). Pure; unit-tested.
+/// when those address creates fail). Both delete-first sequences are SKIPPED
+/// outright while the create-health circuit is open (see `ReconcileGuards`) —
+/// under an account-wide create block a restore is itself a create, so the
+/// transaction could not complete. Pure; unit-tested.
 struct WritePlan {
     /// NS deletes that must precede any address create (a TRUE disengagement
     /// only: the name has NO desired NS, so the delegation frees it for the
@@ -1113,14 +1224,110 @@ fn is_orphan_candidate(in_flight: bool, created_ms: Option<u64>, now_ms: u64) ->
     }
 }
 
-/// One reconcile pass over one zone. Returns Err on API failure (caller backs off).
+/// Cross-pass guard state threaded through `reconcile_zone`: the create-health
+/// circuit and the never-dark alarm's edge trigger. One struct so both travel
+/// together across the zone reconciles of a pass.
+#[derive(Default)]
+struct ReconcileGuards {
+    /// Consecutive zone-passes whose creates ALL failed (>=1 attempted, 0
+    /// succeeded). While non-zero the circuit is OPEN: Vercel is refusing
+    /// creates account-wide while still allowing deletes — live-witnessed
+    /// 2026-08-04 as a fair-use 402 block. Under that asymmetry any
+    /// delete-before-create sequence (the disengagement's NS-deletes-first,
+    /// the cutover's address-deletes-first) is unrecoverable BY CONSTRUCTION:
+    /// the restore is itself a create. An open circuit therefore skips those
+    /// deletes outright — a stale-but-answering delegation beats a dark name,
+    /// always.
+    create_failing_passes: u32,
+    /// Edge trigger for the account-wide create-failure incident.
+    create_incident_open: bool,
+    /// Managed names already alarmed as dark (`"{domain}\0{name}"`) — the edge
+    /// trigger so a sustained outage opens ONE incident per name, not one per
+    /// pass. Cleared once the name has records again, so a LATER outage of
+    /// the same name alarms afresh.
+    dark_alarmed: std::collections::HashSet<String>,
+}
+
+impl ReconcileGuards {
+    fn creates_blocked(&self) -> bool {
+        self.create_failing_passes > 0
+    }
+
+    /// Fold one zone-pass's create outcomes into the circuit. A pass with no
+    /// creates says nothing; any success closes the circuit immediately.
+    fn record_pass(&mut self, attempted: usize, succeeded: usize) {
+        if succeeded > 0 {
+            self.create_failing_passes = 0;
+            self.create_incident_open = false;
+        } else if attempted > 0 {
+            self.create_failing_passes = self.create_failing_passes.saturating_add(1);
+        }
+    }
+}
+
+/// The NEVER-DARK invariant alarm: a MANAGED name this pass desired A/AAAA/NS
+/// records for must end the pass with at least one of them published. Names
+/// with nothing desired are skipped — an operator emptying a name is a
+/// withdrawal, not an outage. Edge-triggered per name (`guards.dark_alarmed`)
+/// so a sustained block opens one incident, not one per pass.
+///
+/// `end_count` is the pass-start listing folded with this pass's CONFIRMED
+/// writes — never a re-list, which would race Vercel's eventually-consistent
+/// listing and could miss a just-created record (the same race the ACME
+/// orphan sweeper's age gate exists for), crying wolf on a dark-name alarm.
+fn alarm_dark_names(
+    domain: &str,
+    desired: &[DesiredRecord],
+    managed_names: &[&str],
+    end_count: &HashMap<&str, usize>,
+    guards: &mut ReconcileGuards,
+    cloud: &Arc<CloudState>,
+) {
+    for name in managed_names {
+        let wants = desired
+            .iter()
+            .any(|d| d.name == *name && (d.rtype == "A" || d.rtype == "AAAA" || d.rtype == "NS"));
+        let key = format!("{domain}\u{0}{name}");
+        if !wants || end_count.get(*name).copied().unwrap_or(0) > 0 {
+            guards.dark_alarmed.remove(&key);
+            continue;
+        }
+        tracing::error!(
+            %domain,
+            name = %name,
+            "DNS reconciler: managed name ends the pass with NEITHER addresses NOR delegation published — it is DARK"
+        );
+        if guards.dark_alarmed.insert(key) {
+            cloud.incidents.open(crate::incidents::OpenReq {
+                title: format!(
+                    "DNS name dark: {name}.{domain} serves neither addresses nor delegation"
+                ),
+                severity: crate::incidents::Severity::Major,
+                affected: vec!["dns".into()],
+                message: format!(
+                    "The reconcile pass desired records for {name}.{domain} but confirmed none published at its end — \
+                     every create failed (an account-wide create block fails creates while still allowing deletes) or \
+                     a delegation transition was interrupted. The name resolves to nothing. Check the Vercel account's \
+                     create health and this node's reconcile logs."
+                ),
+            });
+        }
+    }
+}
+
+/// One reconcile pass over one zone. Returns the pass-start zone listing on
+/// success (the caller reads live delegation state from it — see
+/// `api_ns_published` in the reconcile loop); Err on API failure (caller
+/// backs off).
 async fn reconcile_zone<A: DnsApi>(
     api: &A,
     domain: &str,
     desired: &[DesiredRecord],
     managed_names: &[&str],
     cloud: &Arc<CloudState>,
-) -> anyhow::Result<()> {
+    guards: &mut ReconcileGuards,
+) -> anyhow::Result<Vec<RecordView>> {
+    let current = api.list(domain).await?;
     // NEVER publish an empty set: losing every record would blackhole the domain
     // harder than stale-but-healthy-yesterday IPs. Keep last-known-good + incident.
     if !desired.iter().any(|r| r.rtype == "A" || r.rtype == "AAAA") {
@@ -1132,9 +1339,8 @@ async fn reconcile_zone<A: DnsApi>(
             affected: vec!["dns".into()],
             message: "Desired DNS record set is empty (no healthy nodes with public IPs). Keeping last-known-good records published.".into(),
         });
-        return Ok(());
+        return Ok(current);
     }
-    let current = api.list(domain).await?;
     let (creates, deletes) = diff(&current, desired, managed_names);
     // Per-name last-known-good: a degraded registry view can leave a managed
     // name with ZERO desired addresses while env-sourced names (relay/
@@ -1226,12 +1432,25 @@ async fn reconcile_zone<A: DnsApi>(
     }
 
     let plan = plan_writes(&current, desired, managed_names, creates, deletes);
+    // Projected end-of-pass A/AAAA/NS count per managed name, seeded from the
+    // pass-start listing and folded with each CONFIRMED write below — the
+    // input to the never-dark alarm at the end of the pass.
+    let mut end_count: HashMap<&str, usize> = HashMap::new();
+    for r in current
+        .iter()
+        .filter(|r| r.rtype == "A" || r.rtype == "AAAA" || r.rtype == "NS")
+    {
+        *end_count.entry(r.name.as_str()).or_insert(0) += 1;
+    }
     if plan.ns_deletes_first.is_empty()
         && plan.cutovers.is_empty()
         && plan.creates.is_empty()
         && plan.deletes.is_empty()
     {
-        return Ok(()); // converged — write nothing
+        // Converged — write nothing. The alarm still runs: it clears the
+        // edge trigger for names that have recovered.
+        alarm_dark_names(domain, desired, managed_names, &end_count, guards, cloud);
+        return Ok(current);
     }
     // Creates are PACED and individually fault-tolerant. Previously this was a
     // tight `api.create(...).await?` loop: the first rate-limited create aborted
@@ -1243,6 +1462,8 @@ async fn reconcile_zone<A: DnsApi>(
     // up next pass; the pass still reports failure at the end so the caller's
     // backoff (and the error log) still happen.
     let mut failed: Option<anyhow::Error> = None;
+    let mut creates_attempted = 0usize;
+    let mut creates_succeeded = 0usize;
 
     // Phase 0: a disengaging delegation's NS deletes free the name for any
     // address creates below (Vercel forbids NS and address records coexisting
@@ -1251,19 +1472,47 @@ async fn reconcile_zone<A: DnsApi>(
     // delegation is restored below — the never-dark rule is symmetric, or a
     // fleet roll dipping the capable set below floor would strand the api
     // label for a whole backoff interval (adversarial-review confirmed).
+    //
+    // CIRCUIT: when Vercel refuses creates account-wide (the 2026-08-04
+    // fair-use 402 block: EVERY create fails while deletes keep working) this
+    // delete-first sequence is unrecoverable by construction — the rollback's
+    // NS restore is itself a create. An open circuit therefore SKIPS the NS
+    // deletes and leaves the existing delegation in place.
     let by_id: HashMap<&str, &RecordView> = current.iter().map(|r| (r.id.as_str(), r)).collect();
     let mut disengaged_ns: HashMap<&str, Vec<&RecordView>> = HashMap::new();
-    for id in &plan.ns_deletes_first {
-        if let Err(e) = api.delete(domain, id).await {
-            tracing::warn!(%domain, id = %id, error = %e, "DNS delete failed; continuing (retried next pass)");
-            if failed.is_none() {
-                failed = Some(e);
+    if !plan.ns_deletes_first.is_empty() && guards.creates_blocked() {
+        let names: std::collections::BTreeSet<&str> = plan
+            .ns_deletes_first
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).map(|r| r.name.as_str()))
+            .collect();
+        STATS
+            .create_circuit_skips
+            .fetch_add(plan.ns_deletes_first.len() as u64, Ordering::Relaxed);
+        tracing::error!(
+            %domain,
+            names = ?names,
+            "Vercel creates are failing account-wide — SKIPPING the disengagement NS deletes; the existing delegation stays (a stale-but-answering delegation beats a dark name, always)"
+        );
+    } else {
+        for id in &plan.ns_deletes_first {
+            if let Err(e) = api.delete(domain, id).await {
+                tracing::warn!(%domain, id = %id, error = %e, "DNS delete failed; continuing (retried next pass)");
+                if failed.is_none() {
+                    failed = Some(e);
+                }
+                continue;
             }
-            continue;
-        }
-        STATS.deletes.fetch_add(1, Ordering::Relaxed);
-        if let Some(r) = by_id.get(id.as_str()) {
-            disengaged_ns.entry(r.name.as_str()).or_default().push(r);
+            STATS.deletes.fetch_add(1, Ordering::Relaxed);
+            if let Some(r) = by_id.get(id.as_str()) {
+                // Hoisted deletes are NS records by construction (see
+                // plan_writes), so every confirmed delete shrinks the name's
+                // projected delegation count.
+                if let Some(c) = end_count.get_mut(r.name.as_str()) {
+                    *c = (*c).saturating_sub(1);
+                }
+                disengaged_ns.entry(r.name.as_str()).or_default().push(r);
+            }
         }
     }
 
@@ -1274,11 +1523,26 @@ async fn reconcile_zone<A: DnsApi>(
     // address record restored immediately, leaving the name exactly as it was
     // (last-known-good) for next pass's retry.
     for (name, addr_records, ns_records) in &plan.cutovers {
+        // Same circuit as phase 0: under an account-wide create block the
+        // rollback's address restores are themselves creates, so the whole
+        // transaction is unrecoverable by construction — don't start it.
+        if guards.creates_blocked() {
+            STATS.create_circuit_skips.fetch_add(1, Ordering::Relaxed);
+            tracing::error!(
+                %domain,
+                name = %name,
+                "Vercel creates are failing account-wide — SKIPPING the delegation cutover; the flat set stays (under a create block the rollback could not restore it)"
+            );
+            continue;
+        }
         let mut deleted_addr: Vec<&RecordView> = Vec::new();
         for r in addr_records {
             match api.delete(domain, &r.id).await {
                 Ok(_) => {
                     STATS.deletes.fetch_add(1, Ordering::Relaxed);
+                    if let Some(c) = end_count.get_mut(r.name.as_str()) {
+                        *c = (*c).saturating_sub(1);
+                    }
                     deleted_addr.push(r);
                 }
                 Err(e) => {
@@ -1295,9 +1559,12 @@ async fn reconcile_zone<A: DnsApi>(
             if i > 0 {
                 tokio::time::sleep(CREATE_PACING).await;
             }
+            creates_attempted += 1;
             match api.create(domain, rec).await {
                 Ok(id) => {
+                    creates_succeeded += 1;
                     STATS.creates.fetch_add(1, Ordering::Relaxed);
+                    *end_count.entry(rec.name.as_str()).or_insert(0) += 1;
                     created_ns_ids.push(id);
                 }
                 Err(e) => {
@@ -1330,13 +1597,21 @@ async fn reconcile_zone<A: DnsApi>(
             .map(|s| s.as_str())
             .chain(leftover_ns.iter().map(|r| r.id.as_str()))
         {
-            if let Err(e) = api.delete(domain, id).await {
-                tracing::warn!(%domain, name = %name, id = %id, error = %e, "cutover rollback: partial-NS delete failed; continuing");
-                if failed.is_none() {
-                    failed = Some(e);
+            match api.delete(domain, id).await {
+                Ok(_) => {
+                    if let Some(c) = end_count.get_mut(name.as_str()) {
+                        *c = (*c).saturating_sub(1);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(%domain, name = %name, id = %id, error = %e, "cutover rollback: partial-NS delete failed; continuing");
+                    if failed.is_none() {
+                        failed = Some(e);
+                    }
                 }
             }
         }
+        let mut restore_failed = 0usize;
         for r in &deleted_addr {
             let restore = DesiredRecord {
                 name: r.name.clone(),
@@ -1345,11 +1620,15 @@ async fn reconcile_zone<A: DnsApi>(
                 ttl: 60,
             };
             tokio::time::sleep(CREATE_PACING).await;
+            creates_attempted += 1;
             match api.create(domain, &restore).await {
                 Ok(_) => {
+                    creates_succeeded += 1;
                     STATS.creates.fetch_add(1, Ordering::Relaxed);
+                    *end_count.entry(r.name.as_str()).or_insert(0) += 1;
                 }
                 Err(e) => {
+                    restore_failed += 1;
                     tracing::warn!(%domain, name = %r.name, error = %e, "cutover rollback: address restore failed (retried next pass)");
                     if failed.is_none() {
                         failed = Some(e);
@@ -1357,7 +1636,13 @@ async fn reconcile_zone<A: DnsApi>(
                 }
             }
         }
-        tracing::error!(%domain, name = %name, "delegation cutover ROLLED BACK — flat addresses restored, NS delegation retries next pass");
+        // Log what ACTUALLY happened: an unverifiable "restored" claim is how
+        // a name goes dark behind a green-looking log line.
+        if restore_failed == 0 {
+            tracing::error!(%domain, name = %name, "delegation cutover ROLLED BACK — flat addresses restored, NS delegation retries next pass");
+        } else {
+            tracing::error!(%domain, name = %name, restore_failed, "delegation cutover rollback INCOMPLETE — address restores failed; the never-dark alarm below opens an incident if the name now has neither addresses nor delegation");
+        }
     }
 
     // Phase 2: the ordinary creates-then-deletes flow for everything else.
@@ -1368,13 +1653,18 @@ async fn reconcile_zone<A: DnsApi>(
         if i > 0 {
             tokio::time::sleep(CREATE_PACING).await;
         }
+        creates_attempted += 1;
         match api.create(domain, rec).await {
             Ok(_) => {
                 created += 1;
+                creates_succeeded += 1;
                 STATS.creates.fetch_add(1, Ordering::Relaxed);
                 if rec.rtype == "A" || rec.rtype == "AAAA" {
                     addr_create_ok.insert(rec.name.as_str());
                 }
+                // diff only emits A/AAAA/NS creates, so every confirmed create
+                // grows the name's projected published count.
+                *end_count.entry(rec.name.as_str()).or_insert(0) += 1;
             }
             Err(e) => {
                 tracing::warn!(%domain, name = %rec.name, rtype = %rec.rtype, error = %e, "DNS create failed; continuing (retried next pass)");
@@ -1396,6 +1686,13 @@ async fn reconcile_zone<A: DnsApi>(
     // flat set retries next pass. When at least one address create succeeded,
     // coexistence forbids the NS restore and the partial address set serves
     // (degraded, not dark) until the next pass completes it.
+    //
+    // The restore is VERIFIED per record and the outcome reported honestly —
+    // live-witnessed 2026-08-04: under Vercel's fair-use block every NS
+    // re-create 402'd, each failure was only WARN-logged, and the pass then
+    // logged "ROLLED BACK — NS delegation restored" while api.shadw.cloud
+    // served NEITHER addresses NOR delegation. Any failed restore now says
+    // INCOMPLETE and opens a Major incident naming the name and the records.
     for (name, ns_records) in disengaged_ns {
         if !addr_create_failed.contains(name) || addr_create_ok.contains(name) {
             continue;
@@ -1403,6 +1700,7 @@ async fn reconcile_zone<A: DnsApi>(
         STATS
             .delegation_cutover_rollbacks
             .fetch_add(1, Ordering::Relaxed);
+        let mut restore_failed: Vec<String> = Vec::new();
         for r in ns_records {
             let restore = DesiredRecord {
                 name: r.name.clone(),
@@ -1411,19 +1709,42 @@ async fn reconcile_zone<A: DnsApi>(
                 ttl: 300,
             };
             tokio::time::sleep(CREATE_PACING).await;
+            creates_attempted += 1;
             match api.create(domain, &restore).await {
                 Ok(_) => {
+                    creates_succeeded += 1;
                     STATS.creates.fetch_add(1, Ordering::Relaxed);
+                    *end_count.entry(r.name.as_str()).or_insert(0) += 1;
                 }
                 Err(e) => {
                     tracing::warn!(%domain, name = %name, error = %e, "disengagement rollback: NS restore failed (retried next pass)");
+                    restore_failed.push(r.value.clone());
                     if failed.is_none() {
                         failed = Some(e);
                     }
                 }
             }
         }
-        tracing::error!(%domain, name = %name, "disengagement ROLLED BACK — NS delegation restored, flat addresses retry next pass");
+        if restore_failed.is_empty() {
+            tracing::error!(%domain, name = %name, "disengagement ROLLED BACK — NS delegation restored, flat addresses retry next pass");
+        } else {
+            tracing::error!(%domain, name = %name, failed_records = ?restore_failed, "disengagement rollback INCOMPLETE — {name} has neither addresses nor delegation");
+            cloud.incidents.open(crate::incidents::OpenReq {
+                title: format!(
+                    "DNS disengagement rollback incomplete: {name}.{domain} is dark"
+                ),
+                severity: crate::incidents::Severity::Major,
+                affected: vec!["dns".into()],
+                message: format!(
+                    "The reconciler deleted the NS delegation for {name}.{domain} to restore the flat address set, \
+                     but every address create failed AND {} NS restore(s) failed: {}. The name currently serves \
+                     neither addresses nor delegation. Check the Vercel account's create health — a fair-use/402 \
+                     block fails creates while still allowing deletes.",
+                    restore_failed.len(),
+                    restore_failed.join(", ")
+                ),
+            });
+        }
     }
     for id in &plan.deletes {
         // Same fault-tolerance as creates: one failed delete must not abort the
@@ -1436,7 +1757,33 @@ async fn reconcile_zone<A: DnsApi>(
             continue;
         }
         STATS.deletes.fetch_add(1, Ordering::Relaxed);
+        if let Some(r) = by_id.get(id.as_str()) {
+            if r.rtype == "A" || r.rtype == "AAAA" || r.rtype == "NS" {
+                if let Some(c) = end_count.get_mut(r.name.as_str()) {
+                    *c = (*c).saturating_sub(1);
+                }
+            }
+        }
     }
+    // Fold this pass's create outcomes into the circuit BEFORE the Err return
+    // below: a failing pass must still arm the guard for the next one.
+    guards.record_pass(creates_attempted, creates_succeeded);
+    if guards.create_failing_passes >= 2 && !guards.create_incident_open {
+        guards.create_incident_open = true;
+        cloud.incidents.open(crate::incidents::OpenReq {
+            title: "Vercel DNS creates failing account-wide".into(),
+            severity: crate::incidents::Severity::Major,
+            affected: vec!["dns".into()],
+            message: format!(
+                "Every create in {} consecutive zone reconcile pass(es) failed while deletes still work — the \
+                 fair-use/402 block shape (witnessed 2026-08-04). Disengagement NS-deletes and delegation cutovers \
+                 are being SKIPPED so no managed name is stranded dark. Investigate the Vercel account before any \
+                 delegation change.",
+                guards.create_failing_passes
+            ),
+        });
+    }
+    alarm_dark_names(domain, desired, managed_names, &end_count, guards, cloud);
     if let Some(e) = failed {
         // Partial progress already landed; surface the failure so the caller
         // backs off and the operator sees it.
@@ -1447,7 +1794,7 @@ async fn reconcile_zone<A: DnsApi>(
         .map(|r| format!("{} {} {}", r.name, r.rtype, r.value))
         .collect();
     tracing::info!(%domain, created = created, deleted = plan.deletes.len(), published = ?published, "DNS reconciled");
-    Ok(())
+    Ok(current)
 }
 
 /// Leader-elected reconcile loop. Runs on every node; only the elected leader
@@ -1472,9 +1819,22 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
     tracing::info!(interval, apps = %cloud.apps_domain, platform = %cloud.platform_domain, "Vercel DNS reconciler up (leader-elected)");
     tokio::spawn(async move {
         let mut damping = PublishDamping::default();
+        let mut api_damping = DelegationDamping::default();
+        let mut guards = ReconcileGuards::default();
+        // Whether the platform zone published NS records on `api` at the last
+        // successful reconcile of that zone (None = not yet observed). This is
+        // the ground truth the api-delegation decision holds or falls back
+        // from — a freshly-elected leader must never plan NS deletes on its
+        // first pass, so the unknown state is the safe-direction Hold. The
+        // observation refreshes only on a pass with ZERO failed writes; a
+        // stale Some(true) can hold the api name for one extra interval after
+        // a block lifts (the first clean pass corrects it) — benign, because
+        // while writes are still failing the flat-set creates would fail too.
+        let mut api_ns_published: Option<bool> = None;
         let mut backoff: u64 = 0; // consecutive failures
                                   // Edge-trigger for the "delegation held" incident (see the call site).
         let mut geo_hold_active = false;
+        let mut api_hold_active = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
         loop {
             tick.tick().await;
@@ -1682,15 +2042,74 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false);
             // Geo-DNS for the API host: when >=2 `dns_api`-capable nameservers
-            // exist, delegate the `api` label to Seer (health-aware, proximity-
-            // ordered answers) and withhold the flat round-robin A set; below
-            // the floor, the flat set stays — self-healing in both directions
-            // as the fleet rolls or the capable set shrinks.
-            let api_delegation = desired_api_delegation(&publish, &cloud.apps_domain);
-            STATS
-                .api_delegation_records
-                .store(api_delegation.len() as u64, Ordering::Relaxed);
-            let delegate_api = !api_delegation.is_empty();
+            // are PEER-PROVEN (and have been for HEALTHY_PASSES_BEFORE_REPUBLISH
+            // consecutive passes), delegate the `api` label to Seer (health-
+            // aware, proximity-ordered answers) and withhold the flat
+            // round-robin A set. Below the floor the pass HOLDS whatever is
+            // published — a proof dip must never plan a disengagement
+            // (live-witnessed 2026-08-04: that disengagement deleted six NS
+            // records into an account-wide create block and stranded
+            // api.shadw.cloud dark). With no delegation published, the flat
+            // set stays — self-healing in both directions as the fleet rolls
+            // or the capable set shrinks.
+            let api_declared = nodes.iter().any(|n| n.dns_ns && n.dns_api);
+            let (api_records, api_hold) = match desired_api_delegation(
+                &publish,
+                &cloud.apps_domain,
+                api_declared,
+                api_ns_published,
+                &mut api_damping,
+            ) {
+                ApiDelegation::Delegate(records) => {
+                    STATS
+                        .api_delegation_records
+                        .store(records.len() as u64, Ordering::Relaxed);
+                    (records, false)
+                }
+                // HOLD: the gauge is deliberately left untouched — it keys
+                // acme.rs's live-delegation gate, and the whole point of the
+                // hold is that the LIVE delegation is still out there.
+                ApiDelegation::Hold => (Vec::new(), true),
+                ApiDelegation::Flat => {
+                    STATS.api_delegation_records.store(0, Ordering::Relaxed);
+                    (Vec::new(), false)
+                }
+            };
+            // A HELD api delegation must be loud, same rule as the geo hold:
+            // the name is running on last-known-good NS records nobody can
+            // currently prove. Incident on the TRANSITION only
+            // (`incidents::open` does not dedup), and only when a delegation
+            // is actually published — a hold over an UNOBSERVED name (a fresh
+            // leader's first passes) is the safe-direction default, not an
+            // incident.
+            if api_hold {
+                STATS.api_delegation_holds.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    proven = proven.len(),
+                    declared = api_declared,
+                    delegated = ?api_ns_published,
+                    "api delegation HELD: fewer than 2 proven api-capable nameservers — the api name is left exactly as published (changing it on a proof dip is how a name goes dark)"
+                );
+                if !api_hold_active && api_ns_published == Some(true) {
+                    api_hold_active = true;
+                    cloud.incidents.open(crate::incidents::OpenReq {
+                        title: "API delegation held: fewer than 2 proven api-capable nameservers".into(),
+                        severity: crate::incidents::Severity::Major,
+                        affected: vec!["dns".into()],
+                        message: "The api label's published NS delegation is being HELD (not disengaged) because \
+                                  the peer-proven api-capable nameserver set dropped below the floor. The name \
+                                  keeps resolving through the child zone. See GET /v1/dns/stats for the per-node \
+                                  evidence."
+                            .into(),
+                    });
+                }
+            } else {
+                api_hold_active = false;
+            }
+            // During a HOLD the flat set is withheld too: child address records
+            // under the live delegation would be occluded AND would veto a
+            // later NS re-creation (Vercel's coexistence rule).
+            let delegate_api = api_hold || !api_records.is_empty();
             let mut platform = desired_platform(
                 &publish,
                 &relay_ips,
@@ -1698,7 +2117,7 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 dashboard,
                 delegate_api,
             );
-            platform.extend(api_delegation);
+            platform.extend(api_records);
             let (platform_region, platform_region_names) = desired_region_names(&publish, "api-");
             platform.extend(platform_region);
             STATS
@@ -1706,8 +2125,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 .store(platform_region_names.len() as u64, Ordering::Relaxed);
 
             let mut ok = true;
-            if let Err(e) =
-                reconcile_zone(&api, &cloud.apps_domain, &apps, &apps_managed_refs, &cloud).await
+            if let Err(e) = reconcile_zone(
+                &api,
+                &cloud.apps_domain,
+                &apps,
+                &apps_managed_refs,
+                &cloud,
+                &mut guards,
+            )
+            .await
             {
                 STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                 tracing::warn!(error = %e, zone = %cloud.apps_domain, "DNS reconcile failed");
@@ -1736,20 +2162,33 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // an unmanaged name is invisible to diff() forever, so a withdrawn
             // region's records would never be cleaned up.
             platform_managed.extend(platform_region_names);
+            // During an api HOLD the name is UNMANAGED this pass: the diff must
+            // never see its records, or it would plan the very disengagement
+            // the hold exists to prevent.
+            if api_hold {
+                platform_managed.retain(|n| n != "api");
+            }
             let platform_managed_refs: Vec<&str> =
                 platform_managed.iter().map(|s| s.as_str()).collect();
-            if let Err(e) = reconcile_zone(
+            match reconcile_zone(
                 &api,
                 &cloud.platform_domain,
                 &platform,
                 &platform_managed_refs,
                 &cloud,
+                &mut guards,
             )
             .await
             {
-                STATS.api_errors.fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");
-                ok = false;
+                Ok(listing) => {
+                    api_ns_published =
+                        Some(listing.iter().any(|r| r.name == "api" && r.rtype == "NS"));
+                }
+                Err(e) => {
+                    STATS.api_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(error = %e, zone = %cloud.platform_domain, "DNS reconcile failed");
+                    ok = false;
+                }
             }
             // Per-tenant DB gateway zone (`*.{db_domain}`): the wildcard + apex →
             // all publishable nodes (cert coverage + fallback), PLUS a specific A
@@ -1843,8 +2282,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     }
                 }
                 let managed_refs: Vec<&str> = managed.iter().map(|s| s.as_str()).collect();
-                if let Err(e) =
-                    reconcile_zone(&api, &cloud.db_domain, &db_desired, &managed_refs, &cloud).await
+                if let Err(e) = reconcile_zone(
+                    &api,
+                    &cloud.db_domain,
+                    &db_desired,
+                    &managed_refs,
+                    &cloud,
+                    &mut guards,
+                )
+                .await
                 {
                     STATS.api_errors.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(error = %e, zone = %cloud.db_domain, "DNS reconcile failed");

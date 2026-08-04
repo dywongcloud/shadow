@@ -388,6 +388,28 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   names with no desired NS and symmetrically restores the delegation when
   the flat-address creates all fail; a rotation on a still-delegated name
   keeps creates-then-deletes order (replacement before removal).
+- **Rollback restores are VERIFIED, and delete-first steps are circuit-gated.**
+  A Vercel fair-use block (402 on EVERY create, deletes still allowed —
+  witnessed 2026-08-04) makes any delete-before-create sequence
+  unrecoverable by construction: the restore is itself a create. So (1) the
+  disengagement/cutover rollbacks check every restore's result and open a
+  Major incident naming the name and the failed records when one fails —
+  never log "restored" unverified; (2) `ReconcileGuards`' create circuit
+  (any all-creates-failed zone pass opens it, any success closes it) makes
+  phase 0 SKIP the NS deletes and phase 1 SKIP cutovers while creates are
+  broken — a stale-but-answering delegation beats a dark name, always; (3)
+  `alarm_dark_names` ends every pass by opening a Major incident for any
+  managed name with desired records but a confirmed-empty projected state
+  (the pass-start listing folded with confirmed writes — never a racy
+  re-list). The `api` delegation decision (`desired_api_delegation`) now
+  mirrors the geo path: peer-ATTESTED nameservers only (`dns_validated`),
+  and below the floor it HOLDS the published NS set (the name is unmanaged
+  and the flat set withheld for the pass) instead of planning a
+  disengagement — a proof dip stranded `api.shadw.cloud` dark on
+  2026-08-04. Engagement and disengagement are damped with the same two
+  constants `publishable` uses; a true disengagement requires
+  `UNHEALTHY_PASSES_BEFORE_WITHDRAW` consecutive passes with ZERO nodes
+  declaring `dns_ns && dns_api`.
 - **The ACME orphan sweeper runs every reconcile pass.** Issuance cleanup
   races Vercel's eventually-consistent listing, so a finished order's TXT
   can survive and then veto future delegations from under its parent name.
@@ -396,8 +418,10 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   and unknown age means KEEP (deletes are forever). acme.rs's Vercel-side
   TXT create is best-effort ONLY on a 409 under a LIVE delegation gauge
   (`STATS.geo_delegation_records` / `STATS.api_delegation_records`), never
-  static zone config — below the capable-NS floor the flat set is
-  authoritative again and a swallowed failure fails orders opaquely.
+  static zone config — the api gauge is deliberately NOT zeroed during a
+  below-floor hold (the held delegation is still live), and only a Flat
+  verdict (no delegation published, or a true damped disengagement) zeroes
+  it; a swallowed failure fails orders opaquely.
 - **publishable() is damped in BOTH directions.** Withdrawal stays fast
   (K=2 consecutive unhealthy passes); re-addition requires
   `HEALTHY_PASSES_BEFORE_REPUBLISH` consecutive healthy passes — a

@@ -5169,6 +5169,8 @@ async fn dns_stats(
             "reconciler_last_pass_proven": crate::vercel_dns::STATS.geo_ns_validated.load(Ordering::Relaxed),
             "reconciler_last_pass_unproven": crate::vercel_dns::STATS.geo_ns_unproven.load(Ordering::Relaxed),
             "delegation_holds": crate::vercel_dns::STATS.geo_delegation_holds.load(Ordering::Relaxed),
+            "api_delegation_holds": crate::vercel_dns::STATS.api_delegation_holds.load(Ordering::Relaxed),
+            "create_circuit_skips": crate::vercel_dns::STATS.create_circuit_skips.load(Ordering::Relaxed),
             // Never-dark cutover telemetry: cutovers completed, rollbacks
             // (a climbing rollback count = a delegation RETRYING, never
             // stranding), and ACME orphan challenges swept.
