@@ -7,11 +7,20 @@ import { installationAuthConfigured, installationTokenForRepo, listAppInstallati
 /**
  * GitHub facade — the ONE import for everything GitHub in the dashboard.
  *
- * Provider preference per request:
+ * Credential preference per request:
  *   1. First-party GitHub App user token (encrypted cookie, org-level
  *      permissions — private repos + orgs work wherever the App is installed).
- *   2. Composio-managed OAuth connection (legacy fallback; `repo` scope only,
+ *   2. READS stop there; WRITES (commit/webhook/variable) additionally fall
+ *      through to a server-to-server INSTALLATION token minted with the App's
+ *      own identity (./github-installation — the same credential the node's
+ *      webhook clone path uses), so a GitOps write triggered without any
+ *      browser session still applies instead of silently no-op'ing.
+ *   3. Composio-managed OAuth connection (legacy fallback; `repo` scope only,
  *      no org enumeration).
+ *
+ * CONNECT STATE is derived from GitHub's real installation record whenever the
+ * cookie is absent (./github-installation `listAppInstallations`) — the cookie
+ * is a cache, never the source of truth.
  *
  * Function names/signatures mirror lib/composio's GitHub helpers exactly, so
  * consumers switch imports without other changes. The `entity` arg is only used
@@ -189,10 +198,10 @@ export async function createRepo(
  *      silently no-op'ing on "not connected";
  *   3. null → the caller falls back to the legacy Composio connection.
  *
- * `appError` carries a REAL failure of the app-credential path (bad key,
- * GitHub 401, transport) so the caller can surface it loudly when no other
- * credential exists — a broken app credential must never read as a benign
- * skip. "App not installed on this repo" is NOT an error and returns {}.
+ * `appError` carries the app-credential path's outcome when it produced no
+ * token: either a REAL failure (bad key, GitHub 401, transport) or "the App is
+ * not installed on this repo" — both surface loudly when no other credential
+ * exists, and are appended as context when the legacy fallback also fails.
  */
 async function resolveWriterToken(
   owner: string,
@@ -202,19 +211,26 @@ async function resolveWriterToken(
   if (userToken) return { token: userToken };
   if (!installationAuthConfigured()) return {};
   const r = await installationTokenForRepo(owner, repo);
-  if (r.ok) return r.token ? { token: r.token } : {};
+  if (r.ok) {
+    return r.token
+      ? { token: r.token }
+      : { appError: `GitHub App is not installed on ${owner}/${repo} — no installation token available` };
+  }
   return { appError: r.error };
 }
 
-/** composio result, upgraded to the app-credential error when that's the real
- *  failure and Composio has nothing to offer (unconfigured, or its own write
- *  failed too) — the loud error wins over a silent/generic one. */
+/** composio result, upgraded to the app-credential path's reason when that's
+ *  the real story: when Composio isn't even configured its bare
+ *  "COMPOSIO_API_KEY not set" would misreport why the write didn't happen;
+ *  when it IS configured and failed on its own, the app path's reason is
+ *  appended as context. Never a bare silent/generic error. */
 function writerFallback(
   r: CommitResult & { ok: boolean },
   appError?: string
 ): CommitResult {
   if (r.ok || !appError) return r;
-  return { ok: false, error: `github-app installation token failed (${appError}); fallback: ${r.error || "unavailable"}` };
+  if (!composio.composioConfigured()) return { ok: false, error: appError };
+  return { ok: false, error: `${r.error || "composio write failed"}; github-app installation path: ${appError}` };
 }
 
 export async function commitFile(

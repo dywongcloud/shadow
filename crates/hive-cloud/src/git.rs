@@ -194,38 +194,85 @@ pub fn project_name_from_url(url: &str) -> String {
         .collect()
 }
 
+/// Durable deployment root: `$HIVE_DATA/deploys`. The mock backend serves files
+/// straight from a deployment's `root` for the deployment's whole life, so the
+/// root must survive a host reboot for exactly as long as the (replicated)
+/// deployment RECORD does. Under `/tmp` it did not: a reboot wiped the checkout
+/// while the record persisted, and the node then 404'd DEPLOYMENT_NOT_FOUND for
+/// a deployment it believed it had (witnessed live: dan.shadw.app, 2026-08-03).
+/// Pre-change roots under [`legacy_deploy_root`] keep working untouched — records
+/// carry absolute paths and the boot restore keys off `root` existing — until
+/// their host reboots; the lookup/purge/GC paths below all fall back to the
+/// legacy root so pre-change zip projects can still redeploy from retained
+/// source and their stale dirs still get reaped.
 pub(crate) fn deploy_root() -> PathBuf {
+    crate::persist::data_dir().join("deploys")
+}
+
+/// The pre-durability deployment root (`$TMPDIR/hive-deploys`). Nothing writes
+/// here anymore; it remains a read fallback (retained source for redeploys) and
+/// a GC/purge target until every pre-change checkout has aged out or rebooted away.
+pub(crate) fn legacy_deploy_root() -> PathBuf {
     std::env::temp_dir().join("hive-deploys")
 }
 
-/// The newest on-disk deploy checkout for a project (`<deploy_root>/<project>-*`),
+/// A project's on-disk name component under the deploy root. A project name is
+/// tenant-controlled text, so it is NEVER interpolated into a path verbatim —
+/// `sanitize_tag` maps it to `[a-z0-9._-]` (the same discipline as `hive-vol-`
+/// volume names), so a project called `..` or `a/b` can never escape the root.
+/// Pre-sanitization checkouts used the raw name; readers that must still find
+/// those take both prefixes (see `checkout_prefixes`).
+fn checkout_tag(project: &str) -> String {
+    sanitize_tag(project)
+}
+
+/// Dir-name prefixes a project's checkouts can carry: the sanitized component
+/// (current), plus the raw project name (pre-sanitization dirs). Matching both
+/// is what lets redeploy/GC/purge see checkouts written by older binaries.
+pub(crate) fn checkout_prefixes(project: &str) -> Vec<String> {
+    let tag = checkout_tag(project);
+    let mut v = vec![format!("{tag}-")];
+    let raw = format!("{project}-");
+    if !v.contains(&raw) {
+        v.push(raw);
+    }
+    v
+}
+
+/// The newest on-disk deploy checkout for a project (`<deploy_root>/<tag>-*`),
 /// preferring a completed checkout with a package.json/Dockerfile. Lets a node that
 /// holds the SOURCE derive the service graph even when it holds no deployment
 /// RECORD (container deploys register the record on the coordinator, run on the
-/// lease-owner node). Returns None if no source is on disk.
+/// lease-owner node). Scans BOTH the durable root and the legacy /tmp root.
+/// Returns None if no source is on disk.
 pub(crate) fn newest_deploy_dir(project: &str) -> Option<PathBuf> {
-    let base = deploy_root();
-    let prefix = format!("{project}-");
-    let mut cands: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(&base)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
-        .filter_map(|e| {
+    let prefixes = checkout_prefixes(project);
+    let mut cands: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    for base in [deploy_root(), legacy_deploy_root()] {
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+                continue;
+            }
             let p = e.path();
             if !p.is_dir() {
-                return None;
+                continue;
             }
             // Only real checkouts (has a package.json or a container build file).
             if !p.join("package.json").exists()
                 && !p.join("Dockerfile").exists()
                 && !p.join("Containerfile").exists()
             {
-                return None;
+                continue;
             }
-            let m = e.metadata().ok()?.modified().ok()?;
-            Some((m, p))
-        })
-        .collect();
+            if let Ok(m) = e.metadata().and_then(|m| m.modified()) {
+                cands.push((m, p));
+            }
+        }
+    }
     cands.sort_by_key(|(m, _)| *m);
     cands.pop().map(|(_, p)| p)
 }
@@ -251,16 +298,17 @@ fn project_has_deployment(cloud: &Arc<CloudState>, project: &str) -> bool {
         .any(|d| d.project == project)
 }
 
-/// Self-management GC: reap stale clone/build working dirs under `hive-deploys`.
-/// Each build clones a repo into `<root>/<project>-<stamp>` (and `-building-<ms>`);
-/// these are NOT removed after the build, so they accumulate and exhaust `/tmp`
-/// disk over time. Remove any dir untouched for longer than `max_age` — UNLESS it
-/// is the `root` of a LIVE deployment. The mock backend serves files straight from
-/// `root`, and the restart restore keys off `root` existing, so reaping an active
-/// root would take a deployment offline / drop it on the next restart (this is the
-/// bug that dropped shoomoo). Best-effort; returns the number of dirs removed.
+/// Self-management GC: reap stale clone/build working dirs under the deploy
+/// roots. Each build clones a repo into `<root>/<tag>-<stamp>-<bid>` (and
+/// `-building-<ms>-<bid>`); these are NOT removed after the build, so they
+/// accumulate and exhaust disk over time. Remove any dir untouched for longer
+/// than `max_age` — UNLESS it is the `root` of a LIVE deployment. The mock
+/// backend serves files straight from `root`, and the restart restore keys off
+/// `root` existing, so reaping an active root would take a deployment offline /
+/// drop it on the next restart (this is the bug that dropped shoomoo). Sweeps
+/// BOTH the durable root and the legacy /tmp root (pre-durability checkouts
+/// still age out there). Best-effort; returns the number of dirs removed.
 pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize {
-    let root = deploy_root();
     // Never reap a dir that currently backs a deployment (its `root`), canonicalized
     // so symlink/relative differences don't cause a false "not live".
     let live_roots: std::collections::HashSet<PathBuf> = cloud
@@ -269,32 +317,34 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
         .iter()
         .map(|r| std::fs::canonicalize(&r.root).unwrap_or_else(|_| PathBuf::from(&r.root)))
         .collect();
-    let mut entries = match tokio::fs::read_dir(&root).await {
-        Ok(d) => d,
-        Err(_) => return 0,
-    };
     let now = std::time::SystemTime::now();
     let mut removed = 0usize;
-    while let Ok(Some(e)) = entries.next_entry().await {
-        let p = e.path();
-        if !p.is_dir() {
-            continue;
-        }
-        let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
-        if live_roots.contains(&canon) {
-            continue; // backs a live deployment — keep it
-        }
-        let stale = e
-            .metadata()
-            .await
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| now.duration_since(t).ok())
-            .map(|age| age > max_age)
-            .unwrap_or(false);
-        if stale && tokio::fs::remove_dir_all(&p).await.is_ok() {
-            removed += 1;
-            tracing::info!(dir = %p.display(), "gc: reaped stale build dir");
+    for root in [deploy_root(), legacy_deploy_root()] {
+        let mut entries = match tokio::fs::read_dir(&root).await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        while let Ok(Some(e)) = entries.next_entry().await {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let canon = std::fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if live_roots.contains(&canon) {
+                continue; // backs a live deployment — keep it
+            }
+            let stale = e
+                .metadata()
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| now.duration_since(t).ok())
+                .map(|age| age > max_age)
+                .unwrap_or(false);
+            if stale && tokio::fs::remove_dir_all(&p).await.is_ok() {
+                removed += 1;
+                tracing::info!(dir = %p.display(), "gc: reaped stale build dir");
+            }
         }
     }
     removed
@@ -340,7 +390,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         // First-deploy only: serve a "Building…" page at the domain immediately so
         // the URL resolves throughout the build (a slow Next.js build no longer
         // 404s). The real deployment supersedes it; we then remove the placeholder.
-        let placeholder = register_building_placeholder(&cloud, &project, &req).await;
+        let placeholder = register_building_placeholder(&cloud, &project, &req, &bid).await;
         let result = run_build(&cloud, &bid, req, project, first_deploy).await;
         if let Some(pid) = &placeholder {
             // The real deploy (or the build-failed page) has taken over the alias;
@@ -367,11 +417,30 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
 }
 
 /// True when THIS node holds the retained source for `project` — a durable
-/// `<project>.src.zip` OR a prior build checkout — i.e. a zip redeploy can rebuild
+/// `<tag>.src.zip` OR a prior build checkout — i.e. a zip redeploy can rebuild
 /// here without re-fetching from a peer.
 pub(crate) fn has_local_source(project: &str) -> bool {
-    deploy_root().join(format!("{project}.src.zip")).is_file()
-        || newest_deploy_dir(project).is_some()
+    retained_source_path(project).is_some() || newest_deploy_dir(project).is_some()
+}
+
+/// The durable retained-source archive for a zip-uploaded project
+/// (`<deploy_root>/<tag>.src.zip`). Writes always target this path.
+fn retained_source_write_path(project: &str) -> PathBuf {
+    deploy_root().join(format!("{}.src.zip", checkout_tag(project)))
+}
+
+/// The retained-source archive to READ: the durable location first, then the
+/// pre-durability /tmp locations (sanitized and raw-name) so a zip project
+/// deployed by an older binary can still redeploy after the upgrade.
+fn retained_source_path(project: &str) -> Option<PathBuf> {
+    let tag = checkout_tag(project);
+    [
+        retained_source_write_path(project),
+        legacy_deploy_root().join(format!("{tag}.src.zip")),
+        legacy_deploy_root().join(format!("{project}.src.zip")),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 /// Redeploy a project whose retained source lives on a SPECIFIC host node (not this
@@ -663,8 +732,17 @@ async fn run_build(
     tokio::time::sleep(Duration::from_millis(350)).await;
 
     // Acquire the source: extract an UPLOADED ZIP, or `git clone` a repo.
+    //
+    // The checkout dir carries the BUILD ID, not just the millisecond stamp:
+    // two concurrent builds of the same project used to collide on
+    // `<project>-<now_ms()>` (both wake from the synchronized 350ms sleep above
+    // on the same timer tick), extracting + installing into ONE shared dir —
+    // two racing `unzip -o` processes then kill one build with "cannot create
+    // …: No such file or directory" (exit 50) and the loser never reaches
+    // ready (witnessed live 3x). The project component is `sanitize_tag`'d: a
+    // tenant-controlled name is never a path component verbatim.
     let stamp = now_ms();
-    let dir = deploy_root().join(format!("{project}-{stamp}"));
+    let dir = deploy_root().join(format!("{}-{}-{}", checkout_tag(&project), stamp, bid));
     tokio::fs::create_dir_all(deploy_root()).await?;
     let branch = req.branch.clone().unwrap_or_default();
 
@@ -703,13 +781,24 @@ async fn run_build(
         ));
         // Retain the ORIGINAL archive durably so a later Redeploy can rebuild this
         // zip-uploaded project from source. Stored as a FILE beside the checkouts —
-        // `gc_build_dirs` only reaps directories, so this survives build-dir GC (and,
-        // on a persistent /tmp, node restarts); the redeploy path re-extracts it.
-        let retained = deploy_root().join(format!("{project}.src.zip"));
-        if let Err(e) = tokio::fs::write(&retained, &bytes).await {
-            log(format!(
+        // `gc_build_dirs` only reaps directories, so this survives build-dir GC and,
+        // living under the durable deploy root, host reboots; the redeploy path
+        // re-extracts it. Written via tmp+rename: two concurrent builds of the same
+        // project (or a concurrent redeploy re-extracting it) otherwise truncate/
+        // rewrite this shared file mid-read — a torn zip fails the OTHER build.
+        let retained = retained_source_write_path(&project);
+        let retained_tmp = deploy_root().join(format!("{}.{}.tmp", retained.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bid));
+        match tokio::fs::write(&retained_tmp, &bytes).await {
+            Ok(()) => {
+                if let Err(e) = tokio::fs::rename(&retained_tmp, &retained).await {
+                    log(format!(
+                        "(note) could not retain source archive for future redeploys: {e}"
+                    ));
+                }
+            }
+            Err(e) => log(format!(
                 "(note) could not retain source archive for future redeploys: {e}"
-            ));
+            )),
         }
         (
             "upload".to_string(),
@@ -726,13 +815,14 @@ async fn run_build(
     } else if req.repo_url.starts_with("upload://") {
         // REDEPLOY of a zip-uploaded project: no git remote to clone and the request
         // carries no fresh archive. Rebuild from RETAINED source on THIS node — the
-        // durable `<project>.src.zip` if present (clean original), else a copy of the
+        // durable `<tag>.src.zip` if present (clean original; `retained_source_path`
+        // also falls back to the pre-durability /tmp locations), else a copy of the
         // prior build's on-disk checkout. The redeploy handler pins the rebuild to the
         // node that holds this source, so a missing source here is a real error.
         let name = req.repo_url.trim_start_matches("upload://").to_string();
-        let retained = deploy_root().join(format!("{project}.src.zip"));
+        let retained = retained_source_path(&project);
         let t0 = now_ms();
-        if retained.is_file() {
+        if let Some(retained) = retained {
             log(format!(
                 "Redeploy: re-extracting retained source archive ({})",
                 if name.is_empty() {
@@ -3173,7 +3263,17 @@ async fn bun_version(bun_bin: &str) -> Option<String> {
 /// resulting file count. `unzip` itself refuses absolute/`..` (zip-slip) paths.
 async fn extract_zip_into(bytes: &[u8], dir: &Path) -> anyhow::Result<u64> {
     tokio::fs::create_dir_all(dir).await?;
-    let tmp = dir.with_extension("upload.zip"); // sibling of dir, never inside the build
+    // Sibling temp file, never inside the build (so it isn't counted as a build
+    // output). Append-based name, NOT `Path::with_extension`: a dotted checkout
+    // name (a sanitized project tag may contain `.`) would be truncated to its
+    // first label — "foo.bar-…" → "foo.upload.zip" — colliding across projects.
+    // The per-build-unique `dir` makes this path unique per build.
+    let tmp = dir.with_file_name(format!(
+        "{}.upload.zip",
+        dir.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    ));
     tokio::fs::write(&tmp, bytes).await?;
     // unzip exit 0 = ok, 1 = warning (e.g. it skipped an unsafe path) — both acceptable.
     let out = Command::new("unzip")
@@ -3999,7 +4099,12 @@ async fn restore_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, k
 }
 
 /// Save node_modules (+ framework cache if present) to the content-addressed cache.
-/// Best-effort, atomic (write temp + rename).
+/// Best-effort, atomic (write temp + rename). The temp name carries the build id:
+/// the cache key is a CONTENT hash, so two concurrent builds with the same
+/// lockfile (same project redeployed twice, or two projects with identical deps)
+/// share a key — an un-suffixed `<key>.tar.tmp` had both `tar -cf` writers
+/// interleaving one file, and the loser's rename could then install a torn
+/// archive as the cached artifact.
 async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key: &str) {
     if !install_dir.join("node_modules").exists() {
         return;
@@ -4008,7 +4113,7 @@ async fn save_cache(cloud: &Arc<CloudState>, bid: &str, install_dir: &Path, key:
     if tokio::fs::create_dir_all(&dir).await.is_err() {
         return;
     }
-    let tmp = dir.join(format!("{key}.tar.tmp"));
+    let tmp = dir.join(format!("{key}.{bid}.tar.tmp"));
     let final_ = dir.join(format!("{key}.tar"));
     // Include the framework's incremental cache too when it lives under the
     // install dir (e.g. node_modules/.cache); .next/cache lives in node_modules
@@ -5216,10 +5321,14 @@ fn building_page(project: &str) -> String {
 /// page, so the domain resolves during the build. Returns the placeholder
 /// deployment id (removed once the real deployment is live). A redeploy returns
 /// None — the current version stays live until the new build is ready.
+/// `bid` uniquifies the scratch dir: two concurrent first deploys of the same
+/// project (both pass `project_has_deployment` before either registers) must not
+/// point two deployment records at ONE shared placeholder root.
 async fn register_building_placeholder(
     cloud: &Arc<CloudState>,
     project: &str,
     req: &GitDeployRequest,
+    bid: &str,
 ) -> Option<String> {
     if project_has_deployment(cloud, project) {
         // Redeploy (the project already has a live deployment somewhere in the
@@ -5229,7 +5338,12 @@ async fn register_building_placeholder(
         // deployment row on every redeploy.
         return None;
     }
-    let dir = deploy_root().join(format!("{project}-building-{}", now_ms()));
+    let dir = deploy_root().join(format!(
+        "{}-building-{}-{}",
+        checkout_tag(project),
+        now_ms(),
+        bid
+    ));
     tokio::fs::create_dir_all(&dir).await.ok()?;
     tokio::fs::write(dir.join("index.html"), building_page(project))
         .await

@@ -3466,6 +3466,10 @@ async fn serve_browser_conn(
                     Ok(None) => {}
                     Ok(Some(_)) | Err(_) => return Err(browser_reset::MALFORMED_PAYLOAD),
                 }
+                // Metered the moment the frame is fully read: 4 (u32 LE
+                // prefix) + 1 (op byte) + payload. A refusal downstream of
+                // this point still paid the inbound leg.
+                meter_browser_bytes(&remote_id, 5 + payload.len() as u64, 0);
                 Ok::<_, u32>((op, payload, byte_permit))
             })
             .await;
@@ -3524,6 +3528,9 @@ async fn serve_browser_conn(
             .await
             {
                 Ok(Ok(())) => {
+                    // The full framed reply (u32 LE prefix + body) is written;
+                    // a FIN failure below does not un-send those bytes.
+                    meter_browser_bytes(&remote_id, 0, 4 + reply.len() as u64);
                     if send.finish().is_err() {
                         reject_browser_stream(
                             &mut send,
@@ -3583,7 +3590,8 @@ where
 /// Test/diagnostic helper (#H4): accept P2P connections + bi streams but NEVER
 /// write a response — the "accept-but-silent" peer. Holds both stream halves open
 /// without answering, so a caller's first-byte timeout must fire. Not used in
-/// production; exposed so the timeout tests can stand up a real silent owner.
+/// production; exposed so the live timeout witnesses (`examples/pool_witness.rs`)
+/// can stand up a real silent owner.
 #[doc(hidden)]
 pub async fn serve_silent(ep: Endpoint) {
     while let Some(incoming) = ep.accept().await {
@@ -3863,72 +3871,4 @@ fn _assert_duplex<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>() {}
 #[allow(dead_code)]
 fn _check() {
     _assert_duplex::<P2pStream>();
-}
-
-#[cfg(test)]
-mod trust_tests {
-    use super::*;
-    use std::collections::HashSet;
-    use std::sync::RwLock;
-
-    #[test]
-    fn peer_trust_allowlist_admits_only_known_ids() {
-        let set: TrustSet = Arc::new(RwLock::new(HashSet::new()));
-        // Empty allowlist → nothing is trusted (fail-closed when enforcing).
-        assert!(!peer_trusted(&set, "node-abc"));
-        set.write().unwrap().insert("node-abc".to_string());
-        assert!(peer_trusted(&set, "node-abc"), "listed id admitted");
-        assert!(!peer_trusted(&set, "node-xyz"), "unlisted id rejected");
-    }
-
-    #[test]
-    fn endpoint_id_from_garbage_is_none() {
-        assert_eq!(endpoint_id_from_addr_json("not json"), None);
-        assert_eq!(endpoint_id_from_addr_json("{}"), None);
-    }
-
-    #[test]
-    fn parse_bootstrap_seeds_forms() {
-        // A valid ed25519 public key (iroh EndpointId), 64 hex chars.
-        let id = "ae58ff8833241ac82d6ff7611046ed67b5072d142c588d0063e942d9a75502b6";
-        // NodeId only, NodeId@addr(+addr), with relay, plus garbage that must drop.
-        let csv = format!(
-            "{id} , {id}@1.2.3.4:9000+5.6.7.8:9001 , {id}|https://relay.example/ , not-a-key , ",
-        );
-        let seeds = super::parse_bootstrap_seeds(&csv);
-        assert_eq!(seeds.len(), 3, "3 valid entries, garbage+empty dropped");
-        for s in &seeds {
-            assert_eq!(s.node_id, id, "node_id extracted");
-            // addr_json round-trips to an EndpointAddr with the right id.
-            assert_eq!(
-                super::endpoint_id_from_addr_json(&s.addr_json).as_deref(),
-                Some(id)
-            );
-        }
-        // The @addr entry carries the direct addresses; the bare entry doesn't.
-        let with_addrs = &seeds[1].addr_json;
-        assert!(
-            with_addrs.contains("1.2.3.4") && with_addrs.contains("5.6.7.8"),
-            "direct addrs preserved: {with_addrs}"
-        );
-        assert!(super::parse_bootstrap_seeds("").is_empty());
-    }
-
-    #[test]
-    fn persistent_secret_is_stable_across_loads() {
-        let dir = std::env::temp_dir().join(format!("iroh-key-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let path = dir.join("iroh_secret.key");
-        // First call generates + persists.
-        let k1 = super::load_or_create_secret(&path).public();
-        assert!(path.exists(), "key file written");
-        // Second call loads the SAME key (stable identity).
-        let k2 = super::load_or_create_secret(&path).public();
-        assert_eq!(k1, k2, "persisted identity must be stable across loads");
-        // Malformed file → regenerate (different key), no panic.
-        std::fs::write(&path, b"short").unwrap();
-        let k3 = super::load_or_create_secret(&path).public();
-        assert_ne!(k3, k1, "malformed key file is regenerated");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

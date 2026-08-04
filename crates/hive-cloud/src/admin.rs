@@ -314,6 +314,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_db::routes())
         // ---- Coarse browser presence (constellation satellites) ----
         .merge(crate::browser_presence::routes())
+        // ---- Per-tenant browser relay byte metering (operator; metering only, never bills) ----
+        .merge(crate::browser_metering::routes())
         // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,
         //      deployment protection, microfrontends, conformance) ----
         .merge(crate::enterprise_api::routes())
@@ -3109,15 +3111,23 @@ async fn purge_project_podman_volumes(project: &str) {
 /// leave a leaked secret or PII in the raw source tree readable on the host
 /// disk for up to ~40 minutes after an explicit delete request — the timer
 /// polls every 10 minutes and only reaps dirs untouched for 30+ minutes).
+/// Sweeps BOTH the durable deploy root and the legacy /tmp root, matching the
+/// sanitized name component (current) and the raw project name (checkouts
+/// written before the name was sanitized for path use).
 async fn purge_project_source_dirs(project: &str) {
-    let base = crate::git::deploy_root();
-    let prefix = format!("{project}-");
-    let Ok(mut rd) = tokio::fs::read_dir(&base).await else {
-        return;
-    };
-    while let Ok(Some(e)) = rd.next_entry().await {
-        if e.file_name().to_string_lossy().starts_with(&prefix) {
-            let _ = tokio::fs::remove_dir_all(e.path()).await;
+    let prefixes = crate::git::checkout_prefixes(project);
+    for base in [
+        crate::git::deploy_root(),
+        crate::git::legacy_deploy_root(),
+    ] {
+        let Ok(mut rd) = tokio::fs::read_dir(&base).await else {
+            continue;
+        };
+        while let Ok(Some(e)) = rd.next_entry().await {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if prefixes.iter().any(|p| name.starts_with(p.as_str())) {
+                let _ = tokio::fs::remove_dir_all(e.path()).await;
+            }
         }
     }
 }

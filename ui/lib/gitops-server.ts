@@ -61,6 +61,15 @@ export function authTokenFrom(req: {
  * Read the live platform objects for a tenant and render the full GitOps artifact
  * tree. Returns the files plus a content hash (ignoring the volatile generatedAt
  * stamps) so callers can skip a redundant commit when nothing changed.
+ *
+ * `failures` lists CORE reads that failed (non-2xx). Only `/v1/gitops/projects`
+ * is core: committing a tree built without it would omit every project — and,
+ * because sync commits with the `projects/` managed prefix, TOMBSTONE every
+ * real project file in the repo. Callers must refuse to commit when `failures`
+ * is non-empty. The remaining reads degrade to absent-by-design: a personal
+ * namespace legitimately has no team row, and the enterprise endpoints are
+ * optional features — treating those as fatal would break tenants that simply
+ * don't use them.
  */
 export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml", authToken?: string | null) {
   const [projRes, teamRes, ovRes, routingRes, ipRes, siemRes, samlRes, scimRes, mfeRes, dbRes] = await Promise.all([
@@ -78,6 +87,8 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     // reused here rather than a bespoke gitops-only route.
     backend("/v1/databases", team, undefined, authToken),
   ]);
+  const failures: string[] = [];
+  if (!projRes.ok) failures.push(`/v1/gitops/projects -> HTTP ${projRes.status}`);
   const projects = projRes.ok ? await projRes.json() : [];
   const teamInfo = teamRes.ok ? await teamRes.json() : null;
   const ov = ovRes.ok ? await ovRes.json() : null;
@@ -131,5 +142,5 @@ export async function buildOrgArtifacts(team: string, rootPath = "openedge.yaml"
     .replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, "");
   const hash = createHash("sha256").update(stable).digest("hex").slice(0, 16);
 
-  return { files, hash, projectCount: Array.isArray(projects) ? projects.length : 0 };
+  return { files, hash, projectCount: Array.isArray(projects) ? projects.length : 0, failures };
 }

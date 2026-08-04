@@ -420,6 +420,63 @@ Browser peers are a **third trust class, structurally disjoint from fleet trust*
    mode's checker header is actually `X-Iroh-NodeId`, despite docs claiming
    `X-Iroh-Endpoint-Id`.)
 
+### 2.10 Mesh gossip via iroh-gossip — verified feasible upstream, deliberately not adopted
+
+A 2026-08-03 scout claimed browsers can join mesh gossip because iroh-gossip officially
+supports wasm32-unknown-unknown since v0.33 with a working browser example; the claim was
+recorded with web tools down and re-verified against primary sources 2026-08-04:
+
+- **The upstream claim is true.** iroh-gossip 0.33.0 (2025-02-25) shipped "Compile to wasm
+  and run in browsers" (n0-computer/iroh-gossip#37, merged), one day after iroh 0.33.0's
+  "Make `iroh` compile to `wasm32-unknown-unknown`" (n0-computer/iroh#3189). Current pins:
+  iroh-gossip **0.101.0** (docs.rs latest) against iroh 1.x, now in its own repo (split out
+  of the monorepo in n0-computer/iroh#2826). The official example is real and maintained:
+  `n0-computer/iroh-examples/browser-chat` — one shared `ChatNode` driving both a CLI and a
+  wasm-bindgen/React browser build, auto-deployed by upstream, browser↔CLI interop over
+  iroh-gossip.
+- **Relay-only peers are first-class gossip citizens, not a degraded mode.** PR #37's own
+  description: "Do not wait for direct addresses to arrive, because that doesn't ever
+  resolve in browsers — instead we wait for either the home relay or the direct addresses
+  to be ready before launching gossip." The HyParView/PlumTree swarm logic is
+  connection-agnostic: `net.rs` publishes the endpoint's own `EndpointAddr` (relay-URL-only
+  for a browser) as its `PeerData`, decodes neighbors' relay URLs the same way, and the
+  crate's tests run whole swarms over relay-URL-only addresses. A browser peer can receive
+  AND originate over the same relayed connection it already dials.
+- **Discovery needs no mDNS.** The example's `presets::N0` is `PkarrPublisher::n0_dns()` +
+  `PkarrResolver::n0_dns()` (HTTPS against n0's DNS server — browser-legal) plus the
+  default relay set; the DNS-record resolver is `cfg(not(wasm_browser))` and mDNS is not
+  in the preset at all. Bootstrap is a user-carried ticket (`topic_id` + bootstrap
+  `EndpointId`s) resolved through pkarr.
+
+**Decision: STAY with `hive/browser/0` + replicated-store fanout; never bridge browser
+peers into mesh gossip.** Feasibility was never the deciding factor:
+
+1. **There is no iroh-gossip mesh to join.** The fleet control plane is the bespoke
+   HTTP-shaped protocol over `hive/tunnel/0` mode bytes (`STREAM_GOSSIP` /
+   `STREAM_GOSSIP_SIGNED`), and no hive crate imports `iroh_gossip` — the crate sits in
+   `Cargo.lock` only as a transitive dependency of vendored guardian-db's iroh-docs sync
+   path (native `hive-cloud` side; the browser wasm crate never links it). "Browser joins
+   gossip" actually means "stand up a second, iroh-gossip-ALPN broadcast fabric on every
+   fleet node for browsers."
+2. **A gossip topic has no read ACL — a joined peer can always originate.** Flood-fill
+   gives every swarm member equal broadcast rights; the only gate is withholding the
+   32-byte topic id, which is security-by-obscurity against a curious donor. That cannot
+   express §2.8's third trust class (team-scoped, revocable, metered) and structurally
+   conflicts with the signer check `STREAM_GOSSIP_SIGNED` exists to enforce.
+3. **Churn and metering are wrong-shaped.** Tab-lifetime peers (§2.7) joining/leaving
+   flood membership events across every fleet subscriber, and each byte rides our relays
+   both ways (§1.2) — control-plane noise proportional to browser churn, buying nothing
+   the four scoped surfaces don't already provide with per-tenant authorization.
+4. **Browser status metadata rides the replicated presence surface, not gossip.** This
+   resolves the §2.5/§2.8 wording tension (Appendix A
+   `gap-browser-metadata-transport-contradiction`): §2.5's "gossip both as node metadata"
+   means the team-scoped presence store, never a mesh topic; the word "gossip" there is
+   descriptive, not a transport claim.
+5. **Revisit only for application-level pub/sub.** If team pubsub/presence (§2.8 surface
+   d) ever outgrows replicated-store fanout, the sanctioned shape is a *browser-scoped*
+   iroh-gossip ALPN whose per-team topic ids are minted by the admission record — disjoint
+   from every control-plane topic — never the fleet mesh itself.
+
 ---
 
 ## 3. Security model

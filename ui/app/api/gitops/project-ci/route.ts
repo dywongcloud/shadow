@@ -18,9 +18,16 @@ function parseRepo(input: string): { owner: string; repo: string } | null {
 /**
  * Install the OpenEdge deploy workflow + the OPENEDGE_WEBHOOK_URL Actions variable
  * into a PROJECT's source repo, so pushes to it auto-trigger build+deploy. Called
- * after a Git import. No-ops gracefully when GitHub isn't connected.
+ * after a Git import. No-ops gracefully ONLY when GitHub genuinely isn't part of
+ * this deployment (not configured / unparseable repo).
  *
  * Body: { repo: string }  // clone URL or "owner/repo"
+ *
+ * Failure honesty: "GitHub not connected" is a 502 with `reason` preserved (a
+ * connected-looking deployment that can't write is a broken integration, never
+ * a benign skip), and an install attempt where neither the webhook nor the
+ * workflow landed returns 502 with the underlying GitHub errors in `error` —
+ * callers persist/show that instead of a bare silent `ok:false`.
  */
 export async function POST(req: NextRequest) {
   if (!githubConfigured()) return NextResponse.json({ skipped: true, reason: "github-not-configured" });
@@ -30,7 +37,12 @@ export async function POST(req: NextRequest) {
 
   const entity = await resolveEntity();
   const status = await githubStatus(entity);
-  if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
+  if (!status.connected) {
+    return NextResponse.json(
+      { ok: false, reason: "github-not-connected", error: "GitHub is not connected — the CI webhook/workflow cannot be installed. Reconnect GitHub (Integrations), then retry." },
+      { status: 502 }
+    );
+  }
 
   const { owner, repo } = parsed;
   const webhookUrl = (process.env.OPENEDGE_WEBHOOK_URL || "").replace(/\/$/, "");
@@ -41,9 +53,11 @@ export async function POST(req: NextRequest) {
   // PREVIEW deploy for every other branch + PR. Covers all branches + PRs, unlike
   // the Actions workflow (push-to-main only).
   let webhookInstalled = false;
+  let webhookError: string | undefined;
   if (webhookUrl) {
     const hook = await createRepoWebhook(entity, owner, repo, `${webhookUrl}/v1/git/webhook`, secret);
     webhookInstalled = hook.ok;
+    if (!hook.ok) webhookError = hook.error;
   }
 
   // Fallback ONLY when the real webhook couldn't be installed (e.g. no public URL):
@@ -51,6 +65,7 @@ export async function POST(req: NextRequest) {
   // We never install both — that would double-fire on push-to-main.
   let workflowInstalled = false;
   let variableSet = false;
+  const writeErrors: string[] = webhookError ? [`webhook: ${webhookError}`] : [];
   if (!webhookInstalled) {
     const commit = await commitFile(entity, {
       owner, repo,
@@ -59,14 +74,34 @@ export async function POST(req: NextRequest) {
       message: "ci(openedge): add deploy workflow",
     });
     workflowInstalled = commit.ok;
+    if (!commit.ok) writeErrors.push(`workflow: ${commit.error || "commit failed"}`);
     if (webhookUrl) {
       const v = await setRepoVariable(entity, owner, repo, "OPENEDGE_WEBHOOK_URL", webhookUrl);
       variableSet = v.ok;
+      if (!v.ok) writeErrors.push(`variable: ${v.error || "set failed"}`);
     }
   }
 
+  if (!webhookInstalled && !workflowInstalled) {
+    // NEITHER write landed — a silent 200 here is how pushes used to stop
+    // deploying with zero visible error. Fail loudly with the real reasons.
+    return NextResponse.json(
+      {
+        ok: false,
+        repo: `${owner}/${repo}`,
+        webhookInstalled,
+        workflowInstalled,
+        variableSet,
+        error: writeErrors.length
+          ? writeErrors.join("; ")
+          : "no OpenEdge webhook URL configured and the workflow install did not run",
+      },
+      { status: 502 }
+    );
+  }
+
   return NextResponse.json({
-    ok: webhookInstalled || workflowInstalled,
+    ok: true,
     repo: `${owner}/${repo}`,
     webhookInstalled,
     workflowInstalled,

@@ -20,6 +20,9 @@ interface GhDetail {
   /** Which auth path serves this connection: the first-party GitHub App (org-level
    *  permissions) or the legacy Composio-managed OAuth app. */
   provider?: "github-app" | "composio";
+  /** What the state was derived FROM — "installation" means GitHub's own
+   *  server-to-server installation record answered (browser-cookie-independent). */
+  via?: "user-token" | "installation" | "composio";
   /** Where to install/configure the App on orgs (github-app provider only). */
   installUrl?: string;
 }
@@ -395,7 +398,9 @@ function GithubCard({ gh, orgs, onRefresh }: { gh: GhDetail; orgs: GhOrg[]; onRe
     ? "not configured"
     : active
     ? gh.login
-      ? `@${gh.login}`
+      ? `@${gh.login}${gh.via === "installation" ? " · app installation" : ""}`
+      : gh.via === "installation"
+      ? "connected via app installation"
       : "connected"
     : needsReconnect
     ? "reconnect needed"

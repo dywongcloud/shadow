@@ -77,7 +77,16 @@ export async function POST(req: NextRequest) {
   }, authToken);
 
   // 3) Scaffold + push the full artifact tree as one commit.
-  const { files, hash, projectCount } = await buildOrgArtifacts(team, path, authToken);
+  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, path, authToken);
+  if (failures.length) {
+    // The repo is linked but the platform state the tree is built from could
+    // not be read — committing now would push a GUTTED scaffold (see the sync
+    // route). Loud failure; the user can retry the sync once reads recover.
+    return NextResponse.json(
+      { ok: false, repo: fullName, created, error: `platform state unreadable (${failures.join(", ")}) — refusing to commit a partial config tree` },
+      { status: 502 }
+    );
+  }
   const result = await commitFiles(entity, {
     owner, repo, branch,
     message: created

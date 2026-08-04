@@ -252,11 +252,18 @@ export default function NewProjectPage() {
         body: JSON.stringify({ repo: repoUrl }),
       })
         .then((r) => r.json())
-        .then((j: { ok?: boolean; skipped?: boolean; reason?: string; webhookInstalled?: boolean; workflowInstalled?: boolean }) =>
+        .then((j: { ok?: boolean; skipped?: boolean; reason?: string; error?: string; webhookInstalled?: boolean; workflowInstalled?: boolean }) =>
           apiSend("PUT", `/v1/projects/${project || fallbackName}/git-ci`, {
             webhook_installed: !!j.webhookInstalled,
             workflow_installed: !!j.workflowInstalled,
-            skipped_reason: j.skipped ? j.reason || "unknown" : "",
+            // Loud failures (502 {ok:false,error}) are recorded verbatim so the
+            // git-settings CI card shows the REAL reason, not a blank "not
+            // configured" — a silent no-op here is how pushes stop deploying.
+            skipped_reason: j.skipped
+              ? j.reason || "unknown"
+              : j.webhookInstalled || j.workflowInstalled
+              ? ""
+              : j.error || j.reason || "install-failed",
             checked_ms: 0,
           }).catch(() => {}),
         )

@@ -42,6 +42,8 @@ interface CiInstallResult {
   ok?: boolean;
   skipped?: boolean;
   reason?: string;
+  /** Present on a LOUD install failure (HTTP 502): the real GitHub-side error(s). */
+  error?: string;
   webhookInstalled?: boolean;
   workflowInstalled?: boolean;
 }
@@ -205,6 +207,8 @@ export function GitSettings({ paramsPromise }: { paramsPromise: Promise<{ projec
       setRetryMsg(
         j.webhookInstalled || j.workflowInstalled
           ? "Installed — pushes to this repository will now auto-deploy."
+          : j.error
+          ? `Install failed: ${j.error}`
           : j.skipped
           ? `Skipped: ${reasonLabel(j.reason || "unknown")}.`
           : "Install attempt finished — see status above.",

@@ -1,5 +1,44 @@
 # Changelog
 
+## (pending) — Durable deployment roots + concurrent same-project zip deploys
+
+Two deployment-lifecycle fixes in the git/zip build path, both live-witnessed
+on a local `HIVE_FORCE_MOCK=1` node:
+
+- **Deployment roots are durable (`$HIVE_DATA/deploys`, not `/tmp`).** The mock
+  backend serves files straight from a deployment's recorded `root` for its
+  whole life, but `git::deploy_root()` was `$TMPDIR/hive-deploys` — a host
+  reboot wiped the checkout while the replicated deployment RECORD survived,
+  so the node 404'd `DEPLOYMENT_NOT_FOUND` for a deployment it believed it had
+  (root-caused live: dan.shadw.app, 2026-08-03). New checkouts and retained
+  zip sources now live under `$HIVE_DATA/deploys`; boot restore is unchanged
+  (records carry absolute paths), so pre-upgrade `/tmp` roots keep serving
+  until their host reboots, and every root-scanning reader
+  (`newest_deploy_dir`, `gc_build_dirs`, `purge_project_source_dirs`,
+  retained-source lookup) falls back to the legacy `/tmp` root — a pre-upgrade
+  zip project still redeploys from its `/tmp`-retained archive and
+  re-materializes into the durable root (witnessed). The project-name path
+  component is now `sanitize_tag`'d everywhere a checkout dir is built
+  (tenant-controlled text is never a path component verbatim), with
+  raw-name prefix fallback (`git::checkout_prefixes`) so pre-sanitization
+  checkouts remain visible to redeploy/GC/purge.
+- **Concurrent same-project builds no longer share one checkout dir.**
+  `run_build` named the checkout `<project>-<now_ms()>`, and two concurrent
+  builds (both woken by the same timer tick from the synchronized 350ms
+  pre-build sleep) land on the SAME millisecond far more often than intuition
+  says — one shared dir, two racing `unzip -o` processes, and the loser dies
+  with exit 50 "cannot create …: No such file or directory" (reproduced both
+  through the API and with bare `unzip`; the witness hit it 3x and had to
+  serialize deploys). The checkout dir, the "Building…" placeholder dir, the
+  extract temp zip, and the build-cache temp tar now all carry the build id;
+  the retained `<tag>.src.zip` write is tmp+rename (two concurrent writers
+  could previously tear it mid-read by a redeploy). Two concurrent zip
+  deploys of one project now BOTH reach `ready` (witnessed 3/3 race-window
+  hits, including one pair with byte-identical ms stamps); the alias resolves
+  to the later finisher, matching Vercel's concurrent-deploy model. When the
+  two requests instead serialize on the project-name check, the loser still
+  gets the pre-existing loud 409 — retryable, never a silent strand.
+
 ## (pending) — Browser↔fleet live CRR exchange (browser_db databases replicate for real)
 
 A project that opts in via a fluid.json top-level `browser_db` block now gets a

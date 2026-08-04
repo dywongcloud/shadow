@@ -269,6 +269,13 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 crate::browser_presence::mesh_list(cloud, &tenant)
             }
         }
+        // Per-tenant relay byte metering local slice (bn-impl-relay-byte-metering)
+        // — the iroh-only-peer path for the fleet fanout; mirrors the
+        // `/v1/functions` arm's "the outer request already enforced operator"
+        // posture. Prefix-disjoint with the other /v1/browser/* arms.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/metering") => {
+            crate::browser_metering::mesh_local(cloud)
+        }
         // Generic leader->follower store snapshot: `GET /v1/store-snapshot/<name>`
         // serves any store registered in `store_sync::REGISTRY` (teams,
         // incidents, apikeys, webhooks, databases, domains, integrations,

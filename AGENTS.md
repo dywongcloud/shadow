@@ -653,6 +653,22 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
 
 ## Storage capacity & placement
 
+- **Deployment checkouts live in the DURABLE deploy root, and the dir-naming
+  convention is load-bearing.** `git::deploy_root()` is `$HIVE_DATA/deploys`
+  (it was `$TMPDIR/hive-deploys` — a reboot wiped the checkout while the
+  replicated deployment RECORD survived, and the node 404'd
+  `DEPLOYMENT_NOT_FOUND` for a deployment it believed it had; dan.shadw.app,
+  2026-08-03). The mock backend serves from the recorded `root` for the
+  deployment's whole life. Checkout dirs are
+  `{sanitize_tag(project)}-{ms}-{build_id}` (the build-id suffix keeps two
+  concurrent same-project builds — which routinely land on the SAME
+  millisecond — from sharing one dir and killing each other's `unzip`/
+  install); retained zip sources are `<tag>.src.zip` written tmp+rename.
+  Every reader that scans the root by prefix (`newest_deploy_dir`,
+  `gc_build_dirs`, `purge_project_source_dirs`, the retained-source lookup)
+  must keep covering BOTH roots — the legacy `/tmp` root is a read/GC
+  fallback for pre-upgrade checkouts — and BOTH name forms (sanitized +
+  pre-sanitization raw); `git::checkout_prefixes` is the one helper.
 - **Placement must consider free disk, and disk is a HARD filter, not a score
   term.** `schedule.rs` filtered on health/region/GPU and then sorted by
   deployment COUNT — a metric that says nothing about space — so a full node and

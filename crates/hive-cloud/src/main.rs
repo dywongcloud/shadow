@@ -14,6 +14,8 @@ mod billing;
 mod browser_admission;
 mod browser_artifacts;
 mod browser_db;
+// bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
+mod browser_metering;
 mod browser_presence;
 mod cluster;
 mod compose;
@@ -939,6 +941,8 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .filter(|v| v.trim() == "0")
             .map_or_else(|| Some(crate::browser_db::crr_sync_handler(&cloud)), |_| None);
+        // bn-impl-relay-byte-metering (registration line; sibling-owned file, flagged)
+        hive_p2p::set_browser_meter(Some(crate::browser_metering::meter_handler(&cloud)));
         tokio::spawn(hive_p2p::serve_tunnels_full(
             ep,
             gateway_addr,
@@ -965,10 +969,11 @@ async fn main() -> anyhow::Result<()> {
     spawn_guardian_reap_loop(cloud.clone());
     spawn_lease_loop(cloud.clone());
 
-    // Self-management GC: reap stale clone/build working dirs under /tmp/hive-deploys
-    // every 10 min (dirs untouched >30 min are dead builds), so build scratch never
-    // exhausts host disk. Pairs with the firecracker orphan-overlay GC. Skips dirs
-    // that still back a live deployment.
+    // Self-management GC: reap stale clone/build working dirs under the deploy
+    // roots ($HIVE_DATA/deploys, plus the legacy /tmp/hive-deploys) every 10 min
+    // (dirs untouched >30 min are dead builds), so build scratch never exhausts
+    // host disk. Pairs with the firecracker orphan-overlay GC. Skips dirs that
+    // still back a live deployment.
     let gc_cloud = cloud.clone();
     tokio::spawn(async move {
         loop {

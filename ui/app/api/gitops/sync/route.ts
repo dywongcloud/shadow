@@ -11,15 +11,25 @@ export const dynamic = "force-dynamic";
  *
  * Called on link, and periodically by the dashboard so any settings / runtime /
  * region / tier change reflects in the committed config automatically.
+ *
+ * Outcome honesty contract (a linked tenant must never see a silent no-op):
+ *   - `{skipped}` 200          — GitOps genuinely not set up (no repo linked,
+ *                                or no GitHub auth path configured at all).
+ *   - `{unchanged}` 200        — desired tree hash matches the last push.
+ *   - `{ok:true}` 200          — committed.
+ *   - `{ok:false,error}` 502   — a repo IS linked but the write could not run
+ *                                (no working GitHub credential) or failed, or
+ *                                the platform state the tree is built from
+ *                                could not be read. Never a quiet 200.
  */
 export async function POST(req: NextRequest) {
   if (!githubConfigured()) return NextResponse.json({ skipped: true, reason: "github-not-configured" });
   const team = (await req.json().catch(() => ({})))?.team || req.headers.get("x-hive-team") || "personal";
-  const entity = await resolveEntity();
-  const status = await githubStatus(entity);
-  if (!status.connected) return NextResponse.json({ skipped: true, reason: "github-not-connected" });
-
   const authToken = authTokenFrom(req);
+
+  // Read the link FIRST: it decides whether "not connected" is a benign skip
+  // (nothing to sync — no repo) or a BROKEN sync (a repo is linked but we hold
+  // no working credential), which must fail loudly instead of skipping.
   const linkRes = await backend("/v1/gitops", team, undefined, authToken);
   const link = linkRes.ok ? await linkRes.json() : null;
   if (!link?.repo || !link.repo.includes("/")) {
@@ -29,7 +39,25 @@ export async function POST(req: NextRequest) {
   const branch = link.branch || "main";
   const path = link.path || "openedge.yaml";
 
-  const { files, hash, projectCount } = await buildOrgArtifacts(team, path, authToken);
+  const entity = await resolveEntity();
+  const status = await githubStatus(entity);
+  if (!status.connected) {
+    return NextResponse.json(
+      { ok: false, error: "GitHub is not connected — the linked config repo cannot be synced. Reconnect GitHub (Integrations) to resume GitOps mirroring." },
+      { status: 502 }
+    );
+  }
+
+  const { files, hash, projectCount, failures } = await buildOrgArtifacts(team, path, authToken);
+  if (failures.length) {
+    // The artifact tree is built from live platform state; committing it after
+    // a failed read would push a GUTTED tree (and, with the projects/ managed
+    // prefix, tombstone real project files). Refuse loudly instead.
+    return NextResponse.json(
+      { ok: false, error: `platform state unreadable (${failures.join(", ")}) — refusing to commit a partial config tree` },
+      { status: 502 }
+    );
+  }
   if (hash === link.last_hash) {
     return NextResponse.json({ unchanged: true, repo: link.repo, files: files.length });
   }
