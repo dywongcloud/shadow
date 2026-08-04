@@ -218,7 +218,12 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   healthz 200 and opened 25 mesh trunks, yet each saw ONLY ITSELF in
   `/v1/nodes` while the rest of the fleet couldn't see them either — invisible
   to the dashboard, to placement, and to DNS. Relay-addressed seeds
-  (`<id>|http://<public-ip>:3340`) converged the registry immediately.
+  (`<id>|https://<node>.relay.shadw.app:3343`) converged the registry
+  immediately. The relay URL form matters: with TLS enabled the standalone
+  iroh-relay serves EVERY relay service (`/relay`, `/ping`, QAD) on the https
+  socket only — the plaintext `:3340` listener is captive-portal-only, so an
+  `http://<ip>:3340` relay URL is a dead hint (and an IP literal can never
+  pass the `*.relay.shadw.app` cert check; use the DNS name).
 - `peer_iroh.json` stores each peer's **private** addrs (10.x/172.16/192.168),
   so copying a populated peer book from one node to seed another does not give
   a dialable address — use public IPs / relay URLs for seeds.
@@ -473,6 +478,25 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   from, descriptor rotation included (`routing_identity_changed` tears the
   old route down first). The block is additive JSON on the admission HTTP
   API; `hive-browser-proto`'s QUIC wire contract is untouched.
+- **A fresh validated admission supersedes the relay denylist; a bare revoke
+  still denies.** `stop()`'s admission DELETE writes a relay-denylist entry
+  (10-min retention, `RELAY_DENYLIST_RETENTION_MS`) so a revoked identity
+  cannot sit on the embedded relay — and `BrowserAdmissionStore::put` now
+  REMOVES that entry for the same endpoint id, because an admission that
+  already passed fresh-session + PoP + descriptor validation is by
+  definition the identity owner re-admitting, not a replay. Followers learn
+  it within one mesh round trip (`fanout_deny_clear` → the
+  `/v1/browser/admissions/mesh-deny-clear/` gossip arm, the
+  `fanout_revoke` mirror; denylist-only on receipt, never versioned state),
+  else on the next snapshot adoption. Revocation semantics are unchanged:
+  without a new admission the entry stands for its full retention window
+  (witnessed live: stop → same-identity reboot denied `browser admission
+  revoked` → fresh admit → immediate reconnect). Caveat for browsers booting
+  THROUGH an enforcing (embedded) relay: `BrowserNode.boot` gates on
+  relay-online before the worker can admit, so a denylisted boot still fails
+  there until the browser side admits pre-online — production browsers use
+  the standalone relays, which run no AccessControl, so the deadlock is
+  dev-only.
 - **`trusted_callers` comes from the live registry, never client input.**
   Every HEALTHY node's proven iroh identity (parsed from the gossiped
   `EndpointAddr`, else the join-verified `peer_id`) — never node names, never

@@ -113,6 +113,14 @@ let status = {
   abiVersion: HOST_ABI_VERSION,
   lifecycle: "stopped",
   endpointId: null,
+  // bn-safari-sharedworker-cryptokey-dataclone: how this boot's identity is
+  // held — "persistent" (wrapping key in IndexedDB, survives any restart) or
+  // "memory" (wrapping key dies with this worker; identity survives this
+  // worker's lifetime, NOT its restart on engines where a SharedWorker cannot
+  // structured-clone a CryptoKey — Safari 26, witnessed). Surfaced honestly,
+  // never hidden. Additive on the wire; the ui/lib/run-node-status.ts typed
+  // mirror picks it up separately (that file is owned elsewhere).
+  identityPersistence: null,
   relay: null,
   admission: "none",
   geoConsent: "undecided",
@@ -238,15 +246,35 @@ async function callApi(method, path, team, body) {
       signal: controller.signal,
     });
     if (!r.ok) {
+      const contentType = String(r.headers.get("content-type") || "").toLowerCase();
       const text = await r.text().catch(() => "");
-      let payload = null;
-      try {
-        payload = text ? JSON.parse(text) : null;
-      } catch {
-        // Pre-structured-error nodes return plain text during rollout.
+      let detail = null;
+      // The structured error field is content-type-gated: only a body the
+      // server actually LABELLED as JSON is parsed as one. A proxy/static
+      // origin's error page (e.g. a bare 501) is text/html.
+      if (contentType.includes("json") && text) {
+        try {
+          const payload = JSON.parse(text);
+          detail = payload && payload.error && typeof payload.error === "object" ? payload.error : null;
+        } catch {
+          // Malformed JSON error body — fall through to the bounded reason.
+        }
       }
-      const detail = payload && payload.error && typeof payload.error === "object" ? payload.error : null;
-      const error = new Error((detail && detail.message) || text || `${method} ${path} -> ${r.status}`);
+      // bn-worker-error-body-html-leak: a raw error body is NEVER copied into
+      // the message verbatim — this string lands in the dashboard status via
+      // lastError, and an HTML error page would render there tags and all.
+      // The only body-derived reason allowed is short, single-line and
+      // markup-free (rollout-compat: pre-structured-error nodes return plain
+      // text); everything else collapses to the bare status line.
+      const plain =
+        !detail && text && !contentType.includes("html") && text.length <= 200 && !/[<>\r\n]/.test(text)
+          ? text.trim()
+          : null;
+      const reason =
+        (detail && detail.message) ||
+        plain ||
+        `${method} ${path} -> ${r.status}${r.statusText ? ` ${r.statusText}` : ""}`;
+      const error = new Error(String(reason).slice(0, 300));
       error.code = detail && typeof detail.code === "string" ? detail.code : null;
       error.retryable = detail && typeof detail.retryable === "boolean" ? detail.retryable : null;
       error.status = r.status;
@@ -760,13 +788,16 @@ async function start(msg) {
     // Identity persistence (bn-impl-key-persistence): boot a throwaway node
     // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
     // the persisted seed so the reported id is stable across reloads.
+    // `persistence` (bn-safari-sharedworker-cryptokey-dataclone) reports WHICH
+    // custody mode holds the identity — "memory" means a worker restart on
+    // this engine forfeits it; surfaced in status below, never hidden.
     const scratch = await BrowserNode.boot(orderedRelay, null, null);
     booted = scratch;
     if (myEpoch !== epoch) {
       await discardStaleAttempt(scratch, null, msg.team);
       return;
     }
-    const { seedHex, created } = await loadOrCreateSeed(scratch.secretHex());
+    const { seedHex, created, persistence } = await loadOrCreateSeed(scratch.secretHex());
     let n;
     if (created) {
       n = scratch;
@@ -810,7 +841,7 @@ async function start(msg) {
     // current. setAddressHandler synchronously emits iroh's current address,
     // then keeps the same callback alive for every relay migration.
     node = n;
-    setStatus({ endpointId, relay: null, lifecycle: "starting" });
+    setStatus({ endpointId, relay: null, lifecycle: "starting", identityPersistence: persistence || null });
     n.setAddressHandler((json) => onAddressChange(n, myEpoch, json));
   } catch (error) {
     if (myEpoch !== epoch) {
@@ -959,6 +990,7 @@ async function stop() {
     protocolMismatch: "none",
     sessionStale: false,
     endpointId: null,
+    identityPersistence: null,
     relay: null,
     lastError: null,
     functions: null,
@@ -1006,10 +1038,16 @@ if (typeof SharedWorkerGlobalScope !== "undefined" && self instanceof SharedWork
 } else {
   // Web Locks fallback (bn-ui-sharedworker-owner): this script was loaded as
   // a plain dedicated Worker by a tab that lost SharedWorker feature
-  // detection (Safari private mode, an older engine, or an explicit
+  // detection (an engine with no SharedWorker at all, or an explicit
   // capability failure) but won the navigator.locks single-owner election in
-  // ui/lib/use-run-node.ts. Exactly one "port" exists — `self` itself — so
-  // there is only ever one connectPort() call here, never a growing `ports`
-  // array the way a real SharedWorker accumulates one per tab.
+  // ui/lib/use-run-node.ts. NOT "Safari private mode": Safari 26 HAS
+  // SharedWorker in normal AND private windows (witnessed live, Safari
+  // 26.3.1) — modern Safari takes the SharedWorker branch, and its remaining
+  // context quirk (a CryptoKey is not structured-cloneable inside a
+  // SharedWorker) is handled inside identity.js's memory-custody mode
+  // (bn-safari-sharedworker-cryptokey-dataclone), not by routing here.
+  // Exactly one "port" exists — `self` itself — so there is only ever one
+  // connectPort() call here, never a growing `ports` array the way a real
+  // SharedWorker accumulates one per tab.
   connectPort(self);
 }

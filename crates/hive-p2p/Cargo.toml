@@ -19,6 +19,9 @@ url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
 [[bin]]
 name = "p2p-demo"
 path = "src/bin/p2p_demo.rs"

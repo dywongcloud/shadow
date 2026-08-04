@@ -238,6 +238,27 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             }
             Vec::new()
         }
+        // Fresh-admission deny-CLEAR echo (bn-relay-denylist-restart-friction):
+        // the exact inverse of the mesh-revoke arm above — the leader fans
+        // this out right after a validated admission supersedes a stale
+        // stop()-created denylist entry, so follower relays let the
+        // re-admitted endpoint reconnect within one mesh round trip instead
+        // of waiting out the snapshot-pull interval. Denylist-only on the
+        // receiving side; same "leader already decided" trust posture as the
+        // revoke echo.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/browser/admissions/mesh-deny-clear/") =>
+        {
+            let endpoint_id = p
+                .trim_start_matches("/v1/browser/admissions/mesh-deny-clear/")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            if !endpoint_id.is_empty() {
+                crate::browser_admission::mesh_deny_clear_echo(cloud, endpoint_id).await;
+            }
+            Vec::new()
+        }
         // Coarse browser presence first-read leader fallback (constellation
         // satellites) — tenant-scoped the same way as the admissions list arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/presence") => {

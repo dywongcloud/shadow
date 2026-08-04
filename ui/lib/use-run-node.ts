@@ -355,12 +355,19 @@ export function useRunNode() {
 
     if (hasLocksFallback) {
       // Web Locks fallback (bn-ui-sharedworker-owner): no SharedWorker in this
-      // browser (Safari private mode, an older engine). Exactly one tab per
-      // origin wins the `shadw-run-node-owner` exclusive lock and runs a
-      // plain dedicated Worker hosting the SAME run-node-worker.js script
-      // (see its own SharedWorkerGlobalScope-detection branch) — every other
-      // tab relays control through BroadcastChannel and mirrors status from
-      // it, never running a second Worker/BrowserNode instance of its own.
+      // browser (an older engine, or a context whose SharedWorker constructor
+      // exists but cannot spawn). NOT "Safari private mode": Safari 26 HAS
+      // SharedWorker in normal AND private windows (witnessed live on Safari
+      // 26.3.1), so modern Safari takes the SharedWorker branch above — its
+      // remaining context quirk (a CryptoKey is not structured-cloneable
+      // inside a SharedWorker) is handled by identity.js's memory-custody
+      // mode (bn-safari-sharedworker-cryptokey-dataclone), not by routing
+      // here. Exactly one tab per origin wins the `shadw-run-node-owner`
+      // exclusive lock and runs a plain dedicated Worker hosting the SAME
+      // run-node-worker.js script (see its own SharedWorkerGlobalScope-
+      // detection branch) — every other tab relays control through
+      // BroadcastChannel and mirrors status from it, never running a second
+      // Worker/BrowserNode instance of its own.
       const statusChannel = new BroadcastChannel("shadw-run-node-status");
       const controlChannel = new BroadcastChannel("shadw-run-node-control");
       let dedicatedWorker: Worker | null = null;

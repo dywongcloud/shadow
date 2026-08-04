@@ -3,9 +3,11 @@
  * Deliberately conservative: API / proxy / auth requests are NEVER cached
  * (always hit the network), navigations AND app code (JS/CSS) are network-first
  * — so the latest build always loads and a stale cached bundle can never pin an
- * old UI (which previously left mobile showing an outdated dashboard). Only
- * media/fonts are cached stale-while-revalidate. Cache is the offline fallback.
- * Bump VERSION to evict every prior cache on activate. */
+ * old UI (which previously left mobile showing an outdated dashboard). The ONE
+ * exception is the versioned browser-node pkg URLs (/browser-node/pkg/*?v=N),
+ * which are immutable per version by contract and therefore cache-first (see
+ * below). Only media/fonts are cached stale-while-revalidate. Cache is the
+ * offline fallback. Bump VERSION to evict every prior cache on activate. */
 
 const VERSION = "shadw-v5";
 const STATIC_CACHE = `shadw-static-${VERSION}`;
@@ -56,6 +58,39 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
+  // Versioned browser-node pkg URLs (/browser-node/pkg/*?v=WASM_BUNDLE_VERSION):
+  // CACHE-FIRST. The ?v= query IS the cache key — bytes are immutable per
+  // version by contract, so staleness is caught by the version bump itself
+  // (that is what wasm_bundle_version exists for), backstopped by the worker's
+  // live wasmBundleVersion() check after init. Network-first here made Safari
+  // re-download the 4.4MB hive_browser_bg.wasm on EVERY page load (witnessed
+  // bn-safari-wasm-refetch-cost: transferSize 4382386, 200 not 304, while the
+  // JS glue cached fine) — every Safari donor paying ~4.4MB per page view.
+  // Network-first only ever bought protection against same-URL content
+  // changes, which the version contract forbids. A version bump is a new URL,
+  // hence a cache miss, hence fresh bytes.
+  const isVersionedPkg = url.pathname.startsWith("/browser-node/pkg/") && url.searchParams.has("v");
+  if (isVersionedPkg) {
+    event.respondWith(
+      caches.open(STATIC_CACHE).then(async (cache) => {
+        const cached = await cache.match(req);
+        if (cached) return cached;
+        try {
+          const res = await fetch(req);
+          // Same poison guard as the network-first branch: never cache a
+          // redirect-bounced HTML document under an asset URL.
+          if (res && res.status === 200 && res.type === "basic" && !res.redirected) {
+            cache.put(req, res.clone());
+          }
+          return res;
+        } catch {
+          return Response.error();
+        }
+      })
+    );
+    return;
+  }
+
   // App CODE (JS/CSS/source-maps/WASM): NETWORK-FIRST. The freshest build always
   // wins when online; the cache is only an offline fallback. This stops a stale
   // cached bundle from rendering an outdated UI when chunk URLs aren't
@@ -64,9 +99,10 @@ self.addEventListener("fetch", (event) => {
   // already covered install/offline/caching for /run-node, but the wasm bundle
   // -- the actual thing "Run a node" cannot function without -- previously
   // matched NEITHER this branch nor the media one below, so it got no caching
-  // or offline-fallback treatment at all) — network-first is doubly correct
-  // for it specifically, since this session's OWN wasmBundleVersion check
-  // exists precisely to catch a stale wasm bundle paired with fresh JS glue.
+  // or offline-fallback treatment at all). NOTE: the versioned browser-node
+  // pkg URLs never reach this branch — they are cache-first above; this is
+  // network-first for everything else (unversioned chunks whose bytes CAN
+  // change under the same URL).
   const isCode = /\.(?:js|css|map|wasm)$/.test(url.pathname);
   if (isCode) {
     event.respondWith(

@@ -259,6 +259,20 @@ impl BrowserAdmissionStore {
         let revision = state.next_version();
         record.revision = revision;
         state.tombstones.remove(&record.endpoint_id);
+        // A fresh, fully-validated admission (fresh interactive session +
+        // proof-of-possession of the endpoint's own key + server-resolved
+        // descriptor — every check in `validate_request` already passed by the
+        // time `admit` calls this) SUPERSEDES any relay-denylist entry for the
+        // same endpoint id (bn-relay-denylist-restart-friction). The denylist
+        // exists to keep a REVOKED identity off the relay; once that same
+        // identity authenticates a brand-new admission, denying its relay
+        // reconnection is no longer revocation enforcement, it is a 10-minute
+        // stop-then-start outage for a deliberate restart (`stop()`'s DELETE
+        // is itself a revoke). Revocation semantics are untouched: without a
+        // new admission the entry still stands for its full retention window,
+        // and this changes nothing about WHICH admissions are accepted — only
+        // the relay layer learns about an acceptance the store already made.
+        state.denylist.remove(&record.endpoint_id);
         let endpoint_id = record.endpoint_id.clone();
         let old = state.active.insert(endpoint_id, record);
         if old.is_some() {
@@ -280,6 +294,22 @@ impl BrowserAdmissionStore {
     fn mark_denied(&self, endpoint_id: &str, now: u64) {
         let mut state = self.inner.lock();
         state.denylist.insert(endpoint_id.to_string(), now);
+        state.prune_tombstones(now);
+    }
+
+    /// Fast-path relay UN-deny applied by a follower echoing a leader's fresh
+    /// admission (bn-relay-denylist-restart-friction,
+    /// `fanout_deny_clear`/`mesh_deny_clear_echo` below) -- the exact inverse
+    /// of [`mark_denied`] and bound by the same discipline: denylist only,
+    /// never the versioned active/tombstone state, so it cannot race this
+    /// follower's own `adopt()` ordering. `put` clears the entry on the
+    /// leader; this clears it on followers before the next periodic snapshot
+    /// adoption would (otherwise a stop-then-start still waits up to the
+    /// store_sync pull interval on whichever follower relay the browser
+    /// reconnects to).
+    fn mark_deny_cleared(&self, endpoint_id: &str, now: u64) {
+        let mut state = self.inner.lock();
+        state.denylist.remove(endpoint_id);
         state.prune_tombstones(now);
     }
 
@@ -693,6 +723,13 @@ async fn admit(
     let claims = fresh_user_claims(claims)?;
     let (tenant, expires_ms, descriptor) = validate_request(&cloud, &claims, &request)?;
     let issued_ms = hive_core::now_ms();
+    // Captured BEFORE `put` clears it (bn-relay-denylist-restart-friction):
+    // whether this endpoint carried a stale relay-denylist entry (a `stop()`'s
+    // DELETE is a revoke). `put` clears the local entry; followers need the
+    // echo below to clear theirs before the next snapshot adoption.
+    let had_deny_entry = cloud
+        .browser_admissions
+        .is_denied(&request.endpoint_id, issued_ms);
     let mut record = BrowserAdmission {
         endpoint_id: request.endpoint_id,
         addr_json: request.addr_json,
@@ -740,6 +777,14 @@ async fn admit(
             "gateway_unavailable",
             error,
         ));
+    }
+    if had_deny_entry {
+        // The admission is fully committed (store + gateway route) — shrink
+        // the window a stop-then-start browser is still denied at FOLLOWER
+        // relays from the ~60s snapshot-pull interval to one mesh round trip,
+        // exactly mirroring fanout_revoke's latency argument for the deny
+        // direction. Best-effort: a missed peer converges on the next pull.
+        fanout_deny_clear(&cloud, &record.endpoint_id);
     }
     // The capability block is one ATOMIC snapshot (admit and renewal alike):
     // the descriptor the server just authorized plus the CURRENT trusted
@@ -944,6 +989,50 @@ fn fanout_revoke(cloud: &Arc<CloudState>, endpoint_id: &str) {
 pub async fn mesh_revoke_echo(cloud: &Arc<CloudState>, endpoint_id: &str) {
     cloud.browser_admissions.mark_denied(endpoint_id, hive_core::now_ms());
     remove_endpoint(cloud, endpoint_id).await;
+}
+
+/// Fan the fresh-admission deny-CLEAR echo to every OTHER healthy peer
+/// (bn-relay-denylist-restart-friction) -- the exact mirror of
+/// [`fanout_revoke`]: the leader's `put` already cleared its own denylist
+/// entry for a re-admitted endpoint, and this shrinks the window followers
+/// keep denying its relay reconnection from the ~60s periodic store_sync
+/// snapshot-pull interval down to one mesh round trip. Same best-effort
+/// contract: a missed peer simply converges on the next pull.
+fn fanout_deny_clear(cloud: &Arc<CloudState>, endpoint_id: &str) {
+    let targets: Vec<(String, String)> = cloud
+        .registry
+        .nodes()
+        .iter()
+        .filter(|n| n.healthy && n.name != cloud.node_name)
+        .filter_map(|n| Some((n.peer_id.clone()?, n.iroh_addr.clone()?)))
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let cloud = cloud.clone();
+    let endpoint_id = endpoint_id.to_string();
+    tokio::spawn(async move {
+        let path = format!("/v1/browser/admissions/mesh-deny-clear/{endpoint_id}");
+        for (id, addr) in targets {
+            let ok =
+                crate::gossip::request_to(&cloud, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 5)
+                    .await
+                    .is_some();
+            tracing::debug!(endpoint_id = %endpoint_id, node = %id, ok, "browser admission deny-clear echo");
+        }
+    });
+}
+
+/// Receiving side of `fanout_deny_clear`'s echo, dispatched via
+/// `gossip::dispatch`'s `/v1/browser/admissions/mesh-deny-clear/:endpoint_id`
+/// POST arm. Denylist only (see `BrowserAdmissionStore::mark_deny_cleared`)
+/// — deliberately does NOT touch gateway routing or presence: the leader's
+/// admission snapshot programs those, and a follower removing routes on this
+/// echo could tear down a route its own (newer) snapshot already restored.
+pub async fn mesh_deny_clear_echo(cloud: &Arc<CloudState>, endpoint_id: &str) {
+    cloud
+        .browser_admissions
+        .mark_deny_cleared(endpoint_id, hive_core::now_ms());
 }
 
 fn routing_identity_changed(old: &BrowserAdmission, new: &BrowserAdmission) -> bool {

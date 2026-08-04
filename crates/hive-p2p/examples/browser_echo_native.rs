@@ -15,6 +15,12 @@ use hive_browser_proto::{encode_request, Op};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
     let key_path = std::env::var("HIVE_BROWSER_CLIENT_KEY")
         .ok()
         .map(std::path::PathBuf::from);
@@ -26,7 +32,18 @@ async fn main() -> anyhow::Result<()> {
     // relay-only), so printing addr_json before `online()` resolves hands out
     // an EndpointAddr with real-but-useless entries and no relay hint at all —
     // exactly the shape that made the browser's connect() time out here.
-    ep.online().await;
+    //
+    // BOUNDED, not awaited forever: `online()` only resolves once net_report
+    // has selected a HOME relay, which never happens when every relay in the
+    // map fails its `/ping` probe (e.g. a plaintext http:// URL pointed at a
+    // relay whose TLS config moved all services to the https socket). An
+    // OUTBOUND dial doesn't need a home relay at all (the dial opens an
+    // on-demand relay connection for the peer's own relay URL), so hanging
+    // here both blocked every dial-mode witness and hid the distinction.
+    match tokio::time::timeout(std::time::Duration::from_secs(20), ep.online()).await {
+        Ok(()) => println!("NATIVE_ONLINE:home-relay"),
+        Err(_) => println!("NATIVE_ONLINE:timeout(no home relay selected)"),
+    }
     println!("NATIVE_ID:{}", ep.id());
     if std::env::var("HIVE_BROWSER_PRINT_ID").as_deref() == Ok("1") {
         return Ok(());

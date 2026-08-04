@@ -26,7 +26,7 @@ hive_admin: "127.0.0.1:8786"
 # For a from-scratch fleet, leave the first node's bootstrap_peers empty.
 hive_bootstrap_peers: ""
 hive_discovery_dns: ""     # comma-separated http://<ip>:3350 of discovery-capable nodes
-hive_relay_urls: ""        # comma-separated http://<ip>:3340 of self-hosted iroh relays
+hive_relay_urls: ""        # comma-separated self-hosted iroh relay URLs; TLS relays MUST use their https://<name>.relay.shadw.app:3343 form (the plaintext :3340 socket is captive-portal-only once TLS is on — see hosts.ini)
 hive_discovery_n0: "0"     # 0 = opt out of public n0 discovery, use self-hosted only (fleet default)
 hive_gossip_iroh: "1"
 hive_gossip_sign: "1"
