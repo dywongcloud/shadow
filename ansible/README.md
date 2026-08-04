@@ -71,6 +71,34 @@ One host at a time (`serial: 1`) so mesh quorum is never lost across more
 than one node at once -- the same discipline this project's sessions used
 manually every time a code fix needed rolling out fleet-wide.
 
+## Parallel fleet deploy (replaces the bash roll scripts)
+
+```bash
+ansible-playbook playbooks/parallel-deploy.yml
+```
+
+Redeploys BOTH the `hive-cloud` backend and the `ui/` dashboard across every
+`[platform]` host, replacing `scripts/roll-backend-fleet.sh` and
+`scripts/deploy-ui-fleet.sh`. Runs in three phases: build once per glibc
+group (backend) / once on the control-plane leader (UI) -- these builds run
+in parallel with each other; push the resulting artifact to every host in
+parallel (no service touched yet); then restart `hive-node`/`hive-ui` a
+bounded number of hosts at a time (`serial`, default 1) so mesh quorum and
+the public round-robin dashboard both stay up throughout the roll.
+
+```bash
+ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2   # faster restart batches, still bounded
+ansible-playbook playbooks/parallel-deploy.yml --tags backend       # hive-cloud only
+ansible-playbook playbooks/parallel-deploy.yml --tags ui             # ui/ dashboard only
+ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm        # subset of hosts
+```
+
+Requires `inventory/hosts.ini`'s `[glibc239]`/`[glibc238]` groups to stay
+current with the fleet's real glibc membership (AGENTS.md "Fleet has two
+glibc groups" -- membership is by OS image, not region; verify with
+`scripts/audit-runtime-versions.sh` before trusting the group split after
+adding or re-imaging a node).
+
 ## Add one new node (day 2)
 
 ```bash

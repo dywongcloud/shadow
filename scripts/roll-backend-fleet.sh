@@ -31,9 +31,18 @@ TGT238="43.128.46.225 43.166.223.197 43.166.233.114 43.153.106.173 170.106.155.1
 BIN_PATH=/root/hive/target/release/hive-cloud
 
 build() { # $1 src ip
+  # crates/ ALONE is not a buildable tree: the workspace root manifest and
+  # lockfile carry workspace.members + workspace.dependencies (e.g.
+  # hive-browser-proto was added 2026-08-04) — a crates-only sync leaves the
+  # remote with a stale root manifest and cargo fails at manifest load, which
+  # the `| tail -1` below then SWALLOWED (pipeline exit status is tail's).
+  # Witnessed 2026-08-04: a full rollout distributed the stale binary because
+  # of exactly this pair of bugs. Sync the root inputs too and fail LOUDLY.
   rsync -az --delete -e "ssh ${SSHO[*]}" "$REPO_ROOT/crates/" "root@$1:/root/hive/crates/" || return 1
+  rsync -az -e "ssh ${SSHO[*]}" "$REPO_ROOT/Cargo.toml" "$REPO_ROOT/Cargo.lock" "root@$1:/root/hive/" || return 1
   # rsync preserves local mtimes; touch so cargo cannot silently skip the rebuild.
-  ssh "${SSHO[@]}" "root@$1" 'cd /root/hive && find crates -name "*.rs" -exec touch {} + && cargo build --release -p hive-cloud 2>&1 | tail -1'
+  # pipefail so a failed build fails the roll instead of shipping the old binary.
+  ssh "${SSHO[@]}" "root@$1" 'set -o pipefail; cd /root/hive && find crates -name "*.rs" -exec touch {} + && cargo build --release -p hive-cloud 2>&1 | tail -1'
 }
 
 swap_restart() { # $1 target ip, $2 expected sha256

@@ -1,0 +1,43 @@
+---
+# Runs on every platform host IN PARALLEL (build host excluded): syncs ui/
+# source (still needed for node_modules/package-lock on the follower) and
+# pushes the two canonical artifacts, but does not npm ci / extract /
+# restart -- that's restart.yml, serialized.
+
+- name: Skip push on the UI build host itself
+  ansible.builtin.meta: end_host
+  when: inventory_hostname == hive_ui_build_host
+
+- name: Ensure the ui directory exists on the follower
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui"
+    state: directory
+    mode: "0755"
+
+- name: Sync ui/ source (exclude node_modules/.next/.git)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../ui/"
+    dest: "{{ hive_src_dir }}/ui/"
+    delete: false
+    rsync_opts:
+      - "--exclude=node_modules"
+      - "--exclude=.next"
+      - "--exclude=.git"
+
+- name: Template ui/.env.local
+  ansible.builtin.template:
+    src: "{{ role_path }}/../hive_ui/templates/env.local.j2"
+    dest: "{{ hive_src_dir }}/ui/.env.local"
+    mode: "0640"
+
+- name: Push the canonical .next artifact
+  ansible.builtin.copy:
+    src: "{{ hive_artifact_root }}/.next-artifact.tar.gz"
+    dest: "{{ hive_src_dir }}/ui/.next-artifact.tar.gz"
+    mode: "0644"
+
+- name: Push the canonical wf-console artifact
+  ansible.builtin.copy:
+    src: "{{ hive_artifact_root }}/wfconsole-artifact.tar.gz"
+    dest: "{{ hive_src_dir }}/ui/wfconsole-artifact.tar.gz"
+    mode: "0644"

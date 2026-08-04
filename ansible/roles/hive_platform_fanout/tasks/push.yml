@@ -1,0 +1,22 @@
+---
+# Runs on every host (build host included, no-op there) IN PARALLEL: pushes
+# the group's canonical binary and verifies its sha256 landed intact, but
+# does NOT swap/restart -- that happens in the serial restart.yml pass so a
+# bad binary never takes more than one host's hive-node down at once.
+
+- name: Skip push on the build host itself (already has the canonical binary)
+  ansible.builtin.meta: end_host
+  when: inventory_hostname == hive_group_build_host
+
+- name: Push the group's canonical binary to /tmp
+  ansible.builtin.copy:
+    src: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}"
+    dest: /tmp/hive-cloud.new
+    mode: "0755"
+
+- name: Verify the pushed binary's sha256 matches the canonical build
+  ansible.builtin.command:
+    cmd: sha256sum /tmp/hive-cloud.new
+  register: _pushed_sha
+  changed_when: false
+  failed_when: _pushed_sha.stdout.split(' ')[0] != hostvars[hive_group_build_host].hive_group_build_sha256

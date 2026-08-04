@@ -1,0 +1,108 @@
+---
+# Runs ONLY on the elected UI build host (the control-plane leader, see
+# playbooks/parallel-deploy.yml). ONE BUILD, MANY NODES: Next/Turbopack
+# builds are not deterministic, so per-node `next build` produced 13
+# different chunk sets behind one round-robin hostname (the "mobile endless
+# flicker" incident) -- this role builds ONCE and every other host in
+# hive_ui_deploy.yml's push.yml/restart.yml receives the identical artifact.
+
+- name: Ensure the ui directory exists on the build host
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui"
+    state: directory
+    mode: "0755"
+
+- name: Sync ui/ source
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../ui/"
+    dest: "{{ hive_src_dir }}/ui/"
+    delete: false
+    rsync_opts:
+      - "--exclude=node_modules"
+      - "--exclude=.next"
+      - "--exclude=.git"
+
+- name: Template ui/.env.local
+  ansible.builtin.template:
+    src: "{{ role_path }}/../hive_ui/templates/env.local.j2"
+    dest: "{{ hive_src_dir }}/ui/.env.local"
+    mode: "0640"
+
+- name: npm ci
+  ansible.builtin.command:
+    cmd: npm ci
+    chdir: "{{ hive_src_dir }}/ui"
+  environment:
+    PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
+  async: 900
+  poll: 15
+
+- name: npm run build (the ONE canonical build; also runs patch-wf-console.mjs)
+  ansible.builtin.command:
+    cmd: npm run build
+    chdir: "{{ hive_src_dir }}/ui"
+  environment:
+    PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
+    NODE_ENV: production
+  async: 900
+  poll: 15
+
+- name: Read the canonical BUILD_ID
+  ansible.builtin.command:
+    cmd: cat .next/BUILD_ID
+    chdir: "{{ hive_src_dir }}/ui"
+  register: _build_id
+  changed_when: false
+
+- name: Confirm the @workflow/web console patch landed on the build host
+  ansible.builtin.command:
+    # single-quoted grep -rl body; failure here means patch-wf-console.mjs
+    # did not run as part of npm run build -- never ship a pristine console.
+    cmd: >-
+      grep -rl "__hive_rpc_guard"
+      node_modules/@workflow/web/build/server/assets/
+    chdir: "{{ hive_src_dir }}/ui"
+  changed_when: false
+
+- name: Package the .next build (exclude cache -- node-local, huge)
+  ansible.builtin.command:
+    cmd: tar -C .next --exclude cache -czf {{ hive_src_dir }}/ui/.next-artifact.tar.gz .
+    chdir: "{{ hive_src_dir }}/ui"
+
+- name: Package the patched @workflow/web console build
+  ansible.builtin.command:
+    cmd: tar -C node_modules/@workflow/web -czf {{ hive_src_dir }}/ui/wfconsole-artifact.tar.gz build
+    chdir: "{{ hive_src_dir }}/ui"
+
+- name: sha256 the wf-console server build (canonical md5 equivalent)
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js
+      | md5sum | cut -d' ' -f1
+    chdir: "{{ hive_src_dir }}/ui"
+    executable: /bin/bash
+  register: _wf_md5
+  changed_when: false
+
+- name: Set facts for the canonical UI artifacts
+  ansible.builtin.set_fact:
+    hive_canon_build_id: "{{ _build_id.stdout }}"
+    hive_canon_wf_md5: "{{ _wf_md5.stdout }}"
+
+- name: Fetch the canonical artifacts to the control host
+  ansible.builtin.fetch:
+    src: "{{ hive_src_dir }}/ui/{{ item }}"
+    dest: "{{ hive_artifact_root }}/{{ item }}"
+    flat: true
+  loop:
+    - .next-artifact.tar.gz
+    - wfconsole-artifact.tar.gz
+
+- name: Remove the packaged artifacts from the build host (they've been fetched)
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui/{{ item }}"
+    state: absent
+  loop:
+    - .next-artifact.tar.gz
+    - wfconsole-artifact.tar.gz

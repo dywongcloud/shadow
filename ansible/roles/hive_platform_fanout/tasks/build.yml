@@ -1,0 +1,84 @@
+---
+# Runs ONLY on the elected build host for one glibc group (see
+# playbooks/parallel-deploy.yml). Syncs source, builds hive-cloud release,
+# and packages the resulting binary + its sha256 for fan-out -- mirrors
+# scripts/roll-backend-fleet.sh's build() step, but expressed as a role task
+# file instead of a bash function so ansible drives the parallel-build /
+# serial-restart split.
+
+- name: Ensure the source directory exists on the build host
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Sync crates/ (the whole Cargo workspace's source)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../crates/"
+    dest: "{{ hive_src_dir }}/crates/"
+    delete: true
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=.git"
+  register: _synced
+
+# rsync -a preserves local mtimes, so a build that finishes AFTER a sync
+# lands can leave cargo fingerprints newer than the fresh sources and
+# silently skip rebuilding (AGENTS.md "Fleet-roll gotcha"). Touch whenever
+# the sync actually changed anything.
+- name: Touch synced sources so cargo cannot skip the rebuild
+  ansible.builtin.command:
+    cmd: find crates -name "*.rs" -exec touch {} +
+    chdir: "{{ hive_src_dir }}"
+  when: _synced.changed
+
+- name: Sync vendor/ (patched crates, e.g. guardian-db)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../vendor/"
+    dest: "{{ hive_src_dir }}/vendor/"
+    delete: true
+    rsync_opts:
+      - "--exclude=target"
+      - "--exclude=tmp"
+      - "--exclude=.git"
+
+- name: Copy Cargo.toml + Cargo.lock (workspace manifest, exact-pinned)
+  ansible.builtin.copy:
+    src: "{{ playbook_dir }}/../../{{ item }}"
+    dest: "{{ hive_src_dir }}/{{ item }}"
+    mode: "0644"
+  loop:
+    - Cargo.toml
+    - Cargo.lock
+
+- name: Build hive-cloud (release) on the group's build host
+  ansible.builtin.command:
+    cmd: cargo build --release -p hive-cloud
+    chdir: "{{ hive_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+    CARGO_TARGET_DIR: "{{ hive_cargo_target_dir }}"
+  async: 1800
+  poll: 15
+
+- name: Confirm the binary was produced
+  ansible.builtin.stat:
+    path: "{{ hive_binary_path }}"
+  register: _bin
+  failed_when: not _bin.stat.exists
+
+- name: sha256 the canonical binary
+  ansible.builtin.command:
+    cmd: "sha256sum {{ hive_binary_path }}"
+  register: _sha
+  changed_when: false
+
+- name: Set facts for this build host's artifact
+  ansible.builtin.set_fact:
+    hive_group_build_sha256: "{{ _sha.stdout.split(' ')[0] }}"
+
+- name: Fetch the canonical binary to the control host
+  ansible.builtin.fetch:
+    src: "{{ hive_binary_path }}"
+    dest: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}"
+    flat: true

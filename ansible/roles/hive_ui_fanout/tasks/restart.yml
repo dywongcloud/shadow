@@ -1,0 +1,106 @@
+---
+# Runs SERIALLY (see playbooks/parallel-deploy.yml's serial: on this play) --
+# dashboard is never down fleet-wide, matching scripts/deploy-ui-fleet.sh's
+# comment ("Still one host at a time for the restart").
+
+- name: Build host -- .next already canonical, nothing to extract
+  ansible.builtin.debug:
+    msg: "{{ hive_name }}: UI build host, {{ hive_canon_build_id | default('(build id unavailable this run)') }}"
+  when: inventory_hostname == hive_ui_build_host
+
+- name: Follower -- npm ci (clean install matching package-lock)
+  ansible.builtin.command:
+    cmd: npm ci
+    chdir: "{{ hive_src_dir }}/ui"
+  environment:
+    PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
+  async: 900
+  poll: 15
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- extract the canonical .next into a staging dir
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui/.next.new"
+    state: directory
+    mode: "0755"
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- untar the canonical .next
+  ansible.builtin.unarchive:
+    src: "{{ hive_src_dir }}/ui/.next-artifact.tar.gz"
+    dest: "{{ hive_src_dir }}/ui/.next.new"
+    remote_src: true
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- atomic-ish swap (.next -> .next.old, .next.new -> .next)
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      rm -rf .next.old
+      [ -d .next ] && mv .next .next.old
+      mv .next.new .next
+      rm -f .next-artifact.tar.gz
+    chdir: "{{ hive_src_dir }}/ui"
+    executable: /bin/bash
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- overlay the patched @workflow/web console build
+  ansible.builtin.unarchive:
+    src: "{{ hive_src_dir }}/ui/wfconsole-artifact.tar.gz"
+    dest: "{{ hive_src_dir }}/ui/node_modules/@workflow/web"
+    remote_src: true
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- remove the wf-console artifact (extracted)
+  ansible.builtin.file:
+    path: "{{ hive_src_dir }}/ui/wfconsole-artifact.tar.gz"
+    state: absent
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Follower -- confirm the wf-console patch marker landed after overlay
+  ansible.builtin.command:
+    cmd: >-
+      grep -rl "__hive_rpc_guard"
+      node_modules/@workflow/web/build/server/assets/
+    chdir: "{{ hive_src_dir }}/ui"
+  changed_when: false
+  when: inventory_hostname != hive_ui_build_host
+
+- name: Template the hive-ui systemd unit
+  ansible.builtin.template:
+    src: "{{ role_path }}/../hive_ui/templates/hive-ui.service.j2"
+    dest: /etc/systemd/system/hive-ui.service
+    mode: "0644"
+  register: _ui_unit
+
+- name: Reload systemd if the unit changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _ui_unit.changed
+
+- name: Restart hive-ui
+  ansible.builtin.systemd:
+    name: hive-ui
+    state: restarted
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the UI to answer on loopback :3002
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3002/"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _ui
+  retries: 12
+  delay: 5
+  until: _ui.status in [200, 307, 308]
+
+- name: Confirm this host's BUILD_ID matches the canonical build
+  ansible.builtin.command:
+    cmd: cat .next/BUILD_ID
+    chdir: "{{ hive_src_dir }}/ui"
+  register: _got_build_id
+  changed_when: false
+  failed_when: >-
+    hostvars[hive_ui_build_host].hive_canon_build_id is defined and
+    _got_build_id.stdout != hostvars[hive_ui_build_host].hive_canon_build_id

@@ -1,0 +1,59 @@
+---
+# Runs SERIALLY (see playbooks/parallel-deploy.yml's serial: on this play) --
+# swaps the binary into place (a no-op copy on the build host, an atomic
+# mv from the pushed /tmp copy on every follower), restarts hive-node, and
+# health-checks before ansible moves to the next batch. One host at a time
+# by default so mesh quorum is never lost across more than one node at once
+# (AGENTS.md health-verdict-per-observer note; the same reasoning
+# playbooks/platform-only.yml's serial: 1 already encodes).
+
+- name: Build host -- binary is already canonical, nothing to swap
+  ansible.builtin.debug:
+    msg: "{{ hive_name }}: build host, binary already at {{ hive_binary_path }}"
+  when: inventory_hostname == hive_group_build_host
+
+- name: Follower -- back up the running binary before swap
+  ansible.builtin.copy:
+    src: "{{ hive_binary_path }}"
+    dest: "{{ hive_binary_path }}.old-roll"
+    remote_src: true
+    mode: "0755"
+  when: inventory_hostname != hive_group_build_host
+
+- name: Follower -- atomically move the verified pushed binary into place
+  ansible.builtin.command:
+    cmd: mv -f /tmp/hive-cloud.new {{ hive_binary_path }}
+  when: inventory_hostname != hive_group_build_host
+
+- name: Template the hive-node systemd unit (in case env/vars changed)
+  ansible.builtin.template:
+    src: "{{ role_path }}/../hive_platform/templates/hive-node.service.j2"
+    dest: /etc/systemd/system/hive-node.service
+    mode: "0644"
+  register: _unit
+
+- name: Reload systemd if the unit changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _unit.changed
+
+- name: Restart hive-node
+  ansible.builtin.systemd:
+    name: hive-node
+    state: restarted
+    enabled: true
+    daemon_reload: true
+
+- name: Wait for the admin port to answer
+  ansible.builtin.uri:
+    url: "http://{{ hive_admin }}/v1/mesh"
+    method: GET
+    status_code: 200
+  register: _mesh
+  retries: 12
+  delay: 5
+  until: _mesh.status == 200
+
+- name: Report mesh health
+  ansible.builtin.debug:
+    msg: "{{ hive_name }}: /v1/mesh -> {{ _mesh.json }}"

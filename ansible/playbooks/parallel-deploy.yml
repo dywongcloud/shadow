@@ -1,0 +1,150 @@
+---
+# Fleet-wide deploy of BOTH the hive-cloud backend and the ui/ dashboard,
+# replacing scripts/roll-backend-fleet.sh + scripts/deploy-ui-fleet.sh with
+# one Ansible entry point across all 13 hosts.
+#
+# Parallelism model (deliberately NOT "restart all 13 at once" -- see
+# AGENTS.md's mesh quorum-loss / round-robin-dashboard-availability notes,
+# and playbooks/platform-only.yml's existing serial: 1):
+#
+#   1. BUILD (parallel):  one host per glibc group builds hive-cloud; one
+#      host (the control-plane leader) builds the ui/ Next.js bundle once.
+#      All three builds run concurrently with each other.
+#   2. PUSH (parallel):   every host pulls its group's/the canonical
+#      artifact and verifies its checksum. No service is touched yet, so
+#      this step is safe to fan out to all 13 hosts at once.
+#   3. RESTART (serial):  hive-node and hive-ui are swapped in and
+#      restarted a bounded number of hosts at a time (serial, see
+#      -e deploy_serial=N below), each batch health-checked before the
+#      next starts -- so a bad build/rollback never takes more than
+#      deploy_serial hosts down together, and mesh quorum / the public
+#      round-robin dashboard both stay up throughout.
+#
+# Usage:
+#   ansible-playbook playbooks/parallel-deploy.yml
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2   # faster, still bounded
+#   ansible-playbook playbooks/parallel-deploy.yml --tags backend       # backend only
+#   ansible-playbook playbooks/parallel-deploy.yml --tags ui            # ui only
+#   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset (still 2-phase build/push, serial restart within the subset)
+#
+# Every step below is idempotent (matches hive_platform/hive_ui's own
+# idempotency) so a partial re-run after a mid-deploy failure picks up
+# rather than redoing completed work.
+
+- name: Elect build hosts and stage the shared artifact directory
+  hosts: platform
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - name: Elect the first host of each glibc group as its build host
+      ansible.builtin.group_by:
+        key: "{{ 'glibc239_builder' if inventory_hostname == groups['glibc239'][0] else ('glibc238_builder' if inventory_hostname == groups['glibc238'][0] else 'glibc_follower') }}"
+
+    # hive_name is a per-host var, not a hostname -- the control-plane
+    # leader (hive_cp_owner_chain's first entry) is identified by matching
+    # its own hive_name against the chain, same ordering intent
+    # scripts/deploy-ui-fleet.sh derived from inventory (leader deployed
+    # first).
+    - name: Elect the control-plane leader as the UI build host
+      ansible.builtin.group_by:
+        key: "{{ 'ui_builder' if hive_name == hive_cp_owner_chain.split(',')[0] else 'ui_follower' }}"
+
+    - name: Create a scratch dir on the control host for fetched artifacts
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: hive-parallel-deploy-
+      delegate_to: localhost
+      delegate_facts: true
+      connection: local
+      run_once: true
+      register: _artifact_tmp
+
+    - name: Publish the artifact root to every host's facts
+      ansible.builtin.set_fact:
+        hive_artifact_root: "{{ hostvars['localhost']['_artifact_tmp']['path'] }}"
+
+- name: Backend build (parallel, one host per glibc group)
+  hosts: glibc239_builder:glibc238_builder
+  become: true
+  tags: [backend]
+  vars:
+    hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
+  tasks:
+    - name: Announce this host's build role
+      ansible.builtin.debug:
+        msg: "{{ hive_name }}: elected build host for {{ hive_glibc_group }}"
+    - ansible.builtin.include_role:
+        name: hive_platform_fanout
+        tasks_from: build
+
+- name: Backend push (parallel, all platform hosts)
+  hosts: platform
+  become: true
+  tags: [backend]
+  vars:
+    hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
+    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_platform_fanout
+        tasks_from: push
+
+- name: Backend restart (serial -- mesh quorum safety)
+  hosts: platform
+  become: true
+  serial: "{{ deploy_serial | default(1) }}"
+  tags: [backend]
+  vars:
+    hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
+    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_platform_fanout
+        tasks_from: restart
+
+- name: UI build (once, on the control-plane leader)
+  hosts: ui_builder
+  become: true
+  tags: [ui]
+  tasks:
+    - name: Announce this host's build role
+      ansible.builtin.debug:
+        msg: "{{ hive_name }}: elected UI build host (control-plane leader)"
+    - ansible.builtin.include_role:
+        name: hive_ui_fanout
+        tasks_from: build
+
+- name: UI push (parallel, all platform hosts)
+  hosts: platform
+  become: true
+  tags: [ui]
+  vars:
+    hive_ui_build_host: "{{ groups['ui_builder'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_ui_fanout
+        tasks_from: push
+
+- name: UI restart (serial -- dashboard never down fleet-wide)
+  hosts: platform
+  become: true
+  serial: "{{ deploy_serial | default(1) }}"
+  tags: [ui]
+  vars:
+    hive_ui_build_host: "{{ groups['ui_builder'][0] }}"
+    hive_canon_build_id: "{{ hostvars[groups['ui_builder'][0]].hive_canon_build_id | default('') }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_ui_fanout
+        tasks_from: restart
+
+- name: Clean up the control host's scratch artifact directory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [always]
+  tasks:
+    - ansible.builtin.file:
+        path: "{{ hostvars['localhost']['_artifact_tmp']['path'] }}"
+        state: absent
+      run_once: true
