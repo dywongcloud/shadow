@@ -250,7 +250,12 @@ const nextConfig = {
           { key: "X-Content-Type-Options", value: "nosniff" },
           { key: "X-Frame-Options", value: "SAMEORIGIN" },
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
-          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()" },
+          // geolocation=(self): the run-node page's geo-consent flow (publish the
+          // browser node's coarse location to the constellation) calls
+          // navigator.geolocation; `geolocation=()` overrides the user's own
+          // site permission and made consent impossible (witnessed 2026-08-04:
+          // "not allowed" even with the browser setting at ask).
+          { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=(self), payment=(), usb=(), interest-cohort=()" },
           { key: "Content-Security-Policy", value: CSP_ENFORCED },
           { key: "Content-Security-Policy-Report-Only", value: CSP_REPORT_ONLY },
           // Only meaningful over HTTPS; harmless (browsers ignore it) when
