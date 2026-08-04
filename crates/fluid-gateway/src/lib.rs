@@ -2783,6 +2783,22 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         // carries the `public_port` → deployment mapping to every edge node
         // (the generic raw proxy's routing table).
         raw_ports: d.manifest.raw_port_bindings(),
+        // Browser-eligible functions + their artifact descriptors, so the
+        // admission-validating leader can tie a donor's digest to a real build
+        // artifact for deployments hosted on OTHER nodes.
+        browser_functions: d
+            .manifest
+            .functions
+            .iter()
+            .filter_map(|f| {
+                f.browser_artifact
+                    .clone()
+                    .map(|artifact| fluid_core::BrowserFunctionRef {
+                        name: f.name.clone(),
+                        artifact,
+                    })
+            })
+            .collect(),
     }
 }
 

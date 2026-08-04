@@ -432,6 +432,79 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
 - Rebuild constraint from the node half: fc-sanjose-gpu-2 runs driver
   570.211.01 — any llama.cpp rebuild must stay on CUDA 12.x, not 13.x.
 
+## Browser-function artifacts (build contract)
+
+- **A function is browser-eligible ONLY by opting in** via fluid.json
+  `functions[].browser` (`fluid_core::BrowserPolicy`: `entry` + bounded
+  `mode`/`timeout_ms`/`memory_bytes`/`stack_bytes`/`allowed_ops`) and
+  surviving `browser_artifacts::bundle` at build time. An opted-in function
+  that is ineligible — container/python/go/command runtime, TypeScript or
+  missing entry, any Node/Bun/Deno surface in the source (`require`,
+  `import`/`export`, `process.`, `Buffer`, `Bun.`, `fetch(` in quickjs mode),
+  an unknown host-op id — FAILS THE BUILD loudly; the deployment is never
+  registered. Never "warn and drop the opt-in": that leaves the fleet serving
+  code donors believe they serve.
+- **The canonical policy digest is ONE contract with TWO implementations.**
+  `fluid_core::browser_policy_digest` must stay byte-for-byte identical to
+  `policyDigest` in `crates/hive-browser/www/function-runtime.js`
+  (domain `hive-browser-policy-v1\0`, LE fields, sorted deduped op ids with
+  their ABI strings from `fluid_core::browser_host_op_abi`). The policy digest
+  binds the source digest to the exact limits and is THE wire digest
+  (`encode_invoke`, `pin`'s return, the admission's `digest`) — a drift
+  between the two implementations silently breaks every artifact pin.
+- **Bytes stay node-local; only descriptor metadata replicates.** Artifacts
+  live in `$HIVE_DATA/browser-artifacts/<policy_digest>.js` + a `.json`
+  owner sidecar (deployment ids); the manifest carries only
+  `FunctionConfig::browser_artifact` (digests, size, limits), which
+  `DeploymentInfo.browser_functions` gossips. Artifacts never ride
+  `PlatformSnapshot`/store_sync (the `dns_geo.json` precedent) and are
+  deliberately NOT packed into the deliver_build ext4 — they execute in
+  donors' browsers, carry no env/secrets.
+- **Admission capabilities are entirely server-derived.** `browser_admission`'s
+  `validate_request` resolves deployment+function to its ready descriptor
+  under the authenticated tenant (`browser_artifacts::descriptor_for`) and the
+  admission record's `digest` IS that descriptor's canonical policy digest;
+  `AdmissionRequest.digest` is a rollout-compat field that is accepted but
+  never read — a forged digest admits nothing (there is nothing to match it
+  against), and a stale one is simply reconciled to the current descriptor.
+  The admit/renewal response carries a `capability` block — `artifact_url`,
+  `policy_digest`/`source_digest`/`source_bytes`, resolved limits, and
+  `trusted_callers` — one atomic snapshot the donor reconciles its grants
+  from, descriptor rotation included (`routing_identity_changed` tears the
+  old route down first). The block is additive JSON on the admission HTTP
+  API; `hive-browser-proto`'s QUIC wire contract is untouched.
+- **`trusted_callers` comes from the live registry, never client input.**
+  Every HEALTHY node's proven iroh identity (parsed from the gossiped
+  `EndpointAddr`, else the join-verified `peer_id`) — never node names, never
+  browser ids, never a wildcard/TrustSet. Health-filtered by design: a fleet
+  removal drops the id on the next renewal and a re-addition restores it, on
+  the same snapshot the descriptor rotation rides.
+- **Artifact delivery is a tenant-authorized content-addressed GET with an
+  owner proxy** (`GET /v1/browser/artifacts/<policy_digest>`,
+  `browser_artifacts::routes`). Serve only when the authenticated session's
+  tenant owns a READY deployment referencing that exact descriptor
+  (`resolve_for_tenant`; foreign tenant and unknown digest both 404 — no
+  existence leak), and only after re-verifying exact size + source BLAKE3
+  against the descriptor. The bytes live only on the build node, so a local
+  miss proxies to a deployment host / the leader
+  (`fetch_artifact_from_host`: HTTP admin with a `?local=true` no-re-proxy
+  guard, else the gossip `/v1/browser/artifacts/` arm, which re-runs the
+  tenant gate against the OWNER's own deployment state — the
+  `proxy_to_owner` re-check precedent). Proxied bytes pass the SAME
+  verification before serving — this node never emits unverified bytes under
+  immutable headers (`Cache-Control: public, max-age=31536000, immutable`,
+  ETag + `x-hive-policy/source-digest`). The digest is validated (64
+  lowercase hex) before it ever becomes a path component — tenant path
+  fragments get 400, never a filesystem lookup.
+- **GC is guarded exactly like `gc_rootfs_images`.** The keep-set is the
+  policy digests of ALL live local deployment records; `browser_artifacts::gc`
+  refuses an empty keep-set and any reap set over
+  `HIVE_BROWSER_ARTIFACT_GC_MAX_REAP_FRACTION` (default 0.5), and only reaps
+  files older than `HIVE_BROWSER_ARTIFACT_GC_GRACE_SECS` (default 600). A
+  legitimate full drain (every browser deployment deleted) therefore refuses
+  forever by design — that is a state-versus-caller-bug ambiguity no GC may
+  resolve by deleting; drain the store dir by hand.
+
 ## Tenant volume isolation (verified, keep it this way)
 
 - **A project name can never become a host path, and that is load-bearing.**

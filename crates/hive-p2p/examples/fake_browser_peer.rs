@@ -45,6 +45,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or(0);
     let reply_mode = std::env::var("HIVE_FAKE_BROWSER_REPLY_MODE")
         .unwrap_or_else(|_| "normal".to_string());
+    let observe_ms = std::env::var("HIVE_FAKE_BROWSER_OBSERVE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(15_000);
 
     let ep = hive_p2p::bind_full(None, &[], &[], false).await?;
     ep.online().await;
@@ -97,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("fake_browser_peer: accepted a bi-stream");
                 let reply = reply.clone();
                 let reply_mode = reply_mode.clone();
+                let observe_ms = observe_ms;
                 tokio::spawn(async move {
                     if read_delay_ms > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(read_delay_ms)).await;
@@ -168,7 +173,8 @@ async fn main() -> anyhow::Result<()> {
                     // HIVE_FAKE_BROWSER_REPLY_MODE.
                     let framed = hive_browser_proto::encode_reply(&reply);
                     let bytes = match reply_mode.as_str() {
-                        "normal" | "trailing" => framed.as_slice(),
+                        "normal" | "trailing" | "never-fin" => framed.as_slice(),
+                        "prefix-only" => &framed[..4.min(framed.len())],
                         "prefix-truncated" => &framed[..framed.len().min(2)],
                         "body-truncated" => &framed[..(4 + reply.len() / 2).min(framed.len())],
                         mode => {
@@ -193,9 +199,49 @@ async fn main() -> anyhow::Result<()> {
                             return;
                         }
                     }
-                    match send.finish() {
-                        Ok(()) => eprintln!("fake_browser_peer: reply complete"),
-                        Err(error) => eprintln!("fake_browser_peer: reply finish failed: {error}"),
+                    if reply_mode == "never-fin" || reply_mode == "prefix-only" {
+                        eprintln!(
+                            "fake_browser_peer: holding stream open without FIN (mode {reply_mode})"
+                        );
+                    } else {
+                        match send.finish() {
+                            Ok(()) => eprintln!("fake_browser_peer: reply complete"),
+                            Err(error) => {
+                                eprintln!("fake_browser_peer: reply finish failed: {error}")
+                            }
+                        }
+                    }
+                    // Observe how the REAL client implementation closes its half:
+                    // a Drop-owned guard must reset/stop with one protocol code.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(observe_ms),
+                        send.stopped(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(code)) => eprintln!(
+                            "fake_browser_peer: FAKE_OBSERVE_STOPPED_CODE:{}",
+                            code.map(|c| c.into_inner()).unwrap_or_default()
+                        ),
+                        Ok(Err(error)) => {
+                            eprintln!("fake_browser_peer: stopped wait failed: {error}")
+                        }
+                        Err(_) => eprintln!("fake_browser_peer: FAKE_OBSERVE_STOPPED_CODE:pending"),
+                    }
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(2_000),
+                        recv.received_reset(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(code)) => eprintln!(
+                            "fake_browser_peer: FAKE_OBSERVE_RESET_CODE:{}",
+                            code.map(|c| c.into_inner()).unwrap_or_default()
+                        ),
+                        Ok(Err(error)) => {
+                            eprintln!("fake_browser_peer: reset wait failed: {error}")
+                        }
+                        Err(_) => eprintln!("fake_browser_peer: FAKE_OBSERVE_RESET_CODE:pending"),
                     }
                 });
             }

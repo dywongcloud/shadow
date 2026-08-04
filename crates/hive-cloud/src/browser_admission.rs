@@ -398,6 +398,16 @@ struct AdmissionRequest {
     addr_json: String,
     deployment: String,
     function: String,
+    /// ROLLOUT-COMPATIBILITY ONLY (browser-admission-derived-capabilities):
+    /// pre-derived-capability workers believed they chose the code digest and
+    /// sent it here. The value is now NEVER consulted — the effective digest
+    /// is resolved server-side from the deployment's build-stamped artifact
+    /// descriptor, so a forged, stale, or missing donor digest all produce the
+    /// same result: the descriptor's canonical policy digest, returned in the
+    /// capability block. Kept as an accepted-but-ignored field so a worker
+    /// built before this change keeps deserializing during the rollout window.
+    #[serde(default)]
+    #[allow(dead_code)]
     digest: String,
     #[serde(default)]
     lease_secs: Option<u64>,
@@ -556,7 +566,7 @@ fn validate_request(
     cloud: &Arc<CloudState>,
     claims: &crate::auth::Claims,
     request: &AdmissionRequest,
-) -> Result<(String, u64), AdmissionFailure> {
+) -> Result<(String, u64, fluid_core::BrowserFunctionRef), AdmissionFailure> {
     // Range check, not exact-match (bn-p2p-version-negotiation): the two
     // failure directions need distinct client-facing signals. A durably
     // outdated client (below the server's floor) needs a forced reload — no
@@ -605,8 +615,7 @@ fn validate_request(
         ));
     }
     verify_proof_of_possession(&endpoint_id, request.challenge_ms, &request.signature)?;
-    if !hive_browser_proto::valid_function_digest(&request.digest)
-        || request.deployment.is_empty()
+    if request.deployment.is_empty()
         || request.deployment.len() > 256
         || request.function.is_empty()
         || request.function.len() > 256
@@ -625,13 +634,38 @@ fn validate_request(
         ));
     }
     let tenant = crate::admin::norm(&claims.tenant).to_string();
-    if !deployment_serves(cloud, &tenant, &request.deployment, &request.function) {
-        return Err(AdmissionFailure::retryable(
-            StatusCode::NOT_FOUND,
-            "deployment_not_ready",
-            "no ready deployment function exists in this tenant",
-        ));
-    }
+    // The ENTIRE authorization decision is the server-side descriptor
+    // resolution (browser-admission-derived-capabilities, on top of
+    // browser-function-artifact-build-contract's store): the deployment +
+    // function named by the donor must resolve — under the AUTHENTICATED
+    // tenant — to a Ready deployment whose build stamped a browser artifact
+    // descriptor on that function. The donor's own `digest` field is a
+    // rollout-compat leftover and is never consulted: a forged digest admits
+    // nothing (there is nothing to match it against), and a stale one simply
+    // gets reconciled to the current descriptor returned in the capability.
+    let descriptor = match crate::browser_artifacts::descriptor_for(
+        cloud,
+        &tenant,
+        &request.deployment,
+        &request.function,
+    ) {
+        None => {
+            return Err(AdmissionFailure::retryable(
+                StatusCode::NOT_FOUND,
+                "deployment_not_ready",
+                "no ready deployment function exists in this tenant",
+            ));
+        }
+        Some(None) => {
+            return Err(AdmissionFailure::terminal(
+                StatusCode::FORBIDDEN,
+                "function_not_browser_eligible",
+                "the named function has no build-produced browser artifact — it never opted in \
+                 via fluid.json `browser`, or the build rejected it as unsupported",
+            ));
+        }
+        Some(Some(descriptor)) => descriptor,
+    };
     let now = hive_core::now_ms();
     let requested = request
         .lease_secs
@@ -648,30 +682,7 @@ fn validate_request(
             "platform session expires before the minimum browser lease",
         ));
     }
-    Ok((tenant, expires_ms))
-}
-
-fn deployment_serves(
-    cloud: &Arc<CloudState>,
-    tenant: &str,
-    deployment: &str,
-    function: &str,
-) -> bool {
-    let local = cloud.gw.deployment_records().into_iter().any(|record| {
-        record.id == deployment
-            && record.state == fluid_core::DeployState::Ready
-            && crate::admin::record_tenant(&record.tenant) == tenant
-            && record.manifest.functions.iter().any(|f| f.name == function)
-    });
-    local
-        || cloud.peer_deployments.read().values().any(|deployments| {
-            deployments.iter().any(|record| {
-                record.id.as_str() == deployment
-                    && record.state == fluid_core::DeployState::Ready
-                    && crate::admin::record_tenant(&record.tenant) == tenant
-                    && record.functions.iter().any(|name| name == function)
-            })
-        })
+    Ok((tenant, expires_ms, descriptor))
 }
 
 async fn admit(
@@ -680,14 +691,20 @@ async fn admit(
     Json(request): Json<AdmissionRequest>,
 ) -> AdmissionResult {
     let claims = fresh_user_claims(claims)?;
-    let (tenant, expires_ms) = validate_request(&cloud, &claims, &request)?;
+    let (tenant, expires_ms, descriptor) = validate_request(&cloud, &claims, &request)?;
     let issued_ms = hive_core::now_ms();
     let mut record = BrowserAdmission {
         endpoint_id: request.endpoint_id,
         addr_json: request.addr_json,
         deployment: request.deployment,
         function: request.function,
-        digest: request.digest,
+        // SERVER-DERIVED (browser-admission-derived-capabilities): the exact
+        // canonical-policy digest of the deployment function's build-stamped
+        // descriptor — never the donor-supplied compat field. On a RENEWAL
+        // after a redeploy rotated the artifact, this is where the record
+        // atomically moves to the new digest (routing_identity_changed below
+        // tears down the old route first, so no invoke can straddle them).
+        digest: descriptor.artifact.policy_digest.clone(),
         tenant,
         subject: claims.sub,
         issued_ms,
@@ -724,7 +741,84 @@ async fn admit(
             error,
         ));
     }
-    Ok(Json(json!({ "admission": record })))
+    // The capability block is one ATOMIC snapshot (admit and renewal alike):
+    // the descriptor the server just authorized plus the CURRENT trusted
+    // caller set. The donor reconciles its grants from exactly this — granting
+    // every listed caller, revoking every caller no longer listed, and
+    // re-pinning when the descriptor rotated — so fleet additions/removals
+    // and artifact rotation take effect on the same response, never piecemeal.
+    Ok(Json(json!({
+        "admission": record,
+        "capability": capability_json(&cloud, &descriptor.artifact, expires_ms),
+    })))
+}
+
+/// The server-derived capability returned by `admit` (initial and renewal):
+/// everything the donor needs to pin the artifact and program its invoker
+/// grants, and nothing it could have supplied itself.
+///
+/// * `artifact_url` — the tenant-authorized content-addressed GET
+///   (browser-function-artifact-delivery), relative to the API origin the
+///   admission call was made against. The worker fetches with a bounded
+///   deadline and recomputes BOTH BLAKE3 digests before pinning.
+/// * `policy_digest` / `source_digest` / `source_bytes` — verbatim from the
+///   build-stamped descriptor, so a stale or mismatched served body is
+///   detectable byte-for-byte.
+/// * `trusted_callers` — see [`trusted_caller_ids`]: the exact fleet
+///   EndpointIds the donor grants via `BrowserNode.grantInvoker`. Anything
+///   else (a wildcard, a browser id, a client-supplied id) is refused by
+///   construction — it never appears here.
+fn capability_json(
+    cloud: &Arc<CloudState>,
+    artifact: &fluid_core::BrowserArtifact,
+    expires_ms: u64,
+) -> Value {
+    json!({
+        "version": 1,
+        "artifact_url": format!("/v1/browser/artifacts/{}", artifact.policy_digest),
+        "policy_digest": artifact.policy_digest,
+        "source_digest": artifact.source_digest,
+        "source_bytes": artifact.source_bytes,
+        "mode": artifact.mode,
+        "timeout_ms": artifact.timeout_ms,
+        "memory_bytes": artifact.memory_bytes,
+        "stack_bytes": artifact.stack_bytes,
+        "allowed_ops": artifact.allowed_ops,
+        "trusted_callers": trusted_caller_ids(cloud),
+        "expires_ms": expires_ms,
+    })
+}
+
+/// The fleet EndpointIds currently allowed to originate BrowserPool invokes
+/// against an admitted browser: every HEALTHY node in the live registry,
+/// keyed by its proven iroh identity — parsed out of the gossiped
+/// `EndpointAddr` when present (the canonical form the mesh join verified
+/// against the peer's QUIC handshake), else the join-verified `peer_id`.
+///
+/// Deliberately NOT: client input (the request never names a caller), node
+/// NAMES (labels, not identities — the PeerPool keying incident), browser ids
+/// (donors must never appear here), or any wildcard/TrustSet aggregate
+/// (each entry is one exact EndpointId, which is the only shape
+/// `grantInvoker` accepts). Health-filtered because a node the control plane
+/// currently cannot reach has no business holding a fresh grant; renewal
+/// re-derives the set, so a flapping node loses and regains its grant on the
+/// same snapshot the descriptor rotation rides.
+fn trusted_caller_ids(cloud: &Arc<CloudState>) -> Vec<String> {
+    let mut ids = BTreeSet::new();
+    for n in cloud.registry.nodes() {
+        if !n.healthy {
+            continue;
+        }
+        let id = n
+            .iroh_addr
+            .as_deref()
+            .and_then(hive_p2p::endpoint_id_from_addr_json)
+            .or_else(|| n.peer_id.clone());
+        if let Some(id) = id.filter(|id| hive_browser_proto::valid_blake3_digest(id)) {
+            ids.insert(id);
+        }
+    }
+    ids.into_iter().collect()
 }
 
 async fn list_admissions(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {

@@ -358,6 +358,26 @@ pub struct FunctionConfig {
     /// dashboard function-settings toggle.
     #[serde(default, skip_serializing_if = "is_false")]
     pub gpu: bool,
+    /// Explicit opt-in to browser-node execution (fluid.json
+    /// `functions[].browser`) with a bounded execution policy. ABSENT means the
+    /// function is NOT browser-eligible, by construction: only an opted-in
+    /// function whose handler survives the build-time bundle + rejection pass
+    /// ([`BrowserPolicy`]'s docs) gets a [`FunctionConfig::browser_artifact`]
+    /// descriptor, and only descriptor-carrying functions can ever be admitted
+    /// for browser serving. This is the contract that replaces "pretend every
+    /// deployed Node/Bun/container function can run in a browser".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<BrowserPolicy>,
+    /// Build-stamped descriptor of the emitted browser artifact — digest
+    /// metadata ONLY (source + canonical-policy BLAKE3, size, resolved
+    /// limits), never the bytes. Written by the build pipeline after the
+    /// bundle pass succeeds; `None` in every user-authored manifest and for
+    /// any function the build rejected or never opted in. Because this rides
+    /// the manifest, it reaches the replicated deployment state
+    /// (`DeployRecord`) and the gossiped [`DeploymentInfo::browser_functions`]
+    /// view — that metadata is what admission ties a donor's digest to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_artifact: Option<BrowserArtifact>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -430,8 +450,322 @@ impl Default for FunctionConfig {
             protocol: ServiceProtocol::default(),
             ports: Vec::new(),
             gpu: false,
+            browser: None,
+            browser_artifact: None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Browser-executable function artifact contract
+// (browser-function-artifact-build-contract)
+// ---------------------------------------------------------------------------
+//
+// A function becomes browser-eligible ONLY by opting in through fluid.json
+// `functions[].browser` and surviving the build-time bundle pass. The build
+// emits ONE deterministic, self-contained source string — an
+// `async function (request, ops)` expression in exactly the shape
+// `crates/hive-browser/www/pkg/function-worker.js` evaluates
+// (`globalThis.__hive_handler = (<source>)`) — computes two BLAKE3 digests
+// (source bytes; canonical policy encoding), persists the bytes
+// content-addressed on the building node, and stamps only the descriptor onto
+// the manifest. The digest the wire protocol routes on
+// (`hive_browser_proto::encode_invoke`'s code digest,
+// `BrowserFunctionRuntime.pin`'s return value) is the POLICY digest: it binds
+// the exact source digest to the exact bounded policy, so a browser pinning
+// the artifact re-derives — and thereby verifies — the same 64-hex value the
+// deployment state carries.
+//
+// The canonical policy encoding below is byte-for-byte the one
+// `crates/hive-browser/www/function-runtime.js`'s `policyDigest` implements.
+// Any change to either side without the other silently breaks every artifact
+// verification — they are ONE contract with two implementations.
+
+/// Domain separator of the canonical policy encoding — identical to
+/// function-runtime.js's `policyDigest`.
+pub const BROWSER_POLICY_DIGEST_DOMAIN: &[u8] = b"hive-browser-policy-v1\0";
+
+/// Ceiling on a single browser entry file's UTF-8 source. The artifact is one
+/// self-contained source string executed inside a donor's browser tab; an
+/// unbounded bundle would turn the (per-tab) QuickJS memory limit and the
+/// delivery path into a denial-of-service vector. 256 KiB is generous for an
+/// edge handler — larger apps belong on the container/microVM path.
+pub const BROWSER_ENTRY_MAX_SOURCE_BYTES: usize = 256 * 1024;
+
+/// Platform defaults — identical to `normalizePolicy`'s fallbacks in
+/// function-runtime.js, so an unset fluid.json limit resolves to the value
+/// the browser would have assumed anyway.
+pub const BROWSER_TIMEOUT_MS_DEFAULT: u64 = 1_000;
+pub const BROWSER_MEMORY_BYTES_DEFAULT: u64 = 32 * 1024 * 1024;
+pub const BROWSER_STACK_BYTES_DEFAULT: u64 = 512 * 1024;
+
+/// Ceilings a tenant's own fluid.json can never exceed (the
+/// `ContainerLimits::for_container` clamp precedent: a tenant request must
+/// never remove the ceiling entirely). The timeout ceiling matches the
+/// gateway's default browser circuit (`HIVE_BROWSER_CIRCUIT_MS`, 30 s) — a
+/// longer invocation would be cut by the circuit anyway.
+pub const BROWSER_TIMEOUT_MS_MAX: u64 = 30_000;
+pub const BROWSER_MEMORY_BYTES_MAX: u64 = 256 * 1024 * 1024;
+pub const BROWSER_STACK_BYTES_MAX: u64 = 8 * 1024 * 1024;
+/// Bound on the policy's op allowlist — keeps the canonical policy encoding
+/// (and thus every descriptor riding the replicated state) small.
+pub const BROWSER_ALLOWED_OPS_MAX: usize = 16;
+
+/// Execution substrate for a browser artifact. Wire strings match
+/// function-runtime.js's `mode` exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserExecMode {
+    /// quickjs-emscripten inside the sandboxed frame: deterministic metering
+    /// (memory/stack/interrupt quotas) — the default and the only mode with
+    /// engine-enforced limits.
+    #[default]
+    Quickjs,
+    /// Same-frame Worker running the artifact directly: full-JIT throughput,
+    /// no engine quotas (wall-clock timeout only).
+    Native,
+}
+
+impl BrowserExecMode {
+    /// The mode byte of the canonical policy encoding (function-runtime.js:
+    /// `policy.mode === "native" ? 0 : 1`).
+    fn policy_byte(self) -> u8 {
+        match self {
+            BrowserExecMode::Native => 0,
+            BrowserExecMode::Quickjs => 1,
+        }
+    }
+}
+
+/// The browser-execution opt-in entry from fluid.json `functions[].browser`.
+/// Its PRESENCE is the opt-in; every field has a platform default.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct BrowserPolicy {
+    /// Entry file, relative to the deployment root — a single self-contained
+    /// `.js`/`.mjs`/`.cjs` file assigning its handler to `module.exports`
+    /// (or `exports.handler`). Required: the function's `start_cmd` entry is
+    /// the long-running SERVER, a different contract from the request→response
+    /// browser handler, so it is never silently reused. TypeScript entries are
+    /// rejected loudly (no deterministic toolchain-free transpile exists) —
+    /// ship the compiled JS.
+    pub entry: String,
+    #[serde(default)]
+    pub mode: BrowserExecMode,
+    /// Per-invocation wall-clock budget, ms. 0 = platform default, clamped to
+    /// the platform ceiling.
+    #[serde(default)]
+    pub timeout_ms: u64,
+    /// QuickJS `setMemoryLimit`. 0 = default, clamped to ceiling.
+    #[serde(default)]
+    pub memory_bytes: u64,
+    /// QuickJS `setMaxStackSize`. 0 = default, clamped to ceiling.
+    #[serde(default)]
+    pub stack_bytes: u64,
+    /// Host-op ids the artifact may call (`ops.call(id, payload)`), each
+    /// resolvable in [`browser_host_op_abi`]. Ids are deduplicated and sorted
+    /// at resolution so the canonical policy encoding is order-insensitive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_ops: Vec<u64>,
+}
+
+/// A [`BrowserPolicy`] after validation: every limit concrete, op ids sorted
+/// + deduplicated, every id resolvable to a host-op ABI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedBrowserPolicy {
+    pub mode: BrowserExecMode,
+    pub timeout_ms: u64,
+    pub memory_bytes: u64,
+    pub stack_bytes: u64,
+    pub allowed_ops: Vec<u64>,
+    /// Human-readable notes for the build log — limits the tenant set that
+    /// the platform ceiling clamped.
+    pub notes: Vec<String>,
+}
+
+impl BrowserPolicy {
+    /// Validate + resolve to concrete limits. Unknown host-op ids are a hard
+    /// error (loud build rejection); over-ceiling limits clamp with a note,
+    /// matching the container-limits convention.
+    pub fn resolve(&self) -> Result<ResolvedBrowserPolicy, String> {
+        let mut notes = Vec::new();
+        let clamp = |value: u64, default: u64, max: u64, name: &str, notes: &mut Vec<String>| {
+            let resolved = if value == 0 { default } else { value };
+            if resolved > max {
+                notes.push(format!(
+                    "{name} {resolved} exceeds the platform ceiling {max} — clamped"
+                ));
+                max
+            } else {
+                resolved
+            }
+        };
+        let timeout_ms = clamp(
+            self.timeout_ms,
+            BROWSER_TIMEOUT_MS_DEFAULT,
+            BROWSER_TIMEOUT_MS_MAX,
+            "timeout_ms",
+            &mut notes,
+        );
+        let memory_bytes = clamp(
+            self.memory_bytes,
+            BROWSER_MEMORY_BYTES_DEFAULT,
+            BROWSER_MEMORY_BYTES_MAX,
+            "memory_bytes",
+            &mut notes,
+        );
+        let stack_bytes = clamp(
+            self.stack_bytes,
+            BROWSER_STACK_BYTES_DEFAULT,
+            BROWSER_STACK_BYTES_MAX,
+            "stack_bytes",
+            &mut notes,
+        );
+        let mut allowed_ops = self.allowed_ops.clone();
+        allowed_ops.sort_unstable();
+        allowed_ops.dedup();
+        if allowed_ops.len() > BROWSER_ALLOWED_OPS_MAX {
+            return Err(format!(
+                "allowed_ops lists {} host ops, over the {BROWSER_ALLOWED_OPS_MAX}-op bound",
+                allowed_ops.len()
+            ));
+        }
+        for op in &allowed_ops {
+            if browser_host_op_abi(*op).is_none() {
+                return Err(format!(
+                    "allowed_ops references unknown host op {op} — the platform browser-op registry \
+                     (fluid_core::browser_host_op_abi) has no entry for it"
+                ));
+            }
+        }
+        Ok(ResolvedBrowserPolicy {
+            mode: self.mode,
+            timeout_ms,
+            memory_bytes,
+            stack_bytes,
+            allowed_ops,
+            notes,
+        })
+    }
+}
+
+/// Descriptor of one build-emitted browser artifact. This is ALL the
+/// replicated deployment state ever carries about an artifact — the source
+/// bytes stay in the building node's content-addressed store.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserArtifact {
+    /// BLAKE3 (lowercase hex) of the exact emitted source string — what
+    /// `BrowserFunctionRuntime.pin` re-computes from the delivered bytes and
+    /// refuses to pin on mismatch.
+    pub source_digest: String,
+    /// BLAKE3 of the canonical policy encoding — binds `source_digest` to
+    /// this exact policy. THE wire digest: `encode_invoke`'s code digest,
+    /// `pin`'s return value, the admission's `digest`.
+    pub policy_digest: String,
+    /// Byte length of the emitted source (UTF-8).
+    pub source_bytes: u64,
+    pub mode: BrowserExecMode,
+    pub timeout_ms: u64,
+    pub memory_bytes: u64,
+    pub stack_bytes: u64,
+    /// Sorted + deduplicated (canonical form).
+    pub allowed_ops: Vec<u64>,
+}
+
+/// One browser-eligible function of a deployment, carried by
+/// [`DeploymentInfo::browser_functions`] so a peer (the admission-validating
+/// control-plane leader in particular) can tie an admission's digest to a
+/// real build artifact without holding the deployment's full manifest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserFunctionRef {
+    pub name: String,
+    #[serde(flatten)]
+    pub artifact: BrowserArtifact,
+}
+
+/// The platform browser host-op registry: op id → canonical ABI string. This
+/// is the ONLY source of truth for which host operations a built artifact may
+/// request — the browser side registers handlers under these exact ABI
+/// strings (`crates/hive-browser/www/index.html`'s harness ops 1/2,
+/// `node-compat.js`'s op 16), and the canonical policy digest commits to the
+/// ABI text, so an id missing here is an unresolvable — and therefore loudly
+/// rejected — policy.
+pub fn browser_host_op_abi(op: u64) -> Option<&'static str> {
+    match op {
+        1 => Some("hive-browser/identity-json-v1"),
+        2 => Some("hive-browser/utf8-array-buffer-v1"),
+        16 => Some("hive.node-compat.fs-read/v1"),
+        _ => None,
+    }
+}
+
+/// BLAKE3 (lowercase hex) of an emitted artifact source string — identical to
+/// function-runtime.js's `sourceDigest(hash, source)`.
+pub fn browser_source_digest(source: &str) -> String {
+    blake3::hash(source.as_bytes()).to_hex().to_string()
+}
+
+/// BLAKE3 (lowercase hex) of the canonical policy encoding — byte-for-byte
+/// function-runtime.js's `policyDigest`:
+/// `"hive-browser-policy-v1\0" || source_digest(32 raw bytes) || u32le op_count
+/// || per op (ascending id): u64le id || u8 effect(0=read) || u32le abi_len || abi
+/// || u8 mode (0=native, 1=quickjs) || u64le timeout_ms || u64le memory_bytes
+/// || u64le stack_bytes`.
+///
+/// `allowed_ops` must already be in canonical (sorted, deduplicated) form and
+/// every id must resolve in [`browser_host_op_abi`] — callers get both by
+/// going through [`BrowserPolicy::resolve`].
+pub fn browser_policy_digest(
+    source_digest: &str,
+    mode: BrowserExecMode,
+    timeout_ms: u64,
+    memory_bytes: u64,
+    stack_bytes: u64,
+    allowed_ops: &[u64],
+) -> Result<String, String> {
+    if source_digest.len() != 64
+        || !source_digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(format!(
+            "source digest must be 64 lowercase hexadecimal characters, got {source_digest:?}"
+        ));
+    }
+    let mut raw = [0u8; 32];
+    for (i, byte) in raw.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&source_digest[i * 2..i * 2 + 2], 16)
+            .map_err(|e| format!("source digest is not valid hex: {e}"))?;
+    }
+    let mut abis = Vec::with_capacity(allowed_ops.len());
+    for op in allowed_ops {
+        let abi = browser_host_op_abi(*op)
+            .ok_or_else(|| format!("allowed_ops references unknown host op {op}"))?;
+        abis.push((*op, abi));
+    }
+    let mut bytes = Vec::with_capacity(
+        BROWSER_POLICY_DIGEST_DOMAIN.len()
+            + 32
+            + 4
+            + abis.iter().map(|(_, abi)| 8 + 1 + 4 + abi.len()).sum::<usize>()
+            + 1
+            + 8 * 3,
+    );
+    bytes.extend_from_slice(BROWSER_POLICY_DIGEST_DOMAIN);
+    bytes.extend_from_slice(&raw);
+    bytes.extend_from_slice(&(abis.len() as u32).to_le_bytes());
+    for (op, abi) in &abis {
+        bytes.extend_from_slice(&op.to_le_bytes());
+        // effect: 0 = read (the only effect the browser runtime accepts today;
+        // write ops are rejected by readOperation before any of this runs).
+        bytes.push(0);
+        bytes.extend_from_slice(&(abi.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(abi.as_bytes());
+    }
+    bytes.push(mode.policy_byte());
+    bytes.extend_from_slice(&timeout_ms.to_le_bytes());
+    bytes.extend_from_slice(&memory_bytes.to_le_bytes());
+    bytes.extend_from_slice(&stack_bytes.to_le_bytes());
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 // `Runtime` (the language/engine selector) lives in `hive_core` — the lower
@@ -1655,6 +1989,14 @@ pub struct DeploymentInfo {
     /// HTTP-only deployments and for peers running older binaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_ports: Vec<RawPortBinding>,
+    /// Browser-eligible functions with their build-stamped artifact descriptors
+    /// (digest metadata only, never bytes — see [`BrowserArtifact`]). Carried
+    /// here for the same reason as `raw_ports`: the control-plane leader
+    /// validates browser admissions against deployments it may not host, and
+    /// this gossip view is what it sees. Empty for every deployment with no
+    /// browser opt-in and for peers running older binaries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_functions: Vec<BrowserFunctionRef>,
 }
 fn default_ready() -> DeployState {
     DeployState::Ready

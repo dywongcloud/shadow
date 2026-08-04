@@ -2,6 +2,11 @@ target/
 .env
 .env.local
 
+# Browser crsqlite wasm build scratch (wa-sqlite checkout at a pinned commit,
+# sqlite amalgamation cache, node-flavored wire-proof build) -- recreated by
+# crates/hive-browser/www/sqlite/build-sqlite.sh, never committed.
+crates/hive-browser/www/sqlite/.build/
+
 # Ansible: real inventory/secrets are operator-local, never committed --
 # only the .example templates ship in the repo.
 ansible/inventory/hosts.ini

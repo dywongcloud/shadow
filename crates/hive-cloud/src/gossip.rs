@@ -163,6 +163,25 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
         "/v1/incidents/snapshot" if method == hive_p2p::GOSSIP_GET => {
             serde_json::to_vec(&cloud.incidents.snapshot()).unwrap_or_default()
         }
+        // Browser artifact BYTES (browser-function-artifact-delivery): the
+        // content-addressed GET proxies here when round-robin ingress landed
+        // it on a node that never ran the build. Prefix-disjoint with the
+        // admissions/presence arms below; the owner re-runs the tenant gate
+        // against ITS deployment state before serving (mesh_tenant carries the
+        // signed delegation token). Returns raw bytes; empty = not servable.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/artifacts/") => {
+            let digest = p
+                .trim_start_matches("/v1/browser/artifacts/")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            let tenant = mesh_tenant(p);
+            if tenant.is_empty() {
+                Vec::new()
+            } else {
+                crate::browser_artifacts::mesh_get(cloud, &tenant, digest).await
+            }
+        }
         // Accept-side browser admission recheck is identity-only and must
         // precede the tenant-scoped endpoint arm below.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/accept/") => {

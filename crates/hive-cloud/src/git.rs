@@ -1481,6 +1481,64 @@ async fn run_build(
         }
     }
 
+    // Browser-executable artifacts (browser-function-artifact-build-contract):
+    // every function that opted in via fluid.json `functions[].browser` is
+    // bundled into ONE deterministic QuickJS-compatible source, persisted
+    // content-addressed on THIS node, and stamped onto the manifest as a
+    // digest-only descriptor — the only thing the replicated deployment state
+    // ever carries. An opted-in function that is NOT browser-eligible
+    // (container/python/go runtime, TypeScript entry, Node/Bun/Deno API use,
+    // unresolved host ops) FAILS THE BUILD loudly here: dropping the opt-in
+    // silently would leave the function serving on the fleet path while
+    // donors believe they are serving it — the exact pretend-every-function-
+    // can-run-in-a-browser state this contract exists to remove. Deliberately
+    // NOT packed into the deliver_build ext4: the artifact executes in
+    // donors' browsers, not in the microVM, and carries no env/secrets.
+    let mut browser_bundles: Vec<(String, fluid_core::BrowserArtifact)> = Vec::new();
+    if !build_failed {
+        for f in manifest.functions.iter_mut() {
+            if f.browser.is_none() {
+                continue;
+            }
+            let bundled = match crate::browser_artifacts::bundle(&build_dir, f) {
+                Ok(bundled) => bundled,
+                Err(reason) => {
+                    let msg = format!(
+                        "Browser opt-in rejected — the deployment was NOT registered and the \
+                         function stays browser-ineligible: {reason}"
+                    );
+                    log(msg.clone());
+                    tracing::warn!(project = %project, function = %f.name, %reason, "browser artifact bundle rejected");
+                    return Err(anyhow::anyhow!(msg));
+                }
+            };
+            for note in &bundled.notes {
+                log(format!("Browser artifact ({}): {note}", f.name));
+            }
+            if let Err(e) = crate::browser_artifacts::persist(&bundled.source, &bundled.descriptor).await {
+                let msg = format!(
+                    "Browser artifact ({}): could not persist to the content-addressed store: {e}",
+                    f.name
+                );
+                log(msg.clone());
+                return Err(anyhow::anyhow!(msg));
+            }
+            log(format!(
+                "Browser artifact ({}): bundled {} bytes, source {}, policy {} (mode {:?}, {} ms, {} MiB, ops {:?}).",
+                f.name,
+                bundled.descriptor.source_bytes,
+                &bundled.descriptor.source_digest[..12],
+                &bundled.descriptor.policy_digest[..12],
+                bundled.descriptor.mode,
+                bundled.descriptor.timeout_ms,
+                bundled.descriptor.memory_bytes / (1024 * 1024),
+                bundled.descriptor.allowed_ops,
+            ));
+            browser_bundles.push((f.name.clone(), bundled.descriptor.clone()));
+            f.browser_artifact = Some(bundled.descriptor);
+        }
+    }
+
     // For an isolated backend (Firecracker), a serving microVM cannot see the
     // host build dir the mock backend serves from. Pack the build output into a
     // per-deployment artifact the cell mounts at /build, and point this
@@ -1542,6 +1600,18 @@ async fn run_build(
         },
         tenant,
     );
+
+    // Record deployment ownership of each browser artifact now that the
+    // deployment id exists (`deploy_full` mints it). The bytes are already
+    // persisted; ownership is bookkeeping — the GC keep-set derives from live
+    // deployment records, so a failed write here is a WARN, never fatal.
+    for (function, descriptor) in &browser_bundles {
+        if let Err(e) = crate::browser_artifacts::add_owner(&descriptor.policy_digest, &info.id.0).await {
+            log(format!(
+                "WARN: browser artifact ({function}) ownership was not recorded ({e}); the GC keep-set still protects it."
+            ));
+        }
+    }
 
     // Register `vercel.json` crons against the PRODUCTION deployment (Vercel only
     // runs crons in production). Replaces this project's prior config-sourced jobs

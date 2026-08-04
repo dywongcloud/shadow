@@ -308,6 +308,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/incidents/:id/updates", post(incident_update))
         // ---- Low-trust browser serving admissions ----
         .merge(crate::browser_admission::routes())
+        // ---- Browser function artifact bytes (content-addressed, owner-proxied) ----
+        .merge(crate::browser_artifacts::routes())
         // ---- Coarse browser presence (constellation satellites) ----
         .merge(crate::browser_presence::routes())
         // ---- Enterprise feature suite (IP blocking, SIEM, SAML, SCIM,

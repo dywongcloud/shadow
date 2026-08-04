@@ -27,6 +27,15 @@ vendoring). It introduces breaking clock-table/`ts`-column changes vs upstream
 v0.15.0 — anything speaking cr-sqlite's wire format (a browser wasm build
 included) must vendor this SAME commit/version, not a mix.
 
+## Local patches on top of the vendored commit
+
+- `core/rs/bundle/src/lib.rs`: added `#[cfg(target_family = "wasm")] use
+  core::alloc::Layout;` — the wasm-only `__rust_alloc_error_handler` shim
+  referenced `Layout` without importing it (E0412 on the
+  wasm32-unknown-emscripten build; invisible natively because the shim is
+  cfg'd out there). Required by `bn-impl-sqlite-automerge`'s browser wasm
+  build.
+
 ## Toolchain
 
 Building `core/rs/{bundle,bundle_static,core,fractindex-core}` still requires

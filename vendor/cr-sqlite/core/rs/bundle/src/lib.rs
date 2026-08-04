@@ -5,6 +5,12 @@
 extern crate alloc;
 
 use core::ffi::c_char;
+// `Layout` is referenced only by the wasm-only alloc-error-handler shim
+// below; without this import the wasm32 target fails with E0412 (cannot find
+// type `Layout` in this scope). Local patch on top of the vendored
+// superfly/cr-sqlite commit -- recorded in vendor/cr-sqlite/VENDOR.md.
+#[cfg(target_family = "wasm")]
+use core::alloc::Layout;
 use core::panic::PanicInfo;
 use crsql_core;
 use crsql_core::sqlite3_crsqlcore_init;

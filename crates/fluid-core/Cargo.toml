@@ -12,3 +12,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 regex = "1"
+# BLAKE3 is the platform's content-addressing hash (browser artifact digests).
+# Already in the workspace lock (hive-browser, guardian-db) at 1.8.x.
+blake3 = "1"

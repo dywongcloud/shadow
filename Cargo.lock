@@ -1818,6 +1818,7 @@ dependencies = [
 name = "fluid-core"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "hive-core",
  "regex",
  "serde",
@@ -2590,6 +2591,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

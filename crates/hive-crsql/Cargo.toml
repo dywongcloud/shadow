@@ -8,3 +8,9 @@ description = "rusqlite wrapper for the vendored superfly/cr-sqlite loadable ext
 [dependencies]
 rusqlite = { version = "0.32", features = ["load_extension", "bundled"] }
 anyhow = "1"
+
+# Examples only (live wire-proof witnesses, e.g. examples/wire_proof.rs) --
+# never linked into the library itself.
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

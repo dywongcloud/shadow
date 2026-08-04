@@ -884,13 +884,28 @@ async fn read_outbound_with_progress(
     recv: &mut RecvStream,
     mut payload: &mut [u8],
     stage: &'static str,
-) -> Result<(), String> {
+) -> Result<(), (u32, String)> {
     while !payload.is_empty() {
         match n0_future::time::timeout(OUTBOUND_IO_IDLE_TIMEOUT, recv.read(payload)).await {
             Ok(Ok(Some(read))) if read > 0 => payload = &mut payload[read..],
-            Ok(Ok(_)) => return Err(format!("{stage}: stream ended before frame completed")),
-            Ok(Err(error)) => return Err(format!("{stage}: {error}")),
-            Err(_) => return Err(format!("{stage}: idle deadline exceeded")),
+            Ok(Ok(_)) => {
+                return Err((
+                    proto_reset::MALFORMED_PAYLOAD,
+                    format!("{stage}: stream ended before frame completed"),
+                ))
+            }
+            Ok(Err(error)) => {
+                return Err((
+                    proto_reset::MALFORMED_PAYLOAD,
+                    format!("{stage}: {error}"),
+                ))
+            }
+            Err(_) => {
+                return Err((
+                    proto_reset::DEADLINE_EXCEEDED,
+                    format!("{stage}: idle deadline exceeded"),
+                ))
+            }
         }
     }
     Ok(())
@@ -905,7 +920,7 @@ async fn read_outbound_eof(recv: &mut RecvStream) -> Result<(), (u32, String)> {
             "reply frame contains trailing bytes".into(),
         )),
         Ok(Err(error)) => Err((
-            proto_reset::DEADLINE_EXCEEDED,
+            proto_reset::MALFORMED_PAYLOAD,
             format!("read reply eof: {error}"),
         )),
         Err(_) => Err((
@@ -1677,7 +1692,7 @@ impl BrowserNode {
             return Err(JsError::new(&format!("finish: {error}")));
         }
         let mut lenb = [0u8; 4];
-        if let Err(error) = read_outbound_with_progress(
+        if let Err((code, error)) = read_outbound_with_progress(
             io.recv
                 .as_mut()
                 .expect("outbound receive stream is present"),
@@ -1686,7 +1701,7 @@ impl BrowserNode {
         )
         .await
         {
-            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            io.cancel(code);
             return Err(JsError::new(&error));
         }
         let len = match check_len(lenb) {
@@ -1697,7 +1712,7 @@ impl BrowserNode {
             }
         };
         let mut reply = vec![0u8; len];
-        if let Err(error) = read_outbound_with_progress(
+        if let Err((code, error)) = read_outbound_with_progress(
             io.recv
                 .as_mut()
                 .expect("outbound receive stream is present"),
@@ -1706,7 +1721,7 @@ impl BrowserNode {
         )
         .await
         {
-            io.cancel(proto_reset::DEADLINE_EXCEEDED);
+            io.cancel(code);
             return Err(JsError::new(&error));
         }
         if let Err((code, error)) = read_outbound_eof(
@@ -2048,13 +2063,21 @@ fn spawn_accept_loop(
                         .await
                         {
                             Ok(Ok(())) => {}
-                            Ok(Err(())) => return,
+                            Ok(Err(())) => {
+                                // Peer stopped reading mid-reply: the send-side reset
+                                // is moot, but the stop still lands on the peer's send
+                                // half with a protocol code (mirrors the native
+                                // serve_browser_conn write-failure arm).
+                                reject_stream(&mut send, &mut recv, proto_reset::HANDLER_FAILED);
+                                return;
+                            }
                             Err(_) => {
                                 reject_stream(&mut send, &mut recv, proto_reset::DEADLINE_EXCEEDED);
                                 return;
                             }
                         }
                         if send.finish().is_err() {
+                            reject_stream(&mut send, &mut recv, proto_reset::HANDLER_FAILED);
                             return;
                         }
                         served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

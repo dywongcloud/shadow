@@ -1,12 +1,21 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { MapPin, RadioTower, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
 import { lifecycleLabel } from "@/lib/run-node-status";
 import { upsertPresence, clearPresence, type PresenceState } from "@/lib/run-node-client";
+import { usePoll, type Deployment } from "@/lib/api";
+import { resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
+import { TargetPicker, type TargetSelection } from "./target-picker";
 
 const GEO_CONSENT_KEY = "hive_run_node_geo_consent"; // "granted" | "denied"
+// browser-run-node-target-picker: the persisted selection is the STABLE
+// deployment+function pair only — never a digest. The digest is re-derived
+// from fresh descriptor metadata on every render/start/replay, so a redeploy
+// that rotates the policy digest under the same name keeps working and a
+// deleted/ineligible target fails visibly and clears instead of replaying.
+const TARGET_KEY = "hive_run_node_target";
 const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
 const PRESENCE_REFRESH_MS = 45_000; // well inside the backend's 90s presence TTL
 // Re-derive the fix well before the browser's own 10-minute cache
@@ -39,11 +48,102 @@ function presenceState(lifecycle: string): PresenceState | null {
 }
 
 export default function RunNodePage() {
-  const { status, supported, start, stop, setGeoConsent, dataSaverBlocked } = useRunNode();
-  const [deployment, setDeployment] = useState("");
-  const [fn, setFn] = useState("");
-  const [digest, setDigest] = useState("");
-  const [scope, setScope] = useState<"team" | "public">("team");
+  const { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError } = useRunNode();
+  // Eligible serve targets come from the same authenticated /deployments list
+  // the rest of the dashboard polls — served locally with leader/owner
+  // fallback server-side (admin_ingress + the /cloud proxy), so this page
+  // never needs a node-specific endpoint. Re-polled live so rotation,
+  // deletion, and team switches are revalidated against current metadata.
+  const { data: deployments, error: deploymentsError, loading: deploymentsLoading } =
+    usePoll<Deployment[]>("/deployments", 5000);
+  const targets = useMemo(() => targetsFromDeployments(deployments ?? []), [deployments]);
+  const excludedCount = useMemo(
+    () => (deployments ?? []).filter((d) => d.state !== "ready" || (d.browser_functions ?? []).length === 0).length,
+    [deployments],
+  );
+  // Persisted selection restored lazily (localStorage is unavailable during
+  // SSR — same pattern as geoDecision below). Scope rides along so a restored
+  // selection also restores the visibility it was last used with.
+  const [selection, setSelection] = useState<(TargetSelection & { scope?: "team" | "public" }) | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const raw = localStorage.getItem(TARGET_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.deployment !== "string" || typeof parsed.fn !== "string") return null;
+      return parsed;
+    } catch {
+      return null;
+    }
+  });
+  const [scope, setScope] = useState<"team" | "public">(() => {
+    if (typeof window === "undefined") return "team";
+    try {
+      const raw = localStorage.getItem(TARGET_KEY);
+      const parsed = raw ? JSON.parse(raw) : null;
+      return parsed && (parsed.scope === "public" || parsed.scope === "team") ? parsed.scope : "team";
+    } catch {
+      return "team";
+    }
+  });
+  // The digest handed to Start is resolved from the CURRENT snapshot on every
+  // render — never from the persisted selection — so a target rotated between
+  // page load and click starts the current artifact, not a stale digest.
+  const resolved = selection && deployments ? resolveTarget(deployments, selection.deployment, selection.fn) : null;
+  const selectedTarget = resolved && resolved.ok ? resolved.target : null;
+  // Revalidation failure, derived per render: while the list is still loading
+  // (including the team-switch window, where usePoll drops data to null)
+  // nothing is judged; the moment real data lands, a selection that no longer
+  // resolves produces its reason immediately — no effect round trip.
+  const revalidationFailure = selection && resolved && !resolved.ok ? resolved.reason : null;
+  // …and its STICKY counterpart: the clear below un-sets the selection, which
+  // makes the derived reason vanish on the very next render — a one-frame
+  // flash, not "fails visibly". So the reason is copied into state at the
+  // moment of failure and survives the clear until the user picks a new
+  // target (choose) or starts one (which clears replayError the same way).
+  const [clearedError, setClearedError] = useState<string | null>(null);
+  const selectionError = revalidationFailure ?? clearedError;
+
+  // A failed revalidation must also CLEAR (state + localStorage) so the dead
+  // selection can never replay forever — "fail visibly and clear". This is a
+  // genuine sync from an external system (the polled deployments list) into
+  // state, so per react-hooks/set-state-in-effect's own rationale the fix is
+  // deferral (one microtask turn, invisible), not removal — same precedent as
+  // the SharedWorker-constructor failure path in use-run-node.ts.
+  useEffect(() => {
+    if (!revalidationFailure) return;
+    queueMicrotask(() => {
+      try {
+        localStorage.removeItem(TARGET_KEY);
+      } catch {
+        /* ignore */
+      }
+      setClearedError(revalidationFailure);
+      setSelection(null);
+    });
+  }, [revalidationFailure]);
+
+  function choose(sel: TargetSelection) {
+    setSelection(sel);
+    setClearedError(null);
+    try {
+      localStorage.setItem(TARGET_KEY, JSON.stringify({ ...sel, scope }));
+    } catch {
+      /* storage unavailable — the selection just won't survive a reload */
+    }
+  }
+
+  function chooseScope(next: "team" | "public") {
+    setScope(next);
+    if (selection) {
+      try {
+        localStorage.setItem(TARGET_KEY, JSON.stringify({ ...selection, scope: next }));
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
   // Restored via a lazy initializer (runs once, during this component's own
   // first render) rather than an effect — localStorage is unavailable during
   // SSR, so the guard falls back to "undecided" there and the real value
@@ -201,8 +301,7 @@ export default function RunNodePage() {
     }
   }
 
-  const canStart =
-    deployment.trim() && fn.trim() && digest.trim() && status.lifecycle === "stopped" && !dataSaverBlocked;
+  const canStart = selectedTarget !== null && status.lifecycle === "stopped" && !dataSaverBlocked;
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -244,38 +343,31 @@ export default function RunNodePage() {
 
       <section className="mb-5 rounded-lg border border-border bg-card p-4">
         <h2 className="mb-3 text-sm font-medium text-fg">What to serve</h2>
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field label="Deployment ID">
-            <input
-              value={deployment}
-              onChange={(e) => setDeployment(e.target.value)}
-              disabled={status.lifecycle !== "stopped"}
-              placeholder="dpl-abc123"
-              className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
-            />
-          </Field>
-          <Field label="Function name">
-            <input
-              value={fn}
-              onChange={(e) => setFn(e.target.value)}
-              disabled={status.lifecycle !== "stopped"}
-              placeholder="web"
-              className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
-            />
-          </Field>
-          <Field label="Function digest (BLAKE3 hex)">
-            <input
-              value={digest}
-              onChange={(e) => setDigest(e.target.value)}
-              disabled={status.lifecycle !== "stopped"}
-              placeholder="from the deployment's function manifest"
-              className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm font-mono text-xs disabled:opacity-60"
-            />
-          </Field>
+        {(selectionError || replayError) && (
+          <div
+            role="alert"
+            className="mb-3 flex items-start gap-2 rounded-md bg-red-500/10 p-2 text-xs text-red-500"
+          >
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              {selectionError ?? replayError} Pick another target below.
+            </span>
+          </div>
+        )}
+        <TargetPicker
+          targets={targets}
+          excludedCount={excludedCount}
+          loading={deploymentsLoading && !deployments}
+          fetchError={deploymentsError}
+          selected={selection}
+          onSelect={choose}
+          disabled={status.lifecycle !== "stopped"}
+        />
+        <div className="mt-3">
           <Field label="Visibility">
             <select
               value={scope}
-              onChange={(e) => setScope(e.target.value as "team" | "public")}
+              onChange={(e) => chooseScope(e.target.value as "team" | "public")}
               disabled={status.lifecycle !== "stopped"}
               className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
             >
@@ -429,7 +521,16 @@ export default function RunNodePage() {
         <div className="mt-4 flex gap-2">
           {status.lifecycle === "stopped" ? (
             <button
-              onClick={() => start({ deployment, fn, digest, scope })}
+              onClick={() => {
+                if (selectedTarget) {
+                  start({
+                    deployment: selectedTarget.deployment,
+                    fn: selectedTarget.fn,
+                    digest: selectedTarget.policyDigest,
+                    scope,
+                  });
+                }
+              }}
               disabled={!canStart || !supported}
               className="min-h-11 flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
             >

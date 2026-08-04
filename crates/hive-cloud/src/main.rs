@@ -12,6 +12,7 @@ mod audit;
 mod auth;
 mod billing;
 mod browser_admission;
+mod browser_artifacts;
 mod browser_presence;
 mod cluster;
 mod compose;
@@ -1206,6 +1207,11 @@ async fn main() -> anyhow::Result<()> {
     // request pays for it — and covers locks leaked by anything outside that
     // path (a crashed node, a manual podman run).
     spawn_container_lock_sweep();
+
+    // Reap browser-function artifacts no live deployment references anymore.
+    // Every node (the store is per-host), guarded against empty/mostly-orphaned
+    // keep-sets — see browser_artifacts::gc.
+    browser_artifacts::spawn_gc_loop(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone()).layer(

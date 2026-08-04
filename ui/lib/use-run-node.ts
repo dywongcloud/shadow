@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { currentTeam } from "./api";
+import { resolveTargetFresh } from "./run-node-targets";
 import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
 
 const WORKER_URL = "/run-node-worker.js";
@@ -34,12 +35,18 @@ const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || DEFAULT_RELAYS;
 // needs it. `relay`/`team` are deliberately NOT persisted here — they're
 // re-derived fresh (RELAY from env, team via currentTeam()) at replay time
 // rather than trusting a stale snapshot.
+// browser-run-node-target-picker: the DIGEST is no longer persisted either —
+// only the stable deployment+function selection. The digest is re-derived
+// from fresh deployment descriptor metadata at replay time (see
+// replayLastStart), so a target rotation (redeploy → new policy_digest under
+// the same name) replays the CURRENT artifact, and a stale/deleted/ineligible
+// selection fails visibly and clears instead of replaying forever.
 const LAST_START_KEY = "hive_run_node_last_start";
 function persistLastStart(args: StartArgs) {
   try {
     localStorage.setItem(
       LAST_START_KEY,
-      JSON.stringify({ deployment: args.deployment, fn: args.fn, digest: args.digest, scope: args.scope ?? "team" }),
+      JSON.stringify({ deployment: args.deployment, fn: args.fn, scope: args.scope ?? "team" }),
     );
   } catch {
     /* storage unavailable/full — replay-on-handoff just won't happen */
@@ -50,7 +57,7 @@ function readLastStart(): StartArgs | null {
     const raw = localStorage.getItem(LAST_START_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed.deployment !== "string") return null;
+    if (!parsed || typeof parsed.deployment !== "string" || typeof parsed.fn !== "string") return null;
     return parsed as StartArgs;
   } catch {
     return null;
@@ -67,6 +74,8 @@ function clearLastStart() {
 export interface StartArgs {
   deployment: string;
   fn: string;
+  /** The descriptor's policy digest, resolved from fresh deployment metadata
+   *  by the picker (or the handoff replay) — never a donor-typed value. */
   digest: string;
   scope?: "team" | "public";
 }
@@ -162,6 +171,45 @@ export function useRunNode() {
   // harmless, no-op-on-a-fresh-mount reconnect attempt.
   const lastHeartbeatRef = useRef<number>(0);
   const reconnectRef = useRef<() => void>(() => {});
+  // Owner-handoff replay failure (browser-run-node-target-picker): when a
+  // persisted selection no longer resolves against fresh deployment metadata
+  // (deleted deployment, no-longer-ready, function no longer browser-eligible)
+  // the replay is dropped, the persisted start is cleared, and the reason is
+  // surfaced here for the page to render — "fail visibly and clear", never a
+  // silent skip that would replay forever on the next handoff.
+  const [replayError, setReplayError] = useState<string | null>(null);
+
+  // Owner-handoff replay, revalidated: a persisted selection is never replayed
+  // verbatim — the digest is re-derived from FRESH descriptor metadata, so a
+  // rotated target (redeploy → new policy_digest under the same
+  // deployment+function) picks up the CURRENT artifact instead of a stale one.
+  // A fetch failure is transient: the persisted start is left alone for the
+  // next handoff/reload to retry, and nothing is cleared or reported.
+  const replayLastStart = useCallback((post: (msg: object) => void) => {
+    const last = readLastStart();
+    if (!last) return;
+    resolveTargetFresh(last.deployment, last.fn)
+      .then((res) => {
+        if (!res.ok) {
+          clearLastStart();
+          setReplayError(res.reason);
+          return;
+        }
+        setReplayError(null);
+        post({
+          type: "start",
+          relay: RELAY,
+          deployment: res.target.deployment,
+          fn: res.target.fn,
+          digest: res.target.policyDigest,
+          scope: last.scope ?? "team",
+          team: currentTeam(),
+        });
+      })
+      .catch(() => {
+        /* transient fetch failure — leave the persisted start for the next handoff */
+      });
+  }, []);
 
   const applyIncomingStatus = useCallback((raw: RunNodeStatus & { abiVersion?: number }) => {
     lastHeartbeatRef.current = Date.now();
@@ -213,18 +261,7 @@ export function useRunNode() {
         // return;`) makes a replay against an ALREADY-running node a no-op,
         // so every ordinary tab connecting to an already-live SharedWorker
         // (the common case) costs one ignored message, never a duplicate boot.
-        const last = readLastStart();
-        if (last) {
-          p.postMessage({
-            type: "start",
-            relay: RELAY,
-            deployment: last.deployment,
-            fn: last.fn,
-            digest: last.digest,
-            scope: last.scope ?? "team",
-            team: currentTeam(),
-          });
-        }
+        replayLastStart((msg) => p.postMessage(msg));
       };
 
       const connect = (): boolean => {
@@ -391,19 +428,10 @@ export function useRunNode() {
         // no-op on a normal first-ever start (nothing persisted yet), and
         // the SAME replay a genuine crash-recovery restart needs — a worker
         // that died mid-session should come back serving the same thing.
+        // The replay is revalidated against fresh deployment metadata
+        // (browser-run-node-target-picker) — see replayLastStart.
         if (replay) {
-          const last = readLastStart();
-          if (last) {
-            worker.postMessage({
-              type: "start",
-              relay: RELAY,
-              deployment: last.deployment,
-              fn: last.fn,
-              digest: last.digest,
-              scope: last.scope ?? "team",
-              team: currentTeam(),
-            });
-          }
+          replayLastStart((msg) => worker.postMessage(msg));
         }
       };
 
@@ -551,6 +579,7 @@ export function useRunNode() {
       return;
     }
     persistLastStart(args);
+    setReplayError(null); // an explicit manual start supersedes any stale handoff-replay failure
     sendRef.current({
       type: "start",
       relay: RELAY,
@@ -590,5 +619,5 @@ export function useRunNode() {
     sendRef.current({ type: "geoConsent", value });
   }, []);
 
-  return { status, supported, start, stop, setGeoConsent, dataSaverBlocked };
+  return { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError };
 }

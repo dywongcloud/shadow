@@ -818,6 +818,34 @@ export interface Deployment {
    *  of the shared 80/443 gateway. See `ui/lib/deploy-url.ts`'s
    *  `rawPortAddress` for the ready-to-copy `host:port` connection string. */
   raw_ports?: RawPortBinding[];
+  /** Browser-eligible functions with build-stamped artifact descriptors
+   *  (`DeploymentInfo.browser_functions` — gossiped, so the merged
+   *  /deployments list carries it for deployments hosted on other nodes too).
+   *  Absent/empty for every deployment with no browser opt-in. */
+  browser_functions?: BrowserFunctionRef[];
+}
+
+/** One browser-eligible function of a deployment, with its build-stamped
+ *  artifact descriptor. Mirrors `fluid_core::BrowserFunctionRef` — the
+ *  artifact fields are serde-flattened into the same object. Descriptor
+ *  metadata only; the artifact source bytes never leave the fleet. */
+export interface BrowserFunctionRef {
+  name: string;
+  /** BLAKE3 hex of the emitted artifact source — never shown in the UI. */
+  source_digest: string;
+  /** BLAKE3 of the canonical policy encoding. THE wire digest the browser
+   *  node's admission ties itself to — supplied to the worker from this
+   *  descriptor, never typed by the donor. */
+  policy_digest: string;
+  /** Byte length of the emitted artifact source (UTF-8). */
+  source_bytes: number;
+  /** "quickjs" | "native" (fluid_core::BrowserExecMode, snake_case). */
+  mode: string;
+  timeout_ms: number;
+  memory_bytes: number;
+  stack_bytes: number;
+  /** Sorted + deduplicated host-op ids (fluid_core::browser_host_op_abi). */
+  allowed_ops: number[];
 }
 
 export interface RawPortBinding {
