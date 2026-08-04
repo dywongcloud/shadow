@@ -11,6 +11,8 @@
 // `presence` control message; this worker never decides consent policy.
 
 import { loadOrCreateSeed } from "./browser-node/identity.js";
+import { WorkerFunctionRuntime } from "./browser-node/worker-function-runtime.js";
+import { DIGEST_RE } from "./browser-node/artifact-policy.js";
 
 const PROTOCOL_VERSION = 0; // must match hive_browser_proto::BROWSER_PROTOCOL_VERSION
 const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease window
@@ -63,6 +65,18 @@ let renewTimer = null;
 let closing = false;
 let session = null; // { deployment, fn, digest, scope, team, relay }
 
+// browser-worker-quickjs-runtime: the worker-native QuickJS function lane.
+// fnRuntime owns verified/pinned artifacts, per-artifact queues and the
+// global caps; fnGrants mirrors exactly what has been granted on `node` via
+// grantInvoker (policyDigest -> Set<callerEndpointId>) so every renewal can
+// reconcile by set difference — revoking stale callers/digests BEFORE
+// granting their replacements. Both are torn down together with `node`:
+// stop(), a terminal admission failure, or an endpoint rotation; a worker
+// crash needs no local teardown (the wasm grant map dies with the worker —
+// the server-side lease expiry removes the route).
+let fnRuntime = null;
+let fnGrants = new Map();
+
 // Epoch fencing (bn-p2p-reconnect-state, bn-p2p-resurrection-after-stop):
 // start()'s async boot (wasm init + BrowserNode.boot, seconds on a cold
 // fetch), the scheduled renewal tick, and the network-restore admit all
@@ -113,6 +127,10 @@ let status = {
   // own identity/protocol) is stale — see isSessionStaleError. Self-clears on
   // the next successful renewal; never blocks retry (see that function's doc).
   sessionStale: false,
+  // browser-worker-quickjs-runtime introspection (additive): the pinned
+  // artifact digests, live invoker-grant count and served-invoke total of the
+  // worker's QuickJS lane. null while no function runtime is running.
+  functions: null,
 };
 
 // bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
@@ -250,7 +268,9 @@ async function admitOnce(addrJson, endpointId) {
   // around it (see verify_proof_of_possession's HIVE_BROWSER_POP_WINDOW_MS).
   const challengeMs = Date.now();
   const signature = node.signAdmission(String(challengeMs));
-  await callApi("POST", "/v1/browser/admissions", team, {
+  // The response carries the server-derived capability block (artifact
+  // descriptor + trusted caller set); the caller reconciles from it.
+  return await callApi("POST", "/v1/browser/admissions", team, {
     endpoint_id: endpointId,
     addr_json: addrJson,
     deployment,
@@ -261,6 +281,225 @@ async function admitOnce(addrJson, endpointId) {
     challenge_ms: challengeMs,
     signature,
   });
+}
+
+// ---------------------------------------------------------------------------
+// browser-worker-quickjs-runtime: capability reconciliation + artifact pin.
+//
+// The admission response's capability block is the ONLY source of what this
+// worker may serve: artifact_url/policy_digest/source_digest/source_bytes/
+// mode/limits/allowed_ops describe the artifact; trusted_callers is the exact
+// fleet EndpointId set to grant. The worker never accepts a digest, a byte,
+// or a caller id from anywhere else.
+// ---------------------------------------------------------------------------
+
+const ARTIFACT_FETCH_DEADLINE_MS = 15_000;
+const ARTIFACT_CACHE_NAME = "hive-browser-artifacts-v1";
+
+function artifactRequestUrl(policyDigest) {
+  return `/cloud/v1/browser/artifacts/${policyDigest}`;
+}
+
+// Validate the capability block's shape into a local descriptor. Everything
+// not matching is a hard error — a malformed capability pins nothing.
+function normalizeCapability(capability) {
+  if (!capability || typeof capability !== "object") {
+    throw new Error("admission response is missing its capability block");
+  }
+  const descriptor = {
+    policyDigest: capability.policy_digest,
+    sourceDigest: capability.source_digest,
+    sourceBytes: capability.source_bytes,
+    mode: capability.mode,
+    timeoutMs: capability.timeout_ms,
+    memoryBytes: capability.memory_bytes,
+    stackBytes: capability.stack_bytes,
+    allowedOps: capability.allowed_ops,
+  };
+  if (!DIGEST_RE.test(descriptor.policyDigest || "") || !DIGEST_RE.test(descriptor.sourceDigest || "")) {
+    throw new Error("capability carries a malformed digest");
+  }
+  if (descriptor.mode !== "quickjs") {
+    throw new Error(`capability mode ${JSON.stringify(descriptor.mode)} is unsupported — the worker lane serves quickjs artifacts only`);
+  }
+  if (!Number.isSafeInteger(descriptor.sourceBytes) || descriptor.sourceBytes <= 0) {
+    throw new Error("capability source_bytes must be a positive integer");
+  }
+  if (!Array.isArray(descriptor.allowedOps)) throw new Error("capability allowed_ops must be an array");
+  // artifact_url is server-derived but still checked against the ONLY shape
+  // the delivery contract defines before it is ever fetched.
+  const expectedUrl = `/v1/browser/artifacts/${descriptor.policyDigest}`;
+  if (capability.artifact_url !== expectedUrl) {
+    throw new Error("capability artifact_url does not match its policy digest");
+  }
+  // trusted_callers is server-derived (healthy fleet EndpointIds); filter to
+  // the exact 64-hex shape anyway — grantInvoker accepts nothing else, and a
+  // malformed entry must never reach the grant map.
+  const trustedCallers = Array.isArray(capability.trusted_callers) ? capability.trusted_callers : [];
+  const callers = [...new Set(trustedCallers.filter(id => typeof id === "string" && DIGEST_RE.test(id)))];
+  return { descriptor, callers };
+}
+
+// Fetch the artifact body with a bounded deadline through the same
+// authenticated /cloud proxy path as callApi. Returns raw bytes — verified by
+// pin() before anything executes or persists.
+async function fetchArtifactBytes(descriptor, team) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ARTIFACT_FETCH_DEADLINE_MS);
+  try {
+    const r = await fetch(artifactRequestUrl(descriptor.policyDigest), {
+      credentials: "same-origin",
+      headers: { "x-hive-team": team },
+      signal: controller.signal,
+    });
+    if (!r.ok) throw new Error(`artifact fetch failed: ${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Cache Storage holds ONLY verified bytes: entries are written solely after a
+// successful pin (which recomputes both digests), and a cache read is never
+// trusted — the bytes go through the same pin() verification as network
+// bytes. A cache that fails verification is deleted and refetched.
+async function readCachedArtifact(descriptor) {
+  if (typeof caches === "undefined") return null;
+  try {
+    const cache = await caches.open(ARTIFACT_CACHE_NAME);
+    const hit = await cache.match(artifactRequestUrl(descriptor.policyDigest));
+    if (!hit) return null;
+    return new Uint8Array(await hit.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+async function persistVerifiedArtifact(descriptor, bytes) {
+  if (typeof caches === "undefined") return;
+  try {
+    const cache = await caches.open(ARTIFACT_CACHE_NAME);
+    await cache.put(
+      artifactRequestUrl(descriptor.policyDigest),
+      new Response(bytes, { headers: { "content-length": String(bytes.length) } }),
+    );
+  } catch {
+    /* quota or storage failure — the next renewal simply refetches */
+  }
+}
+
+async function dropCachedArtifact(policyDigest) {
+  if (typeof caches === "undefined") return;
+  try {
+    const cache = await caches.open(ARTIFACT_CACHE_NAME);
+    await cache.delete(artifactRequestUrl(policyDigest));
+  } catch {
+    /* best effort */
+  }
+}
+
+// One atomic reconcile per admission/renewal response. Verification fully
+// precedes mutation: the artifact is fetched + pinned (both digests
+// recomputed locally) BEFORE any grant changes, then stale callers/digests
+// are revoked BEFORE their replacements are granted — a failed reconcile
+// leaves the previous pin + grants exactly as they were.
+async function reconcileCapability(capability, myEpoch) {
+  const runtime = fnRuntime;
+  const owner = node;
+  if (!runtime || runtime.closed || !owner) throw new Error("function runtime is not running");
+  const team = session && session.team;
+  const { descriptor, callers } = normalizeCapability(capability);
+
+  if (!runtime.has(descriptor.policyDigest)) {
+    let bytes = await readCachedArtifact(descriptor);
+    if (bytes) {
+      try {
+        runtime.pin(descriptor, bytes);
+      } catch {
+        await dropCachedArtifact(descriptor.policyDigest);
+        bytes = null;
+      }
+    }
+    if (!bytes) {
+      bytes = await fetchArtifactBytes(descriptor, team);
+      if (myEpoch !== epoch || node !== owner) return; // a newer epoch owns teardown now
+      runtime.pin(descriptor, bytes); // throws on any digest/size mismatch
+      await persistVerifiedArtifact(descriptor, bytes);
+    }
+  }
+  if (myEpoch !== epoch || node !== owner) return;
+
+  // Revoke stale digests (close their runners) and stale callers FIRST.
+  for (const [digest, granted] of [...fnGrants]) {
+    if (digest === descriptor.policyDigest) continue;
+    for (const caller of granted) {
+      try {
+        owner.revokeInvoker(caller, digest);
+      } catch {
+        /* node already closed — the grant map died with it */
+      }
+    }
+    fnGrants.delete(digest);
+    runtime.unpin(digest);
+  }
+  const desired = new Set(callers);
+  const current = fnGrants.get(descriptor.policyDigest) || new Set();
+  for (const caller of [...current]) {
+    if (desired.has(caller)) continue;
+    try {
+      owner.revokeInvoker(caller, descriptor.policyDigest);
+    } catch {
+      /* node already closed */
+    }
+    current.delete(caller);
+  }
+  // Only now grant replacements: every exact returned caller EndpointId, for
+  // only the returned policy digest.
+  for (const caller of desired) {
+    if (current.has(caller)) continue;
+    owner.grantInvoker(caller, descriptor.policyDigest);
+    current.add(caller);
+  }
+  fnGrants.set(descriptor.policyDigest, current);
+  updateFunctionsStatus();
+}
+
+function updateFunctionsStatus() {
+  if (!fnRuntime || fnRuntime.closed) {
+    if (status.functions !== null) setStatus({ functions: null });
+    return;
+  }
+  const stats = fnRuntime.stats();
+  let grants = 0;
+  for (const callers of fnGrants.values()) grants += callers.size;
+  setStatus({ functions: { pinned: stats.pinned, grants, served: stats.servedTotal } });
+}
+
+// Every teardown path (stop, terminal admission failure, endpoint rotation)
+// funnels here: close runners, revoke every outstanding grant, forget pins.
+// `owner` is the node the grants were applied to (the terminal path passes
+// its doomed node explicitly after clearing `node`).
+function teardownFunctionLane(owner = node) {
+  if (owner) {
+    for (const [digest, callers] of fnGrants) {
+      for (const caller of callers) {
+        try {
+          owner.revokeInvoker(caller, digest);
+        } catch {
+          /* node already closed — its wasm grant map is gone anyway */
+        }
+      }
+    }
+  }
+  fnGrants = new Map();
+  if (fnRuntime) {
+    try {
+      fnRuntime.close();
+    } catch {
+      /* already closed */
+    }
+    fnRuntime = null;
+  }
 }
 
 // One renewal spine owns every admission write: periodic lease refresh,
@@ -321,11 +560,18 @@ async function renewNow(myEpoch) {
   let nextDelay = null;
   let outcome = "retrying";
   try {
-    await admitOnce(attemptedAddr, endpointId);
+    const admitResult = await admitOnce(attemptedAddr, endpointId);
     if (myEpoch !== epoch) {
       await discardStaleAttempt(null, endpointId, renewalTeam);
       return "stale";
     }
+    // Capability reconcile rides the same renewal spine: pin/re-verify the
+    // server-described artifact, then revoke stale callers/digests before
+    // granting their replacements. A reconcile failure is treated exactly
+    // like an admission failure (backoff retry) — the previous pin + grants
+    // are left untouched.
+    await reconcileCapability(admitResult && admitResult.capability, myEpoch);
+    if (myEpoch !== epoch) return "stale";
     admittedAddrJson = attemptedAddr;
     renewBackoffMs = RENEW_BACKOFF_BASE_MS;
     const lifecycle = anyVisible() ? "online" : "suspended";
@@ -350,6 +596,7 @@ async function renewNow(myEpoch) {
       node = null;
       currentAddrJson = null;
       admittedAddrJson = null;
+      teardownFunctionLane(doomed);
       await discardStaleAttempt(doomed, endpointId, renewalTeam);
       outcome = "terminal";
     } else {
@@ -499,7 +746,7 @@ async function start(msg) {
   try {
     const orderedRelay = await orderRelaysByLatency(msg.relay);
     if (myEpoch !== epoch) return; // stop() ran during the relay probe
-    const { BrowserNode, wasmBundleVersion } = await loadBrowserModule();
+    const { BrowserNode, wasmBundleVersion, blake3Hex } = await loadBrowserModule();
     if (myEpoch !== epoch) return; // stop() ran during wasm init
     // Check the ACTUAL loaded module's version, not just an assumption from
     // the URL/cache key — catches a stale service-worker-cached .wasm binary
@@ -535,6 +782,30 @@ async function start(msg) {
       return;
     }
     const endpointId = n.nodeId();
+    // browser-worker-quickjs-runtime: create the worker-native QuickJS lane
+    // and install the invoke handler BEFORE this endpoint can become routable
+    // — the first admission only happens after setAddressHandler -> kickRenew
+    // below. The handler resolves exclusively against locally pinned,
+    // server-described, BLAKE3-verified artifacts; an unpinned digest
+    // rejects, so installing early grants nobody anything.
+    const runtime = new WorkerFunctionRuntime({
+      blake3: blake3Hex,
+      ops: {
+        // The platform registry's read ops with worker-meaningful handlers
+        // (hive-browser/identity-json-v1, hive-browser/utf8-array-buffer-v1);
+        // per artifact the admission policy's allowed_ops narrows further.
+        1: async (value) => value,
+        2: async (value) => new TextEncoder().encode(String(value)).buffer,
+      },
+    });
+    n.setInvokeHandler((digest, request) => {
+      if (fnRuntime !== runtime || runtime.closed) {
+        return Promise.reject(new Error("function runtime is not running"));
+      }
+      return runtime.invoke(digest, request);
+    });
+    fnRuntime = runtime;
+    fnGrants = new Map();
     // Publish the node + endpointId ONLY once this epoch is confirmed still
     // current. setAddressHandler synchronously emits iroh's current address,
     // then keeps the same callback alive for every relay migration.
@@ -550,6 +821,8 @@ async function start(msg) {
     node = null;
     currentAddrJson = null;
     admittedAddrJson = null;
+    fnRuntime = null;
+    fnGrants = new Map();
     if (booted) await discardStaleAttempt(booted, null, msg.team);
     setStatus({
       lifecycle: "error",
@@ -656,6 +929,9 @@ async function stop() {
   const endpointId = status.endpointId;
   const team = session && session.team;
   if (node) {
+    // Revoke every invoker grant + close every runner BEFORE the admission
+    // DELETE and the node close (which itself clears the wasm grant map).
+    teardownFunctionLane(node);
     try {
       if (endpointId && team) {
         await callApi("DELETE", `/v1/browser/admissions/${encodeURIComponent(endpointId)}`, team);
@@ -685,6 +961,7 @@ async function stop() {
     endpointId: null,
     relay: null,
     lastError: null,
+    functions: null,
   });
 }
 

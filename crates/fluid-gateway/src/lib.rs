@@ -2799,6 +2799,10 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
                     })
             })
             .collect(),
+        // The browser-database opt-in block, verbatim (raw policy, resolved at
+        // the point of use) — same cross-node resolution reason as
+        // `browser_functions` above.
+        browser_db: d.manifest.browser_db.clone(),
     }
 }
 

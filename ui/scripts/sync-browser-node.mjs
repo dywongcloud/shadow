@@ -28,8 +28,16 @@ for (const f of readdirSync(srcPkg)) {
     copyFileSync(join(srcPkg, f), join(destPkg, f));
   }
 }
-const identitySrc = join(srcRoot, "identity.js");
-if (existsSync(identitySrc)) {
-  copyFileSync(identitySrc, join(destRoot, "identity.js"));
+// Worker-loadable ES modules the SharedWorker imports directly (identity for
+// both, plus the browser-worker-quickjs-runtime lane: the canonical policy
+// digest module and the worker-native QuickJS runtime). These are hand-written
+// sources in www/, not build artifacts — pkg/ alone is not enough.
+for (const f of ["identity.js", "artifact-policy.js", "worker-function-runtime.js"]) {
+  const src = join(srcRoot, f);
+  if (existsSync(src)) {
+    copyFileSync(src, join(destRoot, f));
+  } else if (f !== "identity.js") {
+    console.warn(`[sync-browser-node] ${src} missing — the worker QuickJS lane will fail to load until it exists.`);
+  }
 }
 console.log(`[sync-browser-node] synced ${srcPkg} -> ${destPkg}`);

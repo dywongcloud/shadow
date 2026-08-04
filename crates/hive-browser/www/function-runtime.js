@@ -1,15 +1,17 @@
 import { FunctionRunner, post } from "./function-runner.js";
+import {
+  DIGEST_RE,
+  normalizePolicy as normalizePolicyShape,
+  policyDigest,
+  positiveInteger,
+  sourceDigest,
+} from "./artifact-policy.js";
 
-const DIGEST = /^[0-9a-f]{64}$/;
 const encoder = new TextEncoder();
 
 function site(hostname) {
   if (hostname === "localhost" || /^\d+(?:\.\d+){3}$/.test(hostname)) return hostname;
   return hostname.split(".").slice(-2).join(".");
-}
-
-function sourceDigest(hash, source) {
-  return hash(encoder.encode(source));
 }
 
 function abortError(signal) {
@@ -34,12 +36,6 @@ function abortable(promise, signal) {
   });
 }
 
-function positiveInteger(value, fallback, name) {
-  const out = value ?? fallback;
-  if (!Number.isSafeInteger(out) || out <= 0) throw new Error(`${name} must be a positive integer`);
-  return out;
-}
-
 function readOperation(value) {
   const handler = typeof value === "function" ? value : value?.handler;
   const effect = typeof value === "function" ? "read" : value?.effect ?? "read";
@@ -52,59 +48,28 @@ function readOperation(value) {
   return Object.freeze({ handler, effect, abi });
 }
 
-function hexBytes(hex) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i++) out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  return out;
-}
-
+// Policy normalization delegates the canonical shape (mode/ids/limits and the
+// ABI lookup order) to artifact-policy.js; the runtime-specific part is that
+// an op's ABI comes from the ops REGISTERED here, so an unregistered op keeps
+// failing with this runtime's own error. `abis` is carried through for the
+// shared policyDigest; `operations` for the runner's op dispatch.
 function normalizePolicy(options, operations) {
-  const mode = options.mode ?? "native";
-  if (mode !== "native" && mode !== "quickjs") throw new Error("artifact mode must be native or quickjs");
-  const ids = [...new Set(options.allowedOps ?? [])].sort((a, b) => a - b);
-  const snapshot = new Map();
-  for (const id of ids) {
-    if (!Number.isSafeInteger(id) || id < 0) throw new Error("operation ids must be non-negative integers");
+  const policy = normalizePolicyShape(options, id => {
     const operation = operations.get(id);
     if (!operation) throw new Error(`operation ${id} must be registered before pin`);
-    snapshot.set(id, operation);
-  }
+    return operation.abi;
+  });
+  const snapshot = new Map();
+  for (const id of policy.ids) snapshot.set(id, operations.get(id));
   return Object.freeze({
-    mode,
-    ids: Object.freeze(ids),
+    mode: policy.mode,
+    ids: policy.ids,
+    abis: policy.abis,
     operations: snapshot,
-    timeoutMs: positiveInteger(options.timeoutMs, 1000, "timeoutMs"),
-    memoryBytes: positiveInteger(options.memoryBytes, 32 * 1024 * 1024, "memoryBytes"),
-    stackBytes: positiveInteger(options.stackBytes, 512 * 1024, "stackBytes"),
+    timeoutMs: policy.timeoutMs,
+    memoryBytes: policy.memoryBytes,
+    stackBytes: policy.stackBytes,
   });
-}
-
-function policyDigest(hash, sourceDigestValue, policy) {
-  const domain = encoder.encode("hive-browser-policy-v1\0");
-  const operationBytes = policy.ids.map(id => {
-    const operation = policy.operations.get(id);
-    return { id, effect: 0, abi: encoder.encode(operation.abi) };
-  });
-  const size = domain.length + 32 + 4
-    + operationBytes.reduce((sum, item) => sum + 8 + 1 + 4 + item.abi.length, 0)
-    + 1 + 8 * 3;
-  const bytes = new Uint8Array(size);
-  const view = new DataView(bytes.buffer);
-  let offset = 0;
-  bytes.set(domain, offset); offset += domain.length;
-  bytes.set(hexBytes(sourceDigestValue), offset); offset += 32;
-  view.setUint32(offset, operationBytes.length, true); offset += 4;
-  for (const item of operationBytes) {
-    view.setBigUint64(offset, BigInt(item.id), true); offset += 8;
-    view.setUint8(offset, item.effect); offset += 1;
-    view.setUint32(offset, item.abi.length, true); offset += 4;
-    bytes.set(item.abi, offset); offset += item.abi.length;
-  }
-  view.setUint8(offset, policy.mode === "native" ? 0 : 1); offset += 1;
-  for (const value of [policy.timeoutMs, policy.memoryBytes, policy.stackBytes]) {
-    view.setBigUint64(offset, BigInt(value), true); offset += 8;
-  }
-  return hash(bytes);
 }
 
 export class BrowserFunctionRuntime {
@@ -182,12 +147,12 @@ export class BrowserFunctionRuntime {
 
   async pin(sourceDigestValue, source, options = {}) {
     if (this.closed) throw new Error("function runtime is closed");
-    if (!DIGEST.test(sourceDigestValue)) throw new Error("artifact digest must be 64 lowercase hexadecimal characters");
+    if (!DIGEST_RE.test(sourceDigestValue)) throw new Error("artifact digest must be 64 lowercase hexadecimal characters");
     if (typeof source !== "string") throw new Error("artifact source must be a string");
     if (sourceDigest(this.blake3, source) !== sourceDigestValue) throw new Error("artifact source does not match BLAKE3 digest");
     const policy = normalizePolicy(options, this.ops);
     const digest = policyDigest(this.blake3, sourceDigestValue, policy);
-    if (!DIGEST.test(digest)) throw new Error("BLAKE3 policy digest must be 64 lowercase hexadecimal characters");
+    if (!DIGEST_RE.test(digest)) throw new Error("BLAKE3 policy digest must be 64 lowercase hexadecimal characters");
     const artifact = {
       digest,
       sourceDigest: sourceDigestValue,

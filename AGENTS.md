@@ -505,6 +505,50 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   forever by design — that is a state-versus-caller-bug ambiguity no GC may
   resolve by deleting; drain the store dir by hand.
 
+## Browser-replicated databases (the `browser_db` contract)
+
+The contract the browser↔fleet CRR exchange implements is
+`docs/browser-db-contract.md`; the load-bearing invariants:
+
+- **Opt-in is a fluid.json TOP-LEVEL `browser_db` block, one logical database
+  per PROJECT.** `fluid_core::BrowserDbPolicy` (presence = opt-in, every field
+  defaulted, ceilings clamp with notes via `resolve()` — never warn-and-drop)
+  rides `Manifest::browser_db` → `DeployRecord` → and is stamped VERBATIM onto
+  `DeploymentInfo::browser_db` for the `/v1/fleet-deployments` gossip view, so
+  the admission-issuing leader and exchange peers resolve caps for deployments
+  they do not host. The block replicates RAW and resolves at the point of use
+  (the `InferenceSpec` precedent); a pre-upgrade peer carries no field and
+  presents as not-opted-in — absent capability, never wrong capability.
+  Database IDENTITY is the project (the `hive-vol-{project}` precedent: data
+  survives redeploys); the spec and every grant are deployment-scoped.
+- **Grants ride the admission, server-derived and tenant-pinned.** A `db`
+  block on the admit/renewal capability, resolved from the deployment
+  descriptor under the authenticated tenant, dying with the admission lease.
+  Team scope = read+write; Public scope = read-only and only with
+  `public_read: true` — an anonymous donor never writes tenant data. The
+  exchange peer re-checks the grant against its OWN replicated
+  `browser_admissions` view (the `proxy_to_owner` precedent).
+- **Caps bind BOTH sides.** `max_bytes` (default 64 MiB, ceiling 1 GiB)
+  per-replica on the browser OPFS copy AND each fleet file; `max_value_bytes`
+  (default 1 MiB, ceiling 16 MiB) at the sync boundary. Over-cap = typed
+  refusal + whole-batch rollback — NEVER truncate or evict rows to fit, which
+  in an LWW store is silent permanent divergence.
+- **The converged fleet replica set is the system of record; every browser
+  OPFS copy is a cache of record** (replication factor zero). Revocation wipes
+  the browser copy, expiry seals it until re-admission (watermarks resume),
+  churn costs nothing. Fleet files live while the project lives: block removal
+  stops grants and starts a 30-day inert grace, then GC with the
+  `browser_artifacts::gc` guards (empty keep-set refuses, max reap fraction,
+  grace age).
+- **Naming is platform-templated, bytes never ride replicated state.** Fleet
+  `$HIVE_DATA/browser-dbs/hive-browserdb-{sanitize_tag(project)}.db`, browser
+  `/hive-crsql/<same>` — the volume-isolation invariant applied to DB files;
+  no wire field ever names a file. Replica bytes/site-ids/watermarks replicate
+  ONLY through the `hive_crsql` ChangeBatch protocol — never
+  `PlatformSnapshot`/`store_sync`/a gossip snapshot arm (the `dns_geo.json`
+  precedent), and no owner-proxy HTTP arm serves DB bytes: a file copy is not
+  a merge.
+
 ## Tenant volume isolation (verified, keep it this way)
 
 - **A project name can never become a host path, and that is load-bearing.**

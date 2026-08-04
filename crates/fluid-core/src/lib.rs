@@ -768,6 +768,144 @@ pub fn browser_policy_digest(
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Browser-replicated database opt-in (bn-browser-db-ownership-contract)
+// ---------------------------------------------------------------------------
+//
+// A project gets a browser-replicated cr-sqlite database ONLY by opting in
+// through a fluid.json top-level `browser_db` block — the same presence-is-
+// the-opt-in discipline as [`FunctionConfig::browser`], and the same fail-the-
+// input-loudly boundary as [`Manifest::from_json`]'s strict validation (a
+// mistyped block is a deploy error, never a silently dropped opt-in). The
+// SPEC rides the replicated deployment state — `Manifest::browser_db` inside
+// `DeployRecord` (persisted in `PlatformSnapshot`) and stamped verbatim onto
+// [`DeploymentInfo::browser_db`] for the `/v1/fleet-deployments` gossip view —
+// so the admission-issuing leader and every fleet exchange peer resolve the
+// exact caps for deployments they do not host, without any client input.
+//
+// The full ownership/retention/naming contract (what the browser↔fleet
+// exchange row implements against) is `docs/browser-db-contract.md`. The
+// load-bearing shape decisions:
+//
+// * ONE logical database per PROJECT, not per deployment and not per
+//   function. Database identity is the project — the `container_volume_cfg`
+//   `hive-vol-{project}` precedent, so data survives redeploys — while the
+//   opt-in spec and every grant are resolved against a specific Ready
+//   deployment's descriptor. A redeploy that keeps the block re-uses the same
+//   database; a redeploy that drops it stops new grants.
+// * The block is REPLICATED RAW and resolved at the point of use
+//   ([`BrowserDbPolicy::resolve`]) — the `InferenceSpec` precedent (raw spec
+//   synced, validated at consume), so every consumer applies its own binary's
+//   defaults/ceilings deterministically and a pre-upgrade peer simply carries
+//   no field (`serde(default)`).
+// * Resolution can only clamp (never hard-fail): there is no tenant-authored
+//   value that is dangerous to the platform, only values that exceed a
+//   platform ceiling, and those clamp with a build-log note — the
+//   `ContainerLimits::for_container` / [`BrowserPolicy::resolve`] convention.
+
+/// Per-replica total database size cap, enforced on BOTH the browser's OPFS
+/// copy and every fleet-side replica file. 64 MiB is generous for an edge app's
+/// replicated dataset; the 1 GiB ceiling exists because browser OPFS copies
+/// live under the origin's storage quota inside a tab — a larger dataset
+/// belongs on the platform's server-side storage paths, not replicated into
+/// donors' browsers.
+pub const BROWSER_DB_MAX_BYTES_DEFAULT: u64 = 64 * 1024 * 1024;
+pub const BROWSER_DB_MAX_BYTES_MAX: u64 = 1024 * 1024 * 1024;
+/// Cap on ONE change's value payload (a single `crsql_changes` `val`), enforced
+/// at the sync boundary in both directions: an oversized value stays in its
+/// origin replica and is refused replication, loudly, rather than ever being
+/// truncated (truncation in an LWW store is silent permanent divergence).
+/// Change rows travel as structured-clone JSON on the browser side and HCB1
+/// frames on the fleet side; a payload past the 16 MiB ceiling belongs in the
+/// content-addressed asset store, not in a CRR cell.
+pub const BROWSER_DB_VALUE_MAX_BYTES_DEFAULT: u64 = 1024 * 1024;
+pub const BROWSER_DB_VALUE_MAX_BYTES_MAX: u64 = 16 * 1024 * 1024;
+
+/// The browser-database opt-in entry from fluid.json's top-level `browser_db`
+/// block. Its PRESENCE is the opt-in; every field has a platform default.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDbPolicy {
+    /// Per-replica total size cap in bytes (browser OPFS copy AND each
+    /// fleet-side replica file). 0 = platform default, clamped to the platform
+    /// ceiling. Exceeding it refuses the applying change set with a typed
+    /// quota error and rolls the batch back — never a truncated replica.
+    #[serde(default)]
+    pub max_bytes: u64,
+    /// Single change-value payload cap in bytes. 0 = platform default, clamped
+    /// to the platform ceiling. Enforced at the sync boundary (export/apply),
+    /// not on local SQL execution: an oversized value persists in its origin
+    /// replica but never replicates, and the sync error names the table/pk.
+    #[serde(default)]
+    pub max_value_bytes: u64,
+    /// Allow PUBLIC-scope admissions (anonymous donors) a READ-ONLY replica of
+    /// this project's database. Default `false`: only Team-scope admissions —
+    /// browsers operated by members of the owning tenant — hold DB grants at
+    /// all. Read-only means the fleet applies nothing originating from that
+    /// grant (`changes-since` export only); a public donor must never write
+    /// tenant data regardless of the toggle.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub public_read: bool,
+}
+
+/// A [`BrowserDbPolicy`] after resolution: every cap concrete (defaults
+/// applied, ceilings enforced), contradictions clamped with a note.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedBrowserDbPolicy {
+    pub max_bytes: u64,
+    pub max_value_bytes: u64,
+    pub public_read: bool,
+    /// Human-readable notes for the build log — values the platform ceilings
+    /// (or internal consistency) clamped.
+    pub notes: Vec<String>,
+}
+
+impl BrowserDbPolicy {
+    /// Resolve to concrete caps. Infallible by design (see the section docs):
+    /// over-ceiling values clamp with a note, and a `max_value_bytes` larger
+    /// than `max_bytes` — a single value that could never fit the database —
+    /// clamps to `max_bytes` with a note rather than failing the deploy.
+    pub fn resolve(&self) -> ResolvedBrowserDbPolicy {
+        let mut notes = Vec::new();
+        let clamp = |value: u64, default: u64, max: u64, name: &str, notes: &mut Vec<String>| {
+            let resolved = if value == 0 { default } else { value };
+            if resolved > max {
+                notes.push(format!(
+                    "{name} {resolved} exceeds the platform ceiling {max} — clamped"
+                ));
+                max
+            } else {
+                resolved
+            }
+        };
+        let max_bytes = clamp(
+            self.max_bytes,
+            BROWSER_DB_MAX_BYTES_DEFAULT,
+            BROWSER_DB_MAX_BYTES_MAX,
+            "max_bytes",
+            &mut notes,
+        );
+        let mut max_value_bytes = clamp(
+            self.max_value_bytes,
+            BROWSER_DB_VALUE_MAX_BYTES_DEFAULT,
+            BROWSER_DB_VALUE_MAX_BYTES_MAX,
+            "max_value_bytes",
+            &mut notes,
+        );
+        if max_value_bytes > max_bytes {
+            notes.push(format!(
+                "max_value_bytes {max_value_bytes} exceeds max_bytes {max_bytes} — clamped to max_bytes"
+            ));
+            max_value_bytes = max_bytes;
+        }
+        ResolvedBrowserDbPolicy {
+            max_bytes,
+            max_value_bytes,
+            public_read: self.public_read,
+            notes,
+        }
+    }
+}
+
 // `Runtime` (the language/engine selector) lives in `hive_core` — the lower
 // crate in the dependency graph, reachable from `hive-cell-agent`/
 // `hive-backend` (which do NOT depend on fluid-core) as well as from here.
@@ -1365,6 +1503,14 @@ pub struct Manifest {
     /// means a Static miss stays a 404/SPA-fallback — behavior unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_function: Option<String>,
+    /// Explicit opt-in to a browser-replicated cr-sqlite database for this
+    /// project (fluid.json top-level `browser_db`). ABSENT means the project
+    /// gets NO browser database, by construction: only a deployment whose
+    /// manifest carries the block can ever ground a DB grant. See
+    /// [`BrowserDbPolicy`]'s docs and `docs/browser-db-contract.md` for the
+    /// full ownership/retention/naming contract this rides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_db: Option<BrowserDbPolicy>,
 }
 
 /// Strict deploy-time protocol validation for raw `fluid.json` text: walk
@@ -1997,6 +2143,16 @@ pub struct DeploymentInfo {
     /// browser opt-in and for peers running older binaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_functions: Vec<BrowserFunctionRef>,
+    /// The deployment's browser-database opt-in block, VERBATIM from the
+    /// manifest (raw policy — resolved at the point of use via
+    /// [`BrowserDbPolicy::resolve`], the `InferenceSpec` raw-spec-replicated
+    /// precedent). Carried for the same reason as `browser_functions`: the
+    /// admission-issuing leader and the fleet exchange peers resolve DB grants
+    /// and caps for deployments they may not host, and this gossip view is
+    /// what they see. `None` for every deployment with no `browser_db` opt-in
+    /// and for peers running older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_db: Option<BrowserDbPolicy>,
 }
 fn default_ready() -> DeployState {
     DeployState::Ready
