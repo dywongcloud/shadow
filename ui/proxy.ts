@@ -254,8 +254,14 @@ export const config = {
   // Run on app routes. Skip Next internals + static FILES (extension at the end),
   // but still gate app routes that legitimately contain dots (e.g. a domain
   // detail page like /domains/example.com) — otherwise they'd bypass auth.
+  // wasm+mjs are in the exclusion list: the browser-node package
+  // (/browser-node/pkg/*.wasm) and the sqlite module set (crsqlite-sync.mjs,
+  // crsqlite-sync.wasm) are PUBLIC static assets a not-yet-signed-in browser
+  // must be able to fetch — gating them 307s a wasm fetch into a sign-in HTML
+  // redirect and the whole browser-node boot fails (witnessed 2026-08-04:
+  // hive_browser_bg.wasm -> 307 while hive_browser.js -> 200).
   matcher: [
-    "/((?!_next)(?!.*\\.(?:ico|png|jpg|jpeg|gif|svg|webp|woff2?|ttf|css|js|map|txt|xml|webmanifest)$).*)",
+    "/((?!_next)(?!.*\\.(?:ico|png|jpg|jpeg|gif|svg|webp|woff2?|ttf|css|js|mjs|wasm|map|txt|xml|webmanifest)$).*)",
     "/",
   ],
 };
