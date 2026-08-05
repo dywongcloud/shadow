@@ -213,24 +213,81 @@ impl BrowserPresenceStore {
         self.inner.lock().clone()
     }
 
-    fn adopt(&self, mut incoming: PresenceSnapshot) -> Option<(PresenceSnapshot, PresenceSnapshot)> {
-        for (id, revision) in &incoming.tombstones {
-            if incoming
-                .active
-                .get(id)
-                .is_some_and(|record| record.revision <= *revision)
-            {
-                incoming.active.remove(id);
+    /// Merge an incoming snapshot into local state **per endpoint id** — never
+    /// as a wholesale replacement.
+    ///
+    /// This used to be `*state = incoming` behind an `incoming.version <=
+    /// state.version` gate, and that silently DESTROYED presence records.
+    /// Every node's `version` is wall-clock anchored (`next_version()` is
+    /// `now_ms()`), so two nodes that each admitted a browser hold snapshots
+    /// whose versions differ by milliseconds; whichever replicated with the
+    /// higher version overwrote the other node's entire map, and the browser
+    /// admitted through the losing node vanished from the constellation with
+    /// no error logged anywhere. Presence is a per-endpoint fact owned by
+    /// whichever node the browser admitted through — with 14 nodes behind
+    /// round-robin DNS that is routinely a different node per browser — so the
+    /// join has to be per endpoint id, not per snapshot.
+    ///
+    /// Rules, applied to the union of both sides: a record wins on the higher
+    /// `revision`; a tombstone at or above a record's revision always beats
+    /// that record (so revocation/expiry still propagates as authoritative
+    /// deletion — the "replicate zero satellites now" property `store_sync`'s
+    /// REGISTRY comment depends on); tombstones union by max revision. A
+    /// record that is dropped WITHOUT a tombstone (a node that lost state)
+    /// can be resurrected by a peer here, which is deliberate and bounded:
+    /// `expires_ms` is a 90s TTL and `list` filters on it, so a genuinely
+    /// dead record ages out on its own rather than being destroyed early.
+    fn adopt(&self, incoming: PresenceSnapshot) -> Option<(PresenceSnapshot, PresenceSnapshot)> {
+        let mut state = self.inner.lock();
+        let old = state.clone();
+
+        for (id, revision) in incoming.tombstones {
+            let entry = state.tombstones.entry(id).or_insert(0);
+            if revision > *entry {
+                *entry = revision;
             }
         }
-        let mut state = self.inner.lock();
-        let local_empty = state.active.is_empty() && state.tombstones.is_empty();
-        if incoming.version <= state.version && !local_empty {
+        for (id, record) in incoming.active {
+            if state
+                .active
+                .get(&id)
+                .is_some_and(|local| local.revision >= record.revision)
+            {
+                continue;
+            }
+            state.active.insert(id, record);
+        }
+        // Disjoint field borrows: a tombstone at or above a record's revision
+        // removes it, whichever side each of them arrived from.
+        let dead: Vec<String> = {
+            let PresenceSnapshot {
+                active, tombstones, ..
+            } = &*state;
+            active
+                .iter()
+                .filter(|(id, record)| {
+                    tombstones
+                        .get(id.as_str())
+                        .is_some_and(|revision| *revision >= record.revision)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in dead {
+            state.active.remove(&id);
+        }
+
+        state.version = state.version.max(incoming.version);
+        state.prune_tombstones(hive_core::now_ms());
+
+        // Preserve the caller's no-op signal: store_sync treats `None` as
+        // "nothing adopted", and a merge that changed nothing must not be
+        // reported as a change.
+        if state.active == old.active && state.tombstones == old.tombstones {
             return None;
         }
-        let old = state.clone();
-        *state = incoming.clone();
-        Some((old, incoming))
+        let new = state.clone();
+        Some((old, new))
     }
 }
 

@@ -80,7 +80,17 @@ const MAX_OUTBOUND_CONNECTIONS: usize = 16;
 const MAX_ACTIVE_OUTBOUND_STREAMS: usize = 32;
 const MAX_OUTBOUND_DIAL_WAITERS: usize = 32;
 const MAX_INFLIGHT_ASSET_BYTES: usize = 128 << 20;
-const RELAY_ONLINE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Budget for the best-effort "is the home relay up yet?" wait in `boot()`.
+///
+/// This was 10s, which is structurally SMALLER THAN ONE worst-case attempt:
+/// `ep.online()` cannot resolve until a net_report round finishes, that round
+/// does not short-circuit until every configured relay has answered (three are
+/// configured by default), and a single relay dial carries its own ~10s
+/// connect timeout — so ~13s+ is reachable on a perfectly healthy fleet from a
+/// slow or distant client, and the old budget guaranteed failure there. It is
+/// now both larger than that worst case AND non-fatal on expiry (see `boot`),
+/// so a slow network gets a working node either way instead of an error.
+const RELAY_ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const STREAM_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1023,7 +1033,7 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
 /// wire contract it implements) is not safely usable by an older worker.
 #[wasm_bindgen(js_name = wasmBundleVersion)]
 pub fn wasm_bundle_version() -> u32 {
-    14
+    15
 }
 
 /// A live browser mesh node. Holds the bound endpoint and the spawned accept
@@ -1240,12 +1250,38 @@ impl BrowserNode {
         // information available", blaming the caller for this node's
         // un-readiness. `browser_echo_native.rs` hit exactly this and carries
         // the same `online()` call for the same reason.
+        // ...so we WAIT for it here — but only as a convenience, never as a
+        // gate. This used to `ep.close()` and throw "browser relay online
+        // deadline exceeded" on timeout, which turned every transient slow
+        // relay handshake into a hard, self-inflicted dead end: the endpoint
+        // was already bound and iroh would have kept working the whole
+        // RelayMap in the background, but tearing it down threw that away and
+        // left the user staring at an error with nothing retrying behind it.
+        // Live-measured for contrast, this same call returns in ~1.3s against
+        // a healthy relay from a well-connected client — but the tail is much
+        // longer than that median and was the whole bug: the net_report round
+        // `online()` waits on does not short-circuit until EVERY configured
+        // relay has answered, and only one relay is actually dialed, so a
+        // single slow or websocket-broken relay stalls the whole wait no
+        // matter how healthy the other two are. Expiring here now means "not
+        // yet", not "failed".
+        //
+        // Returning a not-yet-online node is SAFE by construction on the JS
+        // side and needs no caller change: `addr_json()` below still refuses
+        // to hand out an addr with no transport hints, `spawn_address_loop`
+        // emits `{online:false, relays:[], addrJson:null}` immediately and
+        // again the moment the home relay lands, and the worker's renew path
+        // is already guarded on having an address before it will admit. So a
+        // slow relay now surfaces as "degraded, connecting" that heals itself,
+        // instead of a dead node the user has to notice and restart by hand.
         if n0_future::time::timeout(RELAY_ONLINE_TIMEOUT, ep.online())
             .await
             .is_err()
         {
-            ep.close().await;
-            return Err(JsError::new("browser relay online deadline exceeded"));
+            tracing::warn!(
+                timeout_secs = RELAY_ONLINE_TIMEOUT.as_secs(),
+                "browser relay not online yet — continuing; the address handler reports readiness when the home relay lands"
+            );
         }
 
         let served = Arc::new(std::sync::atomic::AtomicU64::new(0));

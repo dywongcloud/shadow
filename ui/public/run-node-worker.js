@@ -56,7 +56,7 @@ const HOST_ABI_VERSION = 1;
 // (see start() below), not just trusted by filename/cache-key, so a stale
 // service-worker-cached .wasm paired with fresh JS glue is caught even
 // though the two are normally synced/cached together as a pair.
-const WASM_BUNDLE_VERSION = 14; // v14: Op::CrrSync browser-replicated database exchange (setCrrSyncHandler/grantCrrSync/revokeCrrSync + outbound crrSyncOn)
+const WASM_BUNDLE_VERSION = 15; // v15: relay-online wait is non-fatal — boot returns a connecting node instead of throwing "relay online deadline exceeded"
 const WASM_MODULE_URL = new URL(
   `./browser-node/pkg/hive_browser.js?v=${WASM_BUNDLE_VERSION}`,
   import.meta.url,
@@ -269,7 +269,60 @@ function setStatus(patch) {
 // admitOnce failure -- no special-casing needed there.
 const DIAL_DEADLINE_MS = 10_000;
 
+/** Re-mint the httpOnly `hive_jwt` cookie from inside the worker.
+ *
+ *  The dashboard mints on mount and then only every ~50 MINUTES
+ *  (ui/components/session-token.tsx), while the backend's browser-admission
+ *  bar requires a session no older than HIVE_BROWSER_SESSION_MAX_AGE_SECS —
+ *  default 300 SECONDS (crates/hive-cloud/src/browser_admission.rs). So for
+ *  roughly 45 of every 50 minutes an admission or renewal was rejected
+ *  `session_stale`, and because that failure is classified RETRYABLE the
+ *  worker just retried forever against the very same stale cookie: the node
+ *  booted fine, never admitted, never published presence, and so never
+ *  appeared on the constellation map. The page already self-heals exactly
+ *  this way for its own requests (ui/lib/api.ts's mint-on-auth-failure);
+ *  this is that same recovery for the worker, which had none.
+ *
+ *  Deduped through a single in-flight promise so a burst of renewals can't
+ *  fire a mint storm at /api/token. */
+let mintInFlight = null;
+function remintSession(team) {
+  if (!mintInFlight) {
+    mintInFlight = (async () => {
+      try {
+        const r = await fetch("/api/token", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ team }),
+        });
+        return r.ok;
+      } catch {
+        return false;
+      }
+    })().finally(() => {
+      mintInFlight = null;
+    });
+  }
+  return mintInFlight;
+}
+
 async function callApi(method, path, team, body) {
+  try {
+    return await callApiOnce(method, path, team, body);
+  } catch (error) {
+    // Only an auth-shaped failure is worth a mint; anything else propagates
+    // untouched so the existing classify/backoff paths behave identically.
+    const stale = Boolean(error) && (error.status === 401 || error.code === "session_stale");
+    if (!stale) throw error;
+    if (!(await remintSession(team))) throw error;
+    // Exactly one retry: a second 401 after a SUCCESSFUL mint is a real
+    // authorization answer (wrong tenant, revoked user), not a stale cookie.
+    return await callApiOnce(method, path, team, body);
+  }
+}
+
+async function callApiOnce(method, path, team, body) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), DIAL_DEADLINE_MS);
   try {
@@ -1467,7 +1520,17 @@ async function start(msg) {
     team: msg.team,
     relay: msg.relay,
   };
-  setStatus({ lifecycle: "starting", lastError: null, admission: "pending", sessionStale: false });
+  // endpointId is cleared here, not just set on success: it survived a failed
+  // or stopped run otherwise, and the presence heartbeat is keyed on it — so a
+  // restart would keep republishing a satellite for an endpoint that no longer
+  // exists until the record's TTL happened to catch up.
+  setStatus({
+    lifecycle: "starting",
+    lastError: null,
+    admission: "pending",
+    sessionStale: false,
+    endpointId: null,
+  });
   let booted = null;
   try {
     const orderedRelay = await orderRelaysByLatency(msg.relay);

@@ -148,7 +148,15 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
   const R = Math.min(W, H) * 0.36;
   const n = nodes.length;
 
-  if (n === 0) {
+  // Only genuinely empty when there is NOTHING to draw. This used to return on
+  // `n === 0` alone, which silently gated every browser satellite behind the
+  // FLEET node list: any pass where /v1/nodes was empty or still loading threw
+  // away a perfectly good presence feed and rendered "Discovering nodes…", so
+  // browser nodes could never appear on their own. Satellites are positioned
+  // relative to the ring, not to any individual node, so they draw fine with
+  // an empty fleet — `nodes.map` yields no positions and every satellite
+  // simply falls into the unanchored ring below.
+  if (n === 0 && presence.length === 0) {
     return <div className="py-20 text-center text-sm text-secondary">Discovering nodes…</div>;
   }
 
@@ -209,9 +217,17 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
   const sortedPresence = [...presence].sort((a, b) => (a.endpoint_id < b.endpoint_id ? -1 : a.endpoint_id > b.endpoint_id ? 1 : 0));
   const satellites = sortedPresence.slice(0, MAX_SATELLITES);
   const satelliteOverflow = sortedPresence.length - satellites.length;
+  // `relay_hint` carries the node's WHOLE connected relay set, comma-joined
+  // (the worker publishes `status.relay`, which is `relays.join(",")`), so
+  // feeding it straight to `new URL()` always threw and every satellite fell
+  // into the unanchored bucket — the relay-anchoring below was dead code from
+  // the day it landed. Take the first entry, and tolerate a bare hostname.
   const hostOf = (u?: string | null): string => {
     if (!u) return "";
-    try { return new URL(u).hostname; } catch { return ""; }
+    const first = u.split(",")[0]?.trim() ?? "";
+    if (!first) return "";
+    try { return new URL(first).hostname; } catch { /* fall through to bare-host */ }
+    return /^[a-z0-9.-]+$/i.test(first) ? first : "";
   };
   const nodeAngle = (i: number) => -Math.PI / 2 + (i * 2 * Math.PI) / n;
   const anchorOf = satellites.map((p) => {

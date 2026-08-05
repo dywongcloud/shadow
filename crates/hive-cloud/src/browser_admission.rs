@@ -1183,6 +1183,14 @@ pub fn snapshot_bytes(cloud: &Arc<CloudState>) -> Vec<u8> {
         let expired = cloud.browser_admissions.expire(hive_core::now_ms());
         for record in expired {
             cloud.gw.remove_browser_endpoint(&record.endpoint_id);
+            // Same invariant `remove_endpoint` states for the REVOKE path — "a
+            // presence record must never outlive the admission that authorized
+            // it" — applied to the EXPIRY path, which was missing it. Without
+            // this an admission that simply aged out left its presence record
+            // behind, so the constellation kept drawing a satellite for a
+            // browser that no longer had any right to serve, until presence's
+            // own TTL happened to catch up.
+            crate::browser_presence::remove_for_endpoint(cloud, &record.endpoint_id);
             let cloud = cloud.clone();
             tokio::spawn(async move {
                 close_endpoint(&cloud, &record.endpoint_id).await;

@@ -4,12 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { MapPin, RadioTower, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
 import { lifecycleLabel, type RunNodeStatus } from "@/lib/run-node-status";
-import { upsertPresence, clearPresence, type PresenceState } from "@/lib/run-node-client";
+import { clearPresence, GEO_CONSENT_KEY, GEO_COORDS_KEY } from "@/lib/run-node-client";
 import { usePoll, type Deployment } from "@/lib/api";
 import { resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
 import { TargetPicker, type TargetSelection } from "./target-picker";
-
-const GEO_CONSENT_KEY = "hive_run_node_geo_consent"; // "granted" | "denied"
 // browser-run-node-target-picker: the persisted selection is the STABLE
 // deployment+function pair only — never a digest. The digest is re-derived
 // from fresh descriptor metadata on every render/start/replay, so a redeploy
@@ -17,7 +15,6 @@ const GEO_CONSENT_KEY = "hive_run_node_geo_consent"; // "granted" | "denied"
 // deleted/ineligible target fails visibly and clears instead of replaying.
 const TARGET_KEY = "hive_run_node_target";
 const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
-const PRESENCE_REFRESH_MS = 45_000; // well inside the backend's 90s presence TTL
 // Re-derive the fix well before the browser's own 10-minute cache
 // (`maximumAge` below) goes stale, so a long-running tab's dot on the
 // constellation map tracks a laptop that changed networks instead of
@@ -39,13 +36,6 @@ function staleSuffix(locatedMs: number | null): string {
   return ageMin >= 15 ? ` · fix is ${ageMin}m old` : "";
 }
 
-function presenceState(lifecycle: string): PresenceState | null {
-  if (lifecycle === "starting") return "starting";
-  if (lifecycle === "online") return "online";
-  if (lifecycle === "degraded" || lifecycle === "error") return "degraded";
-  if (lifecycle === "suspended") return "suspended";
-  return null; // "stopped" — no presence record while stopped
-}
 
 // bn-run-node-db-sync-wiring: the worker's additive db-lane status field.
 // Present only while the admitted project's capability carries a
@@ -191,7 +181,6 @@ export default function RunNodePage() {
   const [geoError, setGeoError] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [locatedMs, setLocatedMs] = useState<number | null>(null);
-  const refreshTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   const geoTimer = useRef<ReturnType<typeof setInterval> | null>(null);
   // Focus restoration (bn-ui-accessibility): the "Don't share"/"Share" and
   // "Reset" buttons each unmount the moment they're clicked (the whole block
@@ -283,35 +272,21 @@ export default function RunNodePage() {
     };
   }, [geoDecision]);
 
-  // Push a fresh presence record whenever there's something live to publish,
-  // and keep it alive on an interval while the node is up — the presence TTL
-  // is short (90s) so a satellite disappears promptly if this page (or the
-  // node) actually stops updating it.
+  // The heartbeat itself now lives in `useRunNode` (mounted app-wide by the
+  // sidebar's run-node control). It used to be an effect HERE, and this
+  // page's unmount cleanup cleared its interval — so navigating to /network
+  // to look at the constellation was itself what stopped refreshing this
+  // node's satellite, which the server's 90s TTL then expired off the map.
+  // What remains here is the half only this page can do: persist the
+  // consented fix so the app-wide heartbeat can publish it from any route.
   useEffect(() => {
-    const state = presenceState(status.lifecycle);
-    if (!status.endpointId || !state) {
-      if (refreshTimer.current) {
-        clearInterval(refreshTimer.current);
-        refreshTimer.current = null;
-      }
-      return;
+    if (typeof window === "undefined") return;
+    if (geoDecision === "granted" && coords) {
+      localStorage.setItem(GEO_COORDS_KEY, JSON.stringify({ lat: coords.lat, lon: coords.lon }));
+    } else if (geoDecision !== "granted") {
+      localStorage.removeItem(GEO_COORDS_KEY);
     }
-    const publish = () => {
-      upsertPresence({
-        endpoint_id: status.endpointId!,
-        lat: geoDecision === "granted" ? coords?.lat ?? null : null,
-        lon: geoDecision === "granted" ? coords?.lon ?? null : null,
-        relay_hint: status.relay ?? "",
-        state,
-      }).catch(() => {});
-    };
-    publish();
-    refreshTimer.current = setInterval(publish, PRESENCE_REFRESH_MS);
-    return () => {
-      if (refreshTimer.current) clearInterval(refreshTimer.current);
-      refreshTimer.current = null;
-    };
-  }, [status.endpointId, status.lifecycle, status.relay, geoDecision, coords?.lat, coords?.lon]);
+  }, [geoDecision, coords?.lat, coords?.lon]);
 
   function decideGeo(next: "granted" | "denied") {
     setGeoDecision(next);

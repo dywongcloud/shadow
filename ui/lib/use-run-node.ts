@@ -4,8 +4,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { currentTeam } from "./api";
 import { resolveTargetFresh } from "./run-node-targets";
 import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
+import { presenceState, readPresenceGeo, upsertPresence } from "./run-node-client";
 
 const WORKER_URL = "/run-node-worker.js";
+/** Well inside the backend's 90s presence TTL, so one missed publish never
+ *  de-orbits a live node from the constellation. */
+const PRESENCE_REFRESH_MS = 45_000;
+/** Claimed by whichever mounted `useRunNode` instance publishes presence, so
+ *  /run-node (page + sidebar control, two instances) doesn't double the POST
+ *  rate for one node. Module scope = per document, which is the right grain:
+ *  the node is per-document too (one SharedWorker per origin, surfaced into
+ *  each tab). */
+let presenceOwner: object | null = null;
 // bn-impl-relay-tls: real WSS relays now exist (deployed + live-witnessed
 // 2026-08-01 on fc-bangkok/fc-virginia/fc-sanjose) -- before this, an unset
 // NEXT_PUBLIC_HIVE_BROWSER_RELAY meant `boot()` always received an empty
@@ -107,6 +117,8 @@ function dataSaverActive(): boolean {
 
 export function useRunNode() {
   const [status, setStatusState] = useState<RunNodeStatus>(initialRunNodeStatus());
+  // Stable per-instance identity for the presence-publisher claim below.
+  const ownerToken = useRef<object>({}).current;
   // Network policy (bn-ui-mobile-lifecycle): distinct from `status.lastError`
   // (a worker-reported failure) — this is a CLIENT-SIDE policy refusal that
   // never reaches the worker at all, so it needs its own state rather than
@@ -649,6 +661,48 @@ export function useRunNode() {
       window.removeEventListener("offline", report);
     };
   }, []);
+
+  // PRESENCE HEARTBEAT — lives here, in the hook, because the hook is mounted
+  // app-wide by the sidebar's run-node control while the node itself is owned
+  // by a SharedWorker that outlives any single page. It used to be a
+  // `useEffect` inside the /run-node PAGE, whose cleanup cleared the interval
+  // on unmount: navigating to /network to LOOK at the constellation was itself
+  // what stopped the heartbeat, and the server's 90s presence TTL then expired
+  // the satellite off the very map the user had just opened. The record is
+  // republished well inside that TTL (PRESENCE_REFRESH_MS) for as long as the
+  // node reports a publishable lifecycle, from whatever page is open.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const endpointId = status.endpointId;
+    const state = presenceState(status.lifecycle);
+    if (!endpointId || !state) return;
+    // One publisher per document: /run-node mounts this hook alongside the
+    // sidebar control, and both would otherwise POST the same record on the
+    // same interval. The upsert is idempotent, so this is purely about not
+    // doubling the request rate.
+    if (presenceOwner !== null && presenceOwner !== ownerToken) return;
+    presenceOwner = ownerToken;
+    const publish = () => {
+      const { lat, lon } = readPresenceGeo();
+      upsertPresence({
+        endpoint_id: endpointId,
+        lat,
+        lon,
+        relay_hint: status.relay ?? "",
+        state,
+      }).catch(() => {
+        // Transient publish failures are recovered by the next tick; the
+        // server TTL is 2x this interval, so a single miss never de-orbits
+        // a live node.
+      });
+    };
+    publish();
+    const timer = setInterval(publish, PRESENCE_REFRESH_MS);
+    return () => {
+      clearInterval(timer);
+      if (presenceOwner === ownerToken) presenceOwner = null;
+    };
+  }, [status.endpointId, status.lifecycle, status.relay, ownerToken]);
 
   const stop = useCallback(() => {
     clearLastStart();
