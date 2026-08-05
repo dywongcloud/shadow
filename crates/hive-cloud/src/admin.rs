@@ -1851,6 +1851,13 @@ pub(crate) async fn deploy_zip(
         env: Option<std::collections::BTreeMap<String, String>>,
         #[serde(default)]
         production: Option<bool>,
+        /// Same semantics as the git path's `redeploy`: the upload targets an
+        /// EXISTING same-tenant project, so its name is kept verbatim instead
+        /// of 409ing. Without this flag a same-named re-upload could never
+        /// satisfy the conflict guard (zip has no git index, so `same_repo`
+        /// is always false and both escape hatches were hardcoded off).
+        #[serde(default)]
+        redeploy: Option<bool>,
     }
     let meta: ZipMeta = headers
         .get("x-hive-deploy-meta")
@@ -1861,6 +1868,7 @@ pub(crate) async fn deploy_zip(
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let zip_b64 = base64::engine::general_purpose::STANDARD.encode(body.as_ref());
     let filename = meta.filename.unwrap_or_else(|| "archive.zip".into());
+    let redeploy = meta.redeploy.unwrap_or(false);
     let req = fluid_core::GitDeployRequest {
         repo_url: format!("upload://{filename}"),
         branch: None,
@@ -1877,7 +1885,7 @@ pub(crate) async fn deploy_zip(
         fanout_secondary: false, // coordinator-originated: fanout_remote stamps this per target
         build_config: None,
         function_settings: None,
-        redeploy: false,
+        redeploy,
         zip_b64: Some(zip_b64),
         image_ref: None,
         image_port: None,

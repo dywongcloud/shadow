@@ -19,7 +19,13 @@ const ADMIN_OPS = process.env.HIVE_ADMIN_OPS || ADMIN;
  * cache-control layer (next.config.mjs headers()) -- never `"use cache"`.
  */
 export async function fetchOpsServer<T>(path: string): Promise<T> {
-  const r = await fetch(`${ADMIN_OPS}${path}`, { cache: "no-store" });
+  // Bounded: an unreachable admin host must fail FAST with an honest error,
+  // never hang the server component's render indefinitely — previously a bare
+  // fetch with no timeout at all (ui-cloud-proxy-admin-fallback).
+  const r = await fetch(`${ADMIN_OPS}${path}`, {
+    cache: "no-store",
+    signal: AbortSignal.timeout(10_000),
+  });
   if (!r.ok) throw new Error(`ops GET ${path} -> ${r.status}`);
   return (await r.json()) as T;
 }

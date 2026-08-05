@@ -86,7 +86,11 @@ export default function UploadProjectPage() {
         await switchTeam(team === "personal" ? "__personal__" : team);
       }
       const e = env();
-      const meta = { project: proj, filename: file.name, env: Object.keys(e).length ? e : undefined, production: true };
+      // redeploy: true — a same-named upload to a project the SAME tenant owns
+      // is a redeploy, not a name grab (previously always 409: zip has no git
+      // index so the same_repo exemption could never fire). A name owned by a
+      // DIFFERENT tenant still 409s, which is the guard's real job.
+      const meta = { project: proj, filename: file.name, env: Object.keys(e).length ? e : undefined, production: true, redeploy: true };
       const metaB64 = btoa(unescape(encodeURIComponent(JSON.stringify(meta))));
       const res = await fetch("/cloud/v1/deploy/zip", {
         method: "POST",

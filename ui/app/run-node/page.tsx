@@ -5,7 +5,7 @@ import { MapPin, RadioTower, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
 import { lifecycleLabel, type RunNodeStatus } from "@/lib/run-node-status";
 import { clearPresence, GEO_CONSENT_KEY, GEO_COORDS_KEY } from "@/lib/run-node-client";
-import { usePoll, type Deployment } from "@/lib/api";
+import { usePoll, sessionMintStatus, type Deployment } from "@/lib/api";
 import { resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
 import { TargetPicker, type TargetSelection } from "./target-picker";
 // browser-run-node-target-picker: the persisted selection is the STABLE
@@ -110,10 +110,23 @@ export default function RunNodePage() {
       return "team";
     }
   });
+  // Auth-window guard (bn-picker-auth-window-empty-list-clears-selection):
+  // while the session mint is in backoff/failed, requests proceed
+  // unauthenticated and /deployments answers a REAL 200 scoped to an
+  // anonymous/empty tenant — an [] that is indistinguishable from a genuinely
+  // empty tenant. Judging the selection against THAT [] wiped the persisted
+  // target permanently. Only the two KNOWN-degraded mint states hold
+  // judgment: "ok" is authoritative, "unattempted" covers Clerk-off dev, and
+  // a non-empty list is real data by construction.
+  const mintState = sessionMintStatus().state;
+  const authWindow =
+    deployments !== null &&
+    deployments.length === 0 &&
+    (mintState === "backoff" || mintState === "failed");
   // The digest handed to Start is resolved from the CURRENT snapshot on every
   // render — never from the persisted selection — so a target rotated between
   // page load and click starts the current artifact, not a stale digest.
-  const resolved = selection && deployments ? resolveTarget(deployments, selection.deployment, selection.fn) : null;
+  const resolved = selection && deployments && !authWindow ? resolveTarget(deployments, selection.deployment, selection.fn) : null;
   const selectedTarget = resolved && resolved.ok ? resolved.target : null;
   // Revalidation failure, derived per render: while the list is still loading
   // (including the team-switch window, where usePoll drops data to null)

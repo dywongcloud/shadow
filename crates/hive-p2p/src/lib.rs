@@ -679,16 +679,53 @@ async fn read_frame_max<R: AsyncRead + Unpin>(r: &mut R, max: usize) -> std::io:
 }
 
 /// Read one datagram frame off a raw-target UDP mesh stream: `Ok(Some(bytes))`
-/// per datagram, `Ok(None)` on a clean end-of-stream. Exported so the edge-side
-/// UDP relay speaks byte-identical framing to the owner-side pump in this crate.
+/// per datagram, `Ok(None)` ONLY on a clean end-of-stream at a frame boundary
+/// (zero bytes of the length prefix read). A peer that dies mid-frame — EOF
+/// after 1–3 prefix bytes or mid-payload — is `Err(InvalidData "truncated
+/// datagram frame")`, never a silent clean close: the previous shape mapped
+/// every `UnexpectedEof` to `Ok(None)`, making a mid-write peer death
+/// indistinguishable from a graceful end (p2p-raw-datagram-truncation).
+/// Exported so the edge-side UDP relay speaks byte-identical framing to the
+/// owner-side pump in this crate.
 pub async fn read_raw_datagram<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    match read_frame_max(r, RAW_MAX_DATAGRAM).await {
-        Ok(d) => Ok(Some(d)),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-        Err(e) => Err(e),
+    let mut prefix = [0u8; 4];
+    let mut got = 0;
+    while got < 4 {
+        match r.read(&mut prefix[got..]).await {
+            Ok(0) => {
+                if got == 0 {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "truncated datagram frame: EOF mid length-prefix",
+                ));
+            }
+            Ok(n) => got += n,
+            Err(e) => return Err(e),
+        }
     }
+    let n = u32::from_be_bytes(prefix) as usize;
+    if n > RAW_MAX_DATAGRAM {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too large",
+        ));
+    }
+    let mut v = vec![0u8; n];
+    r.read_exact(&mut v).await.map_err(|e| {
+        if e.kind() == std::io::ErrorKind::UnexpectedEof {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "truncated datagram frame: EOF mid payload",
+            )
+        } else {
+            e
+        }
+    })?;
+    Ok(Some(v))
 }
 
 /// Write one datagram frame (`[u32 len][bytes]`, boundary-preserving) onto a
@@ -1995,6 +2032,19 @@ pub struct PeerPool {
     /// (`close_peer`, `sever_peer`) still work for callers that only know a name,
     /// without reintroducing a second keyspace for the trunks themselves.
     aliases: Mutex<HashMap<String, String>>,
+    /// In-flight first-contact dials, keyed like `trunks`. The FIRST concurrent
+    /// acquire becomes the leader and dials; the rest `subscribe()` and await
+    /// the shared outcome instead of double-handshaking (singleflight — the old
+    /// last-insert-wins shape paid two holepunches per cold peer).
+    inflight: Mutex<
+        HashMap<String, tokio::sync::watch::Sender<Option<Result<Connection, String>>>>,
+    >,
+    /// Per-peer dial generation, bumped ONLY by `close_peer` (a peer-lifecycle
+    /// eviction). Internal dead-trunk evictions stay within the generation. A
+    /// leader dial that completes after its generation moved closes its fresh
+    /// connection instead of publishing it — a stale dial can never resurrect
+    /// a trunk the pool meant to kill.
+    generations: Mutex<HashMap<String, u64>>,
     opened: AtomicU64,
     reused: AtomicU64,
     timeouts: Arc<TimeoutCounters>,
@@ -2007,6 +2057,8 @@ impl PeerPool {
             ep,
             trunks: Mutex::new(HashMap::new()),
             aliases: Mutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
+            generations: Mutex::new(HashMap::new()),
             opened: AtomicU64::new(0),
             reused: AtomicU64::new(0),
             timeouts: Arc::new(TimeoutCounters::default()),
@@ -2092,57 +2144,122 @@ impl PeerPool {
             }
         } // lock dropped: trunk missing or dead → dial below
 
+        // Singleflight: the FIRST concurrent acquire dials as the leader; the
+        // rest subscribe to the shared outcome instead of paying a second
+        // holepunch (previously: last-insert-wins double-dial, with the
+        // displaced connection dropped unclosed).
+        let (signal, leader) = {
+            let mut inflight = self.inflight.lock().await;
+            match inflight.get(&key) {
+                Some(tx) => (tx.clone(), false),
+                None => {
+                    let (tx, _) = tokio::sync::watch::channel(None);
+                    inflight.insert(key.clone(), tx.clone());
+                    (tx, true)
+                }
+            }
+        };
+        if !leader {
+            let mut rx = signal.subscribe();
+            return match rx.wait_for(|v| v.is_some()).await {
+                Ok(guard) => match &*guard {
+                    Some(Ok(conn)) => Ok(conn.clone()),
+                    Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+                    None => Err(anyhow::anyhow!("dial signal resolved empty")),
+                },
+                Err(_) => Err(anyhow::anyhow!("leader dial dropped before completing")),
+            };
+        }
+
+        // Leader path. Record the generation BEFORE dialing: a `close_peer`
+        // landing mid-dial moves it and vetoes the publish below, so a stale
+        // dial can never resurrect a trunk the pool just killed.
+        let gen = *self.generations.lock().await.get(&key).unwrap_or(&0);
+
         // Slow path: dial OUTSIDE the lock, BOUNDED by the connect budget (#H4).
         // A holepunch that never completes would otherwise hang here forever and —
         // since edge.rs walks candidates sequentially — block the whole queue.
-        let budget = connect_budget();
-        let conn = match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
-                // Hard connect error against the CACHED hint. This hint is very often a
-                // stale, never-refreshed snapshot learned second/third-hand via gossip
-                // (see `addr_json` — built once at the peer's own boot, no refresh setter
-                // exists) rather than something this node ever dialed directly. Don't
-                // give up on the peer yet: fall back to fresh discovery below. Log it —
-                // previously this branch discarded the error with zero tracing, which is
-                // exactly how the hk↔sj mesh-flap went unnoticed in production.
-                self.evict(&key).await;
-                tracing::warn!(node_id, err = %e, "p2p connect error using cached hint; retrying via fresh discovery");
-                self.dial_fresh(node_id, id).await?
-            }
-            Err(_) => {
-                // Pre-send timeout against the cached hint: nothing was sent. Rather than
-                // declaring the peer dead outright (the old behavior), give discovery a
-                // real shot — the hint's direct addrs/relay may simply be stale, not the
-                // peer itself.
-                self.timeouts.bump(node_id, PHASE_CONNECT).await;
-                self.evict(&key).await; // stale trunk (if any) is definitely dead
-                tracing::warn!(
-                    node_id,
-                    budget_ms = budget.as_millis() as u64,
-                    "p2p connect timeout using cached hint; retrying via fresh discovery"
-                );
-                self.dial_fresh(node_id, id).await?
-            }
-        };
+        let dialed: Result<Connection> = async {
+            let budget = connect_budget();
+            Ok(match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => {
+                    // Hard connect error against the CACHED hint. This hint is very often a
+                    // stale, never-refreshed snapshot learned second/third-hand via gossip
+                    // (see `addr_json` — built once at the peer's own boot, no refresh setter
+                    // exists) rather than something this node ever dialed directly. Don't
+                    // give up on the peer yet: fall back to fresh discovery below. Log it —
+                    // previously this branch discarded the error with zero tracing, which is
+                    // exactly how the hk↔sj mesh-flap went unnoticed in production.
+                    self.evict(&key).await;
+                    tracing::warn!(node_id, err = %e, "p2p connect error using cached hint; retrying via fresh discovery");
+                    self.dial_fresh(node_id, id).await?
+                }
+                Err(_) => {
+                    // Pre-send timeout against the cached hint: nothing was sent. Rather than
+                    // declaring the peer dead outright (the old behavior), give discovery a
+                    // real shot — the hint's direct addrs/relay may simply be stale, not the
+                    // peer itself.
+                    self.timeouts.bump(node_id, PHASE_CONNECT).await;
+                    self.evict(&key).await; // stale trunk (if any) is definitely dead
+                    tracing::warn!(
+                        node_id,
+                        budget_ms = budget.as_millis() as u64,
+                        "p2p connect timeout using cached hint; retrying via fresh discovery"
+                    );
+                    self.dial_fresh(node_id, id).await?
+                }
+            })
+        }
+        .await;
 
-        // Re-lock to publish the trunk. A concurrent first-contact may double-dial;
-        // that's fine — last insert wins and the extra connection drops (closes).
+        // Publish under the generation fence, then complete the shared cell so
+        // every waiter resolves with the same outcome. The LEADER keeps its
+        // original typed error (e.g. DeadPeerTimeout, which callers and
+        // witnesses downcast); only the wire to waiters is stringified.
+        let (shared, own): (Result<Connection, String>, Result<Connection>) = match dialed {
+            Ok(conn) => {
+                let now = *self.generations.lock().await.get(&key).unwrap_or(&0);
+                if now == gen {
+                    {
+                        let mut map = self.trunks.lock().await;
+                        if let Some(old) = map.insert(key.clone(), Trunk { conn: conn.clone() }) {
+                            // The displaced trunk (e.g. a severed-in-place
+                            // connection) must be closed EXPLICITLY — dropping
+                            // it closes silently, with no code and no reason.
+                            old.conn.close(0u32.into(), b"replaced by fresh trunk");
+                        }
+                    }
+                    // Remember how this caller referred to the peer so the label-taking
+                    // helpers can find the trunk without a second keyspace.
+                    if node_id != key {
+                        self.aliases
+                            .lock()
+                            .await
+                            .insert(node_id.to_string(), key.clone());
+                    }
+                    self.opened.fetch_add(1, Ordering::Relaxed);
+                    tracing::info!(node_id, key = %key, "trunk opened");
+                    (Ok(conn.clone()), Ok(conn))
+                } else {
+                    conn.close(0u32.into(), b"dial superseded by eviction");
+                    tracing::info!(node_id, key = %key, "dial superseded by eviction; fresh connection closed");
+                    (
+                        Err("dial superseded by eviction".to_string()),
+                        Err(anyhow::anyhow!("dial superseded by eviction")),
+                    )
+                }
+            }
+            Err(e) => (Err(format!("{e}")), Err(e)),
+        };
         {
-            let mut map = self.trunks.lock().await;
-            map.insert(key.clone(), Trunk { conn: conn.clone() });
+            let mut inflight = self.inflight.lock().await;
+            if inflight.get(&key).is_some_and(|tx| tx.same_channel(&signal)) {
+                inflight.remove(&key);
+            }
+            let _ = signal.send(Some(shared));
         }
-        // Remember how this caller referred to the peer so the label-taking
-        // helpers can find the trunk without a second keyspace.
-        if node_id != key {
-            self.aliases
-                .lock()
-                .await
-                .insert(node_id.to_string(), key.clone());
-        }
-        self.opened.fetch_add(1, Ordering::Relaxed);
-        tracing::info!(node_id, key = %key, "trunk opened");
-        Ok(conn)
+        own
     }
 
     /// Fallback dial using ONLY the peer's `EndpointId` — no cached direct addrs,
@@ -2680,6 +2797,10 @@ impl PeerPool {
     /// the very eviction meant to clear it.
     pub async fn close_peer(&self, node_id: &str) {
         let key = self.canonical_key(node_id).await;
+        // Bump the generation FIRST so any leader dial still in flight for this
+        // peer is fenced: its publish check fails and it closes its fresh
+        // connection instead of resurrecting the trunk we are killing here.
+        *self.generations.lock().await.entry(key.clone()).or_insert(0) += 1;
         if let Some(t) = self.trunks.lock().await.remove(&key) {
             t.conn.close(0u32.into(), b"closed by pool");
         }
