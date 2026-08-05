@@ -2710,7 +2710,7 @@ async fn dep_create(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<fluid_core::DeployRequest>,
-) -> Json<Value> {
+) -> Result<Json<Value>, (StatusCode, String)> {
     // Tag the deployment (and the cells it spawns) with the caller's tenant so
     // compute is partitioned per team — mirrors gw.deploy()'s defaults otherwise.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
@@ -2726,6 +2726,26 @@ async fn dep_create(
     // the record is registered/persisted. No-op for HTTP-only manifests.
     let mut manifest = req.manifest;
     let project = manifest.project.clone();
+    // Browser-function contract enforcement (bn-launch-blocked-assets-never-deployed):
+    // this route runs NO bundle/persist step, so a manifest carrying a browser
+    // policy would present as loudly-ineligible forever, and a client-supplied
+    // `browser_artifact` descriptor would admit donors whose artifact fetch
+    // then 404s on every node. Mirror the git path's rule — an opt-in that
+    // cannot produce real bytes fails loudly — by rejecting browser policies
+    // here and stripping any descriptor: the ONLY legitimate descriptor
+    // source is the git build pipeline.
+    for f in &mut manifest.functions {
+        if f.browser.is_some() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "function {:?} opts into browser serving, but POST /deployments runs no bundle/persist step; browser opt-ins must deploy through the git build path",
+                    f.name
+                ),
+            ));
+        }
+        f.browser_artifact = None;
+    }
     if let Err(e) =
         crate::raw_ports::allocate_raw_ports_coordinated(&c, &project, &mut manifest).await
     {
@@ -2743,7 +2763,7 @@ async fn dep_create(
     // Persist so the deployment survives a node restart (without this it lived
     // only in memory and was lost on reboot).
     crate::persist::persist(&c);
-    Json(json!(info))
+    Ok(Json(json!(info)))
 }
 
 /// Roll back / promote: make an existing deployment the project's production.

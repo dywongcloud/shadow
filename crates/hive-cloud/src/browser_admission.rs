@@ -530,6 +530,106 @@ pub fn routes() -> Router<Arc<CloudState>> {
             get(get_admission).delete(revoke_admission),
         )
         .route("/v1/browser/stats", get(browser_stats))
+        .route(
+            "/v1/browser/deployments/:id/status",
+            get(deployment_status),
+        )
+}
+
+/// Tenant-scoped "is my browser function actually being served right now"
+/// (browser-node-post-deploy-observability): ONE call joining the deployment's
+/// descriptors, the live admissions pinned to them, those endpoints' presence
+/// state, the artifact host set, and this node's locally-verified byte copy —
+/// the join that previously had to be done client-side across three endpoints
+/// (and for artifact availability was impossible at all).
+async fn deployment_status(
+    State(cloud): State<Arc<CloudState>>,
+    claims: Claims,
+    Path(id): Path<String>,
+) -> ApiResult {
+    let claims = claims_required(claims)?;
+    let tenant = crate::admin::norm(&claims.tenant).to_string();
+    let now = hive_core::now_ms();
+
+    // Resolve the deployment across local records first, then the gossiped
+    // peer view — foreign tenant and unknown id are the identical 404, no
+    // existence leak (the resolve_for_tenant precedent).
+    let mut found: Option<(String, Vec<fluid_core::BrowserArtifact>)> = None;
+    for record in cloud.gw.deployment_records() {
+        if record.id != id || crate::admin::record_tenant(&record.tenant) != tenant {
+            continue;
+        }
+        found = Some((
+            record.manifest.project.clone(),
+            record
+                .manifest
+                .functions
+                .iter()
+                .filter_map(|f| f.browser_artifact.clone())
+                .collect(),
+        ));
+        break;
+    }
+    if found.is_none() {
+        let peers = cloud.peer_deployments.read();
+        'outer: for (_, deployments) in peers.iter() {
+            for info in deployments {
+                if info.id.0 == id && crate::admin::record_tenant(&info.tenant) == tenant {
+                    found = Some((
+                        info.project.clone(),
+                        info.browser_functions
+                            .iter()
+                            .map(|bf| bf.artifact.clone())
+                            .collect(),
+                    ));
+                    break 'outer;
+                }
+            }
+        }
+    }
+    let Some((project, descriptors)) = found else {
+        return Err((StatusCode::NOT_FOUND, "deployment not found".into()));
+    };
+
+    let admissions = cloud.browser_admissions.list(&tenant, now);
+    let presence = cloud.browser_presence.list(&tenant, now);
+    let mut functions = Vec::new();
+    for descriptor in &descriptors {
+        let live: Vec<_> = admissions
+            .iter()
+            .filter(|a| a.deployment == id && a.digest == descriptor.policy_digest)
+            .collect();
+        let online = presence
+            .iter()
+            .filter(|p| {
+                p.state == "online" && live.iter().any(|a| a.endpoint_id == p.endpoint_id)
+            })
+            .count();
+        let artifact_hosts =
+            crate::browser_artifacts::resolve_for_tenant(&cloud, &tenant, &descriptor.policy_digest)
+                .map(|r| r.hosts)
+                .unwrap_or_default();
+        let local_verified = crate::browser_artifacts::read_verified(descriptor)
+            .await
+            .is_some();
+        functions.push(json!({
+            "policy_digest": descriptor.policy_digest,
+            "source_bytes": descriptor.source_bytes,
+            "live_admissions": live.len(),
+            "presence_online": online,
+            "artifact_hosts": artifact_hosts,
+            "artifact_local_verified": local_verified,
+        }));
+    }
+    Ok(Json(json!({
+        "deployment": id,
+        "project": project,
+        "browser_functions": functions,
+        "admissions": admissions
+            .iter()
+            .filter(|a| a.deployment == id)
+            .collect::<Vec<_>>(),
+    })))
 }
 
 /// Bounded, tenant-free operational counters (bn-p2p-observability): global

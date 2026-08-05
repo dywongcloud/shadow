@@ -6,7 +6,18 @@ import { resolveTargetFresh } from "./run-node-targets";
 import { applyStatus, HOST_ABI_VERSION, initialRunNodeStatus, type RunNodeStatus } from "./run-node-status";
 import { presenceState, readPresenceGeo, upsertPresence } from "./run-node-client";
 
-const WORKER_URL = "/run-node-worker.js";
+/* The ABI version is part of the worker's IDENTITY, not just something it
+ * reports. A SharedWorker is keyed by (url, name) and OUTLIVES page reloads
+ * for as long as any tab holds it — so before this, shipping a new worker
+ * build did nothing for anyone with a tab already open: every reload
+ * re-attached to the OLD instance, which kept requesting the old
+ * `?v=<WASM_BUNDLE_VERSION>` wasm (cache-first in sw.js) and kept throwing an
+ * error string that no longer exists in the deployed binary. The only
+ * documented remedy was "close every tab first", which no user will discover.
+ * Versioning the url + name makes a post-deploy page attach to a genuinely
+ * new worker immediately; the stale one simply dies with its last tab. */
+const WORKER_URL = `/run-node-worker.js?abi=${HOST_ABI_VERSION}`;
+const WORKER_NAME = `shadw-run-node-v${HOST_ABI_VERSION}`;
 /** Well inside the backend's 90s presence TTL, so one missed publish never
  *  de-orbits a live node from the constellation. */
 const PRESENCE_REFRESH_MS = 45_000;
@@ -310,7 +321,7 @@ export function useRunNode() {
 
       const connect = (): boolean => {
         try {
-          worker = new SharedWorker(WORKER_URL, { type: "module", name: "shadw-run-node" });
+          worker = new SharedWorker(WORKER_URL, { type: "module", name: WORKER_NAME });
         } catch {
           // Real, pre-existing eslint react-hooks/set-state-in-effect violation,
           // fixed while touching this file for the host-ABI-versioning change

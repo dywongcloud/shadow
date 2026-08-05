@@ -49,7 +49,7 @@ const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease windo
 // plain page reload does NOT replace; every connecting tab has to close
 // first). Fixed on the status object below, never patched, so it survives
 // every `{...status, ...patch}` spread in setStatus() untouched.
-const HOST_ABI_VERSION = 1;
+const HOST_ABI_VERSION = 2;
 // bn-p2p-version-negotiation (PWA wasm bundle): must match
 // crates/hive-browser/src/lib.rs's wasm_bundle_version() return value --
 // checked live against the ACTUAL loaded module right after init() succeeds

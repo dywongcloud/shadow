@@ -28,7 +28,15 @@ export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
  *  hive_browser_proto::BROWSER_PROTOCOL_VERSION -- a plain JS file served
  *  from public/ can't import a TS module, so this can't be a single shared
  *  export). */
-export const HOST_ABI_VERSION = 1;
+/* v2 (2026-08-05): the worker's boot/admission behaviour changed materially
+ * (non-fatal relay-online wait + wasm v15, session re-mint, endpointId reset).
+ * Bumping is not cosmetic — a live SharedWorker survives page reloads, so
+ * without a bump every already-open tab kept serving the PREVIOUS worker
+ * build and users kept hitting an error string that no longer exists in the
+ * deployed wasm. `use-run-node.ts` now also embeds this number in the worker
+ * URL and SharedWorker name, which is what actually forces a fresh worker;
+ * this constant remains the detector of last resort. */
+export const HOST_ABI_VERSION = 2;
 
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one

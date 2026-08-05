@@ -139,7 +139,7 @@ impl BrowserPresenceStore {
         }
     }
 
-    fn list(&self, tenant: &str, now: u64) -> Vec<BrowserPresence> {
+    pub(crate) fn list(&self, tenant: &str, now: u64) -> Vec<BrowserPresence> {
         self.inner
             .lock()
             .active

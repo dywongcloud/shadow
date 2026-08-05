@@ -761,7 +761,7 @@ fn verify_bytes(descriptor: &BrowserArtifact, bytes: &[u8]) -> bool {
 /// Read the local store copy for `descriptor`, verified. `None` on any
 /// miss/mismatch — a corrupted store file is treated as absent so the caller
 /// falls through to the owner proxy instead of serving bad bytes.
-async fn read_verified(descriptor: &BrowserArtifact) -> Option<Vec<u8>> {
+pub(crate) async fn read_verified(descriptor: &BrowserArtifact) -> Option<Vec<u8>> {
     let (js_path, _) = digest_paths(&descriptor.policy_digest).ok()?;
     let md = tokio::fs::metadata(&js_path).await.ok()?;
     if md.len() > MAX_ARTIFACT_BYTES || md.len() != descriptor.source_bytes {

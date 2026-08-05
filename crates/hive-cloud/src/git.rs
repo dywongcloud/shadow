@@ -46,6 +46,12 @@ pub struct Build {
     pub deployment_id: Option<String>,
     #[serde(default)]
     pub alias: Option<String>,
+    /// Set when a NEWER build of the same project started while this one was
+    /// in flight — `run_build` checks it just before `deploy_full` and vetoes
+    /// its own production flip, so the last flip is always the newest push,
+    /// never merely the last-finishing build (latest-push-wins).
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     #[serde(default)]
     pub lines: Vec<LogLine>,
 }
@@ -357,6 +363,23 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         .project
         .clone()
         .unwrap_or_else(|| project_name_from_url(&req.repo_url));
+    // Latest-push-wins coalescing (bn-launch-sequencing-rebuild-before-deploy):
+    // any in-flight build of the same project is now stale — mark it superseded
+    // so it vetoes its own production flip just before `deploy_full`. Without
+    // this, two rapid pushes race to the production alias and the LAST FINISH
+    // wins regardless of commit freshness (an older commit's slow build could
+    // regress production indefinitely).
+    for b in cloud.builds.list() {
+        if b.project == project && matches!(b.state, DeployState::Queued | DeployState::Building) {
+            cloud.builds.update(&b.id, |old| {
+                old.superseded_by = Some(id.clone());
+                old.lines.push(LogLine {
+                    ts_ms: now_ms(),
+                    line: format!("superseded by newer build {id}"),
+                });
+            });
+        }
+    }
     cloud.builds.insert(Build {
         id: id.clone(),
         project: project.clone(),
@@ -369,6 +392,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         finished_ms: None,
         deployment_id: None,
         alias: None,
+        superseded_by: None,
         lines: Vec::new(),
     });
 
@@ -467,6 +491,7 @@ pub(crate) fn redeploy_on_host(
         finished_ms: None,
         deployment_id: None,
         alias: None,
+        superseded_by: None,
         lines: Vec::new(),
     });
     let bid = id.clone();
@@ -1673,6 +1698,16 @@ async fn run_build(
     // Capture vercel.json crons before the manifest is moved into the gateway —
     // they're registered (production only) after the deployment is live.
     let cron_specs = manifest.crons.clone();
+
+    // Build-inversion veto (bn-launch-sequencing-rebuild-before-deploy): the
+    // newer build marked this one superseded at `start_build`; honor it just
+    // before the production flip so the newest push's record is the one that
+    // lands, never merely the last-finishing build.
+    if let Some(newer) = cloud.builds.get(bid).and_then(|b| b.superseded_by) {
+        return Err(anyhow::anyhow!(
+            "build superseded by newer build {newer} for project {project}; skipping the production flip"
+        ));
+    }
 
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
@@ -6509,6 +6544,7 @@ mod tests {
             finished_ms: None,
             deployment_id: None,
             alias: None,
+            superseded_by: None,
             lines: Vec::new(),
         });
         store.log("dpl-test", "building…");
