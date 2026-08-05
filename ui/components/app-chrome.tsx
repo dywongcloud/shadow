@@ -66,6 +66,11 @@ export function ChromeBottom() {
         <GitOps />
         <CommandBar />
         <PendingBuildsProvider />
+        {/* Dev-mint keeper (bn-local-dev-clerk-hydration-gap): mounts the same
+            cookie-mint component the Clerk path uses when the local dev-mint
+            flag is on, so the hive_jwt cookie re-mints on its 50-minute cadence
+            and the 401-remint path is exercised locally too. */}
+        {process.env.NEXT_PUBLIC_HIVE_DEV_MINT === "1" && <SessionToken />}
       </>
     );
   }

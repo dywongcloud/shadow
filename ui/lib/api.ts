@@ -18,6 +18,13 @@ const BASE = "/cloud";
  * pollers re-fetch under the correct namespace. With Clerk disabled (local
  * single-user dev) plain "personal" is correct. */
 const CLERK_ON = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+// Dev-mint (bn-local-dev-clerk-hydration-gap): with the auth bypass on and no
+// Clerk keys, /api/token mints a LOCAL JWT for the requested team, so local
+// full-page testing exercises the real mint→cookie→JWT-tenant path instead of
+// the anonymous/empty tenant. MINT_ON gates the same auto-mint paths CLERK_ON
+// does (session keeper + 401/403 re-mint).
+const DEV_MINT = process.env.NEXT_PUBLIC_HIVE_DEV_MINT === "1";
+const MINT_ON = CLERK_ON || DEV_MINT;
 
 export function currentTeam(): string {
   if (typeof window === "undefined") return "personal";
@@ -171,7 +178,7 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   // AUTOMATIC mint path, so it also respects the shared failure budget: while
   // minting is in backoff or suspended (`failed`), re-minting here cannot
   // succeed any harder than it just did, so the response propagates as-is.
-  if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && CLERK_ON) {
+  if ((r.status === 401 || r.status === 403) && typeof window !== "undefined" && MINT_ON) {
     const now = Date.now();
     if (mintState === "failed" || now < mintNextAutoAttemptAt) return r;
     if (now - lastAutoMintAt < AUTO_MINT_COOLDOWN_MS) return r;
@@ -275,7 +282,7 @@ function noteMintOutcome(granted: string | null): void {
  */
 let sessionMintPromise: Promise<void> | null = null;
 export function ensureSessionMinted(): Promise<void> {
-  if (typeof window === "undefined" || !CLERK_ON) return Promise.resolve();
+  if (typeof window === "undefined" || !MINT_ON) return Promise.resolve();
   if (sessionMintPromise) return sessionMintPromise; // in-flight or settled-ok: share it
   if (mintState === "ok") return Promise.resolve(); // an explicit mint already succeeded
   if (mintState === "failed" || Date.now() < mintNextAutoAttemptAt) {

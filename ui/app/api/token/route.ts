@@ -40,7 +40,53 @@ const OWNER_EMAILS = new Set(
  */
 export async function POST(req: NextRequest) {
   if (!clerkEnabled) {
-    return NextResponse.json({ ok: false, reason: "clerk-disabled" });
+    // Dev-mint branch (bn-local-dev-clerk-hydration-gap): with the auth bypass
+    // on (the same NODE_ENV-gated condition as ui/proxy.ts's hatch) and no
+    // Clerk keys, mint a LOCAL JWT for the requested team so full-page local
+    // testing exercises the REAL production mint→cookie→JWT-tenant path
+    // (401-remint included) instead of reading the anonymous/empty tenant.
+    // Never production-reachable by construction.
+    const devMint = process.env.HIVE_AUTH_BYPASS === "1" && process.env.NODE_ENV !== "production";
+    if (!devMint) {
+      return NextResponse.json({ ok: false, reason: "clerk-disabled" });
+    }
+    let team = "personal";
+    try {
+      const t = String(((await req.json()) as { team?: unknown })?.team ?? "").trim();
+      if (t && t !== "__pending__") team = t;
+    } catch {
+      /* no/invalid body → default to personal */
+    }
+    try {
+      const r = await fetch(`${ADMIN}/v1/token`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(INTERNAL ? { "x-hive-internal": INTERNAL } : {}) },
+        // `email` lets the backend derive `platform_admin` from its own
+        // HIVE_OWNER_EMAIL — the dev mint asserts no platform claim itself.
+        body: JSON.stringify({ sub: "local-dev", tenant: team, role: "owner", email: process.env.HIVE_OWNER_EMAIL || "" }),
+        cache: "no-store",
+      });
+      if (!r.ok) {
+        return NextResponse.json({ ok: false, reason: `mint-failed-${r.status}` }, { status: 502 });
+      }
+      const d = await r.json();
+      const token = d.token || "";
+      const expiresIn = d.expires_in || 3600;
+      if (!token) {
+        return NextResponse.json({ ok: true, tenant: team, enforced: false });
+      }
+      const res = NextResponse.json({ ok: true, tenant: team, role: "owner", dev: true });
+      res.cookies.set("hive_jwt", token, {
+        httpOnly: true,
+        secure: false, // local-only branch (NODE_ENV !== "production" above)
+        sameSite: "lax",
+        path: "/",
+        maxAge: Math.max(60, expiresIn - 30),
+      });
+      return res;
+    } catch {
+      return NextResponse.json({ ok: false, reason: "mint-unreachable" }, { status: 502 });
+    }
   }
   let userId: string | null = null;
   try {
