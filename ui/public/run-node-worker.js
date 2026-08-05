@@ -1483,28 +1483,30 @@ async function start(msg) {
         `wasm_bundle_stale: loaded module reports version ${loadedWasmVersion}, this worker expects ${WASM_BUNDLE_VERSION} — reload to fetch the current bundle`,
       );
     }
-    // Identity persistence (bn-impl-key-persistence): boot a throwaway node
-    // ONLY to obtain a fresh seed if none is persisted yet, then re-boot from
-    // the persisted seed so the reported id is stable across reloads.
+    // Identity persistence (bn-impl-key-persistence): `loadOrCreateSeed`'s
+    // candidate is only ever READ when no seed is persisted yet (see
+    // identity.js's `existing` branches — an existing record never touches
+    // it), so it needs no network boot to produce: a raw 32 bytes from
+    // WebCrypto's CSPRNG is exactly what an ed25519 seed is, identical in
+    // distribution to what `BrowserNode.boot()`'s internal `SecretKey`
+    // generation would have produced. Previously this called
+    // `BrowserNode.boot(...)` TWICE in series on a cold start with no
+    // persisted seed — a full throwaway network boot (bind + the
+    // `RELAY_ONLINE_TIMEOUT` wait inside it) purely to read
+    // `scratch.secretHex()`, discarded unread on every RETURNING user's boot
+    // (`existing` present) and, worse, on a first-ever boot, DOUBLING both
+    // the relay-online wait and its failure probability before the node the
+    // user actually gets ever starts connecting — exactly the shape of a
+    // "browser relay online deadline exceeded" report on a cold start.
     // `persistence` (bn-safari-sharedworker-cryptokey-dataclone) reports WHICH
     // custody mode holds the identity — "memory" means a worker restart on
     // this engine forfeits it; surfaced in status below, never hidden.
-    const scratch = await BrowserNode.boot(orderedRelay, null, null);
-    booted = scratch;
-    if (myEpoch !== epoch) {
-      await discardStaleAttempt(scratch, null, msg.team);
-      return;
-    }
-    const { seedHex, created, persistence } = await loadOrCreateSeed(scratch.secretHex());
-    let n;
-    if (created) {
-      n = scratch;
-    } else {
-      await scratch.close();
-      scratch.free();
-      booted = null;
-      n = await BrowserNode.boot(orderedRelay, msg.discovery || null, seedHex);
-    }
+    const freshSeedHex = Array.from(crypto.getRandomValues(new Uint8Array(32)))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("");
+    const { seedHex, persistence } = await loadOrCreateSeed(freshSeedHex);
+    if (myEpoch !== epoch) return; // stop() ran during identity load
+    const n = await BrowserNode.boot(orderedRelay, msg.discovery || null, seedHex);
     booted = n;
     if (myEpoch !== epoch) {
       await discardStaleAttempt(booted, null, msg.team);

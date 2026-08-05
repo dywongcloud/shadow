@@ -1438,10 +1438,79 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(region=%region, node=%args.name, public=%args.listen, admin=%args.admin, tls=%tls_addr, "hive-cloud node up");
 
+    // The loopback admin listener serves the raw admin router, and the
+    // dashboard's /cloud proxy targets it (HIVE_ADMIN=127.0.0.1:8786) — so a
+    // dashboard-driven mutation was handled by WHICHEVER node hosted that
+    // dashboard and never reached the control-plane leader (only the public
+    // admin_ingress forwarded). Witnessed 2026-08-04: an admission granted on
+    // a follower never appeared on the leader, and browser serving never
+    // engaged through the public ingress. Mirror admin_ingress's discipline
+    // here: mutations on a non-leader forward to the leader; reads stay local.
+    let admin_router = admin_router.layer(axum::middleware::from_fn_with_state(
+        (
+            cloud.clone(),
+            format!("api.{}", cloud.platform_domain),
+        ),
+        admin_loopback_forward,
+    ));
+
     let pub_srv = serve(public, args.listen, "public");
     let adm_srv = serve(admin_router, args.admin, "admin");
     tokio::try_join!(pub_srv, adm_srv)?;
     Ok(())
+}
+
+/// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
+/// to the raw admin listener). Reads serve locally; mutations on a non-leader
+/// forward to the current leader over the SNI-pinned client. Chain
+/// termination + internal hops: a request marked x-hive-admin-forwarded
+/// (forwarded by a peer) or x-hive-internal (service hop) is always served
+/// locally; /v1/token is stateless HS256 minting and must never depend on
+/// leader reachability.
+async fn admin_loopback_forward(
+    axum::extract::State((cloud, api_host)): axum::extract::State<(std::sync::Arc<state::CloudState>, String)>,
+    req: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
+    // Chain termination with the same anti-spoof rule admin_ingress applies: a
+    // forwarded-marked mutation is only ever applied on the CURRENT leader —
+    // landing anywhere else means a forged marker or a mid-flight leadership
+    // change, both refused with 503 (the client retries and re-resolves).
+    if req.headers().contains_key("x-hive-admin-forwarded") {
+        if is_mutation && !cloud.is_control_plane_leader() {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "not control-plane leader",
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
+    if !is_mutation
+        || req.uri().path() == "/v1/token"
+        || req.headers().contains_key("x-hive-internal")
+        || cloud.is_control_plane_leader()
+    {
+        return next.run(req).await;
+    }
+    // Forward to the leader over the public SNI-pinned HTTPS ingress — the
+    // exact helper admin_ingress uses (production-proven transport), never a
+    // second bespoke path.
+    let leader_ip = cloud
+        .leader_node()
+        .and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
+    if let Some(ip) = leader_ip {
+        if let Some(client) = leader_client(&ip, &api_host) {
+            return admin_forward_to_leader(client, &api_host, cloud.cluster.epoch(), req).await;
+        }
+    }
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "control-plane leader unreachable",
+    )
+        .into_response()
 }
 
 /// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the
