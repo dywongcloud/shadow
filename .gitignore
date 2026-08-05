@@ -44,3 +44,8 @@ ansible/.vault_pass
 # agentplug-runner single-shot dispatch scratch (used when the shared
 # daemon is wedged; pure runtime state, regenerated per dispatch).
 .agentplug/
+# Local operator scratch notes that landed in the repo root (integration
+# error dumps, one-off breadcrumbs) — kept on disk, never repo content.
+/1
+/wqall
+/error.txt_*
