@@ -109,17 +109,38 @@ function fanOutCollisions<T extends { x: number; y: number }>(points: T[], radiu
     const key = `${p.x.toFixed(1)}_${p.y.toFixed(1)}`;
     (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
   }
+  // The ring must never be wider than the gap to the NEAREST OTHER cluster, or
+  // a multi-node city smears into its neighbour and the two visually swap
+  // members. Witnessed live on this 100x62 world projection: San Jose lands at
+  // (16.12, 20.08) and Los Angeles at (17.15, 21.51) — only 1.76 units apart —
+  // so a fixed 1.6 ring threw a San Jose marker out to x=17.72 (PAST Los
+  // Angeles' centre) and a Los Angeles marker to x=15.55 (inside the Bay Area
+  // cluster). The markers were at their correct coordinates; the fan-out was
+  // what moved them into the wrong city. Clamping to a third of the gap keeps
+  // every ring comfortably inside its own territory, while `radius` still caps
+  // it so an isolated cluster fans out exactly as before.
+  const centres = Array.from(groups.values(), (g) => ({ x: g[0].x, y: g[0].y }));
   const out: T[] = [];
-  for (const group of groups.values()) {
+  Array.from(groups.values()).forEach((group, gi) => {
     if (group.length === 1) {
       out.push(group[0]);
-      continue;
+      return;
     }
+    let nearest = Infinity;
+    for (let i = 0; i < centres.length; i++) {
+      if (i === gi) continue;
+      const d = Math.hypot(centres[i].x - centres[gi].x, centres[i].y - centres[gi].y);
+      if (d < nearest) nearest = d;
+    }
+    // `nearest` stays Infinity when this is the only cluster — then the caller's
+    // radius applies unchanged. The lower bound keeps a dense cluster from
+    // collapsing onto a single indistinguishable point.
+    const r = Math.max(0.35, Math.min(radius, nearest / 3));
     group.forEach((p, i) => {
       const angle = (2 * Math.PI * i) / group.length;
-      out.push({ ...p, x: p.x + radius * Math.cos(angle), y: p.y + radius * Math.sin(angle) });
+      out.push({ ...p, x: p.x + r * Math.cos(angle), y: p.y + r * Math.sin(angle) });
     });
-  }
+  });
   return out;
 }
 
@@ -168,25 +189,12 @@ export function RegionMap({
           m.color || (m.isGpu ? GPU_COLOR : autoColor ? PALETTE[i % PALETTE.length] : "#10b981");
         return { ...m, x, y, color };
       });
-    const groups = new Map<string, typeof proj>();
-    for (const p of proj) {
-      const key = `${p.x.toFixed(1)}_${p.y.toFixed(1)}`;
-      (groups.get(key) ?? groups.set(key, []).get(key)!).push(p);
-    }
-    const out: typeof proj = [];
-    for (const group of groups.values()) {
-      if (group.length === 1) {
-        out.push(group[0]);
-        continue;
-      }
-      // Fan co-located markers out around a small ring so each is visible.
-      const radius = 1.6;
-      group.forEach((p, i) => {
-        const angle = (2 * Math.PI * i) / group.length;
-        out.push({ ...p, x: p.x + radius * Math.cos(angle), y: p.y + radius * Math.sin(angle) });
-      });
-    }
-    return out;
+    // Fan co-located markers out around a small ring so each is visible. This
+    // used to be a hand-inlined copy of `fanOutCollisions` that drifted from it
+    // (it never gained the neighbour clamp), which is exactly how Los Angeles
+    // ended up rendering inside the Bay Area cluster — one shared
+    // implementation now, so a fix here can never miss one of the two callers.
+    return fanOutCollisions(proj, 1.6);
   }, [markers, autoColor]);
 
   const placedSatellites = useMemo(() => {
