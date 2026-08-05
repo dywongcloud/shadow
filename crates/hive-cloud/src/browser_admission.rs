@@ -692,6 +692,40 @@ fn fresh_user_claims(claims: Claims) -> Result<crate::auth::Claims, AdmissionFai
     Ok(claims)
 }
 
+/// Divisions (Clerk org tenants) whose MEMBERS — not just owners/admins — may
+/// run a PUBLIC browser node. `HIVE_PUBLIC_NODE_TENANTS` (comma-separated,
+/// normalized) overrides; defaults to `thoth-division`. A member operating
+/// under one of these tenants mints `role: "member"` (Clerk-verified at mint),
+/// which the base owner/admin gate would otherwise reject.
+fn public_node_tenants() -> Vec<String> {
+    let raw = std::env::var("HIVE_PUBLIC_NODE_TENANTS")
+        .unwrap_or_else(|_| "thoth-division".to_string());
+    raw.split(',')
+        .map(|s| crate::admin::norm(s).to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// May this caller run a PUBLIC-scope browser node?
+///
+/// Public serving exposes a deployment to ANY anonymous donor, so it stays
+/// gated — but the gate is now three ways, not "team owner/admin" alone:
+///   * `platform_admin` — the operator email allowlist (owner_email +
+///     HIVE_ADMIN_EMAILS); this is what grants the four named admin emails on
+///     whatever tenant they hold.
+///   * tenant-scoped `owner`/`admin` — unchanged; every personal namespace
+///     mints `owner`, so this already covered a user's own deployments.
+///   * membership in a public-node division (see `public_node_tenants`) — the
+///     "anyone in thoth division too" grant, keyed on the Clerk-verified
+///     `tenant` claim so no email lookup is needed and it can't be spoofed.
+fn may_serve_public(claims: &crate::auth::Claims) -> bool {
+    if claims.platform_admin || matches!(claims.role.as_str(), "owner" | "admin") {
+        return true;
+    }
+    let tenant = crate::admin::norm(&claims.tenant).to_string();
+    public_node_tenants().iter().any(|t| *t == tenant)
+}
+
 /// Proof-of-possession (bn-p2p-heartbeat-lease): reject an admission whose
 /// `challenge_ms` is stale (bounds replay of a captured signature to this
 /// window, rather than forever — there is no separate nonce round trip, so
@@ -811,11 +845,11 @@ fn validate_request(
             "invalid browser function target",
         ));
     }
-    if request.scope == BrowserScope::Public && !matches!(claims.role.as_str(), "owner" | "admin") {
+    if request.scope == BrowserScope::Public && !may_serve_public(claims) {
         return Err(AdmissionFailure::terminal(
             StatusCode::FORBIDDEN,
             "public_scope_forbidden",
-            "public browser serving requires a team owner or admin",
+            "public browser serving requires a platform admin, a team owner/admin, or membership in a public-node division",
         ));
     }
     let tenant = crate::admin::norm(&claims.tenant).to_string();

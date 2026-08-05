@@ -394,7 +394,7 @@ export default function RunNodePage() {
               className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
             >
               <option value="team">Team only</option>
-              <option value="public">Public (requires owner/admin)</option>
+              <option value="public">Public (admins &amp; public-node divisions)</option>
             </select>
           </Field>
         </div>

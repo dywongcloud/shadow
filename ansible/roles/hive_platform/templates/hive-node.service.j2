@@ -62,6 +62,8 @@ Environment=HIVE_HEALTH_TIMEOUT={{ hive_health_timeout | default(10) }}
 Environment=HIVE_HEALTH_INTERVAL={{ hive_health_interval | default(15) }}
 Environment=HIVE_HEALTH_FAIL_THRESHOLD={{ hive_health_fail_threshold | default(2) }}
 Environment=HIVE_OWNER_EMAIL={{ hive_owner_email }}
+Environment=HIVE_ADMIN_EMAILS={{ hive_admin_emails | default('') }}
+Environment=HIVE_PUBLIC_NODE_TENANTS={{ hive_public_node_tenants | default('thoth-division') }}
 Environment=HIVE_JWT_SECRET={{ vault_hive_jwt_secret }}
 Environment=HIVE_INTERNAL_TOKEN={{ vault_hive_internal_token }}
 {% if vault_stripe_secret_key %}

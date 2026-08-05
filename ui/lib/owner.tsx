@@ -9,7 +9,14 @@
 
 import { useUser } from "@clerk/nextjs";
 
-const ADMIN_EMAILS = new Set(["dylanwong007@gmail.com", "dylan@shadw.com"]);
+const ADMIN_EMAILS = new Set([
+  "dylanwong007@gmail.com",
+  "dylan@shadw.com",
+  "noahbladenbankers@gmail.com",
+  "dylan@simplyfi.cloud",
+  "dylan@shadw.cloud",
+  "dylan@weave.cloud",
+]);
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 

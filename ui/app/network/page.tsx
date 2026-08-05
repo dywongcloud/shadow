@@ -48,8 +48,8 @@ export default function NetworkPage() {
                 cubes blue with no legend entry is just an unexplained color. */}
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#3b82f6]" /> GPU</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#9ca3af]" /> unhealthy</span>
-            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — never counted as fleet capacity">
-              <span className="inline-block h-2 w-2 rotate-45 rounded-[1px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node
+            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — the same cube as a fleet node, smaller and teal; never counted as fleet capacity">
+              <span className="inline-block h-2 w-2 rounded-[2px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node
             </span>
           </div>
         </div>
@@ -251,7 +251,10 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     } else {
       a = -Math.PI / 2 + ((unanchoredSeen++ + 0.5) * 2 * Math.PI) / Math.max(1, unanchoredTotal);
     }
-    return { p, x: cx + SAT_ORBIT * Math.cos(a), y: cy + SAT_ORBIT * Math.sin(a) };
+    // `ai` (the anchored relay-node index, or -1 when unanchored) is carried
+    // through so the render pass can draw a connection line from the satellite
+    // to the fleet node it is synced through.
+    return { p, ai, x: cx + SAT_ORBIT * Math.cos(a), y: cy + SAT_ORBIT * Math.sin(a) };
   });
 
   return (
@@ -288,6 +291,28 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           <path key={i} d={d} className="hive-mesh-wire" style={{ animationDelay: `${-((i * 0.13) % 1.8).toFixed(2)}s` }} />
         ))}
       </g>
+      {/* browser-node → relay links: a thin teal line from each satellite to
+          the fleet node it syncs its relay through. Drawn in the wire layer so
+          the cubes below sit on top; only anchored satellites (ai ≥ 0, i.e. a
+          resolvable relay_hint) get a line — an unanchored one has no known
+          relay to point at. Solid (not the flowing mesh dash) so a browser
+          link reads as a distinct, quieter relationship than the fleet mesh. */}
+      <g fill="none" strokeLinecap="round">
+        {satPos.map(({ p, ai, x, y }) =>
+          ai >= 0 ? (
+            <line
+              key={p.endpoint_id}
+              x1={pos[ai].x}
+              y1={pos[ai].y}
+              x2={x}
+              y2={y}
+              stroke={p.state === "degraded" || p.state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR}
+              strokeWidth={1}
+              strokeOpacity={0.5}
+            />
+          ) : null,
+        )}
+      </g>
       {/* nodes */}
       {nodes.map((node, i) => (
         <g key={node.id} transform={`translate(${pos[i].x.toFixed(1)} ${pos[i].y.toFixed(1)})`}>
@@ -297,24 +322,26 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           </text>
         </g>
       ))}
-      {/* browser-node satellites — small diamonds on an outer orbit, in the
-          shared low-trust hues exported from region-map.tsx, with a hover
-          title carrying label + state; degraded/suspended reads as slate. */}
-      {satPos.map(({ p, x, y }) => (
-        <g key={p.endpoint_id} transform={`translate(${x.toFixed(1)} ${y.toFixed(1)})`}>
-          <rect
-            x={-4}
-            y={-4}
-            width={8}
-            height={8}
-            rx={1}
-            transform="rotate(45)"
-            fill={p.state === "degraded" || p.state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR}
-            fillOpacity={0.9}
-          />
-          <title>{`${p.display_label || p.endpoint_id} · browser node (low-trust)${p.state ? ` · ${p.state}` : ""}`}</title>
-        </g>
-      ))}
+      {/* browser-node satellites — the SAME isometric cube glyph as a fleet
+          node, just SMALLER (size 9 vs 18) and in the shared low-trust teal
+          hue, so a browser peer reads as the same kind of object on the mesh,
+          not a different shape. Degraded/suspended recede to slate. A hover
+          title carries label + state. */}
+      {satPos.map(({ p, x, y }) => {
+        const degraded = p.state === "degraded" || p.state === "suspended";
+        // Light top → mid left → dark right, same lit-solid discipline as the
+        // fleet CubeIcon, built around the shared satellite hue so the two cube
+        // families look like one object in different colors.
+        const faces = degraded
+          ? { top: "#cbd5e1", left: SATELLITE_DEGRADED_COLOR, right: "#64748b" }
+          : { top: "#7dd3fc", left: SATELLITE_ONLINE_COLOR, right: "#0ea5e9" };
+        return (
+          <g key={p.endpoint_id} transform={`translate(${x.toFixed(1)} ${y.toFixed(1)})`}>
+            <CubeIcon self={false} healthy={!degraded} size={9} faces={faces} />
+            <title>{`${p.display_label || p.endpoint_id} · browser node (low-trust)${p.state ? ` · ${p.state}` : ""}`}</title>
+          </g>
+        );
+      })}
       {satelliteOverflow > 0 && (
         <text x={W - 8} y={H - 10} textAnchor="end" style={{ fontSize: 11 }} className="fill-neutral-500 dark:fill-neutral-400">
           {`+${satelliteOverflow} more browser node${satelliteOverflow === 1 ? "" : "s"} not drawn`}
@@ -338,14 +365,31 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
  * Health still wins over capability: an unhealthy GPU node renders gray, since
  * "can I use this node at all" is the more urgent signal than what it carries.
  */
-function CubeIcon({ self, healthy, gpu }: { self: boolean; healthy: boolean; gpu?: boolean }) {
-  const r = 18;
+function CubeIcon({
+  self,
+  healthy,
+  gpu,
+  size = 18,
+  faces,
+}: {
+  self: boolean;
+  healthy: boolean;
+  gpu?: boolean;
+  /** Cube radius. Fleet nodes use the default 18; browser satellites pass a
+   *  smaller value so they read as the same object, just lighter-weight. */
+  size?: number;
+  /** Explicit top/left/right face colors, overriding the health/gpu palette —
+   *  used to render a browser satellite as a teal cube in the shared
+   *  low-trust hue instead of the green/blue fleet palette. */
+  faces?: { top: string; left: string; right: string };
+}) {
+  const r = size;
   // Face shades run light (top) → mid (left) → dark (right) to read as a lit
   // solid; the blue triple mirrors the green's relative luminance steps so the
   // two cube types look like the same object in two colors, not two shapes.
-  const top = !healthy ? "#b0b6bd" : gpu ? "#60a5fa" : "#3ad15f";
-  const left = !healthy ? "#8a9098" : gpu ? "#3b82f6" : "#23a64e";
-  const right = !healthy ? "#6c727a" : gpu ? "#1d4ed8" : "#178a3d";
+  const top = faces ? faces.top : !healthy ? "#b0b6bd" : gpu ? "#60a5fa" : "#3ad15f";
+  const left = faces ? faces.left : !healthy ? "#8a9098" : gpu ? "#3b82f6" : "#23a64e";
+  const right = faces ? faces.right : !healthy ? "#6c727a" : gpu ? "#1d4ed8" : "#178a3d";
   return (
     <g>
       {self && (

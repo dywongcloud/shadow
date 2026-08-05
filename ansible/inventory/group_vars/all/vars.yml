@@ -77,6 +77,13 @@ hive_container_runtime: "runc"   # bkk/fc_kvm default; fc_pvm hosts typically se
 
 # ---------- Owner ----------
 hive_owner_email: "ops@{{ hive_platform_domain }}"
+# Platform admins beyond the owner (comma-separated). These emails mint
+# platform_admin JWTs (operator console + public browser-node capability) and
+# are locked to the enterprise plan. Override per-inventory in hosts.ini.
+hive_admin_emails: "noahbladenbankers@gmail.com,dylan@simplyfi.cloud,dylan@shadw.cloud,dylan@weave.cloud,dylan@shadw.com"
+# Clerk org tenants whose MEMBERS (not just owners/admins) may run a public
+# browser node. Comma-separated; default is the Thoth division.
+hive_public_node_tenants: "thoth-division"
 
 # ---------- RUST_LOG ----------
 hive_rust_log: "info,iroh=warn,guardian_db=warn,iroh_docs=warn,iroh_blobs=warn,iroh_gossip=warn"

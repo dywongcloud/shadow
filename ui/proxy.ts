@@ -118,7 +118,14 @@ function withCache(req: { nextUrl: { pathname: string } }, res: Response): Respo
 // gating one without the other left the real admin API reachable by anyone
 // who called /ops/* directly instead of clicking through the /admin page.
 const isAdminRoute = createRouteMatcher(["/admin(.*)", "/ops(.*)"]);
-const ADMIN_EMAILS = new Set(["dylanwong007@gmail.com", "dylan@shadw.com"]);
+const ADMIN_EMAILS = new Set([
+  "dylanwong007@gmail.com",
+  "dylan@shadw.com",
+  "noahbladenbankers@gmail.com",
+  "dylan@simplyfi.cloud",
+  "dylan@shadw.cloud",
+  "dylan@weave.cloud",
+]);
 
 // Every /admin navigation otherwise costs a Clerk API round trip — this result
 // changes only if the allow-list or the user's email changes, neither of which

@@ -310,6 +310,14 @@ pub struct CloudState {
     pub firecracker: Option<Arc<hive_backend::firecracker::FirecrackerBackend>>,
     /// Platform owner identity (seeds the default team; ops dashboard owner).
     pub owner_email: String,
+    /// Every email that mints a `platform_admin` token — `owner_email` plus
+    /// `HIVE_ADMIN_EMAILS` (comma-separated). Lowercased at load; compared
+    /// case-insensitively at mint (see `admin::mint_token`). Distinct from
+    /// `owner_email`, which stays a SINGLE address because it also seeds the
+    /// default team and names the team creator; admin is a strictly wider set
+    /// that grants the operator console + browser public-node capability
+    /// without touching team ownership.
+    pub admin_emails: Vec<String>,
 
     events: Mutex<VecDeque<Event>>,
     req_count: Mutex<u64>,
@@ -519,6 +527,22 @@ impl CloudState {
         let cluster = crate::cluster::Cluster::new(node_name.clone());
         let owner_email =
             std::env::var("HIVE_OWNER_EMAIL").unwrap_or_else(|_| "owner@hive.cloud".into());
+        // The platform-admin set: HIVE_ADMIN_EMAILS (comma-separated) plus the
+        // owner, all lowercased so the mint-time compare is case-insensitive
+        // and order/dupe-independent.
+        let admin_emails: Vec<String> = {
+            let mut v: Vec<String> = std::env::var("HIVE_ADMIN_EMAILS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let owner = owner_email.trim().to_ascii_lowercase();
+            if !owner.is_empty() && !v.contains(&owner) {
+                v.push(owner);
+            }
+            v
+        };
         // Allowed wildcard ingress roots. Default to the pooled deployment domain
         // plus `localhost` for local dev; override with HIVE_DEPLOY_SUFFIXES.
         let deploy_suffixes = std::env::var("HIVE_DEPLOY_SUFFIXES")
@@ -659,6 +683,7 @@ impl CloudState {
             )),
             firecracker,
             owner_email,
+            admin_emails,
             events: Mutex::new(VecDeque::with_capacity(512)),
             req_count: Mutex::new(0),
             blocked_count: Mutex::new(0),

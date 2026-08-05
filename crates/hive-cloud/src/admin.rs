@@ -504,11 +504,40 @@ async fn mint_token(
         ));
     }
     // Independently derive platform-operator status from THIS backend's own
-    // owner_email config — never trust a client-supplied claim for it. Mirrors
-    // the identity/sync owner check (admin.rs `is_owner` above).
-    let platform_admin = !c.owner_email.trim().is_empty()
-        && !req.email.trim().is_empty()
-        && req.email.trim().eq_ignore_ascii_case(c.owner_email.trim());
+    // admin_emails set (owner_email + HIVE_ADMIN_EMAILS) — never trust a
+    // client-supplied claim for it. Case-insensitive membership, mirroring the
+    // owner check's eq_ignore_ascii_case.
+    let email = req.email.trim();
+    let platform_admin = !email.is_empty()
+        && c.admin_emails
+            .iter()
+            .any(|a| email.eq_ignore_ascii_case(a));
+    // Admins are always enterprise (feature: "make all admins automatically
+    // always enterprise plan no matter what"). Set an unbypassable tier FLOOR
+    // on the admin's tenant via the existing lock — the same mechanism
+    // `account()`/`set_plan()` honor at read AND write time, so it survives
+    // every automatic downgrade path (free checkout, Stripe
+    // subscription.deleted). Two guards keep this safe inside the mint path:
+    //   * LEADER-ONLY — /v1/token is exempt from leader-forwarding precisely
+    //     because it writes no state, so a follower writing teams/billing here
+    //     would race the leader's replicated snapshot. The leader is on the
+    //     same round-robin and the dashboard re-mints hourly, so the lock
+    //     lands (and replicates) the first time an admin's mint hits the
+    //     leader.
+    //   * IDEMPOTENT — only write when the floor is not already enterprise, so
+    //     the hourly re-mint does not spam the billing ledger with no-op
+    //     plan_change entries.
+    if platform_admin && !req.tenant.trim().is_empty() && c.is_control_plane_leader() {
+        let already = c
+            .billing
+            .account(req.tenant.trim())
+            .tier_locked_plan
+            .as_deref()
+            == Some("enterprise");
+        if !already {
+            apply_admin_enterprise(&c, req.tenant.trim());
+        }
+    }
     // 1-hour tokens; the dashboard re-mints on load + periodically. Short-lived so
     // a leaked cookie expires quickly.
     let ttl = 3600i64;
@@ -640,10 +669,18 @@ async fn project_build_put(
 /// The tier (hobby/pro/enterprise) of the team owning a project.
 fn team_plan(c: &Arc<CloudState>, project: &str) -> String {
     let team = norm(&c.projects.team_of(project)).to_string();
+    // Fall back to the BILLING plan when there is no team row — a personal
+    // namespace (`u_<uid>`, `personal`) has a billing account but no team, so
+    // `teams.get` returns None there. Without this an admin whose tenant is a
+    // personal namespace read "hobby" for feature-gating (duration cap, etc.)
+    // even while billing correctly held enterprise via the tier lock — the two
+    // halves disagreeing is exactly the drift `apply_plan_everywhere` exists to
+    // prevent. `account()` already applies the enterprise floor, so this
+    // reflects the admin-always-enterprise lock too.
     c.teams
         .get(&team)
         .map(|t| t.plan)
-        .unwrap_or_else(|| "hobby".into())
+        .unwrap_or_else(|| c.billing.account(&team).plan)
 }
 
 async fn project_functions_put(
@@ -7368,6 +7405,21 @@ pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &st
     if !crate::billing::plan_allows_sso(plan) {
         c.teams.set_sso(tenant, false);
     }
+}
+
+/// Lock a platform-admin's tenant at enterprise, permanently. Wraps
+/// `apply_plan_everywhere` (both halves) with an unbypassable tier FLOOR via
+/// `set_tier_lock` so no automatic downgrade path (free-plan checkout, Stripe
+/// `customer.subscription.deleted`) can drop it back below enterprise — the
+/// "no matter what" the admin-always-enterprise feature requires. Called from
+/// `mint_token`, leader-only and idempotent (see its guards).
+pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
+    apply_plan_everywhere(c, tenant, "enterprise");
+    // The FLOOR is what makes it durable: set_plan alone is overwritten by the
+    // next downgrade, the lock is not (billing.rs set_plan honors it).
+    c.billing.set_tier_lock(tenant, Some("enterprise"));
+    crate::persist::persist(c);
+    tracing::info!(tenant, "platform admin tenant locked to enterprise");
 }
 
 #[derive(Deserialize)]
