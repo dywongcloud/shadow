@@ -70,6 +70,13 @@ pub struct BrowserTarget {
     pub scope: BrowserScope,
 }
 
+/// Hard ceiling on serving registrations one browser endpoint may hold
+/// (browser-auto-serve-eligible-set). The admission side bounds its own
+/// eligible set well below this; this is the gateway's own independent refusal
+/// so a bug (or a future caller) upstream can never make one tab's routing
+/// table unbounded.
+pub const MAX_BROWSER_TARGETS_PER_ENDPOINT: usize = 64;
+
 #[derive(Clone, Debug)]
 pub struct BrowserInvokeFailure {
     pub sent: bool,
@@ -194,35 +201,77 @@ impl Gateway {
 
     /// Insert or replace the one target owned by an endpoint for a function.
     /// Replacement is atomic: stale digest/address data cannot survive renewal.
+    ///
+    /// Thin wrapper over [`Gateway::set_browser_targets`] — a one-element set —
+    /// kept because the single-target shape is still the explicit-pin case.
     pub fn upsert_browser_target(&self, target: BrowserTarget) -> Result<(), &'static str> {
-        if target.tenant.trim().is_empty()
-            || target.deployment.trim().is_empty()
-            || target.function.trim().is_empty()
-            || target.endpoint_id.len() != 64
-            || !target
-                .endpoint_id
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-            || target.digest.len() != 64
-            || !target
-                .digest
+        let endpoint_id = target.endpoint_id.clone();
+        self.set_browser_targets(&endpoint_id, vec![target])
+    }
+
+    /// Replace the COMPLETE set of serving registrations owned by one endpoint,
+    /// atomically (browser-auto-serve-eligible-set).
+    ///
+    /// One browser endpoint may serve SEVERAL (deployment, function) pairs — a
+    /// donor is admitted for every browser-eligible function its tenant owns,
+    /// not one hand-picked target — but it still owns exactly ONE registration
+    /// per function key, and a renewal replaces the whole set under a single
+    /// write lock. That is what keeps the original invariant intact: a target
+    /// dropped from the set (redeploy rotated its digest, deployment deleted,
+    /// tenant/scope moved) is unreachable the instant the new set lands, never
+    /// left behind as a stale sibling.
+    ///
+    /// Every member is validated independently and identically to the
+    /// single-target path — empty tenant/deployment/function, a non-64-hex
+    /// endpoint id or digest, or a member naming a DIFFERENT endpoint than the
+    /// one being replaced all reject the whole call without mutating anything.
+    pub fn set_browser_targets(
+        &self,
+        endpoint_id: &str,
+        targets: Vec<BrowserTarget>,
+    ) -> Result<(), &'static str> {
+        if endpoint_id.len() != 64
+            || !endpoint_id
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         {
-            return Err("invalid browser serving target");
+            return Err("invalid browser serving endpoint id");
         }
-        let key = func_key(&target.deployment, &target.function);
+        if targets.len() > MAX_BROWSER_TARGETS_PER_ENDPOINT {
+            return Err("too many browser serving targets for one endpoint");
+        }
+        let mut validated: Vec<(String, BrowserTarget)> = Vec::with_capacity(targets.len());
+        for target in targets {
+            if target.tenant.trim().is_empty()
+                || target.deployment.trim().is_empty()
+                || target.function.trim().is_empty()
+                || target.endpoint_id != endpoint_id
+                || target.digest.len() != 64
+                || !target
+                    .digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                return Err("invalid browser serving target");
+            }
+            let key = func_key(&target.deployment, &target.function);
+            // One registration per function key per endpoint: a duplicated
+            // pair in the incoming set is caller confusion, never two routes.
+            if validated.iter().any(|(existing, _)| *existing == key) {
+                return Err("duplicate browser serving target for one function");
+            }
+            validated.push((key, target));
+        }
         let mut browser = self.browser.write();
-        // An endpoint owns exactly one serving registration across the whole
-        // gateway, not one per function key. A renewal that moves deployment or
-        // function must not leave its previous target reachable.
-        for targets in browser.by_function.values_mut() {
-            targets.retain(|old| old.endpoint_id != target.endpoint_id);
+        for existing in browser.by_function.values_mut() {
+            existing.retain(|old| old.endpoint_id != endpoint_id);
         }
         browser.by_function.retain(|_, targets| !targets.is_empty());
-        let targets = browser.by_function.entry(key).or_default();
-        targets.push(target);
-        targets.sort_by(|a, b| (&a.endpoint_id, &a.digest).cmp(&(&b.endpoint_id, &b.digest)));
+        for (key, target) in validated {
+            let targets = browser.by_function.entry(key).or_default();
+            targets.push(target);
+            targets.sort_by(|a, b| (&a.endpoint_id, &a.digest).cmp(&(&b.endpoint_id, &b.digest)));
+        }
         Ok(())
     }
 
@@ -744,10 +793,49 @@ impl Gateway {
         self.state.lock().aliases.contains_key(sub)
     }
 
+    /// The state of the deployment this host's subdomain alias EXACTLY names —
+    /// no default-deployment fallback, and `None` for both "no alias here" and a
+    /// DANGLING alias (one whose deployment record is gone).
+    ///
+    /// `serves_host` answers "is there an alias", which is not the same question
+    /// as "can this node serve it": an orphaned `Building…` placeholder (its
+    /// build's task died before it could be removed, then reconciled to `Error`
+    /// on the next boot) keeps the project alias forever, and because the edge
+    /// treated any alias as authoritative, that node served the dead placeholder
+    /// locally and never proxied to the peer holding the project's READY
+    /// deployment. Witnessed live on `archive-zip.shadw.app` (2026-08-05).
+    pub fn host_deploy_state(&self, host: &str) -> Option<fluid_core::DeployState> {
+        let h = host.split(':').next().unwrap_or(host);
+        let sub = h.split('.').next().unwrap_or(h);
+        let st = self.state.lock();
+        let id = st.aliases.get(sub)?;
+        st.deployments.get(id).map(|d| d.state)
+    }
+
     /// All host subdomains this node serves (project aliases + deployment ids),
     /// published to peers so the mesh knows where each deployment lives.
     pub fn served_hosts(&self) -> Vec<String> {
         self.state.lock().aliases.keys().cloned().collect()
+    }
+
+    /// The subset of [`Gateway::served_hosts`] whose deployment is actually
+    /// `Ready`. Anything that steers traffic to ONE node (DNS affinity records)
+    /// must use this, not `served_hosts`: a specific A record beats the
+    /// wildcard, so publishing a label at a node holding only a failed build or
+    /// an orphaned placeholder pins every client to the one node that cannot
+    /// answer. `served_hosts` itself stays state-blind — the mesh route table
+    /// legitimately wants to know a node holds the label at all.
+    pub fn served_hosts_ready(&self) -> Vec<String> {
+        let st = self.state.lock();
+        st.aliases
+            .iter()
+            .filter(|(_, id)| {
+                st.deployments
+                    .get(*id)
+                    .is_some_and(|d| d.state == fluid_core::DeployState::Ready)
+            })
+            .map(|(label, _)| label.clone())
+            .collect()
     }
 
     /// Projects this node hosts that are **container** deployments (a function with
@@ -1605,6 +1693,59 @@ async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
     None
 }
 
+/// The 404 for "no static file here", made to distinguish its two very
+/// different causes.
+///
+/// A bare `not found` is honest for a static site missing a file. It is a lie
+/// for a deployment whose `routes` never matched the request at all: nothing
+/// was ever going to serve that path — not the fleet function, not a browser
+/// donor (`try_browser` hangs off the `RouteTarget::Function` branch alone) —
+/// and the response read identically to an unknown host, so the deployment
+/// looked healthy from every angle while serving nothing. Name the miss and the
+/// patterns that produced it instead.
+fn no_static_file(dep: &Deployment, path: &str) -> Response {
+    if dep.manifest.functions.is_empty() || dep.manifest.route_matched(path) {
+        let mut resp = (StatusCode::NOT_FOUND, "not found").into_response();
+        resp.headers_mut()
+            .insert("x-hive-error", HeaderValue::from_static("NOT_FOUND"));
+        return resp;
+    }
+    let patterns = if dep.manifest.routes.is_empty() {
+        "none declared".to_string()
+    } else {
+        dep.manifest
+            .routes
+            .iter()
+            .map(|r| format!("{:?}", r.pattern))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let functions = dep
+        .manifest
+        .functions
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let body = format!(
+        "NO_ROUTE_MATCHED: no route in this deployment matches {path:?}, and no static file \
+         exists there either.\n\nDeclared routes: {patterns}\nDeclared functions: {functions}\n\n\
+         Add a catch-all to fluid.json, e.g. \"routes\": [{{ \"pattern\": \"/*\", \"target\": \
+         {{ \"function\": \"{first}\" }} }}]. Patterns are prefix matches: \"/\", \"/*\" and \
+         \"*\" match every path; \"/api\" and \"/api/*\" match /api and /api/...\n",
+        first = dep
+            .manifest
+            .functions
+            .first()
+            .map(|f| f.name.as_str())
+            .unwrap_or("web"),
+    );
+    let mut resp = (StatusCode::NOT_FOUND, body).into_response();
+    resp.headers_mut()
+        .insert("x-hive-error", HeaderValue::from_static("NO_ROUTE_MATCHED"));
+    resp
+}
+
 async fn serve_static(dep: &Deployment, path: &str) -> Response {
     let static_dir = dep
         .manifest
@@ -1663,7 +1804,7 @@ async fn serve_static(dep: &Deployment, path: &str) -> Response {
                 )
                     .into_response()
             } else {
-                (StatusCode::NOT_FOUND, "not found").into_response()
+                no_static_file(dep, path)
             }
         }
     }

@@ -173,6 +173,62 @@ pub fn db_descriptor_for(
     None
 }
 
+/// The deployment whose `browser_db` block a node with NO explicitly chosen
+/// target should replicate (browser-auto-serve-eligible-set) — `None` unless
+/// the tenant's answer is UNAMBIGUOUS.
+///
+/// A browser holds exactly ONE replica (one OPFS file, one lane), so "serve
+/// everything automatically" has an honest automatic answer for databases only
+/// when the tenant has exactly one project carrying a block. With two or more
+/// the platform would be choosing, on recency, WHICH of a tenant's databases
+/// gets copied into a donor's browser — and for a Public-scope donor, which
+/// one strangers get a read-only replica of. That is a decision the picker
+/// must keep making explicitly, so this returns `None` and the node runs with
+/// no database grant rather than an arbitrary one.
+///
+/// Within the single opted-in project the newest Ready deployment wins (its
+/// spec is the current one). Same two replicated sources and the same tenant
+/// gate as [`db_descriptor_for`].
+pub fn auto_db_deployment_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> Option<String> {
+    // project -> (created_at_ms, deployment id) of the newest Ready deployment
+    // carrying a block.
+    let mut by_project: BTreeMap<String, (u64, String)> = BTreeMap::new();
+    let mut note = |project: String, created: u64, id: String| {
+        let entry = by_project.entry(project).or_insert((created, id.clone()));
+        if created > entry.0 {
+            *entry = (created, id);
+        }
+    };
+    for record in cloud.gw.deployment_records() {
+        if record.state != fluid_core::DeployState::Ready
+            || crate::admin::record_tenant(&record.tenant) != tenant
+            || record.manifest.browser_db.is_none()
+        {
+            continue;
+        }
+        note(
+            record.project.clone(),
+            record.created_at_ms,
+            record.id.clone(),
+        );
+    }
+    for deployments in cloud.peer_deployments.read().values() {
+        for info in deployments {
+            if info.state != fluid_core::DeployState::Ready
+                || crate::admin::record_tenant(&info.tenant) != tenant
+                || info.browser_db.is_none()
+            {
+                continue;
+            }
+            note(info.project.clone(), info.created_at_ms, info.id.0.clone());
+        }
+    }
+    if by_project.len() != 1 {
+        return None;
+    }
+    by_project.into_values().next().map(|(_, id)| id)
+}
+
 /// What one sync round is allowed to do, resolved fresh per request from the
 /// live admission + the live descriptor (never from wire input).
 struct RoundGrant {

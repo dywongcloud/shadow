@@ -1925,14 +1925,23 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let mut apps = desired_apps(&publish);
             // Deployment affinity: point each served label straight at its host
             // node so a client lands on the owner instead of a random node that
-            // then has to forward. Local aliases first (authoritative for what
-            // WE serve), then the gossiped peer route table — first writer wins,
-            // so a host we serve is never attributed to a peer.
-            let mut owners: Vec<(String, String)> = cloud
-                .gw
-                .served_hosts()
-                .into_iter()
-                .map(|h| (h, cloud.node_name.clone()))
+            // then has to forward. Precedence (first writer wins):
+            //   1. local labels whose deployment is READY — authoritative,
+            //   2. the gossiped peer route table,
+            //   3. local labels we hold but cannot serve READY.
+            //
+            // Tier 3 is why this is ordered rather than a single `served_hosts()`
+            // pass. A specific record BEATS the wildcard, so attributing a label
+            // to a node holding only a failed build or an orphaned `Building…`
+            // placeholder pins every client to the one node that cannot answer —
+            // exactly what stranded `archive-zip.shadw.app` on fc-sanjose's
+            // `Error` placeholder while fc-sanjose-gpu-1 served the Ready
+            // deployment (2026-08-05). It stays LAST rather than being dropped
+            // so a label no peer route covers still gets an answer.
+            let ready_local: Vec<String> = cloud.gw.served_hosts_ready();
+            let mut owners: Vec<(String, String)> = ready_local
+                .iter()
+                .map(|h| (h.clone(), cloud.node_name.clone()))
                 .collect();
             {
                 let routes = cloud.peer_routes.read();
@@ -1943,6 +1952,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     if let Some(best) = rs.iter().filter(|r| r.healthy).min_by_key(|r| r.latency_ms)
                     {
                         owners.push((label.clone(), best.node_id.clone()));
+                    }
+                }
+            }
+            {
+                let ready: std::collections::HashSet<&str> =
+                    ready_local.iter().map(|s| s.as_str()).collect();
+                for h in cloud.gw.served_hosts() {
+                    if !ready.contains(h.as_str()) {
+                        owners.push((h, cloud.node_name.clone()));
                     }
                 }
             }

@@ -67,7 +67,17 @@ function persistLastStart(args: StartArgs) {
   try {
     localStorage.setItem(
       LAST_START_KEY,
-      JSON.stringify({ deployment: args.deployment, fn: args.fn, scope: args.scope ?? "team" }),
+      JSON.stringify({
+        deployment: args.deployment,
+        fn: args.fn,
+        scope: args.scope ?? "team",
+        // browser-auto-serve-eligible-set: WHICH serve lane, persisted
+        // alongside the (still digest-free) selection. Nothing about the
+        // eligible set itself is persisted — it is re-derived server-side on
+        // every admission, so a replay after a redeploy serves what the fleet
+        // believes now, never a snapshot.
+        serveMode: args.serveMode ?? "auto",
+      }),
     );
   } catch {
     /* storage unavailable/full — replay-on-handoff just won't happen */
@@ -106,6 +116,13 @@ export interface StartArgs {
    *  by the picker (or the handoff replay) — never a donor-typed value. Empty
    *  whenever there is no function to serve. */
   digest: string;
+  /** browser-auto-serve-eligible-set: what to serve when NO deployment is
+   *  pinned above. `"auto"` (the default) asks the fleet to derive this
+   *  tenant's whole browser-eligible set and refresh it on every renewal — the
+   *  node never names what lands in it; `"none"` is capacity only. Ignored
+   *  whenever `deployment` is set: an explicit pin is exactly as narrow as it
+   *  looks. */
+  serveMode?: "auto" | "none";
   scope?: "team" | "public";
 }
 
@@ -249,6 +266,11 @@ export function useRunNode() {
         deployment: "",
         fn: "",
         digest: "",
+        // browser-auto-serve-eligible-set: an unpinned node replays the serve
+        // MODE it was running with. A record persisted before this field
+        // existed replays as "auto" — this build's default, and still nothing
+        // but the donor's own tenant's Ready deployments.
+        serveMode: last.serveMode ?? "auto",
         scope: last.scope ?? "team",
         team: currentTeam(),
       });
@@ -692,6 +714,7 @@ export function useRunNode() {
       deployment: args.deployment,
       fn: args.fn,
       digest: args.digest,
+      serveMode: args.serveMode ?? "auto",
       scope: args.scope ?? "team",
       team: currentTeam(),
     });

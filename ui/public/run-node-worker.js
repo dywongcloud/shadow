@@ -53,7 +53,11 @@ const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease windo
 // deployment/fn/digest ("attach to nothing"), and the admission capability can
 // come back with `serving: false` and no artifact fields — a pre-v3 worker
 // wedges on both. Keep in sync with ui/lib/run-node-status.ts.
-const HOST_ABI_VERSION = 3;
+// v4 (browser-auto-serve-eligible-set): `start` carries `serveMode`
+// ("auto" | "none") and the capability answers with an ARRAY of authorized
+// artifacts instead of one; a pre-v4 worker reads only the flat compat mirror
+// and would serve one of them while the fleet routes all of them here.
+const HOST_ABI_VERSION = 4;
 // bn-p2p-version-negotiation (PWA wasm bundle): must match
 // crates/hive-browser/src/lib.rs's wasm_bundle_version() return value --
 // checked live against the ACTUAL loaded module right after init() succeeds
@@ -94,7 +98,7 @@ const portVisibility = new Map();
 let node = null;
 let renewTimer = null;
 let closing = false;
-let session = null; // { deployment, fn, digest, scope, team, relay }
+let session = null; // { deployment, fn, digest, serveMode, scope, team, relay }
 
 // browser-worker-quickjs-runtime: the worker-native QuickJS function lane.
 // fnRuntime owns verified/pinned artifacts, per-artifact queues and the
@@ -107,6 +111,16 @@ let session = null; // { deployment, fn, digest, scope, team, relay }
 // the server-side lease expiry removes the route).
 let fnRuntime = null;
 let fnGrants = new Map();
+// browser-auto-serve-eligible-set: display context for the digests currently
+// pinned (policyDigest -> { deployment, function, project }), straight from the
+// server-derived capability. Status/UI only — nothing here is ever an
+// authorization input: the invoke handler resolves on the pinned digest alone.
+let fnRoutes = new Map();
+// Per-artifact pin failures from the last reconcile ([{ digest, error }]).
+// Surfaced honestly in status rather than silently dropped: one unreachable
+// artifact must not blank a node that is serving the other nine, and must not
+// look like it is serving something it is not.
+let fnFailures = [];
 
 // Epoch fencing (bn-p2p-reconnect-state, bn-p2p-resurrection-after-stop):
 // start()'s async boot (wasm init + BrowserNode.boot, seconds on a cold
@@ -178,6 +192,12 @@ let status = {
   // identity, presence and database replication all work; only the serve lane
   // is idle.
   serving: false,
+  // browser-auto-serve-eligible-set (additive): which serve lane this run
+  // asked for — "auto" (whatever this tenant has, refreshed on every renewal),
+  // "pinned" (one deliberately chosen function), or "none" (capacity only).
+  // A statement about the REQUEST; `serving`/`functions` stay the statement
+  // about what is actually pinned.
+  serveMode: "none",
   // bn-run-node-db-sync-wiring introspection (additive on the wire, like
   // functions above; the ui/lib/run-node-status.ts typed mirror is owned
   // elsewhere): { project, dbFile, access, state, persisted, peers,
@@ -414,7 +434,7 @@ function serveTargetless(s = session) {
 }
 
 async function admitOnce(addrJson, endpointId) {
-  const { deployment, fn, digest, scope, team } = session;
+  const { deployment, fn, digest, serveMode, scope, team } = session;
   // Proof-of-possession (bn-p2p-heartbeat-lease): prove THIS call controls
   // endpointId's private key, not just that the caller has a valid platform
   // session -- without this an admission naming any endpoint_id was accepted
@@ -434,6 +454,12 @@ async function admitOnce(addrJson, endpointId) {
     deployment: deployment || "",
     function: fn || "",
     digest: digest || "",
+    // browser-auto-serve-eligible-set: a REQUEST for the automatic shape, not a
+    // capability. With no deployment named, "auto" asks the server to derive
+    // this tenant's whole eligible set itself; anything else (including an old
+    // node that ignores the field entirely) leaves the serve lane empty. This
+    // side never names what lands in the set.
+    serve_mode: serveMode === "auto" ? "auto" : "none",
     scope: scope || "team",
     protocol_version: PROTOCOL_VERSION,
     challenge_ms: challengeMs,
@@ -458,32 +484,35 @@ function artifactRequestUrl(policyDigest) {
   return `/cloud/v1/browser/artifacts/${policyDigest}`;
 }
 
-// Validate the capability block's shape into a local descriptor. Everything
-// not matching is a hard error — a malformed capability pins nothing.
-//
-// A capability with `serving: false` carries NO artifact fields and an empty
-// trusted-caller list (browser-node-optional-serve-target). That is a
-// well-formed answer, not a malformed one: it means the server authorized this
-// browser as a node without authorizing it to serve anything. It resolves to a
-// null descriptor with no callers, so the reconcile below revokes whatever the
-// previous capability granted and grants nothing — absence of capability is
-// never the same as a broader one.
-function normalizeCapability(capability) {
-  if (!capability || typeof capability !== "object") {
-    throw new Error("admission response is missing its capability block");
-  }
-  if (capability.serving === false) {
-    return { descriptor: null, callers: [] };
-  }
+// The worker's own ceiling on how many artifacts one admission may pin
+// (browser-auto-serve-eligible-set). The server bounds its eligible set well
+// below this (HIVE_BROWSER_AUTO_SERVE_MAX, default 16); this is the donor's
+// independent refusal to let a server-side bug turn one tab into an unbounded
+// pin set. Over the cap the extras are DROPPED and named in status — never
+// silently, and never by throwing away an otherwise-valid admission.
+const MAX_PINNED_ARTIFACTS = 32;
+
+// Bounded display label from the capability. Server-derived, rendered as text
+// by the dashboard, never used as an identifier here.
+function label(value) {
+  return typeof value === "string" ? value.slice(0, 128) : "";
+}
+
+// Validate ONE capability artifact entry into a local descriptor. Everything
+// not matching is a hard error — a malformed entry pins nothing.
+function normalizeArtifact(entry) {
   const descriptor = {
-    policyDigest: capability.policy_digest,
-    sourceDigest: capability.source_digest,
-    sourceBytes: capability.source_bytes,
-    mode: capability.mode,
-    timeoutMs: capability.timeout_ms,
-    memoryBytes: capability.memory_bytes,
-    stackBytes: capability.stack_bytes,
-    allowedOps: capability.allowed_ops,
+    policyDigest: entry.policy_digest,
+    sourceDigest: entry.source_digest,
+    sourceBytes: entry.source_bytes,
+    mode: entry.mode,
+    timeoutMs: entry.timeout_ms,
+    memoryBytes: entry.memory_bytes,
+    stackBytes: entry.stack_bytes,
+    allowedOps: entry.allowed_ops,
+    deployment: label(entry.deployment),
+    function: label(entry.function),
+    project: label(entry.project),
   };
   if (!DIGEST_RE.test(descriptor.policyDigest || "") || !DIGEST_RE.test(descriptor.sourceDigest || "")) {
     throw new Error("capability carries a malformed digest");
@@ -498,15 +527,58 @@ function normalizeCapability(capability) {
   // artifact_url is server-derived but still checked against the ONLY shape
   // the delivery contract defines before it is ever fetched.
   const expectedUrl = `/v1/browser/artifacts/${descriptor.policyDigest}`;
-  if (capability.artifact_url !== expectedUrl) {
+  if (entry.artifact_url !== expectedUrl) {
     throw new Error("capability artifact_url does not match its policy digest");
+  }
+  return descriptor;
+}
+
+// Validate the capability block's shape into the local descriptor SET
+// (browser-auto-serve-eligible-set). Everything not matching is a hard error —
+// a malformed capability pins nothing.
+//
+// A capability with `serving: false` carries NO artifact fields and an empty
+// trusted-caller list (browser-node-optional-serve-target). That is a
+// well-formed answer, not a malformed one: it means the server authorized this
+// browser as a node without authorizing it to serve anything. It resolves to an
+// EMPTY descriptor set with no callers, so the reconcile below revokes whatever
+// the previous capability granted and grants nothing — absence of capability is
+// never the same as a broader one.
+//
+// Rollout: a node that predates `artifacts[]` answers with the flat single
+// artifact fields, which are read as a one-element set. The server ALSO mirrors
+// its first entry into those same flat fields, so neither direction of the
+// rollout ever sees a shape it cannot parse.
+function normalizeCapability(capability) {
+  if (!capability || typeof capability !== "object") {
+    throw new Error("admission response is missing its capability block");
   }
   // trusted_callers is server-derived (healthy fleet EndpointIds); filter to
   // the exact 64-hex shape anyway — grantInvoker accepts nothing else, and a
   // malformed entry must never reach the grant map.
   const trustedCallers = Array.isArray(capability.trusted_callers) ? capability.trusted_callers : [];
   const callers = [...new Set(trustedCallers.filter(id => typeof id === "string" && DIGEST_RE.test(id)))];
-  return { descriptor, callers };
+  if (capability.serving === false) {
+    return { descriptors: [], callers: [], dropped: 0 };
+  }
+  const entries = Array.isArray(capability.artifacts) ? capability.artifacts : [capability];
+  const descriptors = [];
+  const seen = new Set();
+  let dropped = 0;
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") throw new Error("capability artifact entry is not an object");
+    const descriptor = normalizeArtifact(entry);
+    // Two deployments can legitimately reference the SAME content-addressed
+    // artifact; one pin serves every route that names its digest.
+    if (seen.has(descriptor.policyDigest)) continue;
+    if (descriptors.length >= MAX_PINNED_ARTIFACTS) {
+      dropped += 1;
+      continue;
+    }
+    seen.add(descriptor.policyDigest);
+    descriptors.push(descriptor);
+  }
+  return { descriptors, callers, dropped };
 }
 
 // Fetch the artifact body with a bounded deadline through the same
@@ -567,61 +639,74 @@ async function dropCachedArtifact(policyDigest) {
   }
 }
 
-// One atomic reconcile per admission/renewal response. Verification fully
-// precedes mutation: the artifact is fetched + pinned (both digests
-// recomputed locally) BEFORE any grant changes, then stale callers/digests
-// are revoked BEFORE their replacements are granted — a failed reconcile
-// leaves the previous pin + grants exactly as they were.
+// Pin ONE descriptor (cache first, then the authenticated content-addressed
+// GET), verifying both digests locally before anything is executable. Returns
+// true once the digest is pinned; throws on any verification/fetch failure.
+async function pinArtifact(runtime, descriptor, team, owner, myEpoch) {
+  if (runtime.has(descriptor.policyDigest)) return true;
+  let bytes = await readCachedArtifact(descriptor);
+  if (bytes) {
+    try {
+      runtime.pin(descriptor, bytes);
+      return true;
+    } catch {
+      await dropCachedArtifact(descriptor.policyDigest);
+      bytes = null;
+    }
+  }
+  bytes = await fetchArtifactBytes(descriptor, team);
+  if (myEpoch !== epoch || node !== owner) return false; // a newer epoch owns teardown now
+  runtime.pin(descriptor, bytes); // throws on any digest/size mismatch
+  await persistVerifiedArtifact(descriptor, bytes);
+  return true;
+}
+
+// One atomic reconcile per admission/renewal response, over the whole
+// authorized SET (browser-auto-serve-eligible-set). Verification fully precedes
+// mutation: every artifact is fetched + pinned (both digests recomputed
+// locally) BEFORE any grant changes, then stale digests/callers are revoked
+// BEFORE their replacements are granted.
+//
+// A per-artifact failure does NOT discard the rest: with a set, one unreachable
+// artifact would otherwise take down a node serving every other one. The failed
+// digest is simply never granted (nothing can be invoked that is not pinned),
+// it is named in status, and the next renewal retries it. Only a TOTAL failure
+// — every authorized artifact failed — throws, preserving exactly today's
+// backoff-and-retry behaviour for the single-artifact case.
 async function reconcileCapability(capability, myEpoch) {
   const runtime = fnRuntime;
   const owner = node;
   if (!runtime || runtime.closed || !owner) throw new Error("function runtime is not running");
   const team = session && session.team;
-  const { descriptor, callers } = normalizeCapability(capability);
+  const { descriptors, callers, dropped } = normalizeCapability(capability);
 
-  // Serve-less admission: revoke every grant this worker still holds and
-  // unpin every artifact, then stop. The invoke handler stays installed and
-  // resolves exclusively against pinned digests, so with nothing pinned every
-  // invoke rejects — the node is running and contributing, and serving
-  // nothing.
-  if (descriptor === null) {
-    for (const [digest, granted] of [...fnGrants]) {
-      for (const caller of granted) {
-        try {
-          owner.revokeInvoker(caller, digest);
-        } catch {
-          /* node already closed — the grant map died with it */
-        }
-      }
-      fnGrants.delete(digest);
-      runtime.unpin(digest);
+  const pinned = [];
+  const failures = [];
+  for (const descriptor of descriptors) {
+    try {
+      if (await pinArtifact(runtime, descriptor, team, owner, myEpoch)) pinned.push(descriptor);
+    } catch (error) {
+      failures.push({
+        digest: descriptor.policyDigest,
+        error: String((error && error.message) || error).slice(0, 200),
+      });
     }
-    updateFunctionsStatus();
-    return;
+    if (myEpoch !== epoch || node !== owner) return;
   }
-
-  if (!runtime.has(descriptor.policyDigest)) {
-    let bytes = await readCachedArtifact(descriptor);
-    if (bytes) {
-      try {
-        runtime.pin(descriptor, bytes);
-      } catch {
-        await dropCachedArtifact(descriptor.policyDigest);
-        bytes = null;
-      }
-    }
-    if (!bytes) {
-      bytes = await fetchArtifactBytes(descriptor, team);
-      if (myEpoch !== epoch || node !== owner) return; // a newer epoch owns teardown now
-      runtime.pin(descriptor, bytes); // throws on any digest/size mismatch
-      await persistVerifiedArtifact(descriptor, bytes);
-    }
+  if (descriptors.length > 0 && pinned.length === 0) {
+    fnFailures = failures;
+    throw new Error(failures[0] ? failures[0].error : "no authorized artifact could be pinned");
   }
   if (myEpoch !== epoch || node !== owner) return;
 
-  // Revoke stale digests (close their runners) and stale callers FIRST.
+  const desiredDigests = new Set(pinned.map((d) => d.policyDigest));
+  // Revoke stale digests (close their runners) and stale callers FIRST. This
+  // covers the serve-less admission too: an empty authorized set revokes every
+  // grant and unpins everything, and the invoke handler — which resolves
+  // exclusively against pinned digests — then rejects every invoke. The node is
+  // running and contributing, and serving nothing.
   for (const [digest, granted] of [...fnGrants]) {
-    if (digest === descriptor.policyDigest) continue;
+    if (desiredDigests.has(digest)) continue;
     for (const caller of granted) {
       try {
         owner.revokeInvoker(caller, digest);
@@ -632,25 +717,45 @@ async function reconcileCapability(capability, myEpoch) {
     fnGrants.delete(digest);
     runtime.unpin(digest);
   }
+  // An artifact pinned but never granted (a previous reconcile lost its epoch
+  // race, or its grant set was empty) is still executable-in-principle memory:
+  // drop it too once it leaves the authorized set.
+  for (const digest of runtime.stats().pinned) {
+    if (!desiredDigests.has(digest)) runtime.unpin(digest);
+  }
+
   const desired = new Set(callers);
-  const current = fnGrants.get(descriptor.policyDigest) || new Set();
-  for (const caller of [...current]) {
-    if (desired.has(caller)) continue;
-    try {
-      owner.revokeInvoker(caller, descriptor.policyDigest);
-    } catch {
-      /* node already closed */
+  for (const descriptor of pinned) {
+    const digest = descriptor.policyDigest;
+    const current = fnGrants.get(digest) || new Set();
+    for (const caller of [...current]) {
+      if (desired.has(caller)) continue;
+      try {
+        owner.revokeInvoker(caller, digest);
+      } catch {
+        /* node already closed */
+      }
+      current.delete(caller);
     }
-    current.delete(caller);
+    // Only now grant replacements: every exact returned caller EndpointId, for
+    // only the returned policy digests.
+    for (const caller of desired) {
+      if (current.has(caller)) continue;
+      owner.grantInvoker(caller, digest);
+      current.add(caller);
+    }
+    fnGrants.set(digest, current);
   }
-  // Only now grant replacements: every exact returned caller EndpointId, for
-  // only the returned policy digest.
-  for (const caller of desired) {
-    if (current.has(caller)) continue;
-    owner.grantInvoker(caller, descriptor.policyDigest);
-    current.add(caller);
+  fnRoutes = new Map(
+    pinned.map((d) => [d.policyDigest, { deployment: d.deployment, function: d.function, project: d.project }]),
+  );
+  fnFailures = failures;
+  if (dropped > 0) {
+    fnFailures = [
+      ...failures,
+      { digest: "", error: `${dropped} more authorized artifact${dropped === 1 ? "" : "s"} exceeded this browser's ${MAX_PINNED_ARTIFACTS}-artifact cap and are not served here` },
+    ];
   }
-  fnGrants.set(descriptor.policyDigest, current);
   updateFunctionsStatus();
 }
 
@@ -673,7 +778,17 @@ function updateFunctionsStatus() {
   // stringifies and compares as NaN, which is false for a genuinely serving
   // node too, i.e. silently always-false.
   setStatus({
-    functions: { pinned: stats.pinned, grants, served: stats.servedTotal },
+    functions: {
+      pinned: stats.pinned,
+      grants,
+      served: stats.servedTotal,
+      // browser-auto-serve-eligible-set: what those digests ARE, so the
+      // dashboard can name the functions this node is carrying instead of
+      // showing a count. Ordered by the capability, filtered to what is
+      // actually pinned right now.
+      serving: stats.pinned.map((digest) => ({ digest, ...(fnRoutes.get(digest) || {}) })),
+      failed: fnFailures,
+    },
     serving: stats.pinned.length > 0,
   });
 }
@@ -695,6 +810,8 @@ function teardownFunctionLane(owner = node) {
     }
   }
   fnGrants = new Map();
+  fnRoutes = new Map();
+  fnFailures = [];
   if (fnRuntime) {
     try {
       fnRuntime.close();
@@ -1606,10 +1723,19 @@ async function start(msg) {
   // normalized to "" here so every downstream check is one shape, and a start
   // message that simply omits it is a first-class "run a node, serve nothing
   // yet" request rather than a malformed one.
+  // browser-auto-serve-eligible-set: naming a deployment is a deliberate PIN
+  // and always wins; otherwise the page's choice decides between the automatic
+  // set and capacity-only. An absent serveMode from a message this build didn't
+  // write (an owner-handoff replay persisted before the field existed) resolves
+  // to "auto", which is this build's default — never to a target the user
+  // never picked, since auto is derived entirely server-side from their own
+  // tenant's Ready deployments.
+  const serveMode = msg.deployment ? "pinned" : msg.serveMode === "none" ? "none" : "auto";
   session = {
     deployment: msg.deployment || "",
     fn: msg.fn || "",
     digest: msg.digest || "",
+    serveMode,
     scope: msg.scope,
     team: msg.team,
     relay: msg.relay,
@@ -1624,6 +1750,7 @@ async function start(msg) {
     admission: "pending",
     sessionStale: false,
     endpointId: null,
+    serveMode,
   });
   let booted = null;
   try {
@@ -1869,6 +1996,7 @@ async function stop() {
     // across a stop would carry a claim about a node that no longer exists
     // into whatever starts next.
     serving: false,
+    serveMode: "none",
     db: null,
   });
 }

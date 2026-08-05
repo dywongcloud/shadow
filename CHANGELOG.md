@@ -1,5 +1,51 @@
 # Changelog
 
+## (pending) — Browser nodes are dispatched to, not hand-fed
+
+A running browser node now receives whatever browser-eligible work its tenant
+has, automatically, instead of serving the one artifact a human picked at
+start. The picker survives as a deliberate override, not a gate.
+
+- **The admission capability is a SET.** `browser_admission::validate_request`
+  resolves the donor's whole eligible set server-side
+  (`browser_artifacts::eligible_for_tenant`: every browser-eligible function of
+  every Ready deployment under the AUTHENTICATED tenant, from the same two
+  replicated sources `descriptor_for` already reads, deterministically ordered
+  production-then-newest and capped by `HIVE_BROWSER_AUTO_SERVE_MAX`, default
+  16). It is re-derived on every renewal, so a function deployed after the node
+  started is served within one lease tick — no restart, no re-pick. The
+  capability block gains `artifacts[]` and keeps mirroring its first entry into
+  the flat fields a pre-upgrade worker reads.
+- **`serve_mode` is a request, not a capability.** `"auto"` asks the server to
+  derive the set; absent (a pre-upgrade worker) or anything else still means
+  serve nothing, so a rollout never starts serving code on a donor that did not
+  ask for it. Naming a `deployment` overrides auto and pins exactly that one —
+  today's behaviour, unchanged.
+- **One endpoint, many routes.** `fluid_gateway::set_browser_targets` replaces
+  an endpoint's complete registration set atomically (one entry per function
+  key, each validated exactly as before, hard-capped at
+  `MAX_BROWSER_TARGETS_PER_ENDPOINT`); `upsert_browser_target` is now its
+  one-element wrapper. `routing_identity_changed` became a superset test: a
+  pure addition no longer tears down the browser's QUIC trunk and constellation
+  presence every time anyone in the tenant deploys.
+- **The scalar admission triple is now a compat view only** and is kept a
+  coherent member of the set — never a deployment-A/function-of-B mixture,
+  which a pre-`serves` follower would have registered as a route that could
+  execute the wrong digest for a same-named function. In auto mode with no
+  database pin it is empty, so an old follower routes nothing rather than
+  something wrong.
+- **Databases are not auto-picked among several.** A browser holds one replica,
+  so `browser_db::auto_db_deployment_for_tenant` grants only when the tenant has
+  exactly one project carrying a `browser_db` block; with two or more the picker
+  chooses or the node runs without one.
+- **Worker (HOST_ABI v4).** `normalizeCapability`/`reconcileCapability` handle
+  the descriptor set: pin every authorized artifact (both BLAKE3 digests
+  recomputed locally, cache-first), then revoke stale digests/callers before
+  granting replacements. A per-artifact failure no longer discards the rest —
+  it lands in `status.functions.failed` and retries next renewal; only a total
+  failure takes the old backoff path. `status.functions.serving[]` names what is
+  actually pinned, so /run-node reports the real set instead of a count.
+
 ## (pending) — Durable deployment roots + concurrent same-project zip deploys
 
 Two deployment-lifecycle fixes in the git/zip build path, both live-witnessed

@@ -597,6 +597,44 @@ pub async fn gc_build_dirs(cloud: &Arc<CloudState>, max_age: Duration) -> usize 
     removed
 }
 
+/// Releases the `Building…` placeholder's hold on the project's host alias even
+/// when the build task never finishes.
+///
+/// `Drop` runs when a spawned task is ABORTED (the future is dropped) and when
+/// it panics — the two cases that used to leak the placeholder forever, since
+/// the removal lived at the end of the happy path. Removal is async and `Drop`
+/// is not, so the guard hands the work to a detached task; outside a runtime
+/// (process teardown) it degrades to the boot reconciler + reaper, which reap
+/// the same shells.
+struct PlaceholderGuard {
+    cloud: Arc<CloudState>,
+    id: Option<String>,
+}
+
+impl PlaceholderGuard {
+    /// Take the id so the caller removes it inline on the happy path — after
+    /// this the guard is inert.
+    fn disarm(&mut self) -> Option<String> {
+        self.id.take()
+    }
+}
+
+impl Drop for PlaceholderGuard {
+    fn drop(&mut self) {
+        let Some(id) = self.id.take() else { return };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(deployment = %id, "Building… placeholder left behind (no runtime to remove it); the boot reconciler will drop it");
+            return;
+        };
+        let cloud = self.cloud.clone();
+        handle.spawn(async move {
+            cloud.gw.remove(&id).await;
+            crate::persist::persist(&cloud);
+            tracing::warn!(deployment = %id, "removed Building… placeholder after its build task ended without finishing (cancel/panic)");
+        });
+    }
+}
+
 /// Start a build; returns its id immediately. The build runs in the background.
 pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
@@ -662,13 +700,22 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         // First-deploy only: serve a "Building…" page at the domain immediately so
         // the URL resolves throughout the build (a slow Next.js build no longer
         // 404s). The real deployment supersedes it; we then remove the placeholder.
-        let placeholder = register_building_placeholder(&cloud, &project, &req, &bid).await;
+        // The placeholder is a RESERVATION (it holds the project's host alias),
+        // so it is released by a Drop guard, not by a line at the end of the
+        // happy path: a user cancel ABORTS this task, and an aborted future
+        // never reaches its remaining statements — which is how a shell that
+        // owns `<project>` outlived its build and made this node answer for a
+        // deployment it does not have. Same discipline as `ColdStartGuard`.
+        let mut placeholder = PlaceholderGuard {
+            cloud: cloud.clone(),
+            id: register_building_placeholder(&cloud, &project, &req, &bid).await,
+        };
         let result = run_build(&cloud, &bid, req, project, first_deploy).await;
-        if let Some(pid) = &placeholder {
+        if let Some(pid) = placeholder.disarm() {
             // The real deploy (or the build-failed page) has taken over the alias;
             // drop the placeholder so it doesn't linger. On a hard error this also
             // clears the "Building…" page (matching prior no-deployment behavior).
-            let _ = cloud.gw.remove(pid).await;
+            let _ = cloud.gw.remove(&pid).await;
             crate::persist::persist(&cloud);
         }
         if let Err(e) = result {
@@ -5999,6 +6046,83 @@ async fn register_building_placeholder(
     );
     crate::persist::persist(cloud);
     Some(info.id.to_string())
+}
+
+/// The infix `register_building_placeholder` stamps into a placeholder's root
+/// dir (`<tag>-building-<ms>-<bid>`). It is the only durable marker that tells a
+/// placeholder apart from a real deployment after a restart, so both the boot
+/// reconciler and the reaper below key off it.
+pub(crate) const PLACEHOLDER_ROOT_INFIX: &str = "-building-";
+
+/// Is this deployment root a `Building…` placeholder's scratch dir, and which
+/// build minted it?
+///
+/// Returns the build id parsed out of the dir name, or `None` when the root is
+/// not a placeholder at all.
+pub(crate) fn placeholder_build_id(root: &str) -> Option<&str> {
+    let name = std::path::Path::new(root).file_name()?.to_str()?;
+    let (_, tail) = name.rsplit_once(PLACEHOLDER_ROOT_INFIX)?;
+    // tail = `<ms>-<bid>`; the build id is everything after the first `-`.
+    let (_ms, bid) = tail.split_once('-')?;
+    (!bid.is_empty()).then_some(bid)
+}
+
+/// True for a persisted record that is a placeholder shell rather than a real
+/// deployment: placeholder root, no git source, no functions.
+pub(crate) fn is_placeholder_record(rec: &fluid_core::DeployRecord) -> bool {
+    placeholder_build_id(&rec.root).is_some()
+        && rec.git.is_none()
+        && rec.manifest.functions.is_empty()
+}
+
+/// Reap `Building…` placeholders whose build is over.
+///
+/// The placeholder is removed exactly once, on the happy path of the task
+/// `start_build` spawned — so ANY way that task fails to reach its last line
+/// leaks it permanently: a user cancel (`BuildCancelRegistry` aborts the task
+/// handle, and an aborted future never runs the removal), a panic, or the
+/// process dying mid-build. A leaked placeholder is not inert: `deploy_full`
+/// hands a project's FIRST deployment the production alias, so the shell owns
+/// `<project>` on that node forever, `persist::restore` then reconciles it from
+/// `Building` to a permanent `Error`, and the node both serves it and publishes
+/// a DNS affinity record for it. Witnessed on `archive-zip.shadw.app`
+/// (2026-08-05): fc-sanjose answered the project host from a 2-day-old
+/// placeholder while fc-sanjose-gpu-1 held the Ready deployment.
+///
+/// The reap condition is "the build that minted it is no longer in flight",
+/// which is decidable from local state alone and is exactly the condition the
+/// removal call was standing in for. An unknown build id counts as over: build
+/// records do not outlive a restart, and a placeholder for a build nobody
+/// remembers can never be superseded by it.
+pub async fn reap_orphan_placeholders(cloud: &Arc<CloudState>) -> usize {
+    let stale: Vec<(String, String)> = cloud
+        .gw
+        .deployment_records()
+        .into_iter()
+        .filter(|rec| rec.state != DeployState::Ready && is_placeholder_record(rec))
+        .filter(|rec| {
+            placeholder_build_id(&rec.root).is_some_and(|bid| {
+                !cloud
+                    .builds
+                    .get(bid)
+                    .is_some_and(|b| matches!(b.state, DeployState::Queued | DeployState::Building))
+            })
+        })
+        .map(|rec| (rec.id, rec.project))
+        .collect();
+    if stale.is_empty() {
+        return 0;
+    }
+    for (id, project) in &stale {
+        cloud.gw.remove(id).await;
+        tracing::warn!(
+            deployment = %id,
+            project = %project,
+            "reaped orphaned Building… placeholder (its build is no longer in flight)"
+        );
+    }
+    crate::persist::persist(cloud);
+    stale.len()
 }
 
 async fn run_git(dir: &Path, args: &[&str]) -> Option<String> {

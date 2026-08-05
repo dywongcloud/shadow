@@ -2966,6 +2966,41 @@ pub async fn bind_full(
             "using self-hosted iroh relays (HIVE_RELAY_URLS)"
         );
     }
+    // Pin the QUIC bind port when HIVE_IROH_PORT is set. By default iroh binds an
+    // EPHEMERAL UDP port (witnessed live: 37095/60316/43633/51891 on one node,
+    // different every restart). That is fine when every path is relayed, but it
+    // makes a cloud security-group rule impossible to write — you cannot open a
+    // port whose number changes on each boot, which is exactly why the CVM/GPU
+    // hosts (inbound 22 only) could never accept a DIRECT connection and were
+    // relay-only. Pinning the port is the PREREQUISITE for allowing hole-punched
+    // direct p2p on those hosts; relays are unchanged and remain the fallback
+    // whenever the direct path or discovery is unavailable. Unset ⇒ ephemeral,
+    // exactly as before, so nothing changes for hosts that don't need it.
+    if let Some(port) = std::env::var("HIVE_IROH_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+    {
+        // One `bind_addr` per address family (iroh's own contract: calling it
+        // twice for the SAME family is undefined routing), preceded by
+        // `clear_ip_transports` so our explicit pair replaces the preset's
+        // default sockets rather than racing them — this mirrors iroh's
+        // documented example. Both calls are infallible in practice: the
+        // addresses are `UNSPECIFIED` + a parsed `u16`, and the only error
+        // arms are a duplicate user-defined default (impossible right after
+        // clearing) or an invalid prefix length (not reachable with default
+        // opts), so a failure here is a programming error and must be loud
+        // rather than silently reverting to an ephemeral port the operator
+        // then cannot open in a firewall.
+        let v4 = std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port));
+        let v6 = std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port));
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(v4)
+            .and_then(|b| b.bind_addr(v6))
+            .expect("UNSPECIFIED v4/v6 with a parsed u16 port is always a bindable socket addr");
+        tracing::info!(port, "pinned iroh QUIC bind port (HIVE_IROH_PORT)");
+    }
     if let Some(path) = key_path {
         builder = builder.secret_key(load_or_create_secret(&path));
     }

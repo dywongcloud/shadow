@@ -1687,13 +1687,26 @@ impl Manifest {
         for r in &self.routes {
             if path_matches(&r.pattern, path) {
                 match best {
-                    Some(b) if b.pattern.len() >= r.pattern.len() => {}
+                    // Specificity is the matched PREFIX, not the raw pattern
+                    // text — else a catch-all `/*` (2 chars) would outrank the
+                    // `/api` (4 chars) it is meant to be the fallback for the
+                    // moment wildcards became matchable.
+                    Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {}
                     _ => best = Some(r),
                 }
             }
         }
         best.map(|r| r.target.clone())
             .unwrap_or(RouteTarget::Static)
+    }
+
+    /// Did any declared route actually match `path`? `resolve` answers
+    /// `RouteTarget::Static` for BOTH "a route says static" and "no route
+    /// matched at all", which is exactly the ambiguity that let an unroutable
+    /// deployment 404 as if it were an ordinary missing file. Callers that need
+    /// to explain a 404 ask this.
+    pub fn route_matched(&self, path: &str) -> bool {
+        self.routes.iter().any(|r| path_matches(&r.pattern, path))
     }
 
     /// The per-route runtime policy (#16) for a request path, if any. Matches the
@@ -1824,14 +1837,38 @@ fn rule_target(source: &str, destination: &str, path: &str) -> String {
     destination.to_string()
 }
 
+/// The matching PREFIX a route pattern denotes, with a trailing wildcard
+/// stripped. `"/"` → `""`, `"/*"` → `""`, `"*"` → `""`, `"/api/*"` → `"/api"`,
+/// `"/api"` → `"/api"`.
+///
+/// The wildcard forms are why this exists. `path_matches` used to be a bare
+/// `strip_prefix`, so a `fluid.json` route written the natural way —
+/// `{"pattern": "/*", "target": {"function": "web"}}` — matched NOTHING: no
+/// request path begins with the literal two characters `/*`. Every request then
+/// fell through `Manifest::resolve`'s `RouteTarget::Static` default, so the
+/// deployment 404'd `not found` on every path while reporting Ready with its
+/// function registered, and `try_browser` (reachable only from the
+/// `RouteTarget::Function` branch) was never consulted either — a deployment
+/// that could serve neither from the fleet nor from a donor browser. Witnessed
+/// live on `archive-zip.shadw.app` (2026-08-05): `GET /` → 404 `not found`,
+/// while `GET /fluid.json` returned the project's own source as a static file.
+///
+/// Only a TRAILING wildcard is understood — a pattern with one in the middle
+/// (`/api/*/x`) keeps its literal, matches-nothing behaviour rather than being
+/// silently reinterpreted as something it does not say.
+pub fn route_prefix(pattern: &str) -> &str {
+    pattern.trim().trim_end_matches('*').trim_end_matches('/')
+}
+
 /// Prefix match with `/` boundary awareness. `"/api"` matches `/api` and
-/// `/api/x` but not `/apixyz`. `"/"` matches everything.
+/// `/api/x` but not `/apixyz`. `"/"`, `"/*"` and `"*"` match everything;
+/// `"/api/*"` matches exactly what `"/api"` does.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
-    if pattern == "/" {
+    let prefix = route_prefix(pattern);
+    if prefix.is_empty() {
         return true;
     }
-    let pattern = pattern.trim_end_matches('/');
-    if let Some(rest) = path.strip_prefix(pattern) {
+    if let Some(rest) = path.strip_prefix(prefix) {
         rest.is_empty() || rest.starts_with('/')
     } else {
         false

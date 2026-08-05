@@ -679,6 +679,112 @@ pub fn descriptor_for(
     None
 }
 
+/// One browser-eligible function of one Ready deployment, resolved from
+/// replicated state (browser-auto-serve-eligible-set). Everything here is
+/// SERVER-DERIVED from the deployment record — no field originates with the
+/// donor, which is what lets the whole set become an admission capability.
+#[derive(Clone, Debug)]
+pub struct EligibleFunction {
+    pub deployment: String,
+    pub project: String,
+    pub function: String,
+    pub artifact: BrowserArtifact,
+    /// Ordering inputs only (never sent to the donor): a promoted production
+    /// deployment outranks a preview, and newer outranks older, so the cap
+    /// below truncates the LEAST relevant work rather than an arbitrary slice.
+    production: bool,
+    created_at_ms: u64,
+}
+
+/// Default ceiling on how many eligible functions one admission may carry.
+/// Each one costs the donor a pinned artifact (bounded source bytes, a lazily
+/// booted runner) and the gateway one routing entry, so the set is bounded by
+/// policy rather than by however many deployments a tenant happens to own.
+const DEFAULT_AUTO_SERVE_MAX: usize = 16;
+
+pub fn auto_serve_max() -> usize {
+    std::env::var("HIVE_BROWSER_AUTO_SERVE_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_AUTO_SERVE_MAX)
+        .min(fluid_gateway::MAX_BROWSER_TARGETS_PER_ENDPOINT)
+}
+
+/// EVERY browser-eligible function a tenant owns, across every Ready
+/// deployment — the automatic counterpart of [`descriptor_for`]'s one
+/// hand-named target (browser-auto-serve-eligible-set).
+///
+/// Same two replicated sources, in the same order, under the same tenant gate
+/// as `descriptor_for`/`resolve_for_tenant`: local gw records first, then the
+/// gossiped peer view, with (deployment, function) dedup so a deployment
+/// visible in both is counted once. A deployment that is not Ready, or belongs
+/// to another tenant, or carries no build-stamped artifact simply is not in the
+/// set — absence of capability, never a broader one.
+///
+/// Deterministically ordered (production, then newest, then id/name) and
+/// truncated to `auto_serve_max()`, so every node computing this from the same
+/// replicated state produces the same answer and a renewal does not reshuffle
+/// a donor's pins for no reason.
+pub fn eligible_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> Vec<EligibleFunction> {
+    let mut out: Vec<EligibleFunction> = Vec::new();
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for record in cloud.gw.deployment_records() {
+        if record.state != fluid_core::DeployState::Ready
+            || crate::admin::record_tenant(&record.tenant) != tenant
+        {
+            continue;
+        }
+        for f in &record.manifest.functions {
+            let Some(artifact) = f.browser_artifact.clone() else {
+                continue;
+            };
+            if !seen.insert((record.id.clone(), f.name.clone())) {
+                continue;
+            }
+            out.push(EligibleFunction {
+                deployment: record.id.clone(),
+                project: record.project.clone(),
+                function: f.name.clone(),
+                artifact,
+                production: record.production,
+                created_at_ms: record.created_at_ms,
+            });
+        }
+    }
+    for deployments in cloud.peer_deployments.read().values() {
+        for info in deployments {
+            if info.state != fluid_core::DeployState::Ready
+                || crate::admin::record_tenant(&info.tenant) != tenant
+            {
+                continue;
+            }
+            for bf in &info.browser_functions {
+                if !seen.insert((info.id.0.clone(), bf.name.clone())) {
+                    continue;
+                }
+                out.push(EligibleFunction {
+                    deployment: info.id.0.clone(),
+                    project: info.project.clone(),
+                    function: bf.name.clone(),
+                    artifact: bf.artifact.clone(),
+                    production: info.production,
+                    created_at_ms: info.created_at_ms,
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.production
+            .cmp(&a.production)
+            .then(b.created_at_ms.cmp(&a.created_at_ms))
+            .then(a.deployment.cmp(&b.deployment))
+            .then(a.function.cmp(&b.function))
+    });
+    out.truncate(auto_serve_max());
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Content-addressed delivery (browser-function-artifact-delivery)
 // ---------------------------------------------------------------------------

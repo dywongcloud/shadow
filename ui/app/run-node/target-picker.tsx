@@ -8,17 +8,23 @@
 // limits, and deployments whose only browser contribution is a replicated
 // database. Artifact source and digests are never shown and never asked for.
 //
-// browser-node-optional-serve-target: this picker is NOT a gate. "Nothing —
-// just contribute capacity" is always the first, always-selectable option and
-// is what an empty list falls back to, so a donor whose deployments are all
-// long-running servers or containers can still run a node. Start never depends
+// browser-auto-serve-eligible-set: this picker is no longer how work REACHES a
+// node. The first, default option is automatic — the fleet derives this
+// tenant's whole browser-eligible set server-side and refreshes it on every
+// admission renewal, so a function deployed after the node started begins being
+// served without anyone touching this page. What remains here is (a) an
+// explicit "capacity only" refusal and (b) pinning ONE function or database on
+// purpose, which is exactly as narrow as it looks.
+//
+// browser-node-optional-serve-target: this picker is still NOT a gate — every
+// option, including an empty list, starts a working node. Start never depends
 // on anything chosen here.
 //
 // Keyboard: a plain radio group, so arrow keys move between options and Tab
 // enters/leaves the group — no custom key handling to get wrong. The whole
 // card is the <label>, which keeps the click/tap target large on mobile.
 
-import { Database, RadioTower, Radio } from "lucide-react";
+import { Database, RadioTower, Radio, Sparkles } from "lucide-react";
 import type { ExcludedDeployment, RunNodeTarget } from "@/lib/run-node-targets";
 
 export interface TargetSelection {
@@ -26,10 +32,15 @@ export interface TargetSelection {
   fn: string;
 }
 
+/** What the picker can be set to: the automatic eligible set (the default —
+ *  the fleet decides, live), capacity only, or ONE deliberately pinned target. */
+export type PickerSelection = TargetSelection | "auto" | "none";
+
 export function targetKey(t: TargetSelection): string {
   return `${t.deployment}\u0000${t.fn}`;
 }
 
+const AUTO_KEY = "\u0000auto";
 const NONE_KEY = "\u0000none";
 
 function formatBytes(bytes: number): string {
@@ -40,6 +51,10 @@ function formatBytes(bytes: number): string {
 
 function formatTimeout(ms: number): string {
   return ms % 1000 === 0 ? `${ms / 1000}s` : `${ms}ms`;
+}
+
+function selectionKey(sel: PickerSelection): string {
+  return sel === "auto" ? AUTO_KEY : sel === "none" ? NONE_KEY : targetKey(sel);
 }
 
 export function TargetPicker({
@@ -61,28 +76,57 @@ export function TargetPicker({
   excluded: ExcludedDeployment[];
   loading: boolean;
   fetchError: string | null;
-  /** `null` = the explicit "serve nothing" choice, which is a real, supported
-   *  way to run a node — never an unfinished form. */
-  selected: TargetSelection | null;
-  onSelect: (sel: TargetSelection | null) => void;
+  /** `"auto"` = the automatic eligible set (the default), `"none"` = the
+   *  explicit "serve nothing" choice, an object = one pinned target. All three
+   *  are real, supported ways to run a node — never an unfinished form. */
+  selected: PickerSelection;
+  onSelect: (sel: PickerSelection) => void;
   /** True while the node is running — the attached target is fixed for the
    *  node's lifetime, exactly like the free-form inputs it replaces were. */
   disabled: boolean;
 }) {
-  const selectedKey = selected === null ? NONE_KEY : targetKey(selected);
+  const selectedKey = selectionKey(selected);
+  const eligible = targets.filter((t) => t.kind === "function").length;
 
   return (
     <div>
-      <div role="radiogroup" aria-label="What this node attaches to" className="grid gap-2">
+      <div role="radiogroup" aria-label="What this node serves" className="grid gap-2">
+        <Option
+          optionKey={AUTO_KEY}
+          checked={selectedKey === AUTO_KEY}
+          disabled={disabled}
+          onSelect={() => onSelect("auto")}
+          icon={<Sparkles className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
+          title="Everything this team can run in a browser"
+          detail={
+            <>
+              {/* The count is what the picker can SEE right now; the node is
+                  admitted for whatever the fleet resolves at admission time and
+                  re-resolves on every renewal, so this never claims to be the
+                  authoritative set — it describes it. */}
+              {loading && !fetchError
+                ? "Checking what this team has…"
+                : eligible === 0
+                  ? "Nothing is browser-eligible in this team yet — the node still joins the mesh and starts serving the moment something is, with no restart."
+                  : `${eligible} browser-eligible function${eligible === 1 ? "" : "s"} right now. New deployments are picked up automatically, within a minute, without restarting the node.`}
+            </>
+          }
+        />
         <Option
           optionKey={NONE_KEY}
           checked={selectedKey === NONE_KEY}
           disabled={disabled}
-          onSelect={() => onSelect(null)}
+          onSelect={() => onSelect("none")}
           icon={<Radio className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
           title="Nothing — just contribute capacity"
           detail="Joins the mesh, holds a relay identity and appears on the constellation map. Serves no function and replicates no database."
         />
+        {targets.length > 0 && (
+          <p className="mt-1 text-[11px] text-muted">
+            Or pin exactly one thing — this node then serves only that, and nothing new is added to it
+            automatically.
+          </p>
+        )}
         {targets.map((t) => {
           const key = targetKey(t);
           return t.kind === "function" ? (
@@ -145,9 +189,10 @@ export function TargetPicker({
         <div className="mt-2 rounded-md border border-dashed border-border-strong p-3 text-xs leading-relaxed text-secondary">
           <p className="font-medium text-fg">Nothing in this team can run in a browser yet.</p>
           <p className="mt-1">
-            That doesn&apos;t stop you running a node — it just runs with no serve lane. A function becomes
-            selectable here <span className="font-medium text-fg">automatically</span> once it&apos;s
-            browser-eligible: a JS or Bun request→response handler that exports{" "}
+            That doesn&apos;t stop you running a node — it just runs with no serve lane until something is
+            eligible, and then it picks that up{" "}
+            <span className="font-medium text-fg">on its own, without restarting</span>. A function becomes
+            eligible automatically once it&apos;s a JS or Bun request→response handler that exports{" "}
             <code className="font-mono">module.exports</code> (or ships a <code className="font-mono">browser.js</code>{" "}
             handler) and uses no Node/Bun-only APIs. Containers, long-running servers (Next.js, Express),
             TypeScript, and Python/Go functions can&apos;t execute in a browser engine at all. A project with a

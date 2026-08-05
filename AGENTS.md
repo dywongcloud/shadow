@@ -492,16 +492,51 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
 - **Admission capabilities are entirely server-derived.** `browser_admission`'s
   `validate_request` resolves deployment+function to its ready descriptor
   under the authenticated tenant (`browser_artifacts::descriptor_for`) and the
-  admission record's `digest` IS that descriptor's canonical policy digest;
+  admission record's digests ARE those descriptors' canonical policy digests;
   `AdmissionRequest.digest` is a rollout-compat field that is accepted but
   never read — a forged digest admits nothing (there is nothing to match it
   against), and a stale one is simply reconciled to the current descriptor.
-  The admit/renewal response carries a `capability` block — `artifact_url`,
-  `policy_digest`/`source_digest`/`source_bytes`, resolved limits, and
-  `trusted_callers` — one atomic snapshot the donor reconciles its grants
-  from, descriptor rotation included (`routing_identity_changed` tears the
-  old route down first). The block is additive JSON on the admission HTTP
-  API; `hive-browser-proto`'s QUIC wire contract is untouched.
+  The admit/renewal response carries a `capability` block — `artifacts[]`
+  (each with `artifact_url`, `policy_digest`/`source_digest`/`source_bytes`,
+  resolved limits) and `trusted_callers` — one atomic snapshot the donor
+  reconciles its grants from, descriptor rotation included
+  (`routing_identity_changed` tears the old route down first). The block is
+  additive JSON on the admission HTTP API; `hive-browser-proto`'s QUIC wire
+  contract is untouched.
+- **Work reaches a browser node AUTOMATICALLY; the picker is an override.**
+  A donor that pins nothing sends `serve_mode: "auto"` and the server derives
+  the WHOLE set — `browser_artifacts::eligible_for_tenant`: every
+  browser-eligible function of every Ready deployment under the AUTHENTICATED
+  tenant, from the same two replicated sources `descriptor_for` reads,
+  deterministically ordered (production, then newest) and capped
+  (`HIVE_BROWSER_AUTO_SERVE_MAX`, default 16, hard-bounded by
+  `fluid_gateway::MAX_BROWSER_TARGETS_PER_ENDPOINT`). It is re-derived on
+  every renewal, so a newly deployed function is served within one lease tick
+  with no restart. `serve_mode` is a REQUEST, never a capability: it can only
+  ask for what the tenant already owns, and absent/anything-else still means
+  serve nothing (a pre-upgrade worker must never start serving code it did not
+  ask for). Naming a `deployment` always overrides auto.
+  - `BrowserAdmission.serves` is the replicated set; the scalar
+    `deployment`/`function`/`digest` triple survives ONLY as the pre-`serves`
+    follower's view and must stay a COHERENT member of the set (never a
+    deployment-A/function-of-B mixture, which would let a same-named function
+    execute the wrong digest) — in auto mode with no database pin it is empty,
+    so an old follower routes nothing rather than something wrong.
+  - `fluid_gateway::set_browser_targets` replaces an endpoint's WHOLE
+    registration set under one write lock (one entry per function key, every
+    member independently validated); `upsert_browser_target` is the
+    one-element wrapper. `routing_identity_changed` is now a SUPERSET test —
+    a pure addition (someone deployed) must not tear down the browser's QUIC
+    trunk and presence, only a removed/rotated entry may.
+  - The database grant does NOT auto-pick among several: a browser holds one
+    replica, so `browser_db::auto_db_deployment_for_tenant` grants only when
+    the tenant has exactly ONE project with a `browser_db` block; with two or
+    more the picker must choose, or the node runs without one.
+  - Donor side: the worker pins each descriptor on demand and unpins whatever
+    left the set. A per-artifact pin failure never discards the rest (one
+    unreachable artifact must not blank a node serving nine others) — it is
+    named in `status.functions.failed` and retried next renewal; only a TOTAL
+    failure throws and takes the existing backoff path.
 - **A fresh validated admission supersedes the relay denylist; a bare revoke
   still denies.** `stop()`'s admission DELETE writes a relay-denylist entry
   (10-min retention, `RELAY_DENYLIST_RETENTION_MS`) so a revoked identity

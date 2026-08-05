@@ -517,6 +517,25 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             )
         })
         .count();
+    // A `Building…` PLACEHOLDER is the one in-flight record that must be DROPPED
+    // rather than reconciled. It is a shell (no git, no functions, a scratch root
+    // holding one "Building…" page) whose build died with the previous process,
+    // and `deploy_full` gave it the project's production alias because it was the
+    // project's first deployment — so promoting it to `Error` makes the shell the
+    // permanent owner of `<project>` on this node, which then serves it and
+    // publishes a DNS affinity record for it while the real deployment sits on
+    // whichever node placement chose. Witnessed on `archive-zip.shadw.app`
+    // (2026-08-05). Dropping it costs nothing: no build can still be superseding
+    // it, and `crate::git::reap_orphan_placeholders` removes the same shells on a
+    // running node.
+    let before = deployments.len();
+    deployments.retain(|rec| {
+        !(matches!(
+            rec.state,
+            fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+        ) && crate::git::is_placeholder_record(rec))
+    });
+    let dropped = before - deployments.len();
     for rec in &mut deployments {
         if matches!(
             rec.state,
@@ -525,8 +544,14 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
             rec.state = fluid_core::DeployState::Error;
         }
     }
-    if orphaned_count > 0 {
-        tracing::warn!(count = orphaned_count, "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)");
+    if dropped > 0 {
+        tracing::warn!(
+            count = dropped,
+            "persist::restore: dropped orphaned Building… placeholder(s) (their builds died with a prior process; the project alias is freed for the real deployment)"
+        );
+    }
+    if orphaned_count > dropped {
+        tracing::warn!(count = orphaned_count - dropped, "persist::restore: reconciled orphaned in-flight deployment(s) to Error (interrupted by a prior node restart)");
     }
     for rec in deployments {
         // Decide whether a persisted deployment can still serve after a restart:

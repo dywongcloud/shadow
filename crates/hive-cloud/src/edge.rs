@@ -411,7 +411,46 @@ async fn edge_pipeline_inner(
         .leases
         .owner_of(&sub)
         .filter(|owner| owner != &cloud.node_name);
-    if !already_proxied && !host.is_empty() && (!serve_local || container_owner.is_some()) {
+    // A local record that CANNOT SERVE must not win the host over a peer that
+    // can. `serves_host` only asks "is there an alias", and an alias outlives
+    // the deployment's usefulness: an orphaned `Building…` placeholder (the
+    // build task died before removing it, then `persist::restore` reconciled it
+    // to `Error`) keeps the project label forever on the node that started the
+    // build, while the real deployment lands on the node placement chose. That
+    // node then served the dead record locally and NEVER consulted
+    // `peer_routes` — witnessed on `archive-zip.shadw.app` (2026-08-05):
+    // fc-sanjose answered the project host from its `Error` placeholder while
+    // fc-sanjose-gpu-1 held the Ready production deployment one hop away, and
+    // the contrast was visible in the same fleet — the branch alias, which
+    // fc-sanjose did NOT hold, proxied correctly and returned 200.
+    //
+    // Deliberately gated on a peer actually having a healthy route: with no
+    // peer to hand off to, serving the local `Building…`/build-failed page is
+    // still the most honest answer this node has.
+    //
+    // `None` here — an alias whose deployment record is gone — counts as not
+    // ready for the same reason.
+    let local_state = serve_local
+        .then(|| cloud.gw.host_deploy_state(&host))
+        .flatten();
+    let prefer_peer = serve_local
+        && !matches!(local_state, Some(fluid_core::DeployState::Ready))
+        && cloud
+            .peer_routes
+            .read()
+            .get(&sub)
+            .is_some_and(|rs| rs.iter().any(|r| r.healthy));
+    if prefer_peer {
+        tracing::warn!(
+            host = %host,
+            state = ?local_state,
+            "local deployment for this host is not Ready; routing to a peer that serves it"
+        );
+    }
+    if !already_proxied
+        && !host.is_empty()
+        && (!serve_local || container_owner.is_some() || prefer_peer)
+    {
         // Only nodes healthy in BOTH the route table AND the gossip registry are
         // eligible (#6) — a dropped/unhealthy node is excluded as a candidate.
         let healthy_ids: std::collections::HashSet<String> = cloud
@@ -941,7 +980,25 @@ async fn edge_pipeline_inner(
     // domain. Render the Vercel-style DEPLOYMENT_NOT_FOUND page (region-aware id)
     // instead of silently falling back to the default deployment / preview gate.
     // (`_vercel/*` + `/_shadw/zk` were already handled above.)
+    //
+    // …UNLESS the fleet knows this label. "Never deployed" and "deployed, but
+    // every build failed / nothing is Ready / no healthy route exists from here"
+    // are different facts with different fixes, and answering both with the same
+    // 404 sent owners hunting a DNS/typo problem for a broken build. Say which.
     if !serve_local && !already_proxied && !host.is_empty() {
+        if let Some(known) = known_label_status(&cloud, &sub) {
+            let ev = cloud.event(
+                &region,
+                &method,
+                &host,
+                &path,
+                503,
+                "deployment-not-ready",
+                &known.detail,
+            );
+            cloud.record(ev);
+            return deployment_not_ready(&region, &known);
+        }
         let ev = cloud.event(
             &region,
             &method,
@@ -1300,6 +1357,158 @@ fn deployment_not_found(region: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::NOT_FOUND.into_response());
     set(&mut resp, "x-hive-region", region);
     set(&mut resp, "x-hive-error", "DEPLOYMENT_NOT_FOUND");
+    resp
+}
+
+/// What the fleet knows about a host label that nothing here can serve.
+struct KnownLabel {
+    project: String,
+    /// One sentence naming the actual condition (build state, or "hosted on X
+    /// with no healthy route from here").
+    reason: String,
+    /// Short, log/event-sized form of the same fact.
+    detail: String,
+}
+
+/// Does ANY deployment record in the fleet — local or gossiped — claim this host
+/// label, or does a project by that name exist at all?
+///
+/// Returns `None` for a label nothing has ever heard of (the real
+/// DEPLOYMENT_NOT_FOUND) and `Some` when the label is known but unserved here,
+/// which is a different problem with a different fix. Ready records are reported
+/// too: a Ready deployment we could not route to is a routing/gossip gap, and
+/// saying "not found" for it has actively misdirected debugging.
+fn known_label_status(cloud: &Arc<CloudState>, sub: &str) -> Option<KnownLabel> {
+    let label_hit = |d: &fluid_core::DeploymentInfo| {
+        d.project == sub
+            || [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
+                .iter()
+                .any(|a| !a.is_empty() && a.split('.').next().unwrap_or(a) == sub)
+    };
+    // Local records first (authoritative for this node), then the gossiped
+    // fleet view; newest wins so the answer describes the latest attempt.
+    let mut best: Option<(u64, String, fluid_core::DeployState, Option<String>)> = None;
+    for d in cloud.gw.list().into_iter().filter(label_hit) {
+        let cand = (d.created_at_ms, d.project.clone(), d.state, None);
+        if best.as_ref().is_none_or(|b| b.0 < cand.0) {
+            best = Some(cand);
+        }
+    }
+    for (node, deps) in cloud.peer_deployments.read().iter() {
+        for d in deps.iter().filter(|d| label_hit(d)) {
+            let cand = (
+                d.created_at_ms,
+                d.project.clone(),
+                d.state,
+                Some(node.clone()),
+            );
+            if best.as_ref().is_none_or(|b| b.0 < cand.0) {
+                best = Some(cand);
+            }
+        }
+    }
+    if let Some((_, project, state, node)) = best {
+        let (reason, detail) = match (state, node.as_deref()) {
+            // The visitor-facing sentence never names the hosting NODE — that is
+            // internal topology on a page served to the public internet. The
+            // event detail keeps it, which is where an operator looks anyway.
+            (fluid_core::DeployState::Ready, Some(n)) => (
+                format!(
+                    "The latest deployment of \"{project}\" is ready, but this region has no \
+                     healthy route to it right now. Retry in a moment."
+                ),
+                format!("{project}:ready-unroutable:{n}"),
+            ),
+            (fluid_core::DeployState::Ready, None) => (
+                format!(
+                    "The latest deployment of \"{project}\" is ready, but it is not aliased to \
+                     this host. Retry in a moment."
+                ),
+                format!("{project}:ready-unaliased"),
+            ),
+            (fluid_core::DeployState::Error, _) => (
+                format!(
+                    "The latest build of \"{project}\" FAILED, so there is no deployment to \
+                     serve. Open the project's build logs, fix the error and redeploy."
+                ),
+                format!("{project}:build-error"),
+            ),
+            (fluid_core::DeployState::Cancelled, _) => (
+                format!(
+                    "The latest build of \"{project}\" was cancelled, so there is no deployment \
+                     to serve. Redeploy to bring it back."
+                ),
+                format!("{project}:build-cancelled"),
+            ),
+            (st, _) => (
+                format!(
+                    "\"{project}\" is still building ({st:?}). This URL starts serving as soon \
+                     as the build finishes."
+                ),
+                format!("{project}:building"),
+            ),
+        };
+        return Some(KnownLabel {
+            project,
+            reason,
+            detail,
+        });
+    }
+    // No deployment record anywhere, but the project itself exists (every build
+    // failed before a record was ever registered — the dropped-browser-opt-in
+    // guard and every other pre-registration rejection land here).
+    let project = cloud.projects.find_key_ci(sub)?;
+    Some(KnownLabel {
+        reason: format!(
+            "The project \"{project}\" exists but has no deployment: no build has ever completed \
+             successfully. Open its build logs, fix the error and redeploy."
+        ),
+        detail: format!("{project}:no-deployment"),
+        project,
+    })
+}
+
+/// The honest counterpart to [`deployment_not_found`]: the platform KNOWS this
+/// project, it just has nothing Ready to serve. 503 (not 404) because the name
+/// is real and the condition is temporary by construction — a fixed build makes
+/// it serve with no other action.
+fn deployment_not_ready(region: &str, known: &KnownLabel) -> Response {
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
+    let html = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>503: DEPLOYMENT_NOT_READY</title>
+<style>
+  html,body{{height:100%}}
+  body{{margin:0;background:#fff;color:#000;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+  .wrap{{max-width:780px;margin:0 auto;padding:34vh 24px 0}}
+  .card{{border:1px solid #eaeaea;border-radius:8px;padding:26px 30px}}
+  .card h1{{font-size:15px;font-weight:400;margin:0 0 20px}}
+  .card h1 b{{font-weight:700}}
+  .row{{font-size:15px;margin:13px 0;line-height:1.5}}
+  code{{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,'Liberation Mono',monospace;font-size:14px}}
+</style></head>
+<body><div class="wrap">
+  <div class="card">
+    <h1><b>503</b>: DEPLOYMENT_NOT_READY</h1>
+    <div class="row">Project: <code>{project}</code></div>
+    <div class="row">{reason}</div>
+  </div>
+</div></body></html>"#,
+        project = esc(&known.project),
+        reason = esc(&known.reason),
+    );
+    let mut resp = Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")
+        .body(Body::from(html))
+        .unwrap_or_else(|_| StatusCode::SERVICE_UNAVAILABLE.into_response());
+    set(&mut resp, "x-hive-region", region);
+    set(&mut resp, "x-hive-error", "DEPLOYMENT_NOT_READY");
+    set(&mut resp, "x-hive-project", &known.project);
+    set(&mut resp, "retry-after", "30");
     resp
 }
 

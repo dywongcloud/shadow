@@ -982,6 +982,15 @@ async fn main() -> anyhow::Result<()> {
             if n > 0 {
                 tracing::info!(removed = n, "gc: cleaned stale build dirs");
             }
+            // Same tick, different leak: a `Building…` placeholder whose build
+            // task never reached its removal line (user cancel aborts the task
+            // handle; a panic ends it) owns the project's host alias forever and
+            // makes this node answer for a deployment it does not have. Reaped
+            // here so a running node self-heals instead of waiting for a restart.
+            let p = crate::git::reap_orphan_placeholders(&gc_cloud).await;
+            if p > 0 {
+                tracing::info!(removed = p, "gc: reaped orphaned Building… placeholders");
+            }
         }
     });
 
@@ -1472,7 +1481,6 @@ async fn admin_loopback_forward(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use axum::response::IntoResponse;
     let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
     // Chain termination with the same anti-spoof rule admin_ingress applies: a
     // forwarded-marked mutation is only ever applied on the CURRENT leader —
@@ -1480,11 +1488,7 @@ async fn admin_loopback_forward(
     // change, both refused with 503 (the client retries and re-resolves).
     if req.headers().contains_key("x-hive-admin-forwarded") {
         if is_mutation && !cloud.is_control_plane_leader() {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "not control-plane leader",
-            )
-                .into_response();
+            return not_leader_refusal();
         }
         return next.run(req).await;
     }
@@ -1498,19 +1502,7 @@ async fn admin_loopback_forward(
     // Forward to the leader over the public SNI-pinned HTTPS ingress — the
     // exact helper admin_ingress uses (production-proven transport), never a
     // second bespoke path.
-    let leader_ip = cloud
-        .leader_node()
-        .and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
-    if let Some(ip) = leader_ip {
-        if let Some(client) = leader_client(&ip, &api_host) {
-            return admin_forward_to_leader(client, &api_host, cloud.cluster.epoch(), req).await;
-        }
-    }
-    (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        "control-plane leader unreachable",
-    )
-        .into_response()
+    admin_forward_to_leader(&cloud, &api_host, req).await
 }
 
 /// One listener, split by Host (real-DNS ingress): `api.{platform_domain}` (the
@@ -1717,11 +1709,7 @@ async fn admin_ingress(
             return serve_local(admin, req).await;
         }
         if is_mutation {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                "not control-plane leader",
-            )
-                .into_response();
+            return not_leader_refusal();
         }
         return serve_local(admin, req).await;
     }
@@ -1776,28 +1764,40 @@ async fn admin_ingress(
     if cloud.is_control_plane_leader() {
         return serve_local(admin, req).await;
     }
-    // Forward to the leader. Build the SNI-pinned client up front: a leader with no
-    // reachable IP — OR a malformed registry IP that won't parse to a socket addr —
-    // must FAIL CLOSED (never fall back to plain DNS, which could send the write
-    // anywhere). In that case avoid split-brain: serve reads locally (best effort),
-    // refuse mutations with 503.
-    let leader_ip = cloud
-        .leader_node()
-        .and_then(|n| n.public_ip.clone().or(n.public_ip6.clone()));
-    if let Some(ip) = leader_ip {
-        if let Some(client) = leader_client(&ip, &api_host) {
-            return admin_forward_to_leader(client, &api_host, cloud.cluster.epoch(), req).await;
-        }
-    }
-    if matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH") {
-        (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "control-plane leader unreachable",
-        )
-            .into_response()
-    } else {
-        serve_local(admin, req).await
-    }
+    // Forward to the leader. Every candidate is SNI-pinned to a registry IP: a
+    // leader with no reachable IP — OR a malformed registry IP that won't parse to
+    // a socket addr — must FAIL CLOSED (never fall back to plain DNS, which could
+    // send the write anywhere), so with nothing dialable the mutation is refused
+    // with 503 rather than applied here (split-brain). Reads never reach this
+    // point (they returned locally above).
+    admin_forward_to_leader(&cloud, &api_host, req).await
+}
+
+/// The EXACT body a node returns when a forwarded mutation lands on it and it is
+/// not the control-plane leader. One constant, three users — the two refusal
+/// sites and `is_not_leader_refusal` — because a forwarder now has to RECOGNISE
+/// this answer to route around it, and a drift between emitter and matcher would
+/// silently reinstate the dead end this constant exists to close.
+const NOT_LEADER_BODY: &str = "not control-plane leader";
+
+/// The refusal itself. Load-bearing property: it is emitted BEFORE `next.run` /
+/// `serve_local`, so a caller that receives it knows the request was PROVABLY
+/// not applied — which is the only reason re-sending it to another candidate is
+/// safe (an ambiguous failure, e.g. a mid-flight transport error, is never
+/// retried).
+fn not_leader_refusal() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        NOT_LEADER_BODY,
+    )
+        .into_response()
+}
+
+/// True for exactly the response [`not_leader_refusal`] produces.
+fn is_not_leader_refusal(status: u16, body: &[u8]) -> bool {
+    status == axum::http::StatusCode::SERVICE_UNAVAILABLE.as_u16()
+        && std::str::from_utf8(body).is_ok_and(|s| s.trim() == NOT_LEADER_BODY)
 }
 
 /// A no-redirect reqwest client that resolves `api_host` to a specific leader
@@ -1806,6 +1806,10 @@ async fn admin_ingress(
 /// Returns `None` when `ip` doesn't parse to an address or the client can't be
 /// built, so the caller FAILS CLOSED rather than falling back to plain DNS (which
 /// would resolve `api_host` to an arbitrary node and mis-route the forward).
+///
+/// The connect timeout is separate from (and far tighter than) the overall
+/// request timeout: a candidate whose address black-holes must not burn the
+/// whole 30s budget before the next candidate is tried.
 fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, reqwest::Client>>,
@@ -1819,6 +1823,7 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .resolve(api_host, addr)
+        .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .ok()?;
@@ -1826,13 +1831,72 @@ fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client> {
     Some(client)
 }
 
-/// Forward an admin request to the leader over HTTPS (pinned to the leader IP,
-/// SNI/Host = api host). Adds the loop-guard header; preserves method, path+query,
-/// headers (incl. Authorization/Cookie), and body; streams the response back.
+/// Ordered (node name, dialable IP) candidates for a leader forward.
+///
+/// WHY THIS IS A LIST AND NOT ONE ADDRESS. `control_plane_leader()` resolves the
+/// owner from the CALLING node's own registry health view, and a health verdict
+/// is per-observer (AGENTS.md, "a health verdict is per-OBSERVER"). One missed
+/// probe against the real owner makes this node fall through
+/// `HIVE_CP_OWNER_CHAIN` to the next entry — which does NOT agree it is the
+/// owner and answers the forwarded write with `not control-plane leader`. That
+/// dead-ends a write the fleet was perfectly able to accept: measured live
+/// 2026-08-05, every follower logged 6–9 owner changes in 3h (cp epoch 86,591)
+/// while the leader itself logged ZERO, i.e. the transitions were the observers'
+/// blips, not real failovers — surfacing to browser-node donors as a raw
+/// "not control-plane leader" on `POST /v1/browser/admissions`.
+///
+/// Order: this node's believed leader first (unchanged behaviour and, in the
+/// common case, correct), then the remaining curated chain entries in chain
+/// order — the operator-controlled candidate set that is the ONLY place
+/// ownership can legitimately sit. Addresses come from the LOCAL registry, so a
+/// candidate is still only ever a node this fleet already knows; deliberately
+/// NOT health-filtered, because the stale health verdict is precisely the input
+/// that just misled us. Self is skipped (we already know we are not the leader,
+/// so a round trip to our own public address can only refuse again).
+fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
+    let nodes = cloud.registry.nodes();
+    let addr_of = |name: &str| -> Option<String> {
+        nodes
+            .iter()
+            .find(|n| n.name == name)
+            .and_then(|n| n.public_ip.clone().or_else(|| n.public_ip6.clone()))
+            .filter(|ip| !ip.trim().is_empty())
+    };
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut push = |name: String, ip: String| {
+        if name != cloud.node_name && !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, ip));
+        }
+    };
+    if let Some(leader) = cloud.leader_node() {
+        if let Some(ip) = leader.public_ip.clone().or_else(|| leader.public_ip6.clone()) {
+            push(leader.name.clone(), ip);
+        }
+    }
+    for entry in crate::cluster::Cluster::owner_chain_from_env() {
+        if let Some(ip) = addr_of(&entry) {
+            push(entry, ip);
+        }
+    }
+    out
+}
+
+/// Forward an admin MUTATION to the control-plane leader over HTTPS (pinned to a
+/// registry IP, SNI/Host = api host). Adds the loop-guard header + the epoch
+/// fencing token; preserves method, path+query, headers (incl.
+/// Authorization/Cookie) and body verbatim, so the receiving leader re-runs the
+/// FULL auth path and re-derives the tenant from the caller's own token — this
+/// hop grants nothing and asserts no identity of its own.
+///
+/// Walks [`leader_forward_candidates`] and moves to the next one on exactly two
+/// provably-not-applied outcomes: the `not control-plane leader` refusal (issued
+/// before the receiver's router ever runs) and a CONNECT failure (nothing was
+/// sent). Any other answer — including a mid-flight transport error, whose
+/// effect is unknowable — is returned as-is, because re-sending a mutation that
+/// may already have been applied is worse than surfacing the failure.
 async fn admin_forward_to_leader(
-    client: reqwest::Client,
+    cloud: &Arc<CloudState>,
     api_host: &str,
-    cp_epoch: u64,
     req: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
@@ -1855,47 +1919,88 @@ async fn admin_forward_to_leader(
             return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
         }
     };
-    // The forwarder's control-plane epoch rides along as the fencing token —
-    // the receiver refuses the write if this is behind ITS epoch (the sender's
-    // view of ownership is stale). See admin_ingress's forwarded branch.
-    let mut rb = client
-        .request(method, &url)
-        .header("x-hive-admin-forwarded", "1")
-        .header("x-hive-cp-epoch", cp_epoch.to_string());
-    for (k, v) in parts.headers.iter() {
-        let n = k.as_str().to_ascii_lowercase();
-        if matches!(n.as_str(), "host" | "content-length" | "connection") {
-            continue;
+    let cp_epoch = cloud.cluster.epoch();
+    let candidates = leader_forward_candidates(cloud);
+    let last = candidates.len().saturating_sub(1);
+    let mut refused: Option<axum::response::Response> = None;
+    for (i, (name, ip)) in candidates.iter().enumerate() {
+        let Some(client) = leader_client(ip, api_host) else {
+            continue; // unparsable registry address: nothing was sent, try the next
+        };
+        // The forwarder's control-plane epoch rides along as the fencing token —
+        // the receiver refuses the write if this is behind ITS epoch (the sender's
+        // view of ownership is stale). See admin_ingress's forwarded branch.
+        let mut rb = client
+            .request(method.clone(), &url)
+            .header("x-hive-admin-forwarded", "1")
+            .header("x-hive-cp-epoch", cp_epoch.to_string());
+        for (k, v) in parts.headers.iter() {
+            let n = k.as_str().to_ascii_lowercase();
+            if matches!(n.as_str(), "host" | "content-length" | "connection") {
+                continue;
+            }
+            rb = rb.header(k, v);
         }
-        rb = rb.header(k, v);
-    }
-    rb = rb
-        .header(reqwest::header::HOST, api_host)
-        .body(body.to_vec());
-    match rb.send().await {
-        Ok(resp) => {
-            let mut out = axum::http::Response::builder().status(resp.status().as_u16());
-            for (k, v) in resp.headers().iter() {
-                let n = k.as_str().to_ascii_lowercase();
-                if matches!(
-                    n.as_str(),
-                    "connection" | "transfer-encoding" | "content-length"
-                ) {
+        rb = rb
+            .header(reqwest::header::HOST, api_host)
+            .body(body.to_vec());
+        match rb.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let mut out = axum::http::Response::builder().status(status);
+                for (k, v) in resp.headers().iter() {
+                    let n = k.as_str().to_ascii_lowercase();
+                    if matches!(
+                        n.as_str(),
+                        "connection" | "transfer-encoding" | "content-length"
+                    ) {
+                        continue;
+                    }
+                    out = out.header(k.as_str(), v.as_bytes());
+                }
+                let bytes = resp.bytes().await.unwrap_or_default();
+                if is_not_leader_refusal(status, &bytes) {
+                    tracing::warn!(
+                        candidate = %name,
+                        path = %path_q,
+                        remaining = last.saturating_sub(i),
+                        "leader forward refused: candidate is not the control-plane leader"
+                    );
+                    // Keep the refusal as the answer of last resort, then try the
+                    // next candidate — this node's own view is the thing in doubt.
+                    refused = Some(
+                        (axum::http::StatusCode::SERVICE_UNAVAILABLE, NOT_LEADER_BODY)
+                            .into_response(),
+                    );
                     continue;
                 }
-                out = out.header(k.as_str(), v.as_bytes());
+                return out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
+                    (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response()
+                });
             }
-            let bytes = resp.bytes().await.unwrap_or_default();
-            out.body(axum::body::Body::from(bytes)).unwrap_or_else(|_| {
-                (axum::http::StatusCode::BAD_GATEWAY, "bad gateway").into_response()
-            })
+            Err(e) if e.is_connect() => {
+                tracing::warn!(candidate = %name, error = %e, "leader forward could not connect");
+                continue; // connection never established: provably not applied
+            }
+            Err(_) => {
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    "control-plane leader forward failed",
+                )
+                    .into_response()
+            }
         }
-        Err(_) => (
-            axum::http::StatusCode::BAD_GATEWAY,
-            "control-plane leader forward failed",
-        )
-            .into_response(),
     }
+    // Every candidate refused (or none was dialable at all). Fail CLOSED: never
+    // apply the mutation locally, which is exactly the split-brain the
+    // single-writer rule exists to prevent.
+    refused.unwrap_or_else(|| {
+        (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "control-plane leader unreachable",
+        )
+            .into_response()
+    })
 }
 
 /// Minimal streaming reverse proxy for the dashboard hosts. Forwards method,

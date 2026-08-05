@@ -44,7 +44,15 @@ export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
  * retry loop. Bumping re-keys the worker URL + SharedWorker name so a reloaded
  * page attaches to a worker that understands the shape, per the mechanism
  * described for v2 above. */
-export const HOST_ABI_VERSION = 3;
+/* v4 (2026-08-05, browser-auto-serve-eligible-set): the `start` message carries
+ * `serveMode` ("auto" | "none"), and the admission capability answers with an
+ * ARRAY of authorized artifacts (`artifacts[]`) rather than one hand-picked
+ * descriptor. A pre-v4 worker reads only the flat compat mirror the server
+ * still emits, so it pins the FIRST artifact while the fleet routes every one
+ * of them to it — the extra routes hit its not-pinned-locally rejection and
+ * open their per-digest circuit. Bumping re-keys the worker URL + SharedWorker
+ * name so a reloaded page attaches to a worker that pins the whole set. */
+export const HOST_ABI_VERSION = 4;
 
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one
@@ -129,6 +137,29 @@ export type DbLaneStatus = {
   siteVersion: number;
   error: string | null;
 };
+
+/** browser-auto-serve-eligible-set: the worker's additive function-lane status.
+ *  Like `db` above this is an ADDITIVE wire key (consumers widen
+ *  `RunNodeStatus` with `{ functions?: FunctionLaneStatus | null }`), and like
+ *  `serving` it describes what is actually PINNED — never what was requested.
+ *  `serving[]` names the pinned digests' deployments/functions so the dashboard
+ *  can say what this node carries; `failed[]` names artifacts the last
+ *  reconcile could not pin, which the next renewal retries. */
+export type FunctionLaneStatus = {
+  /** Policy digests currently pinned in the worker runtime. */
+  pinned: string[];
+  /** Live invoker grants across every pinned digest. */
+  grants: number;
+  /** Invocations served since this run started. */
+  served: number;
+  serving: { digest: string; deployment?: string; function?: string; project?: string }[];
+  failed: { digest: string; error: string }[];
+};
+
+/** Which serve lane the running node ASKED for (the worker echoes its own
+ *  session): the automatic eligible set, one deliberately pinned function, or
+ *  capacity only. Distinct from `serving`, which is about what is pinned. */
+export type ServeMode = "auto" | "pinned" | "none";
 
 export function dbLaneStateLabel(db: DbLaneStatus): string {
   switch (db.state) {
