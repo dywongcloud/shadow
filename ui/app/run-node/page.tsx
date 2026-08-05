@@ -325,6 +325,32 @@ export default function RunNodePage() {
 
   const canStart = selectedTarget !== null && status.lifecycle === "stopped" && !dataSaverBlocked;
 
+  // Explicit reason the Start button is disabled, so it is NEVER a silent dead
+  // end — the "works on my other device but not this one" report was a node
+  // that couldn't start with no visible cause. The two loudest cases
+  // (dataSaver, unsupported) already have their own banners above, so those
+  // return null here to avoid duplicating them; every remaining case that
+  // leaves `canStart` false gets a one-line, actionable explanation right at
+  // the button. Target SELECTION lives in this device's localStorage, so a
+  // fresh device legitimately has none until the user picks one — that is the
+  // single most common cause and previously showed nothing at all.
+  const startDisabledReason =
+    status.lifecycle !== "stopped" || canStart
+      ? null
+      : !supported
+        ? null // covered by the SharedWorker banner above
+        : dataSaverBlocked
+          ? null // covered by the Data Saver banner above
+          : authWindow
+            ? "Waiting for your session to finish signing in — this list fills in automatically, then pick a target to start."
+            : selectionError
+              ? null // the selection-error notice above already explains it
+              : targets.length === 0
+                ? excludedCount > 0
+                  ? "None of your deployments expose a browser-eligible function yet. Deploy a browser function — or a JS/Bun function that ships a browser.js handler — and it becomes runnable here automatically."
+                  : "Deploy a function first — once you have a browser-eligible deployment, you can run it here."
+                : "Choose a deployment and function above, then Start.";
+
   return (
     <div className="mx-auto max-w-2xl">
       <div className="mb-6 flex items-center gap-3">
@@ -350,8 +376,9 @@ export default function RunNodePage() {
         <div className="mb-5 flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-4 text-sm text-amber-600 dark:text-amber-400">
           <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
           <span>
-            This browser doesn&apos;t support SharedWorker, which &quot;Run a node&quot; requires. Try a recent
-            Chrome, Edge, or Firefox desktop build.
+            This browser supports neither SharedWorker nor the Web Locks fallback that &quot;Run a node&quot;
+            needs to keep a node alive across tabs. Try a recent Chrome, Edge, Firefox, or Safari build (a
+            private/incognito window can also disable these).
           </span>
         </div>
       )}
@@ -596,6 +623,11 @@ export default function RunNodePage() {
             </button>
           )}
         </div>
+        {startDisabledReason && (
+          <p className="mt-2 text-xs text-secondary" role="status">
+            {startDisabledReason}
+          </p>
+        )}
       </section>
     </div>
   );
