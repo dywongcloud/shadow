@@ -85,31 +85,15 @@ export default function RunNodePage() {
     () => (deployments ?? []).filter((d) => d.state !== "ready" || (d.browser_functions ?? []).length === 0).length,
     [deployments],
   );
-  // Persisted selection restored lazily (localStorage is unavailable during
-  // SSR — same pattern as geoDecision below). Scope rides along so a restored
-  // selection also restores the visibility it was last used with.
-  const [selection, setSelection] = useState<(TargetSelection & { scope?: "team" | "public" }) | null>(() => {
-    if (typeof window === "undefined") return null;
-    try {
-      const raw = localStorage.getItem(TARGET_KEY);
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed.deployment !== "string" || typeof parsed.fn !== "string") return null;
-      return parsed;
-    } catch {
-      return null;
-    }
-  });
-  const [scope, setScope] = useState<"team" | "public">(() => {
-    if (typeof window === "undefined") return "team";
-    try {
-      const raw = localStorage.getItem(TARGET_KEY);
-      const parsed = raw ? JSON.parse(raw) : null;
-      return parsed && (parsed.scope === "public" || parsed.scope === "team") ? parsed.scope : "team";
-    } catch {
-      return "team";
-    }
-  });
+  // Persisted selection + scope are hydrated AFTER mount (the effect below),
+  // NOT in a lazy useState initializer. Reading localStorage during the first
+  // render makes the client's initial tree diverge from the SSR HTML (the
+  // server has no `window`, so it renders the defaults), and React aborts
+  // hydration with #418 — regenerating the whole tree and, witnessed live,
+  // leaving "Start" dead on any returning device. Initial state is the
+  // SSR-safe default; the one-frame restore flash is the correct tradeoff.
+  const [selection, setSelection] = useState<(TargetSelection & { scope?: "team" | "public" }) | null>(null);
+  const [scope, setScope] = useState<"team" | "public">("team");
   // Auth-window guard (bn-picker-auth-window-empty-list-clears-selection):
   // while the session mint is in backoff/failed, requests proceed
   // unauthenticated and /deployments answers a REAL 200 scoped to an
@@ -181,16 +165,36 @@ export default function RunNodePage() {
     }
   }
 
-  // Restored via a lazy initializer (runs once, during this component's own
-  // first render) rather than an effect — localStorage is unavailable during
-  // SSR, so the guard falls back to "undecided" there and the real value
-  // lands on the client's own first render, with no extra effect-driven
-  // re-render in between.
-  const [geoDecision, setGeoDecision] = useState<"undecided" | "granted" | "denied">(() => {
-    if (typeof window === "undefined") return "undecided";
-    const saved = localStorage.getItem(GEO_CONSENT_KEY);
-    return saved === "granted" || saved === "denied" ? saved : "undecided";
-  });
+  // Also hydrated after mount (the effect below), same #418 reason as
+  // selection/scope above. geoDecision swaps ENTIRE subtrees (the consent
+  // prompt vs the granted/denied block), so a lazy-initializer read of
+  // GEO_CONSENT_KEY was the loudest of the three SSR≠client mismatches.
+  const [geoDecision, setGeoDecision] = useState<"undecided" | "granted" | "denied">("undecided");
+
+  // The ONE place persisted UI state is read from localStorage on load, run
+  // once AFTER the first render has already committed the SSR-identical
+  // defaults above — this is what keeps the hydrated tree byte-identical to the
+  // server's HTML (no #418). Malformed/absent entries leave the defaults.
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(TARGET_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.deployment === "string" && typeof parsed.fn === "string") {
+          setSelection(parsed);
+          if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
+        }
+      }
+    } catch {
+      /* ignore malformed persisted selection */
+    }
+    try {
+      const savedGeo = localStorage.getItem(GEO_CONSENT_KEY);
+      if (savedGeo === "granted" || savedGeo === "denied") setGeoDecision(savedGeo);
+    } catch {
+      /* ignore */
+    }
+  }, []);
   const [geoError, setGeoError] = useState<string | null>(null);
   const [coords, setCoords] = useState<{ lat: number; lon: number } | null>(null);
   const [locatedMs, setLocatedMs] = useState<number | null>(null);
@@ -203,12 +207,14 @@ export default function RunNodePage() {
   // the one just clicked.
   const geoResetBtnRef = useRef<HTMLButtonElement>(null);
   const geoShareBtnRef = useRef<HTMLButtonElement>(null);
-  const geoDecisionMounted = useRef(false);
+  // Focus moves ONLY in response to a real click (Share / Don't share / Reset),
+  // never on mount and never on the post-mount localStorage hydration above —
+  // both set geoDecision without user intent and must not steal focus. The old
+  // first-render-skip guard only skipped ONE settle; hydration adds a second
+  // non-interactive settle, so gate on user action instead.
+  const geoUserActed = useRef(false);
   useEffect(() => {
-    if (!geoDecisionMounted.current) {
-      geoDecisionMounted.current = true;
-      return;
-    }
+    if (!geoUserActed.current) return;
     if (geoDecision === "undecided") geoShareBtnRef.current?.focus();
     else geoResetBtnRef.current?.focus();
   }, [geoDecision]);
@@ -302,6 +308,7 @@ export default function RunNodePage() {
   }, [geoDecision, coords?.lat, coords?.lon]);
 
   function decideGeo(next: "granted" | "denied") {
+    geoUserActed.current = true;
     setGeoDecision(next);
     localStorage.setItem(GEO_CONSENT_KEY, next);
     setGeoConsent(next);
@@ -467,6 +474,7 @@ export default function RunNodePage() {
             <button
               ref={geoResetBtnRef}
               onClick={() => {
+                geoUserActed.current = true;
                 localStorage.removeItem(GEO_CONSENT_KEY);
                 setGeoDecision("undecided");
                 setCoords(null);

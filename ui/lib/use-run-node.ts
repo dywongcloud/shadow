@@ -135,7 +135,24 @@ export function useRunNode() {
   // never reaches the worker at all, so it needs its own state rather than
   // overloading RunNodeStatus's wire shape with a field the worker itself
   // has no way to produce.
-  const [dataSaverBlocked, setDataSaverBlocked] = useState(() => dataSaverActive());
+  // SSR-safe: starts false (the server has no `navigator`, so it must render as
+  // "not blocked" to match), and the real value + live updates land in the
+  // effect below. Reading dataSaverActive() in the initializer diverged the
+  // first client render from the SSR HTML for any data-saver user (React #418,
+  // the same hydration-mismatch class as the run-node page's persisted state),
+  // and it also never updated when the connection changed mid-session.
+  const [dataSaverBlocked, setDataSaverBlocked] = useState(false);
+  useEffect(() => {
+    const update = () => setDataSaverBlocked(dataSaverActive());
+    update();
+    const conn = (
+      navigator as Navigator & {
+        connection?: { addEventListener?: (t: string, l: () => void) => void; removeEventListener?: (t: string, l: () => void) => void };
+      }
+    ).connection;
+    conn?.addEventListener?.("change", update);
+    return () => conn?.removeEventListener?.("change", update);
+  }, []);
   // Environment capability check as a lazy initializer (runs once, during
   // this component's own render) rather than an effect-time setState — SSR
   // has no `window`/`SharedWorker`, so it starts `true` there and the real
