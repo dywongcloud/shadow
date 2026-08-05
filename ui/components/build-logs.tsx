@@ -19,6 +19,7 @@ export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; 
   const state = build?.state ?? "queued";
   const building = state === "building" || state === "queued";
   const errored = state === "error";
+  const cancelled = state === "cancelled";
 
   // Tick a clock while building so the elapsed counter advances live.
   useEffect(() => {
@@ -62,6 +63,10 @@ export function BuildLogs({ build, defaultOpen = true }: { build: Build | null; 
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
           ) : errored ? (
             <span className="flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white">
+              <CircleX className="h-3.5 w-3.5" />
+            </span>
+          ) : cancelled ? (
+            <span className="flex h-5 w-5 items-center justify-center rounded-full bg-muted/40 text-secondary">
               <CircleX className="h-3.5 w-3.5" />
             </span>
           ) : null}

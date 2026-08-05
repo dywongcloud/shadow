@@ -1,4 +1,15 @@
 #!/bin/bash
+# PREFERRED PATH: ansible-playbook ansible/playbooks/parallel-deploy.yml --tags backend
+# (see ansible/README.md's "Parallel fleet deploy" section). That entry point
+# builds per glibc group in parallel, pushes every host's binary in parallel
+# (bounded by forks/throttle, not a bash for-loop), and restarts a bounded
+# number of hosts at a time -- all via ansible.cfg's ControlMaster/
+# ControlPersist reuse, which is the fix for this script's own naive-&-wait
+# parallelization failure (many concurrent SSH -A hops from the operator
+# machine converging on one SOURCE node's sshd, dropped by MaxStartups; see
+# swap_restart/roll_group below and deploy-ui-fleet.sh's header for the same
+# failure class). This script is kept as a documented fallback, not deleted.
+#
 # Roll the hive-cloud backend binary fleet-wide with NODE-TO-NODE distribution.
 #
 # The fleet has two glibc groups needing separate native builds (see AGENTS.md

@@ -49,7 +49,11 @@ const RENEW_INTERVAL_MS = 60_000; // inside the backend's [30s,300s] lease windo
 // plain page reload does NOT replace; every connecting tab has to close
 // first). Fixed on the status object below, never patched, so it survives
 // every `{...status, ...patch}` spread in setStatus() untouched.
-const HOST_ABI_VERSION = 2;
+// v3 (browser-node-optional-serve-target): `start` now accepts an empty
+// deployment/fn/digest ("attach to nothing"), and the admission capability can
+// come back with `serving: false` and no artifact fields — a pre-v3 worker
+// wedges on both. Keep in sync with ui/lib/run-node-status.ts.
+const HOST_ABI_VERSION = 3;
 // bn-p2p-version-negotiation (PWA wasm bundle): must match
 // crates/hive-browser/src/lib.rs's wasm_bundle_version() return value --
 // checked live against the ACTUAL loaded module right after init() succeeds
@@ -166,6 +170,14 @@ let status = {
   // artifact digests, live invoker-grant count and served-invoke total of the
   // worker's QuickJS lane. null while no function runtime is running.
   functions: null,
+  // browser-node-optional-serve-target (additive): is this node actually
+  // serving a function right now? Derived from the pinned-artifact count in
+  // updateFunctionsStatus, so it is a statement about real capability rather
+  // than about what the user selected. A donor whose deployments are all
+  // long-running servers runs perfectly well with this false — mesh, relay
+  // identity, presence and database replication all work; only the serve lane
+  // is idle.
+  serving: false,
   // bn-run-node-db-sync-wiring introspection (additive on the wire, like
   // functions above; the ui/lib/run-node-status.ts typed mirror is owned
   // elsewhere): { project, dbFile, access, state, persisted, peers,
@@ -210,6 +222,22 @@ function isSessionStaleError(error) {
     return code === "session_required" || code === "session_stale" || code === "session_lease_too_short";
   }
   return message.includes("session is expired or not fresh") || message.includes("requires a fresh interactive user session");
+}
+
+// Mid-rollout compatibility (browser-node-optional-serve-target): a node still
+// running a pre-change binary rejects an admission carrying no serve target as
+// a TERMINAL `function_target_invalid`. For a session that deliberately has no
+// target, that verdict is about the node's age, not about this request — the
+// public API host is round-robin DNS, so the next retry can land on an upgraded
+// node and succeed. Downgraded to retryable so a donor never dead-ends on the
+// first old node it happens to hit. A genuinely malformed target can't be
+// confused with this: this worker only ever sends deployment+function together
+// or neither, and this check requires the "neither" case.
+function isPreUpgradeTargetlessRefusal(error) {
+  if (!serveTargetless()) return false;
+  const code = error && typeof error === "object" ? error.code : null;
+  const message = String((error && error.message) || error || "");
+  return code === "function_target_invalid" || message.includes("invalid browser function target");
 }
 
 function isTerminalAdmissionError(error) {
@@ -374,6 +402,17 @@ async function callApiOnce(method, path, team, body) {
   }
 }
 
+/** True while this session has no serve target at all
+ *  (browser-node-optional-serve-target): "run a node" and "have a
+ *  browser-servable function" are independent, so a donor whose deployments
+ *  are all long-running servers/containers still joins the mesh, holds a relay
+ *  identity, publishes presence, and (when a deployment with a `browser_db`
+ *  block is attached) replicates its database. The serve lane simply stays
+ *  idle — never faked. */
+function serveTargetless(s = session) {
+  return !s || !s.deployment || !s.fn;
+}
+
 async function admitOnce(addrJson, endpointId) {
   const { deployment, fn, digest, scope, team } = session;
   // Proof-of-possession (bn-p2p-heartbeat-lease): prove THIS call controls
@@ -389,9 +428,12 @@ async function admitOnce(addrJson, endpointId) {
   return await callApi("POST", "/v1/browser/admissions", team, {
     endpoint_id: endpointId,
     addr_json: addrJson,
-    deployment,
-    function: fn,
-    digest,
+    // Both are OPTIONAL on the wire and empty means exactly what it says: no
+    // deployment attached / no function served. The server decides the shape
+    // (serving, database-only, or bare donor) — this side never asserts one.
+    deployment: deployment || "",
+    function: fn || "",
+    digest: digest || "",
     scope: scope || "team",
     protocol_version: PROTOCOL_VERSION,
     challenge_ms: challengeMs,
@@ -418,9 +460,20 @@ function artifactRequestUrl(policyDigest) {
 
 // Validate the capability block's shape into a local descriptor. Everything
 // not matching is a hard error — a malformed capability pins nothing.
+//
+// A capability with `serving: false` carries NO artifact fields and an empty
+// trusted-caller list (browser-node-optional-serve-target). That is a
+// well-formed answer, not a malformed one: it means the server authorized this
+// browser as a node without authorizing it to serve anything. It resolves to a
+// null descriptor with no callers, so the reconcile below revokes whatever the
+// previous capability granted and grants nothing — absence of capability is
+// never the same as a broader one.
 function normalizeCapability(capability) {
   if (!capability || typeof capability !== "object") {
     throw new Error("admission response is missing its capability block");
+  }
+  if (capability.serving === false) {
+    return { descriptor: null, callers: [] };
   }
   const descriptor = {
     policyDigest: capability.policy_digest,
@@ -526,6 +579,27 @@ async function reconcileCapability(capability, myEpoch) {
   const team = session && session.team;
   const { descriptor, callers } = normalizeCapability(capability);
 
+  // Serve-less admission: revoke every grant this worker still holds and
+  // unpin every artifact, then stop. The invoke handler stays installed and
+  // resolves exclusively against pinned digests, so with nothing pinned every
+  // invoke rejects — the node is running and contributing, and serving
+  // nothing.
+  if (descriptor === null) {
+    for (const [digest, granted] of [...fnGrants]) {
+      for (const caller of granted) {
+        try {
+          owner.revokeInvoker(caller, digest);
+        } catch {
+          /* node already closed — the grant map died with it */
+        }
+      }
+      fnGrants.delete(digest);
+      runtime.unpin(digest);
+    }
+    updateFunctionsStatus();
+    return;
+  }
+
   if (!runtime.has(descriptor.policyDigest)) {
     let bytes = await readCachedArtifact(descriptor);
     if (bytes) {
@@ -582,13 +656,26 @@ async function reconcileCapability(capability, myEpoch) {
 
 function updateFunctionsStatus() {
   if (!fnRuntime || fnRuntime.closed) {
-    if (status.functions !== null) setStatus({ functions: null });
+    if (status.functions !== null || status.serving !== false) {
+      setStatus({ functions: null, serving: false });
+    }
     return;
   }
   const stats = fnRuntime.stats();
   let grants = 0;
   for (const callers of fnGrants.values()) grants += callers.size;
-  setStatus({ functions: { pinned: stats.pinned, grants, served: stats.servedTotal } });
+  // `serving` is DERIVED from what is actually pinned, never from what the
+  // session asked for (browser-node-optional-serve-target): a target-less or
+  // database-only node pins nothing, so it reports false and the dashboard can
+  // say plainly that it is running without serving a function.
+  // `stats.pinned` is the ARRAY of pinned digests (WorkerFunctionRuntime.stats
+  // returns `[...artifacts.keys()]`), so this must test its LENGTH — `array > 0`
+  // stringifies and compares as NaN, which is false for a genuinely serving
+  // node too, i.e. silently always-false.
+  setStatus({
+    functions: { pinned: stats.pinned, grants, served: stats.servedTotal },
+    serving: stats.pinned.length > 0,
+  });
 }
 
 // Every teardown path (stop, terminal admission failure, endpoint rotation)
@@ -1347,10 +1434,13 @@ async function renewNow(myEpoch) {
     outcome = "success";
   } catch (error) {
     if (myEpoch !== epoch) return "stale";
-    const message = String((error && error.message) || error);
+    const preUpgrade = isPreUpgradeTargetlessRefusal(error);
+    const message = preUpgrade
+      ? "This node hasn't rolled forward to support running without a serve target yet — retrying automatically, no action needed."
+      : String((error && error.message) || error);
     const mismatch = classifyAdmissionError(error);
     const sessionStale = isSessionStaleError(error);
-    const terminal = isTerminalAdmissionError(error);
+    const terminal = isTerminalAdmissionError(error) && !preUpgrade;
     setStatus({
       admission: "denied",
       lifecycle: terminal ? "error" : "degraded",
@@ -1512,10 +1602,14 @@ async function start(msg) {
   admittedAddrJson = null;
   renewKickPending = false;
   renewBackoffMs = RENEW_BACKOFF_BASE_MS;
+  // The serve target is OPTIONAL (browser-node-optional-serve-target) —
+  // normalized to "" here so every downstream check is one shape, and a start
+  // message that simply omits it is a first-class "run a node, serve nothing
+  // yet" request rather than a malformed one.
   session = {
-    deployment: msg.deployment,
-    fn: msg.fn,
-    digest: msg.digest,
+    deployment: msg.deployment || "",
+    fn: msg.fn || "",
+    digest: msg.digest || "",
     scope: msg.scope,
     team: msg.team,
     relay: msg.relay,
@@ -1770,6 +1864,11 @@ async function stop() {
     relay: null,
     lastError: null,
     functions: null,
+    // Cleared with the rest of the run (browser-node-optional-serve-target):
+    // `serving` describes THIS run's pinned artifacts, so leaving it true
+    // across a stop would carry a claim about a node that no longer exists
+    // into whatever starts next.
+    serving: false,
     db: null,
   });
 }

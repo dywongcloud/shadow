@@ -88,8 +88,27 @@ const RELAY_DENYLIST_RETENTION_MS: u64 = 10 * 60 * 1_000;
 pub struct BrowserAdmission {
     pub endpoint_id: String,
     pub addr_json: String,
+    /// The deployment this browser is attached to, or EMPTY for a donor that
+    /// attached to nothing (browser-node-optional-serve-target). Empty is a
+    /// first-class shape, not a degenerate one: a donor whose tenant has no
+    /// browser-eligible function at all still joins the mesh, holds a relay
+    /// identity and publishes presence — it simply has no serve lane and no
+    /// database grant. Kept a plain `String` (never `Option`) so a
+    /// pre-upgrade follower parses the replicated snapshot unchanged.
+    #[serde(default)]
     pub deployment: String,
+    /// The function this browser serves, or EMPTY for an admission with no
+    /// serve lane (either fully target-less, or database-only: a `deployment`
+    /// with a `browser_db` block but no browser-eligible function).
+    #[serde(default)]
     pub function: String,
+    /// The descriptor's canonical policy digest, or EMPTY when there is no
+    /// serve lane. `serving()` below is the ONE predicate every caller uses;
+    /// `fluid_gateway::upsert_browser_target` independently rejects an empty
+    /// deployment/function/digest, so a serve-less record structurally cannot
+    /// become a routable target even on a peer that has never heard of this
+    /// shape.
+    #[serde(default)]
     pub digest: String,
     pub tenant: String,
     pub subject: String,
@@ -143,6 +162,13 @@ pub enum BrowserDbAccess {
 }
 
 impl BrowserAdmission {
+    /// Does this admission carry a SERVE lane at all? Every routing decision
+    /// funnels through this one predicate rather than re-deriving it, so a
+    /// target-less donor can never acquire a route by an inconsistent check.
+    pub fn serving(&self) -> bool {
+        !self.deployment.is_empty() && !self.function.is_empty() && !self.digest.is_empty()
+    }
+
     fn target(&self) -> BrowserTarget {
         BrowserTarget {
             tenant: self.tenant.clone(),
@@ -481,7 +507,17 @@ impl Default for BrowserAdmissionStore {
 struct AdmissionRequest {
     endpoint_id: String,
     addr_json: String,
+    /// OPTIONAL (browser-node-optional-serve-target). Three admissible
+    /// shapes, decided entirely server-side in `validate_request`:
+    ///   * `deployment` + `function` — today's serving admission.
+    ///   * `deployment` alone — database-only: the deployment must resolve
+    ///     under the authenticated tenant AND still carry a `browser_db`
+    ///     block; no artifact, no serve route, no invoker grants.
+    ///   * neither — a bare donor: mesh + relay identity + presence only.
+    /// A `function` without a `deployment` is the one rejected combination.
+    #[serde(default)]
     deployment: String,
+    #[serde(default)]
     function: String,
     /// ROLLOUT-COMPATIBILITY ONLY (browser-admission-derived-capabilities):
     /// pre-derived-capability workers believed they chose the code digest and
@@ -785,7 +821,7 @@ fn validate_request(
     cloud: &Arc<CloudState>,
     claims: &crate::auth::Claims,
     request: &AdmissionRequest,
-) -> Result<(String, u64, fluid_core::BrowserFunctionRef), AdmissionFailure> {
+) -> Result<(String, u64, Option<fluid_core::BrowserFunctionRef>), AdmissionFailure> {
     // Range check, not exact-match (bn-p2p-version-negotiation): the two
     // failure directions need distinct client-facing signals. A durably
     // outdated client (below the server's floor) needs a forced reload — no
@@ -834,10 +870,18 @@ fn validate_request(
         ));
     }
     verify_proof_of_possession(&endpoint_id, request.challenge_ms, &request.signature)?;
-    if request.deployment.is_empty()
-        || request.deployment.len() > 256
-        || request.function.is_empty()
-        || request.function.len() > 256
+    // A serve target is OPTIONAL (browser-node-optional-serve-target): running
+    // a node and having something browser-servable are independent facts, and
+    // a donor whose deployments are all long-running servers/containers can
+    // contribute everything that does not need a function artifact. What stays
+    // mandatory is COHERENCE — a function name with no deployment names
+    // nothing resolvable, and an over-long identifier is malformed input
+    // whichever shape it arrives in.
+    let deployment = request.deployment.trim();
+    let function = request.function.trim();
+    if deployment.len() > 256
+        || function.len() > 256
+        || (deployment.is_empty() && !function.is_empty())
     {
         return Err(AdmissionFailure::terminal(
             StatusCode::BAD_REQUEST,
@@ -862,28 +906,46 @@ fn validate_request(
     // rollout-compat leftover and is never consulted: a forged digest admits
     // nothing (there is nothing to match it against), and a stale one simply
     // gets reconciled to the current descriptor returned in the capability.
-    let descriptor = match crate::browser_artifacts::descriptor_for(
-        cloud,
-        &tenant,
-        &request.deployment,
-        &request.function,
-    ) {
-        None => {
+    //
+    // With NO function named, that resolution is simply skipped and the
+    // admission carries no artifact capability at all — never a permissive
+    // one. A database-only admission (deployment, no function) still has to
+    // resolve its deployment under this tenant, so a serve-less shape can
+    // never be used to pin an admission record to a deployment the caller
+    // does not own.
+    let descriptor = if function.is_empty() {
+        if !deployment.is_empty()
+            && crate::browser_db::db_descriptor_for(cloud, &tenant, deployment).is_none()
+        {
+            // Unknown deployment, foreign tenant and block-removed are the
+            // IDENTICAL answer (the `db_descriptor_for` contract) — no
+            // existence leak across tenants.
             return Err(AdmissionFailure::retryable(
                 StatusCode::NOT_FOUND,
                 "deployment_not_ready",
-                "no ready deployment function exists in this tenant",
+                "no ready deployment with a browser database block exists in this tenant",
             ));
         }
-        Some(None) => {
-            return Err(AdmissionFailure::terminal(
-                StatusCode::FORBIDDEN,
-                "function_not_browser_eligible",
-                "the named function has no build-produced browser artifact — it never opted in \
-                 via fluid.json `browser`, or the build rejected it as unsupported",
-            ));
+        None
+    } else {
+        match crate::browser_artifacts::descriptor_for(cloud, &tenant, deployment, function) {
+            None => {
+                return Err(AdmissionFailure::retryable(
+                    StatusCode::NOT_FOUND,
+                    "deployment_not_ready",
+                    "no ready deployment function exists in this tenant",
+                ));
+            }
+            Some(None) => {
+                return Err(AdmissionFailure::terminal(
+                    StatusCode::FORBIDDEN,
+                    "function_not_browser_eligible",
+                    "the named function has no build-produced browser artifact — it never opted in \
+                     via fluid.json `browser`, or the build rejected it as unsupported",
+                ));
+            }
+            Some(Some(descriptor)) => Some(descriptor),
         }
-        Some(Some(descriptor)) => descriptor,
     };
     let now = hive_core::now_ms();
     let requested = request
@@ -911,14 +973,20 @@ async fn admit(
 ) -> AdmissionResult {
     let claims = fresh_user_claims(claims)?;
     let (tenant, expires_ms, descriptor) = validate_request(&cloud, &claims, &request)?;
+    // Canonical (trimmed) target identifiers — `validate_request` judged
+    // exactly these, so the stored record can never differ from what was
+    // authorized. Both are empty for a target-less donor.
+    let deployment = request.deployment.trim().to_string();
+    let function = request.function.trim().to_string();
     // Server-derived DATABASE grant (bn-browser-fleet-crr-exchange): present
     // only when the admitted deployment's descriptor carries a `browser_db`
     // block — resolved from the same replicated deployment state as the
     // function descriptor, never from donor input. Public scope gets a grant
     // only with `public_read: true`, and even then read-only. Its absence is
     // not an error: function-serving admissions without a database opt-in
-    // simply carry no `db` capability.
-    let db_capability = crate::browser_db::db_descriptor_for(&cloud, &tenant, &request.deployment)
+    // simply carry no `db` capability, and a target-less donor names no
+    // deployment at all so this resolves to `None` by construction.
+    let db_capability = crate::browser_db::db_descriptor_for(&cloud, &tenant, &deployment)
         .and_then(|(project, spec)| {
             let resolved = spec.resolve();
             let access = match request.scope {
@@ -946,15 +1014,20 @@ async fn admit(
     let mut record = BrowserAdmission {
         endpoint_id: request.endpoint_id,
         addr_json: request.addr_json,
-        deployment: request.deployment,
-        function: request.function,
+        deployment,
+        function,
         // SERVER-DERIVED (browser-admission-derived-capabilities): the exact
         // canonical-policy digest of the deployment function's build-stamped
         // descriptor — never the donor-supplied compat field. On a RENEWAL
         // after a redeploy rotated the artifact, this is where the record
         // atomically moves to the new digest (routing_identity_changed below
         // tears down the old route first, so no invoke can straddle them).
-        digest: descriptor.artifact.policy_digest.clone(),
+        // EMPTY when there is no serve lane, which `serving()` — and the
+        // gateway's own independent validation — both refuse to route.
+        digest: descriptor
+            .as_ref()
+            .map(|d| d.artifact.policy_digest.clone())
+            .unwrap_or_default(),
         tenant,
         subject: claims.sub,
         issued_ms,
@@ -984,15 +1057,23 @@ async fn admit(
         // in this window can reuse the old BrowserPool trunk with the new grant.
         remove_endpoint(&cloud, &record.endpoint_id).await;
     }
-    if let Err(error) = cloud.gw.upsert_browser_target(record.target()) {
-        cloud
-            .browser_admissions
-            .revoke(&record.tenant, &record.endpoint_id);
-        return Err(AdmissionFailure::retryable(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "gateway_unavailable",
-            error,
-        ));
+    if record.serving() {
+        if let Err(error) = cloud.gw.upsert_browser_target(record.target()) {
+            cloud
+                .browser_admissions
+                .revoke(&record.tenant, &record.endpoint_id);
+            return Err(AdmissionFailure::retryable(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "gateway_unavailable",
+                error,
+            ));
+        }
+    } else {
+        // A serve-less admission is a live, fully-authorized identity with NO
+        // route — never a route with a permissive target. The explicit removal
+        // (rather than merely skipping the upsert) makes that true even if an
+        // earlier lease for this same endpoint id had one.
+        cloud.gw.remove_browser_endpoint(&record.endpoint_id);
     }
     if had_deny_entry {
         // The admission is fully committed (store + gateway route) — shrink
@@ -1012,7 +1093,7 @@ async fn admit(
         "admission": record,
         "capability": capability_json(
             &cloud,
-            &descriptor.artifact,
+            descriptor.as_ref().map(|d| &d.artifact),
             expires_ms,
             db_capability
                 .as_ref()
@@ -1036,26 +1117,40 @@ async fn admit(
 ///   EndpointIds the donor grants via `BrowserNode.grantInvoker`. Anything
 ///   else (a wildcard, a browser id, a client-supplied id) is refused by
 ///   construction — it never appears here.
+///
+/// `artifact: None` is the target-less/database-only donor
+/// (browser-node-optional-serve-target). The block then carries `serving:
+/// false`, NO artifact fields at all, and an EMPTY `trusted_callers` list —
+/// absence of capability, never a broader one. There is nothing for the donor
+/// to pin and therefore nobody it can grant: `grantInvoker` takes a
+/// (caller, policy_digest) pair, and a donor with no pinned digest cannot
+/// form one.
 fn capability_json(
     cloud: &Arc<CloudState>,
-    artifact: &fluid_core::BrowserArtifact,
+    artifact: Option<&fluid_core::BrowserArtifact>,
     expires_ms: u64,
     db: Option<(&str, &BrowserDbGrant, &fluid_core::ResolvedBrowserDbPolicy)>,
 ) -> Value {
     let mut out = json!({
         "version": 1,
-        "artifact_url": format!("/v1/browser/artifacts/{}", artifact.policy_digest),
-        "policy_digest": artifact.policy_digest,
-        "source_digest": artifact.source_digest,
-        "source_bytes": artifact.source_bytes,
-        "mode": artifact.mode,
-        "timeout_ms": artifact.timeout_ms,
-        "memory_bytes": artifact.memory_bytes,
-        "stack_bytes": artifact.stack_bytes,
-        "allowed_ops": artifact.allowed_ops,
-        "trusted_callers": trusted_caller_ids(cloud),
+        "serving": artifact.is_some(),
+        "trusted_callers": match artifact {
+            Some(_) => trusted_caller_ids(cloud),
+            None => Vec::new(),
+        },
         "expires_ms": expires_ms,
     });
+    if let Some(artifact) = artifact {
+        out["artifact_url"] = json!(format!("/v1/browser/artifacts/{}", artifact.policy_digest));
+        out["policy_digest"] = json!(artifact.policy_digest);
+        out["source_digest"] = json!(artifact.source_digest);
+        out["source_bytes"] = json!(artifact.source_bytes);
+        out["mode"] = json!(artifact.mode);
+        out["timeout_ms"] = json!(artifact.timeout_ms);
+        out["memory_bytes"] = json!(artifact.memory_bytes);
+        out["stack_bytes"] = json!(artifact.stack_bytes);
+        out["allowed_ops"] = json!(artifact.allowed_ops);
+    }
     // The `db` section is part of the SAME atomic capability snapshot
     // (bn-browser-fleet-crr-exchange): the donor reconciles its OPFS replica
     // name, caps, schema and sync peers from exactly this — present only when
@@ -1364,6 +1459,15 @@ fn reconcile(
                 if before.is_some_and(|before| routing_identity_changed(before, record)) {
                     cloud.gw.remove_browser_endpoint(&id);
                     schedule_close(cloud, id.clone());
+                }
+                if !record.serving() {
+                    // Target-less / database-only donor
+                    // (browser-node-optional-serve-target): a live admission
+                    // with deliberately NO serve route. Removing rather than
+                    // skipping keeps this idempotent against any earlier
+                    // serving lease for the same endpoint id.
+                    cloud.gw.remove_browser_endpoint(&id);
+                    continue;
                 }
                 if let Err(error) = cloud.gw.upsert_browser_target(record.target()) {
                     tracing::warn!(endpoint_id = %id, %error, "rejected replicated browser admission");

@@ -129,7 +129,7 @@ impl BuildStore {
             }
         }
     }
-    fn update(&self, id: &str, f: impl FnOnce(&mut Build)) {
+    pub fn update(&self, id: &str, f: impl FnOnce(&mut Build)) {
         if let Some(b) = self.map.lock().get_mut(id) {
             f(b);
         }
@@ -146,6 +146,247 @@ impl BuildStore {
         before - m.len()
     }
 }
+
+// ---- Build cancellation ----------------------------------------------------
+//
+// A build's actual work (git clone, npm/pnpm/yarn install, the framework
+// build command, a `podman build`) runs as real OS child processes spawned
+// from `run_build`'s background task. Marking the `Build` record `Cancelled`
+// alone does not stop any of that — the child keeps running to completion
+// (or hanging forever) unless something actually signals it. This registry is
+// the "something": every long-running command in the pipeline runs through
+// `run_cancellable_output` (git clone chain) or is wrapped equivalently in
+// `run_streamed` (install/build), each of which publishes the live process's
+// GROUP id here before awaiting it. `cancel_build` then (1) flips a flag so no
+// FURTHER step starts, (2) SIGKILLs that whole process group — not just one
+// pid, since a shell driving `npm install` forks `npm`/`node` as children that
+// inherit its group, and a single-pid kill would leave them running as
+// orphans — (3) asks a MIRRORED build's real remote host to cancel too, and
+// (4) aborts the Rust task driving the build so it can't proceed once its
+// process is dead.
+
+/// Where a MIRRORED build's real backing process actually lives: the "pure
+/// remote placement" fanout branch in `run_build` dispatches the real build to
+/// a peer and only mirrors its logs/state here (see `mirror_remote_build`).
+/// Cancelling the coordinator's (mirror) build must also cancel the REAL
+/// process, which runs on this target under its OWN, different build id.
+#[derive(Clone)]
+struct MirrorTarget {
+    admin: Option<String>,
+    iroh: Option<(String, String)>,
+    target_bid: String,
+}
+
+#[derive(Default)]
+struct BuildCancelSlot {
+    /// Process-GROUP id of whatever child THIS build is currently blocked on.
+    /// `None` between steps (no command in flight right now).
+    pgid: Mutex<Option<u32>>,
+    /// Set true the instant `cancel_build` runs — checked at step boundaries
+    /// so a step that finishes just as the kill signal goes out never starts
+    /// the next command.
+    cancelled: std::sync::atomic::AtomicBool,
+    /// Set while this build mirrors a remote fanned-out build.
+    mirror: Mutex<Option<MirrorTarget>>,
+    /// The task actually driving this build.
+    task: Mutex<Option<tokio::task::AbortHandle>>,
+}
+
+/// Registry of in-flight builds' cancellation handles, keyed by build id.
+/// Lives on `CloudState` (`cloud.build_cancels`) — deliberately NOT persisted
+/// or gossiped: it describes only a live local OS process, which cannot
+/// survive a restart (and a restarted node already finalizes any
+/// Queued/Building record to `Error` on boot — see `BuildStore::load`).
+#[derive(Default)]
+pub struct BuildCancelRegistry {
+    map: Mutex<HashMap<String, Arc<BuildCancelSlot>>>,
+}
+
+impl BuildCancelRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a fresh slot for a build about to start — called
+    /// synchronously in `start_build`, BEFORE the driving task is even
+    /// spawned, so a cancel arriving in the first instant of a build's life
+    /// (before any child has spawned) still has somewhere to record itself.
+    fn register(&self, bid: &str) {
+        self.map
+            .lock()
+            .insert(bid.to_string(), Arc::new(BuildCancelSlot::default()));
+    }
+
+    fn attach_task(&self, bid: &str, task: tokio::task::AbortHandle) {
+        if let Some(slot) = self.map.lock().get(bid) {
+            *slot.task.lock() = Some(task);
+        }
+    }
+
+    fn slot(&self, bid: &str) -> Option<Arc<BuildCancelSlot>> {
+        self.map.lock().get(bid).cloned()
+    }
+
+    /// Whether `bid` has been asked to cancel — checked cooperatively at step
+    /// boundaries throughout `run_build` so a build already mid-cancel never
+    /// starts a fresh, unkillable-until-spawned step.
+    pub fn is_cancelled(&self, bid: &str) -> bool {
+        self.map
+            .lock()
+            .get(bid)
+            .is_some_and(|s| s.cancelled.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    /// Publish (or clear, `None`) the OS process-GROUP id THIS build is
+    /// currently blocked on. Called by every cancellable command wrapper
+    /// right after spawn, and again (with `None`) once that command exits —
+    /// so a later, unrelated step never targets a stale/reused pid.
+    fn set_running(&self, bid: &str, pgid: Option<u32>) {
+        if let Some(slot) = self.slot(bid) {
+            *slot.pgid.lock() = pgid;
+        }
+    }
+
+    fn set_mirror(&self, bid: &str, target: MirrorTarget) {
+        if let Some(slot) = self.slot(bid) {
+            *slot.mirror.lock() = Some(target);
+        }
+    }
+
+    /// Drop the bookkeeping for a finished build — nothing can spawn under
+    /// this id anymore once it's terminal.
+    fn forget(&self, bid: &str) {
+        self.map.lock().remove(bid);
+    }
+
+    /// Cancel an in-flight build: mark it cancelled, SIGKILL whatever OS
+    /// process GROUP it's currently blocked on, ask its mirror target (if any)
+    /// to cancel the REAL remote build, then give the Rust task driving it a
+    /// brief grace window to notice its child died and unwind NORMALLY —
+    /// running its own remaining cleanup (e.g. removing a first-deploy
+    /// placeholder, `forget`ting this very slot) — before force-aborting it.
+    /// A self-driven exit is strictly better than an abort: abort tears the
+    /// task down mid-poll with NONE of its remaining cleanup ever running, so
+    /// it's the fallback for a task truly stuck somewhere with no tracked
+    /// child (a step this registry doesn't instrument), never the common case.
+    /// Returns `false` when `bid` has no live slot (already terminal, or
+    /// never existed) — the caller's own "not found" handling covers that.
+    pub async fn cancel(&self, cloud: &Arc<CloudState>, bid: &str) -> bool {
+        let slot = match self.slot(bid) {
+            Some(s) => s,
+            None => return false,
+        };
+        slot.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let pgid = *slot.pgid.lock();
+        if let Some(pg) = pgid {
+            // Negative pid = signal the whole process GROUP (see module doc).
+            let _ = tokio::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(format!("-{pg}"))
+                .output()
+                .await;
+        }
+        let mirror = slot.mirror.lock().clone();
+        if let Some(m) = mirror {
+            let _ = cancel_remote_build(cloud, &m).await;
+        }
+        let task = slot.task.lock().clone();
+        if let Some(task) = task {
+            // SIGKILL delivery + the task noticing (its `child.wait()` return)
+            // is normally low tens of ms; 1s at 50ms steps gives it ample room
+            // without making a cancel request feel stuck.
+            for _ in 0..20 {
+                if task.is_finished() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if !task.is_finished() {
+                task.abort();
+            }
+        }
+        // The task's own tail (if it got to run) already called `forget` —
+        // this is a no-op then, and the necessary cleanup for the abort path.
+        self.forget(bid);
+        true
+    }
+}
+
+/// Ask a remote node to cancel a build it's actually running (the target of a
+/// mirrored/fanned-out build) — same transport `fanout_remote`/
+/// `mirror_remote_build` use. Best-effort: a failure here still leaves the
+/// LOCAL kill (if any) and the cancelled-flag/task-abort in effect.
+async fn cancel_remote_build(cloud: &Arc<CloudState>, m: &MirrorTarget) -> bool {
+    let path = format!("/v1/builds/{}/cancel", m.target_bid);
+    if let Some(admin) = &m.admin {
+        return cloud
+            .http
+            .post(format!("{admin}{path}"))
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+    }
+    if let Some((id, addr)) = &m.iroh {
+        return crate::gossip::request_to(
+            cloud,
+            id,
+            addr,
+            hive_p2p::GOSSIP_POST,
+            &path,
+            &[],
+            15,
+        )
+        .await
+        .is_some();
+    }
+    false
+}
+
+/// Like `Command::output()`, but first drops `cmd` into its OWN process group
+/// (`process_group(0)`: pgid == its own pid) and publishes that group into the
+/// per-build cancel registry — so `cancel_build` can SIGKILL the whole tree,
+/// not just this one pid, if the user cancels while THIS command is the one
+/// hung. Cleared again once the command exits so a later, unrelated step
+/// never targets a stale/reused pid. Used by the git clone/fetch/checkout
+/// chain; `run_streamed` (install/build) does the equivalent inline since it
+/// already manages its own child for log streaming.
+async fn run_cancellable_output(
+    cmd: &mut Command,
+    cloud: &Arc<CloudState>,
+    bid: &str,
+) -> std::io::Result<std::process::Output> {
+    use std::process::Stdio;
+    cmd.process_group(0);
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    cloud.build_cancels.set_running(bid, child.id());
+    if cloud.build_cancels.is_cancelled(bid) {
+        // A cancel landed in the tiny window between the caller's last
+        // cooperative check and this spawn — kill it now rather than let it
+        // run unkilled to completion.
+        let _ = child.start_kill();
+    }
+    let out = child.wait_with_output().await;
+    cloud.build_cancels.set_running(bid, None);
+    out
+}
+
+/// Marker error: `run_build` returned `Err` because the user cancelled it, not
+/// because a step genuinely failed. Lets the outer catch (in `start_build`'s
+/// driving task) set `DeployState::Cancelled` instead of `Error` without
+/// fragile string-matching on the message.
+#[derive(Debug)]
+struct BuildCancelled;
+impl std::fmt::Display for BuildCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "build cancelled by user")
+    }
+}
+impl std::error::Error for BuildCancelled {}
 
 /// Sanitize a string for use in a container image tag ([a-z0-9._-] only).
 pub(crate) fn sanitize_tag(s: &str) -> String {
@@ -403,9 +644,16 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         serde_json::json!({ "id": id, "project": project, "repo": req.repo_url, "state": "building" }),
     );
 
+    // Register cancellation bookkeeping BEFORE spawning the driving task, so a
+    // cancel arriving in the first instant of this build's life (before any
+    // child process even exists) still has somewhere to record itself — see
+    // `BuildCancelRegistry`.
+    cloud.build_cancels.register(&id);
+
     let bid = id.clone();
     let wh_project = project.clone();
-    tokio::spawn(async move {
+    let cloud_for_registry = cloud.clone();
+    let handle = tokio::spawn(async move {
         // Whether this is the project's FIRST deployment — captured BEFORE the
         // placeholder registers an alias (which would otherwise make it look like a
         // redeploy). Drives `npm ci` on the initial build (Task 1). Fleet-aware so a
@@ -424,19 +672,40 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
             crate::persist::persist(&cloud);
         }
         if let Err(e) = result {
-            cloud.builds.log(&bid, format!("Error: {e}"));
-            cloud.builds.update(&bid, |b| {
-                b.state = DeployState::Error;
-                b.finished_ms = Some(now_ms());
-            });
-            crate::webhooks::dispatch(
-                &cloud.webhooks,
-                &wh_project,
-                "deployment.error",
-                serde_json::json!({ "id": bid, "project": wh_project, "error": e.to_string() }),
-            );
+            // A cancel already stamped the record + fired the kill (see
+            // `BuildCancelRegistry::cancel`, called from the admin handler) —
+            // distinguish that from a genuine build failure so we don't
+            // overwrite `Cancelled` with `Error` nor fire a spurious
+            // `deployment.error` webhook for a user-requested stop.
+            let cancelled = e.downcast_ref::<BuildCancelled>().is_some()
+                || cloud.build_cancels.is_cancelled(&bid);
+            if cancelled {
+                cloud.builds.log(&bid, "Build cancelled by user.".to_string());
+                cloud.builds.update(&bid, |b| {
+                    if !matches!(b.state, DeployState::Cancelled) {
+                        b.state = DeployState::Cancelled;
+                        b.finished_ms.get_or_insert_with(now_ms);
+                    }
+                });
+            } else {
+                cloud.builds.log(&bid, format!("Error: {e}"));
+                cloud.builds.update(&bid, |b| {
+                    b.state = DeployState::Error;
+                    b.finished_ms = Some(now_ms());
+                });
+                crate::webhooks::dispatch(
+                    &cloud.webhooks,
+                    &wh_project,
+                    "deployment.error",
+                    serde_json::json!({ "id": bid, "project": wh_project, "error": e.to_string() }),
+                );
+            }
         }
+        cloud.build_cancels.forget(&bid);
     });
+    cloud_for_registry
+        .build_cancels
+        .attach_task(&id, handle.abort_handle());
     id
 }
 
@@ -510,6 +779,49 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
         .find(|c| build_dir.join(c).is_file())
 }
 
+/// Every function name a repo's `fluid.json` EXPLICITLY opted into browser
+/// execution, read straight off the raw file.
+///
+/// Load-bearing because only ONE of `produce_manifest`'s five manifest shapes
+/// (the plain-`fluid.json` branch) deserializes the file into a `Manifest` at
+/// all: the prebuilt-image, docker-compose, Dockerfile, and FDI branches each
+/// SYNTHESIZE `functions` from their own source, so `FunctionConfig::browser`
+/// arrives at the bundling pass as `None` and the opt-in evaporates with no
+/// error, no log, and no artifact — the deployment goes Ready and the picker
+/// silently omits it. The build-contract rule is loud-or-honored, never
+/// silently dropped, so `deploy_full` compares this against the manifest it
+/// actually produced (see its "dropped browser opt-in" guard) and fails the
+/// build naming each lost function. Parsed with a minimal local shape (not
+/// `Manifest`) so a container-path `fluid.json` that carries only a `container`
+/// block — or a malformed one, which those paths tolerate today — still yields
+/// an empty list rather than becoming a new way to fail a build.
+async fn fluid_json_browser_optins(build_dir: &Path) -> Vec<String> {
+    #[derive(serde::Deserialize)]
+    struct Fn_ {
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        browser: Option<serde_json::Value>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Wrap {
+        #[serde(default)]
+        functions: Vec<Fn_>,
+    }
+    let Ok(text) = tokio::fs::read_to_string(build_dir.join("fluid.json")).await else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Wrap>(&text)
+        .map(|w| {
+            w.functions
+                .into_iter()
+                .filter(|f| f.browser.as_ref().is_some_and(|v| !v.is_null()))
+                .map(|f| f.name)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The retained-source archive to READ: the durable location first, then the
 /// pre-durability /tmp locations (sanitized and raw-name) so a zip project
 /// deployed by an older binary can still redeploy after the upgrade.
@@ -551,14 +863,17 @@ pub(crate) fn redeploy_on_host(
         superseded_by: None,
         lines: Vec::new(),
     });
+    cloud.build_cancels.register(&id);
     let bid = id.clone();
-    tokio::spawn(async move {
+    let cloud_for_registry = cloud.clone();
+    let handle = tokio::spawn(async move {
         cloud.builds.log(
             &bid,
             format!("Redeploy: dispatching to host node {}", host.node),
         );
         // Single pinned host = the deploy's one-and-only (primary) target — never
-        // a secondary replica of a multi-region fanout.
+        // a secondary replica of a multi-region fanout. `fanout_remote` publishes
+        // it as this build's cancel mirror target as soon as dispatch succeeds.
         let ok = fanout_remote(
             &cloud,
             &bid,
@@ -568,16 +883,23 @@ pub(crate) fn redeploy_on_host(
             true,
         )
         .await;
+        let cancelled = !ok && cloud.build_cancels.is_cancelled(&bid);
         cloud.builds.update(&bid, |b| {
             b.state = if ok {
                 DeployState::Ready
+            } else if cancelled {
+                DeployState::Cancelled
             } else {
                 DeployState::Error
             };
             b.finished_ms = Some(now_ms());
         });
         crate::persist::persist(&cloud);
+        cloud.build_cancels.forget(&bid);
     });
+    cloud_for_registry
+        .build_cancels
+        .attach_task(&id, handle.abort_handle());
     id
 }
 
@@ -779,8 +1101,11 @@ async fn run_build(
             // take down the currently-serving deployment; the old one keeps serving
             // and the user just sees a failed build. (This is the bug that dropped a
             // healthy project when a relocating redeploy errored.)
+            let cancelled = !ok && cloud.build_cancels.is_cancelled(bid);
             if ok {
                 cleanup_non_targets(cloud, &project, &names).await;
+            } else if cancelled {
+                log("Build cancelled by user — keeping the existing deployment in place.".into());
             } else {
                 log(
                     "Build failed — keeping the existing deployment in place (no relocation)."
@@ -790,12 +1115,15 @@ async fn run_build(
             cloud.builds.update(bid, |b| {
                 b.state = if ok {
                     DeployState::Ready
+                } else if cancelled {
+                    DeployState::Cancelled
                 } else {
                     DeployState::Error
                 };
                 b.finished_ms = Some(now_ms());
             });
             crate::persist::persist(cloud);
+            cloud.build_cancels.forget(bid);
             return Ok(());
         }
         if local_selected && !remote.is_empty() {
@@ -1018,11 +1346,13 @@ async fn run_build(
         // specific commit to pin to), behavior is EXACTLY the prior shallow
         // branch-tip clone.
         let run_clone = |clone_url: String| {
-            let (dir, branch, token, commit) = (
+            let (dir, branch, token, commit, ccloud, cbid) = (
                 dir.clone(),
                 branch.clone(),
                 git_token.clone(),
                 pinned_commit.clone(),
+                cloud.clone(),
+                bid.to_string(),
             );
             async move {
                 let scrub = |raw: &[u8]| {
@@ -1039,8 +1369,7 @@ async fn run_build(
                         init.env("GIT_TERMINAL_PROMPT", "0")
                             .env("GIT_ASKPASS", "/bin/echo");
                         init.arg("init").arg("-q").arg(&dir);
-                        let init_ok = init
-                            .output()
+                        let init_ok = run_cancellable_output(&mut init, &ccloud, &cbid)
                             .await
                             .map(|o| o.status.success())
                             .unwrap_or(false);
@@ -1056,7 +1385,7 @@ async fn run_build(
                                 .arg("add")
                                 .arg("origin")
                                 .arg(&clone_url);
-                            let _ = remote.output().await;
+                            let _ = run_cancellable_output(&mut remote, &ccloud, &cbid).await;
 
                             let mut fetch = Command::new("git");
                             fetch
@@ -1070,7 +1399,7 @@ async fn run_build(
                                 .arg("1")
                                 .arg("origin")
                                 .arg(&sha);
-                            match fetch.output().await {
+                            match run_cancellable_output(&mut fetch, &ccloud, &cbid).await {
                                 Ok(out) if out.status.success() => {
                                     let mut checkout = Command::new("git");
                                     checkout
@@ -1081,7 +1410,7 @@ async fn run_build(
                                         .arg("checkout")
                                         .arg("-q")
                                         .arg("FETCH_HEAD");
-                                    match checkout.output().await {
+                                    match run_cancellable_output(&mut checkout, &ccloud, &cbid).await {
                                         Ok(cout) if cout.status.success() => {
                                             return (true, scrub(&cout.stderr));
                                         }
@@ -1118,7 +1447,7 @@ async fn run_build(
                         cmd.arg("--branch").arg(&branch);
                     }
                     cmd.arg(&clone_url).arg(&dir);
-                    match cmd.output().await {
+                    match run_cancellable_output(&mut cmd, &ccloud, &cbid).await {
                         Ok(out) if out.status.success() => {
                             let mut checkout = Command::new("git");
                             checkout
@@ -1129,7 +1458,7 @@ async fn run_build(
                                 .arg("checkout")
                                 .arg("-q")
                                 .arg(&sha);
-                            match checkout.output().await {
+                            match run_cancellable_output(&mut checkout, &ccloud, &cbid).await {
                                 Ok(cout) => (cout.status.success(), scrub(&cout.stderr)),
                                 Err(e) => (false, format!("{e}")),
                             }
@@ -1148,7 +1477,7 @@ async fn run_build(
                         cmd.arg("--branch").arg(&branch);
                     }
                     cmd.arg(&clone_url).arg(&dir);
-                    match cmd.output().await {
+                    match run_cancellable_output(&mut cmd, &ccloud, &cbid).await {
                         Ok(out) => (out.status.success(), scrub(&out.stderr)),
                         Err(e) => (false, format!("{e}")),
                     }
@@ -1180,6 +1509,9 @@ async fn run_build(
             let (ok2, stderr2) = run_clone(clone_source_url.clone()).await;
             ok = ok2;
             stderr = stderr2;
+        }
+        if !ok && cloud.build_cancels.is_cancelled(bid) {
+            return Err(BuildCancelled.into());
         }
         anyhow::ensure!(
             ok,
@@ -1449,6 +1781,37 @@ async fn run_build(
         }
     }
 
+    // Sync/merge the browser-replicated database opt-in (bn-storages-page-
+    // browser-db-wiring). Unlike `inference` above, `browser_db` already lives
+    // IN `fluid_core::Manifest` (parsed straight off fluid.json by
+    // `Manifest::from_json`, the explicit-fluid.json branch of
+    // `produce_manifest`), so `manifest.browser_db` here already reflects an
+    // explicit repo-authored block for every manifest-shape path that goes
+    // through it. Two directions, never fighting each other:
+    //   * fluid.json declared a block -> mirror it into project settings (the
+    //     `inference` read-side precedent) so the Storages page shows what's
+    //     actually deployed even for a hand-edited fluid.json.
+    //   * fluid.json declared NONE -> apply the dashboard-managed settings
+    //     spec instead (the `FunctionSettings::gpu` OR precedent, applied to
+    //     an `Option`: an explicit fluid.json block always wins over the
+    //     UI-managed one). This is what lets the Storages page's "Deploy a
+    //     replicated SQLite database" flow take effect with no git push.
+    {
+        let current = cloud.projects.get(&manifest.project).browser_db;
+        if manifest.browser_db.is_some() {
+            if current != manifest.browser_db {
+                cloud
+                    .projects
+                    .set_browser_db(&manifest.project, manifest.browser_db.clone());
+            }
+        } else if let Some(settings_spec) = current {
+            log(
+                "Browser-replicated database: applying the dashboard-managed browser_db config (fluid.json declares none).".into(),
+            );
+            manifest.browser_db = Some(settings_spec);
+        }
+    }
+
     // Inject project env vars + function settings.
     let env = cloud.projects.env_map(&manifest.project);
     let fsettings = cloud.projects.get(&manifest.project).functions;
@@ -1681,18 +2044,92 @@ async fn run_build(
     // fails to bundle is SKIPPED silently (the function just serves the normal
     // fleet path) — only an EXPLICIT fluid.json opt-in still fails the build
     // loudly, because only there did the tenant assert the function IS
-    // browser-eligible.
+    // browser-eligible. Either way the DECISION is recorded on the function
+    // (`browser_ineligible_reason`) so "not listed in the picker" always has a
+    // sentence behind it instead of being indistinguishable from silence.
+    if !build_failed {
+        // A tenant-authored `browser_ineligible_reason` is meaningless input —
+        // this field is a build VERDICT. Clear it before evaluating so a
+        // fluid.json can never inject a fake (or falsely reassuring) reason,
+        // the same server-derived discipline admission capabilities follow.
+        for f in manifest.functions.iter_mut() {
+            f.browser_ineligible_reason = None;
+        }
+        // DROPPED-OPT-IN GUARD. `produce_manifest` deserializes fluid.json into
+        // a `Manifest` on exactly ONE of its five branches; the prebuilt-image,
+        // compose, Dockerfile, and FDI branches synthesize `functions`
+        // themselves and never carry `functions[].browser` through. Without
+        // this check an explicit opt-in on any of those repos vanishes with no
+        // error and no artifact, and the deployment goes Ready looking exactly
+        // like one that never opted in — the reported "I have an opted-in
+        // function yet it doesn't work". The contract has no warn-and-drop
+        // branch, so name every lost function and fail before the record is
+        // registered (the prior deployment keeps serving, same as any other
+        // rejected opt-in).
+        let declared = fluid_json_browser_optins(&build_dir).await;
+        let dropped: Vec<String> = declared
+            .into_iter()
+            .filter(|name| {
+                !manifest
+                    .functions
+                    .iter()
+                    .any(|f| &f.name == name && f.browser.is_some())
+            })
+            .collect();
+        if !dropped.is_empty() {
+            let msg = format!(
+                "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
+                 `functions[].browser` for {}, but this project builds through the {} path, which \
+                 constructs its own function list and cannot carry a per-function browser opt-in. \
+                 The functions this build produced are [{}]. Remove the `browser` block (a \
+                 container/compose/prebuilt-image service can never run in a donor's browser), or \
+                 deploy this function from a plain fluid.json project with a JS/Bun `start_cmd`.",
+                dropped
+                    .iter()
+                    .map(|n| {
+                        // A `functions[]` entry with no `name` still counts as a
+                        // dropped opt-in (it can never match a synthesized
+                        // function), but `""` reads as a bug in the message.
+                        if n.is_empty() {
+                            "an unnamed function entry".to_string()
+                        } else {
+                            format!("{n:?}")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if is_container { "container" } else { "framework-detected" },
+                manifest
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            log(msg.clone());
+            tracing::warn!(project = %project, dropped = ?dropped, "browser opt-in dropped by the manifest path");
+            return Err(anyhow::anyhow!(msg));
+        }
+    }
     let mut auto_browser: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !build_failed {
         for f in manifest.functions.iter_mut() {
             if f.browser.is_some() {
                 continue; // explicit opt-in — leave it exactly as authored
             }
+            let runtime = hive_core::Runtime::resolve(&f.runtime, &f.start_cmd);
             if !matches!(
-                hive_core::Runtime::resolve(&f.runtime, &f.start_cmd),
+                runtime,
                 hive_core::Runtime::Node | hive_core::Runtime::Bun
             ) {
-                continue; // container/python/go/command — never browser-eligible
+                // container/python/go/command — never browser-eligible. Recorded
+                // rather than skipped: this is the single most common reason a
+                // ready deployment is missing from the picker.
+                f.browser_ineligible_reason = Some(format!(
+                    "runs as {} — only plain JS/Bun request→response handlers can run in a browser",
+                    runtime.as_str()
+                ));
+                continue;
             }
             if let Some(entry) = infer_browser_entry(&build_dir, &f.name) {
                 log(format!(
@@ -1705,6 +2142,13 @@ async fn run_build(
                     ..Default::default()
                 });
                 auto_browser.insert(f.name.clone());
+            } else {
+                f.browser_ineligible_reason = Some(format!(
+                    "no browser handler file found — looked for {}.browser.js, browser.js, {}.js, \
+                     handler.js, index.js and main.js (.mjs/.cjs too) in the deployment root; add \
+                     one that assigns its handler to module.exports",
+                    f.name, f.name
+                ));
             }
         }
     }
@@ -1730,6 +2174,10 @@ async fn run_build(
                     ));
                     tracing::info!(project = %project, function = %f.name, %reason, "auto browser artifact skipped (ineligible)");
                     f.browser = None;
+                    // The verdict is kept even though the policy is not: this
+                    // is the exact sentence the run-node picker shows for a
+                    // ready-but-unlisted deployment.
+                    f.browser_ineligible_reason = Some(reason);
                     continue;
                 }
                 Err(reason) => {
@@ -1766,6 +2214,7 @@ async fn run_build(
             ));
             browser_bundles.push((f.name.clone(), bundled.descriptor.clone()));
             f.browser_artifact = Some(bundled.descriptor);
+            f.browser_ineligible_reason = None; // eligible: descriptor XOR reason
         }
     }
 
@@ -2249,6 +2698,20 @@ async fn fanout_remote(
             all_ok = false;
             continue;
         };
+        // This target is the build's designated PRIMARY (see the doc above) —
+        // publish it as the cancel mirror so `cancel_build` on THIS (mirror)
+        // build id reaches the REAL process, which runs on `t`, not here.
+        // Secondaries are extras a cancel doesn't need to chase.
+        if !dreq.fanout_secondary {
+            cloud.build_cancels.set_mirror(
+                bid,
+                MirrorTarget {
+                    admin: t.admin.clone(),
+                    iroh: t.iroh.clone(),
+                    target_bid: target_bid.clone(),
+                },
+            );
+        }
         let ok = mirror_remote_build(cloud, bid, t, &target_bid, &t.node).await;
         if !ok {
             all_ok = false;
@@ -2319,6 +2782,17 @@ async fn mirror_remote_build(
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
+        // `cancel_build` already fired the kill (local process group or, for a
+        // primary target, a direct remote cancel dispatch — see
+        // `BuildCancelRegistry::cancel`) and stamped the coordinator's own
+        // record `Cancelled` BEFORE calling it — this loop just needs to stop
+        // polling promptly instead of riding out the full 10-minute deadline.
+        if cloud.build_cancels.is_cancelled(bid) {
+            cloud
+                .builds
+                .log(bid, format!("{node}: mirror stopped (build cancelled)"));
+            return false;
+        }
         // Poll the target's build over the SAME transport we dispatched on.
         let v: Option<serde_json::Value> = if let Some(admin) = &target.admin {
             match cloud
@@ -3968,9 +4442,20 @@ async fn run_streamed(
         .env("npm_config_audit", "false")
         // Project env vars — injected so the build can read them (last so they win).
         .envs(env)
+        // Own process group (pgid == this pid): `npm install`/`npm run build`
+        // fork `npm`/`node`/framework-worker children that inherit this shell's
+        // group, so `cancel_build`'s group-kill (`kill -KILL -<pgid>`) reaches
+        // the whole tree, not just this one `/bin/sh`.
+        .process_group(0)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+    cloud.build_cancels.set_running(bid, child.id());
+    if cloud.build_cancels.is_cancelled(bid) {
+        // A cancel landed in the tiny window between the caller's last
+        // cooperative check and this spawn — kill it now.
+        let _ = child.start_kill();
+    }
 
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
@@ -4005,8 +4490,13 @@ async fn run_streamed(
             );
         }
     });
-    let status = child.wait().await?;
+    let status = child.wait().await;
+    cloud.build_cancels.set_running(bid, None);
+    let status = status?;
     let _ = tokio::join!(t1, t2);
+    if !status.success() && cloud.build_cancels.is_cancelled(bid) {
+        return Err(BuildCancelled.into());
+    }
     anyhow::ensure!(status.success(), "exited with {status}");
     Ok(())
 }

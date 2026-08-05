@@ -3,16 +3,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MapPin, RadioTower, ShieldCheck, TriangleAlert } from "lucide-react";
 import { useRunNode } from "@/lib/use-run-node";
-import { lifecycleLabel, type RunNodeStatus } from "@/lib/run-node-status";
+import { lifecycleLabel, dbLaneStateLabel, type RunNodeStatus, type DbLaneStatus } from "@/lib/run-node-status";
 import { clearPresence, GEO_CONSENT_KEY, GEO_COORDS_KEY } from "@/lib/run-node-client";
 import { usePoll, sessionMintStatus, type Deployment } from "@/lib/api";
-import { resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
+import { excludedDeployments, resolveTarget, targetsFromDeployments } from "@/lib/run-node-targets";
 import { TargetPicker, type TargetSelection } from "./target-picker";
 // browser-run-node-target-picker: the persisted selection is the STABLE
 // deployment+function pair only — never a digest. The digest is re-derived
 // from fresh descriptor metadata on every render/start/replay, so a redeploy
 // that rotates the policy digest under the same name keeps working and a
 // deleted/ineligible target fails visibly and clears instead of replaying.
+// browser-node-optional-serve-target: an EMPTY deployment is the persisted
+// form of "attached to nothing", which is a real choice a node runs on — not
+// an absent one.
 const TARGET_KEY = "hive_run_node_target";
 const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
 // Re-derive the fix well before the browser's own 10-minute cache
@@ -37,42 +40,14 @@ function staleSuffix(locatedMs: number | null): string {
 }
 
 
-// bn-run-node-db-sync-wiring: the worker's additive db-lane status field.
-// Present only while the admitted project's capability carries a
-// server-derived `db` block (a fluid.json top-level browser_db opt-in) — the
-// typed mirror in lib/run-node-status.ts is owned by another row, so this
-// page widens the type locally, the same way the field rides the wire.
-type DbLaneStatus = {
-  project: string | null;
-  dbFile: string | null;
-  access: "read_write" | "read_only" | null;
-  state: "opening" | "idle" | "syncing" | "sealed" | "error";
-  persisted: boolean | "unknown" | null;
-  peers: number;
-  lastSyncMs: number | null;
-  sites: number;
-  siteVersion: number;
-  error: string | null;
-};
-
-function dbLaneStateLabel(db: DbLaneStatus): string {
-  switch (db.state) {
-    case "opening":
-      return "opening local replica…";
-    case "syncing":
-      return "syncing…";
-    case "sealed":
-      return "sealed — resumes on re-admission";
-    case "error":
-      return "error";
-    case "idle":
-      return db.lastSyncMs ? `last synced ${Math.max(0, Math.round((Date.now() - db.lastSyncMs) / 1000))}s ago` : "idle";
-  }
-}
-
 export default function RunNodePage() {
   const { status, supported, start, stop, setGeoConsent, dataSaverBlocked, replayError } = useRunNode();
   const dbStatus = (status as RunNodeStatus & { db?: DbLaneStatus | null }).db ?? null;
+  // Additive worker field (browser-node-optional-serve-target): whether a
+  // function artifact is actually PINNED right now, derived worker-side from
+  // the runtime rather than from what was requested — so the page can state
+  // plainly that a running node is not serving anything.
+  const serving = (status as RunNodeStatus & { serving?: boolean }).serving === true;
   // Eligible serve targets come from the same authenticated /deployments list
   // the rest of the dashboard polls — served locally with leader/owner
   // fallback server-side (admin_ingress + the /cloud proxy), so this page
@@ -81,10 +56,10 @@ export default function RunNodePage() {
   const { data: deployments, error: deploymentsError, loading: deploymentsLoading } =
     usePoll<Deployment[]>("/deployments", 5000);
   const targets = useMemo(() => targetsFromDeployments(deployments ?? []), [deployments]);
-  const excludedCount = useMemo(
-    () => (deployments ?? []).filter((d) => d.state !== "ready" || (d.browser_functions ?? []).length === 0).length,
-    [deployments],
-  );
+  // Not a count: the REASON each excluded deployment is excluded. A bare number
+  // answered the one question nobody asks ("are some hidden?") and none of the
+  // question every report actually asks ("which of mine, and why?").
+  const excluded = useMemo(() => excludedDeployments(deployments ?? []), [deployments]);
   // Persisted selection + scope are hydrated AFTER mount (the effect below),
   // NOT in a lazy useState initializer. Reading localStorage during the first
   // render makes the client's initial tree diverge from the SSR HTML (the
@@ -110,7 +85,12 @@ export default function RunNodePage() {
   // The digest handed to Start is resolved from the CURRENT snapshot on every
   // render — never from the persisted selection — so a target rotated between
   // page load and click starts the current artifact, not a stale digest.
-  const resolved = selection && deployments && !authWindow ? resolveTarget(deployments, selection.deployment, selection.fn) : null;
+  // A null selection is the explicit "attach to nothing" choice and resolves
+  // to nothing, which is not a failure and never blocks Start.
+  const resolved =
+    selection && deployments && !authWindow
+      ? resolveTarget(deployments, selection.deployment, selection.fn)
+      : null;
   const selectedTarget = resolved && resolved.ok ? resolved.target : null;
   // Revalidation failure, derived per render: while the list is still loading
   // (including the team-switch window, where usePoll drops data to null)
@@ -144,11 +124,17 @@ export default function RunNodePage() {
     });
   }, [revalidationFailure]);
 
-  function choose(sel: TargetSelection) {
+  // `null` = the explicit "serve nothing" option, persisted as an empty
+  // deployment so the choice (and the scope beside it) survives a reload
+  // exactly like a real target does.
+  function choose(sel: TargetSelection | null) {
     setSelection(sel);
     setClearedError(null);
     try {
-      localStorage.setItem(TARGET_KEY, JSON.stringify({ ...sel, scope }));
+      localStorage.setItem(
+        TARGET_KEY,
+        JSON.stringify({ deployment: sel?.deployment ?? "", fn: sel?.fn ?? "", scope }),
+      );
     } catch {
       /* storage unavailable — the selection just won't survive a reload */
     }
@@ -156,12 +142,13 @@ export default function RunNodePage() {
 
   function chooseScope(next: "team" | "public") {
     setScope(next);
-    if (selection) {
-      try {
-        localStorage.setItem(TARGET_KEY, JSON.stringify({ ...selection, scope: next }));
-      } catch {
-        /* ignore */
-      }
+    try {
+      localStorage.setItem(
+        TARGET_KEY,
+        JSON.stringify({ deployment: selection?.deployment ?? "", fn: selection?.fn ?? "", scope: next }),
+      );
+    } catch {
+      /* ignore */
     }
   }
 
@@ -181,7 +168,9 @@ export default function RunNodePage() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.deployment === "string" && typeof parsed.fn === "string") {
-          setSelection(parsed);
+          // An empty deployment is the persisted "attached to nothing" choice
+          // — restore it as a null selection, not as a target named "".
+          setSelection(parsed.deployment ? { deployment: parsed.deployment, fn: parsed.fn } : null);
           if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
         }
       }
@@ -330,17 +319,20 @@ export default function RunNodePage() {
     }
   }
 
-  const canStart = selectedTarget !== null && status.lifecycle === "stopped" && !dataSaverBlocked;
+  // browser-node-optional-serve-target: running a node NEVER depends on having
+  // something to serve. A donor whose deployments are all long-running servers
+  // (Next.js, Express), containers, TypeScript or Python/Go has nothing a
+  // browser engine can execute — a real engine constraint, not a policy — and
+  // used to be locked out of the whole feature by this one boolean. The serve
+  // lane is now the optional part; the node itself is not.
+  const canStart = status.lifecycle === "stopped" && !dataSaverBlocked;
 
   // Explicit reason the Start button is disabled, so it is NEVER a silent dead
   // end — the "works on my other device but not this one" report was a node
-  // that couldn't start with no visible cause. The two loudest cases
-  // (dataSaver, unsupported) already have their own banners above, so those
-  // return null here to avoid duplicating them; every remaining case that
-  // leaves `canStart` false gets a one-line, actionable explanation right at
-  // the button. Target SELECTION lives in this device's localStorage, so a
-  // fresh device legitimately has none until the user picks one — that is the
-  // single most common cause and previously showed nothing at all.
+  // that couldn't start with no visible cause. Both remaining causes have
+  // their own banner above, so this stays null for them rather than saying the
+  // same thing twice; a missing/failed TARGET is deliberately not a cause any
+  // more, it just leaves the serve lane idle (see `serveNotice`).
   const startDisabledReason =
     status.lifecycle !== "stopped" || canStart
       ? null
@@ -348,15 +340,23 @@ export default function RunNodePage() {
         ? null // covered by the SharedWorker banner above
         : dataSaverBlocked
           ? null // covered by the Data Saver banner above
-          : authWindow
-            ? "Waiting for your session to finish signing in — this list fills in automatically, then pick a target to start."
-            : selectionError
-              ? null // the selection-error notice above already explains it
-              : targets.length === 0
-                ? excludedCount > 0
-                  ? "None of your deployments expose a browser-eligible function yet. Deploy a browser function — or a JS/Bun function that ships a browser.js handler — and it becomes runnable here automatically."
-                  : "Deploy a function first — once you have a browser-eligible deployment, you can run it here."
-                : "Choose a deployment and function above, then Start.";
+          : null;
+
+  // What this node will actually do, stated before it starts — the honest
+  // counterpart to no longer gating Start. Never implies a browser can run
+  // something it cannot: with nothing attached the serve lane is simply idle,
+  // and the reason (an all-servers/containers tenant vs. a deliberate choice)
+  // is named rather than left to be inferred from a disabled button.
+  const serveNotice =
+    selection !== null
+      ? null
+      : authWindow
+        ? "Still signing in — the list below fills in automatically. You can start the node now either way; it just won't serve a function."
+        : targets.length === 0 && excluded.length > 0
+          ? "Nothing in this team can run in a browser engine, so this node will serve no function. It still joins the mesh, holds a relay identity, appears on the constellation map, and counts as donated capacity."
+          : targets.length === 0
+            ? "You have nothing deployed to attach to yet, so this node will serve no function. It still joins the mesh, holds a relay identity, and appears on the constellation map."
+            : "This node will serve no function — it joins the mesh, holds a relay identity, and appears on the constellation map. Pick something below to also serve it.";
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -391,14 +391,18 @@ export default function RunNodePage() {
       )}
 
       <p className="mb-5 text-sm leading-relaxed text-secondary">
-        Donate spare capacity in this browser tab to serve one of your own deployed functions over a direct,
-        end-to-end encrypted peer connection. Your browser gets its own low-trust identity — it never joins the
-        platform&apos;s trusted fleet, is never counted toward fleet capacity or health, and can be revoked
-        instantly at any time from this page.
+        Donate spare capacity in this browser tab over a direct, end-to-end encrypted peer connection. Your
+        browser gets its own low-trust identity — it never joins the platform&apos;s trusted fleet, is never
+        counted toward fleet capacity or health, and can be revoked instantly at any time from this page.
+        Attaching one of your own deployed functions is optional: without one the node still joins the mesh and
+        appears on the constellation map, it just doesn&apos;t serve traffic.
       </p>
 
       <section className="mb-5 rounded-lg border border-border bg-card p-4">
-        <h2 className="mb-3 text-sm font-medium text-fg">What to serve</h2>
+        <h2 className="mb-1 text-sm font-medium text-fg">What to serve — optional</h2>
+        <p className="mb-3 text-xs leading-relaxed text-secondary">
+          Attach this node to one of your own deployments, or leave it unattached. Either way it runs.
+        </p>
         {(selectionError || replayError) && (
           <div
             role="alert"
@@ -406,13 +410,19 @@ export default function RunNodePage() {
           >
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>
-              {selectionError ?? replayError} Pick another target below.
+              {selectionError ?? replayError} The node still runs unattached — pick another target below to serve
+              something.
             </span>
           </div>
         )}
+        {serveNotice && (
+          <p className="mb-3 rounded-md bg-subtle p-2 text-xs leading-relaxed text-secondary" role="status">
+            {serveNotice}
+          </p>
+        )}
         <TargetPicker
           targets={targets}
-          excludedCount={excludedCount}
+          excluded={excluded}
           loading={deploymentsLoading && !deployments}
           fetchError={deploymentsError}
           selected={selection}
@@ -422,15 +432,26 @@ export default function RunNodePage() {
         <div className="mt-3">
           <Field label="Visibility">
             <select
-              value={scope}
+              value={selection === null ? "team" : scope}
               onChange={(e) => chooseScope(e.target.value as "team" | "public")}
-              disabled={status.lifecycle !== "stopped"}
+              // Visibility decides who may INVOKE what this node serves (and,
+              // for a database grant, whether an anonymous donor gets a
+              // read-only replica). With nothing attached there is nothing to
+              // expose, so the choice is not merely inert — offering "Public"
+              // would send a non-admin into a guaranteed FORBIDDEN
+              // (`public_scope_forbidden`) for a node that exposes nothing.
+              disabled={status.lifecycle !== "stopped" || selection === null}
               className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
             >
               <option value="team">Team only</option>
               <option value="public">Public (admins &amp; public-node divisions)</option>
             </select>
           </Field>
+          {selection === null && (
+            <p className="mt-1 text-[11px] text-muted">
+              Nothing is attached, so there is nothing for anyone to invoke — this node runs as team-only.
+            </p>
+          )}
         </div>
       </section>
 
@@ -507,6 +528,21 @@ export default function RunNodePage() {
           <dd className="truncate font-mono text-secondary">{status.relay ?? "—"}</dd>
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
+          {/* browser-node-optional-serve-target: a running node that serves
+              nothing is a supported, useful state, so it says so plainly here
+              instead of leaving a blank where a function name would be.
+              `serving` is derived by the worker from what is actually PINNED,
+              never from what was requested. */}
+          <dt className="text-muted">Serving</dt>
+          <dd className="text-secondary">
+            {status.lifecycle === "stopped"
+              ? "—"
+              : serving && selectedTarget
+                ? `${selectedTarget.project} / ${selectedTarget.fn}`
+                : serving
+                  ? "a function"
+                  : "not serving a function — contributing mesh presence and relay capacity"}
+          </dd>
           {dbStatus && (
             <>
               <dt className="text-muted">Database</dt>
@@ -608,14 +644,21 @@ export default function RunNodePage() {
           {status.lifecycle === "stopped" ? (
             <button
               onClick={() => {
-                if (selectedTarget) {
-                  start({
-                    deployment: selectedTarget.deployment,
-                    fn: selectedTarget.fn,
-                    digest: selectedTarget.policyDigest,
-                    scope,
-                  });
-                }
+                // browser-node-optional-serve-target: with no resolvable
+                // target this starts a node attached to NOTHING (all three
+                // fields empty) rather than doing nothing at all — the server
+                // then issues an admission with no artifact capability and no
+                // serve route, which is exactly the intended shape.
+                start({
+                  deployment: selectedTarget?.deployment ?? "",
+                  fn: selectedTarget?.fn ?? "",
+                  digest: selectedTarget?.policyDigest ?? "",
+                  // Scope only means something when something is attached; an
+                  // unattached node is always team-only (see the Visibility
+                  // field above), so a stale "public" choice can never turn a
+                  // bare node into a guaranteed `public_scope_forbidden`.
+                  scope: selectedTarget ? scope : "team",
+                });
               }}
               disabled={!canStart || !supported}
               className="min-h-11 flex-1 rounded-md bg-fg px-3 py-1.5 text-sm font-medium text-bg hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"

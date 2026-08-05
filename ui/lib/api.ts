@@ -809,7 +809,7 @@ export interface Deployment {
   id_alias?: string;
   /** "production" | "preview" (mirrors `production`). */
   target?: string;
-  state: "queued" | "building" | "ready" | "error";
+  state: "queued" | "building" | "ready" | "error" | "cancelled";
   creator: string;
   git: GitSource | null;
   production: boolean;
@@ -830,6 +830,22 @@ export interface Deployment {
    *  /deployments list carries it for deployments hosted on other nodes too).
    *  Absent/empty for every deployment with no browser opt-in. */
   browser_functions?: BrowserFunctionRef[];
+  /** Functions the build EVALUATED for browser eligibility and DECLINED, each
+   *  with the reason (`DeploymentInfo.browser_ineligible` — gossiped alongside
+   *  `browser_functions`, and the negative half of the same answer). The
+   *  distinction that matters to a reader: a ready deployment with no artifact
+   *  AND no entry here was never evaluated at all (built before the pipeline
+   *  did this), so it needs a redeploy rather than a code change. Absent for
+   *  pre-upgrade peers — which is exactly that same never-evaluated state. */
+  browser_ineligible?: BrowserIneligibility[];
+  /** The deployment's `browser_db` opt-in block, VERBATIM from the manifest
+   *  (`DeploymentInfo.browser_db` — gossiped alongside `browser_functions`,
+   *  raw policy resolved at the point of use). Absent for every deployment
+   *  with no browser-database opt-in. A deployment can carry this WITHOUT any
+   *  browser-eligible function — a Next.js/Express app with a `browser_db`
+   *  block is exactly that — which is what makes a database-only browser node
+   *  possible (see `lib/run-node-targets.ts`). */
+  browser_db?: BrowserDbPolicy | null;
 }
 
 /** One browser-eligible function of a deployment, with its build-stamped
@@ -853,6 +869,15 @@ export interface BrowserFunctionRef {
   stack_bytes: number;
   /** Sorted + deduplicated host-op ids (fluid_core::browser_host_op_abi). */
   allowed_ops: number[];
+}
+
+/** One function the build declined to make browser-servable, with the reason.
+ *  Mirrors `fluid_core::BrowserIneligibility`. Entirely server-derived: the
+ *  build clears any tenant-authored value before evaluating, so a fluid.json
+ *  can never inject a reason of its own. */
+export interface BrowserIneligibility {
+  function: string;
+  reason: string;
 }
 
 export interface RawPortBinding {
@@ -914,7 +939,53 @@ export interface ProjectSettings {
   /** Outcome of the auto-CI install attempted right after this project's first
    *  git import — absent for a project with no git source yet. */
   git_ci?: GitCiStatus;
+  /** Dashboard-managed browser-replicated database opt-in (Storages page).
+   *  Absent/null = not configured from the dashboard — a hand-edited
+   *  fluid.json `browser_db` block can still be live even when this is null
+   *  (this mirror only reflects what the dashboard itself last wrote, or what
+   *  the last deploy synced back from an explicit fluid.json block). */
+  browser_db?: BrowserDbPolicy | null;
 }
+
+// ---- Browser-replicated database (browser_db contract) ----
+// Mirrors `fluid_core::BrowserDbPolicy` verbatim — presence is the opt-in.
+export interface BrowserDbTable {
+  /** `[A-Za-z_][A-Za-z0-9_]*` — validated both here and server-side. */
+  name: string;
+  /** Idempotent `CREATE TABLE IF NOT EXISTS ...`. */
+  ddl: string;
+}
+export interface BrowserDbPolicy {
+  /** 0 = platform default (64 MiB), ceiling 1 GiB. */
+  max_bytes: number;
+  /** 0 = platform default (1 MiB), ceiling 16 MiB. */
+  max_value_bytes: number;
+  /** Anonymous PUBLIC-scope donors get a read-only replica when true. */
+  public_read: boolean;
+  schema: BrowserDbTable[];
+}
+export const BROWSER_DB_MAX_BYTES_DEFAULT = 64 * 1024 * 1024;
+export const BROWSER_DB_MAX_BYTES_MAX = 1024 * 1024 * 1024;
+export const BROWSER_DB_VALUE_MAX_BYTES_DEFAULT = 1024 * 1024;
+export const BROWSER_DB_VALUE_MAX_BYTES_MAX = 16 * 1024 * 1024;
+
+/** `GET /v1/projects/:project/browser-db/status` response. */
+export type BrowserDbStatusResponse =
+  | { opted_in: false }
+  | {
+      opted_in: true;
+      max_bytes: number;
+      max_value_bytes: number;
+      public_read: boolean;
+      tables: string[];
+      notes: string[];
+      replica: {
+        exists: boolean;
+        bytes: number;
+        sites: number;
+        last_modified_ms: number | null;
+      };
+    };
 
 /** See `ProjectSettings.git_ci`. Mirrors `hive-cloud::project_settings::GitCiStatus`. */
 export interface GitCiStatus {
@@ -1424,12 +1495,21 @@ export interface Build {
   branch: string;
   commit: string;
   commit_message: string;
-  state: "queued" | "building" | "ready" | "error";
+  state: "queued" | "building" | "ready" | "error" | "cancelled";
   started_ms: number;
   finished_ms: number | null;
   deployment_id: string | null;
   alias: string | null;
   lines: BuildLogLine[];
+}
+
+/** Cancel an in-flight build (`POST /v1/builds/:id/cancel`) — stops the
+ *  ACTUAL server-side build process (git clone / npm install / build
+ *  command), not just a client-side no-op, and returns the updated record
+ *  (state: "cancelled"). Idempotent: cancelling an already-terminal build is
+ *  a no-op that just echoes the current record back. */
+export async function cancelBuild(buildId: string): Promise<Build> {
+  return apiSend<Build>("POST", `/v1/builds/${encodeURIComponent(buildId)}/cancel`);
 }
 
 // ---- CDN routing (dashboard-managed redirects/rewrites; `/v1/routing`) ----

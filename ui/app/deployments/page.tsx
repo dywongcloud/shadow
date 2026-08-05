@@ -3,10 +3,10 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { RotateCcw, RefreshCw, Trash2, Loader2, Plus } from "lucide-react";
+import { RotateCcw, RefreshCw, Trash2, Loader2, Plus, CircleX } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
-import { apiSend, usePoll, type Deployment } from "@/lib/api";
-import { usePendingBuilds } from "@/lib/pending-builds";
+import { apiSend, cancelBuild, usePoll, type Deployment } from "@/lib/api";
+import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 import { RedeployModal } from "@/components/redeploy-modal";
@@ -35,6 +35,20 @@ export default function DeploymentsPage() {
       await refresh();
     } catch (e) { alert(String(e)); } finally { setBusy(""); }
   }
+  // Stops the ACTUAL server-side build process (git clone / npm install /
+  // build command), not just a client-side no-op — see `POST
+  // /v1/builds/:id/cancel`. `p.id` IS the build id (see `PendingBuild`'s doc).
+  async function cancelPending(buildId: string) {
+    setBusy(buildId);
+    try {
+      await cancelBuild(buildId);
+      removePendingBuild(buildId); // now terminal — drop the pulsing row
+    } catch (e) {
+      alert(String(e)); // request itself failed — keep the row, let the user retry
+    } finally {
+      setBusy("");
+    }
+  }
 
   return (
     <div>
@@ -47,25 +61,38 @@ export default function DeploymentsPage() {
         <thead><tr><Th>Project</Th><Th className="hidden lg:table-cell">Deployment</Th><Th>Status</Th><Th>URL</Th><Th className="hidden md:table-cell">Source</Th><Th className="hidden sm:table-cell">Created</Th><Th></Th></tr></thead>
         <tbody>
           {/* Persistent optimistic rows for in-flight builds (survive navigation). */}
-          {pending.map((p) => (
-            <tr key={p.id} className="animate-pulse">
-              <Td className="font-medium">{p.project}</Td>
-              <Td className="font-mono text-xs text-muted hidden lg:table-cell">
-                <a className="text-link hover:underline" href={`/deploy/${p.id}`}>{p.id}</a>
-              </Td>
-              <Td>{p.env === "production" ? <Badge tone="green">Production</Badge> : <Badge>Preview</Badge>}</Td>
-              <Td className="text-xs text-muted">
-                <span className="inline-flex items-center gap-1.5">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" /> building
-                </span>
-              </Td>
-              <Td className="text-xs text-secondary hidden md:table-cell">
-                <span className="inline-flex items-center gap-1"><RefreshCw className="h-3.5 w-3.5" /> deploying</span>
-              </Td>
-              <Td className="text-muted hidden sm:table-cell">just now</Td>
-              <Td></Td>
-            </tr>
-          ))}
+          {pending.map((p) => {
+            const cancelling = busy === p.id;
+            return (
+              <tr key={p.id} className="animate-pulse">
+                <Td className="font-medium">{p.project}</Td>
+                <Td className="font-mono text-xs text-muted hidden lg:table-cell">
+                  <a className="text-link hover:underline" href={`/deploy/${p.id}`}>{p.id}</a>
+                </Td>
+                <Td>{p.env === "production" ? <Badge tone="green">Production</Badge> : <Badge>Preview</Badge>}</Td>
+                <Td className="text-xs text-muted">
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin text-amber-400" /> building
+                  </span>
+                </Td>
+                <Td className="text-xs text-secondary hidden md:table-cell">
+                  <span className="inline-flex items-center gap-1"><RefreshCw className="h-3.5 w-3.5" /> deploying</span>
+                </Td>
+                <Td className="text-muted hidden sm:table-cell">just now</Td>
+                <Td>
+                  <div className="flex items-center justify-end gap-1">
+                    {cancelling ? (
+                      <Loader2 className="h-4 w-4 animate-spin text-muted" />
+                    ) : (
+                      <IconBtn title="Cancel deployment" danger onClick={() => cancelPending(p.id)}>
+                        <CircleX className="h-3.5 w-3.5" />
+                      </IconBtn>
+                    )}
+                  </div>
+                </Td>
+              </tr>
+            );
+          })}
           {(deps ?? []).map((d) => {
             const working = busy === d.id;
             return (

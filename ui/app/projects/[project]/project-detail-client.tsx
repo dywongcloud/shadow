@@ -40,7 +40,7 @@ const ServiceGraph = dynamic(
   }
 );
 import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview } from "@/lib/api";
-import { usePendingBuilds } from "@/lib/pending-builds";
+import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
 import { RawPortConnections } from "@/components/raw-port-connections";
@@ -112,6 +112,31 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
     setBusy(id);
     try { await apiSend("DELETE", `/v1/deployments/${id}`); await refresh(); }
     catch (e) { alert(String(e)); } finally { setBusy(""); }
+  }
+  /**
+   * Cancel an IN-FLIGHT build (queued/building only — see the `canCancel` gate
+   * on each row's menu). The id is the BUILD id: the same key `/deploy/:id`
+   * renders and `/v1/builds/:id` is stored under, which is what is actually
+   * still running — a finished deployment artifact is deleted, not cancelled.
+   *
+   * Two row kinds reach here and both must end in a truthful state:
+   *   * a REAL deployment row still building — the server owns it, so a failure
+   *     is surfaced and `refresh()` re-reads the authoritative state after.
+   *   * an OPTIMISTIC pending row — it lives in localStorage and may not be
+   *     server-registered yet, so a failed call there is EXPECTED (404) rather
+   *     than an error worth shouting about; the local entry is dropped either
+   *     way so a "Building" row can never outlive its own cancel.
+   */
+  async function cancelBuild(id: string, optimistic: boolean) {
+    if (!confirm(`Cancel the in-progress build ${id}?`)) return;
+    setBusy(id);
+    try {
+      await apiSend("POST", `/v1/builds/${encodeURIComponent(id)}/cancel`);
+    } catch (e) {
+      if (!optimistic) { alert(String(e)); setBusy(""); return; }
+    }
+    if (optimistic) removePendingBuild(id);
+    try { await refresh(); } finally { setBusy(""); }
   }
   async function deleteProject() {
     if (!confirm(`Delete the entire "${name}" project and ALL its deployments? This cannot be undone.`)) return;
@@ -325,7 +350,21 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                 </Td>
                 <Td className="px-2 text-secondary hidden sm:table-cell">just now</Td>
                 <Td className="px-2 text-secondary hidden lg:table-cell">you</Td>
-                <Td className="px-2"></Td>
+                {/* An in-flight build's only meaningful action is stopping it,
+                    so this row gets the same "⋯" menu carrying Cancel alone —
+                    it previously rendered an empty cell, leaving a build that
+                    is actively burning CPU with no way to stop it from here. */}
+                <Td className="px-2">
+                  <DeploymentRowMenu
+                    canRollback={false}
+                    canRedeploy={false}
+                    canCancel
+                    busy={busy === p.id}
+                    onRollback={() => {}}
+                    onRedeploy={() => {}}
+                    onCancel={() => cancelBuild(p.id, true)}
+                  />
+                </Td>
               </tr>
             ))}
             {mine.map((d) => (
@@ -373,9 +412,14 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
                     <DeploymentRowMenu
                       canRollback={!d.production}
                       canRedeploy={!!d.git}
+                      /* Cancel is offered ONLY while the build is genuinely in
+                         flight — a ready/error deployment has nothing left to
+                         stop, and offering it there would be a dead action. */
+                      canCancel={d.state === "building" || d.state === "queued"}
                       busy={busy === d.id}
                       onRollback={() => promote(d.id)}
                       onRedeploy={() => setRedeployFor(d)}
+                      onCancel={() => cancelBuild(d.id, false)}
                       onDelete={() => removeDeployment(d.id)}
                     />
                   </div>

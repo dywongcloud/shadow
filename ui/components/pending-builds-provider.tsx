@@ -25,9 +25,14 @@ export function PendingBuildsProvider() {
         }
         try {
           const build = await apiGet<Build>(`/v1/builds/${b.id}`, { fresh: true });
-          // Terminal → the real deployment record now exists; drop the pending row
-          // (the lists' own /deployments poll surfaces the finished deployment).
-          if (build.state === "ready" || build.state === "error") removePendingBuild(b.id);
+          // Terminal → either the real deployment record now exists (ready), it
+          // failed (error), or the user stopped it (cancelled, via the table's
+          // own Cancel action or the /deploy/:id page's) — drop the pending row
+          // in all three cases (the lists' own /deployments poll surfaces the
+          // finished deployment when there is one).
+          if (build.state === "ready" || build.state === "error" || build.state === "cancelled") {
+            removePendingBuild(b.id);
+          }
         } catch {
           /* build not visible yet (cross-node mirror lag) — keep polling */
         }

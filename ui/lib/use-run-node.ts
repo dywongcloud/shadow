@@ -93,10 +93,18 @@ function clearLastStart() {
 }
 
 export interface StartArgs {
+  /** browser-node-optional-serve-target: EMPTY means this node attaches to
+   *  nothing — it joins the mesh, holds its relay identity and publishes
+   *  presence, with no serve lane and no database. A donor whose deployments
+   *  are all long-running servers or containers starts exactly this way. */
   deployment: string;
+  /** Empty alongside a non-empty `deployment` = a database-only node (the
+   *  project's `browser_db` replica, nothing served). Empty alongside an empty
+   *  `deployment` = no target at all. */
   fn: string;
   /** The descriptor's policy digest, resolved from fresh deployment metadata
-   *  by the picker (or the handoff replay) — never a donor-typed value. */
+   *  by the picker (or the handoff replay) — never a donor-typed value. Empty
+   *  whenever there is no function to serve. */
   digest: string;
   scope?: "team" | "public";
 }
@@ -228,6 +236,24 @@ export function useRunNode() {
   const replayLastStart = useCallback((post: (msg: object) => void) => {
     const last = readLastStart();
     if (!last) return;
+    // Target-less replay (browser-node-optional-serve-target): there is
+    // nothing to revalidate — no deployment, no function, no digest — so it
+    // replays directly. Routing it through resolveTargetFresh would fail the
+    // lookup for a deployment id of "" and silently drop a perfectly valid
+    // node from every owner handoff.
+    if (!last.deployment) {
+      setReplayError(null);
+      post({
+        type: "start",
+        relay: RELAY,
+        deployment: "",
+        fn: "",
+        digest: "",
+        scope: last.scope ?? "team",
+        team: currentTeam(),
+      });
+      return;
+    }
     resolveTargetFresh(last.deployment, last.fn)
       .then((res) => {
         if (!res.ok) {

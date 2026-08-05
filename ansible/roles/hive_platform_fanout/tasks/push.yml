@@ -8,11 +8,25 @@
   ansible.builtin.meta: end_host
   when: inventory_hostname == hive_group_build_host
 
+# throttle caps this ONE task's concurrency independent of the play's forks
+# (ansible.cfg sets forks=20 so cheap tasks fan out fully). Every copy here
+# originates from the control host (this operator machine) directly to one
+# target -- never one fleet node relaying to several peers -- so it can
+# never reproduce the sshd MaxStartups pileup scripts/roll-backend-fleet.sh
+# hit (that came from many concurrent SSH -A hops converging on one SOURCE
+# node's sshd). The resource this throttle protects is different: the
+# operator machine's own uplink bandwidth pushing a ~100MB binary to up to
+# 13 hosts at once, which is the exact "residential uplink" problem
+# roll-backend-fleet.sh's header names as its reason for node-to-node
+# distribution. Default 4 is a conservative starting point for a laptop
+# uplink; raise with -e hive_push_throttle=N from a well-provisioned box
+# (measure first -- this is a bandwidth guess, not a proven number).
 - name: Push the group's canonical binary to /tmp
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}"
     dest: /tmp/hive-cloud.new
     mode: "0755"
+  throttle: "{{ hive_push_throttle | default(4) }}"
 
 - name: Verify the pushed binary's sha256 matches the canonical build
   ansible.builtin.command:

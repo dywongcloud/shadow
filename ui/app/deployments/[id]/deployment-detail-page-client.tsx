@@ -12,7 +12,7 @@ import { BuildLogs } from "@/components/build-logs";
 import { WfConsoleFrame } from "@/components/wf-console-frame";
 import { RedeployModal } from "@/components/redeploy-modal";
 import { RawPortConnections } from "@/components/raw-port-connections";
-import { apiSend, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
+import { apiSend, cancelBuild, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 
@@ -74,6 +74,7 @@ function DeploymentDetail({ id }: { id: string }) {
   const state = dep?.state ?? build?.state ?? "queued";
   const ready = state === "ready";
   const errored = state === "error";
+  const cancelled = state === "cancelled";
   const building = state === "building" || state === "queued";
   const env = dep ? (dep.target || (dep.production ? "production" : "preview")) : "preview";
   const duration =
@@ -91,6 +92,23 @@ function DeploymentDetail({ id }: { id: string }) {
     setBusy(true);
     try {
       await apiSend("POST", `/v1/deployments/${dep.id}/promote`);
+      await refresh();
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Stops the ACTUAL server-side build process (git clone / npm install /
+  // build command) via `POST /v1/builds/:id/cancel` — the build's OWN id
+  // (`build.id`), not this deployment's id (a still-building deployment has
+  // no deployment record of its own yet on most paths).
+  async function cancel() {
+    if (!build?.id) return;
+    setBusy(true);
+    try {
+      await cancelBuild(build.id);
       await refresh();
     } catch (e) {
       alert(String(e));
@@ -126,6 +144,11 @@ function DeploymentDetail({ id }: { id: string }) {
             <p className="mt-0.5 font-mono text-xs text-muted">{id}</p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            {building && build?.id && (
+              <Button variant="outline" onClick={cancel} disabled={busy}>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <CircleX className="h-4 w-4" />} Cancel
+              </Button>
+            )}
             {dep && !dep.production && ready && (
               <Button variant="outline" onClick={promote} disabled={busy}>
                 {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />} Promote
@@ -151,16 +174,20 @@ function DeploymentDetail({ id }: { id: string }) {
                 <Check className="h-4 w-4 text-green" />
               ) : errored ? (
                 <TriangleAlert className="h-4 w-4 text-red-500" />
+              ) : cancelled ? (
+                <CircleX className="h-4 w-4 text-muted" />
               ) : (
                 <Loader2 className="h-4 w-4 animate-spin text-secondary" />
               )}
-              {ready ? "Ready" : errored ? "Build Failed" : "Building"}
+              {ready ? "Ready" : errored ? "Build Failed" : cancelled ? "Cancelled" : "Building"}
             </div>
             <p className="mt-2 min-h-[3rem] text-sm text-secondary">
               {errored ? (
                 <span className="font-mono text-xs text-red-500">{errorHeadline(build)}</span>
               ) : ready ? (
                 "Your deployment is live and serving traffic."
+              ) : cancelled ? (
+                "This deployment was cancelled before it finished building."
               ) : (
                 "Your deployment is building…"
               )}
@@ -175,8 +202,12 @@ function DeploymentDetail({ id }: { id: string }) {
             </Meta>
             <Meta label="Status">
               <span className="inline-flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${ready ? "bg-green" : errored ? "bg-red-500" : "bg-amber-400"}`} />
-                {ready ? "Ready" : errored ? "Error" : building ? "Building" : state}
+                <span
+                  className={`h-2 w-2 rounded-full ${
+                    ready ? "bg-green" : errored ? "bg-red-500" : cancelled ? "bg-muted" : "bg-amber-400"
+                  }`}
+                />
+                {ready ? "Ready" : errored ? "Error" : cancelled ? "Cancelled" : building ? "Building" : state}
               </span>
             </Meta>
             <Meta label="Duration" icon={<Clock className="h-3.5 w-3.5" />}>

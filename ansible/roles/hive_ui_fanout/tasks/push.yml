@@ -30,14 +30,20 @@
     dest: "{{ hive_src_dir }}/ui/.env.local"
     mode: "0640"
 
+# See hive_platform_fanout/tasks/push.yml's comment on why throttle (not
+# forks/serial) is the right knob here: it bounds this operator machine's
+# own uplink pushing potentially-large artifacts to every host at once,
+# independent of the play's forks (ansible.cfg forks=20).
 - name: Push the canonical .next artifact
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/.next-artifact.tar.gz"
     dest: "{{ hive_src_dir }}/ui/.next-artifact.tar.gz"
     mode: "0644"
+  throttle: "{{ hive_push_throttle | default(4) }}"
 
 - name: Push the canonical wf-console artifact
   ansible.builtin.copy:
     src: "{{ hive_artifact_root }}/wfconsole-artifact.tar.gz"
     dest: "{{ hive_src_dir }}/ui/wfconsole-artifact.tar.gz"
     mode: "0644"
+  throttle: "{{ hive_push_throttle | default(4) }}"

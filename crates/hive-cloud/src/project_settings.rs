@@ -180,6 +180,18 @@ pub struct ProjectSettings {
     /// Synced from the deploy path; consumed by `inference::spawn_reconcile`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inference: Option<InferenceSpec>,
+    /// Dashboard-managed browser-replicated database opt-in (the Storages
+    /// page "Deploy a replicated SQLite database" flow). Presence is the
+    /// opt-in, same discipline as `fluid_core::Manifest::browser_db` — this
+    /// is a SEPARATE opt-in source, not a copy of the manifest field: `git.rs`
+    /// syncs an explicit fluid.json block into this mirror (read side, the
+    /// `inference` precedent) and, when fluid.json declares NO block, merges
+    /// THIS spec into the manifest at build time instead (write side, the
+    /// `FunctionSettings::gpu` OR precedent applied to an `Option` — an
+    /// explicit fluid.json block always wins). Lets a project opt in from the
+    /// dashboard alone, with no git push required.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_db: Option<fluid_core::BrowserDbPolicy>,
     #[serde(default)]
     pub domains: Vec<String>,
     /// Team that owns this project (slug). Defaults to "personal".
@@ -254,6 +266,7 @@ impl Default for ProjectSettings {
             build: BuildConfig::default(),
             functions: FunctionSettings::default(),
             inference: None,
+            browser_db: None,
             domains: Vec::new(),
             team: default_team(),
             production_branch: String::new(),
@@ -343,6 +356,14 @@ impl ProjectStore {
     pub fn set_inference(&self, project: &str, spec: Option<InferenceSpec>) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().inference = spec;
+    }
+
+    /// See [`ProjectSettings::browser_db`]. `None` clears the dashboard-managed
+    /// opt-in (the Storages page's delete/disable action) — it does not touch
+    /// an explicit fluid.json block, which still wins on the next build.
+    pub fn set_browser_db(&self, project: &str, spec: Option<fluid_core::BrowserDbPolicy>) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().browser_db = spec;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {

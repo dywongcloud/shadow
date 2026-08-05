@@ -2799,6 +2799,26 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
                     })
             })
             .collect(),
+        // …and the negative half: every function the build evaluated and
+        // declined, with the reason. Without this a deployment that is ready
+        // but unlisted is indistinguishable from one that was never evaluated,
+        // which is exactly the "my opted-in function just isn't there" report.
+        // Filtered on `browser_artifact.is_none()` so a function that later
+        // became eligible can never report both.
+        browser_ineligible: d
+            .manifest
+            .functions
+            .iter()
+            .filter(|f| f.browser_artifact.is_none())
+            .filter_map(|f| {
+                f.browser_ineligible_reason
+                    .clone()
+                    .map(|reason| fluid_core::BrowserIneligibility {
+                        function: f.name.clone(),
+                        reason,
+                    })
+            })
+            .collect(),
         // The browser-database opt-in block, verbatim (raw policy, resolved at
         // the point of use) — same cross-node resolution reason as
         // `browser_functions` above.

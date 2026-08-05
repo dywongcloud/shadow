@@ -193,6 +193,12 @@ pub struct CloudState {
     pub world_queue: Arc<crate::world_queue::WorldQueue>,
     pub projects: crate::project_settings::ProjectStore,
     pub builds: crate::git::BuildStore,
+    /// Per-build cancellation bookkeeping (live OS process group + mirror
+    /// target + driving task) — see `git::BuildCancelRegistry`. Deliberately
+    /// NOT persisted/gossiped: it only describes an in-flight build's live
+    /// process, which does not survive a restart (and a restarted node
+    /// already finalizes any Queued/Building record to `Error` on boot).
+    pub build_cancels: crate::git::BuildCancelRegistry,
     pub cluster: Arc<crate::cluster::Cluster>,
     pub teams: crate::teams::TeamStore,
     pub gitops: crate::gitops::GitOpsStore,
@@ -630,6 +636,7 @@ impl CloudState {
             world_queue: crate::world_queue::WorldQueue::new(),
             projects: crate::project_settings::ProjectStore::new(),
             builds: crate::git::BuildStore::new(),
+            build_cancels: crate::git::BuildCancelRegistry::new(),
             cluster,
             teams,
             gitops: crate::gitops::GitOpsStore::new(),

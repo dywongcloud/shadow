@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# PREFERRED PATH: ansible-playbook ansible/playbooks/parallel-deploy.yml --tags ui
+# (see ansible/README.md). That entry point does the same one-build/many-
+# node distribution this script pioneered, but pushes to every host in
+# parallel (bounded by forks/throttle) and restarts a bounded batch (default
+# 3, not one host at a time) instead of this script's serial for-loop. This
+# script is kept as a documented fallback, not deleted.
+#
 # Fleet-wide rollout for the ui/ dashboard (Next.js, systemd hive-ui.service,
 # next-server on 127.0.0.1:3002 behind HIVE_DASHBOARD_UPSTREAM).
 #

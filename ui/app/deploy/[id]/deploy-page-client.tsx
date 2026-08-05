@@ -16,9 +16,19 @@ import {
 } from "lucide-react";
 import { Button, Card } from "@/components/ui";
 import { CloneCard } from "@/components/clone-animation";
-import { apiGet, type Build } from "@/lib/api";
+import { apiGet, cancelBuild, type Build } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+
+// After this many consecutive failed polls (~800ms apart ⇒ ~32s), stop
+// spinning forever and tell the user instead. Without this, a build record
+// this node can never find (evicted from the snapshot, hosted on a node this
+// read never reaches, or created under a control-plane leader that has since
+// failed over — see AGENTS.md's round-robin-reads-vs-leader-forwarded-writes
+// note) rendered as an infinite, un-actionable "Deployment started Xs ago…"
+// spinner with 0 log lines forever — indistinguishable from a genuinely
+// hung build, and with no escape (Cancel had no effect on it either).
+const UNREACHABLE_AFTER_FAILS = 40;
 
 // `https://github.com/owner/repo(.git)` (or scp-style) → `owner/repo` for display.
 function ownerRepo(url: string): string {
@@ -177,18 +187,33 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
   const [logsOpen, setLogsOpen] = useState(true);
   const [q, setQ] = useState("");
   const [now, setNow] = useState(Date.now());
+  const [unreachable, setUnreachable] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let stop = false;
+    let fails = 0;
     async function tick() {
       try {
         const b = await apiGet<Build>(`/v1/builds/${id}`);
-        if (!stop) setBuild(b);
+        fails = 0;
+        if (!stop) {
+          setBuild(b);
+          setUnreachable(false);
+        }
         if (!stop && (b.state === "building" || b.state === "queued")) {
           setTimeout(tick, 500);
         }
       } catch {
+        fails += 1;
+        if (!stop && fails >= UNREACHABLE_AFTER_FAILS) {
+          // Give up polling — nothing left to learn by retrying forever, and
+          // an eternal spinner reads as "still building" when it may in fact
+          // be long finished, just unreachable from here.
+          setUnreachable(true);
+          return;
+        }
         if (!stop) setTimeout(tick, 800);
       }
     }
@@ -199,6 +224,18 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
       clearInterval(t);
     };
   }, [id]);
+
+  async function cancel() {
+    setCancelling(true);
+    try {
+      const b = await cancelBuild(id);
+      setBuild(b);
+    } catch (e) {
+      alert(String(e));
+    } finally {
+      setCancelling(false);
+    }
+  }
 
   // Auto-scroll logs while building.
   useEffect(() => {
@@ -213,6 +250,8 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
 
   const ready = state === "ready";
   const errored = state === "error";
+  const cancelled = state === "cancelled";
+  const settled = ready || errored || cancelled;
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -227,13 +266,36 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
             <Check className="h-4 w-4 text-green" />
           ) : errored ? (
             <CircleX className="h-4 w-4 text-red-500" />
+          ) : cancelled ? (
+            <CircleX className="h-4 w-4 text-muted" />
           ) : (
             <Loader2 className="h-4 w-4 animate-spin text-secondary" />
           )}
           <span className="text-sm font-medium">
-            {ready ? "Deployment ready" : errored ? "Deployment failed" : `Deployment started ${elapsed}s ago…`}
+            {ready
+              ? "Deployment ready"
+              : errored
+                ? "Deployment failed"
+                : cancelled
+                  ? "Deployment cancelled"
+                  : `Deployment started ${elapsed}s ago…`}
           </span>
         </div>
+
+        {/* A build this page can never find (evicted, hosted on an
+            unreachable node, or created under a control-plane leader that has
+            since failed over) — an honest terminal state instead of an
+            infinite, un-actionable spinner. */}
+        {unreachable && !build && (
+          <div className="border-t border-border bg-amber-500/5 px-5 py-3 text-sm text-amber-600 sm:px-6">
+            Can&apos;t find this build right now — it may already have finished on a node this
+            page can&apos;t currently reach. Check{" "}
+            <Link href="/deployments" className="underline">
+              Deployments
+            </Link>{" "}
+            for its latest status, or try refreshing in a moment.
+          </div>
+        )}
 
         {/* Build Logs */}
         <div className="border-t border-border">
@@ -247,7 +309,7 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
             </span>
             <span className="flex items-center gap-2 text-xs text-secondary">
               {elapsed}s
-              {!ready && !errored && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
+              {!settled && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
             </span>
           </button>
 
@@ -282,7 +344,7 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
                   </div>
                 ))}
                 {!lines.length && <div className="py-4 text-muted">Waiting for logs…</div>}
-                {!ready && !errored && (
+                {!settled && (
                   <div className="flex gap-3 py-px text-muted">
                     <Loader2 className="h-3.5 w-3.5 animate-spin" />
                   </div>
@@ -293,8 +355,8 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
         </div>
 
         {/* Pending / done steps */}
-        <Step label="Deployment Summary" done={ready} pending={!ready && !errored} />
-        <Step label="Assigning Custom Domains" done={ready} pending={!ready && !errored} />
+        <Step label="Deployment Summary" done={ready} pending={!settled} />
+        <Step label="Assigning Custom Domains" done={ready} pending={!settled} />
 
         {/* Footer */}
         <div className="flex flex-col gap-3 border-t border-border px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6">
@@ -322,9 +384,17 @@ export function DeployPage({ paramsPromise }: { paramsPromise: Promise<{ id: str
             </div>
           ) : errored ? (
             <Link href="/new"><Button variant="outline">Try again</Button></Link>
+          ) : cancelled ? (
+            <Link href="/new"><Button variant="outline">Deploy again</Button></Link>
           ) : (
-            <Button variant="outline" disabled>
-              Cancel Deployment
+            <Button
+              variant="outline"
+              onClick={cancel}
+              disabled={cancelling || !build}
+              title={!build ? "Waiting for the build record before it can be cancelled" : undefined}
+            >
+              {cancelling ? <Loader2 className="h-4 w-4 animate-spin" /> : <CircleX className="h-4 w-4" />}
+              {cancelling ? "Cancelling…" : "Cancel Deployment"}
             </Button>
           )}
         </div>

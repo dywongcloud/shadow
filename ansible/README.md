@@ -81,13 +81,47 @@ Redeploys BOTH the `hive-cloud` backend and the `ui/` dashboard across every
 `[platform]` host, replacing `scripts/roll-backend-fleet.sh` and
 `scripts/deploy-ui-fleet.sh`. Runs in three phases: build once per glibc
 group (backend) / once on the control-plane leader (UI) -- these builds run
-in parallel with each other; push the resulting artifact to every host in
-parallel (no service touched yet); then restart `hive-node`/`hive-ui` a
-bounded number of hosts at a time (`serial`, default 1) so mesh quorum and
-the public round-robin dashboard both stay up throughout the roll.
+in parallel with each other (`strategy: free`); push the resulting artifact
+to every host in parallel (`strategy: free`, bounded by `ansible.cfg`'s
+`forks = 20` so this is a real fan-out and not the default 5-at-a-time
+batching -- no service touched yet); then restart `hive-node`/`hive-ui` a
+bounded number of hosts at a time (`serial`) so the control-plane leader
+chain and the public round-robin dashboard both stay up throughout the roll.
+
+Backend and UI restart batches have **separate** defaults, reasoned
+differently -- collapsing them into one shared knob was the bug this
+playbook used to have:
+
+- `deploy_serial_backend` (default **1**): `hive_cp_owner_chain` has only 3
+  candidate control-plane-leader nodes fleet-wide; there's no live
+  measurement that a bigger batch can't land 2 of those 3 down together, so
+  this stays conservative -- matching `platform-only.yml`'s own precedent --
+  until someone measures otherwise.
+- `deploy_serial_ui` (default **3**): the dashboard has no leader-election
+  concern, just round-robin DNS across every node, so a batch of 2-3 out of
+  14 is safe (11+ nodes keep serving) and is explicitly NOT left at 1 --
+  `serial: 1` here would run ~14 sequential restart-and-health-check rounds
+  and defeat the point of parallelizing the roll.
+- `deploy_serial` (legacy): if set and the two specific vars above are not,
+  applies to both plays.
+- `hive_push_throttle` (default **4**): caps concurrency of just the heavy
+  ~100MB binary / `.next` bundle `copy` tasks, independent of `forks`. Every
+  push here originates from the control host (this operator machine)
+  straight to one target -- never one fleet node relaying to several peers
+  -- so it structurally can't reproduce the sshd `MaxStartups` pileup
+  `roll-backend-fleet.sh`'s header names (many SSH `-A` hops converging on
+  one *source* node). What it DOES still bound is the operator machine's own
+  uplink bandwidth pushing to a dozen-plus hosts at once -- the same
+  "residential uplink" problem that script's header cites as its reason for
+  node-to-node distribution in the first place. Raise it from a
+  well-provisioned box; the default is a conservative guess, not a measured
+  number.
 
 ```bash
-ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2   # faster restart batches, still bounded
+ansible-playbook playbooks/parallel-deploy.yml
+ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_ui=2        # faster UI restart batches, still bounded
+ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_backend=2   # only with real evidence multi-node restart is quorum-safe
+ansible-playbook playbooks/parallel-deploy.yml -e hive_push_throttle=8      # more concurrent big-artifact pushes (needs real uplink headroom)
 ansible-playbook playbooks/parallel-deploy.yml --tags backend       # hive-cloud only
 ansible-playbook playbooks/parallel-deploy.yml --tags ui             # ui/ dashboard only
 ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm        # subset of hosts
@@ -98,6 +132,12 @@ current with the fleet's real glibc membership (AGENTS.md "Fleet has two
 glibc groups" -- membership is by OS image, not region; verify with
 `scripts/audit-runtime-versions.sh` before trusting the group split after
 adding or re-imaging a node).
+
+`ansible.cfg`'s `[ssh_connection] ssh_args` already carries
+`ControlMaster=auto`/`ControlPersist=120m` fleet-wide (the same fix
+`scripts/deploy-ui-fleet.sh`'s header documents for the `MaxStartups`
+failure class) -- every task in this playbook reuses one multiplexed
+connection per host rather than opening a fresh one per task/module call.
 
 ## Add one new node (day 2)
 
@@ -143,20 +183,33 @@ resolve from the encrypted `vault.yml`.
 | `firecracker_kvm` | Firecracker on hosts with real hardware `/dev/kvm` |
 | `pvm_firecracker` | Firecracker via PVM on hosts without hardware KVM (imported, independently-verified role -- see its own README for the fsgsbase requirement and the critical per-VM kernel non-portability gotcha) |
 | `hive_platform` | builds + installs the `hive-cloud` binary and its systemd unit |
+| `hive_ui` | builds + installs the `ui/` dashboard (Next.js) and its systemd unit -- used by `site.yml`'s from-scratch path |
+| `hive_platform_fanout` | build/push/restart task files backing `parallel-deploy.yml`'s backend phases (one build per glibc group, parallel push, bounded-serial restart) |
+| `hive_ui_fanout` | build/push/restart task files backing `parallel-deploy.yml`'s UI phases (one canonical build, parallel push, bounded-serial restart) |
 | `mesh_bootstrap` | mesh trust config (join-proof self-admit by default, or the opt-in static `HIVE_TRUSTED_NODE_IDS` allowlist) |
 | `dns_vercel` | DNS/TLS ingress systemd drop-in (Vercel DNS + ACME DNS-01), matching `RUNBOOK.md` |
 
 ## Verification
 
 ```bash
-# syntax + basic sanity, no target needed
+# syntax + basic sanity, no target needed -- purely local, opens no
+# connections, safe to run any time
 ansible-playbook playbooks/site.yml --syntax-check
 ansible-playbook playbooks/node-join.yml --syntax-check
 ansible-playbook playbooks/platform-only.yml --syntax-check
+ansible-playbook playbooks/parallel-deploy.yml --syntax-check
+ansible-playbook playbooks/parallel-deploy.yml --list-tasks   # confirm the 8-play structure/tags without connecting anywhere
 
 # dry run against a real host -- proves inventory/connectivity/templating
-# actually work end-to-end without mutating anything
+# actually work end-to-end without mutating anything. NOTE for
+# parallel-deploy.yml specifically: `command`/`shell` tasks (the actual
+# cargo/npm builds) do not execute under --check -- they're skipped, so a
+# green --check run proves connectivity/templating, not that a real build
+# would succeed. Prefer --limit against ONE known-safe host before a real
+# fleet-wide run, and never run this against production hosts without
+# explicit sign-off given what it restarts.
 ansible-playbook playbooks/site.yml --check --diff --limit <a-real-host>
+ansible-playbook playbooks/parallel-deploy.yml --check --diff --limit <a-real-host> --tags backend
 ```
 
 ## What this does NOT cover
@@ -164,7 +217,12 @@ ansible-playbook playbooks/site.yml --check --diff --limit <a-real-host>
 - The local macOS dev nodes (launchd, not systemd) -- this suite targets
   Linux cloud/bare-metal nodes. The local Mac fleet remains hand-managed via
   `scripts/shadwd.sh` and the `dev.shadw.*` launchd agents.
-- The dashboard (`ui/`, Next.js) build/deploy -- a separate concern from the
-  Rust platform binary this suite provisions.
 - Custom per-tenant domains / per-deployment certs (RUNBOOK.md notes these
   as follow-ups to the base DNS migration this role automates).
+
+The dashboard (`ui/`, Next.js) build/deploy WAS a separate concern (the
+`scripts/deploy-ui-fleet.sh` bash script) but is now also covered by
+`playbooks/parallel-deploy.yml --tags ui` / the `hive_ui`+`hive_ui_fanout`
+roles above -- kept as a genuinely separate set of plays/tags from the
+backend (`--tags backend`) since the two are independently-running services
+per AGENTS.md's Process section, not because it's unhandled here.

@@ -11,6 +11,7 @@ import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
 import { apiSend, usePoll, type Database, type DbKind } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import Image from "next/image";
+import { BrowserDbSection } from "./browser-db-panel";
 
 const KIND_ICON: Record<DbKind, React.ReactNode> = {
   postgres: <DbIcon className="h-5 w-5" />,
@@ -130,6 +131,8 @@ export default function StoragePage() {
       )}
 
       {open && <BrowseStorage onClose={() => setOpen(false)} onCreated={() => { setOpen(false); refresh(); }} />}
+
+      <BrowserDbSection />
     </div>
   );
 }

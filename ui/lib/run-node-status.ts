@@ -36,7 +36,15 @@ export type ProtocolMismatch = "none" | "outdated" | "server_upgrading";
  * deployed wasm. `use-run-node.ts` now also embeds this number in the worker
  * URL and SharedWorker name, which is what actually forces a fresh worker;
  * this constant remains the detector of last resort. */
-export const HOST_ABI_VERSION = 2;
+/* v3 (2026-08-05, browser-node-optional-serve-target): the `start` message's
+ * deployment/fn/digest are now OPTIONAL and empty means "attach to nothing".
+ * A pre-v3 worker receiving that message admits with an empty target and then
+ * throws "capability carries a malformed digest" on the serve-less capability
+ * it gets back (it has no `serving: false` branch), wedging in a permanent
+ * retry loop. Bumping re-keys the worker URL + SharedWorker name so a reloaded
+ * page attaches to a worker that understands the shape, per the mechanism
+ * described for v2 above. */
+export const HOST_ABI_VERSION = 3;
 
 export interface RunNodeStatus {
   /** Monotonic generation — a status message with a lower version than one
@@ -97,6 +105,44 @@ export function initialRunNodeStatus(): RunNodeStatus {
 export function applyStatus(current: RunNodeStatus, incoming: RunNodeStatus): RunNodeStatus {
   if (incoming.version <= current.version) return current;
   return incoming;
+}
+
+// bn-run-node-db-sync-wiring / bn-storages-page-browser-db-wiring: the
+// worker's additive db-lane status field. Present only while the admitted
+// project's capability carries a server-derived `db` block (a fluid.json
+// top-level `browser_db` opt-in, or the Storages page's dashboard-managed
+// equivalent — see `crates/hive-cloud/src/browser_db.rs`). Hoisted HERE
+// (rather than staying a page-local widened type on /run-node) so a second
+// consumer — the Storages page's live-status panel — can read the exact same
+// wire shape instead of re-declaring it; both pages widen `RunNodeStatus`
+// with `{ db?: DbLaneStatus | null }` since the field isn't in the core
+// status contract's own TS type (the worker still sends it as an ADDITIVE key).
+export type DbLaneStatus = {
+  project: string | null;
+  dbFile: string | null;
+  access: "read_write" | "read_only" | null;
+  state: "opening" | "idle" | "syncing" | "sealed" | "error";
+  persisted: boolean | "unknown" | null;
+  peers: number;
+  lastSyncMs: number | null;
+  sites: number;
+  siteVersion: number;
+  error: string | null;
+};
+
+export function dbLaneStateLabel(db: DbLaneStatus): string {
+  switch (db.state) {
+    case "opening":
+      return "opening local replica…";
+    case "syncing":
+      return "syncing…";
+    case "sealed":
+      return "sealed — resumes on re-admission";
+    case "error":
+      return "error";
+    case "idle":
+      return db.lastSyncMs ? `last synced ${Math.max(0, Math.round((Date.now() - db.lastSyncMs) / 1000))}s ago` : "idle";
+  }
 }
 
 export function lifecycleLabel(state: NodeLifecycle): string {

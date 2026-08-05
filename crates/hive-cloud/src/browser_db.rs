@@ -595,13 +595,89 @@ async fn operator_sync_round(
     }))
 }
 
-/// `POST /v1/browser/dbs/sync/:endpoint_id` — operator-only fleet-initiated
-/// pull round (see [`operator_sync_round`]).
+/// `POST /v1/browser/dbs/sync/:endpoint_id` (operator-only fleet-initiated
+/// pull round, see [`operator_sync_round`]) plus the Storages page's
+/// tenant-scoped live-status read (see [`project_db_status_http`]).
 pub fn routes() -> axum::Router<Arc<CloudState>> {
-    axum::Router::new().route(
-        "/v1/browser/dbs/sync/:endpoint_id",
-        axum::routing::post(operator_sync_http),
-    )
+    axum::Router::new()
+        .route(
+            "/v1/browser/dbs/sync/:endpoint_id",
+            axum::routing::post(operator_sync_http),
+        )
+        .route(
+            "/v1/projects/:project/browser-db/status",
+            axum::routing::get(project_db_status_http),
+        )
+}
+
+/// `GET /v1/projects/:project/browser-db/status` — the Storages page's live
+/// status panel: resolved caps plus THIS node's own local replica figures
+/// (byte usage, distinct site count, file mtime as a last-write proxy).
+///
+/// Declaring which side of the round-robin-reads-vs-leader-writes split this
+/// is on (AGENTS.md): the replica FILE is node-local storage, which is
+/// usually exactly the footgun that rule warns about (write lands on one
+/// node, GET served by whichever node round-robin DNS/admin_ingress's
+/// local-GET rule picks). It does not apply here — `spawn_reconcile` runs on
+/// EVERY node and the descriptor it reconciles from
+/// (`DeploymentInfo::browser_db`) is gossiped fleet-wide, so every node that
+/// has ever heard of this project's opt-in already maintains its OWN replica
+/// of it (see this file's module docs). Whichever node answers this request
+/// has real, local data — never a stale zero. Figures can disagree slightly
+/// node-to-node until the next anti-entropy round; that is the CRR model
+/// converging, not a bug (the same per-observer caveat as health verdicts).
+async fn project_db_status_http(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    headers: axum::http::HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::extract::Path(project): axum::extract::Path<String>,
+) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_project(&cloud, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let Some(policy) = cloud.projects.get(&project).browser_db else {
+        return Ok(axum::Json(json!({ "opted_in": false })));
+    };
+    let resolved = policy.resolve();
+    let path = store_dir().join(replica_file_name(&project));
+    let (exists, bytes, sites, last_modified_ms) = match std::fs::metadata(&path) {
+        Ok(meta) => {
+            let sites = {
+                let path = path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let conn = hive_crsql::open(&path).ok()?;
+                    hive_crsql::known_sites(&conn).ok()
+                })
+                .await
+                .ok()
+                .flatten()
+                .map(|v| v.len())
+                .unwrap_or(0)
+            };
+            let last_modified_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64);
+            (true, meta.len(), sites, last_modified_ms)
+        }
+        // Not-yet-reconciled (first `HIVE_BROWSER_DB_RECONCILE_SECS` tick
+        // hasn't run on this node yet) or genuinely never opened — either
+        // way, an honest "no replica here yet", never a fabricated zero-cap.
+        Err(_) => (false, 0u64, 0usize, None),
+    };
+    Ok(axum::Json(json!({
+        "opted_in": true,
+        "max_bytes": resolved.max_bytes,
+        "max_value_bytes": resolved.max_value_bytes,
+        "public_read": resolved.public_read,
+        "tables": resolved.schema.iter().map(|t| t.name.clone()).collect::<Vec<_>>(),
+        "notes": resolved.notes,
+        "replica": {
+            "exists": exists,
+            "bytes": bytes,
+            "sites": sites,
+            "last_modified_ms": last_modified_ms,
+        },
+    })))
 }
 
 async fn operator_sync_http(

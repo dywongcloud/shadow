@@ -1,28 +1,51 @@
 ---
 # Fleet-wide deploy of BOTH the hive-cloud backend and the ui/ dashboard,
 # replacing scripts/roll-backend-fleet.sh + scripts/deploy-ui-fleet.sh with
-# one Ansible entry point across all 13 hosts.
+# one Ansible entry point across all 14 hosts.
 #
-# Parallelism model (deliberately NOT "restart all 13 at once" -- see
+# Parallelism model (deliberately NOT "restart all 14 at once" -- see
 # AGENTS.md's mesh quorum-loss / round-robin-dashboard-availability notes,
 # and playbooks/platform-only.yml's existing serial: 1):
 #
-#   1. BUILD (parallel):  one host per glibc group builds hive-cloud; one
-#      host (the control-plane leader) builds the ui/ Next.js bundle once.
-#      All three builds run concurrently with each other.
-#   2. PUSH (parallel):   every host pulls its group's/the canonical
-#      artifact and verifies its checksum. No service is touched yet, so
-#      this step is safe to fan out to all 13 hosts at once.
-#   3. RESTART (serial):  hive-node and hive-ui are swapped in and
-#      restarted a bounded number of hosts at a time (serial, see
-#      -e deploy_serial=N below), each batch health-checked before the
-#      next starts -- so a bad build/rollback never takes more than
-#      deploy_serial hosts down together, and mesh quorum / the public
-#      round-robin dashboard both stay up throughout.
+#   1. BUILD (parallel, strategy: free): one host per glibc group builds
+#      hive-cloud; one host (the control-plane leader) builds the ui/
+#      Next.js bundle once. All builds run concurrently with each other and
+#      don't lockstep on each other's task boundaries.
+#   2. PUSH (parallel, strategy: free): every host pulls its group's/the
+#      canonical artifact and verifies its checksum. No service is touched
+#      yet, so this step is safe to fan out to every host at once -- bounded
+#      by ansible.cfg's `forks` (>= host count, see its comment) so this is
+#      actually one fan-out and not batches of 5. The artifact copy itself
+#      additionally carries its own `throttle:` (see hive_push_throttle
+#      below) independent of forks: forks bounds how many hosts run ANY
+#      task concurrently, throttle caps just the heavy ~100MB binary/bundle
+#      transfer so it doesn't try to saturate the operator machine's own
+#      uplink pushing to a dozen hosts simultaneously (the same residential-
+#      uplink problem scripts/roll-backend-fleet.sh's header names as why it
+#      went node-to-node in the first place -- here we get node-to-node's
+#      MaxStartups safety for free, because every artifact copy originates
+#      from THIS control host to one target each, never one fleet node
+#      relaying to several peers at once, and only bound the operator
+#      uplink's bandwidth instead).
+#   3. RESTART (serial, linear strategy -- batches must fully complete,
+#      health check included, before the next starts): hive-node and hive-ui
+#      are swapped in and restarted a bounded number of hosts at a time.
+#      Backend and UI have SEPARATE, differently-reasoned defaults (see
+#      deploy_serial_backend / deploy_serial_ui below) -- collapsing them to
+#      one shared "deploy_serial" is exactly the bug this playbook used to
+#      have: the UI's own dashboard-availability requirement (a batch of 2-3
+#      is plenty safe, round-robin DNS just needs >=1 node up) has nothing
+#      to do with the backend's control-plane-leader-chain requirement
+#      (hive_cp_owner_chain has only 3 candidate nodes fleet-wide; batching
+#      more than 1 at a time risks two of those three landing in the same
+#      restart batch with no live measurement that's safe).
 #
 # Usage:
 #   ansible-playbook playbooks/parallel-deploy.yml
-#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2   # faster, still bounded
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_ui=2        # UI restart batch size (default 3)
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial_backend=2   # backend restart batch size (default 1 -- raise only with real evidence multi-node restart is quorum-safe)
+#   ansible-playbook playbooks/parallel-deploy.yml -e deploy_serial=2          # legacy: sets BOTH if the specific vars above aren't given
+#   ansible-playbook playbooks/parallel-deploy.yml -e hive_push_throttle=8     # allow more concurrent big-artifact pushes (needs a well-provisioned uplink)
 #   ansible-playbook playbooks/parallel-deploy.yml --tags backend       # backend only
 #   ansible-playbook playbooks/parallel-deploy.yml --tags ui            # ui only
 #   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset (still 2-phase build/push, serial restart within the subset)
@@ -66,6 +89,7 @@
 - name: Backend build (parallel, one host per glibc group)
   hosts: glibc239_builder:glibc238_builder
   become: true
+  strategy: free
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
@@ -80,6 +104,7 @@
 - name: Backend push (parallel, all platform hosts)
   hosts: platform
   become: true
+  strategy: free
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
@@ -92,7 +117,11 @@
 - name: Backend restart (serial -- mesh quorum safety)
   hosts: platform
   become: true
-  serial: "{{ deploy_serial | default(1) }}"
+  # Default 1: hive_cp_owner_chain has only 3 candidate leader nodes
+  # fleet-wide (fc-sanjose, fc-bangkok, fc-virginia) out of 14 -- there is no
+  # live measurement showing a bigger batch can't land 2 of those 3 in the
+  # same restart window, so this stays conservative unless overridden.
+  serial: "{{ deploy_serial_backend | default(deploy_serial | default(1)) }}"
   tags: [backend]
   vars:
     hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
@@ -105,6 +134,7 @@
 - name: UI build (once, on the control-plane leader)
   hosts: ui_builder
   become: true
+  strategy: free
   tags: [ui]
   tasks:
     - name: Announce this host's build role
@@ -117,6 +147,7 @@
 - name: UI push (parallel, all platform hosts)
   hosts: platform
   become: true
+  strategy: free
   tags: [ui]
   vars:
     hive_ui_build_host: "{{ groups['ui_builder'][0] }}"
@@ -128,7 +159,13 @@
 - name: UI restart (serial -- dashboard never down fleet-wide)
   hosts: platform
   become: true
-  serial: "{{ deploy_serial | default(1) }}"
+  # Default 3: the dashboard is round-robin DNS across every node with no
+  # leader-election concern (unlike the backend chain above), so a batch of
+  # 2-3 out of 14 is plenty safe -- 11+ nodes still serve while a batch
+  # restarts, and this is explicitly NOT left at 1 (full serial:1 here would
+  # take ~14 sequential restart-and-health-check rounds to defeat the whole
+  # point of parallelizing the roll).
+  serial: "{{ deploy_serial_ui | default(deploy_serial | default(3)) }}"
   tags: [ui]
   vars:
     hive_ui_build_host: "{{ groups['ui_builder'][0] }}"

@@ -126,6 +126,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/deploy/image", post(deploy_image))
         .route("/v1/fleet-deployments", get(fleet_deployments))
         .route("/v1/builds/:id", get(build_get))
+        .route("/v1/builds/:id/cancel", post(build_cancel))
         .route("/v1/buildcache/:key", get(buildcache_get))
         .route("/v1/build/frameworks", get(build_frameworks))
         .route("/v1/nodes/announce", post(node_announce))
@@ -148,6 +149,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             put(project_cron_enabled_put),
         )
         .route("/v1/projects/:project/git-ci", put(project_git_ci_put))
+        .route(
+            "/v1/projects/:project/browser-db",
+            put(project_browser_db_put).delete(project_browser_db_delete),
+        )
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route(
@@ -701,6 +706,69 @@ async fn project_functions_put(
     // toggle silently never saved. The runtime `order_candidates` already honors
     // this flag; the setting should reflect what the operator selected.)
     c.projects.set_functions(&project, f);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `PUT /v1/projects/:project/browser-db` — the Storages page's "Deploy a
+/// replicated SQLite database" flow. Writes ONLY the dashboard-managed
+/// settings mirror (`ProjectSettings::browser_db`); it does not touch
+/// fluid.json/the repo and does not itself rebuild anything — same
+/// "settings apply going forward" contract as `project_functions_put`'s
+/// vcpus/memory/gpu fields (see that handler's plan-limit comment). The
+/// caller is expected to follow a successful save with the existing
+/// `/v1/projects/:project/redeploy` so the block actually lands in a Ready
+/// deployment's manifest (`git.rs`'s merge, right next to the `inference`
+/// sync).
+async fn project_browser_db_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(policy): Json<fluid_core::BrowserDbPolicy>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // Validate table identifiers at save time so a typo 400s right here.
+    // `BrowserDbPolicy::resolve` clamps/drops invalid entries instead of
+    // failing (correct for a REPLICATED spec another binary might read with
+    // stricter/looser rules), which would otherwise hide a fresh typo from
+    // the person who just typed it into this form.
+    for t in &policy.schema {
+        let valid_name = {
+            let mut chars = t.name.chars();
+            matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+                && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        };
+        if !valid_name {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("table name {:?} must match [A-Za-z_][A-Za-z0-9_]*", t.name),
+            ));
+        }
+        if t.ddl.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("table {:?} needs a CREATE TABLE IF NOT EXISTS ddl", t.name),
+            ));
+        }
+    }
+    c.projects.set_browser_db(&project, Some(policy));
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `DELETE /v1/projects/:project/browser-db` — clears the dashboard-managed
+/// opt-in. Like the PUT side, this alone changes nothing already deployed;
+/// it stops the NEXT deploy from carrying the block (unless fluid.json
+/// itself still declares one, which always wins).
+async fn project_browser_db_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_browser_db(&project, None);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
@@ -2070,26 +2138,96 @@ pub(crate) async fn build_get(
     // Team-scoped — this route previously had no ownership check at all, so
     // any caller (even unauthenticated, since GET bypasses the JWT gate) who
     // knew/guessed a build id could read another tenant's full build log.
-    // The project row is node-local (never gossiped) and Build carries no
-    // tenant tag, so `team_of` alone 404'd a member's OWN build log on any node
-    // whose row was GC'd/never synced. Fall back to the build's deployment
-    // record tenant tag (local gw record or gossiped peer copy) — the same
-    // authority `deployment_build`/`dep_list` trust.
-    let owns = norm(&c.projects.team_of(&b.project)) == norm(&t)
+    if !build_owned_by(&c, &b, &t) {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    Ok(Json(json!(b)))
+}
+
+/// Whether tenant `t` owns build `b` — the project row is node-local (never
+/// gossiped) and `Build` carries no tenant tag of its own, so `team_of` alone
+/// 404'd a member's OWN build log/cancel on any node whose row was GC'd/never
+/// synced. Fall back to the build's deployment record tenant tag (local `gw`
+/// record or gossiped peer copy) — the same authority `deployment_build`/
+/// `dep_list` trust. Shared by `build_get` and `build_cancel`.
+fn build_owned_by(c: &Arc<CloudState>, b: &crate::git::Build, t: &str) -> bool {
+    norm(&c.projects.team_of(&b.project)) == norm(t)
         || b.deployment_id.as_deref().is_some_and(|did| {
             c.gw.deployment_records()
                 .iter()
-                .any(|r| r.id == did && record_tenant(&r.tenant) == norm(&t))
+                .any(|r| r.id == did && record_tenant(&r.tenant) == norm(t))
                 || c.peer_deployments
                     .read()
                     .values()
                     .flatten()
-                    .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(&t))
-        });
-    if !owns {
+                    .any(|d| d.id.as_str() == did && record_tenant(&d.tenant) == norm(t))
+        })
+}
+
+/// Cancel an in-flight build: stop the ACTUAL OS process (git clone / npm
+/// install / npm run build / a remote fanout target's own build) — not just
+/// relabel the record while the process keeps running — and mark it
+/// `Cancelled`. A build already in a terminal state is a no-op (idempotent:
+/// returns the current record rather than erroring, so a UI double-click or a
+/// race with the build finishing naturally is harmless). Not found locally →
+/// best-effort proxy to the current control-plane leader, mirroring
+/// `build_get`'s read fallback (mutations aren't leader-forwarded for an id
+/// this node has never heard of; the leader is the next-most-likely holder).
+pub(crate) async fn build_cancel(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let Some(b) = c.builds.get(&id) else {
+        if !c.is_control_plane_leader() {
+            let leader = c.control_plane_leader();
+            if let Some(v) =
+                post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
+            {
+                return Ok(Json(v));
+            }
+        }
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if !build_owned_by(&c, &b, &t) {
         return Err(StatusCode::NOT_FOUND);
     }
-    Ok(Json(json!(b)))
+    if !matches!(
+        b.state,
+        fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+    ) {
+        // Already terminal (ready/error/already-cancelled) — nothing to stop.
+        return Ok(Json(json!(b)));
+    }
+    c.builds.update(&id, |b| {
+        b.state = fluid_core::DeployState::Cancelled;
+        b.finished_ms = Some(now_ms());
+        b.lines.push(crate::git::LogLine {
+            ts_ms: now_ms(),
+            line: "Build cancelled by user.".into(),
+        });
+    });
+    crate::persist::persist(&c);
+    // Kill the real process (local process group and/or a mirrored remote
+    // build's own host) — see `BuildCancelRegistry::cancel`. The record above
+    // is already updated regardless of how this resolves, so the dashboard
+    // reflects the cancel immediately even if the kill itself is still racing
+    // the build's own natural completion.
+    c.build_cancels.cancel(&c, &id).await;
+    let ev = c.event(&c.region, "CANCEL", &b.project, "/", 200, "deploy", "build cancelled by user");
+    c.record(ev);
+    crate::webhooks::dispatch(
+        &c.webhooks,
+        &b.project,
+        // Matches `webhooks::ALL_EVENTS`'s catalogued spelling exactly — a
+        // webhook's subscription list is built from that catalog, so any
+        // other spelling here would silently match zero subscribers forever.
+        "deployment.canceled",
+        json!({ "id": id, "project": b.project }),
+    );
+    Ok(Json(json!(c.builds.get(&id).unwrap_or(b))))
 }
 
 /// The build behind a deployment — its status, timing, and full log lines — so the
@@ -4710,7 +4848,14 @@ pub(crate) async fn nodes(
     }
     // Every other signed-in user gets the sanitized topology: enough to render
     // the network page (mesh map, health, capacity totals), none of the
-    // mesh-internal addressing (iroh_addr/peer_id/public_ip/public_url).
+    // mesh-internal addressing (iroh_addr/peer_id/public_ip/public_url/
+    // relay_url/guardian_iroh_addr — all dialable endpoints, held back from
+    // non-operators same as public_url). GPU capacity fields are NOT
+    // addresses (they're the same class of hardware descriptor as
+    // cpu_cores/mem_total_mb/disk_total_gb, already included below) — omitting
+    // them used to blank the regions map's GPU coloring/badge
+    // (`isGpuNode`/`nodeColor` in ui/app/regions/page.tsx) for every node, for
+    // every non-operator signed-in viewer, fleet-wide.
     let sanitized: Vec<Value> = list
         .into_iter()
         .map(|n| {
@@ -4729,6 +4874,9 @@ pub(crate) async fn nodes(
                 "cpu_cores": n.cpu_cores,
                 "mem_total_mb": n.mem_total_mb,
                 "disk_total_gb": n.disk_total_gb,
+                "gpu_count": n.gpu_count,
+                "gpu_model": n.gpu_model,
+                "gpu_vram_mb": n.gpu_vram_mb,
             })
         })
         .collect();

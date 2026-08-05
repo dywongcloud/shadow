@@ -378,6 +378,19 @@ pub struct FunctionConfig {
     /// view — that metadata is what admission ties a donor's digest to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_artifact: Option<BrowserArtifact>,
+    /// Why this function is NOT browser-servable, stamped by the build pipeline
+    /// whenever it evaluated the function and declined to emit an artifact — an
+    /// unsupported runtime, no handler-shaped entry on disk, or the exact
+    /// `browser_artifacts::bundle` rejection an AUTO-detected candidate hit.
+    /// SERVER-DERIVED ONLY: the build clears any tenant-supplied value before
+    /// evaluating, so a fluid.json cannot inject a fake reason. Mutually
+    /// exclusive with [`FunctionConfig::browser_artifact`] (eligible functions
+    /// carry a descriptor and no reason). This is what turns "the picker just
+    /// doesn't list my function" into a sentence naming the cause: it rides the
+    /// manifest into `DeployRecord` and out through
+    /// [`DeploymentInfo::browser_ineligible`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_ineligible_reason: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -452,6 +465,7 @@ impl Default for FunctionConfig {
             gpu: false,
             browser: None,
             browser_artifact: None,
+            browser_ineligible_reason: None,
         }
     }
 }
@@ -680,6 +694,21 @@ pub struct BrowserFunctionRef {
     pub name: String,
     #[serde(flatten)]
     pub artifact: BrowserArtifact,
+}
+
+/// The NEGATIVE half of [`BrowserFunctionRef`]: one function the build
+/// evaluated for browser eligibility and declined, with the reason. Carried on
+/// [`DeploymentInfo::browser_ineligible`] for exactly the same reason its
+/// positive twin is carried — the picker (and any operator view) resolves it
+/// for deployments hosted on other nodes — and because a browser-eligibility
+/// decision that only exists in a build log is invisible to the person who
+/// asked for it. Absent from a deployment built before the build pipeline
+/// evaluated eligibility at all, which is itself a distinguishable state (no
+/// artifact AND no reason ⇒ never evaluated ⇒ redeploy).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserIneligibility {
+    pub function: String,
+    pub reason: String,
 }
 
 /// The platform browser host-op registry: op id → canonical ABI string. This
@@ -1897,6 +1926,10 @@ pub enum DeployState {
     Building,
     Ready,
     Error,
+    /// The in-flight build was stopped by an explicit user cancel
+    /// (`POST /v1/builds/:id/cancel`) — distinct from `Error` (a build the
+    /// platform tried and failed) so the dashboard can tell the two apart.
+    Cancelled,
 }
 impl Default for DeployState {
     fn default() -> Self {
@@ -2200,6 +2233,15 @@ pub struct DeploymentInfo {
     /// browser opt-in and for peers running older binaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub browser_functions: Vec<BrowserFunctionRef>,
+    /// Functions the build EVALUATED for browser eligibility and declined, each
+    /// with the reason ([`BrowserIneligibility`]). Replicated alongside
+    /// `browser_functions` because the two are one answer: a deployment absent
+    /// from the run-node picker is either not ready, listed here with a cause,
+    /// or — carrying neither an artifact nor a reason — was built before
+    /// eligibility was evaluated and needs a redeploy. Empty for peers running
+    /// older binaries, which is the "never evaluated" state by construction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub browser_ineligible: Vec<BrowserIneligibility>,
     /// The deployment's browser-database opt-in block, VERBATIM from the
     /// manifest (raw policy — resolved at the point of use via
     /// [`BrowserDbPolicy::resolve`], the `InferenceSpec` raw-spec-replicated
