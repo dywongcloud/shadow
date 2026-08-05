@@ -453,18 +453,28 @@ fn retained_source_write_path(project: &str) -> PathBuf {
     deploy_root().join(format!("{}.src.zip", checkout_tag(project)))
 }
 
-/// Find a conventional browser-handler file for a function that did NOT opt in
-/// via fluid.json — the entry point for AUTOMATIC browser eligibility.
+/// Find a browser-handler file for a function that did NOT opt in via
+/// fluid.json — the entry point for AUTOMATIC browser eligibility.
 ///
-/// Only fixed, function-scoped-then-generic names are probed, first match
-/// wins: `<fn>.browser.{js,mjs,cjs}` (unambiguous per function), then a root
-/// `browser.{js,mjs,cjs}` (the single-function convention). The server's own
-/// `start_cmd` entry is deliberately NEVER used — it is a long-running server,
-/// not a request→response handler, so reusing it would ship the wrong code.
-/// The function name is only used to build a bare filename (rejected if it
-/// contains anything but `[a-z0-9._-]`), and `bundle()`'s own `resolve_entry`
-/// re-checks the final path stays inside the deployment root, so this cannot
-/// be walked outside `build_dir`.
+/// Fixed, function-scoped-then-generic names are probed, first existing match
+/// wins: the explicit `<fn>.browser.{js,mjs,cjs}` / `browser.{js,mjs,cjs}`
+/// convention first, then the function's OWN plausible entry files
+/// (`<fn>.handler.*`, `<fn>.*`, then generic `handler.*` / `index.*` /
+/// `main.*`) — so a function whose ordinary handler file exports
+/// `module.exports` is served in browsers with zero config, not just one that
+/// ships a dedicated `.browser.js`. What makes probing a function's own entry
+/// safe (rather than "shipping the wrong code" from a long-running server) is
+/// `bundle()`'s BUILD-TIME gate: the forbidden-surface scan drops any entry
+/// that uses `require`/`import`/`process`/Node APIs, and `handler_export_present`
+/// drops any entry that never assigns `module.exports`/`exports.handler` — a
+/// server's entry hits both, so it is filtered, never bundled. A synthesized
+/// candidate that fails to bundle is skipped SILENTLY (the function just serves
+/// the normal fleet path); only an explicit fluid.json opt-in fails the build.
+/// The `start_cmd` argv itself is still never parsed for an entry (it may be
+/// `next start`/`npm start` with no JS file at all); the file names above are
+/// probed on disk instead. The function name only builds a bare filename
+/// (rejected unless `[a-z0-9._-]`), and `bundle()`'s `resolve_entry` re-checks
+/// the final path stays inside the deployment root — no walk outside `build_dir`.
 fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     let mut candidates: Vec<String> = Vec::new();
     let safe_name = fn_name
@@ -478,6 +488,22 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
     }
     for ext in ["js", "mjs", "cjs"] {
         candidates.push(format!("browser.{ext}"));
+    }
+    // The function's own plausible handler files, most-specific first. Each is
+    // still gated by bundle()'s forbidden-surface + handler-export checks, so a
+    // matched-but-ineligible file (a server entry) is skipped, not shipped.
+    if safe_name {
+        for ext in ["js", "mjs", "cjs"] {
+            candidates.push(format!("{fn_name}.handler.{ext}"));
+        }
+        for ext in ["js", "mjs", "cjs"] {
+            candidates.push(format!("{fn_name}.{ext}"));
+        }
+    }
+    for stem in ["handler", "index", "main"] {
+        for ext in ["js", "mjs", "cjs"] {
+            candidates.push(format!("{stem}.{ext}"));
+        }
     }
     candidates
         .into_iter()
@@ -1640,18 +1666,22 @@ async fn run_build(
     // can-run-in-a-browser state this contract exists to remove. Deliberately
     // NOT packed into the deliver_build ext4: the artifact executes in
     // donors' browsers, not in the microVM, and carries no env/secrets.
-    // AUTOMATIC browser eligibility (no fluid.json opt-in required): a JS/Bun
-    // function that ships a conventional browser-handler file is served in
-    // browsers automatically. The platform cannot INFER a handler from a
-    // server function's `start_cmd` (that entry is the long-running server, a
-    // different contract from the request→response browser handler — see
-    // BrowserPolicy.entry), so "automatic" means "we found a handler file by
-    // convention", never "we guessed the server's entry". Container/python/
-    // go/command runtimes are excluded by construction. Crucially, a
-    // SYNTHESIZED policy that then fails to bundle is SKIPPED silently (the
-    // function just serves the normal fleet path) — only an EXPLICIT
-    // fluid.json opt-in still fails the build loudly, because only there did
-    // the tenant assert the function IS browser-eligible.
+    // AUTOMATIC browser eligibility (no fluid.json opt-in required): any JS/Bun
+    // function whose own handler file exports `module.exports` is served in
+    // browsers automatically — `infer_browser_entry` probes the `.browser.js`
+    // convention AND the function's ordinary entry files (`<fn>.js`,
+    // `handler.js`, `index.js`, …). "Automatic" no longer means "only a
+    // dedicated .browser.js": it means "we found a handler-SHAPED entry that
+    // survives the build gate". The `start_cmd` argv is still never parsed for
+    // an entry (it may be `next start`/`npm start` with no JS file), and a
+    // long-running SERVER entry is not shipped by accident — bundle()'s
+    // forbidden-surface scan (require/import/process/Node APIs) and its new
+    // handler-export check filter it out. Container/python/go/command runtimes
+    // are excluded by construction. Crucially, a SYNTHESIZED policy that then
+    // fails to bundle is SKIPPED silently (the function just serves the normal
+    // fleet path) — only an EXPLICIT fluid.json opt-in still fails the build
+    // loudly, because only there did the tenant assert the function IS
+    // browser-eligible.
     let mut auto_browser: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !build_failed {
         for f in manifest.functions.iter_mut() {

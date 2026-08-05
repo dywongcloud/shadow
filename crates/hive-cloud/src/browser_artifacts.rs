@@ -145,6 +145,19 @@ fn contains_token(hay: &str, needle: &str) -> bool {
     false
 }
 
+/// Whether a CommonJS entry assigns a handler the wrapper can resolve —
+/// `module.exports = ...`, `module.exports.handler = ...`, or `exports.handler
+/// = ...`. Mirrors the wrapper's runtime resolution (`typeof module.exports ===
+/// "function" ? module.exports : module.exports.handler`), scanned statically
+/// so a server/library/bare-script entry that never touches `module.exports`
+/// is filtered before it can ship. A plain substring is enough: any reference
+/// to `module.exports` (whole-object or `.handler`) means the file participates
+/// in the CommonJS export the wrapper reads; a bare `exports.handler` covers
+/// the aliased form the wrapper also accepts.
+fn handler_export_present(src: &str) -> bool {
+    src.contains("module.exports") || src.contains("exports.handler")
+}
+
 /// Every static `import ...` / `export ...` module form. Matched line-wise so
 /// the denial message can name the exact line.
 fn module_syntax_lines(source: &str) -> Vec<usize> {
@@ -311,6 +324,23 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
                 rejections.push(format!("{:?}: {}", token.needle, token.reason));
             }
         }
+    }
+    // A browser artifact MUST resolve to a request→response handler at runtime:
+    // the wrapper below assigns `module.exports`/`exports.handler` and THROWS if
+    // it is not a function. Verify that export exists STATICALLY here so a
+    // non-handler entry (a long-running server, a library, a bare script) is
+    // caught at build — an AUTO-detected candidate is then skipped silently and
+    // an EXPLICIT opt-in fails the build loudly, instead of shipping bytes that
+    // throw in every donor's browser. This is what makes probing a function's
+    // own entry (not just a `.browser.js` convention file) safe: a server's
+    // entry never assigns module.exports, so it is filtered here.
+    if !handler_export_present(&user) {
+        rejections.push(
+            "defines no handler export — assign the request→response handler to `module.exports` \
+             (or `exports.handler`); an entry that exports none is a server/library, not a browser \
+             handler"
+                .to_string(),
+        );
     }
     if !rejections.is_empty() {
         return Err(format!(

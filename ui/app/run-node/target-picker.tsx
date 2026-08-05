@@ -68,13 +68,16 @@ export function TargetPicker({
   if (targets.length === 0) {
     return (
       <div className="rounded-md border border-dashed border-border-strong p-3 text-xs leading-relaxed text-secondary">
-        <p className="font-medium text-fg">No browser-capable functions in this team yet.</p>
+        <p className="font-medium text-fg">No browser-eligible functions in this team yet.</p>
         <p className="mt-1">
-          Only functions that opt in with <code className="font-mono">functions[].browser</code> in{" "}
-          <code className="font-mono">fluid.json</code>{" "}and survive the build&apos;s eligibility pass can be served
-          from a browser node. Deploy one, and it shows up here once it&apos;s ready.
+          A function runs here <span className="font-medium text-fg">automatically</span> once it&apos;s
+          browser-eligible — a JS or Bun request→response handler that exports{" "}
+          <code className="font-mono">module.exports</code> (or ships a <code className="font-mono">browser.js</code>{" "}
+          handler) and uses no Node/Bun-only APIs. No <code className="font-mono">fluid.json</code> opt-in is
+          required. Containers, long-running servers (Next.js, Express), TypeScript, and Python/Go functions
+          can&apos;t run in a browser and are skipped.
           {excludedCount > 0 &&
-            ` (${excludedCount} deployment${excludedCount === 1 ? "" : "s"} not shown — not ready or no browser-enabled function.)`}
+            ` (${excludedCount} deployment${excludedCount === 1 ? "" : "s"} not shown — not ready, or not browser-eligible.)`}
         </p>
       </div>
     );
@@ -122,8 +125,8 @@ export function TargetPicker({
       </div>
       {excludedCount > 0 && (
         <p className="mt-2 text-[11px] text-muted">
-          {excludedCount} deployment{excludedCount === 1 ? "" : "s"} not shown — not ready or no browser-enabled
-          function.
+          {excludedCount} deployment{excludedCount === 1 ? "" : "s"} not shown — not ready, or not browser-eligible
+          (container, long-running server, TypeScript, or uses Node/Bun APIs).
         </p>
       )}
     </div>
