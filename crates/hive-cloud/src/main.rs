@@ -3891,12 +3891,24 @@ fn spawn_memory_pressure_alarm() {
 }
 
 /// How fresh a peer's gossiped `last_seen_ms` must be to count as independent
-/// proof of liveness in the health loop below. Gossip announces every 3-4s, so
-/// this is ~3 missed announces — tight enough that a genuinely silent node is
-/// not covered by it, loose enough to survive ordinary jitter. Deliberately far
-/// below `NodeRegistry::nodes()`'s own 30s staleness drop, which remains the
-/// mechanism that actually removes a dead node from service.
-const GOSSIP_ALIVE_MS: u64 = 12_000;
+/// proof of liveness in the health loop below.
+///
+/// Sized against MEASURED behaviour, not the nominal announce cadence. Gossip
+/// announces every 3-4s, but on the live fleet delivery is itself lossy: peers
+/// that were provably up (answering HTTP on their public IP) showed last_seen
+/// ages of 11-24s. A tighter bound (12s was tried first) therefore fails to
+/// protect exactly the nodes this guard exists for, which is how a majority of
+/// the fleet stayed grey after the first attempt.
+///
+/// 25s sits just under `NodeRegistry::nodes()`'s own 30s staleness drop, which
+/// is the mechanism that ACTUALLY removes a dead node from service — a silent
+/// node disappears from the registry entirely and stops being served regardless
+/// of this flag. So the practical rule becomes: still gossiping ⇒ still served;
+/// gone quiet ⇒ aged out. The probe's verdict is retained for the narrow 25-30s
+/// band and, more importantly, for its real purpose — diagnosing mesh
+/// reachability — rather than silently withdrawing live nodes from client DNS,
+/// which clients reach directly by public IP and never through the mesh.
+const GOSSIP_ALIVE_MS: u64 = 25_000;
 
 fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
