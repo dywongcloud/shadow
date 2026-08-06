@@ -406,6 +406,51 @@ export class BrowserNode {
         }
     }
     /**
+     * Sign one peer-mesh signalling envelope (bn-browser-peer-webrtc-mesh)
+     * with this node's OWN ed25519 secret key, returning 128 hex chars.
+     *
+     * `context` is the canonical binding string built by
+     * `www/peer-mesh.js::envelopeContext` — it carries BOTH endpoint ids, the
+     * session id, a timestamp and the DTLS certificate FINGERPRINT of the
+     * offer/answer being signalled. That last field is the whole point: the
+     * WebRTC lane's DTLS identity is an ephemeral, self-signed certificate
+     * with no relationship whatsoever to the iroh identity every capability on
+     * this platform is keyed on, so without a signature binding the two, the
+     * signalling relay (a fleet mailbox — an authenticated surface, but still
+     * a THIRD party to the peer link) could substitute its own fingerprint and
+     * sit in the middle of a "direct" connection. With it, a peer sets a
+     * remote description only after verifying that the exact fingerprint in
+     * the SDP was signed by the ed25519 key of the EndpointId the server
+     * admitted, and the browser's own DTLS stack then refuses any certificate
+     * that does not match it.
+     *
+     * Domain-separated (`hive-browser-webrtc-v1\0`) so a mesh signature can
+     * never be replayed as an admission proof-of-possession (which signs the
+     * bare, undomained `"{endpoint_id}:{challenge_ms}"`), nor the reverse.
+     * @param {string} context
+     * @returns {string}
+     */
+    signMeshEnvelope(context) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const ptr0 = passStringToWasm0(context, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+            const len0 = WASM_VECTOR_LEN;
+            const ret = wasm.browsernode_signMeshEnvelope(this.__wbg_ptr, ptr0, len0);
+            var ptr2 = ret[0];
+            var len2 = ret[1];
+            if (ret[3]) {
+                ptr2 = 0; len2 = 0;
+                throw takeFromExternrefTable0(ret[2]);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_free(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * One JSON blob of everything the status UI needs.
      * @returns {string}
      */
@@ -557,6 +602,36 @@ export function blake3Hex(bytes) {
 
 export function on_load() {
     wasm.on_load();
+}
+
+/**
+ * Verify a peer's signalling envelope against the EndpointId the SERVER
+ * admitted (bn-browser-peer-webrtc-mesh). Free function, not a method: it
+ * needs no local key, no live endpoint and no grant — it answers exactly one
+ * question ("did the holder of this ed25519 identity sign this context"), and
+ * binding it to node state would only invite callers to believe it means more
+ * than that.
+ *
+ * Returns `false` for a valid-shaped-but-wrong signature and THROWS for a
+ * malformed id/signature/context, so a caller cannot conflate "this peer is
+ * lying" with "I built the call wrong".
+ * @param {string} endpoint_id
+ * @param {string} context
+ * @param {string} signature_hex
+ * @returns {boolean}
+ */
+export function verifyMeshEnvelope(endpoint_id, context, signature_hex) {
+    const ptr0 = passStringToWasm0(endpoint_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(context, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(signature_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.verifyMeshEnvelope(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[2]) {
+        throw takeFromExternrefTable0(ret[1]);
+    }
+    return ret[0] !== 0;
 }
 
 /**
@@ -1185,42 +1260,42 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1701, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 1697, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h298a6bff5b0691a5);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3418, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [Externref], shim_idx: 3414, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0908a51f6b61a600);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1101, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 1097, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__ha389886adaf6862d);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 2204, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 2200, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h20d1c682fa714cd2);
             return ret;
         },
         __wbindgen_cast_0000000000000005: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1631, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1627, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__hac8c55c6b76aac63);
             return ret;
         },
         __wbindgen_cast_0000000000000006: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1847, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1843, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h0d78351b17b6d108);
             return ret;
         },
         __wbindgen_cast_0000000000000007: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1878, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 1874, ret: Unit, inner_ret: Some(Unit) }, mutable: false }) -> Externref`.
             const ret = makeClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__ha40077c21a1fc6d0);
             return ret;
         },
         __wbindgen_cast_0000000000000008: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3391, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { owned: true, function: Function { arguments: [], shim_idx: 3387, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm_bindgen__convert__closures_____invoke__h100cfb892b577986);
             return ret;
         },

@@ -1201,8 +1201,9 @@ fn validate_request(
         // admission with no serve lane, exactly like an explicit "serve
         // nothing" — and starts serving the moment something eligible lands,
         // on the next renewal, with no restart.
-        db_deployment = crate::browser_db::auto_db_deployment_for_tenant(cloud, &tenant)
-            .unwrap_or_default();
+        db_deployment =
+            crate::browser_db::auto_db_deployment_for_tenant(cloud, &tenant, &endpoint_id)
+                .unwrap_or_default();
         crate::browser_artifacts::eligible_for_tenant(cloud, &tenant)
             .into_iter()
             .map(|e| ServeGrant {

@@ -190,7 +190,11 @@ pub fn db_descriptor_for(
 /// Within the single opted-in project the newest Ready deployment wins (its
 /// spec is the current one). Same two replicated sources and the same tenant
 /// gate as [`db_descriptor_for`].
-pub fn auto_db_deployment_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> Option<String> {
+pub fn auto_db_deployment_for_tenant(
+    cloud: &Arc<CloudState>,
+    tenant: &str,
+    endpoint_id: &str,
+) -> Option<String> {
     // project -> (created_at_ms, deployment id) of the newest Ready deployment
     // carrying a block.
     let mut by_project: BTreeMap<String, (u64, String)> = BTreeMap::new();
@@ -224,10 +228,37 @@ pub fn auto_db_deployment_for_tenant(cloud: &Arc<CloudState>, tenant: &str) -> O
             note(info.project.clone(), info.created_at_ms, info.id.0.clone());
         }
     }
-    if by_project.len() != 1 {
+    // Nothing to replicate is the only honest "no grant" — the tenant has no
+    // project carrying a browser_db block.
+    if by_project.is_empty() {
         return None;
     }
-    by_project.into_values().next().map(|(_, id)| id)
+    // With MORE than one candidate this used to refuse outright (`len() != 1 ->
+    // None`), on the reasoning that a browser holds a single replica so the
+    // picker must choose. In practice that meant a browser node on a tenant with
+    // two or more browser_db projects replicated NOTHING AT ALL, permanently and
+    // silently — the common case, and the opposite of the intent.
+    //
+    // A single replica per browser is a real constraint, but it argues for
+    // CHOOSING deterministically, not for declining. Rendezvous-hash the
+    // candidate projects by the browser's own proven endpoint id, the same
+    // FNV-over-sorted-set rule container placement and the inference coordinator
+    // already use (`lease::hrw_owner`):
+    //   * deterministic — every node computes the same answer for a given
+    //     browser with no coordinator and no election;
+    //   * stable — a browser keeps its project across renewals, so its OPFS
+    //     replica stays warm instead of being re-seeded each lease tick;
+    //   * self-sharding — distinct browsers hash to distinct projects, so N
+    //     browser nodes spread across the tenant's databases rather than all
+    //     piling onto whichever one happened to be alphabetically first;
+    //   * minimal churn — removing a project moves only the browsers that held
+    //     it, which is the property rendezvous hashing exists for.
+    //
+    // BTreeMap keys are already sorted, which is what makes the input set
+    // order-independent across nodes.
+    let projects: Vec<String> = by_project.keys().cloned().collect();
+    let chosen = crate::lease::hrw_owner(endpoint_id, &projects)?;
+    by_project.remove(&chosen).map(|(_, id)| id)
 }
 
 /// What one sync round is allowed to do, resolved fresh per request from the

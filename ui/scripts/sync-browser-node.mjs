@@ -30,9 +30,24 @@ for (const f of readdirSync(srcPkg)) {
 }
 // Worker-loadable ES modules the SharedWorker imports directly (identity for
 // both, plus the browser-worker-quickjs-runtime lane: the canonical policy
-// digest module and the worker-native QuickJS runtime). These are hand-written
-// sources in www/, not build artifacts — pkg/ alone is not enough.
-for (const f of ["identity.js", "artifact-policy.js", "worker-function-runtime.js"]) {
+// digest module and the worker-native QuickJS runtime, and the browser-to-
+// browser WebRTC mesh lane). These are hand-written sources in www/, not build
+// artifacts — pkg/ alone is not enough.
+//
+// peer-mesh*.js are load-bearing here: run-node-worker.js resolves them with a
+// RUNTIME dynamic import against its own deployed origin, so omitting them from
+// this list does not fail any build — it 404s in the browser at the moment the
+// mesh lane starts, on the fleet only. That is exactly what happened: both files
+// existed in crates/hive-browser/www/ and neither was ever copied to
+// ui/public/browser-node/, so the deployed worker imported a path that was never
+// published.
+for (const f of [
+  "identity.js",
+  "artifact-policy.js",
+  "worker-function-runtime.js",
+  "peer-mesh.js",
+  "peer-mesh-agent.js",
+]) {
   const src = join(srcRoot, f);
   if (existsSync(src)) {
     copyFileSync(src, join(destRoot, f));

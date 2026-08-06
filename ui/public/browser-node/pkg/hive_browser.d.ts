@@ -179,6 +179,30 @@ export class BrowserNode {
      */
     signAdmission(challenge_ms: string): string;
     /**
+     * Sign one peer-mesh signalling envelope (bn-browser-peer-webrtc-mesh)
+     * with this node's OWN ed25519 secret key, returning 128 hex chars.
+     *
+     * `context` is the canonical binding string built by
+     * `www/peer-mesh.js::envelopeContext` — it carries BOTH endpoint ids, the
+     * session id, a timestamp and the DTLS certificate FINGERPRINT of the
+     * offer/answer being signalled. That last field is the whole point: the
+     * WebRTC lane's DTLS identity is an ephemeral, self-signed certificate
+     * with no relationship whatsoever to the iroh identity every capability on
+     * this platform is keyed on, so without a signature binding the two, the
+     * signalling relay (a fleet mailbox — an authenticated surface, but still
+     * a THIRD party to the peer link) could substitute its own fingerprint and
+     * sit in the middle of a "direct" connection. With it, a peer sets a
+     * remote description only after verifying that the exact fingerprint in
+     * the SDP was signed by the ed25519 key of the EndpointId the server
+     * admitted, and the browser's own DTLS stack then refuses any certificate
+     * that does not match it.
+     *
+     * Domain-separated (`hive-browser-webrtc-v1\0`) so a mesh signature can
+     * never be replayed as an admission proof-of-possession (which signs the
+     * bare, undomained `"{endpoint_id}:{challenge_ms}"`), nor the reverse.
+     */
+    signMeshEnvelope(context: string): string;
+    /**
      * One JSON blob of everything the status UI needs.
      */
     statusJson(): string;
@@ -218,6 +242,20 @@ export class IntoUnderlyingSource {
 export function blake3Hex(bytes: Uint8Array): string;
 
 export function on_load(): void;
+
+/**
+ * Verify a peer's signalling envelope against the EndpointId the SERVER
+ * admitted (bn-browser-peer-webrtc-mesh). Free function, not a method: it
+ * needs no local key, no live endpoint and no grant — it answers exactly one
+ * question ("did the holder of this ed25519 identity sign this context"), and
+ * binding it to node state would only invite callers to believe it means more
+ * than that.
+ *
+ * Returns `false` for a valid-shaped-but-wrong signature and THROWS for a
+ * malformed id/signature/context, so a caller cannot conflate "this peer is
+ * lying" with "I built the call wrong".
+ */
+export function verifyMeshEnvelope(endpoint_id: string, context: string, signature_hex: string): boolean;
 
 /**
  * bn-p2p-version-negotiation (remaining scope, item 3/3: the PWA wasm bundle
@@ -262,8 +300,10 @@ export interface InitOutput {
     readonly browsernode_setCrrSyncHandler: (a: number, b: any) => [number, number];
     readonly browsernode_setInvokeHandler: (a: number, b: any) => [number, number];
     readonly browsernode_signAdmission: (a: number, b: number, c: number) => [number, number];
+    readonly browsernode_signMeshEnvelope: (a: number, b: number, c: number) => [number, number, number, number];
     readonly browsernode_statusJson: (a: number) => [number, number];
     readonly on_load: () => void;
+    readonly verifyMeshEnvelope: (a: number, b: number, c: number, d: number, e: number, f: number) => [number, number, number];
     readonly wasmBundleVersion: () => number;
     readonly __wbg_intounderlyingsource_free: (a: number, b: number) => void;
     readonly intounderlyingsource_cancel: (a: number) => void;
