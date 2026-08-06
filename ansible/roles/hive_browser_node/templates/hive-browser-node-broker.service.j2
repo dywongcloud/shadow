@@ -28,7 +28,7 @@ LoadCredential=internal-token:{{ hive_browser_node_token_file }}
 EnvironmentFile={{ hive_browser_node_env_file }}
 Environment=NODE_ENV=production
 Environment=HOME={{ hive_browser_node_state_dir }}
-ExecStart=/usr/local/bin/node {{ hive_browser_node_root }}/bin/hive-browser-node-broker.mjs
+ExecStart={{ hive_browser_node_node_bin }} {{ hive_browser_node_root }}/bin/hive-browser-node-broker.mjs
 Restart=always
 RestartSec=5
 

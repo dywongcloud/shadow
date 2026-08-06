@@ -108,6 +108,19 @@
         executable: /bin/bash
       register: bn_presence
       changed_when: false
+      # Presence is published by the browser and then REPLICATED; the node this
+      # loopback proxy happens to reach need not have observed it yet. A
+      # single-shot read therefore fails on a node that is genuinely online and
+      # serving — witnessed on the fc-frankfurt canary, whose /healthz already
+      # reported lifecycle=online, admission=granted, serving=true with presence
+      # published 3.8s earlier. Poll instead of sampling once.
+      #
+      # failed_when is disabled so an exhausted retry falls through to the assert
+      # below, which explains what to check; the bare task failure would not.
+      retries: 12
+      delay: 10
+      until: (bn_health.json.endpoint_id | default('')) in (bn_presence.stdout | default(''))
+      failed_when: false
 
     - name: Assert this node's endpoint appears in fleet presence
       ansible.builtin.assert:

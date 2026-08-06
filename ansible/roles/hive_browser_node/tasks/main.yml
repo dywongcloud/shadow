@@ -261,6 +261,48 @@
 # ---------------------------------------------------------------------------
 # 5. Units
 # ---------------------------------------------------------------------------
+# systemd's ExecStart needs an ABSOLUTE path (no PATH lookup, no `env`), and the
+# node binary is NOT at the same place on every fleet host: measured live it is
+# /usr/local/bin/node on bkk but /usr/bin/node on sj, va, sp and fr. Hardcoding
+# /usr/local/bin/node made the broker fail 203/EXEC and crash-loop on 4 of the 5
+# rostered hosts (witnessed: restart counter 29 on fc-frankfurt), so discover it
+# per host instead.
+#
+# Uses `shell`, not `command`: `command -v` is a SHELL BUILTIN and the command
+# module execs directly with no shell, so it cannot resolve it. That mistake
+# reported "node was not found" on fc-bangkok, which demonstrably has node at
+# /usr/local/bin/node — a false negative that would have blocked a host with a
+# perfectly good install. The explicit candidate paths are the fallback for a
+# login-shell PATH that does not include node's directory.
+- name: Locate the node binary
+  ansible.builtin.shell: |
+    set -u
+    p="$(command -v node 2>/dev/null || true)"
+    if [ -z "$p" ]; then
+      for c in /usr/local/bin/node /usr/bin/node /opt/node/bin/node; do
+        [ -x "$c" ] && { p="$c"; break; }
+      done
+    fi
+    printf '%s' "$p"
+  args:
+    executable: /bin/bash
+  register: hive_browser_node_node_which
+  changed_when: false
+  failed_when: false
+
+- name: Require node on the host
+  ansible.builtin.assert:
+    that:
+      - (hive_browser_node_node_which.stdout | default('') | trim) | length > 0
+    fail_msg: >-
+      node was not found on {{ inventory_hostname }}. The browser-node broker is a
+      node script and systemd cannot PATH-resolve it, so an absolute path is
+      required. Install node, then re-run.
+
+- name: Record the resolved node path
+  ansible.builtin.set_fact:
+    hive_browser_node_node_bin: "{{ hive_browser_node_node_which.stdout | trim }}"
+
 - name: Template the broker unit
   ansible.builtin.template:
     src: hive-browser-node-broker.service.j2
