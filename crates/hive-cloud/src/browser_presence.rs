@@ -98,6 +98,38 @@ const NAME_NOUNS: [&str; 32] = [
 /// operator reading `bn-teal-otter-9c1f` off the map can eyeball-match it
 /// against `9c1f…` in the admissions table — and padded from the digest only
 /// for an id too short or too exotic to supply four.
+/// Subject prefix the fleet-hosted headless browser nodes mint under
+/// (`scripts/hive-browser-node-broker.mjs`: `fleet-browser-node:<node>`).
+const FLEET_BROWSER_NODE_SUBJECT_PREFIX: &str = "fleet-browser-node:";
+
+/// Whether this session belongs to one of the FLEET'S OWN headless browser
+/// nodes, which are shard-eligible without being `platform_admin`.
+///
+/// Why this is not a privilege hole: the subject is not client-assertable. That
+/// token is minted only through `admin::mint_token`, which requires
+/// `x-hive-internal == HIVE_INTERNAL_TOKEN` (constant-time compare, FAILS CLOSED
+/// when the token is unconfigured), the broker reads that secret from a
+/// root-only credential file, and the dashboard proxy strips a client-supplied
+/// `x-hive-internal`. So this subject can only be produced by a process already
+/// running as root on a fleet host — an operator, by definition. Anyone able to
+/// forge it already holds the fleet's internal credential and needs no help from
+/// this function.
+///
+/// Why it is NEEDED: shard eligibility was `claims.platform_admin` alone, and the
+/// broker deliberately mints least-privilege (role=member, platform_admin=false —
+/// a hostile mint body asking for `platform_admin:true` is refused). The five
+/// operator-run browser nodes were therefore permanently excluded from
+/// `shard_members`, leaving membership to be whatever human admin tabs happened
+/// to be open. Witnessed on the leader: membership oscillating members=2 -> 1 ->
+/// 0 -> 1 with `under_replicated=65` of 65 fragments, and at members=0,
+/// `unplaced=65 refusals=65` — i.e. dedicated always-on infrastructure existed
+/// and could hold none of it, which is the opposite of "always replicate".
+fn is_fleet_browser_node(subject: &str) -> bool {
+    subject
+        .strip_prefix(FLEET_BROWSER_NODE_SUBJECT_PREFIX)
+        .is_some_and(|node| !node.is_empty())
+}
+
 pub fn node_name(endpoint_id: &str) -> String {
     let digest = fluid_core::browser_source_digest(&format!("{NODE_NAME_DOMAIN}{endpoint_id}"));
     let nibble = |range: std::ops::Range<usize>| -> usize {
@@ -538,7 +570,7 @@ async fn upsert_presence(
     // against this backend's own `admin_emails` set (see `admin::mint_token`),
     // so it is not a client assertion either.
     let node_name = node_name(&request.endpoint_id);
-    let shard_eligible = claims.platform_admin;
+    let shard_eligible = claims.platform_admin || is_fleet_browser_node(&claims.sub);
     let record = BrowserPresence {
         endpoint_id: request.endpoint_id,
         tenant,
