@@ -3890,6 +3890,14 @@ fn spawn_memory_pressure_alarm() {
     });
 }
 
+/// How fresh a peer's gossiped `last_seen_ms` must be to count as independent
+/// proof of liveness in the health loop below. Gossip announces every 3-4s, so
+/// this is ~3 missed announces — tight enough that a genuinely silent node is
+/// not covered by it, loose enough to survive ordinary jitter. Deliberately far
+/// below `NodeRegistry::nodes()`'s own 30s staleness drop, which remains the
+/// mechanism that actually removes a dead node from service.
+const GOSSIP_ALIVE_MS: u64 = 12_000;
+
 fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
     let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));
@@ -3909,9 +3917,14 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 continue;
             }
             // Probe set: every OTHER node with a public IP + a resolvable iroh address.
-            let targets: Vec<(String, String, String)> = cloud
-                .registry
-                .nodes()
+            // `last_seen` is captured from the SAME snapshot so the liveness check
+            // below can never disagree with the set actually probed this round.
+            let snapshot = cloud.registry.nodes();
+            let last_seen: std::collections::HashMap<String, u64> = snapshot
+                .iter()
+                .map(|n| (n.id.clone(), n.last_seen_ms))
+                .collect();
+            let targets: Vec<(String, String, String)> = snapshot
                 .into_iter()
                 .filter(|n| !n.is_self && n.public_ip.is_some())
                 .filter_map(|n| Some((n.id.clone(), n.peer_id.clone()?, n.iroh_addr.clone()?)))
@@ -3953,8 +3966,48 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 match write {
                     Some(true) => cloud.registry.set_health(&name, rtt.unwrap_or(0), true),
                     Some(false) => {
-                        tracing::debug!(node = %name, misses = next, "peer marked unhealthy (probe)");
-                        cloud.registry.set_health(&name, 0, false);
+                        // A WEDGED LOCAL PROBER MUST NEVER WITHDRAW A LIVE NODE.
+                        // Gossip announces every 3-4s and `upsert_peer` refreshes
+                        // `last_seen_ms` from it while deliberately NOT touching
+                        // `healthy` ("owned by our OWN direct probes"), so a fresh
+                        // timestamp is INDEPENDENT proof the peer is alive and
+                        // still talking to us — the probe failing against that is a
+                        // local mesh-path artifact (stale cached addr, wedged
+                        // trunk), not a dead peer.
+                        //
+                        // Witnessed in production: after a fleet-wide roll the
+                        // control-plane LEADER marked 10 of 17 nodes unhealthy
+                        // while every one of them kept gossiping, and it did not
+                        // self-recover — and because DNS and placement are driven
+                        // from the leader, those 10 live nodes were withheld from
+                        // client DNS and scheduling until the leader was restarted.
+                        // Two other vantages saw the same fleet as 0 and 1
+                        // unhealthy, so the withdrawing verdict was the wrong one.
+                        //
+                        // A genuinely dead node stops gossiping, so it still leaves
+                        // service on its own: `NodeRegistry::nodes()` drops any peer
+                        // stale >30s, which is the real safety net. This only
+                        // declines the redundant, unsafe half of that.
+                        let alive_by_gossip = last_seen
+                            .get(&name)
+                            .is_some_and(|ms| now_ms().saturating_sub(*ms) < GOSSIP_ALIVE_MS);
+                        if alive_by_gossip {
+                            tracing::warn!(
+                                node = %name,
+                                misses = next,
+                                "mesh probe failing but peer is still gossiping — keeping it healthy \
+                                 (a local probe fault must not withdraw a live node from DNS/placement)"
+                            );
+                        } else {
+                            // WARN, not debug: at RUST_LOG=info the old debug line
+                            // meant the fleet could shrink with no log evidence at all.
+                            tracing::warn!(
+                                node = %name,
+                                misses = next,
+                                "peer marked unhealthy (probe failed AND gossip stale)"
+                            );
+                            cloud.registry.set_health(&name, 0, false);
+                        }
                     }
                     None => {}
                 }
