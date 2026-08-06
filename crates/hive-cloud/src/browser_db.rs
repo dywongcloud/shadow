@@ -48,6 +48,7 @@ use fluid_gateway::BrowserScope;
 use hive_browser_proto::{
     reset as browser_reset, CrrStatus, CrrSyncReply, BROWSER_MAX_CRR_FRAME,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::state::CloudState;
@@ -653,7 +654,18 @@ async fn operator_sync_round(
 
 /// `POST /v1/browser/dbs/sync/:endpoint_id` (operator-only fleet-initiated
 /// pull round, see [`operator_sync_round`]) plus the Storages page's
-/// tenant-scoped live-status read (see [`project_db_status_http`]).
+/// tenant-scoped live-status read (see [`project_db_status_http`]) and the
+/// global-state shard planner's three operator reads (see [`shard_plan`]).
+///
+/// Round-robin-reads declaration (AGENTS.md) for the shard routes: every one
+/// of them is a pure function of state that is ALREADY replicated to every
+/// node — `store_sync::REGISTRY` snapshots and the `browser_presence` /
+/// `browser_admissions` stores — so there is no node-local write for a GET to
+/// miss and no owner to proxy to. Two nodes can disagree for one convergence
+/// window (their store snapshots differ by a gossip round, so their fragment
+/// digests differ); that is the same per-observer caveat as a health verdict,
+/// and the `digest` guard on [`shard_fragment_http`] turns it into a loud 409
+/// instead of a silently wrong byte range.
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     axum::Router::new()
         .route(
@@ -663,6 +675,15 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
         .route(
             "/v1/projects/:project/browser-db/status",
             axum::routing::get(project_db_status_http),
+        )
+        .route("/v1/browser/shards", axum::routing::get(shard_plan_http))
+        .route(
+            "/v1/browser/shards/verify",
+            axum::routing::post(shard_verify_http),
+        )
+        .route(
+            "/v1/browser/shards/fragment/:store/:index",
+            axum::routing::get(shard_fragment_http),
         )
 }
 
@@ -926,7 +947,775 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
         loop {
             reconcile_replicas(&cloud);
             gc_replicas(&cloud);
+            reconcile_shards(&cloud);
             tick.tick().await;
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Global-state shards (bn-browser-state-shards)
+// ---------------------------------------------------------------------------
+//
+// A browser cannot hold the platform's replicated state — so it holds SMALL
+// FRAGMENTS of it, and which fragments is a question every node answers
+// identically with no coordinator.
+//
+// The pieces, in the order they compose:
+//
+//  1. FRAGMENTS. Every entry in `store_sync::REGISTRY` already produces
+//     CANONICAL, deterministic bytes for equal state (that is the contract
+//     the follower's byte-compare change-gate depends on). Those bytes are
+//     the global CRDT/GuardianDB state as this platform actually stores it,
+//     so they are what gets fragmented: each store's snapshot is cut into
+//     `fragment_bytes`-sized pieces on UTF-8 boundaries, and each piece is
+//     content-addressed by BLAKE3 (`fluid_core::browser_source_digest`, the
+//     same digest the browser-artifact pins use — literally
+//     `blake3::hash(bytes)`).
+//
+//  2. ASSIGNMENT. Rendezvous/HRW hashing over the membership set, reusing
+//     `lease::hrw_owner` — the SAME function container placement and the
+//     inference coordinator election already agree through, called
+//     repeatedly against a shrinking pool to get a ranked top-R rather than a
+//     single owner. Placement keys on the fragment KEY (`<store>/<index>`),
+//     never on its digest, so a state change does not move fragments and a
+//     membership change moves only the fragments the departed peer held.
+//
+//  3. BOUND. A hard per-browser byte cap, defaulted SMALL (4 MiB). A
+//     fragment that would push a holder over its cap is a TYPED REFUSAL
+//     naming the holder and the fragment — never a truncated fragment, never
+//     a partial one, and never silently re-homed onto a peer HRW did not
+//     rank (which would trade a visible shortfall for an invisible
+//     order-dependent placement). The shortfall surfaces honestly as
+//     `under_replicated_fragments`. This is `apply_push_batches`' cap
+//     discipline — typed refusal, whole unit rolled back, loud message —
+//     applied to placement instead of to a write.
+//
+//  4. RE-DERIVATION. `shard_plan` holds no state at all: it is recomputed
+//     from the live membership every call, so a join/leave/expiry is picked
+//     up by construction. `membership_digest` exists so a caller can tell
+//     cheaply that the answer it is holding is stale, and
+//     [`reconcile_shards`] logs the transition.
+//
+// TRUST — what is implemented and what is NOT. See [`shard_trust_json`],
+// which returns this same statement to every API caller so it cannot drift
+// away from the code:
+//
+//  * IMPLEMENTED: content-addressed fragments. A fragment's identity IS the
+//    BLAKE3 of its bytes, and [`verify_fragment`] re-checks exact length and
+//    digest before any byte is used. A browser that returns WRONG bytes is
+//    therefore caught deterministically, without trusting the browser at all.
+//
+//  * NOT IMPLEMENTED, AND NOT CLAIMED: this proves nothing about continued
+//    possession. A browser that stores nothing, discards a fragment the
+//    moment it is assigned, or serves it back by re-fetching it from another
+//    node, is indistinguishable from one honestly holding it — until the
+//    moment it is asked and fails. Content addressing bounds CORRUPTION, not
+//    AVAILABILITY. It also gives no confidentiality: a fragment handed to a
+//    browser is readable by that browser.
+//
+//  * WHY THE BAR IS PLATFORM-ADMIN TODAY. Because of the two gaps above,
+//    eligibility is gated on `browser_presence`'s server-derived
+//    `shard_eligible`, set only from a `platform_admin` session. A platform
+//    admin can already read this state through the operator console, so
+//    handing them a fragment of it discloses nothing new. Opening this to
+//    non-admin donors needs BOTH halves the current design lacks:
+//    confidentiality (encrypt fragments at rest on the donor, so a fragment
+//    is opaque to its holder) and a real possession argument.
+//
+//  * THE HONEST OPTIONS for that second half, none of them implemented here,
+//    none to be hand-rolled: (a) accept the weaker guarantee and rely on
+//    over-replication plus audit challenges — cheap, standard, and it only
+//    detects loss after the fact; (b) proof-of-retrievability / provable
+//    data possession (Juels–Kaliski PoR, Ateniese PDP, or a Merkle-tree
+//    challenge–response over erasure-coded fragments), which is what
+//    actually proves continued possession and is a scheme to ADOPT from the
+//    literature with its published parameters, never to invent; (c) do not
+//    ask browsers to prove anything and treat every browser replica as a
+//    cache with replication factor zero — exactly the posture
+//    `docs/browser-db-contract.md` already takes for browser DB replicas.
+//    (c) is the cheapest correct answer and the current default.
+
+/// Per-browser hard ceiling on held fragment bytes. Deliberately SMALL: a
+/// donor's browser tab is not storage, and the whole premise is fragments.
+const DEFAULT_SHARD_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Even an operator typo must not hand a browser tab a gigabyte.
+const SHARD_MAX_BYTES_CEILING: u64 = 64 * 1024 * 1024;
+const DEFAULT_SHARD_FRAGMENT_BYTES: u64 = 64 * 1024;
+const SHARD_FRAGMENT_BYTES_MIN: u64 = 4 * 1024;
+const SHARD_FRAGMENT_BYTES_MAX: u64 = 1024 * 1024;
+const DEFAULT_SHARD_REPLICATION: u64 = 2;
+const SHARD_REPLICATION_MAX: u64 = 8;
+/// Enumeration bound. Reaching it is a typed refusal naming the store it
+/// stopped in, never a silent short table.
+const SHARD_MAX_TOTAL_FRAGMENTS: usize = 100_000;
+/// Refusals are reported bounded + counted, never elided: `refusals_total`
+/// always carries the true number.
+const SHARD_MAX_REPORTED_REFUSALS: usize = 64;
+
+/// One content-addressed fragment of one replicated store's canonical
+/// snapshot. `key` is the PLACEMENT identity (stable across content changes);
+/// `digest` is the CONTENT identity (changes with every write).
+#[derive(Clone, Debug, Serialize)]
+pub struct StateFragment {
+    /// `<store>/<zero-padded index>` — zero-padded so lexical order over keys
+    /// is numeric order over fragments, which is what makes the cap
+    /// accounting below deterministic on every node.
+    pub key: String,
+    pub store: String,
+    pub index: u32,
+    pub bytes: u64,
+    /// BLAKE3, lowercase hex, of exactly these bytes.
+    pub digest: String,
+}
+
+/// A refusal the plan is REPORTING, not hiding. Every one names the fragment,
+/// the holder it applies to (empty when it applies to no holder) and why.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShardRefusal {
+    pub reason: &'static str,
+    pub fragment: String,
+    pub endpoint_id: String,
+    pub detail: String,
+}
+
+/// What one browser peer is responsible for. `fragments` is bounded by
+/// construction: `max_bytes / fragment_bytes` entries at most (64 at the
+/// defaults), so this is always a renderable list, never a firehose.
+#[derive(Clone, Debug, Serialize)]
+pub struct ShardHolding {
+    pub endpoint_id: String,
+    /// `browser_presence::node_name` — the same `bn-…` identity the
+    /// constellation renders.
+    pub node_name: String,
+    pub max_bytes: u64,
+    pub held_bytes: u64,
+    pub fragments: Vec<StateFragment>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShardParams {
+    pub enabled: bool,
+    pub max_bytes: u64,
+    pub fragment_bytes: u64,
+    pub replication_factor: usize,
+    /// The replicated stores actually being fragmented, sorted.
+    pub stores: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ShardPlan {
+    pub params: ShardParams,
+    /// Eligible browser endpoint ids, sorted — the HRW membership set.
+    pub membership: Vec<String>,
+    /// Digest of the membership set. A caller holding a plan compares this to
+    /// know its assignment is stale without re-reading the whole plan.
+    pub membership_digest: String,
+    /// Commits to the membership AND to every fragment digest, so it also
+    /// changes when the underlying state moves.
+    pub plan_digest: String,
+    pub fragments_total: usize,
+    pub fragment_bytes_total: u64,
+    pub replicas_wanted: usize,
+    pub replicas_placed: usize,
+    /// Fragments placed on at least one but fewer than `replication_factor`
+    /// holders.
+    pub under_replicated_fragments: usize,
+    /// Fragments placed on NO holder at all.
+    pub unplaced_fragments: usize,
+    pub holdings: Vec<ShardHolding>,
+    pub refusals: Vec<ShardRefusal>,
+    pub refusals_total: usize,
+}
+
+fn env_u64_clamped(name: &str, default: u64, min: u64, max: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+        .clamp(min, max)
+}
+
+/// `HIVE_BROWSER_SHARDS=0` turns the planner off entirely (the
+/// `HIVE_BROWSER_DB_LISTEN=0` precedent): the plan still renders, with an
+/// empty membership and `enabled: false`, so an operator sees WHY there are
+/// no assignments rather than an ambiguous empty list.
+fn shard_params() -> ShardParams {
+    let enabled = std::env::var("HIVE_BROWSER_SHARDS")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "off"))
+        .unwrap_or(true);
+    let selected: BTreeSet<String> = std::env::var("HIVE_BROWSER_SHARD_STORES")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    // REGISTRY order is a source-code fact and therefore already identical on
+    // identical builds; sorting makes it identical across a MIXED-version
+    // fleet too, which is exactly when a placement disagreement would be
+    // hardest to see.
+    let mut stores: Vec<String> = crate::store_sync::REGISTRY
+        .iter()
+        .map(|s| s.name.to_string())
+        .filter(|name| selected.is_empty() || selected.contains(name))
+        .collect();
+    stores.sort();
+    ShardParams {
+        enabled,
+        max_bytes: env_u64_clamped(
+            "HIVE_BROWSER_SHARD_MAX_BYTES",
+            DEFAULT_SHARD_MAX_BYTES,
+            1,
+            SHARD_MAX_BYTES_CEILING,
+        ),
+        fragment_bytes: env_u64_clamped(
+            "HIVE_BROWSER_SHARD_FRAGMENT_BYTES",
+            DEFAULT_SHARD_FRAGMENT_BYTES,
+            SHARD_FRAGMENT_BYTES_MIN,
+            SHARD_FRAGMENT_BYTES_MAX,
+        ),
+        replication_factor: env_u64_clamped(
+            "HIVE_BROWSER_SHARD_REPLICATION",
+            DEFAULT_SHARD_REPLICATION,
+            1,
+            SHARD_REPLICATION_MAX,
+        ) as usize,
+        stores,
+    }
+}
+
+/// The eligible membership set: browser peers that are `shard_eligible`
+/// (server-stamped from a `platform_admin` session), currently `online`, and
+/// STILL carrying a live admission on this node's own replicated view.
+///
+/// The admission re-check is not redundant with presence. Presence is issued
+/// alongside an admission and torn down with it
+/// (`browser_presence::remove_for_endpoint`), but the two stores replicate
+/// independently and a presence record can outlive a revocation by one gossip
+/// round — the `proxy_to_owner` / `resolve_round_grant` re-check precedent:
+/// authorization is re-derived at the point of use, from proven identity,
+/// every time.
+pub fn shard_members(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
+    let now = hive_core::now_ms();
+    cloud
+        .browser_presence
+        .shard_candidates(now)
+        .into_iter()
+        .filter(|record| {
+            cloud
+                .browser_admissions
+                .live_for_endpoint(&record.endpoint_id, now)
+                .is_some()
+        })
+        .map(|record| (record.endpoint_id, record.node_name))
+        .collect()
+}
+
+/// Ranked rendezvous hashing: the top `take` preferred holders of `key`.
+///
+/// Built ONLY out of `lease::hrw_owner` — the same weight function container
+/// placement and the inference-coordinator election agree through — applied
+/// to a shrinking pool. Removing the winner and re-running is exactly HRW
+/// rank order, so the top-1 here is by construction the same node those
+/// callers would pick, and the minimal-churn property carries: a member
+/// leaving promotes each fragment's next-ranked holder and moves nothing
+/// else.
+fn hrw_rank(key: &str, members: &[String], take: usize) -> Vec<String> {
+    let mut pool: Vec<String> = members.to_vec();
+    let mut ranked: Vec<String> = Vec::with_capacity(take.min(pool.len()));
+    while ranked.len() < take {
+        let Some(top) = crate::lease::hrw_owner(key, &pool) else {
+            break;
+        };
+        pool.retain(|member| *member != top);
+        ranked.push(top);
+    }
+    ranked
+}
+
+/// Cut `text` into `target`-byte pieces that never split a UTF-8 character.
+///
+/// The walk-back can move at most 3 bytes and `target` is floored at 4 KiB,
+/// so a piece can never be empty and the loop always advances — no zero-length
+/// fragment, no spin.
+fn utf8_chunks(text: &str, target: usize) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < text.len() {
+        let mut end = (start + target).min(text.len());
+        while end < text.len() && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push((start, end));
+        start = end;
+    }
+    out
+}
+
+/// Enumerate every fragment of every selected store, in stable
+/// `(store, index)` order, alongside any store-level refusals.
+///
+/// Fragment CONTENT is not retained here — only its descriptor. The bytes are
+/// re-derived on demand by [`shard_fragment_http`], which is why the plan can
+/// be recomputed on every call without holding a copy of platform state.
+fn fragment_table(
+    cloud: &Arc<CloudState>,
+    params: &ShardParams,
+) -> (Vec<StateFragment>, Vec<ShardRefusal>) {
+    let mut fragments = Vec::new();
+    let mut refusals = Vec::new();
+    for store in &params.stores {
+        let bytes = crate::store_sync::serve(cloud, store);
+        if bytes.is_empty() {
+            continue;
+        }
+        // Every REGISTRY snapshot is serde_json output and therefore UTF-8;
+        // this arm exists so a future non-JSON store is named loudly instead
+        // of silently vanishing from the shard set.
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            refusals.push(ShardRefusal {
+                reason: "store_not_utf8",
+                fragment: store.clone(),
+                endpoint_id: String::new(),
+                detail: format!(
+                    "store {store} snapshot ({} bytes) is not UTF-8 and cannot be fragmented",
+                    bytes.len()
+                ),
+            });
+            continue;
+        };
+        for (index, (start, end)) in utf8_chunks(text, params.fragment_bytes as usize)
+            .into_iter()
+            .enumerate()
+        {
+            if fragments.len() >= SHARD_MAX_TOTAL_FRAGMENTS {
+                refusals.push(ShardRefusal {
+                    reason: "fragment_budget_exhausted",
+                    fragment: format!("{store}/{index:05}"),
+                    endpoint_id: String::new(),
+                    detail: format!(
+                        "stopped enumerating at {SHARD_MAX_TOTAL_FRAGMENTS} fragments inside store {store}; raise HIVE_BROWSER_SHARD_FRAGMENT_BYTES or narrow HIVE_BROWSER_SHARD_STORES"
+                    ),
+                });
+                return (fragments, refusals);
+            }
+            let piece = &text[start..end];
+            fragments.push(StateFragment {
+                key: format!("{store}/{index:05}"),
+                store: store.clone(),
+                index: index as u32,
+                bytes: piece.len() as u64,
+                digest: fluid_core::browser_source_digest(piece),
+            });
+        }
+    }
+    (fragments, refusals)
+}
+
+/// The whole assignment, recomputed from live state on every call.
+///
+/// Determinism: fragments are walked in lexical key order and members are
+/// sorted, so the cap accounting below visits identical inputs in an
+/// identical order on every node — the plan is a pure function of (fragment
+/// table, membership, params) with no clock, no counter and no local history
+/// in it.
+pub fn shard_plan(cloud: &Arc<CloudState>) -> ShardPlan {
+    let params = shard_params();
+    let (fragments, mut refusals) = fragment_table(cloud, &params);
+    let fragment_bytes_total = fragments.iter().map(|f| f.bytes).sum();
+
+    let members: Vec<(String, String)> = if params.enabled {
+        shard_members(cloud)
+    } else {
+        Vec::new()
+    };
+    let ids: Vec<String> = members.iter().map(|(id, _)| id.clone()).collect();
+    let membership_digest = fluid_core::browser_source_digest(&ids.join("\n"));
+    let plan_digest = {
+        let mut commit = String::with_capacity(64 + fragments.len() * 65);
+        commit.push_str(&membership_digest);
+        commit.push('\u{0}');
+        commit.push_str(&format!(
+            "{}:{}:{}",
+            params.max_bytes, params.fragment_bytes, params.replication_factor
+        ));
+        for fragment in &fragments {
+            commit.push('\n');
+            commit.push_str(&fragment.digest);
+        }
+        fluid_core::browser_source_digest(&commit)
+    };
+
+    let mut holdings: BTreeMap<String, ShardHolding> = members
+        .iter()
+        .map(|(id, name)| {
+            (
+                id.clone(),
+                ShardHolding {
+                    endpoint_id: id.clone(),
+                    node_name: name.clone(),
+                    max_bytes: params.max_bytes,
+                    held_bytes: 0,
+                    fragments: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
+    let mut replicas_placed = 0usize;
+    let mut under_replicated = 0usize;
+    let mut unplaced = 0usize;
+    for fragment in &fragments {
+        // A fragment bigger than the per-browser cap can never be placed
+        // ANYWHERE — the same shape as browser_db's "a batch that cannot fit
+        // any frame stays local, named". Splitting it further to make it fit
+        // would silently change the fragment identity every consumer pins.
+        if fragment.bytes > params.max_bytes {
+            unplaced += 1;
+            refusals.push(ShardRefusal {
+                reason: "fragment_exceeds_cap",
+                fragment: fragment.key.clone(),
+                endpoint_id: String::new(),
+                detail: format!(
+                    "fragment is {} bytes; no browser may hold more than max_bytes {}",
+                    fragment.bytes, params.max_bytes
+                ),
+            });
+            continue;
+        }
+        let ranked = hrw_rank(&fragment.key, &ids, params.replication_factor);
+        if ranked.is_empty() {
+            unplaced += 1;
+            refusals.push(ShardRefusal {
+                reason: "no_eligible_member",
+                fragment: fragment.key.clone(),
+                endpoint_id: String::new(),
+                detail: if params.enabled {
+                    "no online, shard-eligible browser peer with a live admission".to_string()
+                } else {
+                    "shard planning is disabled (HIVE_BROWSER_SHARDS=0)".to_string()
+                },
+            });
+            continue;
+        }
+        let mut placed = 0usize;
+        for holder in &ranked {
+            let Some(holding) = holdings.get_mut(holder) else {
+                continue;
+            };
+            // Cap check BEFORE the assignment, whole fragment or nothing.
+            // Note what does NOT happen on refusal: the fragment is not
+            // trimmed to fit, and it is not re-homed onto a member outside
+            // its HRW top-R. Re-homing would make placement depend on
+            // iteration order and destroy the minimal-churn property; the
+            // shortfall is reported instead.
+            if holding.held_bytes.saturating_add(fragment.bytes) > holding.max_bytes {
+                refusals.push(ShardRefusal {
+                    reason: "browser_cap_exceeded",
+                    fragment: fragment.key.clone(),
+                    endpoint_id: holder.clone(),
+                    detail: format!(
+                        "{} holds {} bytes; a {}-byte fragment would exceed max_bytes {}",
+                        holding.node_name, holding.held_bytes, fragment.bytes, holding.max_bytes
+                    ),
+                });
+                continue;
+            }
+            holding.held_bytes += fragment.bytes;
+            holding.fragments.push(fragment.clone());
+            placed += 1;
+        }
+        replicas_placed += placed;
+        if placed == 0 {
+            unplaced += 1;
+        } else if placed < params.replication_factor {
+            under_replicated += 1;
+        }
+    }
+
+    // Bounded in what is REPORTED, never in what is COUNTED: `refusals_total`
+    // is taken before the truncation, so a plan with 900 refusals says 900 and
+    // shows 64 rather than quietly looking like a plan with 64.
+    let refusals_total = refusals.len();
+    refusals.truncate(SHARD_MAX_REPORTED_REFUSALS);
+    ShardPlan {
+        replicas_wanted: fragments.len() * params.replication_factor,
+        fragments_total: fragments.len(),
+        fragment_bytes_total,
+        replicas_placed,
+        under_replicated_fragments: under_replicated,
+        unplaced_fragments: unplaced,
+        holdings: holdings.into_values().collect(),
+        refusals,
+        refusals_total,
+        membership: ids,
+        membership_digest,
+        plan_digest,
+        params,
+    }
+}
+
+/// The gate every fragment byte must pass before it is used — the one piece
+/// of the trust story that is actually implemented.
+///
+/// Exact length first (a truncated body can never be "close enough"), then
+/// UTF-8, then BLAKE3 against the descriptor's `digest`. A browser that
+/// returns wrong bytes is caught here deterministically without trusting the
+/// browser at all. What this does NOT do is establish that the browser was
+/// holding the bytes rather than fetching them on demand, or that it will
+/// still have them next time — see this section's TRUST notes.
+pub fn verify_fragment(fragment: &StateFragment, bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() as u64 != fragment.bytes {
+        return Err(format!(
+            "fragment {} is {} bytes, expected exactly {}",
+            fragment.key,
+            bytes.len(),
+            fragment.bytes
+        ));
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| format!("fragment {} is not valid UTF-8: {e}", fragment.key))?;
+    let digest = fluid_core::browser_source_digest(text);
+    if digest != fragment.digest {
+        return Err(format!(
+            "fragment {} digest mismatch: got {digest}, expected {}",
+            fragment.key, fragment.digest
+        ));
+    }
+    Ok(())
+}
+
+/// The trust statement, returned to every shard API caller so the claim
+/// travels with the data and cannot quietly diverge from the implementation.
+fn shard_trust_json() -> Value {
+    json!({
+        "model": "content-addressed fragments (BLAKE3) + server-derived platform-admin eligibility",
+        "proves": [
+            "a returned fragment is byte-exact: length and BLAKE3 digest are re-checked before any use (verify_fragment), so a holder cannot serve wrong or corrupted bytes undetected",
+            "assignment is coordinator-free and identical on every node: HRW (lease::hrw_owner) over a server-derived membership set",
+            "a browser cannot choose its own identity or its own eligibility — both are derived server-side from the proven endpoint id and the authenticated session"
+        ],
+        "does_not_prove": [
+            "CONTINUED POSSESSION: nothing here shows a browser still holds a fragment, or ever did. A holder that discards a fragment, or re-fetches it from another node on demand, is indistinguishable from an honest one until it is asked and fails",
+            "AVAILABILITY: content addressing bounds corruption, not loss",
+            "CONFIDENTIALITY: a fragment handed to a browser is readable by that browser. This is why eligibility is platform-admin-only today — an admin can already read this state through the operator console"
+        ],
+        "options_for_a_real_possession_guarantee": [
+            "accept the weaker guarantee: over-replicate and audit by random challenge; detects loss after the fact, costs nothing new",
+            "adopt a published proof-of-retrievability / provable-data-possession scheme (Juels-Kaliski PoR, Ateniese PDP, or Merkle challenge-response over erasure-coded fragments) with its published parameters — adopt, never invent",
+            "do not ask browsers to prove anything: treat every browser copy as a cache with replication factor zero, the posture docs/browser-db-contract.md already takes for browser DB replicas"
+        ],
+        "implemented_here": "assignment, bounding and verification only. There is no transport arm that fetches a fragment back from a browser, and no possession challenge."
+    })
+}
+
+/// Re-derivation driver. The plan itself is stateless — it is recomputed from
+/// live membership on every read, so nothing here has to *cause* the
+/// re-derivation. This loop's job is purely to NOTICE, so a fleet that quietly
+/// stopped being able to place fragments shows up in the log and not only in
+/// an operator's browser.
+///
+/// The membership digest is computed FIRST, on its own, and the loop returns
+/// on no change. That ordering is the whole point: [`shard_plan`] serializes
+/// every replicated store to build its fragment table, and this runs on every
+/// node every `HIVE_BROWSER_DB_RECONCILE_SECS`. Building a full plan per tick
+/// just to compare one digest would spend that serialization on nothing in the
+/// steady state, which is exactly the shape of cost that is invisible until a
+/// store grows.
+fn reconcile_shards(cloud: &Arc<CloudState>) {
+    static LAST_MEMBERSHIP: parking_lot::Mutex<String> = parking_lot::Mutex::new(String::new());
+    let members: Vec<String> = if shard_params().enabled {
+        shard_members(cloud).into_iter().map(|(id, _)| id).collect()
+    } else {
+        Vec::new()
+    };
+    let digest = fluid_core::browser_source_digest(&members.join("\n"));
+    {
+        let mut last = LAST_MEMBERSHIP.lock();
+        if *last == digest {
+            return;
+        }
+        *last = digest.clone();
+    }
+    let plan = shard_plan(cloud);
+    tracing::info!(
+        members = plan.membership.len(),
+        fragments = plan.fragments_total,
+        replicas_placed = plan.replicas_placed,
+        replicas_wanted = plan.replicas_wanted,
+        membership_digest = %plan.membership_digest,
+        "browser shards: membership changed, fragment assignment re-derived"
+    );
+    if plan.unplaced_fragments > 0 || plan.under_replicated_fragments > 0 {
+        tracing::warn!(
+            unplaced = plan.unplaced_fragments,
+            under_replicated = plan.under_replicated_fragments,
+            refusals = plan.refusals_total,
+            first_refusal = plan.refusals.first().map(|r| r.detail.as_str()).unwrap_or(""),
+            "browser shards: fragments are not fully placed"
+        );
+    }
+}
+
+/// `GET /v1/browser/shards` — operator-only. The whole plan plus the trust
+/// statement.
+async fn shard_plan_http(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    let plan = shard_plan(&cloud);
+    Ok(axum::Json(json!({ "plan": plan, "trust": shard_trust_json() })))
+}
+
+/// `GET /v1/browser/shards/fragment/:store/:index[?digest=<hex>]` —
+/// operator-only. The fragment's actual bytes, re-derived from this node's
+/// own copy of the store.
+///
+/// `store` is matched against `store_sync::REGISTRY` by exact name and
+/// `index` parses as an integer, so neither path segment can become a file
+/// path or a query — the same "validate before it is ever a path component"
+/// rule `browser_artifacts` applies to a digest.
+///
+/// The optional `digest` is the anti-skew guard: state moves, and two nodes
+/// can be one gossip round apart. Passing the digest the plan advertised
+/// turns "this node's bytes have since changed" into a loud 409 instead of a
+/// body that silently fails the caller's own verification later.
+async fn shard_fragment_http(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::extract::Path((store, index)): axum::extract::Path<(String, u32)>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    let params = shard_params();
+    if !params.stores.iter().any(|s| *s == store) {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown or unsharded store".to_string(),
+        ));
+    }
+    let bytes = crate::store_sync::serve(&cloud, &store);
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        (
+            axum::http::StatusCode::CONFLICT,
+            "store snapshot is not UTF-8 and is not fragmented".to_string(),
+        )
+    })?;
+    let chunks = utf8_chunks(text, params.fragment_bytes as usize);
+    let (start, end) = *chunks.get(index as usize).ok_or((
+        axum::http::StatusCode::NOT_FOUND,
+        "fragment index is past the end of this store".to_string(),
+    ))?;
+    let piece = &text[start..end];
+    let digest = fluid_core::browser_source_digest(piece);
+    if let Some(expected) = query.get("digest") {
+        if *expected != digest {
+            return Err((
+                axum::http::StatusCode::CONFLICT,
+                format!(
+                    "fragment {store}/{index:05} is now {digest}, not {expected} — this node's state has moved; re-read the plan"
+                ),
+            ));
+        }
+    }
+    Ok(axum::Json(json!({
+        "key": format!("{store}/{index:05}"),
+        "store": store,
+        "index": index,
+        "bytes": piece.len(),
+        "digest": digest,
+        "content": piece,
+    })))
+}
+
+#[derive(Deserialize)]
+struct ShardVerifyRequest {
+    store: String,
+    index: u32,
+    /// The bytes being verified — a browser's answer, or an operator's
+    /// deliberately corrupted copy of one.
+    content: String,
+    /// Optional: verify against THIS digest rather than the one this node
+    /// currently derives, so a fragment captured earlier can still be checked
+    /// after local state has moved.
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+/// `POST /v1/browser/shards/verify` — operator-only. Runs
+/// [`verify_fragment`] against caller-supplied bytes.
+///
+/// This is the verification GATE, exposed so the one property that is
+/// actually proved can be exercised end-to-end today: post a fragment's real
+/// content and it verifies; flip one character and it fails with the exact
+/// digest mismatch. It stands in for the retrieval path deliberately — there
+/// is no arm that fetches a fragment back from a browser yet, and pretending
+/// otherwise is exactly the overclaim this module refuses to make.
+async fn shard_verify_http(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    axum::Json(request): axum::Json<ShardVerifyRequest>,
+) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    let params = shard_params();
+    if !params.stores.iter().any(|s| *s == request.store) {
+        return Err((
+            axum::http::StatusCode::NOT_FOUND,
+            "unknown or unsharded store".to_string(),
+        ));
+    }
+    // The descriptor to verify AGAINST is derived here, from this node's own
+    // state (or from the caller's pinned digest) — never from the submitted
+    // body's own claim about itself, which would make verification circular.
+    let bytes = crate::store_sync::serve(&cloud, &request.store);
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        (
+            axum::http::StatusCode::CONFLICT,
+            "store snapshot is not UTF-8 and is not fragmented".to_string(),
+        )
+    })?;
+    let chunks = utf8_chunks(text, params.fragment_bytes as usize);
+    let (start, end) = *chunks.get(request.index as usize).ok_or((
+        axum::http::StatusCode::NOT_FOUND,
+        "fragment index is past the end of this store".to_string(),
+    ))?;
+    let piece = &text[start..end];
+    let local_digest = fluid_core::browser_source_digest(piece);
+    let (expected_digest, expected_bytes) = match &request.digest {
+        // Verifying against a pinned digest: the length is the SUBMITTED
+        // length, so a digest match is the whole proof. Against local state,
+        // the local length is an independent second check.
+        Some(pinned) => (pinned.clone(), request.content.len() as u64),
+        None => (local_digest.clone(), piece.len() as u64),
+    };
+    if !hive_browser_proto::valid_blake3_digest(&expected_digest) {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "digest must be 64 lowercase hex characters".to_string(),
+        ));
+    }
+    let fragment = StateFragment {
+        key: format!("{}/{:05}", request.store, request.index),
+        store: request.store.clone(),
+        index: request.index,
+        bytes: expected_bytes,
+        digest: expected_digest.clone(),
+    };
+    match verify_fragment(&fragment, request.content.as_bytes()) {
+        Ok(()) => Ok(axum::Json(json!({
+            "verified": true,
+            "key": fragment.key,
+            "digest": expected_digest,
+            "matches_local_state": expected_digest == local_digest,
+        }))),
+        Err(error) => Ok(axum::Json(json!({
+            "verified": false,
+            "key": fragment.key,
+            "digest": expected_digest,
+            "local_digest": local_digest,
+            "error": error,
+        }))),
+    }
 }

@@ -1355,6 +1355,35 @@ impl BrowserNode {
         bytes_to_hex(&sig.to_bytes())
     }
 
+    /// Sign one peer-mesh signalling envelope (bn-browser-peer-webrtc-mesh)
+    /// with this node's OWN ed25519 secret key, returning 128 hex chars.
+    ///
+    /// `context` is the canonical binding string built by
+    /// `www/peer-mesh.js::envelopeContext` — it carries BOTH endpoint ids, the
+    /// session id, a timestamp and the DTLS certificate FINGERPRINT of the
+    /// offer/answer being signalled. That last field is the whole point: the
+    /// WebRTC lane's DTLS identity is an ephemeral, self-signed certificate
+    /// with no relationship whatsoever to the iroh identity every capability on
+    /// this platform is keyed on, so without a signature binding the two, the
+    /// signalling relay (a fleet mailbox — an authenticated surface, but still
+    /// a THIRD party to the peer link) could substitute its own fingerprint and
+    /// sit in the middle of a "direct" connection. With it, a peer sets a
+    /// remote description only after verifying that the exact fingerprint in
+    /// the SDP was signed by the ed25519 key of the EndpointId the server
+    /// admitted, and the browser's own DTLS stack then refuses any certificate
+    /// that does not match it.
+    ///
+    /// Domain-separated (`hive-browser-webrtc-v1\0`) so a mesh signature can
+    /// never be replayed as an admission proof-of-possession (which signs the
+    /// bare, undomained `"{endpoint_id}:{challenge_ms}"`), nor the reverse.
+    #[wasm_bindgen(js_name = signMeshEnvelope)]
+    pub fn sign_mesh_envelope(&self, context: String) -> Result<String, JsError> {
+        self.ensure_open()?;
+        let message = mesh_signing_message(&context)?;
+        let sig = self.ep.secret_key().sign(&message);
+        Ok(bytes_to_hex(&sig.to_bytes()))
+    }
+
     /// The raw 32-byte ed25519 seed, as 64 hex chars — the ONLY way key
     /// material leaves this module. Per `docs/browser-node-proposal.md` §2.2,
     /// this exists solely so the caller can wrap it with a non-extractable
@@ -2439,6 +2468,59 @@ async fn run_crr_sync(
     Ok(out)
 }
 
+/// Domain separator for every peer-mesh signalling signature
+/// (bn-browser-peer-webrtc-mesh). MUST stay byte-identical to
+/// `MESH_SIG_DOMAIN` in `crates/hive-browser/www/peer-mesh.js` — the JS half
+/// builds the context string, this half decides what is actually signed, and a
+/// drift between them silently rejects every peer handshake.
+const MESH_SIG_DOMAIN: &[u8] = b"hive-browser-webrtc-v1\0";
+
+/// Upper bound on a signable context. An SDP is NOT signed (it is far larger
+/// and its only security-relevant field, the fingerprint, is extracted and
+/// bound explicitly); this covers the fixed-shape binding string only, so a
+/// caller handing a whole session description gets a loud refusal rather than
+/// a signature over something the verifier will never reconstruct.
+const MESH_CONTEXT_MAX: usize = 1024;
+
+fn mesh_signing_message(context: &str) -> Result<Vec<u8>, JsError> {
+    if context.is_empty() {
+        return Err(JsError::new("mesh envelope context must not be empty"));
+    }
+    if context.len() > MESH_CONTEXT_MAX {
+        return Err(JsError::new(&format!(
+            "mesh envelope context exceeds the {MESH_CONTEXT_MAX}-byte bound"
+        )));
+    }
+    let mut message = Vec::with_capacity(MESH_SIG_DOMAIN.len() + context.len());
+    message.extend_from_slice(MESH_SIG_DOMAIN);
+    message.extend_from_slice(context.as_bytes());
+    Ok(message)
+}
+
+/// Verify a peer's signalling envelope against the EndpointId the SERVER
+/// admitted (bn-browser-peer-webrtc-mesh). Free function, not a method: it
+/// needs no local key, no live endpoint and no grant — it answers exactly one
+/// question ("did the holder of this ed25519 identity sign this context"), and
+/// binding it to node state would only invite callers to believe it means more
+/// than that.
+///
+/// Returns `false` for a valid-shaped-but-wrong signature and THROWS for a
+/// malformed id/signature/context, so a caller cannot conflate "this peer is
+/// lying" with "I built the call wrong".
+#[wasm_bindgen(js_name = verifyMeshEnvelope)]
+pub fn verify_mesh_envelope(
+    endpoint_id: &str,
+    context: &str,
+    signature_hex: &str,
+) -> Result<bool, JsError> {
+    let key = parse_endpoint_id(endpoint_id)?;
+    let message = mesh_signing_message(context)?;
+    let raw = hex_to_64(signature_hex)
+        .ok_or_else(|| JsError::new("mesh signature must be 128 hex chars (64 bytes)"))?;
+    let signature = iroh::Signature::from_bytes(&raw);
+    Ok(key.verify(&message, &signature).is_ok())
+}
+
 /// Parse the cryptographic endpoint identity used by iroh's completed TLS
 /// handshake. Keeping the typed key in the grants map avoids string aliases
 /// (hex/base32/case) that could make revocation miss the original grant.
@@ -2475,15 +2557,27 @@ fn bytes_to_hex(b: &[u8]) -> String {
 
 /// Parse 64 hex chars into 32 bytes; `None` on any malformed input.
 fn hex_to_32(s: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex_into(s, &mut out)?;
+    Some(out)
+}
+
+/// Parse 128 hex chars into an ed25519 signature's 64 bytes.
+fn hex_to_64(s: &str) -> Option<[u8; 64]> {
+    let mut out = [0u8; 64];
+    hex_into(s, &mut out)?;
+    Some(out)
+}
+
+fn hex_into(s: &str, out: &mut [u8]) -> Option<()> {
     let s = s.trim();
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if s.len() != out.len() * 2 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
-    let mut out = [0u8; 32];
     for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
         let hi = (chunk[0] as char).to_digit(16)?;
         let lo = (chunk[1] as char).to_digit(16)?;
         out[i] = (hi * 16 + lo) as u8;
     }
-    Some(out)
+    Some(())
 }

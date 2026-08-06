@@ -1,0 +1,121 @@
+# {{ ansible_managed }}
+[Unit]
+Description=shadw headless browser node ({{ hive_name }}, team {{ hive_browser_node_team }}, scope {{ hive_browser_node_scope }})
+Documentation=file://{{ hive_browser_node_root }}/bin/hive-browser-node-run.sh
+# Wants=, deliberately NOT Requires=/BindsTo=. Requires-style stop propagation
+# would mean every broker restart (a config change, a token rotation) also
+# stops this unit -- and a dependency-stop does not trigger Restart=, so the
+# browser would stay dark until someone noticed. The supervisor script waits
+# for the broker on start and recycles itself if the broker stays unreachable,
+# which recovers from the same situations without the permanent-dark failure.
+After=network-online.target hive-browser-node-broker.service
+Wants=network-online.target hive-browser-node-broker.service
+# Never give up on a browser node: the browser is fully capped below, so a
+# crash loop is bounded by RestartSec + CPUQuota, whereas a start-limit
+# lockout leaves the host silently contributing nothing until a human notices.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{ hive_browser_node_user }}
+Group={{ hive_browser_node_group }}
+WorkingDirectory={{ hive_browser_node_state_dir }}
+EnvironmentFile={{ hive_browser_node_env_file }}
+# Chromium writes its profile, cache and the worker's IndexedDB/OPFS under
+# HOME; XDG_* are pinned so nothing tries to reach a home directory that the
+# service account deliberately does not have.
+Environment=HOME={{ hive_browser_node_state_dir }}
+Environment=XDG_CONFIG_HOME={{ hive_browser_node_state_dir }}/config
+Environment=XDG_CACHE_HOME={{ hive_browser_node_state_dir }}/cache
+Environment=XDG_DATA_HOME={{ hive_browser_node_state_dir }}/data
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+{% if hive_browser_node_no_sandbox | bool %}
+# EXPLICITLY WAIVED SANDBOX. Only reachable via -e hive_browser_node_no_sandbox=true,
+# which the role gates behind a loud assert. Tenant browser functions are
+# untrusted JS by design and this host also runs hive-node, so this should be
+# a temporary state with a written reason, never a fleet default.
+Environment=CHROME_DEVEL_SANDBOX=
+{% endif %}
+ExecStart={{ hive_browser_node_root }}/bin/hive-browser-node-run.sh
+Restart=always
+RestartSec=15
+# Chromium spawns a process tree (browser, renderer, network/storage/utility);
+# control-group kill is the only mode that reliably reaps all of it.
+KillMode=control-group
+TimeoutStopSec=30
+# Bounded daily recycle against long-run renderer growth, randomized so the
+# five fleet browser nodes never restart in the same minute. The gap costs one
+# presence republish, comfortably inside the backend's 90s presence TTL.
+RuntimeMaxSec={{ hive_browser_node_runtime_max_sec }}
+RuntimeRandomizedExtraSec={{ hive_browser_node_runtime_randomized_extra_sec }}
+
+# ---- resource caps -------------------------------------------------------
+# THE POINT OF THIS FILE. hive-node runs with no caps at all
+# (roles/hive_platform/templates/hive-node.service.j2 sets only LimitNOFILE),
+# so every bound here exists to guarantee the platform process wins any
+# contest for this host. Values are fact-derived and clamped in
+# roles/hive_browser_node/defaults/main.yml; this host resolved to:
+#   MemTotal {{ ansible_memtotal_mb }} MiB, {{ ansible_processor_vcpus }} vCPU
+#
+# MemoryHigh before MemoryMax: the kernel throttles and reclaims at High and
+# only OOM-kills at Max, so a memory spike costs the browser a stall instead
+# of its admission.
+MemoryMax={{ hive_browser_node_memory_max_mb }}M
+MemoryHigh={{ hive_browser_node_memory_high_mb }}M
+# Never let the browser push hive-node's pages out to swap. A browser node is
+# an optional donor; the platform is not.
+MemorySwapMax=0
+# Absolute ceiling ({{ hive_browser_node_cpu_quota_pct }}% = {{ (hive_browser_node_cpu_quota_pct | int) / 100 }} cores) AND a relative share.
+# The quota bounds an idle-host browser; the weight decides a saturated one --
+# hive-node sits at the default 100, so this 5:1 split holds under real load.
+CPUQuota={{ hive_browser_node_cpu_quota_pct }}%
+CPUWeight={{ hive_browser_node_cpu_weight }}
+IOWeight={{ hive_browser_node_io_weight }}
+TasksMax={{ hive_browser_node_tasks_max }}
+# Under genuine global memory pressure the kernel kills the highest score
+# first. hive-node is at the default 0. This line is what makes "a browser
+# node must never take the platform down with it" true rather than hoped for.
+OOMScoreAdjust={{ hive_browser_node_oom_score_adjust }}
+Nice={{ hive_browser_node_nice }}
+LimitNOFILE=65536
+
+# ---- hardening -----------------------------------------------------------
+{% if hive_browser_node_no_new_privileges | default(true) | bool %}
+# Chromium uses its NAMESPACE sandbox when unprivileged user namespaces are
+# available (the role asserts they are), which is unaffected by this. It only
+# blocks the legacy setuid `chrome-sandbox` fallback -- if a host somehow has
+# no user namespaces, Chromium then refuses to start with an explicit sandbox
+# error rather than silently running unsandboxed. That is the correct
+# direction to fail; re-run with -e hive_browser_node_no_new_privileges=false
+# only after understanding which sandbox you are getting.
+NoNewPrivileges=yes
+{% endif %}
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+# The ONLY writable path. Chromium's profile lives here, and so does the
+# worker's IndexedDB record holding the node's persistent ed25519 identity --
+# deleting this directory rotates the endpoint id (and orphans the old
+# presence record until its 90s TTL expires), it does not just clear a cache.
+ReadWritePaths={{ hive_browser_node_state_dir }}
+# DELIBERATELY ABSENT, do not add:
+#   RestrictNamespaces= -- Chromium's sandbox IS user/pid/net namespaces; any
+#     value here disables the sandbox this unit works to keep.
+#   PrivateDevices= -- narrows /dev in ways the renderer's shared-memory path
+#     trips over.
+#   SystemCallFilter= -- Chromium installs its own seccomp-bpf filter inside
+#     the sandbox; layering systemd's on top is a well-known way to get
+#     unexplained renderer crashes.
+#   IPAddressDeny= -- unlike the broker, this process legitimately dials the
+#     public WSS relays ({{ hive_browser_node_relays | trim }}).
+
+[Install]
+WantedBy=multi-user.target

@@ -155,6 +155,34 @@ newcomer's gossip, while the newcomer's OWN view of the mesh still looks
 healthy (a one-directional gap that is easy to miss without checking a
 THIRD node's view of the newcomer, not just the newcomer's own report).
 
+## Headless browser nodes (five hosts, one each)
+
+```bash
+ansible-playbook playbooks/browser-nodes.yml
+```
+
+Runs the `/run-node` browser node unattended on **fc-bangkok, fc-sanjose,
+fc-virginia, fc-saopaulo, fc-frankfurt** — headless Chromium loading a loopback
+page that owns the shipped `ui/public/run-node-worker.js` (verbatim), which
+boots `crates/hive-browser`'s wasm `BrowserNode` over iroh QUIC via a WSS relay.
+
+Two things make it a fleet service rather than a browser tab someone left open:
+
+* **Auth with no human.** `browser_admission.rs::fresh_user_claims` rejects API
+  keys (`sub` = `key:…`), service roles, and anything whose `iat` is older than
+  300s — so the *only* admissible credential is a freshly minted platform JWT.
+  A node-local broker mints one on loopback with `x-hive-internal` (delivered by
+  systemd `LoadCredential=` from a root-only file, never a unit `Environment=`
+  line) and hands the browser nothing but a short-lived, single-tenant,
+  `role: member`, non-admin cookie. No Clerk sign-in, no stored user credential.
+* **Caps that cannot starve `hive-node`.** `hive-node` runs uncapped, so the
+  browser unit carries fact-derived `MemoryMax`/`CPUQuota`/`TasksMax` plus
+  `CPUWeight=20` against the platform's default 100 and `OOMScoreAdjust=700`
+  against its 0 — under real pressure the browser dies and the platform lives.
+
+Full reasoning for both, plus the exact numbers and how to verify a node is
+live in fleet presence: `roles/hive_browser_node/README.md`.
+
 ## Secrets
 
 Never commit real secrets. `inventory/hosts.ini`, `inventory/group_vars/
@@ -188,6 +216,7 @@ resolve from the encrypted `vault.yml`.
 | `hive_ui_fanout` | build/push/restart task files backing `parallel-deploy.yml`'s UI phases (one canonical build, parallel push, bounded-serial restart) |
 | `mesh_bootstrap` | mesh trust config (join-proof self-admit by default, or the opt-in static `HIVE_TRUSTED_NODE_IDS` allowlist) |
 | `dns_vercel` | DNS/TLS ingress systemd drop-in (Vercel DNS + ACME DNS-01), matching `RUNBOOK.md` |
+| `hive_browser_node` | one capped headless browser node per host on the five `[browser_nodes]` hosts: headless Chromium + a loopback session broker that mints the short-lived tenant JWT the admission requires (see its own README for the auth decision and every cap value) |
 
 ## Verification
 
@@ -198,6 +227,7 @@ ansible-playbook playbooks/site.yml --syntax-check
 ansible-playbook playbooks/node-join.yml --syntax-check
 ansible-playbook playbooks/platform-only.yml --syntax-check
 ansible-playbook playbooks/parallel-deploy.yml --syntax-check
+ansible-playbook playbooks/browser-nodes.yml --syntax-check
 ansible-playbook playbooks/parallel-deploy.yml --list-tasks   # confirm the 8-play structure/tags without connecting anywhere
 
 # dry run against a real host -- proves inventory/connectivity/templating

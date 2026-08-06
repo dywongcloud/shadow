@@ -45,3 +45,18 @@ ansible_python_interpreter=/usr/bin/python3
 # The control-plane owner chain (comma-separated hive_name values, most-
 # preferred first). See crates/hive-cloud/src/cluster.rs::control_plane_owner.
 hive_cp_owner_chain=fc-example1,fc-example2,fc-example3
+
+# Hosts running ONE headless browser node each (ansible/playbooks/browser-nodes.yml,
+# roles/hive_browser_node). A browser node is the /run-node page's worker --
+# crates/hive-browser's wasm BrowserNode over iroh QUIC via a WSS relay --
+# running unattended under headless Chromium, capped by systemd so it can never
+# compete with the hive-node process on the same box.
+#
+# Membership is deliberately NARROW and asserted twice (the playbook checks this
+# group, the role checks hive_browser_node_allowed in its defaults), because the
+# node consumes real memory/CPU on a machine whose actual job is the platform.
+# One host per REGION is the intended shape: donor capacity concentrated in one
+# region is not capacity, it is a correlated failure.
+[browser_nodes]
+va-example
+sj-example

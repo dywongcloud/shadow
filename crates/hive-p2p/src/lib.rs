@@ -749,8 +749,55 @@ pub async fn write_raw_datagram<W: AsyncWrite + Unpin>(
 /// Serialize this endpoint's dialable address (direct socket addrs + relay url) to
 /// JSON, so peers can learn it via gossip and dial directly — no DNS/relay
 /// discovery round-trip required.
+///
+/// The advertised set is AUGMENTED with this node's publicly-routable address when
+/// one is configured (see [`configured_public_addr`]). Without that augmentation the
+/// blob carries only what iroh discovered from its own sockets, which on a cloud VM
+/// behind 1:1 NAT is the PRIVATE interface address — `10.0.0.x:11204`, unroutable
+/// from any other region. Measured on the live fleet: the leader's peer book held 72
+/// private `10.x` QUIC addresses against 12 public ones (and those 12 were the relay
+/// port, not the QUIC port), so EVERY direct dial had an unreachable target and the
+/// whole mesh was pinned to the relay fallback. Roughly half of all node pairs then
+/// failed both probe and gossip, and the health loop withdrew live nodes from client
+/// DNS and placement.
+///
+/// This does not REPLACE the discovered addresses, it adds to them: the private
+/// entries stay valid for same-VPC peers, and the relay entry stays as the fallback
+/// for nodes with no inbound reachability at all.
 pub fn addr_json(ep: &Endpoint) -> Option<String> {
-    serde_json::to_string(&ep.addr()).ok()
+    let mut addr = ep.addr();
+    if let Some(sa) = configured_public_addr() {
+        addr.addrs.insert(iroh::TransportAddr::Ip(sa));
+    }
+    serde_json::to_string(&addr).ok()
+}
+
+/// This node's publicly-dialable QUIC address, from `HIVE_PUBLIC_IP` +
+/// `HIVE_IROH_PORT`, or `None` when either is unset/unusable.
+///
+/// BOTH are required and neither is inferable. `HIVE_PUBLIC_IP` is the address
+/// operators already configure for client DNS (a cloud VM cannot read its own
+/// external IP off an interface), and the port must be the PINNED one — an
+/// ephemeral bind port changes on every restart, so publishing it would advertise
+/// an address that goes stale the moment the process restarts, which is worse than
+/// publishing nothing. Loopback/unspecified addresses are rejected: advertising
+/// those tells peers to dial themselves.
+fn configured_public_addr() -> Option<std::net::SocketAddr> {
+    let ip: std::net::IpAddr = std::env::var("HIVE_PUBLIC_IP")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        return None;
+    }
+    let port: u16 = std::env::var("HIVE_IROH_PORT")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|p| *p != 0)?;
+    Some(std::net::SocketAddr::new(ip, port))
 }
 
 /// Extract the iroh `EndpointId` (cryptographic node identity, as a string) from an

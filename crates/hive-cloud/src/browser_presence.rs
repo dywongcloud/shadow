@@ -7,6 +7,19 @@
 //! location: coordinates are quantized server-side regardless of what a
 //! client claims, because a client-only quantization step is trivially
 //! bypassed by a direct API call.
+//!
+//! Two identity facts on every record are derived SERVER-SIDE and are never
+//! client input, the same discipline as `browser_admission`'s capabilities:
+//!
+//! * [`node_name`] — the browser peer's own map/legend identity, a pure
+//!   function of its PROVEN endpoint id (the QUIC public key the admission
+//!   was minted against). Stable across reconnects of the same identity,
+//!   short enough to render under a cube, and prefixed `bn-` so it can never
+//!   be mistaken for a fleet node name.
+//! * `shard_eligible` — whether this peer may hold fragments of GLOBAL
+//!   platform state (`browser_db`'s shard planner). Stamped from the
+//!   authenticated caller's `platform_admin` claim at upsert; a browser can
+//!   no more assert it than it can assert its own admission.
 
 use axum::{
     extract::{Path, State},
@@ -36,6 +49,92 @@ const PRESENCE_TTL_SECS: u64 = 90;
 const TOMBSTONE_RETENTION_MS: u64 = 24 * 60 * 60 * 1_000;
 const VALID_STATES: [&str; 4] = ["starting", "online", "degraded", "suspended"];
 
+/// Domain separator for [`node_name`]'s digest. Prefixing the endpoint id
+/// keeps the naming hash from ever colliding with any other digest the
+/// platform computes over the same id.
+const NODE_NAME_DOMAIN: &str = "hive-browser-node-name-v1\u{0}";
+
+/// The `bn-` prefix is load-bearing, not decoration: fleet node names are
+/// operator-chosen (`fc-virginia`, `sj2`, `node-b`) and a browser peer's name
+/// must be unmistakable on the same diagram, in the same legend, and in the
+/// same log line. Nothing else in the platform mints a name in this shape.
+const NODE_NAME_PREFIX: &str = "bn-";
+
+/// 32 × 32 = 1024 mnemonic pairs, × 65536 tags = ~67M display names. Kept
+/// short (≤7 chars each) so `bn-<adj>-<noun>-<tag>` still fits under a cube
+/// on the constellation. Both lists are FIXED: changing an entry renames
+/// every browser that hashed to it, which breaks exactly the "stable across
+/// reconnects" property this exists for. Append only.
+const NAME_ADJECTIVES: [&str; 32] = [
+    "amber", "azure", "brisk", "calm", "clear", "coral", "crisp", "dusk", "ember", "fern", "flint",
+    "frost", "gold", "ivory", "jade", "lilac", "lunar", "mint", "noble", "ochre", "olive", "onyx",
+    "opal", "pearl", "plum", "quiet", "rapid", "rust", "sage", "slate", "solar", "teal",
+];
+const NAME_NOUNS: [&str; 32] = [
+    "adder", "badger", "bison", "cedar", "crane", "dove", "eagle", "falcon", "finch", "gull",
+    "hawk", "heron", "ibis", "koi", "lark", "lynx", "marlin", "moth", "otter", "owl", "panda",
+    "pike", "quail", "raven", "robin", "seal", "shrew", "stork", "swift", "tern", "vole", "wren",
+];
+
+/// The stable, human-readable map identity of a browser peer, derived only
+/// from its PROVEN endpoint id (`bn-teal-otter-9c1f`).
+///
+/// Properties this must keep, in the order they matter:
+///
+/// * **Server-derived.** The endpoint id is the QUIC public key the admission
+///   was minted against, so the name is a function of proven identity — a
+///   browser cannot pick, spoof or squat one, and there is no field on the
+///   wire for it to try.
+/// * **Stable across reconnects.** Same identity in, same name out, forever;
+///   there is no clock, no counter and no membership input.
+/// * **Distinguishable from a fleet node.** [`NODE_NAME_PREFIX`] plus the
+///   fixed three-part shape.
+/// * **Short.** ≤ 22 characters, renderable under a 9px cube.
+///
+/// It is a DISPLAY name, never an identity key: two endpoint ids can in
+/// principle land on the same mnemonic (birthday-bounded at ~67M), so every
+/// record still carries `endpoint_id` and every lookup still keys on it. The
+/// tag is taken from the endpoint id's own leading hex where possible — an
+/// operator reading `bn-teal-otter-9c1f` off the map can eyeball-match it
+/// against `9c1f…` in the admissions table — and padded from the digest only
+/// for an id too short or too exotic to supply four.
+pub fn node_name(endpoint_id: &str) -> String {
+    let digest = fluid_core::browser_source_digest(&format!("{NODE_NAME_DOMAIN}{endpoint_id}"));
+    let nibble = |range: std::ops::Range<usize>| -> usize {
+        usize::from_str_radix(digest.get(range).unwrap_or("0"), 16).unwrap_or(0)
+    };
+    let adjective = NAME_ADJECTIVES[nibble(0..4) % NAME_ADJECTIVES.len()];
+    let noun = NAME_NOUNS[nibble(4..8) % NAME_NOUNS.len()];
+    let mut tag: String = endpoint_id
+        .chars()
+        .flat_map(|c| c.to_lowercase())
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(4)
+        .collect();
+    if tag.len() < 4 {
+        tag.extend(digest.chars().take(4 - tag.len()));
+    }
+    format!("{NODE_NAME_PREFIX}{adjective}-{noun}-{tag}")
+}
+
+/// Repair a record on the way OUT of the store: fill `node_name` when it is
+/// empty (a record written by a pre-`node_name` leader, or one adopted from
+/// such a peer). Applied on every read path — HTTP list, single get, mesh
+/// list, shard membership — so no consumer ever has to special-case an
+/// anonymous browser peer.
+///
+/// This is a recomputation, not a fallback: the name is a pure function of
+/// `endpoint_id`, so the value written here is exactly the value the issuing
+/// node would have written. `shard_eligible` is deliberately NOT repaired —
+/// it encodes an authorization decision made against a live session, and
+/// there is nothing on the record to re-derive it from.
+fn hydrate(mut record: BrowserPresence) -> BrowserPresence {
+    if record.node_name.is_empty() {
+        record.node_name = node_name(&record.endpoint_id);
+    }
+    record
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BrowserPresence {
     pub endpoint_id: String,
@@ -43,6 +142,27 @@ pub struct BrowserPresence {
     pub subject: String,
     /// Tenant-scoped display token — never the raw platform identity.
     pub display_label: String,
+    /// The peer's own node identity on the constellation ([`node_name`]).
+    ///
+    /// `serde(default)` for the rollout, and EMPTY is repaired rather than
+    /// tolerated: [`hydrate`] recomputes it on every read, so a record
+    /// replicated by a pre-upgrade leader still renders a name. Recomputing
+    /// is not a guess — the name is a pure function of `endpoint_id`, which
+    /// the record already carries, so the repaired value is bit-identical to
+    /// what the issuing node would have written.
+    #[serde(default)]
+    pub node_name: String,
+    /// May this peer hold fragments of GLOBAL platform state
+    /// (`browser_db::shard_plan`)? Stamped from the authenticated caller's
+    /// `platform_admin` claim at upsert — never from the request body.
+    ///
+    /// `false` is the safe default in every direction: a pre-upgrade record
+    /// carries no field and is therefore ineligible (absent capability, never
+    /// wrong capability), and a non-admin tenant's browser is ineligible by
+    /// construction. See `browser_db`'s shard-trust block for why the bar is
+    /// platform-admin today and what would have to exist to lower it.
+    #[serde(default)]
+    pub shard_eligible: bool,
     #[serde(default)]
     pub lat: Option<f64>,
     #[serde(default)]
@@ -146,7 +266,36 @@ impl BrowserPresenceStore {
             .values()
             .filter(|record| record.tenant == tenant && record.expires_ms > now)
             .cloned()
+            .map(hydrate)
             .collect()
+    }
+
+    /// Every live record eligible to hold GLOBAL state fragments, ACROSS
+    /// tenants — the shard planner's membership set
+    /// (`browser_db::shard_members`).
+    ///
+    /// Deliberately not tenant-filtered: platform state is not a tenant's
+    /// data, so its shard membership is fleet-wide. What keeps that sound is
+    /// the `shard_eligible` gate, which only a `platform_admin` session can
+    /// set, plus the caller's own live-admission re-check. `starting`,
+    /// `degraded` and `suspended` are all excluded — a peer that is not
+    /// serving right now must not be planned against, or every transient
+    /// blip reshuffles the map. Sorted by endpoint id so every node derives
+    /// the identical membership list from the identical replicated state.
+    pub(crate) fn shard_candidates(&self, now: u64) -> Vec<BrowserPresence> {
+        let mut out: Vec<BrowserPresence> = self
+            .inner
+            .lock()
+            .active
+            .values()
+            .filter(|record| {
+                record.shard_eligible && record.state == "online" && record.expires_ms > now
+            })
+            .cloned()
+            .map(hydrate)
+            .collect();
+        out.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        out
     }
 
     fn get(&self, tenant: &str, endpoint_id: &str, now: u64) -> Option<BrowserPresence> {
@@ -156,6 +305,7 @@ impl BrowserPresenceStore {
             .get(endpoint_id)
             .filter(|record| record.tenant == tenant && record.expires_ms > now)
             .cloned()
+            .map(hydrate)
     }
 
     fn put(&self, mut record: BrowserPresence) -> BrowserPresence {
@@ -382,11 +532,20 @@ async fn upsert_presence(
         tenant,
         request.endpoint_id.get(..8).unwrap_or(&request.endpoint_id)
     );
+    // Both identity facts are computed HERE, from the proven endpoint id and
+    // the verified session — never from `request`, which carries no field for
+    // either. `platform_admin` is independently derived by the token minter
+    // against this backend's own `admin_emails` set (see `admin::mint_token`),
+    // so it is not a client assertion either.
+    let node_name = node_name(&request.endpoint_id);
+    let shard_eligible = claims.platform_admin;
     let record = BrowserPresence {
         endpoint_id: request.endpoint_id,
         tenant,
         subject: claims.sub,
         display_label,
+        node_name,
+        shard_eligible,
         lat: located.map(|(lat, _, _)| lat),
         lon: located.map(|(_, lon, _)| lon),
         accuracy_km: located.map(|(_, _, accuracy)| accuracy),

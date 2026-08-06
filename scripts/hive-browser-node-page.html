@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>shadw headless browser node</title>
+</head>
+<body>
+<pre id="log">booting…</pre>
+<script type="module">
+/* Headless host page for the fleet-run browser node (ansible role
+ * `hive_browser_node`). Single canonical source is
+ * scripts/hive-browser-node-page.html; the role copies it to the node.
+ *
+ * WHY NOT JUST LOAD /run-node
+ * ---------------------------
+ * The dashboard's /run-node page is Clerk-gated by ui/proxy.ts's middleware
+ * (it is not in `isPublic`), so a headless browser is redirected to /sign-in
+ * -- and the only way past that is a real human credential, which is exactly
+ * what must never sit in a unit file. This page is the same CLIENT of the same
+ * SharedWorker contract instead: it does the small, well-defined part of
+ * ui/lib/use-run-node.ts that a server actually needs -- own the worker, keep
+ * it reported-visible, and republish presence inside the backend's 90s TTL --
+ * against the node-local broker origin, which mints the session server-side.
+ *
+ * IT RUNS THE SHIPPED WORKER VERBATIM. /run-node-worker.js and
+ * /browser-node/** are the exact files from ui/public/, byte-identical; the
+ * entire BrowserNode / admission / artifact-pin / db-lane implementation is
+ * theirs, not a reimplementation. This file only speaks the documented
+ * control protocol to it.
+ *
+ * Dedicated Worker, not SharedWorker, on purpose: the worker script's own
+ * `SharedWorkerGlobalScope` check takes the `connectPort(self)` branch, which
+ * is the SAME production code path -- and in a DedicatedWorkerGlobalScope the
+ * `Worker` constructor exists, so the db lane nests directly instead of
+ * needing this page to broker its sqlite worker. One page, one node, no
+ * cross-tab election to lose.
+ */
+
+const log = (msg) => {
+  const line = `${new Date().toISOString()} ${msg}`;
+  document.getElementById("log").textContent = line;
+  console.log(line);
+};
+
+const PRESENCE_REFRESH_MS = 45_000;   // well inside the backend's 90s presence TTL
+const HEARTBEAT_MS = 15_000;          // supervisor liveness -> broker /healthz
+const REMINT_MS = 120_000;            // inside HIVE_BROWSER_SESSION_MAX_AGE_SECS (300s)
+const VISIBILITY_MS = 30_000;         // re-assert foreground; a headless page can be
+                                      // reported occluded, which flips the worker to
+                                      // "suspended" and mislabels a live node
+
+let status = { lifecycle: "stopped", admission: "none", endpointId: null, relay: null, serving: false, lastError: null };
+let presenceOk = false;
+
+/** presenceState(): identical mapping to ui/lib/run-node-client.ts -- the two
+ *  must agree about what "publishable" means or a live node silently ages off
+ *  the constellation. */
+function presenceState(lifecycle) {
+  if (lifecycle === "starting") return "starting";
+  if (lifecycle === "online") return "online";
+  if (lifecycle === "degraded" || lifecycle === "error") return "degraded";
+  if (lifecycle === "suspended") return "suspended";
+  return null;
+}
+
+async function mint(team) {
+  try {
+    const r = await fetch("/api/token", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ team }),
+    });
+    return r.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function publishPresence(cfg) {
+  const state = presenceState(status.lifecycle);
+  if (!status.endpointId || !state) {
+    presenceOk = false;
+    return;
+  }
+  // The broker resolves coordinates asynchronously on a host with no declared
+  // hive_geo (it asks the platform where IT thinks this machine is), so the
+  // /config read at boot can legitimately have answered null. Re-read while
+  // still unlocated -- one loopback GET per 45s tick, and it stops the moment
+  // a fix lands. Without this the node publishes unplaced FOREVER on exactly
+  // the hosts the fallback exists for.
+  if (cfg.lat === null || cfg.lon === null) {
+    try {
+      const fresh = await (await fetch("/config", { cache: "no-store" })).json();
+      if (fresh.lat !== null && fresh.lon !== null) {
+        cfg.lat = fresh.lat;
+        cfg.lon = fresh.lon;
+        log(`geo resolved (${fresh.geoSource}) lat=${fresh.lat} lon=${fresh.lon}`);
+      }
+    } catch {
+      /* the next tick retries; an unlocated presence record is still valid */
+    }
+  }
+  try {
+    const r = await fetch("/cloud/v1/browser/presence", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "content-type": "application/json", "x-hive-team": cfg.team },
+      body: JSON.stringify({
+        endpoint_id: status.endpointId,
+        lat: cfg.lat,
+        lon: cfg.lon,
+        relay_hint: status.relay || "",
+        state,
+      }),
+    });
+    if (r.status === 401) {
+      // The presence write shares the admission's freshness bar; a stale
+      // cookie is recoverable, exactly as the worker's own callApi treats it.
+      await mint(cfg.team);
+      presenceOk = false;
+      return;
+    }
+    presenceOk = r.ok;
+  } catch {
+    presenceOk = false; // the next tick recovers; the TTL is 2x this interval
+  }
+}
+
+async function heartbeat() {
+  try {
+    await fetch("/heartbeat", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...status, presenceOk }),
+    });
+  } catch {
+    /* the broker's own staleness detector is the backstop */
+  }
+}
+
+async function main() {
+  const cfg = await (await fetch("/config", { cache: "no-store" })).json();
+  log(`config team=${cfg.team} scope=${cfg.scope} serveMode=${cfg.serveMode} abi=${cfg.abi}`);
+
+  // Mint BEFORE the worker's first admission so the cold path costs no 401.
+  if (!(await mint(cfg.team))) log("initial mint failed — the worker's own re-mint will retry");
+
+  const worker = new Worker(`/run-node-worker.js?abi=${cfg.abi}`, { type: "module" });
+  worker.onerror = (e) => log(`worker error: ${e && e.message ? e.message : "unknown"}`);
+  worker.onmessage = (e) => {
+    const msg = e.data;
+    if (msg && msg.type === "status") {
+      status = msg.status;
+      log(`lifecycle=${status.lifecycle} admission=${status.admission} serving=${!!status.serving} endpoint=${(status.endpointId || "").slice(0, 12)} ${status.lastError ? "err=" + status.lastError : ""}`);
+    } else if (msg && msg.type === "dbWorkerRequest") {
+      // Defensive: in this dedicated-worker context the db lane nests its own
+      // sqlite worker and never asks. Answering anyway costs nothing and keeps
+      // the documented broker protocol satisfied if that ever changes.
+      try {
+        const w = new Worker("/browser-node/sqlite/sqlite-worker.js", { type: "module" });
+        const chan = new MessageChannel();
+        chan.port1.onmessage = (ev) => w.postMessage(ev.data);
+        w.onmessage = (ev) => chan.port1.postMessage(ev.data);
+        worker.postMessage({ type: "dbWorkerPort", requestId: msg.requestId }, [chan.port2]);
+      } catch {
+        /* the worker's own timeout surfaces an honest status.db error */
+      }
+    }
+  };
+
+  /* Reported foreground, forever. A headless page is occluded by definition,
+   * and the worker flips online -> "suspended" the moment no connected port
+   * claims visibility -- which would mislabel a perfectly live node on the
+   * constellation. Deliberately never sends `unloading`: that path makes the
+   * worker run stop(), whose admission DELETE writes a 10-minute relay-denylist
+   * entry for this endpoint id. On a service that recycles daily by design,
+   * shutting down through the revoke path is strictly worse than letting the
+   * lease lapse -- the same persistent identity re-admits on restart, and a
+   * lapsed lease needs no denylist reconciliation to do it. */
+  const assertForeground = () => worker.postMessage({ type: "visibility", visible: true });
+  assertForeground();
+  worker.postMessage({ type: "network", online: true });
+
+  worker.postMessage({
+    type: "start",
+    relay: cfg.relay,
+    deployment: cfg.deployment || "",
+    fn: cfg.fn || "",
+    digest: "",              // server-derived; the worker never trusts a client digest
+    serveMode: cfg.serveMode,
+    scope: cfg.scope,
+    team: cfg.team,
+  });
+
+  setInterval(assertForeground, VISIBILITY_MS);
+  setInterval(() => mint(cfg.team), REMINT_MS);
+  setInterval(() => publishPresence(cfg), PRESENCE_REFRESH_MS);
+  setInterval(heartbeat, HEARTBEAT_MS);
+  publishPresence(cfg);
+  heartbeat();
+}
+
+main().catch((e) => log(`fatal: ${e && e.message ? e.message : e}`));
+</script>
+</body>
+</html>

@@ -1,0 +1,128 @@
+---
+# Headless browser node: ONE per host, on the five hosts in [browser_nodes].
+# See roles/hive_browser_node/README.md for the auth + caps reasoning.
+
+# ---------- roster gate ----------
+# The exact hive_name set this role is authorized to run against. The role
+# asserts membership per host, so a stray --limit or a mistyped group can never
+# quietly start a browser node on a sixth machine. Widen this list (not the
+# assert) when the fleet genuinely grows.
+hive_browser_node_allowed:
+  - fc-bangkok
+  - fc-sanjose
+  - fc-virginia
+  - fc-saopaulo
+  - fc-frankfurt
+
+# ---------- layout ----------
+hive_browser_node_root: /opt/hive-browser-node
+hive_browser_node_state_dir: /var/lib/hive/browser-node
+hive_browser_node_user: hive-browser
+hive_browser_node_group: hive-browser
+hive_browser_node_port: 3009
+hive_browser_node_token_file: /etc/hive/browser-node.internal-token
+hive_browser_node_env_file: /etc/hive/browser-node.env
+
+# ---------- browser ----------
+# Google Chrome stable from Google's own signed RPM repo. Chosen over EPEL
+# `chromium` because (a) the fleet is TencentOS/Rocky and EPEL chromium is not
+# consistently available or current there, (b) this repo is first-party and
+# GPG-signed, and (c) `--headless=new` is the full browser -- SharedWorker,
+# dedicated Worker, IndexedDB, OPFS, WebCrypto, WebSocket -- where the old
+# `headless_shell` image drops several of exactly those. Point
+# hive_browser_node_chrome_package/_bin at a distro chromium to use one instead.
+hive_browser_node_chrome_package: google-chrome-stable
+hive_browser_node_chrome_bin: /usr/bin/google-chrome-stable
+hive_browser_node_manage_chrome_repo: true
+hive_browser_node_chrome_repo_baseurl: "https://dl.google.com/linux/chrome/rpm/stable/{{ ansible_architecture }}"
+hive_browser_node_chrome_repo_gpgkey: "https://dl.google.com/linux/linux_signing_key.pub"
+
+# Chromium's namespace sandbox stays ON (the role verifies unprivileged user
+# namespaces exist and fails loudly otherwise). Only set this true with a
+# deliberate, written reason: tenant browser functions are untrusted JS by
+# design, and this host also runs hive-node.
+hive_browser_node_no_sandbox: false
+# NoNewPrivileges blocks only the LEGACY setuid `chrome-sandbox` fallback; the
+# namespace sandbox Chromium actually uses here is unaffected by it. Left true
+# so a host without user namespaces fails with an explicit sandbox error rather
+# than silently running unsandboxed.
+hive_browser_node_no_new_privileges: true
+
+# ---------- node identity / what it serves ----------
+# The tenant whose browser-eligible deployments this node serves. "personal" is
+# the platform owner's own namespace (ui/app/api/token/route.ts maps the owner
+# to it); set an org slug to donate capacity to a team instead.
+hive_browser_node_team: personal
+# "member" is the least-privilege role that can hold a TEAM-scope admission.
+# Never "owner"/"admin" here: those are the roles browser_admission.rs's
+# `may_serve_public` accepts, and a fleet-run donor must not be able to serve a
+# deployment to the anonymous public just because a config flipped.
+hive_browser_node_role: member
+hive_browser_node_scope: team
+# "auto" = the fleet derives this tenant's whole browser-eligible set on every
+# renewal and this node never names what lands in it. "none" = capacity only.
+hive_browser_node_serve_mode: auto
+# Optional explicit pin (both must be set together); empty = the automatic set.
+hive_browser_node_deployment: ""
+hive_browser_node_function: ""
+
+# WSS relays the browser endpoint homes on. Defaults to the same three real
+# relays ui/lib/use-run-node.ts ships as DEFAULT_RELAYS; the https :3343 form is
+# mandatory (the plaintext :3340 socket is captive-portal-only once TLS is on --
+# see inventory/hosts.ini).
+hive_browser_node_relays: >-
+  https://fc-sanjose.relay.shadw.app:3343,https://fc-bangkok.relay.shadw.app:3343,https://fc-virginia.relay.shadw.app:3343
+
+# ---------- resource caps ----------
+# ABSOLUTE, fact-derived, and clamped -- never a bare percentage. hive-node
+# runs with NO caps at all (roles/hive_platform/templates/hive-node.service.j2
+# sets only LimitNOFILE), so every bound here has to be one the platform
+# process can survive being starved of. Both ends of the clamp matter: 1/16th
+# of a 2.2 TB host would hand the browser 140 GB, and 1/16th of a 4 GB host
+# would hand it 256 MB (below Chromium's own floor, so it would OOM-loop).
+#
+#   RAM   : min(2048, max(768, MemTotal/16)) MiB hard, 75% of that as the soft
+#           MemoryHigh so the kernel throttles+reclaims BEFORE it kills
+#   CPU    : min(200%, max(50%, vCPU*100/16)) -- i.e. at most 2 cores' worth,
+#           at most 1/16th of the box, never less than half a core (below that
+#           a wasm cold start takes minutes and every admission times out)
+#   Tasks  : 384 -- a headless Chromium with one renderer runs ~120-150 threads;
+#           this is real headroom without leaving room for a fork bomb
+hive_browser_node_memory_max_mb: "{{ [[(ansible_memtotal_mb | int) // 16, 768] | max, 2048] | min }}"
+hive_browser_node_memory_high_mb: "{{ ((hive_browser_node_memory_max_mb | int) * 75) // 100 }}"
+hive_browser_node_cpu_quota_pct: "{{ [[((ansible_processor_vcpus | int) * 100) // 16, 50] | max, 200] | min }}"
+hive_browser_node_tasks_max: 384
+# V8's own heap ceiling, kept WELL under the cgroup bound so V8 GCs under its
+# own pressure instead of the cgroup OOM-killing the process (a GC pause is
+# recoverable; a kill loses the admission and the endpoint identity's session).
+# 40%, not "most of it", because --max-old-space-size bounds ONE isolate's JS
+# old space and three other things live in the same cgroup: the browser +
+# network + utility processes (~200-300 MiB), and the wasm linear memory that
+# BrowserNode and the QuickJS lane actually run in, which is not V8 old space
+# at all and is therefore invisible to this flag.
+hive_browser_node_js_heap_mb: "{{ ((hive_browser_node_memory_max_mb | int) * 40) // 100 }}"
+# Relative shares, only consulted when the box is actually saturated. hive-node
+# runs at the default CPUWeight/IOWeight of 100, so 20 gives it a 5:1 share.
+hive_browser_node_cpu_weight: 20
+hive_browser_node_io_weight: 20
+# The kernel OOM killer picks the highest score first: hive-node sits at the
+# default 0, so under true global pressure the browser dies and the platform
+# lives. This is the single most important cap on this page.
+hive_browser_node_oom_score_adjust: 700
+hive_browser_node_nice: 10
+# Daily recycle (randomized so five nodes never restart together) bounds
+# long-run renderer growth. Costs one presence gap well under the 90s TTL.
+hive_browser_node_runtime_max_sec: 86400
+hive_browser_node_runtime_randomized_extra_sec: 3600
+
+# Broker caps: a ~200-line loopback HTTP server. Sized so a runaway broker is
+# also incapable of disturbing hive-node.
+hive_browser_node_broker_memory_max_mb: 192
+hive_browser_node_broker_cpu_quota_pct: 25
+hive_browser_node_broker_tasks_max: 32
+
+# ---------- supervision ----------
+hive_browser_node_health_poll_secs: 30
+hive_browser_node_health_fail_limit: 4     # 4 x 30s = a 2-minute dead-node budget
+hive_browser_node_heartbeat_stale_ms: 75000
+hive_browser_node_boot_grace_ms: 300000

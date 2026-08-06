@@ -1,0 +1,351 @@
+---
+# Install + run ONE headless browser node on this host, capped so it can never
+# compete with hive-node. Idempotent throughout: a re-run replaces the bundle
+# and the units in place and restarts only what actually changed.
+
+# ---------------------------------------------------------------------------
+# 0. Gates. Every one of these is a fail-fast, not a skip -- a browser node
+#    that half-installs is worse than one that never started.
+# ---------------------------------------------------------------------------
+- name: "Gate: this host is on the authorized browser-node roster"
+  ansible.builtin.assert:
+    that: hive_name in hive_browser_node_allowed
+    fail_msg: >-
+      {{ hive_name }} is not in hive_browser_node_allowed
+      ({{ hive_browser_node_allowed | join(', ') }}). A browser node consumes
+      real memory/CPU on a host that is also running the platform, so the
+      roster is an explicit allowlist, not a --limit convention.
+
+- name: "Gate: dnf-based distro (matches roles/prerequisites' own assert)"
+  ansible.builtin.assert:
+    that: ansible_pkg_mgr == "dnf"
+    fail_msg: >-
+      This role's package tasks are dnf-based, matching the rest of this repo.
+      Porting to apt means swapping the dnf task below and the Chrome repo task
+      for their Debian equivalents; nothing else here is package-manager aware.
+
+# The caps are computed from facts, so a host too small for the FLOOR (768 MiB)
+# would get a cap worth >25% of its RAM. That is not a browser node, that is a
+# second workload competing with the platform.
+- name: "Gate: the host is large enough for a capped browser node"
+  ansible.builtin.assert:
+    that:
+      - (hive_browser_node_memory_max_mb | int) * 4 <= (ansible_memtotal_mb | int)
+      - (ansible_processor_vcpus | int) >= 2
+    fail_msg: >-
+      {{ inventory_hostname }} has {{ ansible_memtotal_mb }} MiB /
+      {{ ansible_processor_vcpus }} vCPU. The computed cap
+      ({{ hive_browser_node_memory_max_mb }} MiB) would be more than a quarter
+      of this host's RAM — refusing rather than starving hive-node.
+
+- name: Read the unprivileged-user-namespace limit (Chromium's sandbox needs it)
+  ansible.builtin.command: cat /proc/sys/user/max_user_namespaces
+  register: hive_bn_userns
+  changed_when: false
+  failed_when: false
+
+- name: "Gate: unprivileged user namespaces are available (or the sandbox is explicitly waived)"
+  ansible.builtin.assert:
+    that:
+      - hive_browser_node_no_sandbox | bool
+        or ((hive_bn_userns.stdout | default('0') | trim | int) > 0)
+    fail_msg: >-
+      user.max_user_namespaces is 0 on {{ inventory_hostname }}, so Chromium's
+      namespace sandbox cannot start and the browser would refuse to launch.
+      Fix it properly —
+        sysctl -w user.max_user_namespaces=15000 (and a /etc/sysctl.d drop-in)
+      — or, only with a written reason, re-run with
+      -e hive_browser_node_no_sandbox=true. Never the latter silently: tenant
+      browser functions are untrusted JS by design and this host also runs
+      hive-node.
+
+- name: "Gate: the browser-node bundle exists in the control host's checkout"
+  ansible.builtin.stat:
+    path: "{{ playbook_dir }}/../../ui/public/browser-node/pkg/hive_browser_bg.wasm"
+  delegate_to: localhost
+  become: false
+  register: hive_bn_wasm
+
+- name: "Gate: fail loudly if the wasm bundle is missing locally"
+  ansible.builtin.assert:
+    that: hive_bn_wasm.stat.exists
+    fail_msg: >-
+      ui/public/browser-node/pkg/hive_browser_bg.wasm is missing from this
+      checkout. That bundle is committed (see `git ls-files
+      ui/public/browser-node`); a shallow/partial checkout cannot deploy a
+      browser node.
+
+# ---------------------------------------------------------------------------
+# 1. Browser
+# ---------------------------------------------------------------------------
+- name: Configure Google's signed Chrome RPM repository
+  ansible.builtin.yum_repository:
+    name: google-chrome
+    description: google-chrome
+    baseurl: "{{ hive_browser_node_chrome_repo_baseurl }}"
+    gpgkey: "{{ hive_browser_node_chrome_repo_gpgkey }}"
+    gpgcheck: true
+    enabled: true
+  when: hive_browser_node_manage_chrome_repo | bool
+
+- name: Install the headless browser + the fonts it needs to render at all
+  ansible.builtin.dnf:
+    name:
+      - "{{ hive_browser_node_chrome_package }}"
+      # Chrome's RPM declares no font dependency; with zero fonts installed it
+      # logs fontconfig errors on every layout. liberation is the small,
+      # metric-compatible default the rest of the fleet already carries.
+      - liberation-fonts
+    state: present
+    # `curl` is deliberately NOT listed: EL10 images ship `curl-minimal`, and
+    # asking dnf for `curl` there forces a package SWAP on a live host to gain
+    # nothing (curl-minimal already provides /usr/bin/curl, which is all the
+    # supervisor uses). The binary is asserted below instead.
+    # Chrome pulls a substantial X/GTK dependency closure even for headless;
+    # that is inherent to the real browser and is why this is `present` (never
+    # `latest`) — see hive_browser_node_chrome_package to pin a version.
+  notify: restart hive-browser-node
+
+- name: Resolve the installed browser binary
+  ansible.builtin.stat:
+    path: "{{ hive_browser_node_chrome_bin }}"
+  register: hive_bn_chrome
+
+- name: "Gate: the configured browser binary actually exists"
+  ansible.builtin.assert:
+    that: hive_bn_chrome.stat.exists and hive_bn_chrome.stat.executable
+    fail_msg: >-
+      {{ hive_browser_node_chrome_bin }} is missing after installing
+      {{ hive_browser_node_chrome_package }} — set hive_browser_node_chrome_bin
+      to the real path (e.g. /usr/bin/chromium-browser for a distro build).
+
+- name: Record the installed browser version (drift is a real CVE surface)
+  ansible.builtin.command: "{{ hive_browser_node_chrome_bin }} --version"
+  register: hive_bn_chrome_version
+  changed_when: false
+
+- name: Show the browser version this host will run
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} ({{ hive_name }}): {{ hive_bn_chrome_version.stdout | trim }}"
+
+- name: "Gate: /usr/bin/curl exists (the supervisor's health probe)"
+  ansible.builtin.stat:
+    path: /usr/bin/curl
+  register: hive_bn_curl
+  failed_when: not hive_bn_curl.stat.exists
+
+- name: Verify node >= 18 (the broker uses the global fetch)
+  ansible.builtin.shell: |
+    set -e
+    PATH=/usr/local/bin:/usr/bin:/bin
+    node -e 'if (Number(process.versions.node.split(".")[0]) < 18) { console.error("node " + process.versions.node + " < 18"); process.exit(1) }'
+  register: hive_bn_node
+  changed_when: false
+
+# ---------------------------------------------------------------------------
+# 2. Service account + layout
+# ---------------------------------------------------------------------------
+- name: Create the browser-node system group
+  ansible.builtin.group:
+    name: "{{ hive_browser_node_group }}"
+    system: true
+
+- name: Create the browser-node system user (no shell, no login)
+  ansible.builtin.user:
+    name: "{{ hive_browser_node_user }}"
+    group: "{{ hive_browser_node_group }}"
+    system: true
+    shell: /sbin/nologin
+    home: "{{ hive_browser_node_state_dir }}"
+    create_home: false
+
+- name: Create the browser-node directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: "{{ item.owner }}"
+    group: "{{ item.group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ hive_browser_node_root }}", owner: root, group: root, mode: "0755" }
+    - { path: "{{ hive_browser_node_root }}/bin", owner: root, group: root, mode: "0755" }
+    - { path: "{{ hive_browser_node_root }}/www", owner: root, group: root, mode: "0755" }
+    # The ONLY writable path the units get (ReadWritePaths=): Chromium's
+    # profile, its bounded disk cache, and the worker's IndexedDB/OPFS —
+    # which is where the node's persistent ed25519 identity lives, so wiping
+    # this directory rotates the endpoint id.
+    - { path: "{{ hive_browser_node_state_dir }}", owner: "{{ hive_browser_node_user }}", group: "{{ hive_browser_node_group }}", mode: "0750" }
+    - { path: "{{ hive_browser_node_state_dir }}/profile", owner: "{{ hive_browser_node_user }}", group: "{{ hive_browser_node_group }}", mode: "0750" }
+    - { path: /etc/hive, owner: root, group: root, mode: "0755" }
+
+# ---------------------------------------------------------------------------
+# 3. Code + bundle. Single canonical sources in scripts/ and ui/public/ —
+#    copied, never forked (roles/prerequisites' hive-lockdown.sh convention).
+# ---------------------------------------------------------------------------
+- name: Install the session broker
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../scripts/hive-browser-node-broker.mjs"
+    dest: "{{ hive_browser_node_root }}/bin/hive-browser-node-broker.mjs"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart hive-browser-node-broker
+
+- name: Install the browser supervisor
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../scripts/hive-browser-node-run.sh"
+    dest: "{{ hive_browser_node_root }}/bin/hive-browser-node-run.sh"
+    owner: root
+    group: root
+    mode: "0755"
+  notify: restart hive-browser-node
+
+- name: Install the headless host page
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../scripts/hive-browser-node-page.html"
+    dest: "{{ hive_browser_node_root }}/www/index.html"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart hive-browser-node
+
+# The worker + wasm are shipped VERBATIM from ui/public/ so this node runs the
+# exact artifact the dashboard serves. Deliberately NOT read from
+# {{ hive_src_dir }}/ui/public: that copy only exists where the hive_ui role
+# has run, and its version is whatever the last UI deploy left behind — this
+# role must pin the bundle to its own run.
+- name: Install the run-node worker (verbatim from ui/public)
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../ui/public/run-node-worker.js"
+    dest: "{{ hive_browser_node_root }}/www/run-node-worker.js"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: restart hive-browser-node
+
+- name: Sync the browser-node bundle (wasm, identity, quickjs runtime, sqlite VFS)
+  ansible.posix.synchronize:
+    src: "{{ playbook_dir }}/../../ui/public/browser-node/"
+    dest: "{{ hive_browser_node_root }}/www/browser-node/"
+    delete: true
+    rsync_opts:
+      - "--exclude=*.d.ts"
+  notify: restart hive-browser-node
+
+# ---------------------------------------------------------------------------
+# 4. Credential. The internal token NEVER appears in a unit file: it lands in
+#    a root-only 0600 file that systemd's LoadCredential= reads as root and
+#    re-exposes to the broker (only) as a 0400 file in a private tmpfs. It is
+#    therefore absent from `systemctl show`, from `systemctl cat`, and from
+#    /proc/<pid>/environ of every process this host runs.
+# ---------------------------------------------------------------------------
+- name: Install the internal-token credential (root-only, never in a unit)
+  ansible.builtin.copy:
+    content: "{{ vault_hive_internal_token }}"
+    dest: "{{ hive_browser_node_token_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: restart hive-browser-node-broker
+
+- name: Template the non-secret broker/browser configuration
+  ansible.builtin.template:
+    src: browser-node.env.j2
+    dest: "{{ hive_browser_node_env_file }}"
+    owner: root
+    group: "{{ hive_browser_node_group }}"
+    mode: "0640"
+  notify: [restart hive-browser-node-broker, restart hive-browser-node]
+
+# ---------------------------------------------------------------------------
+# 5. Units
+# ---------------------------------------------------------------------------
+- name: Template the broker unit
+  ansible.builtin.template:
+    src: hive-browser-node-broker.service.j2
+    dest: /etc/systemd/system/hive-browser-node-broker.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: [reload systemd, restart hive-browser-node-broker]
+
+- name: Template the browser unit
+  ansible.builtin.template:
+    src: hive-browser-node.service.j2
+    dest: /etc/systemd/system/hive-browser-node.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: [reload systemd, restart hive-browser-node]
+
+- name: Flush handlers so the verification below sees the final state
+  ansible.builtin.meta: flush_handlers
+
+- name: Enable + start the broker
+  ansible.builtin.systemd:
+    name: hive-browser-node-broker
+    state: started
+    enabled: true
+    daemon_reload: true
+
+- name: Enable + start the browser node
+  ansible.builtin.systemd:
+    name: hive-browser-node
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# ---------------------------------------------------------------------------
+# 6. Verify the NODE, not the process. A running Chromium proves nothing; the
+#    broker only reports ok once the page heartbeat is fresh AND the worker
+#    reports a lifecycle it can actually serve from.
+# ---------------------------------------------------------------------------
+- name: Wait for the broker to answer on loopback
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ hive_browser_node_port }}/healthz"
+    status_code: [200, 503]
+  register: hive_bn_broker_up
+  retries: 15
+  delay: 2
+  until: hive_bn_broker_up.status in [200, 503]
+
+    # A 503 here is expected while the wasm cold-starts and the first admission
+    # round-trips, so it is an ACCEPTED status and the real bar lives in
+    # `until` -- otherwise the task fails on its first poll and the retry loop
+    # never gets to observe the node converging.
+- name: Wait for the browser node to reach lifecycle=online with a granted admission
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:{{ hive_browser_node_port }}/healthz"
+    status_code: [200, 503]
+    return_content: true
+  register: hive_bn_health
+  retries: 30
+  delay: 10
+  until:
+    - (hive_bn_health.json.lifecycle | default('')) in ['online', 'suspended']
+    - (hive_bn_health.json.admission | default('')) == 'granted'
+    - (hive_bn_health.json.endpoint_id | default('')) | length > 0
+
+- name: Report the live browser node
+  ansible.builtin.debug:
+    msg: >-
+      {{ hive_name }}: endpoint={{ hive_bn_health.json.endpoint_id }}
+      lifecycle={{ hive_bn_health.json.lifecycle }}
+      admission={{ hive_bn_health.json.admission }}
+      serving={{ hive_bn_health.json.serving }}
+      relay={{ hive_bn_health.json.relay }}
+      team={{ hive_bn_health.json.team }}
+      geo={{ hive_bn_health.json.geo_source | default('?') }}
+      geo_error={{ hive_bn_health.json.geo_error | default('none') or 'none' }}
+      caps=[mem {{ hive_browser_node_memory_max_mb }}MiB / cpu {{ hive_browser_node_cpu_quota_pct }}% / tasks {{ hive_browser_node_tasks_max }}]
+
+- name: "Gate: exactly ONE browser-node unit is running on this host"
+  ansible.builtin.shell: |
+    set -o pipefail
+    systemctl list-units --type=service --state=running --no-legend 'hive-browser-node*.service' | wc -l
+  args:
+    executable: /bin/bash
+  register: hive_bn_units
+  changed_when: false
+  failed_when: (hive_bn_units.stdout | trim | int) != 2   # the browser + its broker, nothing else

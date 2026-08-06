@@ -1,0 +1,82 @@
+# {{ ansible_managed }}
+[Unit]
+Description=shadw headless browser-node session broker ({{ hive_name }}, loopback :{{ hive_browser_node_port }})
+Documentation=file://{{ hive_browser_node_root }}/bin/hive-browser-node-broker.mjs
+# The broker mints against this node's OWN admin listener, so it is useless
+# before hive-node is up -- but only Wants=, never Requires=: a hive-node
+# restart must not tear the browser node down with it (the worker's admission
+# lease and its retry/backoff already cover a few seconds of unreachable
+# control plane, and a stop-propagation here would turn every backend rollout
+# into a fleet-wide browser-node outage).
+After=network-online.target hive-node.service
+Wants=network-online.target hive-node.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User={{ hive_browser_node_user }}
+Group={{ hive_browser_node_group }}
+WorkingDirectory={{ hive_browser_node_state_dir }}
+
+# THE credential, and the reason this file contains no secret at all. systemd
+# reads {{ hive_browser_node_token_file }} as root and re-exposes it to THIS
+# unit only, as a 0400 file under $CREDENTIALS_DIRECTORY on a private tmpfs.
+# It is therefore invisible to `systemctl show`, to `systemctl cat`, to every
+# other unit, and to /proc/<pid>/environ -- including the browser's, which
+# runs as a separate unit and never receives it.
+LoadCredential=internal-token:{{ hive_browser_node_token_file }}
+EnvironmentFile={{ hive_browser_node_env_file }}
+Environment=NODE_ENV=production
+Environment=HOME={{ hive_browser_node_state_dir }}
+ExecStart=/usr/local/bin/node {{ hive_browser_node_root }}/bin/hive-browser-node-broker.mjs
+Restart=always
+RestartSec=5
+
+# ---- resource caps -------------------------------------------------------
+# A ~200-line loopback HTTP server. Sized so that even a pathological broker
+# cannot become a second workload on a host whose real job is hive-node.
+MemoryMax={{ hive_browser_node_broker_memory_max_mb }}M
+MemoryHigh={{ (hive_browser_node_broker_memory_max_mb | int * 75) // 100 }}M
+MemorySwapMax=0
+CPUQuota={{ hive_browser_node_broker_cpu_quota_pct }}%
+CPUWeight={{ hive_browser_node_cpu_weight }}
+IOWeight={{ hive_browser_node_io_weight }}
+TasksMax={{ hive_browser_node_broker_tasks_max }}
+OOMScoreAdjust={{ hive_browser_node_oom_score_adjust }}
+Nice={{ hive_browser_node_nice }}
+LimitNOFILE=8192
+
+# ---- hardening -----------------------------------------------------------
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# Loopback only, both directions: the broker talks to 127.0.0.1:8786 and
+# listens on 127.0.0.1:{{ hive_browser_node_port }}. It has no business
+# reaching the internet, and IPAddressAllow/Deny makes that structural rather
+# than a promise -- an exfiltration path out of the one process that holds the
+# internal token simply does not exist.
+IPAddressDeny=any
+IPAddressAllow=localhost
+# AF_NETLINK is deliberately absent, and that is safe ONLY because HIVE_ADMIN
+# is an IP LITERAL (browser-node.env.j2 hardcodes http://127.0.0.1:<port>):
+# node's dns.lookup short-circuits on isIP() and never reaches glibc
+# getaddrinfo, which is the thing that would need a netlink socket. If anyone
+# ever points HIVE_ADMIN at a HOSTNAME, resolution will fail inside this unit
+# and the broker will be unable to mint at all — add AF_NETLINK here at the
+# same time, or keep it numeric.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# The broker writes nothing; ProtectSystem=strict alone is the whole story.
+
+[Install]
+WantedBy=multi-user.target

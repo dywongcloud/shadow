@@ -1,0 +1,19 @@
+---
+- name: reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+# Ordered by declaration: ansible runs handlers in the order they are DEFINED
+# here, not the order they were notified, so the broker always comes back
+# before the browser that depends on it.
+- name: restart hive-browser-node-broker
+  ansible.builtin.systemd:
+    name: hive-browser-node-broker
+    state: restarted
+    daemon_reload: true
+
+- name: restart hive-browser-node
+  ansible.builtin.systemd:
+    name: hive-browser-node
+    state: restarted
+    daemon_reload: true

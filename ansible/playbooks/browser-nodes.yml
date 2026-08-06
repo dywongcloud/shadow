@@ -1,0 +1,121 @@
+---
+# ONE headless browser node per host, on exactly five hosts:
+#   fc-bangkok  fc-sanjose  fc-virginia  fc-saopaulo  fc-frankfurt
+#
+# A "browser node" is the /run-node page's SharedWorker -- crates/hive-browser's
+# wasm BrowserNode over iroh QUIC via a WSS relay -- running unattended. This
+# playbook installs headless Chromium plus a node-local session broker that
+# mints the short-lived, tenant-scoped platform JWT the admission requires, and
+# caps the whole thing with cgroup limits chosen so it can never compete with
+# hive-node on the same box.
+#
+# Read roles/hive_browser_node/README.md before running: it documents the auth
+# decision and every cap value.
+#
+# Usage:
+#   ansible-playbook playbooks/browser-nodes.yml                       # all five
+#   ansible-playbook playbooks/browser-nodes.yml --limit fr            # one host
+#   ansible-playbook playbooks/browser-nodes.yml --syntax-check        # local only, no connections
+#   # NOTE: --check is NOT a useful dry run here. The verification tasks poll a
+#   # broker that check mode never started, so they report failure for a reason
+#   # that has nothing to do with the change. Use --limit on one host instead.
+#   ansible-playbook playbooks/browser-nodes.yml -e hive_browser_node_team=acme
+#   ansible-playbook playbooks/browser-nodes.yml --tags verify         # re-verify only
+#
+# Rollback (leaves the profile/identity in place so a re-enable keeps the same
+# endpoint id):
+#   ansible browser_nodes -m systemd -a 'name=hive-browser-node state=stopped enabled=false'
+#   ansible browser_nodes -m systemd -a 'name=hive-browser-node-broker state=stopped enabled=false'
+
+- name: Preflight — the browser-node roster is exactly the five intended hosts
+  hosts: browser_nodes
+  gather_facts: false
+  run_once: true
+  tags: [always]
+  tasks:
+    # Guards the ONE thing an inventory edit can silently get wrong: a sixth
+    # host, a duplicate, or a missing region. The role re-checks per host, but
+    # a run that is going to install on the wrong machine should fail before it
+    # touches any machine.
+    - name: Assert the group resolves to exactly the five expected nodes
+      # delegate_to localhost: this is an inventory check, and it must be able
+      # to fail BEFORE any SSH connection is attempted -- a run aimed at the
+      # wrong machines should never reach the machines.
+      delegate_to: localhost
+      become: false
+      ansible.builtin.assert:
+        that:
+          - (groups['browser_nodes'] | length) == 5
+          - (groups['browser_nodes'] | map('extract', hostvars, 'hive_name') | sort)
+            == ['fc-bangkok', 'fc-frankfurt', 'fc-sanjose', 'fc-saopaulo', 'fc-virginia']
+        fail_msg: >-
+          [browser_nodes] resolved to
+          {{ groups['browser_nodes'] | map('extract', hostvars, 'hive_name') | list }} —
+          expected exactly fc-bangkok, fc-sanjose, fc-virginia, fc-saopaulo,
+          fc-frankfurt, one each. Fix inventory/hosts.ini, not this assert.
+        success_msg: "browser-node roster verified: 5 hosts, one per node."
+
+- name: Headless browser node (capped, unattended)
+  hosts: browser_nodes
+  become: true
+  gather_facts: true          # the caps are derived from memtotal/vcpus facts
+  # One host at a time. Not for quorum reasons (a browser node holds no
+  # platform state) but because the FIRST thing this role does on a new host is
+  # install a large package set and start a browser next to a live hive-node:
+  # a mistake should surface on one production host, not five.
+  serial: 1
+  roles:
+    - role: hive_browser_node
+      tags: [hive_browser_node, browser_node]
+
+- name: Verify — every browser node is admitted and visible in presence
+  hosts: browser_nodes
+  become: true
+  gather_facts: false
+  tags: [verify]
+  tasks:
+    - name: Read this node's broker health
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ hive_browser_node_port }}/healthz"
+        return_content: true
+        status_code: [200, 503]
+      register: bn_health
+
+    - name: Summarize
+      ansible.builtin.debug:
+        msg: >-
+          {{ hive_name }} ok={{ bn_health.json.ok }}
+          lifecycle={{ bn_health.json.lifecycle }}
+          admission={{ bn_health.json.admission }}
+          serving={{ bn_health.json.serving }}
+          endpoint={{ (bn_health.json.endpoint_id | default('')) [:16] }}
+          relay={{ bn_health.json.relay }}
+          presence_age_ms={{ bn_health.json.presence_age_ms }}
+          geo={{ bn_health.json.geo_source | default('?') }}
+
+    # The real proof: the CONTROL PLANE lists this endpoint as present. Read
+    # through the same loopback proxy + minted cookie the node itself uses, so
+    # this needs no operator credential on the control host.
+    - name: Ask the fleet for this tenant's browser presence
+      ansible.builtin.shell: |
+        set -euo pipefail
+        jar=$(mktemp)
+        trap 'rm -f "$jar"' EXIT
+        base="http://127.0.0.1:{{ hive_browser_node_port }}"
+        curl -fsS -c "$jar" -X POST "$base/api/token" -H 'content-type: application/json' -d '{}' >/dev/null
+        curl -fsS -b "$jar" "$base/cloud/v1/browser/presence"
+      args:
+        executable: /bin/bash
+      register: bn_presence
+      changed_when: false
+
+    - name: Assert this node's endpoint appears in fleet presence
+      ansible.builtin.assert:
+        that: bn_health.json.endpoint_id | default('') in bn_presence.stdout
+        fail_msg: >-
+          {{ hive_name }}'s endpoint {{ bn_health.json.endpoint_id | default('(none)') }}
+          is NOT in the fleet's browser presence list for team
+          {{ hive_browser_node_team }}. The node is running but the platform
+          cannot see it — check `journalctl -u hive-browser-node -n 100` and the
+          admission errors in /healthz's last_error.
+        success_msg: "{{ hive_name }}: live in fleet browser presence."

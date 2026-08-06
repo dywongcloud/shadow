@@ -36,6 +36,89 @@
 //   { type: "dbQuery", id, sql }   read-class SQL under any live grant; same reply
 //   { type: "dbSyncNow", id }      runs a sync round now; replies
 //                                  { type: "dbSyncResult", id, ok, reports?|error? }
+//
+// bn-browser-peer-webrtc-mesh: this worker also owns the browser↔browser
+// DIRECT lane (the "mesh lane" section below). It is strictly ADDITIVE to the
+// iroh relay path — see browser-node/peer-mesh.js for why it structurally
+// cannot be a replacement — and every consumer degrades to the relay when a
+// direct link is absent, failing, or simply not authorized.
+//
+// It needs TWO things this worker cannot provide alone:
+//
+// 1. A PAGE-HOSTED AGENT. `RTCPeerConnection` is `[Exposed=Window]`: it does
+//    not exist in any worker global scope, so the peer connection is brokered
+//    exactly like the sqlite worker above —
+//      worker -> page : { type: "meshPeerRequest", requestId }   (one page at a time)
+//      page  -> worker: { type: "meshPeerPort", requestId } + transfer [port]
+//    The page does:
+//      import { startMeshAgent } from "<origin>/browser-node/peer-mesh-agent.js";
+//      const channel = new MessageChannel();
+//      const agent = startMeshAgent(channel.port1);
+//      workerPort.postMessage({ type: "meshPeerPort", requestId }, [channel.port2]);
+//    and MUST call `agent.stop()` on { type: "meshPeerDone", requestId } and on
+//    its own unload — an orphaned agent keeps PeerConnections alive after the
+//    admission that authorized them is gone. A page that never answers is a
+//    supported state: the lane stays dormant and everything uses the relay.
+//
+// 2. A FLEET SIGNALLING MAILBOX — the one server-side arm this feature needs,
+//    owned by crates/hive-cloud. Exact contract this worker calls:
+//
+//      POST /cloud/v1/browser/signals      (header: x-hive-team)
+//      body {
+//        endpoint_id, challenge_ms, signature,   // the SAME proof-of-possession
+//                                                // shape as POST /v1/browser/admissions
+//        protocol_version: 1,
+//        ack_seq: <u64>,                         // highest inbox seq consumed
+//        send: [ { to: "<peer 64hex>", kind: "offer"|"answer"|"ice"|"bye",
+//                  payload: "<JSON string, <= 16 KiB>" } ]   // <= 16 entries
+//      }
+//      200 { messages: [ { seq, from, kind, payload, sent_ms } ], retry_ms? }
+//
+//    Required server-side rules (each mirrors an invariant this codebase
+//    already enforces elsewhere):
+//      * POST, never GET. `admin_ingress` forwards mutations to the
+//        control-plane leader but serves GETs LOCALLY behind round-robin DNS,
+//        so a node-local mailbox read over GET reads the wrong node — the
+//        failure class AGENTS.md documents. Reads ride this POST's reply.
+//      * The caller must hold a live admission for `endpoint_id` under the
+//        authenticated tenant, proven by the same PoP check `admit` runs.
+//      * `to` must appear in the CALLER's own server-derived mesh peer set.
+//        Anything else — unknown endpoint, foreign tenant, expired admission —
+//        is the identical refusal, so a browser can neither enumerate peers nor
+//        address a stranger.
+//      * The mailbox is bounded per endpoint (drop-oldest; a suggested shape is
+//        32 messages / 16 KiB each / 60s TTL) and consumed by `ack_seq`.
+//      * A fleet without this arm answers 404/405/501, which this worker treats
+//        as "no peer mesh yet", NOT as an error: the lane goes dormant and the
+//        relay path is untouched.
+//
+//    And the capability half, on the SAME atomic admission response the
+//    artifact/db blocks already ride (`capability.mesh`):
+//      { enabled: true,
+//        signal_poll_ms: 1500,
+//        ice_servers: [ { urls: ["stun:...","turns:..."], username?, credential? } ],
+//        peers: [ { endpoint_id, scope: "team"|"public", project,
+//                   db: "read_write"|"read_only"|"none",
+//                   artifacts: ["<policy_digest>", ...] } ] }
+//    Every field SERVER-DERIVED from live admissions under the tenant, exactly
+//    like `trusted_callers` and `db.sync_peers`: `db` must be "none" for a
+//    Public-scope peer (an anonymous donor never writes tenant data) and
+//    `artifacts` never wider than what the peer's own capability authorizes.
+//    Absent block = no mesh, which is what every pre-upgrade node answers.
+//
+// 3. TWO DEPLOYMENT PREREQUISITES, both outside this file, both currently
+//    UNMET — until each is done the lane is inert (status.mesh reports
+//    "unavailable"/"predates peer-mesh signing" and every byte keeps riding
+//    the relay, which is the designed degradation, not a crash):
+//      * `ui/scripts/sync-browser-node.mjs` must list "peer-mesh.js" and
+//        "peer-mesh-agent.js" alongside identity.js/artifact-policy.js.
+//        It copies a hand-written allowlist, so an unlisted module is simply
+//        never deployed and `import("./browser-node/peer-mesh.js")` 404s.
+//      * `crates/hive-browser/build.sh` must be re-run and its www/pkg output
+//        published: the signMeshEnvelope/verifyMeshEnvelope pair is new, and
+//        without BOTH halves there is no way to bind a DTLS fingerprint to an
+//        EndpointId — so the feature-detect below correctly refuses to open an
+//        unauthenticated peer lane.
 
 import { loadOrCreateSeed } from "./browser-node/identity.js";
 import { WorkerFunctionRuntime } from "./browser-node/worker-function-runtime.js";
@@ -205,6 +288,16 @@ let status = {
   // project's capability carries a server-derived `db` block — the dashboard
   // renders nothing then.
   db: null,
+  // bn-browser-peer-webrtc-mesh introspection (additive, same discipline as
+  // `db` above): PeerMesh.summary() — { state, known, connected, peers[],
+  // direct, artifactHits, crrRounds, bytesIn/Out, error }. `connected` is a
+  // live gauge; `direct` is the lifetime count of channels that actually
+  // opened, which is what answers "did anything go direct at all". null unless the capability
+  // carries a server-derived `mesh` block AND the lane got far enough to
+  // exist. `state: "unsupported"` is an honest, expected rollout value, not an
+  // error: it means this fleet has no signalling arm yet and every byte is
+  // still riding the relay path exactly as before.
+  mesh: null,
 };
 
 // bn-p2p-version-negotiation: the backend prefixes its two protocol-mismatch
@@ -639,9 +732,18 @@ async function dropCachedArtifact(policyDigest) {
   }
 }
 
-// Pin ONE descriptor (cache first, then the authenticated content-addressed
-// GET), verifying both digests locally before anything is executable. Returns
-// true once the digest is pinned; throws on any verification/fetch failure.
+// Pin ONE descriptor (cache, then an authorized browser peer, then the
+// authenticated content-addressed GET), verifying both digests locally before
+// anything is executable. Returns true once the digest is pinned; throws on any
+// verification/fetch failure.
+//
+// The PEER hop (bn-browser-peer-webrtc-mesh) is safe for exactly one reason,
+// and it is the same reason the cache hop is: `runtime.pin` recomputes the
+// size and the BLAKE3 source digest and the canonical policy digest from the
+// bytes themselves, so a peer cannot launder anything into this runtime — the
+// worst it can do is waste a round trip and fall through to the fleet. It is
+// never a dependency: no peer, no link, wrong bytes and a refused request all
+// take the identical fleet path below.
 async function pinArtifact(runtime, descriptor, team, owner, myEpoch) {
   if (runtime.has(descriptor.policyDigest)) return true;
   let bytes = await readCachedArtifact(descriptor);
@@ -652,6 +754,17 @@ async function pinArtifact(runtime, descriptor, team, owner, myEpoch) {
     } catch {
       await dropCachedArtifact(descriptor.policyDigest);
       bytes = null;
+    }
+  }
+  const peerBytes = await fetchArtifactFromMesh(descriptor);
+  if (peerBytes) {
+    if (myEpoch !== epoch || node !== owner) return false;
+    try {
+      runtime.pin(descriptor, peerBytes);
+      await persistVerifiedArtifact(descriptor, peerBytes);
+      return true;
+    } catch {
+      /* a peer's bytes failed local verification — fall through to the fleet */
     }
   }
   bytes = await fetchArtifactBytes(descriptor, team);
@@ -1330,9 +1443,17 @@ async function runDbSync(lane) {
   updateDbStatus();
   let reports = null;
   try {
-    reports = await lane.sync.syncAll();
+    // Fleet peers FIRST, then whatever direct browser links exist right now
+    // (bn-browser-peer-webrtc-mesh). Convergence never depends on the direct
+    // half: with no link the list is exactly the fleet set and this is the
+    // pre-change pass. With one, the same watermark protocol runs over the
+    // DataChannel and the fleet round that follows sees the merged state.
+    reports = await lane.sync.syncAll([...(lane.capability.sync_peers ?? []), ...meshDbPeers()]);
     if (dbLane !== lane) return reports;
-    if (reports.some((r) => r.forbidden)) {
+    // Only a FLEET refusal is the revocation/expiry signal. A direct peer's
+    // refusal means its tab closed or its channel died — sealing on that would
+    // stop a perfectly valid fleet grant for a reason the fleet never gave.
+    if (reports.some((r) => r.forbidden && !r.direct)) {
       // The fleet refused a round: the grant is revoked or the lease lapsed.
       // SEAL and let the renewal spine's re-admission verdict decide
       // resume-vs-stay-sealed (contract §5) — a sync refusal alone never
@@ -1379,8 +1500,10 @@ async function runDbSync(lane) {
 // The page that brokered the current sqlite worker is gone — its
 // DedicatedWorker died with it. Re-broker from a surviving page (the OPFS
 // replica and its watermarks are unaffected; the open retry rides out the
-// handle drain).
+// handle drain). The peer-mesh agent is brokered from a page too and dies the
+// same way, so both lanes are notified from this one call site.
 function notePortRemoved(port) {
+  noteMeshPortRemoved(port);
   const lane = dbLane;
   if (!lane) return;
   if (lane.pendingBroker) {
@@ -1463,6 +1586,296 @@ async function handleDbSyncNow(port, msg) {
   reply(true, { reports });
 }
 
+// ---------------------------------------------------------------------------
+// bn-browser-peer-webrtc-mesh: the browser↔browser direct lane.
+//
+// Additive to the relay path in every direction (see the file header and
+// browser-node/peer-mesh.js). This section owns the wiring only: the
+// authenticated signalling round trip, the page-agent broker, and the two
+// handlers that decide what a peer may actually pull from THIS node. All
+// peer-connection mechanics live in peer-mesh.js (worker half) and
+// peer-mesh-agent.js (page half).
+//
+// The lane NEVER fails an admission — same discipline as the db lane: every
+// failure lands in status.mesh and the relay path carries on untouched.
+// ---------------------------------------------------------------------------
+
+const MESH_SIGNAL_PATH = "/v1/browser/signals";
+const MESH_MODULE_URL = new URL("./browser-node/peer-mesh.js", import.meta.url);
+const MESH_AGENT_BROKER_TIMEOUT_MS = 6_000;
+
+let meshLane = null;
+// shape: { mesh (PeerMesh), brokerPort, brokerRequestId, requestSeq, pendingBroker }
+
+function updateMeshStatus() {
+  const summary = meshLane && meshLane.mesh ? meshLane.mesh.summary() : null;
+  if (JSON.stringify(status.mesh ?? null) === JSON.stringify(summary)) return;
+  setStatus({ mesh: summary });
+}
+
+// A mesh failure with no lane yet (module missing, wasm too old to sign):
+// surfaced honestly, never hidden, never fatal to anything else.
+function noteMeshError(error) {
+  const message = String((error && error.message) || error).slice(0, 300);
+  if (meshLane && meshLane.mesh) {
+    meshLane.mesh.error = message;
+    updateMeshStatus();
+    return;
+  }
+  setStatus({
+    // Same key set PeerMesh.summary() emits — a consumer must never have to
+    // branch on whether the lane got far enough to exist.
+    mesh: { protocol: 1, state: "unavailable", known: 0, connected: 0, peers: [], direct: 0, artifactHits: 0, crrRounds: 0, bytesIn: 0, bytesOut: 0, error: message },
+  });
+}
+
+// One signalling round trip. Proof-of-possession is the SAME shape the
+// admission POST uses (signAdmission over "{endpoint_id}:{challenge_ms}"), so
+// the fleet arm verifies it with the code path it already has.
+async function postMeshSignals(body) {
+  if (!node || !session || !status.endpointId) throw new Error("browser node is not running");
+  const challengeMs = Date.now();
+  return await callApi("POST", MESH_SIGNAL_PATH, session.team, {
+    endpoint_id: status.endpointId,
+    challenge_ms: challengeMs,
+    signature: node.signAdmission(String(challengeMs)),
+    ...body,
+  });
+}
+
+// Broker a page-hosted RTCPeerConnection agent — the sqlite-worker broker
+// pattern verbatim (RTCPeerConnection is Window-only, so there is no nested
+// fallback here at all: with no page willing to host, the lane is dormant).
+async function requestMeshAgent(lane) {
+  let lastError = null;
+  const candidates = [...ports].sort(
+    (a, b) => Number(portVisibility.get(b) ?? true) - Number(portVisibility.get(a) ?? true),
+  );
+  for (const port of candidates) {
+    if (meshLane !== lane) throw new Error("mesh lane superseded during agent broker");
+    try {
+      return await requestBrokeredMeshAgent(lane, port);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("no connected page could host a peer-connection agent");
+}
+
+function requestBrokeredMeshAgent(lane, port) {
+  return new Promise((resolve, reject) => {
+    const requestId = ++lane.requestSeq;
+    const timer = setTimeout(() => {
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(new Error("page did not host a peer-connection agent in time"));
+    }, MESH_AGENT_BROKER_TIMEOUT_MS);
+    lane.pendingBroker = {
+      requestId,
+      resolve: (endpoint) => { clearTimeout(timer); resolve(endpoint); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    };
+    try {
+      port.postMessage({ type: "meshPeerRequest", requestId });
+    } catch (error) {
+      clearTimeout(timer);
+      if (lane.pendingBroker && lane.pendingBroker.requestId === requestId) lane.pendingBroker = null;
+      reject(error);
+    }
+  });
+}
+
+function onMeshPeerPort(port, msg, transferred) {
+  const lane = meshLane;
+  const endpoint = transferred && transferred[0];
+  const pending = lane && lane.pendingBroker;
+  if (!lane || !pending || msg.requestId !== pending.requestId) {
+    try {
+      if (endpoint) endpoint.close();
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+  lane.pendingBroker = null;
+  if (!endpoint) {
+    pending.reject(new Error("meshPeerPort arrived without a transferred port"));
+    return;
+  }
+  lane.brokerPort = port;
+  lane.brokerRequestId = msg.requestId;
+  pending.resolve(endpoint);
+}
+
+// The page hosting the agent went away: its PeerConnections died with it. Drop
+// the agent so the next handshake re-brokers from a surviving page; the peer
+// set, the capability and every fleet path are untouched.
+function noteMeshPortRemoved(port) {
+  const lane = meshLane;
+  if (!lane) return;
+  if (lane.pendingBroker) {
+    try {
+      lane.pendingBroker.reject(new Error("brokering page disconnected"));
+    } catch {
+      /* already settled */
+    }
+    lane.pendingBroker = null;
+  }
+  if (lane.brokerPort !== port) return;
+  lane.brokerPort = null;
+  if (lane.mesh) lane.mesh.agentLost("brokering page disconnected");
+  updateMeshStatus();
+}
+
+// ---- what a peer may pull FROM this node ---------------------------------
+
+// Content-addressed only, and only a digest THIS node itself pinned under its
+// own server-derived capability. peer-mesh.js has already refused any digest
+// outside the peer's authorized set; this is the second, local half of that
+// check — a peer can never make this node fetch something on its behalf.
+async function serveMeshArtifact(_peerId, digest) {
+  if (!fnRuntime || fnRuntime.closed || !fnRuntime.has(digest)) return null;
+  const bytes = await readCachedArtifact({ policyDigest: digest });
+  return bytes && bytes.length ? bytes : null;
+}
+
+// One inbound CRR round from a browser peer. The effective access is the
+// MINIMUM of this node's own server-derived grant and the peer's: a
+// Public-scope (read_only) peer can never push a row into a tenant replica,
+// and a read_only local grant applies nothing from anyone. The responder
+// itself re-checks that the request names THIS replica file (a peer of another
+// project cannot address ours), and the fleet remains the system of record —
+// every batch that lands here still converges through the fleet rounds this
+// lane never replaces.
+async function serveMeshCrr(_peerId, requestBytes, peerAccess) {
+  const lane = dbLane;
+  if (!lane || !lane.client || !lane.makeCrrSyncResponder) throw new Error("no live db lane");
+  if (lane.sealed) throw new Error("the database grant is sealed");
+  const access = lane.capability.access === "read_write" && peerAccess === "read_write" ? "read_write" : "read_only";
+  const responder = lane.makeCrrSyncResponder(lane.client, { ...lane.capability, access });
+  return await responder(requestBytes, null);
+}
+
+async function fetchArtifactFromMesh(descriptor) {
+  if (!meshLane || !meshLane.mesh) return null;
+  try {
+    return await meshLane.mesh.fetchArtifact(descriptor.policyDigest, descriptor.sourceBytes);
+  } catch {
+    return null;
+  }
+}
+
+// Direct peers to include in a db sync pass, as sync-client peer entries.
+// Empty whenever the lane is dormant, unauthorized, or simply not connected —
+// which is why runDbSync can append them unconditionally.
+function meshDbPeers() {
+  if (!meshLane || !meshLane.mesh || !dbLane) return [];
+  try {
+    return meshLane.mesh.dbPeers(dbLane.capability.project);
+  } catch {
+    return [];
+  }
+}
+
+async function startMeshLane(rawMesh, myEpoch) {
+  const owner = node;
+  if (!owner || !status.endpointId) return;
+  let module;
+  let wasm;
+  try {
+    // Dynamic import for the same reason the sqlite set uses one: a deployed
+    // asset set that predates this lane must degrade it honestly, never break
+    // the run-node worker.
+    module = await import(MESH_MODULE_URL.href);
+    wasm = await loadBrowserModule();
+  } catch (error) {
+    noteMeshError(`peer mesh unavailable: ${String((error && error.message) || error)}`);
+    return;
+  }
+  if (myEpoch !== epoch || node !== owner) return;
+  // Feature-detect the identity-binding exports rather than trusting a version
+  // constant: the wasm bundle is a build artifact that can legitimately lag the
+  // JS by a deploy, and without BOTH halves of the signature there is no way to
+  // bind a DTLS fingerprint to an EndpointId — in which case the honest answer
+  // is no peer lane at all, never an unauthenticated one.
+  if (typeof owner.signMeshEnvelope !== "function" || typeof wasm.verifyMeshEnvelope !== "function") {
+    noteMeshError("this browser-node bundle predates peer-mesh signing — peer links stay on the relay path");
+    return;
+  }
+  const capability = module.normalizeMeshCapability(rawMesh);
+  if (!capability) return;
+  const lane = { mesh: null, brokerPort: null, brokerRequestId: 0, requestSeq: 0, pendingBroker: null };
+  meshLane = lane;
+  lane.mesh = new module.PeerMesh({
+    selfId: status.endpointId,
+    sign: (context) => owner.signMeshEnvelope(context),
+    verify: (peerId, context, signature) => {
+      try {
+        return wasm.verifyMeshEnvelope(peerId, context, signature);
+      } catch {
+        return false; // malformed input from a peer is a failed verification
+      }
+    },
+    postSignals: (body) => postMeshSignals(body),
+    requestAgent: () => requestMeshAgent(lane),
+    handlers: { artifact: serveMeshArtifact, crr: serveMeshCrr },
+    onChange: () => {
+      if (meshLane === lane) updateMeshStatus();
+    },
+  });
+  lane.mesh.setCapability(capability);
+  updateMeshStatus();
+}
+
+async function stopMeshLane() {
+  const lane = meshLane;
+  if (!lane) return;
+  meshLane = null;
+  if (lane.brokerPort) {
+    // Tell the page to stop its agent NOW — an orphan holds live
+    // PeerConnections after the admission that authorized them is gone.
+    try {
+      lane.brokerPort.postMessage({ type: "meshPeerDone", requestId: lane.brokerRequestId });
+    } catch {
+      /* page already gone */
+    }
+  }
+  if (lane.mesh) {
+    try {
+      await lane.mesh.stop();
+    } catch {
+      /* best effort */
+    }
+  }
+  setStatus({ mesh: null });
+}
+
+// One reconcile per successful admission/renewal, alongside the db lane's.
+// A lost `mesh` block tears the lane down: peers are a live server-derived
+// grant, never a cached one.
+async function reconcileMeshLane(capability, myEpoch) {
+  const raw = capability && capability.mesh;
+  if (raw === undefined || raw === null) {
+    await stopMeshLane();
+    return;
+  }
+  if (!meshLane) {
+    await startMeshLane(raw, myEpoch);
+    return;
+  }
+  const module = await import(MESH_MODULE_URL.href);
+  if (myEpoch !== epoch || !meshLane) return;
+  const next = module.normalizeMeshCapability(raw);
+  // `enabled: false` (or a set with no peers left) is a real withdrawal, not a
+  // pause: tear the lane down rather than leave it idling on a grant the
+  // server has stopped issuing.
+  if (!next || !next.peers.length) {
+    await stopMeshLane();
+    return;
+  }
+  meshLane.mesh.setCapability(next);
+  updateMeshStatus();
+}
+
 // One renewal spine owns every admission write: periodic lease refresh,
 // browser-network restoration, and iroh home-relay/address migration. The
 // attempt reads currentAddrJson at execution time; boot's first address is
@@ -1543,6 +1956,16 @@ async function renewNow(myEpoch) {
       noteDbLaneError(dbError);
     }
     if (myEpoch !== epoch) return "stale";
+    // The peer-mesh lane rides the same spine, after the db lane (its CRR
+    // handler reads dbLane) and under the same rule: it never fails an
+    // admission. A fleet with no signalling arm, a page that cannot host an
+    // agent, and a peer that never connects are all just "no direct link".
+    try {
+      await reconcileMeshLane(admitResult && admitResult.capability, myEpoch);
+    } catch (meshError) {
+      noteMeshError(meshError);
+    }
+    if (myEpoch !== epoch) return "stale";
     admittedAddrJson = attemptedAddr;
     renewBackoffMs = RENEW_BACKOFF_BASE_MS;
     const lifecycle = anyVisible() ? "online" : "suspended";
@@ -1575,6 +1998,9 @@ async function renewNow(myEpoch) {
       // revocation (contract §5): wipe the replica, no final push — the grant
       // is already gone server-side.
       await stopDbLane({ wipe: true, finalPush: false, owner: doomed });
+      // Peer links are a grant too: a denied admission means the peer set is
+      // no longer authorized, so every direct channel closes with it.
+      await stopMeshLane();
       await discardStaleAttempt(doomed, endpointId, renewalTeam);
       outcome = "terminal";
     } else {
@@ -1715,6 +2141,9 @@ async function start(msg) {
   // origin's single OPFS access-handle pool). Never wipes here: an orphaned
   // lane's replica is the admission lifecycle's call, not this fence's.
   if (dbLane) await stopDbLane({ wipe: false, finalPush: false });
+  // Same fence for the peer lane: a channel authorized by a previous epoch's
+  // admission must never survive into a new one.
+  if (meshLane) await stopMeshLane();
   currentAddrJson = null;
   admittedAddrJson = null;
   renewKickPending = false;
@@ -1956,6 +2385,10 @@ async function stop() {
     // admission DELETE (the fleet re-checks the grant on every round) and
     // before the node closes (the push needs the transport).
     await stopDbLane({ wipe: true, finalPush: true });
+    // Then the peer links: after the final push (which may legitimately ride a
+    // direct channel) and before the admission DELETE, so the `bye` envelopes
+    // still have a live signalling grant to travel on.
+    await stopMeshLane();
     try {
       if (endpointId && team) {
         await callApi("DELETE", `/v1/browser/admissions/${encodeURIComponent(endpointId)}`, team);
@@ -1979,6 +2412,7 @@ async function stop() {
   // fence it anyway, without a wipe: stop()'s wipe path above is the one that
   // had transport + a live grant for the final push.
   if (dbLane) await stopDbLane({ wipe: false, finalPush: false });
+  if (meshLane) await stopMeshLane();
   session = null;
   closing = false;
   setStatus({
@@ -1998,6 +2432,7 @@ async function stop() {
     serving: false,
     serveMode: "none",
     db: null,
+    mesh: null,
   });
 }
 
@@ -2021,6 +2456,9 @@ function connectPort(port) {
     // The db lane's page-broker handshake + control ops
     // (bn-run-node-db-sync-wiring; see the file header for the contract).
     else if (msg.type === "dbWorkerPort") onDbWorkerPort(port, msg, e.ports);
+    // The peer-mesh lane's page-agent handshake (bn-browser-peer-webrtc-mesh;
+    // RTCPeerConnection is Window-only, see the file header).
+    else if (msg.type === "meshPeerPort") onMeshPeerPort(port, msg, e.ports);
     else if (msg.type === "dbExec") handleDbExec(port, msg, true);
     else if (msg.type === "dbQuery") handleDbExec(port, msg, false);
     else if (msg.type === "dbSyncNow") handleDbSyncNow(port, msg);

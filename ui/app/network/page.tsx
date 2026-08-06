@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { Globe2, Server, Share2, ShieldCheck, Database, Network } from "lucide-react";
+import { Globe2, Server, Share2, ShieldCheck, Database, Network, Boxes } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, usePoll, type NodeInfo, type AnycastTable, type RateLimitStats } from "@/lib/api";
 import { SATELLITE_ONLINE_COLOR, SATELLITE_DEGRADED_COLOR } from "@/components/region-map";
@@ -9,6 +9,35 @@ import type { BrowserPresence } from "@/lib/run-node-client";
 import { timeAgo } from "@/lib/utils";
 
 interface ClusterStatus { term: number; leader: string; is_leader: boolean; members: string[]; consensus: string }
+
+/** Amber, and NOT one of the existing mesh hues, because the ring means a
+ *  role rather than a health state: green/blue/gray are already spoken for
+ *  by node health and GPU, and teal is the browser-peer body color the ring
+ *  has to stay legible against. */
+const SHARD_HOLDER_COLOR = "#f59e0b";
+
+/**
+ * A presence record as the constellation reads it.
+ *
+ * `node_name` and `shard_eligible` are SERVER-DERIVED additions on the Rust
+ * record (crates/hive-cloud/src/browser_presence.rs) — the browser sends
+ * neither and cannot. They are declared as optional here, rather than made
+ * required on the shared `BrowserPresence` interface, for one concrete
+ * reason: this dashboard and the backend deploy independently (AGENTS.md's
+ * ui-deploy-gap rule), so a freshly deployed UI routinely talks to a node
+ * that predates them. Optional keeps that case a rendering fallback instead
+ * of a type lie — and the fallback is exact, because the backend recomputes
+ * `node_name` from the endpoint id on every read.
+ */
+type BrowserNode = BrowserPresence & { node_name?: string; shard_eligible?: boolean };
+
+/** `bn-<adj>-<noun>-<tag>` — the backend's own name for this peer, with the
+ *  endpoint-id prefix as the last-resort fallback if we are talking to a node
+ *  that predates the field. Never the tenant-scoped `display_label`: that one
+ *  names the OWNER, not the node. */
+function browserNodeName(p: BrowserNode): string {
+  return p.node_name || `bn-${p.endpoint_id.slice(0, 8)}`;
+}
 
 export default function NetworkPage() {
   // Mesh membership/leadership change at gossip cadence (~5s) — 10s polling is
@@ -19,7 +48,7 @@ export default function NetworkPage() {
   // Low-trust browser-node presence — a SEPARATE feed from `/v1/nodes`, never
   // merged into the fleet node list or capacity totals anywhere on this page
   // (same discipline as the /regions constellation satellites).
-  const { data: presenceFeed } = usePoll<{ presence: BrowserPresence[] }>("/v1/browser/presence", 8000);
+  const { data: presenceFeed } = usePoll<{ presence: BrowserNode[] }>("/v1/browser/presence", 8000);
   const presence = presenceFeed?.presence ?? [];
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
 
@@ -48,8 +77,11 @@ export default function NetworkPage() {
                 cubes blue with no legend entry is just an unexplained color. */}
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#3b82f6]" /> GPU</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#9ca3af]" /> unhealthy</span>
-            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — the same cube as a fleet node, smaller and teal; never counted as fleet capacity">
-              <span className="inline-block h-2 w-2 rounded-[2px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node
+            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — the same cube as a fleet node, smaller and teal; never counted as fleet capacity. Named bn-<adjective>-<noun>-<tag>, derived server-side from the peer's proven endpoint id.">
+              <span className="inline-block h-2 w-2 rounded-[2px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node <span className="font-mono text-[10px] opacity-70">bn-*</span>
+            </span>
+            <span className="flex items-center gap-1.5" title="This browser node is eligible to hold small fragments of global platform state (see Storage shards below). Eligibility is server-derived from a platform-admin session — a browser cannot claim it.">
+              <span className="inline-block h-2.5 w-2.5 rounded-full border border-dashed" style={{ borderColor: SHARD_HOLDER_COLOR }} /> shard holder
             </span>
           </div>
         </div>
@@ -58,10 +90,13 @@ export default function NetworkPage() {
           Every node runs a gateway + Fluid pool, fully meshed over iroh QUIC. The function tunnel protocol
           rides those streams, so a gateway on one node can serve an instance on any other, anywhere reachable.
           {presence.length > 0 && (
-            <> Orbiting satellites are admitted browser nodes — low-trust edge peers attached over the relay, never fleet capacity.</>
+            <> Orbiting satellites are admitted browser nodes — low-trust edge peers attached over the relay, never fleet capacity.
+            Each carries its own <span className="font-mono">bn-…</span> name, derived server-side from its proven endpoint id and stable across reconnects.</>
           )}
         </p>
       </Card>
+
+      <StorageShards />
 
       {/* Architecture rows */}
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -140,7 +175,7 @@ function fmtMem(mb?: number): string {
  * anchored beside their relay fleet node when identifiable. Pure SVG,
  * theme-aware, no deps.
  */
-function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: BrowserPresence[] }) {
+function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: BrowserNode[] }) {
   const W = 760;
   const H = 560;
   const cx = W / 2;
@@ -217,6 +252,12 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
   const sortedPresence = [...presence].sort((a, b) => (a.endpoint_id < b.endpoint_id ? -1 : a.endpoint_id > b.endpoint_id ? 1 : 0));
   const satellites = sortedPresence.slice(0, MAX_SATELLITES);
   const satelliteOverflow = sortedPresence.length - satellites.length;
+  // Name labels sit on the same outer orbit, so their spacing is the orbit
+  // circumference divided by the satellite count. A `bn-…` name is ~18
+  // characters at 9px ≈ 80px wide; the orbit is ~2π(R+62) ≈ 1000px, so ~12
+  // labels fit without collision and 24 is the point past which they start
+  // overlapping badly. Beyond it the hover title carries the name instead.
+  const showSatNames = satellites.length > 0 && satellites.length <= 24;
   // `relay_hint` carries the node's WHOLE connected relay set, comma-joined
   // (the worker publishes `status.relay`, which is `relays.join(",")`), so
   // feeding it straight to `new URL()` always threw and every satellite fell
@@ -325,8 +366,14 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
       {/* browser-node satellites — the SAME isometric cube glyph as a fleet
           node, just SMALLER (size 9 vs 18) and in the shared low-trust teal
           hue, so a browser peer reads as the same kind of object on the mesh,
-          not a different shape. Degraded/suspended recede to slate. A hover
-          title carries label + state. */}
+          not a different shape. Degraded/suspended recede to slate.
+
+          Each one is LABELLED with its own node name, the same way a fleet
+          cube is labelled with `node.name` — that is the whole point: a
+          browser peer is a named member of the mesh, not an anonymous dot.
+          The name is drawn only while the ring is legible (`showSatNames`);
+          past that the hover title still carries it, which is honest about
+          the space rather than rendering 150 overlapping labels. */}
       {satPos.map(({ p, x, y }) => {
         const degraded = p.state === "degraded" || p.state === "suspended";
         // Light top → mid left → dark right, same lit-solid discipline as the
@@ -335,10 +382,22 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
         const faces = degraded
           ? { top: "#cbd5e1", left: SATELLITE_DEGRADED_COLOR, right: "#64748b" }
           : { top: "#7dd3fc", left: SATELLITE_ONLINE_COLOR, right: "#0ea5e9" };
+        const name = browserNodeName(p);
         return (
           <g key={p.endpoint_id} transform={`translate(${x.toFixed(1)} ${y.toFixed(1)})`}>
-            <CubeIcon self={false} healthy={!degraded} size={9} faces={faces} />
-            <title>{`${p.display_label || p.endpoint_id} · browser node (low-trust)${p.state ? ` · ${p.state}` : ""}`}</title>
+            <CubeIcon
+              self={false}
+              healthy={!degraded}
+              size={9}
+              faces={faces}
+              ring={p.shard_eligible ? SHARD_HOLDER_COLOR : undefined}
+            />
+            {showSatNames && (
+              <text y={30} textAnchor="middle" style={{ fontSize: 9 }} className="fill-neutral-500 dark:fill-neutral-400">
+                {name}
+              </text>
+            )}
+            <title>{`${name} · browser node (low-trust)${p.state ? ` · ${p.state}` : ""}${p.shard_eligible ? " · state-shard holder" : ""}\nendpoint ${p.endpoint_id}`}</title>
           </g>
         );
       })}
@@ -371,6 +430,7 @@ function CubeIcon({
   gpu,
   size = 18,
   faces,
+  ring,
 }: {
   self: boolean;
   healthy: boolean;
@@ -382,6 +442,12 @@ function CubeIcon({
    *  used to render a browser satellite as a teal cube in the shared
    *  low-trust hue instead of the green/blue fleet palette. */
   faces?: { top: string; left: string; right: string };
+  /** Draw the dashed orbit ring in this color regardless of `self` — how a
+   *  browser peer that is eligible to hold global-state fragments is marked.
+   *  Deliberately the SAME glyph `self` already uses (a dashed ring means
+   *  "this cube has an extra role"), just in the shard hue, rather than
+   *  inventing a second decoration for the same idea. */
+  ring?: string;
 }) {
   const r = size;
   // Face shades run light (top) → mid (left) → dark (right) to read as a lit
@@ -392,11 +458,11 @@ function CubeIcon({
   const right = faces ? faces.right : !healthy ? "#6c727a" : gpu ? "#1d4ed8" : "#178a3d";
   return (
     <g>
-      {self && (
+      {(self || ring) && (
         <circle
           r={r + 9}
           fill="none"
-          stroke={gpu ? "#3b82f6" : "#34c759"}
+          stroke={ring ?? (gpu ? "#3b82f6" : "#34c759")}
           strokeOpacity={0.55}
           strokeWidth={1.5}
           strokeDasharray="3 3"
@@ -409,6 +475,168 @@ function CubeIcon({
       {/* chip detail on the top face */}
       <path d={`M 0 ${-r * 0.5} L ${r * 0.48} ${-r * 0.25} L 0 0 L ${-r * 0.48} ${-r * 0.25} Z`} fill="none" stroke={right} strokeOpacity={0.55} strokeWidth={1} />
     </g>
+  );
+}
+
+// --- Storage shards -------------------------------------------------------
+
+interface ShardFragment { key: string; store: string; index: number; bytes: number; digest: string }
+interface ShardHolding { endpoint_id: string; node_name: string; max_bytes: number; held_bytes: number; fragments: ShardFragment[] }
+interface ShardRefusal { reason: string; fragment: string; endpoint_id: string; detail: string }
+interface ShardPlan {
+  params: { enabled: boolean; max_bytes: number; fragment_bytes: number; replication_factor: number; stores: string[] };
+  membership: string[];
+  membership_digest: string;
+  plan_digest: string;
+  fragments_total: number;
+  fragment_bytes_total: number;
+  replicas_wanted: number;
+  replicas_placed: number;
+  under_replicated_fragments: number;
+  unplaced_fragments: number;
+  holdings: ShardHolding[];
+  refusals: ShardRefusal[];
+  refusals_total: number;
+}
+interface ShardTrust {
+  model: string;
+  proves: string[];
+  does_not_prove: string[];
+  options_for_a_real_possession_guarantee: string[];
+  implemented_here: string;
+}
+
+function fmtBytes(n: number): string {
+  if (!n) return "0 B";
+  if (n >= 1024 * 1024 * 1024) return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
+  if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${n} B`;
+}
+
+/**
+ * Which fragments of global platform state each browser node is responsible
+ * for (`GET /v1/browser/shards`).
+ *
+ * Operator-only on the backend, so the poll is gated client-side on the same
+ * `hive_is_owner` courtesy flag the notifications page uses — the point is
+ * to not fire a 403 every 20s for every ordinary tenant, not to enforce
+ * anything (the backend does that). Renders nothing at all when the fetch
+ * yields no plan, so a non-operator sees no empty shell.
+ */
+function StorageShards() {
+  const isOwner = typeof window !== "undefined" && localStorage.getItem("hive_is_owner") === "1";
+  const { data } = usePoll<{ plan: ShardPlan; trust: ShardTrust }>("/v1/browser/shards", 20000, isOwner);
+  const [showTrust, setShowTrust] = useState(false);
+  if (!data?.plan) return null;
+  const { plan, trust } = data;
+  const held = plan.holdings.reduce((a, h) => a + h.held_bytes, 0);
+  const shortfall = plan.unplaced_fragments + plan.under_replicated_fragments;
+
+  return (
+    <Card className="mb-6">
+      <div className="mb-1 flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm font-medium"><Boxes className="h-4 w-4" /> Storage shards</div>
+        <Badge tone={plan.params.enabled ? (shortfall > 0 ? "amber" : "green") : "default"}>
+          {!plan.params.enabled ? "disabled" : shortfall > 0 ? "under-replicated" : "placed"}
+        </Badge>
+      </div>
+      <p className="mb-4 text-sm text-secondary">
+        A browser cannot hold the platform&apos;s replicated state, so it holds small fragments of it. Every
+        node derives the same assignment with no coordinator: rendezvous (HRW) hashing over the eligible
+        browser peers, keyed on the fragment — the same hash container placement and the inference
+        coordinator already agree through. A fragment that would push a peer past its byte cap is refused
+        outright and reported below; it is never trimmed to fit and never re-homed onto a peer the hash did
+        not rank.
+      </p>
+
+      <div className="mb-4 grid grid-cols-2 gap-3 text-xs md:grid-cols-4">
+        <Fact label="Eligible peers" value={String(plan.membership.length)} />
+        <Fact label="Fragments" value={`${plan.fragments_total} · ${fmtBytes(plan.fragment_bytes_total)}`} />
+        <Fact label="Replicas placed" value={`${plan.replicas_placed} / ${plan.replicas_wanted}`} />
+        <Fact label="Held by browsers" value={fmtBytes(held)} />
+        <Fact label="Cap per peer" value={fmtBytes(plan.params.max_bytes)} />
+        <Fact label="Fragment size" value={fmtBytes(plan.params.fragment_bytes)} />
+        <Fact label="Replication" value={`${plan.params.replication_factor}×`} />
+        <Fact label="Stores sharded" value={String(plan.params.stores.length)} />
+      </div>
+
+      {plan.holdings.length > 0 ? (
+        <Table>
+          <thead><tr><Th>Browser node</Th><Th>Fragments</Th><Th>Held</Th><Th>Cap used</Th><Th>Endpoint</Th></tr></thead>
+          <tbody>
+            {plan.holdings.map((h) => (
+              <tr key={h.endpoint_id}>
+                <Td className="font-mono text-xs font-medium">{h.node_name}</Td>
+                <Td className="tabular-nums">{h.fragments.length}</Td>
+                <Td className="tabular-nums">{fmtBytes(h.held_bytes)}</Td>
+                <Td className="tabular-nums">{h.max_bytes ? `${Math.round((h.held_bytes / h.max_bytes) * 100)}%` : "—"}</Td>
+                <Td className="font-mono text-[11px] text-secondary">{h.endpoint_id.slice(0, 16)}…</Td>
+              </tr>
+            ))}
+          </tbody>
+        </Table>
+      ) : (
+        <p className="text-sm text-muted">
+          {plan.params.enabled
+            ? "No eligible browser peers online. Eligibility is derived server-side from a platform-admin session — a browser cannot claim it."
+            : "Shard planning is off on this node (HIVE_BROWSER_SHARDS=0)."}
+        </p>
+      )}
+
+      {plan.refusals.length > 0 && (
+        <div className="mt-4">
+          <div className="mb-1 text-xs font-medium text-fg">
+            Refusals{plan.refusals_total > plan.refusals.length ? ` (showing ${plan.refusals.length} of ${plan.refusals_total})` : ""}
+          </div>
+          <ul className="flex flex-col gap-1 text-xs text-secondary">
+            {plan.refusals.map((r, i) => (
+              <li key={`${r.fragment}-${r.endpoint_id}-${i}`}>
+                <span className="font-mono text-[11px] text-muted">{r.reason}</span> {r.detail}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* The trust disclosure ships FROM the backend (`trust` in the same
+          response) rather than being retyped here, so the claim on screen and
+          the claim in the code cannot drift apart. */}
+      <div className="mt-4 border-t border-border pt-3">
+        <button onClick={() => setShowTrust((v) => !v)} className="text-xs font-medium text-secondary underline underline-offset-2">
+          {showTrust ? "Hide" : "What this does and does not prove"}
+        </button>
+        {showTrust && (
+          <div className="mt-2 flex flex-col gap-3 text-xs">
+            <div><span className="font-medium text-fg">Model.</span> <span className="text-secondary">{trust.model}</span></div>
+            <TrustList title="Proves" items={trust.proves} tone="text-secondary" />
+            <TrustList title="Does NOT prove" items={trust.does_not_prove} tone="text-amber-600 dark:text-amber-500" />
+            <TrustList title="Options for a real possession guarantee (none implemented)" items={trust.options_for_a_real_possession_guarantee} tone="text-secondary" />
+            <div><span className="font-medium text-fg">Implemented here.</span> <span className="text-secondary">{trust.implemented_here}</span></div>
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function TrustList({ title, items, tone }: { title: string; items: string[]; tone: string }) {
+  return (
+    <div>
+      <div className="mb-1 font-medium text-fg">{title}</div>
+      <ul className={`flex list-disc flex-col gap-1 pl-4 ${tone}`}>
+        {items.map((t, i) => <li key={i}>{t}</li>)}
+      </ul>
+    </div>
+  );
+}
+
+function Fact({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <span className="text-[11px] uppercase tracking-wide text-muted">{label}</span>
+      <span className="font-medium tabular-nums text-fg">{value}</span>
+    </div>
   );
 }
 

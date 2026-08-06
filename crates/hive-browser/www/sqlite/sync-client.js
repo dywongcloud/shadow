@@ -75,9 +75,24 @@ export class BrowserDbSync {
     this.worker = worker;
     this.node = node;
     this.cap = capability;
-    // The fleet's acknowledged watermarks per site — the push cursor,
+    // The FLEET's acknowledged watermarks per site — the durable push cursor,
     // hydrated from hive_sync_meta and persisted after every reply.
     this.ack = {};
+    // Per-DIRECT-peer push cursors (bn-browser-peer-webrtc-mesh), in memory
+    // only, keyed by endpoint id.
+    //
+    // This separation is load-bearing, not tidiness. `this.ack` is ONE cursor
+    // shared by every peer it is used for, and `sync-export` uses it as the
+    // push selector — so letting a browser peer advance it would tell this
+    // replica "the fleet already has up to version N" on the word of a peer
+    // that is NOT the system of record. A browser that had received those rows
+    // from a third browser (never from the fleet) would silently strip them
+    // from every future fleet push, stranding local writes outside the fleet
+    // replica set entirely. Direct peers therefore get their own cursors,
+    // which resets on reload cost nothing but a replayed push (the responder
+    // reports `replay` and applies nothing), while the fleet cursor keeps
+    // exactly its pre-change durable-resume semantics.
+    this.directAck = new Map();
   }
 
   dbFile() { return this.cap.db_file; }
@@ -119,14 +134,34 @@ export class BrowserDbSync {
     return this.worker.call('exec', { sql });
   }
 
-  // One full sync session against ONE fleet peer: multi-round until the push
+  // One full sync session against ONE peer: multi-round until the push
   // stream is exhausted AND the peer has nothing more to export. Returns a
   // per-session report (the witness harness asserts on these fields).
+  //
+  // TRANSPORT IS INJECTABLE (bn-browser-peer-webrtc-mesh) and nothing else
+  // about a round changes with it: a peer entry may carry its own
+  // `send(requestBytes) => Promise<Uint8Array>` — the direct browser↔browser
+  // WebRTC DataChannel — and the round semantics (watermarks, chunking, the
+  // multi-round termination rule) are identical, because per-site watermarks
+  // make the exchange indifferent to WHICH replica answered. Absent, the
+  // transport is the node's iroh lane exactly as before, so a peer set that
+  // never gained a direct link behaves bit-for-bit like the pre-change client.
+  // The ONE thing that does differ is which push cursor a reply may advance —
+  // see `directAck` in the constructor.
   async syncPeer(peer) {
+    const direct = peer.direct === true;
     const report = {
-      peer: peer.endpoint_id, rounds: 0, pushedBatches: 0, appliedBatches: 0,
-      replayedBatches: 0, statuses: [], messages: [], forbidden: false,
+      peer: peer.endpoint_id, direct, rounds: 0, pushedBatches: 0,
+      appliedBatches: 0, replayedBatches: 0, statuses: [], messages: [], forbidden: false,
     };
+    const send = typeof peer.send === 'function'
+      ? peer.send
+      : (bytes) => this.node.crrSyncOn(peer.addr_json, bytes);
+    let ack = this.ack;
+    if (direct) {
+      if (!this.directAck.has(peer.endpoint_id)) this.directAck.set(peer.endpoint_id, {});
+      ack = this.directAck.get(peer.endpoint_id);
+    }
     for (let round = 0; round < MAX_ROUNDS; round++) {
       report.rounds++;
       const state = await this.state();
@@ -134,7 +169,7 @@ export class BrowserDbSync {
       // Push everything the peer has not yet acknowledged, chunked so each
       // request frame fits the wire cap.
       const exported = await this.worker.call('sync-export', {
-        since: this.ack, maxValueBytes: this.cap.max_value_bytes,
+        since: ack, maxValueBytes: this.cap.max_value_bytes,
       });
       if (exported.skippedOversized > 0) {
         report.messages.push(
@@ -168,12 +203,15 @@ export class BrowserDbSync {
         const request = encodeCrrSyncRequest({ dbFile: this.cap.db_file, pushMore, watermarks, batches: chunk });
         let replyBytes;
         try {
-          replyBytes = await this.node.crrSyncOn(peer.addr_json, request);
+          replyBytes = await send(request);
         } catch (err) {
           // A reset carries no status byte; any refusal here ends the
           // session. Mid-session refusal IS the revocation/expiry signal
           // (contract §5 — the caller decides sealed-vs-wipe via a
           // re-admission attempt); record it verbatim, never swallowed.
+          // A DIRECT peer's refusal is NOT that signal: a DataChannel that
+          // died says nothing about the fleet's grant, so the caller must not
+          // seal on it (see the `direct` flag on the report).
           report.forbidden = true;
           report.messages.push(`sync request refused: ${String(err?.message ?? err)}`);
           return report;
@@ -190,7 +228,12 @@ export class BrowserDbSync {
         for (const [site, version] of reply.watermarks) {
           const hex = toHex(site);
           const v = Number(version);
-          if ((this.ack[hex] ?? 0) < v) await this.saveAck(hex, v);
+          if ((ack[hex] ?? 0) >= v) continue;
+          // A direct peer's acknowledgement moves ONLY that peer's own cursor:
+          // it is not the system of record and must never be able to convince
+          // this replica that the fleet has seen a row.
+          if (direct) ack[hex] = v;
+          else await this.saveAck(hex, v);
         }
         if (reply.batches.length) {
           const applied = await this.worker.call('sync-apply', {
@@ -218,11 +261,17 @@ export class BrowserDbSync {
     return report;
   }
 
-  async syncAll() {
+  // `peers` defaults to the capability's server-derived fleet set. The caller
+  // may pass a wider list (fleet peers PLUS direct browser peers) — the fleet
+  // half stays first so convergence never depends on a direct link existing,
+  // and a direct peer's refusal does not abort the pass the way a fleet
+  // refusal (the revocation signal) does.
+  async syncAll(peers) {
     const reports = [];
-    for (const peer of this.cap.sync_peers ?? []) {
-      reports.push(await this.syncPeer(peer));
-      if (reports[reports.length - 1].forbidden) break;
+    for (const peer of peers ?? this.cap.sync_peers ?? []) {
+      const report = await this.syncPeer(peer);
+      reports.push(report);
+      if (report.forbidden && !report.direct) break;
     }
     return reports;
   }
