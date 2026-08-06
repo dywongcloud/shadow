@@ -111,6 +111,80 @@ function withCache(req: { nextUrl: { pathname: string } }, res: Response): Respo
   return res;
 }
 
+/* ---- CORS for our OWN sibling origin, on the proxy surfaces only ----------
+ *
+ * `/cloud/*` and `/api/*` are deliberately SAME-ORIGIN proxies (next.config's
+ * rewrite says so outright: "Proxy dashboard API calls to a hive-cloud node's
+ * admin API (avoids CORS)"), so normally no CORS headers are needed and none
+ * are emitted.
+ *
+ * The failure this exists for: the site answers on BOTH the apex and `www`. A
+ * browser that has cached a permanent apex→www redirect applies it BEFORE the
+ * network is consulted, so a page loaded on the apex issues `/api/...` and
+ * `/cloud/...` requests the browser itself rewrites to the www host — silently
+ * turning a same-origin call cross-origin. The preflight then fails with "No
+ * 'Access-Control-Allow-Origin' header is present" and run-node loses presence
+ * publishing and gitops sync entirely. Witnessed live; this is NOT a stray
+ * server rule to delete — all 14 fleet nodes answer that preflight 204 with no
+ * Location, so nothing server-side is redirecting. Making the two origins
+ * interchangeable is the only durable fix.
+ *
+ * Deliberately narrow: only these two path prefixes, the Origin is ECHOED only
+ * when it is one of OUR hosts (never reflected blindly, never `*` — these are
+ * cookie-authenticated and `*` is illegal with credentials), and `Vary: Origin`
+ * keeps a cache from serving one origin's response to the other. */
+function isOwnOrigin(origin: string | null): origin is string {
+  if (!origin) return false;
+  let host: string;
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "https:" && u.protocol !== "http:") return false;
+    host = u.hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const apex = (process.env.NEXT_PUBLIC_HIVE_PLATFORM_DOMAIN || "shadw.cloud").toLowerCase();
+  return host === apex || host === `www.${apex}` || host === "localhost" || host === "127.0.0.1";
+}
+
+function isProxySurface(pathname: string): boolean {
+  return pathname.startsWith("/api/") || pathname.startsWith("/cloud/");
+}
+
+function withCors(origin: string, res: Response): Response {
+  res.headers.set("Access-Control-Allow-Origin", origin);
+  res.headers.set("Access-Control-Allow-Credentials", "true");
+  res.headers.append("Vary", "Origin");
+  return res;
+}
+
+/** Wraps a proxy handler so a cross-origin call between our own hosts works:
+ *  answers the preflight directly (the upstream admin API has no OPTIONS route)
+ *  and stamps the echo headers on the real response. Inert for every request
+ *  that is same-origin or outside the two proxy surfaces. */
+function corsWrapped<Req extends { nextUrl: { pathname: string }; headers: Headers; method: string }, Ev>(
+  inner: (req: Req, event: Ev) => Response | Promise<Response>,
+): (req: Req, event: Ev) => Promise<Response> {
+  return async (req: Req, event: Ev) => {
+    const origin = req.headers.get("origin");
+    const wants = isProxySurface(req.nextUrl.pathname) && isOwnOrigin(origin);
+    if (wants && req.method === "OPTIONS") {
+      const pre = new NextResponse(null, { status: 204 });
+      pre.headers.set("Access-Control-Allow-Methods", "GET,HEAD,POST,PUT,PATCH,DELETE,OPTIONS");
+      // Echo the requested headers: the upstream still does its own
+      // authorization, so allowing a header name grants nothing by itself.
+      pre.headers.set(
+        "Access-Control-Allow-Headers",
+        req.headers.get("access-control-request-headers") || "content-type,authorization",
+      );
+      pre.headers.set("Access-Control-Max-Age", "600");
+      return withCors(origin, pre);
+    }
+    const res = await inner(req, event);
+    return wants ? withCors(origin, res) : res;
+  };
+}
+
 // Operations Console (/admin) AND its API proxy (/ops, -> admin.shadw.cloud) —
 // platform-owner only. Restricted to this fixed allow-list of emails; any
 // other signed-in user is bounced to the dashboard. Both must share this gate:
@@ -251,11 +325,15 @@ function neutralizeClerkSelfRewrite(req: Request, res: Response): Response {
 // guard only rewrites when the response's `x-middleware-rewrite` target equals the
 // request URL, so it stays inert unless that exact same-URL self-rewrite reappears.
 export const proxy = bypass
-  ? (req: Request & { nextUrl: { pathname: string } }) => withCache(req, NextResponse.next())
-  : async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
-      const res = await clerk(req, event);
-      return neutralizeClerkSelfRewrite(req, res ?? NextResponse.next());
-    };
+  ? corsWrapped((req: Request & { nextUrl: { pathname: string }; method: string }) =>
+      withCache(req, NextResponse.next()),
+    )
+  : corsWrapped(
+      async (req: Parameters<typeof clerk>[0], event: Parameters<typeof clerk>[1]) => {
+        const res = await clerk(req, event);
+        return neutralizeClerkSelfRewrite(req, res ?? NextResponse.next());
+      },
+    );
 
 export const config = {
   // Run on app routes. Skip Next internals + static FILES (extension at the end),
