@@ -447,10 +447,12 @@ impl BrowserAdmissionStore {
     /// (bn-p2p-revocation-latency, `fanout_revoke`/`mesh_revoke_echo` below) --
     /// deliberately independent of `revoke()`'s full active/tombstone/version
     /// mutation. Touching this node's own wall-clock-anchored version counter
-    /// as if IT made the authoritative decision could race ahead of a leader
-    /// whose clock lags by even a few ms, causing a later genuinely-
-    /// authoritative leader snapshot to be rejected by `adopt()`'s version
-    /// check. The narrower operation (denylist only) is safe regardless.
+    /// as if IT made the authoritative decision would advertise a logical time
+    /// this node never earned (see `adopt`'s version note — a pre-upgrade
+    /// follower still gates its wholesale replace on that number). The narrower
+    /// operation (denylist only) is safe regardless, and `adopt` re-derives the
+    /// entry's fate on every merge: it survives until some node's strictly
+    /// newer admission for the same endpoint supersedes it.
     fn mark_denied(&self, endpoint_id: &str, now: u64) {
         let mut state = self.inner.lock();
         state.denylist.insert(endpoint_id.to_string(), now);
@@ -549,30 +551,146 @@ impl BrowserAdmissionStore {
         self.inner.lock().clone()
     }
 
+    /// Merge an incoming snapshot into local state **per endpoint id** — never
+    /// as a wholesale replacement.
+    ///
+    /// This used to be `*state = incoming` behind an `incoming.version >
+    /// state.version` gate, which silently DESTROYED admissions — the exact bug
+    /// `browser_presence::adopt` was already fixed for, in the store whose
+    /// records actually authorize serving. Every node's `version` is wall-clock
+    /// anchored (`next_version()` is `now_ms()`), so two nodes that each
+    /// admitted a browser hold snapshots whose versions differ by milliseconds;
+    /// whichever replicated with the higher version overwrote the other's
+    /// entire map, and the browsers admitted through the losing node lost
+    /// routing, presence and their database grant with no error logged
+    /// anywhere. An admission is a per-endpoint fact owned by whichever node the
+    /// browser admitted through — behind round-robin DNS that is routinely a
+    /// different node per browser — so the join has to be per endpoint id.
+    ///
+    /// Rules, applied to the union of both sides:
+    /// * a record wins on the higher `revision` (ties keep local);
+    /// * a tombstone at or above a record's revision always removes that record,
+    ///   whichever side either arrived from, so revocation/expiry still
+    ///   propagates as authoritative deletion (the "replicate zero browsers now"
+    ///   property `store_sync::REGISTRY` depends on) while a RE-admission, whose
+    ///   revision is strictly newer than the tombstone that preceded it,
+    ///   survives;
+    /// * tombstones union by max revision, so a merge can never lose one;
+    /// * the relay denylist unions by max revoked-at and then drops any entry
+    ///   the merged `active` map supersedes with a strictly-newer admission —
+    ///   `put`'s "a fresh validated admission supersedes the relay denylist; a
+    ///   bare revoke still denies" rule (AGENTS.md), enforced on the replication
+    ///   path instead of only at the point of admission. Without it a follower's
+    ///   own denylist entry for a since-re-admitted endpoint would survive every
+    ///   merge and deny that browser at the relay for the full retention window;
+    ///   with it, a stale peer snapshot cannot resurrect a cleared entry either,
+    ///   because the newer record drops it again in the same pass. A revoke with
+    ///   no newer admission leaves no such record, so it keeps denying.
+    ///
+    /// A record dropped WITHOUT a tombstone (a node that lost state) can be
+    /// resurrected here by a peer, deliberately and bounded: leases are minutes
+    /// (`MAX_LEASE_SECS`) and every reader filters on `expires_ms`, so a
+    /// genuinely dead admission grants nothing and ages out on the leader's next
+    /// `expire()` rather than being destroyed early.
     fn adopt(
         &self,
-        mut incoming: BrowserAdmissionSnapshot,
+        incoming: BrowserAdmissionSnapshot,
     ) -> Option<(BrowserAdmissionSnapshot, BrowserAdmissionSnapshot)> {
-        for (id, revision) in &incoming.tombstones {
-            if incoming
-                .active
-                .get(id)
-                .is_some_and(|record| record.revision <= *revision)
-            {
-                incoming.active.remove(id);
+        let mut state = self.inner.lock();
+        let old = state.clone();
+
+        for (id, revision) in incoming.tombstones {
+            let entry = state.tombstones.entry(id).or_insert(0);
+            if revision > *entry {
+                *entry = revision;
             }
         }
-        let mut state = self.inner.lock();
-        let local_empty = state.active.is_empty() && state.tombstones.is_empty();
-        if incoming.version < state.version && !local_empty {
+        for (id, record) in incoming.active {
+            if state
+                .active
+                .get(&id)
+                .is_some_and(|local| local.revision >= record.revision)
+            {
+                continue;
+            }
+            state.active.insert(id, record);
+        }
+        // Disjoint field borrows: a tombstone at or above a record's revision
+        // removes it, whichever side each of them arrived from.
+        let dead: Vec<String> = {
+            let BrowserAdmissionSnapshot {
+                active, tombstones, ..
+            } = &*state;
+            active
+                .iter()
+                .filter(|(id, record)| {
+                    tombstones
+                        .get(id.as_str())
+                        .is_some_and(|revision| *revision >= record.revision)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in dead {
+            state.active.remove(&id);
+        }
+
+        for (id, revoked_at) in incoming.denylist {
+            let entry = state.denylist.entry(id).or_insert(0);
+            if revoked_at > *entry {
+                *entry = revoked_at;
+            }
+        }
+        // `put`'s supersede rule, applied to the merged state: revisions and
+        // denylist stamps are both wall-clock ms from the deciding node, the
+        // same basis the tombstone comparison above already rests on, so a
+        // record newer than the revoke IS a re-admission that passed fresh
+        // session + PoP + descriptor validation on some node.
+        let superseded: Vec<String> = {
+            let BrowserAdmissionSnapshot {
+                active, denylist, ..
+            } = &*state;
+            denylist
+                .iter()
+                .filter(|(id, revoked_at)| {
+                    active
+                        .get(id.as_str())
+                        .is_some_and(|record| record.revision > **revoked_at)
+                })
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        for id in superseded {
+            state.denylist.remove(&id);
+        }
+
+        // `version` is this node's logical clock for "everything I have ever
+        // been told about", and after a merge that is exactly the union of both
+        // sides' claims — hence `max`, never a fresh `next_version()` bump. The
+        // distinction is load-bearing for pre-upgrade followers, which still
+        // adopt wholesale behind `incoming.version > local.version`: stamping
+        // `now_ms()` here would advertise a logical time this node never earned
+        // and make an old follower REJECT a genuinely newer snapshot from a
+        // third node that admitted a browser this one has never seen — data loss
+        // manufactured by the fix. `max` can only ever UNDER-claim (holding a
+        // superset of the incoming state while advertising its version), which
+        // costs at worst one round of staleness on an old follower and is
+        // cleared by the next local write, since any admit/renew/revoke bumps
+        // the version past it.
+        state.version = state.version.max(incoming.version);
+        state.prune_tombstones(hive_core::now_ms());
+
+        // Preserve the caller's no-op signal: `adopt_snapshot` treats `None` as
+        // "nothing adopted" and skips `reconcile`, so a merge that changed
+        // nothing must not be reported as a change.
+        if state.active == old.active
+            && state.tombstones == old.tombstones
+            && state.denylist == old.denylist
+        {
             return None;
         }
-        if incoming.version == state.version && !local_empty {
-            return None;
-        }
-        let old = state.clone();
-        *state = incoming.clone();
-        Some((old, incoming))
+        let new = state.clone();
+        Some((old, new))
     }
 }
 

@@ -3625,11 +3625,22 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                     // witnessed as sj=5 / bkk=4 / va=2 teams (a stale failover
                     // stand-in then corrupted the teams mirror) and the admin
                     // incidents page showing nothing on non-leader nodes. Wholesale
-                    // replace (not merge) is correct under the single-writer model:
-                    // the leader IS the authority. `store_sync::REGISTRY` drives
-                    // every one through the same generic path; each entry's `adopt`
-                    // declines an empty/unparsable payload so an unreachable/booting
-                    // leader can never wipe a follower. See `crate::store_sync`.
+                    // replace (not merge) is correct for that class under the
+                    // single-writer model: the leader IS the authority.
+                    //
+                    // TWO stores are deliberate exceptions and MERGE per key
+                    // instead, because they are written on whichever node the
+                    // browser actually reached rather than only on the leader —
+                    // `browser_presence` and `browser_admissions` (see each one's
+                    // own `adopt`). For those, a wholesale replace silently drops
+                    // every record admitted through another node, which is exactly
+                    // the bug both were fixed for; do not "restore consistency" by
+                    // making them replace again.
+                    //
+                    // `store_sync::REGISTRY` drives every one through the same
+                    // generic path; each entry's `adopt` declines an
+                    // empty/unparsable payload so an unreachable/booting leader can
+                    // never wipe a follower. See `crate::store_sync`.
                     let leader = cloud.control_plane_leader();
                     let peer = cloud.registry.nodes().into_iter().find(|n| {
                         n.name == leader

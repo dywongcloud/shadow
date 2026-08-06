@@ -389,13 +389,43 @@ pub struct Checkout {
 }
 
 /// Per-tenant meter cursor: the last cumulative usage seen + the sub-cent remainder
-/// carried between ticks so no usage is lost to rounding. In-memory (rebuilt on
-/// restart from live metrics; charges already recorded persist in the account).
+/// carried between ticks so no usage is lost to rounding.
 #[derive(Default)]
 struct MeterState {
     last: UsageTotals,
     frac_cents: f64,
 }
+
+/// One tenant's meter cursor as it crosses the persistence boundary
+/// (`meters_snapshot`/`meters_load` → `PlatformSnapshot::billing_meters`).
+///
+/// This exists because the cursor is the ONLY thing standing between a restart
+/// and a re-bill: `meter_usage` charges `current - last`, and `last` used to
+/// live exclusively in a `RwLock<HashMap<..>>` that `snapshot()` never
+/// returned. A restart therefore restarted every tenant's watermark at zero
+/// while the fleet-wide counters it is subtracted from kept climbing, so the
+/// first tick after a restart charged the ENTIRE cumulative fleet total again
+/// (the −$55 incident documented on `meter_usage`'s counter-reset branch,
+/// which fixed the fleet-side half of the same arithmetic and left the
+/// persistence-side half open).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MeterWatermark {
+    pub tenant: String,
+    #[serde(default)]
+    pub last: UsageTotals,
+    /// Sub-cent remainder carried to the next tick. Persisted with the
+    /// watermark: dropping it silently discards up to 1¢ of accrued usage per
+    /// tenant per restart, in the customer's favour but out of the ledger.
+    #[serde(default)]
+    pub frac_cents: f64,
+}
+
+/// How long an unconfirmed checkout survives. Stripe expires a Checkout Session
+/// after 24h, so a local record older than that can never be confirmed — and
+/// persistence (below) is what makes the bound necessary in the first place: the
+/// map used to be cleared by every process restart, which "collected" abandoned
+/// checkouts by accident.
+pub const CHECKOUT_RETENTION_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Default)]
 pub struct BillingStore {
@@ -404,6 +434,18 @@ pub struct BillingStore {
     checkouts: RwLock<HashMap<String, Checkout>>,
     meters: RwLock<HashMap<String, MeterState>>,
     invoices: RwLock<HashMap<String, Vec<Invoice>>>,
+    /// Set when this process restored a snapshot that carried NO meters field
+    /// at all (a pre-upgrade node's snapshot, or no snapshot). A missing field
+    /// means the watermarks are UNKNOWN, never zero — so the first reading for
+    /// a tenant with no cursor is adopted as its baseline and charged nothing,
+    /// exactly as a counter DECREASE is (`meter_usage`). Under-counting one
+    /// tick is the correct direction to err; charging from zero re-bills the
+    /// whole fleet's cumulative usage.
+    ///
+    /// Default `false` is the honest value for a store that never loaded
+    /// anything (fresh install, unit tests): there is no lost watermark to be
+    /// unknown about, so a first reading is genuinely first usage.
+    meters_baseline_unknown: std::sync::atomic::AtomicBool,
 }
 
 impl BillingStore {
@@ -547,6 +589,14 @@ impl BillingStore {
         };
         let (delta, carry) = {
             let mut meters = self.meters.write();
+            // No cursor for this tenant AND this process booted without a
+            // persisted meters field => the watermark is UNKNOWN, not zero.
+            // Adopt the live counters as the baseline and charge nothing this
+            // tick (same re-baseline rule as a counter decrease below).
+            let seeding = self
+                .meters_baseline_unknown
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && !meters.contains_key(tenant);
             let st = meters.entry(tenant.to_string()).or_default();
             // These are CUMULATIVE counters summed across the whole fleet
             // (`fleet_function_stats`), so `cur < last` means a counter RESET,
@@ -566,13 +616,22 @@ impl BillingStore {
             // the last sample and the restart, which is the correct direction to
             // err for billing — never charge a customer for a counter reset.
             let sub = |cur: u64, last: u64| if cur >= last { cur - last } else { 0 };
-            let delta = UsageTotals {
-                active_cpu_ms: sub(current.active_cpu_ms, st.last.active_cpu_ms),
-                mem_gb_hr_milli: sub(current.mem_gb_hr_milli, st.last.mem_gb_hr_milli),
-                requests: sub(current.requests, st.last.requests),
-                blocked: sub(current.blocked, st.last.blocked),
-                gpu_ms: sub(current.gpu_ms, st.last.gpu_ms),
-                browser_requests: sub(current.browser_requests, st.last.browser_requests),
+            let delta = if seeding {
+                tracing::info!(
+                    tenant,
+                    "billing meter: no persisted watermark for this tenant — adopting the live \
+                     counters as its baseline and charging nothing this tick"
+                );
+                UsageTotals::default()
+            } else {
+                UsageTotals {
+                    active_cpu_ms: sub(current.active_cpu_ms, st.last.active_cpu_ms),
+                    mem_gb_hr_milli: sub(current.mem_gb_hr_milli, st.last.mem_gb_hr_milli),
+                    requests: sub(current.requests, st.last.requests),
+                    blocked: sub(current.blocked, st.last.blocked),
+                    gpu_ms: sub(current.gpu_ms, st.last.gpu_ms),
+                    browser_requests: sub(current.browser_requests, st.last.browser_requests),
+                }
             };
             st.last = current;
             (delta, st.frac_cents)
@@ -947,6 +1006,11 @@ impl BillingStore {
     }
 
     // --- persistence ---
+    // FOUR pairs, not one: `snapshot`/`load` (accounts + ledger),
+    // `invoices_snapshot`/`invoices_load`, `meters_snapshot`/`meters_load`, and
+    // `checkouts_snapshot`/`checkouts_load`. Every field of `BillingStore` is
+    // covered by exactly one of them — anything added to the struct without a
+    // pair here is state that silently dies at the next restart or failover.
     pub fn snapshot(&self) -> (Vec<BillingAccount>, Vec<LedgerEntry>) {
         (
             self.accounts.read().values().cloned().collect(),
@@ -960,6 +1024,97 @@ impl BillingStore {
             .collect();
         *self.ledger.write() = ledger;
     }
+    /// Per-tenant meter watermarks (for persistence), tenant-sorted so the
+    /// bytes are deterministic — a byte-compare change gate (`store_sync`,
+    /// the relational dirty-check) must not see a HashMap's iteration order as
+    /// a change.
+    ///
+    /// Deliberately a SEPARATE pair from `snapshot()`/`load()` rather than a
+    /// widened tuple: the accounts+ledger tuple is also the wire shape
+    /// `store_sync`'s `billing` entry encodes, and a node running the previous
+    /// binary decodes that wire value with `serde_json::from_slice::<(Map,
+    /// Vec)>`, which fails outright on a 3-element array. Widening it would
+    /// stop billing replicating to every not-yet-upgraded node for the length
+    /// of a rollout. `invoices_snapshot`/`invoices_load` set the same
+    /// precedent.
+    pub fn meters_snapshot(&self) -> Vec<MeterWatermark> {
+        let m = self.meters.read();
+        let mut v: Vec<MeterWatermark> = m
+            .iter()
+            .map(|(tenant, st)| MeterWatermark {
+                tenant: tenant.clone(),
+                last: st.last,
+                frac_cents: st.frac_cents,
+            })
+            .collect();
+        v.sort_by(|a, b| a.tenant.cmp(&b.tenant));
+        v
+    }
+
+    /// Restore the meter watermarks. `None` means the snapshot carried no
+    /// meters field at all — a pre-upgrade node wrote it, or there is no
+    /// snapshot — which is UNKNOWN, not "everyone is at zero"; see
+    /// `meters_baseline_unknown`. `Some(vec![])` is a real, known, empty set
+    /// (nothing has ever been metered), so a tenant absent from a PRESENT list
+    /// is genuinely new and still bills from zero.
+    pub fn meters_load(&self, meters: Option<Vec<MeterWatermark>>) {
+        let Some(list) = meters else {
+            self.meters_baseline_unknown
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "billing meters: snapshot carried no watermarks — treating every tenant's meter \
+                 baseline as UNKNOWN (first reading re-baselines, charges nothing) rather than zero"
+            );
+            return;
+        };
+        let n = list.len();
+        *self.meters.write() = list
+            .into_iter()
+            .map(|w| {
+                (
+                    w.tenant,
+                    MeterState {
+                        last: w.last,
+                        frac_cents: w.frac_cents,
+                    },
+                )
+            })
+            .collect();
+        self.meters_baseline_unknown
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if n > 0 {
+            tracing::info!(tenants = n, "billing meters: restored usage watermarks");
+        }
+    }
+
+    /// Open (unconfirmed) checkouts across all tenants, for persistence.
+    /// Age-filtered: a session past [`CHECKOUT_RETENTION_MS`] can no longer be
+    /// confirmed at Stripe, so persisting it would only grow the map forever.
+    pub fn checkouts_snapshot(&self) -> Vec<Checkout> {
+        let now = now_ms();
+        let mut v: Vec<Checkout> = self
+            .checkouts
+            .read()
+            .values()
+            .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| a.id.cmp(&b.id));
+        v
+    }
+
+    /// Restore open checkouts. The retention bound is enforced HERE as well as
+    /// in `checkouts_snapshot`, so no on-disk file (hand-edited, or written by
+    /// a build with a different bound) can reload an unbounded set.
+    pub fn checkouts_load(&self, checkouts: Vec<Checkout>) {
+        let now = now_ms();
+        *self.checkouts.write() = checkouts
+            .into_iter()
+            .filter(|c| now.saturating_sub(c.created_ms) < CHECKOUT_RETENTION_MS)
+            .map(|c| (c.id.clone(), c))
+            .collect();
+    }
+
     /// Finalized invoices across all tenants (for persistence).
     pub fn invoices_snapshot(&self) -> Vec<Invoice> {
         self.invoices.read().values().flatten().cloned().collect()

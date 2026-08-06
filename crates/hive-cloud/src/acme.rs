@@ -7,7 +7,11 @@
 //! relay does its own TLS so they're off by default).
 //!
 //! * Only the CLUSTER LEADER (same election as billing/DNS-reconciler) runs the
-//!   ACME client — N nodes must not race Let's Encrypt.
+//!   ACME client — N nodes must not race Let's Encrypt. The ACCOUNT it runs as
+//!   is fleet state, not leader state: the credential is sealed with the cluster
+//!   secret and replicated (see `account`), so a handover keeps ONE Let's
+//!   Encrypt identity and one rate-limit budget instead of registering a new
+//!   account per leader.
 //! * Renewal at ~2/3 of the 90-day validity (issue + 60d), jittered daily check.
 //! * Distribution: bundle JSON in the guardian replicated store with the private
 //!   key AEAD-encrypted (`enc:v1:` via `secrets.rs`) — never plaintext in a
@@ -302,22 +306,338 @@ async fn wait_txt(http: &reqwest::Client, fqdn: &str, value: &str) -> bool {
     false
 }
 
-/// Load (or create once) the ACME account. Credentials persist in
-/// `$HIVE_DATA/acme-account.json` (leader-local; a new leader creates its own).
-async fn account(http: &reqwest::Client) -> anyhow::Result<Account> {
-    let _ = http; // account creation uses instant-acme's own hyper client
-    let path = crate::persist::data_dir().join(if staging() {
+// ---- the fleet's ACME account ---------------------------------------------------
+//
+// The account credential is the fleet's IDENTITY at Let's Encrypt, and every
+// rate limit that matters is scoped to it or to the identifier set it orders
+// for. It used to live only in `$HIVE_DATA/acme-account.json`, leader-local and
+// in PLAINTEXT, so every control-plane handover registered a brand-new account:
+// the fleet's issuance history, its per-account limits and its order history all
+// restarted under an identity nothing else in the platform knew about.
+//
+// It is now sealed with the cluster secret (`secrets::encrypt` — the same
+// treatment `CertBundle.key_pem_enc` already gets, in this same file) and stored
+// in the replicated GuardianDB store, so whichever node holds the designation
+// resolves the SAME account. Two rules the code below enforces and that any
+// future change must keep:
+//
+//   * The credential is NEVER written unsealed, NEVER logged, and never carried
+//     in an error or incident message. The only things that surface are the
+//     source it came from and, for a failure, the remedy.
+//   * A NEW account is created ONLY when no source yields credentials at all. If
+//     credentials exist but cannot be ACTIVATED (LE directory unreachable, order
+//     endpoint 5xx), that is an error to retry on the next pass — never a reason
+//     to register a second identity, which is precisely how a transient network
+//     failure would have burned one.
+
+/// Envelope version for the sealed account credential at rest / in the store.
+const ACCOUNT_ENVELOPE_V: u32 = 1;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AccountEnvelope {
+    v: u32,
+    /// `enc:v1:`-sealed serialization of `instant_acme::AccountCredentials`.
+    creds_enc: String,
+    created_ms: u64,
+}
+
+/// The outcome of opening an envelope — three states, because "no account
+/// stored" and "an account is stored that this node cannot decrypt" demand
+/// opposite responses (create one vs. shout about the key).
+enum EnvelopeOpen {
+    Missing,
+    /// Present but no configured key opens it: `HIVE_SECRET_KEY` differs from
+    /// the sealing node's, or was rotated without `HIVE_SECRET_KEY_OLD`.
+    Undecryptable,
+    Opened(Box<AccountCredentials>),
+}
+
+fn account_guardian_key() -> String {
+    format!(
+        "acme/account/{}",
+        if staging() { "staging" } else { "prod" }
+    )
+}
+
+/// Sealed local cache — a deliberately NEW filename, so this build never hands a
+/// sealed envelope to a rolled-back binary that would parse it as bare
+/// `AccountCredentials`, fail, and register a fresh account.
+fn account_sealed_path() -> std::path::PathBuf {
+    crate::persist::data_dir().join(if staging() {
+        "acme-account-sealed-staging.json"
+    } else {
+        "acme-account-sealed.json"
+    })
+}
+
+/// The pre-seal plaintext file. Read once and carried into the sealed store —
+/// an existing account is always reused, never regenerated.
+fn account_legacy_path() -> std::path::PathBuf {
+    crate::persist::data_dir().join(if staging() {
         "acme-account-staging.json"
     } else {
         "acme-account.json"
-    });
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        if let Ok(creds) = serde_json::from_str::<AccountCredentials>(&s) {
-            if let Ok(acct) = Account::builder()?.from_credentials(creds).await {
-                return Ok(acct);
+    })
+}
+
+/// Seal credentials into a storable envelope. `None` only if serialization
+/// itself fails; the error is deliberately not propagated with its payload.
+fn seal_account(creds: &AccountCredentials) -> Option<String> {
+    let plain = serde_json::to_string(creds).ok()?;
+    let env = AccountEnvelope {
+        v: ACCOUNT_ENVELOPE_V,
+        creds_enc: crate::secrets::encrypt(&plain),
+        created_ms: hive_core::now_ms(),
+    };
+    // A seal that didn't actually seal must never reach disk or the mesh.
+    if !crate::secrets::is_encrypted(&env.creds_enc) {
+        tracing::error!(
+            "ACME account credential could not be AEAD-sealed — refusing to store it in the clear"
+        );
+        return None;
+    }
+    serde_json::to_string(&env).ok()
+}
+
+fn open_account_envelope(bytes: &[u8]) -> EnvelopeOpen {
+    let Ok(env) = serde_json::from_slice::<AccountEnvelope>(bytes) else {
+        return EnvelopeOpen::Missing;
+    };
+    if env.v != ACCOUNT_ENVELOPE_V {
+        tracing::warn!(
+            version = env.v,
+            expected = ACCOUNT_ENVELOPE_V,
+            "ACME account envelope has an unknown version — ignoring it"
+        );
+        return EnvelopeOpen::Missing;
+    }
+    // try_decrypt, not decrypt: `decrypt` returns its input unchanged when no
+    // key opens the value, which would turn "wrong key" into a JSON parse
+    // failure indistinguishable from "no account stored" — the exact confusion
+    // that must not silently register a second account.
+    let Some(plain) = crate::secrets::try_decrypt(&env.creds_enc) else {
+        return EnvelopeOpen::Undecryptable;
+    };
+    match serde_json::from_str::<AccountCredentials>(&plain) {
+        Ok(c) => EnvelopeOpen::Opened(Box::new(c)),
+        Err(_) => {
+            tracing::error!(
+                "ACME account credential decrypted but did not parse — the stored envelope is corrupt"
+            );
+            EnvelopeOpen::Undecryptable
+        }
+    }
+}
+
+/// Write the sealed envelope to the local cache (tmp + rename, chmod 600) and
+/// VERIFY it reads back and opens. Returns false on any failure — callers treat
+/// that as loud, because an unwritten credential means the next pass registers
+/// another account.
+fn write_account_sealed(env_json: &str) -> bool {
+    let path = account_sealed_path();
+    let dir = crate::persist::data_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return false;
+    }
+    // tmp name derived from the target, so a staging and a prod write can never
+    // rename each other's partial file into place.
+    let mut tmp = path.clone();
+    tmp.as_mut_os_string().push(".tmp");
+    if std::fs::write(&tmp, env_json).is_err() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
+    match std::fs::read(&path) {
+        Ok(b) => matches!(open_account_envelope(&b), EnvelopeOpen::Opened(_)),
+        Err(_) => false,
+    }
+}
+
+fn read_account_sealed() -> EnvelopeOpen {
+    let path = account_sealed_path();
+    let Ok(bytes) = std::fs::read(&path) else {
+        return EnvelopeOpen::Missing; // no local copy yet — normal
+    };
+    let opened = open_account_envelope(&bytes);
+    if matches!(opened, EnvelopeOpen::Missing) {
+        // The file EXISTS but is not a readable envelope. Treated as absent so
+        // TLS still gets an account, but never silently: this is the one shape
+        // in which a stored credential is lost without a key problem.
+        tracing::error!(path = ?path, "the local sealed ACME account file is present but unreadable — it will be ignored");
+    }
+    opened
+}
+
+/// Open an incident at most ONCE per process for a static, unchanging
+/// condition. The ACME loop revisits every bundle every ~6h, so an unguarded
+/// `open` on a condition that cannot change while the process runs would append
+/// a new incident per bundle per pass, forever.
+fn incident_once(
+    fired: &std::sync::atomic::AtomicBool,
+    incidents: Option<&crate::incidents::IncidentStore>,
+    req: crate::incidents::OpenReq,
+) {
+    let Some(inc) = incidents else { return };
+    if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    inc.open(req);
+}
+
+fn open_key_incident(incidents: Option<&crate::incidents::IncidentStore>, where_: &str) {
+    tracing::error!(
+        source = where_,
+        "the fleet's ACME account credential exists but NO configured key opens it — set the \
+         fleet-shared HIVE_SECRET_KEY (and HIVE_SECRET_KEY_OLD with the previous key if it was \
+         rotated) so this node can reuse the fleet's Let's Encrypt account instead of registering \
+         another one"
+    );
+    static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    incident_once(
+        &FIRED,
+        incidents,
+        crate::incidents::OpenReq {
+            title: "ACME account credential is sealed under an unknown key".into(),
+            severity: crate::incidents::Severity::Major,
+            affected: vec!["tls".into(), "acme".into()],
+            message: format!(
+                "The stored ACME account credential ({where_}) cannot be decrypted with any key \
+                 this node holds, so it cannot act as the fleet's Let's Encrypt account. Set the \
+                 fleet-shared HIVE_SECRET_KEY (carry the previous key in HIVE_SECRET_KEY_OLD if it \
+                 was rotated) and restart this node. Until then every issuance from here runs under \
+                 a separate LE account."
+            ),
+        },
+    );
+}
+
+/// Resolve the fleet's ACME account: sealed local cache → replicated store →
+/// legacy plaintext file (migrated forward) → create one, in that order.
+async fn account(
+    http: &reqwest::Client,
+    incidents: Option<&crate::incidents::IncidentStore>,
+) -> anyhow::Result<Account> {
+    let _ = http; // account creation uses instant-acme's own hyper client
+    let mut found: Option<(&'static str, Box<AccountCredentials>)> = None;
+
+    // REPLICATED COPY FIRST, local cache second. Order is the convergence rule,
+    // not a preference: every node that was ever leader may hold a DIFFERENT
+    // account of its own, and reading the local copy first would let each keep
+    // using its own forever — the exact per-leader-identity split this change
+    // exists to end. Reading the fleet's copy first makes every node adopt the
+    // one account. The local cache remains the fallback for a guardian that is
+    // down or has nothing yet, so an offline node still issues.
+    if let Some(bytes) = crate::guardian::get(&account_guardian_key()).await {
+        match open_account_envelope(&bytes) {
+            EnvelopeOpen::Opened(c) => {
+                // Cache it locally so later boots don't depend on guardian being
+                // reachable. Best-effort: the credential is already in hand.
+                if let Some(env) = seal_account(&c) {
+                    if !write_account_sealed(&env) {
+                        tracing::warn!("adopted the replicated ACME account but could not write the local sealed cache");
+                    }
+                }
+                found = Some(("replicated store", c));
+            }
+            EnvelopeOpen::Undecryptable => open_key_incident(incidents, "replicated store"),
+            EnvelopeOpen::Missing => {}
+        }
+    }
+
+    if found.is_none() {
+        match read_account_sealed() {
+            EnvelopeOpen::Opened(c) => found = Some(("local sealed cache", c)),
+            EnvelopeOpen::Undecryptable => open_key_incident(incidents, "local sealed cache"),
+            EnvelopeOpen::Missing => {}
+        }
+        // Deliberately NOT pushed to guardian on a plain cache hit: `get`
+        // returning nothing cannot distinguish "the fleet has no account" from
+        // "this node's replica hasn't synced yet", and seeding on the second
+        // would overwrite the fleet's identity with this node's. Only the
+        // migrate and create paths below (which know no account was found
+        // anywhere) write to the replicated store.
+    }
+
+    // The pre-seal plaintext file: adopt it rather than ever regenerating, then
+    // seal it forward and remove the plaintext copy.
+    if found.is_none() {
+        let legacy = account_legacy_path();
+        if let Ok(s) = std::fs::read_to_string(&legacy) {
+            match serde_json::from_str::<AccountCredentials>(&s) {
+                Ok(c) => {
+                    let sealed = seal_account(&c);
+                    let stored = match &sealed {
+                        Some(env) => write_account_sealed(env),
+                        None => false,
+                    };
+                    if stored {
+                        if let Some(env) = sealed {
+                            crate::guardian::put(&account_guardian_key(), env.into_bytes()).await;
+                        }
+                        // Only after a VERIFIED sealed copy exists: this is the
+                        // whole point of the migration, an account private key
+                        // must not stay in plaintext on disk.
+                        match std::fs::remove_file(&legacy) {
+                            Ok(()) => tracing::info!(
+                                "migrated the plaintext ACME account credential into the sealed, \
+                                 replicated store and removed the plaintext file"
+                            ),
+                            Err(e) => tracing::warn!(error = %e, "sealed the ACME account credential but could not remove the plaintext file — delete it by hand"),
+                        }
+                    } else {
+                        tracing::error!(
+                            "could not seal the existing plaintext ACME account credential — \
+                             keeping the plaintext file and reusing the account from it"
+                        );
+                    }
+                    found = Some(("legacy plaintext file", Box::new(c)));
+                }
+                Err(_) => tracing::warn!(
+                    "the legacy ACME account file exists but did not parse — ignoring it"
+                ),
             }
         }
     }
+
+    if let Some((source, creds)) = found {
+        // A plaintext credential still on disk after resolving from somewhere
+        // else is a superseded account this node once owned. NOT deleted: we
+        // hold no sealed copy of it, and deleting a credential we haven't
+        // stored is irreversible. Named so an operator can remove it.
+        if source != "legacy plaintext file" {
+            let legacy = account_legacy_path();
+            if legacy.exists() {
+                tracing::warn!(
+                    path = ?legacy,
+                    "a PLAINTEXT ACME account credential from before sealed storage is still on \
+                     disk and is now superseded — remove it by hand (it is not deleted \
+                     automatically: no sealed copy of that particular account exists)"
+                );
+            }
+        }
+        // Credentials in hand: activation failure is TRANSIENT (the ACME
+        // directory is fetched here). Registering a new account on this path
+        // would silently abandon the fleet's identity over a network blip.
+        return match Account::builder()?.from_credentials(*creds).await {
+            Ok(acct) => {
+                tracing::info!(source, "ACME: reusing the fleet's Let's Encrypt account");
+                Ok(acct)
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "ACME account credentials from the {source} could not be activated ({e}) — \
+                 refusing to register a replacement account; retrying next pass"
+            )),
+        };
+    }
+
     let email = std::env::var("HIVE_ACME_EMAIL").unwrap_or_else(|_| "ops@shadw.cloud".into());
     let (acct, creds) = Account::builder()?
         .create(
@@ -330,13 +650,44 @@ async fn account(http: &reqwest::Client) -> anyhow::Result<Account> {
             None,
         )
         .await?;
-    if let Ok(js) = serde_json::to_string(&creds) {
-        let _ = std::fs::write(&path, js);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
+    let sealed = seal_account(&creds);
+    let stored = match &sealed {
+        Some(env) => write_account_sealed(env),
+        None => false,
+    };
+    if let Some(env) = sealed {
+        crate::guardian::put(&account_guardian_key(), env.into_bytes()).await;
+    }
+    if stored {
+        tracing::warn!(
+            staging = staging(),
+            "ACME: registered a NEW Let's Encrypt account (no stored credential was found) — it is \
+             now sealed and replicated, so a control-plane handover will reuse it"
+        );
+    } else {
+        // Unstorable = the next pass finds nothing again and registers yet
+        // another account. That is an operator-visible condition, not a warn line.
+        tracing::error!(
+            "ACME: registered a NEW Let's Encrypt account but could NOT store it — every future \
+             pass will register another one until this is fixed"
+        );
+        static FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        incident_once(
+            &FIRED,
+            incidents,
+            crate::incidents::OpenReq {
+                title: "ACME account credential could not be persisted".into(),
+                severity: crate::incidents::Severity::Major,
+                affected: vec!["tls".into(), "acme".into()],
+                message: format!(
+                    "A new Let's Encrypt account was registered but writing the sealed credential \
+                     to {} failed, so it cannot be reused. Every subsequent ACME pass will register \
+                     another account against the same rate-limit budget until the data directory is \
+                     writable.",
+                    account_sealed_path().display()
+                ),
+            },
+        );
     }
     Ok(acct)
 }
@@ -350,11 +701,12 @@ async fn issue(
     names: &[String],
     zone: &str,
     challenges: &AcmeChallengeStore,
+    incidents: Option<&crate::incidents::IncidentStore>,
 ) -> anyhow::Result<CertBundle> {
     // instant-acme's internal HTTPS client needs a process-level rustls provider;
     // idempotent, so install unconditionally (the listener may not have run yet).
     let _ = rustls::crypto::ring::default_provider().install_default();
-    let acct = account(http).await?;
+    let acct = account(http, incidents).await?;
     let identifiers: Vec<Identifier> = names.iter().map(|n| Identifier::Dns(n.clone())).collect();
     let mut order = acct.new_order(&NewOrder::new(&identifiers)).await?;
 
@@ -597,7 +949,16 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
                         continue;
                     }
                     tracing::info!(%bundle, ?names, forced, "ACME: issuing/renewing certificate bundle");
-                    match issue(&cloud.http, &api, &names, &zone, &cloud.acme_challenges).await {
+                    match issue(
+                        &cloud.http,
+                        &api,
+                        &names,
+                        &zone,
+                        &cloud.acme_challenges,
+                        Some(&cloud.incidents),
+                    )
+                    .await
+                    {
                         Ok(b) => {
                             store_bundle_local(&bundle, &b);
                             if forced {
@@ -1008,7 +1369,7 @@ mod tests {
         let apps = std::env::var("HIVE_APPS_DOMAIN").unwrap_or_else(|_| "shadw.app".into());
         let names = vec![format!("*.{apps}"), apps.clone()];
         let challenges = AcmeChallengeStore::new();
-        let bundle = issue(&http, &api, &names, &apps, &challenges)
+        let bundle = issue(&http, &api, &names, &apps, &challenges, None)
             .await
             .expect("staging issuance failed");
         assert!(bundle.chain_pem.contains("BEGIN CERTIFICATE"));

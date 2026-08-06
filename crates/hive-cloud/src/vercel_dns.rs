@@ -1246,11 +1246,60 @@ struct ReconcileGuards {
     /// pass. Cleared once the name has records again, so a LATER outage of
     /// the same name alarms afresh.
     dark_alarmed: std::collections::HashSet<String>,
+    /// Whether a create has SUCCEEDED during this node's current leadership
+    /// tenure. `false` is the UNKNOWN state, and unknown is treated exactly
+    /// like an open circuit — for the same reason `api_ns_published: None`
+    /// means Hold: a leader that has not itself proven the account accepts
+    /// creates must never start a sequence whose rollback is a create.
+    ///
+    /// This is why the circuit needs no cross-node inheritance. A departing
+    /// leader's counter is HEARSAY about an account this node has not
+    /// exercised (and it is stale by the whole handover gap); the same
+    /// proof-beats-claim rule `dns_validated` applies to nameservers applies
+    /// here — the new leader re-proves within its first pass that lands any
+    /// create, and holds every delete-before-create sequence until it does.
+    create_proven: bool,
+    /// Delete-first steps skipped SOLELY because create health is unproven
+    /// this tenure (the circuit itself is closed). Counted so an indefinite
+    /// hold — a quiet zone whose only pending change IS the delegation
+    /// transition, so no create is ever attempted to prove health — becomes
+    /// an operator-visible incident instead of a silently parked cutover.
+    proof_holds: u32,
+    /// Edge trigger for that incident.
+    proof_incident_open: bool,
 }
+
+/// Delete-first steps skipped for want of create-health proof before the hold
+/// itself is alarmed. At most one skip per zone per pass, so this is roughly
+/// five minutes at the default cadence: long enough that an ordinary handover
+/// (whose next create lands within a pass or two and proves the account) never
+/// alarms, short enough that a delegation transition parked because NOTHING
+/// else in the zone needs creating reaches an operator instead of sitting
+/// silently. Nothing is dark while it holds — the existing records serve.
+const CREATE_PROOF_ALARM_HOLDS: u32 = 10;
 
 impl ReconcileGuards {
     fn creates_blocked(&self) -> bool {
-        self.create_failing_passes > 0
+        self.create_failing_passes > 0 || !self.create_proven
+    }
+
+    /// Why `creates_blocked()` is true — the two causes need different
+    /// operator responses (a blocked account vs. an unexercised new leader).
+    fn block_reason(&self) -> &'static str {
+        if self.create_failing_passes > 0 {
+            "creates are failing account-wide"
+        } else {
+            "create health is unproven since this node took the DNS leadership"
+        }
+    }
+
+    /// This node just (re)took DNS leadership. Only the PROOF state resets:
+    /// the failure counters and incident edge-triggers are this node's own
+    /// observations and stay, because every one of them fails safe.
+    fn begin_tenure(&mut self) {
+        self.create_proven = false;
+        self.proof_holds = 0;
+        self.proof_incident_open = false;
     }
 
     /// Fold one zone-pass's create outcomes into the circuit. A pass with no
@@ -1259,9 +1308,39 @@ impl ReconcileGuards {
         if succeeded > 0 {
             self.create_failing_passes = 0;
             self.create_incident_open = false;
+            self.create_proven = true;
+            self.proof_holds = 0;
+            self.proof_incident_open = false;
         } else if attempted > 0 {
             self.create_failing_passes = self.create_failing_passes.saturating_add(1);
         }
+    }
+
+    /// One delete-first step was skipped. Only a skip attributable to MISSING
+    /// PROOF counts here — a skip under a genuinely open circuit is already
+    /// alarmed by the account-wide create-failure incident.
+    fn note_skip(&mut self, cloud: &Arc<CloudState>, domain: &str) {
+        if self.create_proven || self.create_failing_passes > 0 {
+            return;
+        }
+        self.proof_holds = self.proof_holds.saturating_add(1);
+        if self.proof_holds < CREATE_PROOF_ALARM_HOLDS || self.proof_incident_open {
+            return;
+        }
+        self.proof_incident_open = true;
+        cloud.incidents.open(crate::incidents::OpenReq {
+            title: "DNS delegation transition parked: create health unproven".into(),
+            severity: crate::incidents::Severity::Major,
+            affected: vec!["dns".into()],
+            message: format!(
+                "The DNS leader has skipped {} delete-before-create step(s) in {domain} because no create has \
+                 succeeded since it took leadership, so a rollback (which is itself a create) could not be \
+                 guaranteed. Nothing is dark — the existing records keep serving — but the delegation change is \
+                 not progressing. It clears itself the moment any create succeeds; if none is pending, check the \
+                 Vercel account's create health.",
+                self.proof_holds
+            ),
+        });
     }
 }
 
@@ -1492,8 +1571,10 @@ async fn reconcile_zone<A: DnsApi>(
         tracing::error!(
             %domain,
             names = ?names,
-            "Vercel creates are failing account-wide — SKIPPING the disengagement NS deletes; the existing delegation stays (a stale-but-answering delegation beats a dark name, always)"
+            reason = guards.block_reason(),
+            "SKIPPING the disengagement NS deletes; the existing delegation stays (a stale-but-answering delegation beats a dark name, always)"
         );
+        guards.note_skip(cloud, domain);
     } else {
         for id in &plan.ns_deletes_first {
             if let Err(e) = api.delete(domain, id).await {
@@ -1531,8 +1612,10 @@ async fn reconcile_zone<A: DnsApi>(
             tracing::error!(
                 %domain,
                 name = %name,
-                "Vercel creates are failing account-wide — SKIPPING the delegation cutover; the flat set stays (under a create block the rollback could not restore it)"
+                reason = guards.block_reason(),
+                "SKIPPING the delegation cutover; the flat set stays (unless creates are known-good the rollback could not restore it)"
             );
+            guards.note_skip(cloud, domain);
             continue;
         }
         let mut deleted_addr: Vec<&RecordView> = Vec::new();
@@ -1797,6 +1880,222 @@ async fn reconcile_zone<A: DnsApi>(
     Ok(current)
 }
 
+/// Node-local sidecar holding the flap memory, under `persist::data_dir()`
+/// exactly like `dns_geo.json`: derived node-local state that must NOT ride
+/// `PlatformSnapshot`/`store_sync` or any gossip snapshot arm.
+const DAMPING_FILE: &str = "dns_damping.json";
+const DAMPING_FORMAT_VERSION: u32 = 1;
+/// Damping is a SHORT-HORIZON memory of flapping, not a durable fact. A
+/// snapshot older than this describes a fleet that has since changed shape, so
+/// it is dropped rather than replayed — an hour-old `withheld` set would
+/// suppress a node that has been healthy all night.
+const DAMPING_MAX_AGE_MS: u64 = 60 * 60 * 1000;
+/// Cap enforced on LOAD as well as at runtime, so no on-disk file can reload
+/// past it (the `dns_geo` `MAX_ENTRIES` rule).
+const DAMPING_MAX_NODES: usize = 512;
+const DAMPING_MAX_FILE_BYTES: u64 = 1 << 20;
+
+/// On-disk shape of the flap memory. `BTreeMap` + a sorted `Vec` so equal state
+/// serializes to equal BYTES — that byte-compare is the write gate, so an
+/// unchanged pass touches no disk at all.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DampingDisk {
+    #[serde(default)]
+    v: u32,
+    #[serde(default)]
+    saved_ms: u64,
+    #[serde(default)]
+    unhealthy: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    healthy: std::collections::BTreeMap<String, u32>,
+    #[serde(default)]
+    withheld: Vec<String>,
+    #[serde(default)]
+    api_ready: u32,
+    #[serde(default)]
+    api_undeclared: u32,
+}
+
+/// The reconciler's cross-pass flap memory, made to survive a leader handover.
+///
+/// Everything in here is a function of THIS node's own registry view — health
+/// verdicts are per-observer (peers legitimately disagree), and `publishable`
+/// is fed by the same view the acting leader would use — so the memory is
+/// warmed on EVERY node that could ever act (`spawn_reconciler` only runs where
+/// a `VERCEL_API_TOKEN` makes acting possible), not only on the leader. A newly
+/// elected leader therefore starts with the streaks and `withheld` set it has
+/// been maintaining all along, instead of a zeroed counter that lets a flapping
+/// node straight back into the published set — the create/delete treadmill that
+/// drew sustained 429s on 2026-07-29, and which the damping exists to kill.
+///
+/// Replication is deliberately NOT used: adopting a peer's streaks would mean
+/// publishing on health verdicts THIS node never made, and the state is
+/// reconstructible locally by construction. The durable half covers the case
+/// warming cannot — a fleet-wide binary roll restarts every node at once, which
+/// is exactly the reconvergence that flaps nodes — so the file is node-local
+/// (no replication) and age-gated.
+struct DampingMemory {
+    publish: PublishDamping,
+    api: DelegationDamping,
+    /// Last bytes written; the change gate (empty = never written this boot).
+    written: Vec<u8>,
+    enabled: bool,
+}
+
+impl DampingMemory {
+    /// Load the persisted memory. EVERY failure mode — missing, unreadable,
+    /// oversized, corrupt, wrong version, stale — degrades to an empty memory
+    /// plus a log line: a bad scratch file must cost one flap window, never a
+    /// boot failure on the node that publishes the fleet's DNS.
+    fn load() -> Self {
+        let enabled = std::env::var("HIVE_DNS_DAMPING_PERSIST")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+        let mut out = Self {
+            publish: PublishDamping::default(),
+            api: DelegationDamping::default(),
+            written: Vec::new(),
+            enabled,
+        };
+        if !enabled {
+            return out;
+        }
+        let path = crate::persist::data_dir().join(DAMPING_FILE);
+        // Absent is the normal first-boot case, not an error worth logging.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            return out;
+        };
+        if meta.len() > DAMPING_MAX_FILE_BYTES {
+            tracing::warn!(bytes = meta.len(), path = %path.display(), "dns damping: file too large; starting empty");
+            return out;
+        }
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "dns damping: file unreadable; starting empty");
+                return out;
+            }
+        };
+        let disk: DampingDisk = match serde_json::from_str(&raw) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(), "dns damping: file corrupt; starting empty");
+                return out;
+            }
+        };
+        if disk.v != DAMPING_FORMAT_VERSION {
+            tracing::warn!(
+                found = disk.v,
+                want = DAMPING_FORMAT_VERSION,
+                "dns damping: file version mismatch; starting empty"
+            );
+            return out;
+        }
+        let age = hive_core::now_ms().saturating_sub(disk.saved_ms);
+        if age > DAMPING_MAX_AGE_MS {
+            tracing::info!(age_ms = age, "dns damping: persisted flap memory is stale; starting empty");
+            return out;
+        }
+        out.publish.unhealthy = disk
+            .unhealthy
+            .into_iter()
+            .take(DAMPING_MAX_NODES)
+            .collect();
+        out.publish.healthy = disk.healthy.into_iter().take(DAMPING_MAX_NODES).collect();
+        out.publish.withheld = disk.withheld.into_iter().take(DAMPING_MAX_NODES).collect();
+        out.api.ready = disk.api_ready;
+        out.api.undeclared = disk.api_undeclared;
+        // Seed the write gate with what the file already holds, so a boot that
+        // changes nothing writes nothing.
+        out.written = serde_json::to_vec(&out.rows()).unwrap_or_default();
+        tracing::info!(
+            withheld = out.publish.withheld.len(),
+            api_ready = out.api.ready,
+            age_ms = age,
+            "dns damping: resumed persisted flap memory"
+        );
+        out
+    }
+
+    /// The comparable (timestamp-free) on-disk projection of the live memory.
+    ///
+    /// Every streak is CLAMPED to the threshold it feeds. The live counters
+    /// grow without bound (a node unhealthy for a day, a delegation ready for a
+    /// week) while every read of them is a `>=` against a K of 2, so clamping
+    /// is behaviour-identical and it is what keeps the byte-compare write gate
+    /// meaningful — otherwise a monotonically ticking counter would rewrite the
+    /// file every single pass forever.
+    fn rows(&self) -> DampingDisk {
+        let mut withheld: Vec<String> = self.publish.withheld.iter().cloned().collect();
+        withheld.sort();
+        DampingDisk {
+            v: DAMPING_FORMAT_VERSION,
+            saved_ms: 0,
+            unhealthy: self
+                .publish
+                .unhealthy
+                .iter()
+                .map(|(k, v)| (k.clone(), (*v).min(UNHEALTHY_PASSES_BEFORE_WITHDRAW)))
+                .collect(),
+            healthy: self
+                .publish
+                .healthy
+                .iter()
+                .map(|(k, v)| (k.clone(), (*v).min(HEALTHY_PASSES_BEFORE_REPUBLISH)))
+                .collect(),
+            withheld,
+            api_ready: self.api.ready.min(HEALTHY_PASSES_BEFORE_REPUBLISH),
+            api_undeclared: self.api.undeclared.min(UNHEALTHY_PASSES_BEFORE_WITHDRAW),
+        }
+    }
+
+    /// Persist when — and only when — the memory actually changed. Atomic
+    /// temp-file + fsync + rename, the durability shape every sidecar under the
+    /// data dir uses (`persist::save`, `dns_geo`), on `spawn_blocking` for the
+    /// same reason `dns_geo` does: the write ends in an fsync, which must not
+    /// run on a runtime worker.
+    async fn persist(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let mut disk = self.rows();
+        let Ok(gate) = serde_json::to_vec(&disk) else {
+            return;
+        };
+        if gate == self.written {
+            return;
+        }
+        disk.saved_ms = hive_core::now_ms();
+        let Ok(json) = serde_json::to_vec(&disk) else {
+            return;
+        };
+        match tokio::task::spawn_blocking(move || write_atomic(DAMPING_FILE, &json)).await {
+            Ok(Ok(())) => self.written = gate,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "dns damping: save failed; flap memory is in-process only until it succeeds")
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "dns damping: save task failed; flap memory is in-process only until it succeeds")
+            }
+        }
+    }
+}
+
+fn write_atomic(name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = crate::persist::data_dir();
+    std::fs::create_dir_all(&dir)?;
+    let tmp = dir.join(format!("{name}.tmp"));
+    {
+        let f = std::fs::File::create(&tmp)?;
+        let mut w = std::io::BufWriter::new(&f);
+        w.write_all(bytes)?;
+        w.flush()?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, dir.join(name))
+}
+
 /// Leader-elected reconcile loop. Runs on every node; only the elected leader
 /// (same election as the billing meter: lowest healthy iroh identity) acts.
 /// Enabled when a `VERCEL_API_TOKEN` is present AND (`HIVE_INGRESS != ngrok` or
@@ -1818,8 +2117,10 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
         .unwrap_or(30u64);
     tracing::info!(interval, apps = %cloud.apps_domain, platform = %cloud.platform_domain, "Vercel DNS reconciler up (leader-elected)");
     tokio::spawn(async move {
-        let mut damping = PublishDamping::default();
-        let mut api_damping = DelegationDamping::default();
+        // Flap memory: warmed on every pass on EVERY node and durable
+        // node-locally, so a leader handover inherits it instead of zeroing it
+        // (see `DampingMemory`).
+        let mut memory = DampingMemory::load();
         let mut guards = ReconcileGuards::default();
         // Whether the platform zone published NS records on `api` at the last
         // successful reconcile of that zone (None = not yet observed). This is
@@ -1830,22 +2131,38 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
         // stale Some(true) can hold the api name for one extra interval after
         // a block lifts (the first clean pass corrects it) — benign, because
         // while writes are still failing the flat-set creates would fail too.
+        //
+        // Deliberately NOT inherited across a handover either: it is an
+        // observation of a zone this node has not listed since it lost
+        // leadership, during which another leader may have changed the
+        // delegation. Losing leadership resets it to the same unknown a fresh
+        // process starts with, so the first-pass Hold is preserved exactly.
         let mut api_ns_published: Option<bool> = None;
         let mut backoff: u64 = 0; // consecutive failures
                                   // Edge-trigger for the "delegation held" incident (see the call site).
         let mut geo_hold_active = false;
         let mut api_hold_active = false;
+        // Leadership tenure edge: `false` → `true` is this node taking over.
+        let mut was_leader = false;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
         loop {
             tick.tick().await;
-            if backoff > 0 {
+            if backoff > 0 && was_leader {
                 // Exponential backoff on API failure: 30s * 2^n, capped at 5 min.
+                // Leader-only: a follower makes no API calls, so it has nothing
+                // to back off from and must keep warming its damping on the
+                // regular cadence.
                 let extra = (interval << backoff.min(4)).min(300);
                 tokio::time::sleep(std::time::Duration::from_secs(
                     extra.saturating_sub(interval),
                 ))
                 .await;
             }
+            // Nameserver eligibility is decided ONCE per pass, from the same
+            // registry snapshot everything else in the pass uses, by the same
+            // function `GET /v1/dns/stats` calls — an operator must never be
+            // looking at a different verdict than the one being published.
+            let registry_nodes = cloud.registry.nodes();
             // Same single-writer resolution as admin mutations, ACME and the
             // billing meter (owner chain first, health+addressability gated;
             // identity election fallback) — one designation for every
@@ -1862,11 +2179,9 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             let leader = crate::cluster::Cluster::control_plane_owner(
                 &chain,
                 pref.as_deref(),
-                &cloud.registry.nodes(),
+                &registry_nodes,
             );
-            if leader.as_deref() != Some(cloud.node_name.as_str()) {
-                continue;
-            }
+            let is_leader = leader.as_deref() == Some(cloud.node_name.as_str());
             // Convergence guard: a node that was told to JOIN an existing fleet
             // (HIVE_BOOTSTRAP_PEERS set) but currently sees ONLY itself in the
             // registry has not yet synced gossip — its view of the healthy set
@@ -1876,18 +2191,20 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // shadw.cloud/*.shadw.app to only-itself for ~30s until the real
             // leader re-reconciled). A founding node (no bootstrap peers) has
             // no peers to clobber, so it is exempt and still bootstraps DNS.
+            //
+            // It gates the damping WARM-UP below too: `publishable` drops the
+            // streaks of nodes absent from the registry, so folding a
+            // single-self view in would wipe the very `withheld` set the warm
+            // memory exists to carry across a handover.
             let has_bootstrap = std::env::var("HIVE_BOOTSTRAP_PEERS")
                 .map(|v| !v.trim().is_empty())
                 .unwrap_or(false);
-            if has_bootstrap && cloud.registry.nodes().len() <= 1 {
-                tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
+            if has_bootstrap && registry_nodes.len() <= 1 {
+                if is_leader {
+                    tracing::warn!("DNS reconcile skipped: mesh not yet converged (registry sees only self despite HIVE_BOOTSTRAP_PEERS) — refusing to clobber peer records");
+                }
                 continue;
             }
-            // Nameserver eligibility is decided ONCE per pass, from the same
-            // registry snapshot everything else in the pass uses, by the same
-            // function `GET /v1/dns/stats` calls — an operator must never be
-            // looking at a different verdict than the one being published.
-            let registry_nodes = cloud.registry.nodes();
             let verdicts = crate::dns_probe::validate_nameservers(&registry_nodes);
             let proven: std::collections::HashSet<&str> = verdicts
                 .iter()
@@ -1899,12 +2216,6 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                 .filter(|v| !v.validated)
                 .map(|v| v.node.as_str())
                 .collect();
-            STATS
-                .geo_ns_validated
-                .store(proven.len() as u64, Ordering::Relaxed);
-            STATS
-                .geo_ns_unproven
-                .store(unproven.len() as u64, Ordering::Relaxed);
             let nodes: Vec<NodeView> = registry_nodes
                 .iter()
                 .map(|n| NodeView {
@@ -1919,7 +2230,68 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                     region: n.region.clone(),
                 })
                 .collect();
-            let publish = publishable(&nodes, &mut damping);
+            // ---- warm the flap memory: EVERY node, leader or not ----
+            //
+            // Both damping structures are pure functions of this node's own
+            // registry view, and both are two-sided precisely so a flapping
+            // node cannot drive a create/delete treadmill against the Vercel
+            // API. Folding the view in on every pass — rather than only while
+            // holding leadership — is what makes a handover a non-event: the
+            // node that takes over has been counting the same streaks all
+            // along, so its first pass applies the SAME withdraw/republish
+            // damping the outgoing leader was applying, instead of a zeroed
+            // counter that republishes every withheld node at once. This runs
+            // before the leader gate for that reason and must stay there.
+            //
+            // Nothing here writes to the DNS API or to STATS: a follower's
+            // pass is a read of its own registry plus an in-memory fold. The
+            // `api_delegation_records` / `geo_ns_*` gauges stay leader-only
+            // because acme.rs keys its delegated-zone behaviour off them.
+            let publish = publishable(&nodes, &mut memory.publish);
+            let api_declared = nodes.iter().any(|n| n.dns_ns && n.dns_api);
+            let api_decision = desired_api_delegation(
+                &publish,
+                &cloud.apps_domain,
+                api_declared,
+                api_ns_published,
+                &mut memory.api,
+            );
+            memory.persist().await;
+            if !is_leader {
+                // Tenure end. Everything scoped to "while I was the writer" is
+                // now stale evidence about a zone someone else is changing:
+                // the backoff counts API failures this node is no longer
+                // making, and the delegation observation is a listing this
+                // node will not refresh. Both drop to their unknown state so a
+                // return to leadership re-proves rather than resumes.
+                was_leader = false;
+                backoff = 0;
+                api_ns_published = None;
+                continue;
+            }
+            if !was_leader {
+                was_leader = true;
+                guards.begin_tenure();
+                // The two "delegation held" incidents are edge-triggered per
+                // WRITER: carrying a previous tenure's flag across a foreign
+                // tenure would silently suppress the announcement that the
+                // hold is still in force under the new leader. Re-arming costs
+                // at most one incident per handover and always errs toward
+                // telling the operator.
+                geo_hold_active = false;
+                api_hold_active = false;
+                tracing::info!(
+                    withheld = memory.publish.withheld.len(),
+                    api_ready = memory.api.ready,
+                    "DNS reconciler: took leadership — resuming the warmed flap memory, holding delete-before-create steps until a create proves the account accepts them"
+                );
+            }
+            STATS
+                .geo_ns_validated
+                .store(proven.len() as u64, Ordering::Relaxed);
+            STATS
+                .geo_ns_unproven
+                .store(unproven.len() as u64, Ordering::Relaxed);
             let relay_ips = env_ips("HIVE_RELAY_IPS");
             let discovery_ips = env_ips("HIVE_DISCOVERY_IPS");
             let mut apps = desired_apps(&publish);
@@ -2070,14 +2442,12 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // api.shadw.cloud dark). With no delegation published, the flat
             // set stays — self-healing in both directions as the fleet rolls
             // or the capable set shrinks.
-            let api_declared = nodes.iter().any(|n| n.dns_ns && n.dns_api);
-            let (api_records, api_hold) = match desired_api_delegation(
-                &publish,
-                &cloud.apps_domain,
-                api_declared,
-                api_ns_published,
-                &mut api_damping,
-            ) {
+            //
+            // The decision itself was taken in the warm-up block above (its
+            // two-sided damping has to advance on every node, so a handover
+            // does not restart the engagement/disengagement streaks); only the
+            // gauges and the write plan it drives are leader-side.
+            let (api_records, api_hold) = match api_decision {
                 ApiDelegation::Delegate(records) => {
                     STATS
                         .api_delegation_records

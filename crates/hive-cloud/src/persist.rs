@@ -91,6 +91,23 @@ pub struct PlatformSnapshot {
     pub billing_ledger: Vec<crate::billing::LedgerEntry>,
     #[serde(default)]
     pub billing_invoices: Vec<crate::billing::Invoice>,
+    /// Per-tenant metering watermarks (`BillingStore::meters`). `None` is
+    /// load-bearing and means UNKNOWN — a snapshot written by a node from
+    /// before this field existed, which is NOT the same as "every tenant is at
+    /// zero": billing charges `current − watermark`, so a zero watermark
+    /// against still-climbing fleet counters re-bills the entire cumulative
+    /// total. `BillingStore::meters_load` turns `None` into a re-baseline
+    /// (charge nothing on the first reading) instead.
+    #[serde(default)]
+    pub billing_meters: Option<Vec<crate::billing::MeterWatermark>>,
+    /// Open (unconfirmed) checkouts. Previously in-memory only, so a node
+    /// restart between "user redirected to Stripe" and "user redirected back"
+    /// made `confirm_checkout` return `None` for a session the customer had
+    /// actually paid for. The relational mirror's `billing_checkouts` table is
+    /// a read-only projection for the admin/SQL view — nothing ever loads it
+    /// back — so it was not, and is not, a restore path.
+    #[serde(default)]
+    pub billing_checkouts: Vec<crate::billing::Checkout>,
     #[serde(default)]
     pub domains: Vec<crate::dns::DomainRecord>,
     #[serde(default)]
@@ -342,6 +359,11 @@ pub fn save_namespaces(snap: &PlatformSnapshot) -> std::io::Result<()> {
 
 /// Capture the current platform state into a snapshot.
 pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
+    // ONE billing read: this was two separate `cloud.billing.snapshot()` calls
+    // (`.0` and `.1`), which takes the accounts and ledger locks twice and can
+    // therefore write an account balance from before a ledger entry that is
+    // already in the same file.
+    let (billing_accounts, billing_ledger) = cloud.billing.snapshot();
     PlatformSnapshot {
         saved_ms: hive_core::now_ms(),
         deployments: cloud.gw.deployment_records(),
@@ -367,9 +389,13 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         svcgraphs: cloud.svcgraph.snapshot(),
         orgs: cloud.identity.orgs(),
         users: cloud.identity.users(),
-        billing: cloud.billing.snapshot().0,
-        billing_ledger: cloud.billing.snapshot().1,
+        billing: billing_accounts,
+        billing_ledger,
         billing_invoices: cloud.billing.invoices_snapshot(),
+        // Always `Some` from this build — an empty vec means "known: nothing
+        // metered yet", which `None` (unknown) must never be confused with.
+        billing_meters: Some(cloud.billing.meters_snapshot()),
+        billing_checkouts: cloud.billing.checkouts_snapshot(),
         domains: cloud.domains.snapshot(),
         docs: cloud.docs.snapshot(),
         gitops: cloud.gitops.snapshot(),
@@ -649,6 +675,11 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.identity.load(snap.orgs, snap.users);
     cloud.billing.load(snap.billing, snap.billing_ledger);
     cloud.billing.invoices_load(snap.billing_invoices);
+    // `None` (pre-upgrade snapshot / no snapshot) is passed through as-is:
+    // meters_load must be the one place that decides what an absent watermark
+    // set means, and it means UNKNOWN.
+    cloud.billing.meters_load(snap.billing_meters);
+    cloud.billing.checkouts_load(snap.billing_checkouts);
     cloud.domains.load(snap.domains);
     cloud.docs.load(snap.docs);
     cloud.gitops.load(snap.gitops);
