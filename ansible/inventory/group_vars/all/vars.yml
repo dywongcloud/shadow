@@ -28,6 +28,36 @@ hive_bootstrap_peers: ""
 hive_discovery_dns: ""     # comma-separated http://<ip>:3350 of discovery-capable nodes
 hive_relay_urls: ""        # comma-separated self-hosted iroh relay URLs; TLS relays MUST use their https://<name>.relay.shadw.app:3343 form (the plaintext :3340 socket is captive-portal-only once TLS is on — see hosts.ini)
 hive_discovery_n0: "0"     # 0 = opt out of public n0 discovery, use self-hosted only (fleet default)
+# ---------- Public mainline-DHT address lookup ----------
+# The ONLY address source that needs no fleet peer to be reachable first, which
+# is why it is on by default. With hive_discovery_n0=0 above and an empty
+# hive_bootstrap_peers/hive_discovery_dns, a node registers NO address-lookup
+# provider at all: PeerPool::dial_fresh has nothing to consult, so a node whose
+# data dir is wiped can never re-learn a peer's address and stays dark.
+#
+# WHAT BECOMES PUBLICLY RESOLVABLE: a pkarr (BEP-44) record signed by the node's
+# own key and stored on the public BitTorrent DHT under a key that IS its
+# 64-hex EndpointId. With hive_dht_publish_direct="0" (default) it contains
+# ONLY the node's home relay URL -- i.e. anyone who knows the id learns the
+# relay hostname, never the node's IP. Set "1" only on a node with a real
+# public IP and a pinned HIVE_IROH_PORT; even then RFC1918/CGNAT/link-local
+# addresses are filtered out and never published. hive_discovery_dht="0" turns
+# the whole mechanism off (no DHT socket, no packets); a middle setting
+# HIVE_DHT_PUBLISH=0 keeps resolving while publishing nothing.
+hive_discovery_dht: "1"
+# Deliberately EMPTY, not "6881". The DHT runs in client mode (outbound UDP +
+# the NAT return path, no inbound rule and no listening service to firewall), so
+# a pinned source port buys nothing operationally -- while setting it REMOVES
+# the crate's own 6881-then-ephemeral fallback and turns a port conflict into a
+# skipped provider. Set a number only if you genuinely need a predictable port.
+hive_dht_port: ""
+hive_dht_publish_direct: "0"   # 1 = also publish this node's public ip:HIVE_IROH_PORT
+# dial_fresh's budget for the WHOLE address-lookup set. The code default is
+# 4000ms; measured steady-state DHT resolve is 2.0-4.6s on top of a 2-6s cold
+# routing-table warm-up, so at 4000 the DHT is cancelled before it can answer
+# and ships inert. dial_fallback_ceiling (connect+discovery+1s) grows 10s->14s
+# automatically and all three of its callers already floor their timeouts at it.
+hive_p2p_discovery_ms: "8000"
 hive_gossip_iroh: "1"
 hive_gossip_sign: "1"
 hive_gossip_verify: "enforce"

@@ -19,6 +19,14 @@
 //! nodes are third-party infrastructure that has nothing to do with this fleet,
 //! so a node with only egress can find a peer from cold.
 //!
+//! It is strictly ADDITIVE. iroh's `AddressLookupServices` polls every
+//! registered provider CONCURRENTLY and yields each item the moment it is
+//! produced (`MergeBounded`), so a `MemoryLookup` seed hit — microseconds —
+//! reaches the dial long before a DHT round trip completes, and one provider's
+//! failure cannot hide another's results. Registration order is not a priority
+//! mechanism and nothing here relies on it; adding this provider cannot make an
+//! existing path slower or less likely to answer.
+//!
 //! # What becomes PUBLICLY RESOLVABLE (read this before enabling)
 //!
 //! Publishing is a pkarr [BEP-44 mutable item]: a DNS packet signed by this
@@ -178,7 +186,8 @@ pub struct Snapshot {
     pub dht_port: u64,
     pub dht_publish: bool,
     pub dht_publish_direct: bool,
-    /// Publishes REQUESTED of the DHT lookup by iroh (each address change).
+    /// Publishes REQUESTED of the DHT lookup by iroh (one per address change),
+    /// counted only while publishing is actually enabled.
     ///
     /// Not "succeeded": `AddressLookup::publish` is fire-and-forget by contract
     /// and the crate's republish loop reports its own outcome only to its logs.
@@ -232,10 +241,42 @@ fn skip(reason: impl Into<String>) -> Option<CountedDht> {
         reason = %reason,
         "mainline DHT address lookup NOT registered — seeds/Seer/relay paths unchanged"
     );
-    if let Ok(mut g) = STATS.skip_reason.lock() {
-        *g = Some(reason);
-    }
+    mark_unregistered(Some(reason));
     None
+}
+
+/// Reset every DHT-provider field to "not registered".
+///
+/// A process binds one endpoint, so in production this runs at most once — but
+/// it must still CLEAR rather than merely not-set, otherwise a second bind that
+/// skips would leave the first bind's `registered: true` standing and the stats
+/// endpoint would report a provider that does not exist.
+fn mark_unregistered(reason: Option<String>) {
+    STATS.dht_registered.store(false, Ordering::Relaxed);
+    STATS.dht_bootstrap_nodes.store(0, Ordering::Relaxed);
+    STATS.dht_port.store(0, Ordering::Relaxed);
+    STATS.dht_publish.store(false, Ordering::Relaxed);
+    STATS.dht_publish_direct.store(false, Ordering::Relaxed);
+    if let Ok(mut g) = STATS.skip_reason.lock() {
+        *g = reason;
+    }
+}
+
+/// Render an error together with every `source()` beneath it. A one-line
+/// summary that names only the outermost wrapper turns a precise, actionable
+/// failure into an unactionable one.
+fn full_cause(err: &dyn std::error::Error) -> String {
+    let mut out = err.to_string();
+    let mut cur = err.source();
+    while let Some(e) = cur {
+        let s = e.to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push_str(": ");
+            out.push_str(&s);
+        }
+        cur = e.source();
+    }
+    out
 }
 
 fn now_ms() -> u64 {
@@ -413,9 +454,7 @@ pub(crate) async fn lookup_from_env(secret: Option<&SecretKey>) -> Option<Counte
     if !env_flag("HIVE_DISCOVERY_DHT", true) {
         // Not a warning: an operator opting out is a normal configuration.
         tracing::info!("mainline DHT address lookup disabled (HIVE_DISCOVERY_DHT=0)");
-        if let Ok(mut g) = STATS.skip_reason.lock() {
-            *g = Some("disabled by HIVE_DISCOVERY_DHT".into());
-        }
+        mark_unregistered(Some("disabled by HIVE_DISCOVERY_DHT".into()));
         return None;
     }
 
@@ -476,7 +515,11 @@ pub(crate) async fn lookup_from_env(secret: Option<&SecretKey>) -> Option<Counte
 
     let lookup = match builder.build() {
         Ok(l) => l,
-        Err(e) => return skip(format!("DHT construction failed: {e}")),
+        // `AddressLookupBuilderError`'s own Display is only "Service
+        // 'pkarr-dht' error" — the actual cause (an "Address already in use"
+        // on an explicitly pinned HIVE_DHT_PORT, say) lives one level down the
+        // source chain, and an operator reading the log needs THAT.
+        Err(e) => return skip(format!("DHT construction failed: {}", full_cause(&e))),
     };
 
     STATS.dht_registered.store(true, Ordering::Relaxed);
@@ -500,7 +543,7 @@ pub(crate) async fn lookup_from_env(secret: Option<&SecretKey>) -> Option<Counte
         publish_direct,
         "mainline DHT address lookup registered"
     );
-    Some(CountedDht(lookup))
+    Some(CountedDht { lookup, publish })
 }
 
 // ---------------------------------------------------------------------------
@@ -512,20 +555,35 @@ pub(crate) async fn lookup_from_env(secret: Option<&SecretKey>) -> Option<Counte
 /// A pure pass-through otherwise. It exists so `GET /v1/mesh/discovery` can
 /// report what the DHT provider actually DID, not merely that it was configured.
 #[derive(Debug)]
-pub(crate) struct CountedDht(DhtAddressLookup);
+pub(crate) struct CountedDht {
+    lookup: DhtAddressLookup,
+    /// Whether the inner lookup holds a secret key and will actually write.
+    ///
+    /// iroh calls `publish()` on every address change regardless, and a
+    /// publish-disabled lookup drops it on the floor. Counting those calls
+    /// would report DHT writes that provably never happened
+    /// (`HIVE_DHT_PUBLISH=0` measured 4 "publishes" against zero packets), so
+    /// the counter is gated on the same flag the lookup itself is.
+    publish: bool,
+}
 
 impl AddressLookup for CountedDht {
     fn publish(&self, data: &EndpointData) {
-        STATS.publishes_requested.fetch_add(1, Ordering::Relaxed);
-        STATS
-            .last_publish_request_ms
-            .store(now_ms(), Ordering::Relaxed);
-        self.0.publish(data);
+        if self.publish {
+            STATS.publishes_requested.fetch_add(1, Ordering::Relaxed);
+            STATS
+                .last_publish_request_ms
+                .store(now_ms(), Ordering::Relaxed);
+        }
+        self.lookup.publish(data);
     }
 
-    fn resolve(&self, endpoint_id: EndpointId) -> Option<BoxStream<Result<LookupItem, LookupError>>> {
+    fn resolve(
+        &self,
+        endpoint_id: EndpointId,
+    ) -> Option<BoxStream<Result<LookupItem, LookupError>>> {
         STATS.resolves.fetch_add(1, Ordering::Relaxed);
-        let inner = self.0.resolve(endpoint_id)?;
+        let inner = self.lookup.resolve(endpoint_id)?;
         Some(Box::pin(CountedResolve {
             inner,
             yielded_ok: false,

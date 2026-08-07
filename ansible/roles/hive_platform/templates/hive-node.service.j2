@@ -26,6 +26,21 @@ Environment=HIVE_GOSSIP_IROH={{ hive_gossip_iroh }}
 Environment=HIVE_GOSSIP_SIGN={{ hive_gossip_sign }}
 Environment=HIVE_GOSSIP_VERIFY={{ hive_gossip_verify }}
 Environment=HIVE_DISCOVERY_N0={{ hive_discovery_n0 }}
+# Public mainline-DHT address lookup. Additive and last in the provider list:
+# bootstrap seeds and the Seer pkarr resolver stay registered and still win on
+# latency. Blocked UDP / unresolvable bootstrap => the provider is skipped with
+# a WARN and every existing path is unchanged (never a failed bind).
+# HIVE_DHT_PUBLISH_DIRECT=1 puts this node's PUBLIC ip:HIVE_IROH_PORT on the
+# public DHT alongside its relay URL; 0 publishes the relay URL only. See
+# group_vars/all/vars.yml for the full "what becomes publicly resolvable" note.
+Environment=HIVE_DISCOVERY_DHT={{ hive_discovery_dht | default('1') }}
+{% if hive_dht_port %}
+Environment=HIVE_DHT_PORT={{ hive_dht_port }}
+{% endif %}
+Environment=HIVE_DHT_PUBLISH_DIRECT={{ hive_dht_publish_direct | default('0') }}
+# Must exceed the DHT's measured 2.0-4.6s resolve or dial_fresh cancels the
+# lookup before it can answer and the DHT provider is inert.
+Environment=HIVE_P2P_DISCOVERY_MS={{ hive_p2p_discovery_ms | default('8000') }}
 {% if hive_discovery_dns %}
 Environment=HIVE_DISCOVERY_DNS={{ hive_discovery_dns }}
 {% endif %}

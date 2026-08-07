@@ -881,8 +881,25 @@ fn open_budget() -> Duration {
 /// (typical for a peer only ever learned second/third-hand via gossip, never
 /// dialed directly) can wedge every future dial to that peer forever once its
 /// cross-cloud QUIC path flaps.
+/// NOTE: this budget is now load-bearing for TWO mechanisms, not one. The
+/// public mainline-DHT provider (`dht`) resolves in a measured 2.0–4.6s steady
+/// state, on top of a 2–6s cold-routing-table warm-up, so at the 4000ms default
+/// `dial_fresh` cancels the DHT before it can answer on most first dials and
+/// the provider ships inert. Fleet deploys set `HIVE_P2P_DISCOVERY_MS=8000`
+/// (ansible `hive_p2p_discovery_ms`); the default is left at 4000 so this
+/// change alters nothing for a caller that has not opted into the DHT-friendly
+/// budget. `dial_fallback_ceiling()` tracks it automatically and all three of
+/// its callers already floor their own timeouts at that ceiling.
 fn discovery_budget() -> Duration {
     env_ms("HIVE_P2P_DISCOVERY_MS", 4_000)
+}
+
+/// The live discovery-fallback budget, for operator observability
+/// (`GET /v1/mesh/discovery`). Same function the dial path uses — asking the
+/// question with a second implementation is how a diagnostic and the decision
+/// it describes quietly diverge.
+pub fn dial_discovery_budget() -> Duration {
+    discovery_budget()
 }
 /// Worst-case time `acquire()` needs to run the cached-hint attempt AND the
 /// fresh-discovery fallback to completion: `connect_budget + discovery_budget`,
@@ -3091,12 +3108,13 @@ pub async fn bind_full(
         }
     }
     dht::record_providers(seed_count, pkarr_count, n0_discovery);
-    // Public mainline DHT — registered LAST and strictly ADDITIVE. The seed
-    // `MemoryLookup` and any Seer `PkarrResolver` above stay registered and are
-    // consulted in parallel, so a seed/Seer hit still wins on latency and no
-    // code path ever becomes DHT-only. This is the only source that needs no
-    // fleet peer to be reachable first, which is why it is worth having at all
-    // (see `dht`'s module docs, including what becomes publicly resolvable).
+    // Public mainline DHT — strictly ADDITIVE. The seed `MemoryLookup` and any
+    // Seer `PkarrResolver` above stay registered, and iroh polls every provider
+    // CONCURRENTLY, emitting each item as it arrives, so a seed/Seer hit still
+    // reaches the dial first on latency alone and no code path ever becomes
+    // DHT-only. This is the only source that needs no fleet peer to be
+    // reachable first, which is why it is worth having at all (see `dht`'s
+    // module docs, including what becomes publicly resolvable).
     //
     // Built here rather than handed to iroh as an `AddressLookupBuilder`: iroh
     // propagates a builder error out of `bind()`, and a failed DHT socket must

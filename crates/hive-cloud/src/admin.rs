@@ -53,6 +53,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
+        .route("/v1/mesh/discovery", get(mesh_discovery))
         .route("/v1/debug/heap", get(heap_profile))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
@@ -5396,6 +5397,80 @@ async fn dns_stats(
             "failed_rounds_before_withdraw": crate::dns_probe::FAILED_ROUNDS_BEFORE_WITHDRAW,
         },
         "answer_first_histogram": answers,
+    })))
+}
+
+/// Mesh address-lookup observability (operator): which address SOURCES this
+/// node actually registered, and what the public mainline-DHT provider has
+/// done since boot.
+///
+/// This exists because "the DHT is enabled" is a config claim while "41
+/// resolves, 12 hits, 3 publishes requested" is evidence — without it the
+/// mechanism is unfalsifiable in production. It is also the fastest way to see
+/// the condition that motivated the DHT in the first place: a node whose
+/// `seed_providers`, `pkarr_providers` and `n0_enabled` are all zero/false has
+/// NO address source at all, so `PeerPool::dial_fresh` has nothing to consult
+/// and burns its budget for nothing.
+///
+/// **Node-local by construction, like `/v1/dns/stats`.** Every field is read
+/// from this process's own counters; there is no fleet-wide answer and none is
+/// implied. Note the consequence for the dashboard: `/ops/*` forwards to the
+/// control-plane LEADER, so a browser reading this through the dashboard sees
+/// the leader's numbers, not those of the node serving the page. Query a
+/// specific node's admin port directly to ask about that node.
+async fn mesh_discovery(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let s = hive_p2p::dht::stats();
+    let sources = usize::from(s.n0_enabled) + s.seed_providers + s.pkarr_providers;
+    Ok(Json(json!({
+        "node": c.node_name,
+        // This node's own 64-hex id: the argument another host passes to
+        // `--dht-probe` to prove it can find THIS node from cold.
+        "endpoint_id": c.iroh.read().as_ref().map(|e| e.id().to_string()),
+        // The pre-DHT sources, so "this node had nowhere to look" is a reading
+        // rather than an inference.
+        "sources": {
+            "bootstrap_seeds": s.seed_providers,
+            "pkarr_relays": s.pkarr_providers,
+            "n0_public": s.n0_enabled,
+            "mainline_dht": s.dht_registered,
+            // Sources OTHER than the DHT. 0 is the state that made a wiped
+            // node permanently dark on 12 of 14 fleet hosts.
+            "non_dht_total": sources,
+        },
+        "dht": {
+            "registered": s.dht_registered,
+            // Populated only while NOT registered — names the exact reason
+            // (disabled by env, bootstrap unresolvable, socket conflict), so a
+            // silently-inert feature is impossible to mistake for a live one.
+            "skip_reason": s.dht_skip_reason,
+            "bootstrap_nodes": s.dht_bootstrap_nodes,
+            // 0 = the crate default (try 6881, fall back to an ephemeral port).
+            "port": s.dht_port,
+            "publish": s.dht_publish,
+            // false ⇒ only this node's relay URL is on the public DHT; true ⇒
+            // its globally-routable direct address is too (never its RFC1918
+            // ones — see hive_p2p::dht's publish filter).
+            "publish_direct": s.dht_publish_direct,
+            // "requested", not "succeeded": AddressLookup::publish is
+            // fire-and-forget by contract, so a success count here would be a
+            // claim with no witness.
+            "publishes_requested": s.publishes_requested,
+            "last_publish_request_ms": s.last_publish_request_ms,
+            "resolves": s.resolves,
+            "resolve_hits": s.resolve_hits,
+            "resolve_misses": s.resolve_misses,
+            "resolve_errors": s.resolve_errors,
+        },
+        // The budget dial_fresh gives the whole address-lookup set. Measured
+        // steady-state DHT resolve is 2.0-4.6s on top of a cold-routing-table
+        // warm-up, so a value at or below ~4s means the DHT provider is
+        // registered but is being cancelled before it can answer.
+        "discovery_budget_ms": hive_p2p::dial_discovery_budget().as_millis() as u64,
+        "dial_fallback_ceiling_ms": hive_p2p::dial_fallback_ceiling().as_millis() as u64,
     })))
 }
 

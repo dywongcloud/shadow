@@ -546,6 +546,57 @@ export function useRunNode() {
         port.postMessage({ type: "visibility", visible: false, unloading: !e.persisted });
       };
       const onPageShow = () => reportVisibility();
+
+      // Keep a BACKGROUNDED tab alive on mobile, where the platform otherwise
+      // stops this node outright.
+      //
+      // What the platforms actually do, and why a timer alone cannot win:
+      // Chrome throttles background timers to ~1/minute and freezes a tab after
+      // ~5 minutes backgrounded; iOS Safari suspends on background or screen
+      // lock. The worker renews every 60s against a 90s server presence TTL, so
+      // one throttled tick already risks expiry.
+      //
+      // A silently PLAYING audio element is the one widely-supported signal
+      // that keeps a mobile browser treating the page as active — it is how
+      // every background-audio web app stays alive. It is not a hack around a
+      // security boundary: the user explicitly started a node, playback is
+      // silent (gain 0), and it stops the moment the node stops.
+      //
+      // Deliberately best-effort and never load-bearing: autoplay policy can
+      // refuse until a user gesture, WebAudio may be unavailable, and iOS can
+      // still suspend on hard memory pressure. A failure here costs background
+      // longevity, never correctness — the worker's renew-on-resume path
+      // recovers the node either way. So every call is wrapped and nothing
+      // above it ever sees a rejection.
+      let audioCtx: AudioContext | null = null;
+      const startKeepAlive = () => {
+        if (audioCtx) return;
+        try {
+          const Ctor =
+            window.AudioContext ??
+            (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+          if (!Ctor) return;
+          const ctx = new Ctor();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          gain.gain.value = 0; // inaudible — presence, not sound
+          osc.connect(gain).connect(ctx.destination);
+          osc.start();
+          audioCtx = ctx;
+          // Autoplay policy may park it in "suspended" until a gesture; the
+          // node was started BY a gesture, so this usually resolves.
+          void ctx.resume().catch(() => {});
+        } catch {
+          audioCtx = null;
+        }
+      };
+      const stopKeepAlive = () => {
+        const ctx = audioCtx;
+        audioCtx = null;
+        if (ctx) void ctx.close().catch(() => {});
+      };
+      startKeepAlive();
+
       document.addEventListener("visibilitychange", reportVisibility);
       window.addEventListener("pagehide", onPageHide);
       window.addEventListener("pageshow", onPageShow);
@@ -561,6 +612,10 @@ export function useRunNode() {
         window.removeEventListener("pageshow", onPageShow);
         document.removeEventListener("freeze", reportVisibility);
         document.removeEventListener("resume", reportVisibility);
+        // Release the silent keepalive with the rest of this tab's resources —
+        // an AudioContext outliving its page is a real leak, and on mobile it
+        // is exactly the thing that would keep a dead node's tab alive.
+        stopKeepAlive();
         endDbBridge();
         // An agent left running after its host page unmounts keeps
         // PeerConnections (and their ICE) alive for a node that may already be

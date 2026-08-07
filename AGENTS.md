@@ -52,6 +52,65 @@ history).
   the single-stream framing (and its ordering guarantee, which the current
   consumers may rely on), so it needs a measurement first, not a rewrite.
 
+## Address lookup: a node can only re-learn an address from a peer it can reach
+
+- **Every address source except the public DHT presupposes reachability, and
+  that is the whole chicken-and-egg.** `peer_iroh.json` is a cache holding the
+  peers' PRIVATE addrs; inbound gossip needs someone to reach US; the GuardianDB
+  roster replicates over the very mesh we cannot join; `MemoryLookup` is only as
+  good as `HIVE_BOOTSTRAP_PEERS`; the Seer `PkarrResolver` must itself be
+  reachable. With the fleet default `HIVE_DISCOVERY_N0=0` plus an empty
+  `HIVE_BOOTSTRAP_PEERS`/`HIVE_DISCOVERY_DNS` — the live state of 12 of 14 hosts
+  — the provider list is EMPTY, so `PeerPool::dial_fresh` has nothing to force a
+  resolve against. Measured directly: with that config `connect()` by bare
+  `EndpointId` returns `No addressing information available` in 0ms. Wipe such a
+  node's data dir and it is permanently dark.
+- **`hive_p2p::dht` (mainline DHT) is the ONLY source needing no fleet peer
+  first, and it is strictly additive.** iroh polls every registered provider
+  CONCURRENTLY (`MergeBounded`) and emits each item as it arrives, so a seed hit
+  still reaches the dial first and registration order is not a priority
+  mechanism — never build one on it. Every failure path (`HIVE_DISCOVERY_DHT=0`,
+  unresolvable bootstrap, UDP blocked, port conflict) must leave the provider
+  UNREGISTERED with a WARN naming the cause, never fail `bind()`: `main.rs`
+  wraps `bind_full` in an 8s timeout whose failure arm is "P2P transport
+  disabled", so a DHT fault there would be a fleet outage.
+- **Never hand `DhtBuilder` a hostname.** `DhtBuilder::build()` runs a BLOCKING
+  `to_socket_addrs()`, and it would run inside `bind()`. `dht::resolve_bootstrap`
+  resolves the names itself under its own 2s budget and passes only IP literals
+  (for which `to_socket_addrs` is a parse). For the same reason the lookup is
+  BUILT in `bind_full` rather than passed to iroh as an `AddressLookupBuilder` —
+  iroh propagates a builder error out of `bind()`.
+- **What the DHT publishes is public forever; the default is relay-only.** The
+  record is a pkarr/BEP-44 item signed by the node's own key under a key that IS
+  its `EndpointId`, so impersonation is structurally impossible and the DHT is
+  never a trust/membership/authorization channel — a hostile record can at most
+  cause a failed dial, and every peer still passes the gossip trust gate. But
+  reads are unauthenticated: by default `EndpointId -> home relay URL` is world-
+  readable. `HIVE_DHT_PUBLISH_DIRECT=1` adds the node's public `ip:port`;
+  RFC1918/CGNAT/link-local addrs are stripped by `dht`'s own filter and must
+  stay stripped — `AddrFilter::unfiltered()` would publish the fleet's private
+  VPC topology. Set the filter on the DHT builder, NEVER
+  `Endpoint::builder().addr_filter()`, which applies at the
+  `AddressLookupServices` layer and would also strip the Seer publisher.
+- **Client mode only — never `server_mode()`.** Outbound UDP plus the NAT return
+  path needs no inbound rule, which is what makes this deployable on the
+  CVM/GPU hosts that are inbound-22-only and are the nodes most starved of
+  address sources. Server mode would make the node a routing/storage peer for
+  the whole public DHT. For the same reason `hive_dht_port` is deliberately
+  EMPTY fleet-wide: a pinned source port buys nothing and removes the crate's
+  own 6881→ephemeral fallback.
+- **`HIVE_P2P_DISCOVERY_MS` is now load-bearing for two mechanisms.** Measured
+  DHT resolve is 2.0–4.6s (3278ms / 3412ms / 2001ms / 2110ms across four live
+  runs), so at the 4000ms code default `dial_fresh` can cancel the lookup before
+  it answers and the provider ships inert. Fleet deploys set 8000;
+  `dial_fallback_ceiling` tracks it automatically (10s→14s) and all three
+  callers already floor their timeouts at it.
+- Diagnose with `--dht-probe <64hex>` (binds no endpoint, registers no other
+  provider, so a hit cannot be explained by seeds/Seer/cache/inbound gossip) and
+  `GET /v1/mesh/discovery` (node-local like `/v1/dns/stats`; through the
+  dashboard's `/ops/*` proxy you are reading the LEADER's counters, not the
+  page-serving node's).
+
 ## Round-robin reads vs leader-forwarded writes
 
 - `admin_ingress` forwards MUTATIONS (POST/PUT/DELETE/PATCH) to the current

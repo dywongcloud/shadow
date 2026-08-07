@@ -66,6 +66,43 @@
   changed_when: false
   when: inventory_hostname != hive_ui_build_host
 
+# The shared unit template needs `hive_ui_node_dir`, and this role does NOT run
+# hive_ui/tasks/main.yml — it only borrows that role's template. Adding the
+# discovery there alone left this path templating an undefined var and failing
+# with "'hive_ui_node_dir' is undefined" on every host this role restarts
+# (witnessed: bkk, hk, va). Discover it here too rather than defaulting the
+# template, because a wrong default is exactly the bug being fixed: `next` runs
+# through a `#!/usr/bin/env node` shebang, so a PATH without node's real
+# directory exits 127 in a restart loop while the build still passes.
+- name: Locate the node binary (for the unit's PATH)
+  ansible.builtin.shell: |
+    set -u
+    p="$(command -v node 2>/dev/null || true)"
+    if [ -z "$p" ]; then
+      for c in /usr/local/bin/node /usr/bin/node /opt/node/bin/node; do
+        [ -x "$c" ] && { p="$c"; break; }
+      done
+    fi
+    printf '%s' "$p"
+  args:
+    executable: /bin/bash
+  register: _ui_node_which
+  changed_when: false
+  failed_when: false
+
+- name: Require node on the host
+  ansible.builtin.assert:
+    that:
+      - (_ui_node_which.stdout | default('') | trim) | length > 0
+    fail_msg: >-
+      node was not found on {{ inventory_hostname }}, so hive-ui cannot start
+      (next launches via a `#!/usr/bin/env node` shebang). Install node, then
+      re-run.
+
+- name: Record node's directory for the unit PATH
+  ansible.builtin.set_fact:
+    hive_ui_node_dir: "{{ (_ui_node_which.stdout | trim) | dirname }}"
+
 - name: Template the hive-ui systemd unit
   ansible.builtin.template:
     src: "{{ role_path }}/../hive_ui/templates/hive-ui.service.j2"

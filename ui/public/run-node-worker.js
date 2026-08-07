@@ -2393,6 +2393,27 @@ function onPortVisibility(port, msg) {
     setStatus({ lifecycle: "suspended" });
   } else if (status.lifecycle === "suspended" && anyVisible()) {
     setStatus({ lifecycle: "online" });
+    // Coming back from hidden/frozen: renew IMMEDIATELY instead of waiting for
+    // whatever the timer has left.
+    //
+    // This is what makes a phone survive being backgrounded. A mobile browser
+    // does not keep this worker running: Chrome throttles background timers to
+    // roughly one per minute and freezes a tab entirely after ~5 minutes, and
+    // iOS suspends on background or screen lock. RENEW_INTERVAL_MS is 60s
+    // against a 90s server-side presence TTL, so a SINGLE throttled tick can
+    // outlive presence — the node silently disappears from the fleet while the
+    // tab still believes it is admitted, and only recovers on the next timer,
+    // which is itself late for the same reason.
+    //
+    // `renewNow` is idempotent (it re-derives the whole capability server-side)
+    // and epoch-guarded, so an extra call is free; the timer it reschedules
+    // becomes the new cadence. Guarded on `node` so a suspended-then-visible
+    // transition that happens while nothing is actually running does nothing.
+    if (node) {
+      renewNow(epoch).catch(() => {
+        /* renewNow already records its own failure into status.lastError */
+      });
+    }
   } else {
     // Neither transition applies (e.g. tabCount changed but visibility
     // didn't) — still worth a broadcast so tabCount stays live in the UI.

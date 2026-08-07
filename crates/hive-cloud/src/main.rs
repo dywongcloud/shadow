@@ -26,6 +26,7 @@ mod db_rest;
 mod discovery;
 mod dns;
 mod dns_geo;
+mod dht_probe;
 mod dns_probe;
 mod dnsserver;
 mod docstore;
@@ -211,6 +212,17 @@ struct Args {
     /// target fails, so it composes into a shell check.
     #[arg(long = "dns-probe", value_delimiter = ',')]
     dns_probe: Vec<String>,
+    /// Operator diagnostic (same family as `--dns-probe`): resolve the given
+    /// 64-hex iroh endpoint id(s) through the PUBLIC mainline DHT only, from
+    /// this host, then exit without starting a node. Nothing else is in the
+    /// path — no bootstrap seeds, no Seer pkarr relay, no cached
+    /// `peer_iroh.json` — so a hit is proof the target's pkarr record is live
+    /// on the DHT and this host's egress can read it, and a "the mesh
+    /// converged anyway" explanation is structurally unavailable. Budget from
+    /// `HIVE_DHT_PROBE_TIMEOUT_MS` (default 30s, retried — a cold routing
+    /// table legitimately misses the first attempts). Non-zero exit on a miss.
+    #[arg(long = "dht-probe", value_delimiter = ',')]
+    dht_probe: Vec<String>,
     /// Operator diagnostic (same family as `--dns-probe`): seed the ACME
     /// DNS-01 challenge store at boot with `<fqdn>=<txt value>` — through the
     /// SAME `AcmeChallengeStore::insert` the real issuance path calls — then
@@ -243,6 +255,9 @@ async fn main() -> anyhow::Result<()> {
     // without joining the mesh or touching a port.
     if !args.dns_probe.is_empty() {
         return dns_probe::run_cli(&args.dns_probe).await;
+    }
+    if !args.dht_probe.is_empty() {
+        return dht_probe::run_cli(&args.dht_probe).await;
     }
 
     // Shared isolation backend. The ONLY component that is allowed to be mocked
