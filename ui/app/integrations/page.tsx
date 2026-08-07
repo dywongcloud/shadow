@@ -198,8 +198,17 @@ export default function IntegrationsPage() {
   useEffect(() => {
     let cancelled = false;
     // Catalog: cached for an hour client-side (and on the server route) so the
-    // 1,000+ toolkit list isn't refetched every visit.
-    cachedJson<{ configured: boolean; toolkits: Toolkit[] }>("/api/composio/toolkits", 60 * 60_000)
+    // 1,000+ toolkit list isn't refetched every visit — but ONLY when the
+    // answer is a real catalog. An unconfigured/empty response describes server
+    // config, not data: cache it and the page keeps insisting the key is unset
+    // for an hour after an operator actually sets it (exactly what happened on
+    // 2026-08-08, while the route itself was already returning 1,088 toolkits).
+    cachedJson<{ configured: boolean; toolkits: Toolkit[] }>(
+      "/api/composio/toolkits",
+      60 * 60_000,
+      undefined,
+      (d) => !!d.configured && Array.isArray(d.toolkits) && d.toolkits.length > 0,
+    )
       .then((d) => {
         if (cancelled) return;
         setTkConfigured(!!d.configured);

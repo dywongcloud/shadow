@@ -17,7 +17,26 @@ interface Entry<T> {
 const mem = new Map<string, Entry<unknown>>();
 const PREFIX = "oe_cache:";
 
-export async function cachedJson<T>(url: string, ttlMs = 5 * 60_000, init?: RequestInit): Promise<T> {
+/**
+ * `cacheable` decides whether a RESPONSE is worth remembering. Default: yes.
+ *
+ * Caching a "this feature is not configured" answer is a trap, because that
+ * answer is a statement about SERVER CONFIG, not about data — and the moment an
+ * operator fixes the config, every session that already asked keeps being told
+ * the old answer until its TTL expires. Witnessed 2026-08-08: COMPOSIO_API_KEY
+ * was deployed fleet-wide and `/api/composio/toolkits` immediately returned
+ * `configured: true` with 1,088 toolkits, while the page still rendered "Set
+ * COMPOSIO_API_KEY to connect the catalog" from a cached `configured: false` --
+ * for a full hour, on nothing but stale local state. A caller that can tell a
+ * degraded answer from a good one passes `cacheable` and gets a live re-check
+ * instead.
+ */
+export async function cachedJson<T>(
+  url: string,
+  ttlMs = 5 * 60_000,
+  init?: RequestInit,
+  cacheable: (v: T) => boolean = () => true,
+): Promise<T> {
   const now = Date.now();
 
   const m = mem.get(url);
@@ -41,6 +60,7 @@ export async function cachedJson<T>(url: string, ttlMs = 5 * 60_000, init?: Requ
   const r = await fetch(url, init);
   if (!r.ok) throw new Error(`${url} -> ${r.status}`);
   const v = (await r.json()) as T;
+  if (!cacheable(v)) return v;
   const e: Entry<T> = { t: now, v };
   mem.set(url, e);
   if (typeof window !== "undefined") {
