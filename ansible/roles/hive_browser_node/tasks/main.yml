@@ -321,6 +321,32 @@
     mode: "0644"
   notify: [reload systemd, restart hive-browser-node]
 
+# EXTERNAL watchdog. The supervisor inside hive-browser-node already recycles a
+# degraded NODE; it cannot recover a wedged SUPERVISOR. Witnessed on fc-bangkok
+# 2026-08-08: chrome in uninterruptible `D` state, the supervisor blocked in
+# `anon_pipe_read`, its health loop silent for 5.5h, and systemd still reporting
+# `active` with NRestarts=0 while the node had published no presence for 17
+# hours. Only a prober that shares none of those descriptors can see that.
+- name: Install the external browser-node watchdog
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../../../scripts/hive-browser-node-watchdog.sh"
+    dest: "{{ hive_browser_node_root }}/bin/hive-browser-node-watchdog.sh"
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Template the watchdog unit + timer
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "/etc/systemd/system/{{ item.dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: hive-browser-node-watchdog.service.j2, dest: hive-browser-node-watchdog.service }
+    - { src: hive-browser-node-watchdog.timer.j2, dest: hive-browser-node-watchdog.timer }
+  notify: reload systemd
+
 - name: Flush handlers so the verification below sees the final state
   ansible.builtin.meta: flush_handlers
 
@@ -334,6 +360,16 @@
 - name: Enable + start the browser node
   ansible.builtin.systemd:
     name: hive-browser-node
+    state: started
+    enabled: true
+    daemon_reload: true
+
+# The TIMER is enabled, never the service: the service is oneshot and the timer
+# is what gives it its cadence. Enabling the service itself would run one pass
+# at boot and never again.
+- name: Enable + start the watchdog timer
+  ansible.builtin.systemd:
+    name: hive-browser-node-watchdog.timer
     state: started
     enabled: true
     daemon_reload: true

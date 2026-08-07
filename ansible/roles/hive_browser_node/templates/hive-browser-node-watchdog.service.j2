@@ -1,0 +1,19 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=shadw browser-node external liveness watchdog ({{ hive_name }})
+Documentation=file://{{ hive_browser_node_root }}/bin/hive-browser-node-watchdog.sh
+# Deliberately NOT Requires=/BindsTo= the browser-node unit: the watchdog must
+# keep running (and keep probing) exactly when that unit is unhealthy, and a
+# dependency would drag it down with the thing it supervises.
+After=network-online.target
+
+[Service]
+Type=oneshot
+# Runs as root because its whole job is `systemctl restart` on another unit.
+# It reads one loopback URL and writes one integer; there is no other surface.
+ExecStart={{ hive_browser_node_root }}/bin/hive-browser-node-watchdog.sh
+Environment=HIVE_BROWSER_NODE_ORIGIN=http://127.0.0.1:{{ hive_browser_node_broker_port | default(3009) }}
+Environment=HIVE_BROWSER_NODE_WATCHDOG_LIMIT={{ hive_browser_node_watchdog_limit | default(6) }}
+Environment=HIVE_BROWSER_NODE_UNIT=hive-browser-node.service
+# A watchdog that can wedge is not a watchdog.
+TimeoutStartSec=60

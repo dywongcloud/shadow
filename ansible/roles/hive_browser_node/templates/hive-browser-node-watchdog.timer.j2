@@ -1,0 +1,17 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=shadw browser-node watchdog cadence ({{ hive_name }})
+
+[Timer]
+# First pass well after boot so a node still admitting is never counted against.
+OnBootSec={{ hive_browser_node_watchdog_boot_delay | default('10min') }}
+OnUnitActiveSec={{ hive_browser_node_watchdog_interval | default('5min') }}
+# Consecutive-failure LIMIT x this interval is the real reaction window
+# (default 6 x 5min = 30min of sustained unhealth). That is deliberately much
+# longer than a lease renewal or an admission retry, so the watchdog only ever
+# fires on a node that is genuinely stuck rather than one mid-self-heal.
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
