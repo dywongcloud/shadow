@@ -588,6 +588,95 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   forever by design — that is a state-versus-caller-bug ambiguity no GC may
   resolve by deleting; drain the store dir by hand.
 
+## Managed SQLite over libsql/Hrana (`DbKind::Sqlite`)
+
+- **There are TWO SQLite lanes and they share nothing but the word.**
+  `DbKind::Sqlite` is a MANAGED ENGINE created through the ordinary
+  `POST /v1/databases` path: one plain SQLite file per DATABASE at
+  `$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db`, queried over the
+  libsql wire protocol. `browser_db` (below) is a cr-sqlite CRR replica per
+  PROJECT under `$HIVE_DATA/browser-dbs/`, replicated to browsers by
+  `Op::CrrSync` with no query endpoint at all. **Never point the Hrana handler
+  at a `browser-dbs` file**: a direct SQL writer bypasses the clock tables the
+  CRR merge reads, which is silent permanent divergence in an LWW store. The
+  separation is by directory, by name template and by identity (database id vs
+  project), and this lane never loads the cr-sqlite extension. The dashboard
+  models them as two kinds (`sqlite` / `browser_sqlite`) for the same reason.
+- **The file-name template's input is the PLATFORM-ISSUED id, never a tenant
+  string.** `databases::sqlite_file_path` additionally proves the id is
+  `db_` + 8..=64 LOWERCASE hex before it may become a path component (mixed
+  case would map two ids onto one file), so a crafted id 404s instead of
+  reaching the filesystem — the `browser_artifacts` digest-validation posture.
+- **Two mount points, one handler, and the trailing slash is load-bearing.**
+  `https://<slug>.{HIVE_DB_DOMAIN}/v2/pipeline` (the per-database hostname every
+  managed engine already gets, with its own A record and the wildcard cert) and
+  `https://api.{platform_domain}/v1/sqlite/<db_id>/v2/pipeline` for a fleet with
+  no DB gateway domain. libsql clients resolve `v2/pipeline` RELATIVELY against
+  the base URL, so the path form's published DSN MUST end in `/` — without it
+  the client silently posts to `/v1/sqlite/v2/pipeline`, a different database or
+  none. A bare hostname has no path and cannot have this problem, which is why
+  it is the preferred DSN.
+- **Serve v2 AND v3 pipelines, and never answer `v3-protobuf` 2xx.**
+  `hrana-client-ts` does not probe: it hardcodes `version: 2, encoding: "json"`
+  and posts to `<base>/v2/pipeline`, while the Rust/Go/Python clients hardcode
+  `/v3/pipeline` and `/v3/cursor`. Answering the `v3-protobuf` capability probe
+  is the one thing that would push a client onto an encoding this server does
+  not speak.
+- **The wire types that break clients if you get them wrong:** `integer` and
+  `last_insert_rowid` are STRINGS (JSON numbers are f64 in every JS client;
+  i64 beyond 2^53 would silently lose bits), `blob` is base64 WITH padding
+  (`atob` requires it), a non-finite `float` is a LOUD error naming the column
+  (JSON cannot hold it, and `null` would be indistinguishable from a real
+  NULL), and EVERY request in a pipeline executes even after one errors — the
+  batch conditions are built on later steps observing an earlier failure.
+  `affected_row_count`/`last_insert_rowid` are gated on
+  `sqlite3_stmt_readonly`: `sqlite3_changes` is per-CONNECTION and only DML
+  updates it, so an unguarded read after a write claims it wrote a row.
+- **Owner-routed, never leader-routed.** The file is on `Database::host_node`;
+  every other node PROXIES there (`hrana::forward_to_owner` → HTTP admin, else
+  the gossip `/v1/databases/<id>/hrana-mesh` arm), and the owner re-checks the
+  presented database bearer against ITS OWN replicated record and refuses to
+  re-proxy. Opening the file locally instead would create a second EMPTY
+  database that diverges forever, so an unreachable owner is an honest 421.
+  Both leader gates (`admin_ingress` and `admin_loopback_forward`) exempt these
+  paths via `owner_routed` — forwarding them would strand an interactive
+  transaction's baton on whichever node was leader when the stream opened, and
+  would bounce the mesh envelope (itself a POST) straight back to the leader
+  instead of the owner it was addressed to.
+- **Because every node proxies, all baton state lives on the owner** — an
+  interactive transaction spanning several POSTs is pinned to one connection by
+  construction, whichever node round-robin DNS picked. Batons are 32 CSPRNG
+  bytes, SINGLE-USE (every response mints a fresh one) and database-scoped;
+  an unknown or reused baton is `STREAM_EXPIRED`, never a silent new stream.
+- **Auth is the database's own `DB_REST_TOKEN`**, compared constant-time by the
+  same `db_rest::credential_matches` the Postgres/Redis REST surface uses — so
+  `auth::require_auth` and the ingress gate both exempt `/v1/sqlite/` exactly
+  the way the webhook routes are exempt. No tenant name is ever read from the
+  request.
+- **The pool is a real pool, and it must not change the postgres lane.**
+  `sqlite_pool` gives each database bounded live connections
+  (`HIVE_SQLITE_POOL_MAX`, 8), a bounded idle set (`HIVE_SQLITE_POOL_MAX_IDLE`,
+  4) and a WAIT QUEUE (`HIVE_SQLITE_POOL_WAIT_MS`, 10s) — a burst queues
+  instead of being refused, and only a caller that waits out the whole budget
+  gets a typed `SQLITE_BUSY`. `db_rest`'s `try_acquire`-or-503 admission cap
+  stays exactly as it is for Postgres/Redis. `PooledConn` releases its permit
+  in `Drop`, never on an error branch (axum drops the request future when a
+  client goes away, so a caller-side release is silently skipped —
+  the `ColdStartGuard` rule on a second reservation surface), and a connection
+  still inside a transaction is rolled back before it is pooled, never handed
+  to the next borrower. Abandoned streams are reaped after
+  `HIVE_SQLITE_STREAM_IDLE_MS` (30s), which is also what stops a mid-`BEGIN`
+  stream from holding the file's write lock forever.
+- **No cross-region replication in this lane, deliberately.** `provision`
+  clears `replicas` for this kind: a second file elsewhere is a DIVERGENT
+  database, not a replica. The CRDT lane that does solve this is `browser_db`,
+  and it solves it with cr-sqlite, not file copies.
+- **Env that matters:** `HIVE_SQLITE_POOL_MAX`, `HIVE_SQLITE_POOL_MAX_IDLE`,
+  `HIVE_SQLITE_POOL_WAIT_MS`, `HIVE_SQLITE_BUSY_MS` (SQLite's own lock wait,
+  5s), `HIVE_SQLITE_STREAM_IDLE_MS`. `GET /v1/databases/sqlite-pools`
+  (operator, node-local like `/v1/dns/stats`) reports each pool's
+  live/idle/opened/reused/waited/refused counters and the open stream count.
+
 ## Browser-replicated databases (the `browser_db` contract)
 
 The contract the browser↔fleet CRR exchange implements is

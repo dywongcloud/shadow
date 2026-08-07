@@ -123,7 +123,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
       />
 
       <div className="mb-6 grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <Mini label="Type" value="sqlite" />
+        <Mini label="Type" value="browser_sqlite" />
         <Mini label="Scope" value="global" title="Replicated on every fleet node and in every admitted browser." />
         <Mini label="Access" value={db.policy.public_read ? "public read" : "team only"} />
         <Mini
@@ -148,7 +148,7 @@ export function SqliteDatabaseDetail({ project }: { project: string }) {
         <div className="mb-2 flex items-center gap-2">
           <FileStack className="h-4 w-4 text-muted" />
           <h3 className="text-sm font-semibold">Connection</h3>
-          <KindBadge kind="sqlite" />
+          <KindBadge kind="browser_sqlite" />
         </div>
         <p className="text-sm text-fg">{SQLITE_NO_DSN}</p>
         <div className="mt-3 grid gap-4 md:grid-cols-2">

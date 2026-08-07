@@ -20,7 +20,16 @@
 
 import type { Database, DbKind, Deployment, BrowserDbPolicy } from "@/lib/api";
 
-export type UnifiedKind = DbKind | "sqlite";
+/**
+ * Two genuinely different SQLite objects, never collapsed into one kind:
+ *  * `sqlite` — the MANAGED engine (`DbKind::Sqlite`). One file per database on
+ *    its owning node, spoken over libsql/Hrana, with a real DSN.
+ *  * `browser_sqlite` — the `browser_db` contract. One cr-sqlite CRDT replica
+ *    per PROJECT, replicated into admitted browsers over `Op::CrrSync`, with no
+ *    query endpoint at all.
+ * They share the word SQLite and nothing else, so a row must state which it is.
+ */
+export type UnifiedKind = DbKind | "browser_sqlite";
 
 export const KIND_LABEL: Record<UnifiedKind, string> = {
   postgres: "Postgres",
@@ -31,6 +40,7 @@ export const KIND_LABEL: Record<UnifiedKind, string> = {
   pubsub: "Pub/Sub",
   realtime: "Realtime",
   sqlite: "SQLite",
+  browser_sqlite: "SQLite (browser)",
 };
 
 // ---------------------------------------------------------------------------
@@ -117,6 +127,21 @@ export function managedEndpoint(db: Database): EndpointInfo | null {
       protocol: "redis wire (TLS)",
     };
   }
+  // Managed SQLite publishes `libsql://<host>` — the DSN a libsql/Turso client
+  // takes verbatim. The token rides separately (`LIBSQL_AUTH_TOKEN`), so the
+  // address shown here stays non-secret like every other kind's.
+  if (db.kind === "sqlite") {
+    const url = c.endpoint ?? "";
+    const shown = host || endpointHost(url);
+    if (shown) {
+      return {
+        key: "LIBSQL_URL",
+        address: shown,
+        reach: reachOfHost(shown),
+        protocol: "libsql (Hrana over HTTPS)",
+      };
+    }
+  }
   const endpoint = c.endpoint ?? "";
   if (endpoint) {
     return {
@@ -134,6 +159,9 @@ export function managedNoEndpointReason(db: Database): string {
   if (db.status === "provisioning") return "Still provisioning — the endpoint appears once the engine is up.";
   if (db.kind === "postgres" || db.kind === "redis") {
     return "No address published yet. Wire endpoints come from the DB gateway (HIVE_DB_DOMAIN); until it is configured this database has only its node-local port.";
+  }
+  if (db.kind === "sqlite") {
+    return "No libsql URL published yet — the backend publishes one on the DB gateway hostname, or on the platform API when that domain is unset.";
   }
   return `${KIND_LABEL[db.kind]} is served by the platform API under this database's token — see the connection details.`;
 }
@@ -197,7 +225,9 @@ export interface SqliteDb {
 }
 
 export const SQLITE_NO_DSN =
-  "No connection string — this database has no server-side wire endpoint.";
+  "No connection string — a browser-replicated database has no server-side wire " +
+  "endpoint. (The managed SQLite kind does: create one from Browse Storage to get " +
+  "a libsql:// DSN.)";
 
 /**
  * The honest capability statement for the SQLite lane. Every clause is a fact
@@ -212,9 +242,9 @@ export function sqliteConnectivity(): { how: string[]; missing: string[] } {
       "Access is granted by the admission lease, scoped to the tenant. Team scope is read-write; public read (when enabled) is read-only.",
     ],
     missing: [
-      "There is no libsql/Turso HTTP or WebSocket endpoint on the fleet — nothing speaks the Hrana protocol, so a libsql client cannot connect.",
+      "This lane has no libsql/Hrana endpoint: it converges by change-batch merge, and a file copy is not a merge. For a server-queryable SQLite database with a libsql:// DSN, create the managed SQLite kind instead — that is a different database, not this one exposed differently.",
       "There is no server-side connection pool for it, because there are no server-side connections to pool.",
-      "Server-side (Node/Python function) access is deliberately deferred — contract §9 lists an injected DSN / host op as not yet designed.",
+      "Server-side (Node/Python function) access to THIS replica is deliberately deferred — contract §9 lists an injected DSN / host op as not yet designed.",
     ],
   };
 }
@@ -226,7 +256,7 @@ export function sqliteConnectivity(): { how: string[]; missing: string[] } {
  * a pooler, and the code says so.
  */
 export const POOLING_NOTE =
-  "No server-side pooler. The Postgres/Redis wire endpoints proxy straight to the engine, and the SQL-over-HTTP surface opens a fresh connection per request behind a per-database concurrency cap (16). Pool in your client.";
+  "Postgres/Redis: no server-side pooler — the wire endpoints proxy straight to the engine, and the SQL-over-HTTP surface opens a fresh connection per request behind a per-database concurrency cap (16), so pool in your client. Managed SQLite is different: it has a real per-database pool (bounded live connections, a bounded idle set and a wait queue), so a burst queues instead of being refused.";
 
 // ---------------------------------------------------------------------------
 // The unified row
@@ -328,8 +358,8 @@ export function sqliteRow(db: SqliteDb): UnifiedDb {
     id: sqliteRouteId(db.project),
     href: `/storage/${encodeURIComponent(sqliteRouteId(db.project))}`,
     name: db.project,
-    kind: "sqlite",
-    provider: "OpenEdge SQLite",
+    kind: "browser_sqlite",
+    provider: "OpenEdge SQLite (browser-replicated)",
     project: db.project,
     region: "global",
     regionTitle:

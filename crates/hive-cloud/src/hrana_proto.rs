@@ -377,6 +377,14 @@ fn execute_stmt(conn: &Connection, sql: &str, s: &Stmt) -> Result<Value, String>
     // `last_insert_rowid`). `sqlite3_stmt_readonly` is the exact discriminator,
     // and it is also true for BEGIN/COMMIT/ROLLBACK, which change no rows.
     let readonly = stmt.readonly();
+    // `readonly` alone is NOT enough. DDL (`CREATE`/`DROP`/`ALTER`) and most
+    // `PRAGMA` writes are non-readonly yet never touch `sqlite3_changes`, so
+    // they inherit whatever count the last DML on this CONNECTION left behind —
+    // and connections are pooled and reused across requests, so a `CREATE TABLE`
+    // could report another request's insert count and its `last_insert_rowid`.
+    // `sqlite3_total_changes` moves for exactly the statements `sqlite3_changes`
+    // is meaningful for, so its delta is the precise discriminator.
+    let total_before = conn.total_changes();
 
     let mut rows_json: Vec<Value> = Vec::new();
     let mut rows_read: u64 = 0;
@@ -409,9 +417,19 @@ fn execute_stmt(conn: &Connection, sql: &str, s: &Stmt) -> Result<Value, String>
             }
         }
     }
-    let changes = if readonly { 0 } else { conn.changes() };
-    // SQLite keeps the connection's last inserted rowid; report it only when
-    // this statement actually wrote, so a pure SELECT never carries a stale one.
+    let wrote_rows = conn.total_changes() != total_before;
+    let changes = if readonly || !wrote_rows {
+        0
+    } else {
+        conn.changes()
+    };
+    // SQLite keeps the connection's last inserted rowid indefinitely, so it is
+    // reported only for a statement that actually wrote — which now excludes
+    // DDL/`PRAGMA`, since `changes` is gated on the `total_changes` delta above.
+    // Deliberately NOT additionally gated on "the rowid moved": re-inserting a
+    // rowid that was just deleted leaves it unchanged, and suppressing a real
+    // insert's rowid is a worse failure than an UPDATE/DELETE echoing the
+    // connection's last one.
     let last_insert_rowid = if changes > 0 {
         let id = conn.last_insert_rowid();
         (id != 0).then(|| id.to_string())

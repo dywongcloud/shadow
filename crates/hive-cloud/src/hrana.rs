@@ -175,11 +175,13 @@ pub async fn serve(
     body: axum::body::Bytes,
 ) -> Response {
     if db.kind != DbKind::Sqlite {
-        return err(
-            StatusCode::NOT_FOUND,
-            "this database does not speak the libsql protocol",
-            None,
-        );
+        // BYTE-IDENTICAL to `api_serve`'s unknown-id answer. A distinct
+        // "does not speak the libsql protocol" message here was readable
+        // WITHOUT any credential (the kind check precedes the bearer check), so
+        // an unauthenticated caller holding a leaked id could confirm both that
+        // the id existed and which engine it ran — the existence leak this
+        // surface documents as closed.
+        return err(StatusCode::NOT_FOUND, "no such database", None);
     }
     if !crate::db_rest::credential_matches(&db, &bearer) {
         let mut r = err(
@@ -254,25 +256,40 @@ async fn serve_local(
 async fn checkout(db: &Database, baton: Option<&str>) -> Result<Stream, Response> {
     sweep();
     if let Some(b) = baton {
-        return match streams().lock().remove(b) {
-            // A baton is single-use AND database-scoped: presenting another
-            // database's baton must not reach this database's connection.
-            Some(s) if s.db_id == db.id => Ok(s),
-            Some(other) => {
-                // Put it back — it belongs to a different database.
-                streams().lock().insert(b.to_string(), other);
-                Err(err(
-                    StatusCode::BAD_REQUEST,
-                    "baton does not belong to this database",
-                    Some("STREAM_EXPIRED"),
-                ))
+        // ONE guard covers take-and-restore. Writing this as
+        // `match streams().lock().remove(b) { … }` is a self-deadlock: the
+        // scrutinee's `MutexGuard` temporary lives until the END of the match,
+        // so re-locking inside an arm blocks a non-reentrant
+        // `parking_lot::Mutex` against a guard this very thread holds. It never
+        // unblocks, the guard is never dropped, and because EVERY request
+        // starts with `sweep()` (which locks the same map) the whole node's
+        // HTTP runtime is consumed one wedged worker at a time — witnessed
+        // live: one cross-database baton took down `/healthz` and every other
+        // route on the node, permanently.
+        let taken = {
+            let mut map = streams().lock();
+            match map.remove(b) {
+                // A baton is single-use AND database-scoped: presenting another
+                // database's baton must not reach this database's connection.
+                Some(s) if s.db_id == db.id => Some(s),
+                Some(other) => {
+                    // Belongs to a different database — put it straight back
+                    // under the guard we already hold, and answer exactly as if
+                    // it had never existed (below), so a baton cannot be used to
+                    // probe for live streams on another database.
+                    map.insert(b.to_string(), other);
+                    None
+                }
+                None => None,
             }
-            None => Err(err(
+        };
+        return taken.ok_or_else(|| {
+            err(
                 StatusCode::BAD_REQUEST,
                 "stream expired or was already used — open a new one (baton: null)",
                 Some("STREAM_EXPIRED"),
-            )),
-        };
+            )
+        });
     }
     let Some(path) = crate::databases::sqlite_file_path(&db.id) else {
         return Err(err(
@@ -441,13 +458,26 @@ async fn forward_to_owner(
 ) -> Option<Response> {
     let node = db.host_node.clone();
     if node.is_empty() {
+        tracing::warn!(
+            db = %db.id,
+            "hrana owner proxy: database record carries no host_node; cannot route"
+        );
         return None;
     }
     let env = envelope(bearer, path, body);
     let route = format!("/v1/databases/{}/hrana-mesh", db.id);
 
+    // Every exit below is logged. An unlogged `None` here surfaces to the
+    // client as a bare 421 with no way to tell "no admin URL for the owner"
+    // from "the mesh dial failed" — the two have completely different fixes,
+    // and diagnosing it from the outside means reading this function's source.
+    let mut why = String::new();
+
     // HTTP admin first (same two-tier shape as `admin::fetch_from_host`).
     let admin = cloud.node_admins.read().get(&node).cloned();
+    if admin.is_none() {
+        why.push_str("no HTTP admin URL known for owner; ");
+    }
     if let Some(admin) = admin {
         let mut rb = cloud
             .http
@@ -459,14 +489,16 @@ async fn forward_to_owner(
                 rb = rb.bearer_auth(tok);
             }
         }
-        if let Ok(r) = rb.send().await {
-            if r.status().is_success() {
-                if let Ok(v) = r.json::<Value>().await {
-                    if let Some(resp) = decode_envelope(&v) {
-                        return Some(resp);
-                    }
-                }
-            }
+        match rb.send().await {
+            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                Ok(v) => match decode_envelope(&v) {
+                    Some(resp) => return Some(resp),
+                    None => why.push_str("owner returned an undecodable envelope; "),
+                },
+                Err(e) => why.push_str(&format!("owner reply was not JSON ({e}); ")),
+            },
+            Ok(r) => why.push_str(&format!("owner HTTP admin answered {}; ", r.status())),
+            Err(e) => why.push_str(&format!("owner HTTP admin unreachable ({e}); ")),
         }
     }
 
@@ -476,9 +508,18 @@ async fn forward_to_owner(
         .nodes()
         .into_iter()
         .find(|n| n.name == node)
-        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)))?;
+        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+    let Some(target) = target else {
+        tracing::warn!(
+            db = %db.id, owner = %node,
+            reason = %why,
+            "hrana owner proxy failed: owner has no gossip address (peer_id/iroh_addr) in this \
+             node's registry, so the mesh fallback could not be attempted"
+        );
+        return None;
+    };
     let payload = serde_json::to_vec(&env).ok()?;
-    let bytes = crate::gossip::request_to(
+    let bytes = match crate::gossip::request_to(
         cloud,
         &target.0,
         &target.1,
@@ -487,7 +528,18 @@ async fn forward_to_owner(
         &payload,
         30,
     )
-    .await?;
+    .await
+    {
+        Some(b) => b,
+        None => {
+            tracing::warn!(
+                db = %db.id, owner = %node, peer_id = %target.0,
+                reason = %why,
+                "hrana owner proxy failed: mesh gossip request to the owner timed out or errored"
+            );
+            return None;
+        }
+    };
     let v: Value = serde_json::from_slice(&bytes).ok()?;
     decode_envelope(&v)
 }
@@ -574,12 +626,27 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value
 /// and `auth::require_auth` exempts this prefix for exactly that reason.
 pub fn routes() -> axum::Router<Arc<CloudState>> {
     use axum::routing::{get, post};
+    // `@libsql/client` runs in browsers too, and its POST carries
+    // `authorization` + `content-type: application/json` — both preflight
+    // triggers. Without an OPTIONS arm the router answers 405 and the browser
+    // never sends the real request, so the preflight is part of the endpoint,
+    // not an extra. (The `<slug>.{db_domain}` mount already gets this from
+    // `db_rest::handle`'s own OPTIONS short-circuit.)
     axum::Router::new()
-        .route("/v1/sqlite/:id/v2/pipeline", post(api_pipeline_v2))
-        .route("/v1/sqlite/:id/v3/pipeline", post(api_pipeline_v3))
-        .route("/v1/sqlite/:id/v3/cursor", post(api_cursor_v3))
-        .route("/v1/sqlite/:id/v2", get(api_probe_v2))
-        .route("/v1/sqlite/:id/v3", get(api_probe_v3))
+        .route(
+            "/v1/sqlite/:id/v2/pipeline",
+            post(api_pipeline_v2).options(preflight),
+        )
+        .route(
+            "/v1/sqlite/:id/v3/pipeline",
+            post(api_pipeline_v3).options(preflight),
+        )
+        .route(
+            "/v1/sqlite/:id/v3/cursor",
+            post(api_cursor_v3).options(preflight),
+        )
+        .route("/v1/sqlite/:id/v2", get(api_probe_v2).options(preflight))
+        .route("/v1/sqlite/:id/v3", get(api_probe_v3).options(preflight))
         .route("/v1/databases/:id/hrana-mesh", post(mesh_route))
         .route("/v1/databases/sqlite-pools", get(pool_stats))
 }
@@ -658,6 +725,10 @@ async fn api_probe_v3(
         axum::body::Bytes::new(),
     )
     .await
+}
+
+async fn preflight() -> Response {
+    cors(StatusCode::NO_CONTENT.into_response())
 }
 
 async fn api_serve(

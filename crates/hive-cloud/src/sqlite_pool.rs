@@ -304,7 +304,13 @@ pub fn pool_for(db_id: &str, path: &Path) -> Arc<SqlitePool> {
 /// Drop a database's pool (on delete). In-flight guards keep their `Arc` alive
 /// and release normally; the idle connections close as the last `Arc` drops.
 pub fn close(db_id: &str) {
-    if let Some(pool) = registry().lock().remove(db_id) {
+    // Bind the removal to a statement so the registry guard is DROPPED before
+    // `pool.idle` is locked. Held across, this is a registry→idle nesting; it is
+    // the same order `stats()` uses so it cannot invert today, but the shape is
+    // the one that self-deadlocked `hrana::checkout`, and unnesting it costs
+    // nothing.
+    let pool = registry().lock().remove(db_id);
+    if let Some(pool) = pool {
         pool.idle.lock().clear();
     }
 }

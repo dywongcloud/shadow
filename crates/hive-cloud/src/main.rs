@@ -1479,6 +1479,24 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mutations that are routed to a database's OWNER node, not to the
+/// control-plane leader — the one class of POST that must never be forwarded
+/// by either leader gate.
+///
+/// A managed SQLite database is a FILE on `Database::host_node`, and
+/// `hrana::serve` proxies to that node itself. Sending its pipeline POSTs to
+/// the leader first would (a) add a hop that still has to proxy, (b) pin an
+/// interactive transaction's baton to whichever node was leader when the
+/// stream opened — so a leadership change mid-transaction strands it — and (c)
+/// deadlock the owner-proxy hop outright, because the mesh envelope
+/// (`/v1/databases/<id>/hrana-mesh`) is itself a POST and would be bounced
+/// straight back to the leader instead of being served by the owner it was
+/// deliberately addressed to.
+fn owner_routed(path: &str) -> bool {
+    path.starts_with("/v1/sqlite/")
+        || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
+}
+
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
 /// to the raw admin listener). Reads serve locally; mutations on a non-leader
 /// forward to the current leader over the SNI-pinned client. Chain
@@ -1770,14 +1788,9 @@ async fn admin_ingress(
     // signing with the fleet-shared secret — no state is written — so login
     // must never depend on leader reachability or distance.
     let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    // libsql/Hrana pipelines are OWNER-routed, never leader-routed: the SQLite
-    // file lives on `Database::host_node` and `hrana::serve` proxies there
-    // itself. Forwarding to the leader would add a hop that still has to
-    // proxy — and, worse, would pin an interactive transaction's baton to
-    // whichever node happened to be leader when the stream opened, so a
-    // leadership change mid-transaction would strand it.
-    let owner_routed = req.uri().path().starts_with("/v1/sqlite/");
-    if !is_mutation || owner_routed || req.uri().path() == "/v1/token" {
+    // libsql/Hrana pipelines are OWNER-routed, never leader-routed — see
+    // `owner_routed`.
+    if !is_mutation || owner_routed(req.uri().path()) || req.uri().path() == "/v1/token" {
         return serve_local(admin, req).await;
     }
     // Leader serves locally.

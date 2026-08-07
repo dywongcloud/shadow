@@ -1048,7 +1048,12 @@ export interface Delivery {
 }
 
 // ---- Databases / storage ----
-export type DbKind = "postgres" | "redis" | "blob" | "queue" | "vector" | "pubsub" | "realtime";
+// `sqlite` is the MANAGED SQLite engine (`crates/hive-cloud/src/databases.rs`
+// `DbKind::Sqlite`), spoken over libsql/Hrana with a real DSN. It is a
+// different object from the browser-replicated cr-sqlite lane, which the
+// storage page models as `browser_sqlite` and which has no wire endpoint.
+export type DbKind =
+  | "postgres" | "redis" | "blob" | "queue" | "vector" | "pubsub" | "realtime" | "sqlite";
 export type DbStatus = "provisioning" | "ready" | "error";
 export interface Database {
   id: string;

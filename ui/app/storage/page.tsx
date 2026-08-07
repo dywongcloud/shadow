@@ -27,7 +27,8 @@ import { BrowserDbConfigForm, emptyPolicy, saveBrowserDb } from "./browser-db-pa
 // in a section of its own: it is a database, created the same way as the rest.
 const NATIVE: { kind: UnifiedKind; name: string; desc: string }[] = [
   { kind: "postgres", name: "Postgres", desc: "Managed Postgres — instant, branchable." },
-  { kind: "sqlite", name: "SQLite", desc: "Replicated cr-sqlite — a live copy in every admitted browser." },
+  { kind: "sqlite", name: "SQLite", desc: "Managed SQLite over libsql/Hrana — real libsql:// DSN, pooled." },
+  { kind: "browser_sqlite", name: "SQLite (browser)", desc: "Replicated cr-sqlite — a live copy in every admitted browser." },
   { kind: "redis", name: "Redis", desc: "Durable key-value, TCP + REST." },
   { kind: "blob", name: "Blob", desc: "Fast S3-compatible object storage." },
   { kind: "queue", name: "Queue", desc: "Durable FIFO message queue." },
@@ -323,7 +324,9 @@ function BrowseStorage({
   // sqlite configure step
   const [sqliteProject, setSqliteProject] = useState("");
   const [policy, setPolicy] = useState<BrowserDbPolicy>(emptyPolicy());
-  const isSqlite = sel?.kind === "sqlite";
+  // The browser-replicated lane is configured by a deployment block, not by
+  // POST /v1/databases — the managed `sqlite` kind takes the ordinary path.
+  const isSqlite = sel?.kind === "browser_sqlite";
 
   // Live mesh regions for the replica selector (falls back to the known set).
   const { data: catalog } = usePoll<Record<string, { id: string; label: string }[]>>("/v1/regions/catalog", 30000);
@@ -378,7 +381,7 @@ function BrowseStorage({
               {step === "browse"
                 ? "Create databases and stores that you can connect to your projects."
                 : isSqlite
-                ? "SQLite · replicated to every admitted browser"
+                ? "SQLite (browser) · replicated to every admitted browser"
                 : `${sel?.provider} · backed by OpenEdge ${sel ? KIND_LABEL[sel.kind] : ""}`}
             </p>
           </div>
