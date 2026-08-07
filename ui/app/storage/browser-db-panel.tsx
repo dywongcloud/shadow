@@ -260,7 +260,7 @@ export function BrowserDbStatusPanel({ project }: { project: string }) {
       </div>
       <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-secondary">
         <span>{status.replica.sites} replicated site{status.replica.sites === 1 ? "" : "s"}</span>
-        <span>{status.replica.last_modified_ms ? `last write ${timeAgo(status.replica.last_modified_ms)} ago` : "no writes yet"}</span>
+        <span>{status.replica.last_modified_ms ? `last write ${timeAgo(status.replica.last_modified_ms)}` : "no writes yet"}</span>
         <span>value cap {formatBytes(status.max_value_bytes)}</span>
         <span>tables: {status.tables.join(", ") || "none"}</span>
       </div>

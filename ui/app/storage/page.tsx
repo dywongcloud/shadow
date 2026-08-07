@@ -91,12 +91,24 @@ function useDatabases() {
     }
   }, []);
 
+  // A SQLite database must not blink out of the list because one of N parallel
+  // per-project fetches failed. Two rules make the lane as stable as the managed
+  // half, which is one endpoint and cannot partially fail:
+  //
+  //  * MERGE, never replace. `undefined` means "this fetch failed", and a failed
+  //    fetch must leave the last known answer standing. Only a definite result
+  //    (a policy, or `null` for "this project has no browser_db") overwrites.
+  //  * RETRY the unknowns. The effect keys on the project SET, so without this a
+  //    project that failed once stayed unknown until the set itself changed —
+  //    i.e. a transient blip removed a live database from the page permanently.
   useEffect(() => {
     if (!projects.length) return;
     let cancelled = false;
-    (async () => {
+
+    const load = async (targets: string[]) => {
+      if (!targets.length) return;
       const entries = await Promise.all(
-        projects.map(async (p) => {
+        targets.map(async (p) => {
           try {
             const s = await apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(p)}/settings`);
             return [p, s.browser_db ?? null] as const;
@@ -105,9 +117,24 @@ function useDatabases() {
           }
         }),
       );
-      if (!cancelled) setSettings(Object.fromEntries(entries));
-    })();
-    return () => { cancelled = true; };
+      if (cancelled) return;
+      setSettings((cur) => {
+        const next = { ...cur };
+        for (const [p, v] of entries) if (v !== undefined) next[p] = v;
+        return next;
+      });
+    };
+
+    void load(projects);
+    const retry = setInterval(() => {
+      setSettings((cur) => {
+        const unknown = projects.filter((p) => cur[p] === undefined);
+        if (unknown.length) void load(unknown);
+        return cur;
+      });
+    }, 20000);
+
+    return () => { cancelled = true; clearInterval(retry); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectsKey]);
 
@@ -187,7 +214,7 @@ export default function StoragePage() {
                   <Td><ConnectionCell row={row} /></Td>
                   <Td><StatusBadge row={row} /></Td>
                   <Td className="text-secondary">
-                    <span title={row.createdTitle}>{row.createdMs ? `${timeAgo(row.createdMs)} ago` : "—"}</span>
+                    <span title={row.createdTitle}>{row.createdMs ? timeAgo(row.createdMs) : "—"}</span>
                   </Td>
                 </tr>
               ))}
