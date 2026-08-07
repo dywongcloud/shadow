@@ -8363,18 +8363,60 @@ async fn webhook_deliveries(
 
 // ============================ Databases ============================
 
+/// The leader's answer for a tenant-scoped databases path, or `None` when this
+/// node IS the leader (so there is nothing above it to ask, and no recursion).
+///
+/// Database records are replicated, but replication is neither instantaneous nor
+/// — measured live — always complete. A SQLite database created through the
+/// leader was present on 6 of 11 nodes and ABSENT on the other 5 well after
+/// creation; the five missing it were the nodes that had been restarting or
+/// OOM-thrashing, and nothing backfilled them. Because `admin_ingress` serves
+/// every GET **locally** while the public host is round-robin DNS, that made a
+/// real, ready database 404 on roughly half of all requests — including its
+/// `/credentials`, i.e. the connection string was simply unobtainable about half
+/// the time. That is exactly the round-robin-reads-vs-leader-writes split
+/// AGENTS.md names, and this is its documented owner/leader fallback.
+async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
+    if c.is_control_plane_leader() {
+        return None;
+    }
+    let leader = c.control_plane_leader();
+    if leader.is_empty() || leader == c.node_name {
+        return None;
+    }
+    fetch_from_host(c, &leader, path, team).await
+}
+
 async fn databases_list(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Json<Value> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let list: Vec<_> = c
+    let mut list: Vec<crate::databases::Database> = c
         .databases
         .list(None)
         .into_iter()
         .filter(|d| norm(&d.team) == t)
         .collect();
+
+    // MERGE the leader's view rather than replacing or short-circuiting on
+    // "local is non-empty": a node holding SOME of the tenant's databases would
+    // otherwise silently serve a short list, which reads as "my database was
+    // deleted" rather than as the replication gap it is.
+    if let Some(v) = databases_from_leader(&c, "/v1/databases", &t).await {
+        if let Ok(remote) = serde_json::from_value::<Vec<crate::databases::Database>>(v) {
+            let have: std::collections::HashSet<String> =
+                list.iter().map(|d| d.id.clone()).collect();
+            for d in remote {
+                if norm(&d.team) == t && !have.contains(&d.id) {
+                    list.push(d);
+                }
+            }
+        }
+    }
+    // Deterministic order so a re-poll never reshuffles the rendered list.
+    list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| a.id.cmp(&b.id)));
     Json(json!(list))
 }
 
@@ -8409,11 +8451,18 @@ async fn database_get(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let d = c.databases.get(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if norm(&d.team) != t {
-        return Err(StatusCode::NOT_FOUND);
+    if let Some(d) = c.databases.get(&id) {
+        if norm(&d.team) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        return Ok(Json(json!(d)));
     }
-    Ok(Json(json!(d)))
+    // Absent HERE is not absent everywhere — see `databases_from_leader`. The
+    // leader re-runs its own tenant check, so this can never widen access.
+    if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}"), &t).await {
+        return Ok(Json(v));
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 async fn database_credentials(
@@ -8424,11 +8473,22 @@ async fn database_credentials(
 ) -> Result<Json<Value>, StatusCode> {
     // Returns unmasked connection secrets — must be strictly tenant-scoped.
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let d = c.databases.get_raw(&id).ok_or(StatusCode::NOT_FOUND)?;
-    if norm(&d.team) != t {
-        return Err(StatusCode::NOT_FOUND);
+    if let Some(d) = c.databases.get_raw(&id) {
+        if norm(&d.team) != t {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        return Ok(Json(json!(d)));
     }
-    Ok(Json(json!(d)))
+    // Same fallback as `database_get`, and it matters most here: this is the ONLY
+    // way to obtain a database's connection string, so a replication gap made the
+    // DSN unobtainable on any node that had not caught up. The leader applies the
+    // identical tenant check before answering — the `proxy_to_owner` re-check
+    // precedent — so proxying cannot leak another tenant's secrets.
+    if let Some(v) = databases_from_leader(&c, &format!("/v1/databases/{id}/credentials"), &t).await
+    {
+        return Ok(Json(v));
+    }
+    Err(StatusCode::NOT_FOUND)
 }
 
 /// The env-var (KEY, VALUE, sensitive) triples a database injects into its owning
