@@ -805,44 +805,6 @@ fn configured_public_addr() -> Option<std::net::SocketAddr> {
     Some(std::net::SocketAddr::new(ip, port))
 }
 
-/// Drop transports this node could never actually reach, returning how many went.
-///
-/// Every undialable address handed to `Endpoint::connect` becomes a connection
-/// PATH CANDIDATE, and iroh 1.0.x queues candidates in an unbounded `VecDeque`
-/// (`pending_open_paths`, upstream #4390 — still unbounded in 1.0.3, both
-/// community PRs closed unmerged). That queue is the fleet's OOM: measured on
-/// fc-hongkong with jemalloc profiling, 71,680 MiB — 99.8% of live heap — in one
-/// stack, `RawVec::finish_grow -> VecDeque::grow ->
-/// remote_state::State::open_path_on_conn -> RemoteStateActor::open_path_on_all_conns`.
-///
-/// `addr_json` learned via gossip is full of RFC1918 10.x/172.16/192.168
-/// addresses (AGENTS.md documents `peer_iroh.json` as holding peers' PRIVATE
-/// addrs), and those are not reachable from another region — so they are pure
-/// candidate churn. The PUBLISH side has always filtered them
-/// (`dht::relay_and_public_ip_filter`); the DIAL side never did.
-///
-/// Relay transports are always kept, so a NAT'd peer stays reachable; the cost of
-/// dropping a private addr is a relayed connection, which is what happened anyway
-/// once the direct path failed. Leaving an address set EMPTY is fine and fast:
-/// `connect` fails immediately with "no addressing information" and the caller
-/// falls through to fresh discovery. `HIVE_SEED_ALLOW_PRIVATE=1` restores the old
-/// behaviour for a single-VPC deployment where private addrs really are dialable.
-pub(crate) fn retain_dialable(addr: &mut EndpointAddr) -> usize {
-    if std::env::var("HIVE_SEED_ALLOW_PRIVATE")
-        .map(|v| v.trim() == "1")
-        .unwrap_or(false)
-    {
-        return 0;
-    }
-    let before = addr.addrs.len();
-    addr.addrs.retain(|t| match t {
-        iroh::TransportAddr::Relay(_) => true,
-        iroh::TransportAddr::Ip(sa) => crate::dht::is_publicly_routable(sa.ip()),
-        _ => false,
-    });
-    before.saturating_sub(addr.addrs.len())
-}
-
 /// Extract the iroh `EndpointId` (cryptographic node identity, as a string) from an
 /// `addr_json` blob (a serialized `EndpointAddr` learned via gossip). Used to build
 /// the peer-trust allowlist (#20) from the fleet roster the node already knows.
@@ -2233,16 +2195,9 @@ impl PeerPool {
         // Parse FIRST: the canonical endpoint id is the trunk key (see `trunks`),
         // and it is only knowable from the address. `node_id` is retained purely
         // as a human-facing label for logs, metrics and the alias map.
-        let mut addr: EndpointAddr = serde_json::from_str(addr_json)?;
+        let addr: EndpointAddr = serde_json::from_str(addr_json)?;
         let id = addr.id;
         let key = id.to_string();
-        // THE dial path for the whole mesh — filter here, not just on the seed
-        // hints, because these addresses come from gossip and that is where the
-        // undialable ones actually originate. See `retain_dialable`.
-        let dropped = retain_dialable(&mut addr);
-        if dropped > 0 {
-            tracing::debug!(node_id, dropped, "dropped unroutable peer addresses before dial");
-        }
 
         // Fast path: reuse a still-live trunk.
         {
@@ -3145,12 +3100,23 @@ pub async fn bind_full(
     // connection, which is what actually happened anyway once the direct path
     // failed. `HIVE_SEED_ALLOW_PRIVATE=1` restores the old behaviour for a
     // single-VPC deployment where private addrs genuinely are dialable.
+    let allow_private = std::env::var("HIVE_SEED_ALLOW_PRIVATE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
     let mut dropped_addrs = 0usize;
     let seed_addrs: Vec<EndpointAddr> = seeds
         .iter()
         .filter_map(|s| serde_json::from_str::<EndpointAddr>(&s.addr_json).ok())
         .map(|mut a| {
-            dropped_addrs += retain_dialable(&mut a);
+            if !allow_private {
+                let before = a.addrs.len();
+                a.addrs.retain(|t| match t {
+                    iroh::TransportAddr::Relay(_) => true,
+                    iroh::TransportAddr::Ip(sa) => crate::dht::is_publicly_routable(sa.ip()),
+                    _ => false,
+                });
+                dropped_addrs += before.saturating_sub(a.addrs.len());
+            }
             a
         })
         // A seed with no dialable transport left is not a usable hint; keeping it
