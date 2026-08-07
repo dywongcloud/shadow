@@ -10,7 +10,7 @@ import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/compone
 import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
 import {
   apiGet, apiSend, usePoll,
-  type Database, type DbKind, type Deployment, type ProjectSettings, type BrowserDbPolicy,
+  type Database, type DbKind, type Deployment, type BrowserDbPolicy,
 } from "@/lib/api";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
@@ -79,64 +79,29 @@ function useDatabases() {
     () => Array.from(new Set((deployments ?? []).map((d) => d.project))).sort(),
     [deployments],
   );
-  const projectsKey = projects.join(",");
 
-  const [settings, setSettings] = useState<Record<string, BrowserDbPolicy | null | undefined>>({});
-  const refreshProject = useCallback(async (project: string) => {
-    try {
-      const s = await apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`, { fresh: true });
-      setSettings((cur) => ({ ...cur, [project]: s.browser_db ?? null }));
-    } catch {
-      /* leave the stale entry — the next load retries */
-    }
-  }, []);
-
-  // A SQLite database must not blink out of the list because one of N parallel
-  // per-project fetches failed. Two rules make the lane as stable as the managed
-  // half, which is one endpoint and cannot partially fail:
+  // The SQLite lane is ONE request, exactly like the managed half.
   //
-  //  * MERGE, never replace. `undefined` means "this fetch failed", and a failed
-  //    fetch must leave the last known answer standing. Only a definite result
-  //    (a policy, or `null` for "this project has no browser_db") overwrites.
-  //  * RETRY the unknowns. The effect keys on the project SET, so without this a
-  //    project that failed once stayed unknown until the set itself changed —
-  //    i.e. a transient blip removed a live database from the page permanently.
-  useEffect(() => {
-    if (!projects.length) return;
-    let cancelled = false;
-
-    const load = async (targets: string[]) => {
-      if (!targets.length) return;
-      const entries = await Promise.all(
-        targets.map(async (p) => {
-          try {
-            const s = await apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(p)}/settings`);
-            return [p, s.browser_db ?? null] as const;
-          } catch {
-            return [p, undefined] as const;
-          }
-        }),
-      );
-      if (cancelled) return;
-      setSettings((cur) => {
-        const next = { ...cur };
-        for (const [p, v] of entries) if (v !== undefined) next[p] = v;
-        return next;
-      });
-    };
-
-    void load(projects);
-    const retry = setInterval(() => {
-      setSettings((cur) => {
-        const unknown = projects.filter((p) => cur[p] === undefined);
-        if (unknown.length) void load(unknown);
-        return cur;
-      });
-    }, 20000);
-
-    return () => { cancelled = true; clearInterval(retry); };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectsKey]);
+  // It used to be one `/v1/projects/<p>/settings` fetch PER project, assembled
+  // client-side, with every failure swallowed. That made a database's presence
+  // in the list depend on N independent requests all succeeding, and promptly —
+  // witnessed live as the same tenant's SQLite row rendering in one page load
+  // and missing from the next. Two halves of one list should not have two
+  // different failure modes, so the backend now answers the whole lane at once
+  // (`browser_db::browser_db_projects_http`, tenant-filtered server-side).
+  const { data: browserDb, refresh: refreshBrowserDb } =
+    usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy }[] }>(
+      "/v1/browser-db/projects",
+      15000,
+    );
+  const settings = useMemo(() => {
+    const out: Record<string, BrowserDbPolicy | null | undefined> = {};
+    for (const entry of browserDb?.projects ?? []) out[entry.project] = entry.browser_db;
+    return out;
+  }, [browserDb]);
+  // Identity is the project, but the lane is fetched whole — so re-reading it
+  // after a save is one refresh, not a per-project one.
+  const refreshProject = useCallback(async (_project?: string) => { await refreshBrowserDb(); }, [refreshBrowserDb]);
 
   const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings), [deployments, settings]);
   const rows = useMemo(() => unifiedDatabases(managed ?? [], sqlite), [managed, sqlite]);

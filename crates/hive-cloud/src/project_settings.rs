@@ -299,6 +299,26 @@ impl ProjectStore {
         self.map.read().clone()
     }
 
+    /// Every project carrying a `browser_db` opt-in, as (project, policy).
+    ///
+    /// Exists so the Storage page can learn its whole SQLite lane in ONE call.
+    /// It previously issued one `/v1/projects/<p>/settings` request PER project
+    /// and assembled the lane client-side, which made a database's presence in
+    /// the list depend on N independent requests all succeeding promptly — the
+    /// managed half is one endpoint and cannot partially fail, and the two
+    /// halves of one list should not have different failure modes.
+    ///
+    /// Clones only the matching project names and their (small) policies under
+    /// a read lock — deliberately NOT `snapshot()`, which copies every
+    /// project's env/build/function config (the `find_key_ci` precedent).
+    pub fn browser_db_projects(&self) -> Vec<(String, fluid_core::BrowserDbPolicy)> {
+        self.map
+            .read()
+            .iter()
+            .filter_map(|(name, s)| s.browser_db.clone().map(|p| (name.clone(), p)))
+            .collect()
+    }
+
     /// Case-insensitive lookup of an existing project KEY, holding only a read
     /// lock and cloning a single string — NOT the whole map + every project's
     /// env/build/function config. Used on the hot deploy path (name-collision

@@ -707,6 +707,10 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
             "/v1/projects/:project/browser-db/status",
             axum::routing::get(project_db_status_http),
         )
+        .route(
+            "/v1/browser-db/projects",
+            axum::routing::get(browser_db_projects_http),
+        )
         .route("/v1/browser/shards", axum::routing::get(shard_plan_http))
         .route(
             "/v1/browser/shards/verify",
@@ -716,6 +720,43 @@ pub fn routes() -> axum::Router<Arc<CloudState>> {
             "/v1/browser/shards/fragment/:store/:index",
             axum::routing::get(shard_fragment_http),
         )
+}
+
+/// `GET /v1/browser-db/projects` — every project in the CALLER'S tenant that
+/// carries a `browser_db` opt-in, with its raw policy, in ONE request.
+///
+/// The Storage page renders one list from two backends, and the managed half
+/// is a single endpoint that cannot partially fail. The SQLite half had no
+/// equivalent, so the page fanned out one `/v1/projects/<p>/settings` request
+/// per project and assembled the lane client-side — which made a database's
+/// presence in the list depend on N independent requests all succeeding, and
+/// promptly. Witnessed: the same tenant's SQLite row present in one load and
+/// absent from the next. This is that missing endpoint; the two halves of one
+/// list now have the same failure mode.
+///
+/// Tenant-filtered per project through the same `project_owned_by` guard the
+/// per-project route uses, so this can only ever widen to what the caller
+/// already owns — a project belonging to another team is simply omitted, which
+/// is also why an unknown project and a foreign one are indistinguishable here.
+async fn browser_db_projects_http(
+    axum::extract::State(cloud): axum::extract::State<Arc<CloudState>>,
+    headers: axum::http::HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
+    let tenant = crate::admin::tenant(&cloud, &headers, claims.as_ref().map(|e| &e.0));
+    let mut owned: Vec<(String, BrowserDbPolicy)> = cloud
+        .projects
+        .browser_db_projects()
+        .into_iter()
+        .filter(|(project, _)| crate::admin::project_owned_by(&cloud, project, &tenant))
+        .collect();
+    // Deterministic order so a re-poll never reshuffles the rendered list.
+    owned.sort_by(|a, b| a.0.cmp(&b.0));
+    let projects: Vec<Value> = owned
+        .into_iter()
+        .map(|(project, policy)| json!({ "project": project, "browser_db": policy }))
+        .collect();
+    Ok(axum::Json(json!({ "projects": projects })))
 }
 
 /// `GET /v1/projects/:project/browser-db/status` — the Storages page's live
