@@ -1845,12 +1845,36 @@ pub(crate) async fn start_named_deploy(
         && !requested.trim().is_empty()
         && project != requested.trim()
     {
+        // Say WHOSE name it is, honestly. Project names are unique across the
+        // PLATFORM, not per tenant, because the name becomes a real identifier
+        // downstream: the podman volume `hive-vol-{sanitize_tag(project)}`, the
+        // deploy checkout dir, `hive-browserdb-{tag}.db`. So a name can be taken
+        // by a project the caller cannot see, and the old wording ("already
+        // exists. Choose a different name.") read as "you already have this",
+        // sending the owner hunting for a project that was never in their list.
+        // Witnessed: `smsrelay` was orphaned and invisible, so the owner made
+        // `smsrelay2`.
+        let taken_by_caller = c
+            .projects
+            .find_key_ci(requested.trim())
+            .map(|k| project_owned_by(c, &k, &t))
+            .unwrap_or(false);
         return Err((
             StatusCode::CONFLICT,
-            format!(
-                "A project named \"{}\" already exists. Choose a different name.",
-                requested.trim()
-            ),
+            if taken_by_caller {
+                format!(
+                    "You already have a project named \"{}\". Choose a different name.",
+                    requested.trim()
+                )
+            } else {
+                format!(
+                    "The project name \"{}\" is already taken on this platform. Project names are \
+                     global because they become storage identifiers (volumes, deploy directories, \
+                     database files), so they cannot be reused even by a different team. Choose a \
+                     different name.",
+                    requested.trim()
+                )
+            },
         ));
     }
     // ---- Business locking (plan quotas + credit gate) ----
@@ -7860,6 +7884,41 @@ fn default_true_b() -> bool {
     true
 }
 
+/// Whether `project` belongs to NOBODY: its own tag is `__untagged__` AND no
+/// deployment record anywhere names a real tenant either.
+///
+/// This state is a trap, not a curiosity. `require_project` matches the owner
+/// tag against the caller's tenant and `__untagged__` matches none, while
+/// `project_owned_by`'s optimistic fallback only applies when the project has NO
+/// deployments at all — so an untagged project that HAS untagged deployments is
+/// claimable by no account in existence. It stays invisible in every project
+/// list while still holding its name platform-wide, which is exactly how
+/// creating a project can fail on a duplicate name its owner cannot find
+/// anywhere. Six projects sat in that state on 2026-08-08 (ctest,
+/// internet-structure, mien-kamp, silly-cat-test, smsrelay, tokenhun) — one of
+/// them proven the owner's by a database tagged `personal` under it.
+///
+/// Deliberately strict: if ANY deployment names a real tenant, that tenant owns
+/// the project and this returns false, so adoption can never take a project away
+/// from a live account.
+fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
+    if record_tenant(&c.projects.team_of(project)) != UNTAGGED_TENANT {
+        return false;
+    }
+    let local_clean = c
+        .gw
+        .deployment_records()
+        .iter()
+        .all(|r| !r.project.eq_ignore_ascii_case(project) || record_tenant(&r.tenant) == UNTAGGED_TENANT);
+    let peer_clean = c
+        .peer_deployments
+        .read()
+        .values()
+        .flatten()
+        .all(|d| !d.project.eq_ignore_ascii_case(project) || record_tenant(&d.tenant) == UNTAGGED_TENANT);
+    local_clean && peer_clean
+}
+
 async fn project_team_put(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7867,8 +7926,23 @@ async fn project_team_put(
     Path(project): Path<String>,
     Json(b): Json<ProjectTeam>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    // Only the CURRENT owning team may move a project (or change its protection).
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // Only the CURRENT owning team may move a project (or change its protection)
+    // — EXCEPT that an UNOWNED project may be adopted by a platform operator.
+    // Without that exception an orphaned project is frozen forever: no tenant
+    // matches `__untagged__`, so no caller can pass the check that would let
+    // them fix it. See `project_unowned`, which refuses the moment any
+    // deployment names a real tenant.
+    let adopting_orphan =
+        project_unowned(&c, &project) && require_operator(claims.as_ref().map(|e| &e.0)).is_ok();
+    if !adopting_orphan {
+        require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    } else {
+        tracing::warn!(
+            %project,
+            new_team = %b.team,
+            "adopting an UNOWNED project into a tenant (operator action)"
+        );
+    }
     c.projects.set_team(&project, &b.team);
     c.projects
         .set_preview_protection(&project, b.preview_protection);
