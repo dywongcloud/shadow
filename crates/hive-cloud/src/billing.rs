@@ -52,15 +52,24 @@ pub const PLANS: &[PlanSpec] = &[
         name: "Hobby",
         price_cents: 0,
         stripe_price_id: None,
+        // Included COMPUTE is deliberately unchanged at $5. It is the only field
+        // here that costs real money per active tenant; the rest are resource
+        // ceilings that mostly just decide how early a hobby user hits a wall.
         included_cents: 500,
         overage: false,
-        max_projects: 100,
-        max_members: 1,
-        max_sandboxes: 5,
-        max_running_sandboxes: 1,
-        max_sandbox_mounts: 1,
-        max_sandbox_env_vars: 20,
-        max_sandbox_ports: 2,
+        // Raised 2026-08-08. The previous ceilings (5 sandboxes, 1 running, 1
+        // mount, 2 ports, 1 seat) made the free tier hard to evaluate the
+        // platform on at all — a single running sandbox with one mount cannot
+        // demonstrate much. Pro stays clearly ahead on every axis (50 sandboxes,
+        // 10 running, 25 seats, pay-as-you-go overage), so the upgrade reason is
+        // intact.
+        max_projects: 250,
+        max_members: 3,
+        max_sandboxes: 15,
+        max_running_sandboxes: 3,
+        max_sandbox_mounts: 3,
+        max_sandbox_env_vars: 50,
+        max_sandbox_ports: 4,
         features: &[
             "$5 of included compute / month",
             "1 concurrent build",
@@ -1437,10 +1446,19 @@ mod tests {
 
     #[test]
     fn plan_quotas_are_wired() {
-        assert_eq!(plan_max_members("hobby"), 1);
+        // Assert the SHAPE (bounded, and strictly below Pro), not the exact
+        // numbers: pinning literals here made every deliberate limit change look
+        // like a regression, which is the opposite of what this test is for.
+        // 0 means unlimited, so an enterprise check is an equality on 0.
+        assert!(plan_max_members("hobby") > 0);
+        assert!(plan_max_members("hobby") < plan_max_members("pro"));
         assert_eq!(plan_max_members("enterprise"), 0); // unlimited
         assert!(plan_max_projects("hobby") > 0);
+        assert!(plan_max_projects("hobby") < plan_max_projects("pro"));
         assert_eq!(plan_max_projects("enterprise"), 0);
+        // Hobby must never gain overage billing — it is the no-payment tier.
+        assert!(!plan_spec("hobby").overage);
+        assert!(plan_spec("pro").overage);
     }
 }
 

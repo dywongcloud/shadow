@@ -1829,7 +1829,45 @@ async fn reconcile_zone<A: DnsApi>(
             });
         }
     }
+    // NEVER-DARK, applied PER NAME to address records.
+    //
+    // `addr_create_ok` / `addr_create_failed` were already computed above but
+    // nothing consulted them here, so an ordinary address ROTATION could empty a
+    // name: the replacement A create returns 429, the old A deletes succeed
+    // anyway, and the name ends the pass resolving to nothing. That is the exact
+    // sequence witnessed on 2026-08-08 —
+    //     WARN  DNS create failed ... 429 Too Many Requests (retryable)
+    //     ERROR managed name ends the pass with NEITHER addresses NOR
+    //           delegation published — it is DARK   name=shoomoo
+    // — and it surfaces to a user as an intermittent FUNCTION_NO_RESPONSE on a
+    // deployment that is running perfectly (every node served that app 200 while
+    // its name was dark).
+    //
+    // Creates-before-deletes alone does not prevent this; the delete must also be
+    // CONDITIONAL on its own name's create having landed. A STALE address is
+    // strictly better than none: it still resolves to a node that serves, and the
+    // next pass rotates it once the API stops refusing. Deletes for names whose
+    // create succeeded, and every non-address delete, are unaffected.
+    let mut dark_deletes_skipped = 0usize;
+    let mut deleted_ok = 0usize;
     for id in &plan.deletes {
+        if let Some(r) = by_id.get(id.as_str()) {
+            let is_addr = r.rtype == "A" || r.rtype == "AAAA";
+            if is_addr
+                && addr_create_failed.contains(r.name.as_str())
+                && !addr_create_ok.contains(r.name.as_str())
+            {
+                dark_deletes_skipped += 1;
+                tracing::warn!(
+                    %domain,
+                    name = %r.name,
+                    rtype = %r.rtype,
+                    "DNS delete SKIPPED to keep the name resolvable — every address create for \
+                     it failed this pass (keeping the stale record beats going dark)"
+                );
+                continue;
+            }
+        }
         // Same fault-tolerance as creates: one failed delete must not abort the
         // pass and strand the rest (deletes are also rate-limited).
         if let Err(e) = api.delete(domain, id).await {
@@ -1840,6 +1878,7 @@ async fn reconcile_zone<A: DnsApi>(
             continue;
         }
         STATS.deletes.fetch_add(1, Ordering::Relaxed);
+        deleted_ok += 1;
         if let Some(r) = by_id.get(id.as_str()) {
             if r.rtype == "A" || r.rtype == "AAAA" || r.rtype == "NS" {
                 if let Some(c) = end_count.get_mut(r.name.as_str()) {
@@ -1876,7 +1915,21 @@ async fn reconcile_zone<A: DnsApi>(
         .iter()
         .map(|r| format!("{} {} {}", r.name, r.rtype, r.value))
         .collect();
-    tracing::info!(%domain, created = created, deleted = plan.deletes.len(), published = ?published, "DNS reconciled");
+    // Report what ACTUALLY happened. This logged `deleted = plan.deletes.len()`
+    // — the PLANNED count — so failed and skipped deletes were reported as
+    // completed, and a pass that changed nothing read identically to one that
+    // changed everything. `planned_deletes` is kept so a growing gap between
+    // planned and done is visible, which is what a create/delete treadmill
+    // against a rate-limited API looks like from the outside.
+    tracing::info!(
+        %domain,
+        created = created,
+        deleted = deleted_ok,
+        planned_deletes = plan.deletes.len(),
+        deletes_skipped_to_avoid_dark = dark_deletes_skipped,
+        published = ?published,
+        "DNS reconciled"
+    );
     Ok(current)
 }
 
