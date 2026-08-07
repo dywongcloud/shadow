@@ -338,8 +338,29 @@ pub struct DataSnapshot {
     pub vectors: HashMap<String, HashMap<String, (Vec<f32>, serde_json::Value)>>,
 }
 
+/// How long a deletion is remembered. Long enough that every node — including
+/// one that was down or OOM-cycling for hours — sees the tombstone before it is
+/// collected, because a tombstone dropped too early lets a peer that still holds
+/// the record resurrect it.
+pub const TOMBSTONE_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The replicated payload for the `databases` store: records PLUS the deletions.
+///
+/// Deletions must travel explicitly. When absence-means-deleted, a node that
+/// simply has not heard about a record yet is indistinguishable from one that
+/// knows it was removed — and the replicated store then propagates the loss.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SyncedDatabases {
+    pub dbs: Vec<Database>,
+    /// id -> deletion time (ms).
+    #[serde(default)]
+    pub tombstones: std::collections::BTreeMap<String, u64>,
+}
+
 pub struct DatabaseStore {
     dbs: RwLock<Vec<Database>>,
+    /// id -> deleted_ms. See [`SyncedDatabases`] and `merge_synced`.
+    tombstones: RwLock<std::collections::BTreeMap<String, u64>>,
     port: AtomicU32,
     blob: BlobStore,
     queue: QueueStore,
@@ -351,6 +372,7 @@ impl DatabaseStore {
     pub fn new() -> DatabaseStore {
         DatabaseStore {
             dbs: RwLock::new(Vec::new()),
+            tombstones: RwLock::new(std::collections::BTreeMap::new()),
             port: AtomicU32::new(0),
             blob: BlobStore::new(crate::persist::data_dir().join("blob")),
             queue: QueueStore::default(),
@@ -505,6 +527,81 @@ impl DatabaseStore {
 
     pub fn remove_db(&self, id: &str) {
         self.dbs.write().retain(|d| d.id != id);
+        // Record the deletion so it can REPLICATE. Without this the removal is
+        // invisible to `merge_synced`, and a peer still holding the record would
+        // hand it straight back on the next sync tick.
+        self.tombstones.write().insert(id.to_string(), now_ms());
+    }
+
+    // ---- Replicated snapshot / merge -------------------------------------
+    //
+    // Adoption MERGES; it must never replace. This store previously adopted the
+    // leader's snapshot with `*self.dbs.write() = data`, guarded only against a
+    // fully-empty payload, which makes "the leader has not got this record" and
+    // "this record was deleted" the same event. Witnessed end to end: a managed
+    // SQLite database was created through the leader (HTTP 200, reached `ready`),
+    // existed on 6 of 11 nodes, and then vanished from ALL of them — the leader
+    // was OOM-killed before its debounced save ran (a SIGKILL bypasses
+    // `flush_blocking`), came back without the record, and every follower dutifully
+    // adopted that and erased its own copy. A replicated store must not be able to
+    // destroy data by omission.
+
+    /// Snapshot for replication: records plus the tombstones that explain absences.
+    pub fn snapshot_synced(&self) -> SyncedDatabases {
+        let mut dbs = self.dbs.read().clone();
+        dbs.sort_by(|a, b| a.id.cmp(&b.id)); // deterministic bytes (store_sync contract)
+        SyncedDatabases {
+            dbs,
+            tombstones: self.tombstones.read().clone(),
+        }
+    }
+
+    /// Merge a peer's snapshot into this store. Returns the resulting record count.
+    ///
+    /// Rules, in order:
+    ///   * tombstones union, keeping the LATEST deletion time for an id;
+    ///   * records union by id, the remote copy winning a collision (the leader is
+    ///     authoritative for field updates such as status transitions);
+    ///   * any record whose id carries a tombstone at-or-after its `created_ms` is
+    ///     dropped — so a delete propagates, while a database RE-created under a
+    ///     fresh id (or later timestamp) survives;
+    ///   * tombstones older than [`TOMBSTONE_RETENTION_MS`] are collected.
+    pub fn merge_synced(&self, remote: SyncedDatabases) -> usize {
+        let now = now_ms();
+        {
+            let mut tombs = self.tombstones.write();
+            for (id, ms) in remote.tombstones {
+                let e = tombs.entry(id).or_insert(ms);
+                if ms > *e {
+                    *e = ms;
+                }
+            }
+            tombs.retain(|_, ms| now.saturating_sub(*ms) < TOMBSTONE_RETENTION_MS);
+        }
+        let tombs = self.tombstones.read().clone();
+
+        let mut dbs = self.dbs.write();
+        for r in remote.dbs {
+            match dbs.iter_mut().find(|d| d.id == r.id) {
+                Some(local) => *local = r,
+                None => dbs.push(r),
+            }
+        }
+        dbs.retain(|d| match tombs.get(&d.id) {
+            Some(deleted_ms) => d.created_ms > *deleted_ms,
+            None => true,
+        });
+        dbs.len()
+    }
+
+    /// Tombstones, for the durable snapshot — they must survive a restart or a
+    /// node that reboots forgets its deletions and re-imports them from a peer.
+    pub fn tombstones_snapshot(&self) -> std::collections::BTreeMap<String, u64> {
+        self.tombstones.read().clone()
+    }
+
+    pub fn tombstones_load(&self, data: std::collections::BTreeMap<String, u64>) {
+        *self.tombstones.write() = data;
     }
 
     /// Remove a database record AND purge its actual payload data for the

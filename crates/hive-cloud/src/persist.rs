@@ -60,6 +60,11 @@ pub struct PlatformSnapshot {
     /// restart like blob (disk) and the DB records themselves.
     #[serde(default)]
     pub database_data: crate::databases::DataSnapshot,
+    /// Deletions of database records, kept durable on purpose: a node that
+    /// forgets its tombstones on restart re-imports every database it had
+    /// deleted from whichever peer still holds them.
+    #[serde(default)]
+    pub database_tombstones: std::collections::BTreeMap<String, u64>,
     /// Hour/day consumption-breakdown rollups (Weekly/Monthly chart data) —
     /// minute-resolution buckets are excluded (short retention, refill within
     /// minutes; see metrics.rs's module doc comment for why).
@@ -380,6 +385,7 @@ pub fn capture(cloud: &Arc<CloudState>) -> PlatformSnapshot {
         webhooks: cloud.webhooks.snapshot(),
         databases: cloud.databases.snapshot(),
         database_data: cloud.databases.data_snapshot(),
+        database_tombstones: cloud.databases.tombstones_snapshot(),
         metrics_rollup: cloud.metrics.rollup_snapshot(),
         builds: cloud.builds.snapshot(),
         incidents: cloud.incidents.snapshot(),
@@ -662,6 +668,7 @@ pub fn restore(cloud: &Arc<CloudState>, snap: PlatformSnapshot) {
     cloud.webhooks.load(snap.webhooks);
     cloud.databases.load(snap.databases);
     cloud.databases.data_load(snap.database_data);
+    cloud.databases.tombstones_load(snap.database_tombstones);
     cloud.metrics.rollup_load(snap.metrics_rollup);
     // BuildStore::load() already reconciles Queued/Building -> Error for its
     // own per-build log records internally (git.rs) -- no duplicate needed

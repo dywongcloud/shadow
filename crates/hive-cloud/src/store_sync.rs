@@ -251,15 +251,38 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
     SyncedStore {
         name: "databases",
-        snapshot: |c| enc_sorted(c.databases.snapshot()),
+        snapshot: |c| enc(&c.databases.snapshot_synced()),
+        // MERGE, never replace — and carry deletions explicitly.
+        //
+        // This adopted the leader's list wholesale, guarded only against a fully
+        // EMPTY payload, which makes "the leader has not got this record yet" and
+        // "this record was deleted" the same event. Witnessed end to end: a managed
+        // SQLite database created through the leader (HTTP 200, reached `ready`)
+        // existed on 6 of 11 nodes and then vanished from ALL of them — the leader
+        // was OOM-killed before its debounced save ran (SIGKILL bypasses
+        // `flush_blocking`), restarted without the record, and every follower
+        // adopted that and erased its own copy. A replicated store must not be able
+        // to destroy data by omission.
+        //
+        // Legacy payloads (a bare array, from a node still running the previous
+        // binary) are still accepted so a mixed fleet keeps converging; they simply
+        // carry no tombstones. A pre-upgrade node receiving the NEW object shape
+        // fails to parse and declines to adopt, which leaves its own state intact —
+        // the safe direction.
         adopt: |c, b| {
-            let v: Vec<crate::databases::Database> = serde_json::from_slice(b).ok()?;
-            if v.is_empty() {
+            let synced: crate::databases::SyncedDatabases = serde_json::from_slice(b)
+                .ok()
+                .or_else(|| {
+                    let dbs: Vec<crate::databases::Database> = serde_json::from_slice(b).ok()?;
+                    Some(crate::databases::SyncedDatabases {
+                        dbs,
+                        tombstones: Default::default(),
+                    })
+                })?;
+            if synced.dbs.is_empty() && synced.tombstones.is_empty() {
                 return None;
             }
-            let n = v.len();
-            c.databases.load(v);
-            Some(n)
+            Some(c.databases.merge_synced(synced))
         },
     },
     SyncedStore {
