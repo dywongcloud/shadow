@@ -985,6 +985,210 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
 }
 
 // ---------------------------------------------------------------------------
+// Fleet <-> fleet anti-entropy (direct, no browser carrier)
+// ---------------------------------------------------------------------------
+//
+// v1 converged FLEET replicas only through browser CARRIERS: a Team browser
+// that pulled node A's changes later pushed them to node B. That satisfies the
+// browser-facing contract, but it makes the fleet replica set — which the
+// contract calls the system of record — depend on somebody's tab being open.
+// Two consequences, both real:
+//
+//   * a project whose browsers are all closed stops converging between nodes,
+//     silently, for as long as that lasts; and
+//   * `reconcile_replicas` creates an EMPTY replica on a node that never held
+//     one, and with no fleet-side source that emptiness is only ever filled by
+//     a browser. A node that just joined therefore answers for a database it
+//     holds nothing of — which is exactly what makes an owner-pinned SQL
+//     endpoint unsafe to build on top of the browser-carrier model.
+//
+// This is the direct arm the contract names as the deliberate follow-up. It is
+// PULL-ONLY and reuses the exchange verbatim: same `Op::CrrSync` encodings,
+// same `sync_round` responder, same caps, same whole-batch rollback. Pull-only
+// is what keeps it reasonable — each node periodically asks a peer "what do you
+// have that I do not", which is textbook anti-entropy and needs no write-
+// permission model beyond the peer authentication the mesh already performs.
+// It is also strictly additive: a peer running a pre-upgrade binary has no
+// dispatch arm for the path and simply fails the round, which is the same
+// no-op as an unreachable peer.
+
+const DEFAULT_FLEET_SYNC_SECS: u64 = 45;
+const FLEET_SYNC_TIMEOUT_SECS: u64 = 20;
+/// Peers pulled per project per tick. Bounded so the round cost stays O(1) in
+/// fleet size per tick while the ROTOR still reaches every peer over time.
+const FLEET_SYNC_PEERS_PER_TICK: usize = 2;
+
+/// The grant a FLEET peer syncs under. Peers are node-authenticated by the mesh
+/// transport and hold the same system-of-record role this node does, so the
+/// grant is read+write over any project this node knows to be opted in. An
+/// unknown project yields `None` — the identical refusal shape the browser path
+/// uses, so a caller learns nothing about what exists here.
+fn fleet_round_grant(cloud: &Arc<CloudState>, project: &str) -> Option<RoundGrant> {
+    let spec = opted_in_projects(cloud).remove(project)?;
+    Some(RoundGrant {
+        project: project.to_string(),
+        resolved: spec.resolve(),
+        read_only: false,
+    })
+}
+
+/// Responder half, dispatched from `gossip::dispatch`'s
+/// `/v1/browser-db/mesh-sync/` POST arm. Request and reply are the SAME
+/// `Op::CrrSync` encodings the browser lane uses, so one wire format and one
+/// `sync_round` serve both callers. An empty reply is the refusal; the dialer
+/// treats empty/malformed as a failed round and simply retries next tick.
+pub async fn mesh_crr_sync(cloud: &Arc<CloudState>, project: &str, body: &[u8]) -> Vec<u8> {
+    let Some(grant) = fleet_round_grant(cloud, project) else {
+        tracing::debug!(%project, "fleet db sync refused: project is not opted in on this node");
+        return Vec::new();
+    };
+    let Ok(request) = hive_browser_proto::split_crr_sync_request(body) else {
+        tracing::warn!(%project, "fleet db sync: malformed request");
+        return Vec::new();
+    };
+    // Same rule as the browser path: `db_file` is a grant IDENTIFIER, never a
+    // path, and must equal the name THIS node derives from its own grant.
+    if request.db_file != replica_file_name(&grant.project) {
+        tracing::warn!(%project, "fleet db sync refused: db_file does not match the derived name");
+        return Vec::new();
+    }
+    let path = store_dir().join(replica_file_name(&grant.project));
+    let label = grant.project.clone();
+    match tokio::task::spawn_blocking(move || sync_round(&path, &grant, &request)).await {
+        Ok(Ok(reply)) => hive_browser_proto::encode_crr_sync_reply(&reply),
+        Ok(Err(code)) => {
+            tracing::warn!(project = %label, code, "fleet db sync round failed");
+            Vec::new()
+        }
+        Err(e) => {
+            tracing::warn!(project = %label, error = %e, "fleet db sync worker join failed");
+            Vec::new()
+        }
+    }
+}
+
+/// One PULL round against `peer`: advertise this node's per-site watermarks
+/// with an empty push, then apply whatever the peer exports that this node is
+/// missing. Returns the number of batches applied.
+async fn fleet_pull_round(
+    cloud: &Arc<CloudState>,
+    project: &str,
+    peer_id: &str,
+    addr: &str,
+) -> Result<usize, String> {
+    let grant = fleet_round_grant(cloud, project).ok_or("project is not opted in here")?;
+    let path = store_dir().join(replica_file_name(&grant.project));
+    let file = replica_file_name(&grant.project);
+
+    let wm_path = path.clone();
+    let watermarks = tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, i64)>, String> {
+        if let Some(parent) = wm_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let conn = hive_crsql::open(&wm_path).map_err(|e| e.to_string())?;
+        hive_crsql::known_sites(&conn).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let request = hive_browser_proto::encode_crr_sync_request(&hive_browser_proto::CrrSyncRequest {
+        db_file: file,
+        push_more: false,
+        watermarks,
+        batches: Vec::new(),
+    });
+
+    let reply_bytes = crate::gossip::request_to(
+        cloud,
+        peer_id,
+        addr,
+        hive_p2p::GOSSIP_POST,
+        &format!("/v1/browser-db/mesh-sync/{project}"),
+        &request,
+        FLEET_SYNC_TIMEOUT_SECS,
+    )
+    .await
+    .ok_or("peer unreachable, or it refused the round")?;
+
+    if reply_bytes.is_empty() {
+        return Ok(0);
+    }
+    let reply = hive_browser_proto::split_crr_sync_reply(&reply_bytes).map_err(|e| e.to_string())?;
+    if reply.batches.is_empty() {
+        return Ok(0);
+    }
+    let applied = reply.batches.len();
+    let resolved = grant.resolved.clone();
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let conn = hive_crsql::open(&path).map_err(|e| e.to_string())?;
+        ensure_schema(&conn, &resolved).map_err(|e| e.to_string())?;
+        let (status, message) = apply_push_batches(&conn, &path, &resolved, &reply.batches);
+        if !matches!(status, CrrStatus::Ok) {
+            // Typed refusals (quota, oversized value) are the SAME rollback the
+            // browser path takes — never a partial apply.
+            return Err(message);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(applied)
+}
+
+/// Registered in `main.rs` beside [`spawn_reconcile`]. Every node runs it: the
+/// replica is per-host, so this is peer-to-peer anti-entropy, not a leader job.
+/// `HIVE_BROWSER_DB_FLEET_SYNC=0` disables the DIALING half (the responder arm
+/// stays, so a disabled node still serves peers) — the `HIVE_BROWSER_DB_LISTEN`
+/// precedent for having an ops-side off switch that degrades to a no-op.
+pub fn spawn_fleet_sync(cloud: Arc<CloudState>) {
+    if std::env::var("HIVE_BROWSER_DB_FLEET_SYNC")
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false)
+    {
+        tracing::info!("browser db fleet-fleet sync disabled (HIVE_BROWSER_DB_FLEET_SYNC=0)");
+        return;
+    }
+    let interval_secs = env_u64("HIVE_BROWSER_DB_FLEET_SYNC_SECS", DEFAULT_FLEET_SYNC_SECS);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        tick.tick().await;
+        tick.tick().await;
+        // Rotates so the bounded per-tick peer sample still covers the whole
+        // fleet over successive ticks instead of hammering the same two peers.
+        let mut rotor: usize = 0;
+        loop {
+            let projects: Vec<String> = opted_in_projects(&cloud).into_keys().collect();
+            let peers: Vec<(String, String, String)> = cloud
+                .registry
+                .nodes()
+                .iter()
+                .filter(|n| n.healthy && n.name != cloud.node_name)
+                .filter_map(|n| Some((n.name.clone(), n.peer_id.clone()?, n.iroh_addr.clone()?)))
+                .collect();
+            if !projects.is_empty() && !peers.is_empty() {
+                for project in &projects {
+                    for k in 0..FLEET_SYNC_PEERS_PER_TICK.min(peers.len()) {
+                        let (name, peer_id, addr) = &peers[(rotor + k) % peers.len()];
+                        match fleet_pull_round(&cloud, project, peer_id, addr).await {
+                            Ok(0) => {}
+                            Ok(n) => tracing::info!(
+                                %project, peer = %name, batches = n,
+                                "fleet db sync applied peer changes"
+                            ),
+                            Err(e) => tracing::debug!(
+                                %project, peer = %name, error = %e, "fleet db sync round failed"
+                            ),
+                        }
+                    }
+                }
+                rotor = rotor.wrapping_add(FLEET_SYNC_PEERS_PER_TICK);
+            }
+            tick.tick().await;
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Global-state shards (bn-browser-state-shards)
 // ---------------------------------------------------------------------------
 //

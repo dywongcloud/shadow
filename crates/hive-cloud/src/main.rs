@@ -1262,6 +1262,12 @@ async fn main() -> anyhow::Result<()> {
     // derived schema) present, and reap inert replicas only past the 30-day
     // grace window with the blast-radius guards — see browser_db.rs.
     browser_db::spawn_reconcile(cloud.clone());
+    // Fleet<->fleet anti-entropy for those replicas. Without it, node-to-node
+    // convergence flows ONLY through browser carriers, so a project whose tabs
+    // are all closed stops converging and a freshly-joined node keeps answering
+    // from the empty replica `reconcile_replicas` created for it. Pull-only,
+    // every node, bounded peers per tick — see browser_db::spawn_fleet_sync.
+    browser_db::spawn_fleet_sync(cloud.clone());
     // Protocol-wide browser ROLL CALL: a periodic read-only inventory + drift
     // audit over the admitted browser population (who is present, what each
     // serves, which db grant each holds) against this node's own gateway

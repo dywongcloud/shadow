@@ -259,6 +259,19 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             }
             Vec::new()
         }
+        // Fleet<->fleet browser-db anti-entropy (see `browser_db::mesh_crr_sync`).
+        // Prefix-disjoint from every `/v1/browser/*` arm — note the hyphen — so it
+        // neither shadows nor is shadowed by them. Body and reply are the raw
+        // `Op::CrrSync` encodings, which is why this rides the binary gossip
+        // dispatch rather than a JSON arm.
+        p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/browser-db/mesh-sync/") => {
+            let project = p.trim_start_matches("/v1/browser-db/mesh-sync/");
+            if project.is_empty() {
+                Vec::new()
+            } else {
+                crate::browser_db::mesh_crr_sync(cloud, project, body).await
+            }
+        }
         // Presence write-through to the leader (see `echo_presence_to_leader`).
         // Ordered BEFORE the GET arm below only for readability — the two are
         // already disjoint by method — but it must stay ahead of any future
