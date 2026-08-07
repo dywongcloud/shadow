@@ -306,8 +306,12 @@ where
                 // Connect/open timeout = strongest dead-peer signal (#H4),
                 // same handling as ws_proxy: stop ranking the node.
                 if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-                    cloud.registry.set_health(cand, u64::MAX, false);
-                    tracing::warn!(node = %cand, "raw-proxy: peer marked unhealthy after connect/open timeout");
+                    crate::health::demote(
+                        &cloud.registry,
+                        cand,
+                        "raw-proxy: connect/open timeout",
+                        None,
+                    );
                 }
                 last_err = e;
             }

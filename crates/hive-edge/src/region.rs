@@ -191,6 +191,29 @@ pub struct NodeInfo {
     /// Total VRAM across all GPUs on the host, MiB.
     #[serde(default)]
     pub gpu_vram_mb: u64,
+    /// Epoch-ms this node's PROCESS started (not the host's boot time).
+    ///
+    /// The cheapest possible fleet-visible "is that node cycling?" signal: a
+    /// peer whose uptime keeps resetting is restarting, and until this existed
+    /// the only way to see that was to SSH in and read `dmesg`/`systemctl` on
+    /// the right host at the right moment. A node killed by the cgroup OOM
+    /// killer is back in under a second with healthz answering, so nothing
+    /// else in the gossiped record changes at all.
+    ///
+    /// `0` = not reported (a pre-upgrade peer) and must be read as UNKNOWN,
+    /// never as "just started".
+    #[serde(default)]
+    pub started_ms: u64,
+    /// How many times this node has restarted after an OOM kill within the
+    /// last 24h, as classified by `restart_audit` from the previous run's
+    /// marker plus kernel/cgroup evidence. `0` also means "pre-upgrade peer",
+    /// i.e. unknown — it is a floor, never a proof of health.
+    #[serde(default)]
+    pub oom_restarts_24h: u32,
+    /// Epoch-ms of the most recent boot whose predecessor was OOM-killed.
+    /// `None` = never observed (or not reported).
+    #[serde(default)]
+    pub last_oom_ms: Option<u64>,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -430,6 +453,34 @@ impl NodeRegistry {
         me.gpu_free_mb = gpu_free_mb;
     }
 
+    /// Refresh this node's restart-audit counters (see `hive-cloud`'s
+    /// `restart_audit`). Refreshed on a timer, not only at boot, because the
+    /// 24h window slides: a node that OOMed 25 hours ago must stop advertising
+    /// it, and one that OOMs while running must start.
+    pub fn set_self_restart_audit(
+        &self,
+        started_ms: u64,
+        oom_restarts_24h: u32,
+        last_oom_ms: Option<u64>,
+    ) {
+        let mut me = self.me.write();
+        me.started_ms = started_ms;
+        me.oom_restarts_24h = oom_restarts_24h;
+        me.last_oom_ms = last_oom_ms;
+    }
+
+    /// When this peer was last heard from by gossip, epoch-ms. `None` for an
+    /// unknown id (self included — self is never in `peers`).
+    ///
+    /// Read as INDEPENDENT liveness evidence: `upsert_peer` refreshes this from
+    /// every gossip announce while deliberately leaving `healthy` alone, so a
+    /// fresh timestamp proves the peer is alive even while some local transport
+    /// to it is failing. `hive-cloud`'s `health::demote` gates every withdrawal
+    /// on it.
+    pub fn peer_last_seen_ms(&self, id: &str) -> Option<u64> {
+        self.peers.read().get(id).map(|p| p.last_seen_ms)
+    }
+
     /// Record a peer's measured latency + health (from probing).
     pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
         if let Some(p) = self.peers.write().get_mut(id) {
@@ -630,6 +681,9 @@ mod tests {
             disk_total_gb: 0,
             disk_free_gb: 0,
             gpu_free_mb: None,
+            started_ms: 0,
+            oom_restarts_24h: 0,
+            last_oom_ms: None,
             backend: String::new(),
         }
     }

@@ -448,6 +448,9 @@ mod tests {
             // unknown path, not the has-space path these placement tests mean.
             disk_free_gb: 500,
             gpu_free_mb: None,
+            started_ms: 0,
+            oom_restarts_24h: 0,
+            last_oom_ms: None,
             backend: backend.into(),
         }
     }

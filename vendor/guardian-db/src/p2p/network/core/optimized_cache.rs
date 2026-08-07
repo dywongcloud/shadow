@@ -144,6 +144,13 @@ pub struct CacheConfig {
     pub enable_access_prediction: bool,
 }
 
+/// Maximum CIDs the access predictor tracks. It is a HEURISTIC input to
+/// eviction, not a correctness structure, so a bound costs nothing real —
+/// whereas being unbounded costs one map entry per CID the node ever touches,
+/// forever. Sized well above the combined entry capacity of both caches so the
+/// predictor still covers everything actually resident.
+const MAX_TRACKED_CIDS: usize = 100_000;
+
 /// Access predictor using usage patterns.
 #[derive(Debug)]
 pub struct AccessPredictor {
@@ -544,6 +551,15 @@ impl OptimizedCache {
     }
 
     /// Updates the access history for prediction.
+    ///
+    /// Bounded on BOTH axes, because either alone leaks. The per-CID timestamp
+    /// vector was already windowed to `analysis_window_secs`, but the MAP was
+    /// not: `get()` calls this for every lookup INCLUDING MISSES, and Guardian
+    /// storage is content-addressed, so every mutated value is a brand-new CID
+    /// that is never read again. One permanent `String` key + `Vec` per CID
+    /// ever touched is a monotonic leak whose rate is the write rate — and the
+    /// windowing made it invisible, since it emptied each `Vec` while leaving
+    /// its key behind forever.
     async fn update_access_history(&self, cid: &str) {
         let mut predictor = self.access_predictor.lock().await;
         let now = Instant::now();
@@ -551,17 +567,46 @@ impl OptimizedCache {
         predictor
             .access_history
             .entry(cid.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(now);
 
         // Limit the history so it does not grow indefinitely.
         let analysis_window = predictor.analysis_window_secs; // Copy the value before the borrow.
-        if let Some(history) = predictor.access_history.get_mut(cid) {
-            // Use checked_sub to avoid overflow.
-            if let Some(cutoff) = now.checked_sub(Duration::from_secs(analysis_window)) {
+        let cutoff = now.checked_sub(Duration::from_secs(analysis_window));
+        if let Some(cutoff) = cutoff {
+            if let Some(history) = predictor.access_history.get_mut(cid) {
                 history.retain(|&access_time| access_time > cutoff);
             }
         }
+
+        if predictor.access_history.len() <= MAX_TRACKED_CIDS {
+            return;
+        }
+        // Over the cap: first drop every CID with nothing left inside the
+        // window (pure residue of the windowing above — the common case, and it
+        // costs no prediction accuracy because those entries carry no signal).
+        let before = predictor.access_history.len();
+        predictor.access_history.retain(|_, hist| !hist.is_empty());
+        // Still over: evict least-recently-accessed until at the cap. Sorting
+        // only happens on this path, which the retain above makes rare.
+        if predictor.access_history.len() > MAX_TRACKED_CIDS {
+            let mut by_recency: Vec<(Instant, String)> = predictor
+                .access_history
+                .iter()
+                .map(|(k, v)| (*v.last().unwrap_or(&now), k.clone()))
+                .collect();
+            by_recency.sort_by(|a, b| a.0.cmp(&b.0));
+            let over = predictor.access_history.len() - MAX_TRACKED_CIDS;
+            for (_, key) in by_recency.into_iter().take(over) {
+                predictor.access_history.remove(&key);
+            }
+        }
+        warn!(
+            "access predictor history pruned: {} -> {} tracked CIDs (cap {})",
+            before,
+            predictor.access_history.len(),
+            MAX_TRACKED_CIDS
+        );
     }
 
     /// Checks whether eviction is needed and performs it if so.

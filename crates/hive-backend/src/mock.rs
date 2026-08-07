@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -678,26 +678,35 @@ async fn run_step(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
 
+    // BOUNDED capture — see `hive_core::logcap`. The step is a tenant-supplied
+    // shell command; `lines()` has no length limit, so newline-free output
+    // (a `\r` progress bar, a one-line source map, a binary on stdout) grew a
+    // single String until the host process died. `read_capped_line` keeps
+    // draining the pipe but retains at most MAX_LOG_LINE_BYTES.
     let s_out = sink.clone();
     let out_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut r = BufReader::new(stdout);
+        while let Ok(Some(l)) =
+            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
+        {
             let _ = s_out.send(LogLine {
                 ts_ms: now_ms(),
                 stream: LogStream::Stdout,
-                line,
+                line: l.text,
             });
         }
     });
 
     let s_err = sink.clone();
     let err_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut r = BufReader::new(stderr);
+        while let Ok(Some(l)) =
+            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
+        {
             let _ = s_err.send(LogLine {
                 ts_ms: now_ms(),
                 stream: LogStream::Stderr,
-                line,
+                line: l.text,
             });
         }
     });

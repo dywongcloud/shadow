@@ -282,6 +282,9 @@ mod tests {
             disk_total_gb: 10,
             disk_free_gb: 0,
             gpu_free_mb: None,
+            started_ms: 0,
+            oom_restarts_24h: 0,
+            last_oom_ms: None,
             backend: "mock".into(),
         }
     }

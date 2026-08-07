@@ -409,10 +409,16 @@ async fn mesh_upstream(
             // Connect/open timeout = strongest dead-peer signal (#H4), same
             // handling as ws_proxy / the TCP raw proxy: stop ranking the node.
             if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-                cloud.registry.set_health(node, u64::MAX, false);
-                tracing::warn!(
+                // Through the guarded chokepoint, NOT `set_health` directly: a
+                // connect/open timeout on ONE leg is a local transport fact,
+                // and this observer's `healthy` flag drives DNS and placement.
+                // If the peer is still gossiping it stays healthy and is only
+                // marked locally cold. See health.rs.
+                crate::health::demote(
+                    &cloud.registry,
                     node,
-                    "udp relay: peer marked unhealthy after connect/open timeout"
+                    "udp relay: connect/open timeout",
+                    None,
                 );
             }
             tracing::warn!(port = route.public_port, node, error = %e, "udp relay: mesh leg failed");

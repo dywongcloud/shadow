@@ -7,10 +7,37 @@
 # (AGENTS.md health-verdict-per-observer note; the same reasoning
 # playbooks/platform-only.yml's serial: 1 already encodes).
 
+# Gate BEFORE anything is touched. A `--limit` that keeps hosts of a glibc
+# group but drops that group's build host builds nothing for them, and without
+# this the restart play would happily bounce the service onto whatever binary
+# was already there and report ok= -- a deploy-shaped non-event.
+- name: Require a canonical artifact for this host's glibc group
+  ansible.builtin.assert:
+    that:
+      - hostvars[hive_group_build_host].hive_group_build_sha256 is defined
+      - (hostvars[hive_group_build_host].hive_group_build_sha256 | default('') | length) == 64
+    fail_msg: >-
+      NOTHING WAS BUILT for glibc group '{{ hive_glibc_group }}' in this run --
+      refusing to restart {{ hive_name }} onto an unverified binary. Build host
+      for this group: '{{ hive_group_build_host }}'.
+
 - name: Build host -- binary is already canonical, nothing to swap
   ansible.builtin.debug:
     msg: "{{ hive_name }}: build host, binary already at {{ hive_binary_path }}"
   when: inventory_hostname == hive_group_build_host
+
+- name: Follower -- record the binary content BEFORE the swap
+  ansible.builtin.stat:
+    path: "{{ hive_binary_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _pre_swap
+  when: inventory_hostname != hive_group_build_host
+
+- name: Follower -- publish the pre-swap sha for verification
+  ansible.builtin.set_fact:
+    hive_pre_deploy_sha: "{{ _pre_swap.stat.checksum | default('') }}"
+  when: inventory_hostname != hive_group_build_host
 
 - name: Follower -- back up the running binary before swap
   ansible.builtin.copy:
@@ -24,6 +51,19 @@
   ansible.builtin.command:
     cmd: mv -f /tmp/hive-cloud.new {{ hive_binary_path }}
   when: inventory_hostname != hive_group_build_host
+
+# Fail here, BEFORE the restart, if the file in place is not the artifact this
+# run built -- restarting onto the wrong binary and discovering it in the
+# verification pass costs a service bounce that this check makes unnecessary.
+- name: Verify the binary now in place is the canonical build (pre-restart)
+  ansible.builtin.stat:
+    path: "{{ hive_binary_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _in_place
+  failed_when: >-
+    (_in_place.stat.checksum | default('')) !=
+    hostvars[hive_group_build_host].hive_group_build_sha256
 
 - name: Template the hive-node systemd unit (in case env/vars changed)
   ansible.builtin.template:

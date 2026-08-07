@@ -9,7 +9,7 @@ name = "hive-cloud"
 path = "src/main.rs"
 
 [dependencies]
-hive-core = { workspace = true }
+hive-core = { workspace = true, features = ["async-io"] }
 hive-backend = { workspace = true }
 hive-controlplane = { workspace = true }
 fluid-core = { workspace = true }
@@ -146,5 +146,14 @@ zkauth = ["dep:hive-zkauth"]
 # that ships alongside jemalloc, with one less dependency and no version-skew
 # risk in a crate we would only use for formatting.
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+# `stats` is REQUIRED for `memwatch`/`GET /v1/debug/memory` and is NOT a default
+# feature: without it `tikv-jemalloc-sys`'s build script passes
+# `--disable-stats`, every `stats.*` mallctl returns ENOENT, and the endpoint
+# would report nulls forever — an instrumentation surface that looks present and
+# measures nothing. That absence is exactly why the 2026-08 fc-hongkong OOM hunt
+# could not answer "is this live objects or dirty pages?": the numbers were not
+# merely unread, they were not compiled in. (`stats_print:true` was tried and
+# produced nothing for a second, independent reason — it writes from an atexit
+# hook, and a SIGKILLed process never runs one.)
+tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std"] }

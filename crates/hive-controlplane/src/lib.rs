@@ -47,6 +47,24 @@ struct Inner {
     running_builds: usize,
 }
 
+/// How many FINISHED jobs (record + its replay log bus) are retained. In-flight
+/// jobs are never evicted regardless of this number.
+///
+/// `jobs` and `logs` were both append-only for the life of the process: one
+/// `JobRecord` and one `LogBus` per build ever submitted, neither ever removed.
+/// On a node that builds continuously that is a monotonic leak whose rate is
+/// exactly the deploy rate, and the log half carried the actual build output —
+/// megabytes per entry. Retention has to be a real number, not "forever".
+const MAX_RETAINED_FINISHED_JOBS: usize = 200;
+
+fn max_retained_finished_jobs() -> usize {
+    std::env::var("HIVE_MAX_RETAINED_JOBS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_RETAINED_FINISHED_JOBS)
+}
+
 impl Inner {
     /// Pick the box with the most free vCPUs that can still fit `r` (worst-fit,
     /// spreads load across boxes).
@@ -179,6 +197,70 @@ impl Hive {
 
     pub fn logs_done(&self, id: &JobId) -> bool {
         self.logs.get(id).map(|b| b.is_done()).unwrap_or(false)
+    }
+
+    /// Total bytes currently retained across every job's replay buffer — the
+    /// gauge that makes this bound observable from outside the process
+    /// (hive-cloud surfaces it on `GET /v1/debug/memory`).
+    pub fn log_retention_bytes(&self) -> usize {
+        self.logs.iter().map(|e| e.value().retained_bytes()).sum()
+    }
+
+    /// Number of retained job records / log buses.
+    pub fn retained_job_counts(&self) -> (usize, usize) {
+        // Read the two under separate, non-overlapping locks. Written as one
+        // tuple expression the `inner` guard would live until the end of the
+        // statement, i.e. across the DashMap access — establishing an
+        // inner→logs lock order for a pair of counters that need no atomicity.
+        let jobs = self.inner.lock().jobs.len();
+        (jobs, self.logs.len())
+    }
+
+    /// Evict the oldest FINISHED jobs — record and replay log together — down to
+    /// the retention bound. Called after every job terminates and on the
+    /// autoscaler tick (so a job that finished via a path that forgot to call
+    /// it is still collected).
+    ///
+    /// Record and bus are evicted as one unit: a `JobView` whose logs 404, or a
+    /// `LogBus` no job names, are both worse than an honestly-forgotten job.
+    fn reap_finished_jobs(&self) {
+        let keep = max_retained_finished_jobs();
+        let evict: Vec<JobId> = {
+            let mut inner = self.inner.lock();
+            let mut finished: Vec<(u64, JobId)> = inner
+                .jobs
+                .iter()
+                // `is_terminal()` rather than a local variant list, so a new
+                // terminal state is retained-and-reaped by default instead of
+                // silently becoming immortal.
+                .filter(|(_, j)| j.state.is_terminal())
+                .map(|(id, j)| (j.finished_at_ms.unwrap_or(0), id.clone()))
+                .collect();
+            if finished.len() <= keep {
+                return;
+            }
+            // Oldest first; ties broken by id so the choice is deterministic
+            // rather than dependent on HashMap iteration order.
+            finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let drop_n = finished.len() - keep;
+            let evict: Vec<JobId> = finished.into_iter().take(drop_n).map(|(_, id)| id).collect();
+            for id in &evict {
+                inner.jobs.remove(id);
+            }
+            evict
+        };
+        let mut freed = 0usize;
+        for id in &evict {
+            if let Some((_, bus)) = self.logs.remove(id) {
+                freed += bus.retained_bytes();
+            }
+        }
+        debug!(
+            evicted = evict.len(),
+            freed_log_bytes = freed,
+            retained = keep,
+            "reaped finished job records"
+        );
     }
 
     pub fn cluster_status(&self) -> ClusterStatus {
@@ -429,6 +511,7 @@ impl Hive {
             }
         }
 
+        self.reap_finished_jobs();
         self.teardown_cell(&cell_id).await;
     }
 
@@ -483,6 +566,7 @@ impl Hive {
             });
             bus.mark_done();
         }
+        self.reap_finished_jobs();
         self.wake.notify_one();
     }
 
@@ -492,6 +576,11 @@ impl Hive {
         loop {
             tokio::time::sleep(self.cfg.autoscaler_interval).await;
             self.clone().reconcile_warm_pool();
+            // Backstop for any terminal transition that does not run the
+            // post-build reap (a job failed before `run_build_phase`, a future
+            // cancellation path): retention must not depend on every writer
+            // remembering to call it.
+            self.reap_finished_jobs();
         }
     }
 

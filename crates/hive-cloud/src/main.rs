@@ -40,6 +40,7 @@ mod gitops;
 mod gossip;
 mod gpu_pool;
 mod guardian;
+mod health;
 mod hrana;
 mod hrana_proto;
 mod identity;
@@ -47,6 +48,7 @@ mod incidents;
 mod inference;
 mod integrations;
 mod lease;
+mod memwatch;
 mod mesh_raw;
 mod metrics;
 mod microfrontends;
@@ -61,6 +63,7 @@ mod relational;
 mod resources;
 mod resp;
 mod resp_cache;
+mod restart_audit;
 mod retry;
 mod sandboxes;
 mod sandboxes_api;
@@ -259,6 +262,18 @@ async fn main() -> anyhow::Result<()> {
     if !args.dht_probe.is_empty() {
         return dht_probe::run_cli(&args.dht_probe).await;
     }
+
+    // Restart audit — FIRST thing after the diagnostics, before any subsystem
+    // can wedge or overwrite state. A node killed by the cgroup OOM killer is
+    // restarted by systemd within a second and the platform records NOTHING:
+    // the killed process cannot log its own death and the new one starts
+    // clean, so the only evidence is a kernel line in `dmesg` on that host.
+    // Measured cost of that silence: a node cycling every 2-3h presented as
+    // "random unhealthy nodes" for a whole session, with every downstream
+    // symptom investigated separately. This reads the previous run's marker,
+    // reaches a verdict, and says so loudly. Pure local file I/O — it cannot
+    // fail the boot. See restart_audit.rs.
+    restart_audit::audit_boot(&args.name);
 
     // Shared isolation backend. The ONLY component that is allowed to be mocked
     // (and only when a real microVM host isn't available): we auto-select the real
@@ -632,6 +647,12 @@ async fn main() -> anyhow::Result<()> {
         // which placement must not mistake for "full".
         disk_free_gb: crate::resources::disk_free_gb(),
         gpu_free_mb: crate::resources::measured_gpu_free_mb(),
+        // Seeded from the boot audit that already ran above, so the very first
+        // gossip round already carries the verdict; `spawn_disk_refresh` slides
+        // the 24h window from then on.
+        started_ms: crate::restart_audit::started_ms(),
+        oom_restarts_24h: crate::restart_audit::oom_restarts_24h(),
+        last_oom_ms: crate::restart_audit::last_oom_ms(),
         backend: backend_name.clone(),
         gpu_count: gpus.0,
         gpu_model: gpus.1.clone(),
@@ -719,6 +740,7 @@ async fn main() -> anyhow::Result<()> {
     // grace window is somehow exceeded.
     {
         let flush_cloud = cloud.clone();
+        let flush_node_name = args.name.clone();
         tokio::spawn(async move {
             let _ = &flush_cloud; // keep state alive for the flush
             let mut term =
@@ -746,6 +768,12 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!("shutdown signal → flushing platform state");
             persist::flush_blocking();
+            // Stamp the run marker as a GRACEFUL exit. Without this every
+            // deploy restart and every `systemctl restart` would be classified
+            // `unclean_exit` on the way back up, and a signal that fires on
+            // ordinary operations is a signal nobody reads — which is how the
+            // real OOM kills stayed invisible in the first place.
+            restart_audit::mark_clean_exit(&flush_node_name);
             // Same reason, different file: the geo cache's saver is debounced,
             // so a clean restart would otherwise drop whatever was learned
             // inside the last window and de-tailor those prefixes on the way
@@ -1252,6 +1280,20 @@ async fn main() -> anyhow::Result<()> {
     // request pays for it — and covers locks leaked by anything outside that
     // path (a crashed node, a manual podman run).
     spawn_container_lock_sweep();
+
+    // Memory watchdog. Every node (RSS is per-host, like the lock pool above).
+    // The fleet's OOM kills are episodic bursts that idle-state profiling never
+    // catches, so this arms jemalloc sampling and dumps a profile DURING the
+    // burst, and logs the allocator/RSS/bound gauges every tick above the arm
+    // threshold — the record that survives the kill. See `memwatch`.
+    memwatch::spawn(cloud.hive.clone());
+
+    // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
+    // against (a SIGKILLed process cannot write it on the way out, which is
+    // exactly why the kill was invisible), and re-states an OOM-cycling
+    // verdict periodically so it is loud in a log tail taken at any moment —
+    // not only in the seconds right after the restart. See restart_audit.rs.
+    restart_audit::spawn(args.name.clone());
 
     // Reap browser-function artifacts no live deployment references anymore.
     // Every node (the store is per-host), guarded against empty/mostly-orphaned
@@ -2310,6 +2352,16 @@ fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>) {
                 crate::supervise::beat("disk-refresh");
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
                 registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
+                // Same tick, same reason as the disk figure: the restart
+                // audit's 24h window SLIDES, so a boot-time-only value goes
+                // stale in the direction that matters (a node keeps
+                // advertising an OOM it had 25h ago, or — worse — advertises
+                // none while cycling).
+                registry.set_self_restart_audit(
+                    crate::restart_audit::started_ms(),
+                    crate::restart_audit::oom_restarts_24h(),
+                    crate::restart_audit::last_oom_ms(),
+                );
             }
         }
     });
@@ -2830,6 +2882,10 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             }
             if let Some(pid) = peer_self_id {
                 cloud.registry.set_health(&pid, rtt, true);
+                // A successful exchange retires the local routing penalty
+                // immediately — a recovered trunk must not serve out a cold
+                // window it no longer deserves.
+                crate::health::clear_cold(&pid);
                 // `node_admins` MUST hold only real HTTP(S) admin URLs — the
                 // deploy dispatcher (see git.rs / schedule.rs) treats any entry
                 // here as "reachable via HTTP" and does `http.post(format!(
@@ -2875,7 +2931,14 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())).then(|| k.to_string())
             });
         if let Some(id) = id.filter(|s| !s.is_empty()) {
-            cloud.registry.set_health(&id, 0, false);
+            // ONE failed gossip fetch used to withdraw the peer outright here —
+            // no threshold, no counter-evidence, on every node, every round.
+            // On the leader that is a fleet-wide removal from DNS and
+            // placement caused by a single transient fetch. The chokepoint
+            // keeps a peer that is still announcing TO us (the fetch direction
+            // and the announce direction are different paths and fail
+            // independently) and marks it locally cold instead. See health.rs.
+            crate::health::demote(&cloud.registry, &id, "gossip round: fetch failed", None);
         }
     }
     if let Some(bytes) =
@@ -3944,26 +4007,6 @@ fn spawn_memory_pressure_alarm() {
     });
 }
 
-/// How fresh a peer's gossiped `last_seen_ms` must be to count as independent
-/// proof of liveness in the health loop below.
-///
-/// Sized against MEASURED behaviour, not the nominal announce cadence. Gossip
-/// announces every 3-4s, but on the live fleet delivery is itself lossy: peers
-/// that were provably up (answering HTTP on their public IP) showed last_seen
-/// ages of 11-24s. A tighter bound (12s was tried first) therefore fails to
-/// protect exactly the nodes this guard exists for, which is how a majority of
-/// the fleet stayed grey after the first attempt.
-///
-/// 25s sits just under `NodeRegistry::nodes()`'s own 30s staleness drop, which
-/// is the mechanism that ACTUALLY removes a dead node from service — a silent
-/// node disappears from the registry entirely and stops being served regardless
-/// of this flag. So the practical rule becomes: still gossiping ⇒ still served;
-/// gone quiet ⇒ aged out. The probe's verdict is retained for the narrow 25-30s
-/// band and, more importantly, for its real purpose — diagnosing mesh
-/// reachability — rather than silently withdrawing live nodes from client DNS,
-/// which clients reach directly by public IP and never through the mesh.
-const GOSSIP_ALIVE_MS: u64 = 25_000;
-
 fn spawn_health_loop(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
     let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));
@@ -4030,7 +4073,10 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 let (next, write) = health_decision(prev, rtt.is_some(), threshold);
                 misses.insert(name.clone(), next);
                 match write {
-                    Some(true) => cloud.registry.set_health(&name, rtt.unwrap_or(0), true),
+                    Some(true) => {
+                        cloud.registry.set_health(&name, rtt.unwrap_or(0), true);
+                        crate::health::clear_cold(&name);
+                    }
                     Some(false) => {
                         // A WEDGED LOCAL PROBER MUST NEVER WITHDRAW A LIVE NODE.
                         // Gossip announces every 3-4s and `upsert_peer` refreshes
@@ -4054,26 +4100,20 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                         // service on its own: `NodeRegistry::nodes()` drops any peer
                         // stale >30s, which is the real safety net. This only
                         // declines the redundant, unsafe half of that.
-                        let alive_by_gossip = last_seen
-                            .get(&name)
-                            .is_some_and(|ms| now_ms().saturating_sub(*ms) < GOSSIP_ALIVE_MS);
-                        if alive_by_gossip {
-                            tracing::warn!(
-                                node = %name,
-                                misses = next,
-                                "mesh probe failing but peer is still gossiping — keeping it healthy \
-                                 (a local probe fault must not withdraw a live node from DNS/placement)"
-                            );
-                        } else {
-                            // WARN, not debug: at RUST_LOG=info the old debug line
-                            // meant the fleet could shrink with no log evidence at all.
-                            tracing::warn!(
-                                node = %name,
-                                misses = next,
-                                "peer marked unhealthy (probe failed AND gossip stale)"
-                            );
-                            cloud.registry.set_health(&name, 0, false);
-                        }
+                        //
+                        // The guard now lives in `health::demote` — ONE writer
+                        // for every withdrawal on this node, because it was
+                        // implemented here and nowhere else while five other
+                        // call sites withdrew peers with no guard at all.
+                        // `last_seen` is still passed from the SAME snapshot the
+                        // probe set was built from, so the liveness check can
+                        // never disagree with the set actually probed this round.
+                        crate::health::demote(
+                            &cloud.registry,
+                            &name,
+                            &format!("mesh probe failed ({next} consecutive)"),
+                            last_seen.get(&name).copied(),
+                        );
                     }
                     None => {}
                 }

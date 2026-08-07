@@ -54,7 +54,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
         .route("/v1/mesh/discovery", get(mesh_discovery))
+        .route("/v1/node/restarts", get(node_restarts))
+        .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
+        .route("/v1/debug/memory", get(memory_stats))
         .route("/v1/waf", get(waf_get))
         .route("/v1/waf/rules", post(waf_add_rule))
         .route("/v1/waf/rules/:id", delete(waf_del_rule))
@@ -5158,6 +5161,85 @@ async fn inference_endpoints(
         "local_servers": c.inference.statuses(),
         "node": c.node_name,
     })))
+}
+
+/// Live memory accounting (operator). The measurement that was MISSING during
+/// the 2026-08 fc-hongkong OOM hunt: the heap profile said live sampled heap was
+/// ~80 MB while RSS was ~1.09 GB, and there was no way to read jemalloc's own
+/// `stats.allocated/active/resident/retained` to tell a leak from dirty-page
+/// fragmentation — `stats_print:true` only writes at exit, and the process is
+/// SIGKILLed, so the atexit hook never runs.
+///
+/// Unlike `/v1/debug/heap` this is CHEAP (no sampling, no dump) and safe to
+/// poll, so it is also the right thing for a monitor to scrape. It reports, on
+/// one document: the OS view (RSS, thread count), the allocator view, and every
+/// tenant-driven growth bound this node enforces as a live gauge — a bound
+/// nobody can read is indistinguishable from no bound at all.
+///
+/// NODE-LOCAL, like `/v1/dns/stats`: `/proc/self` and this process's own
+/// allocator. Through the dashboard's `/ops/*` proxy you are reading the
+/// LEADER's memory, not the page-serving node's.
+async fn memory_stats(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let mut v = crate::memwatch::snapshot(Some(&c.hive));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("node".into(), json!(c.node_name));
+        obj.insert("region".into(), json!(c.region));
+    }
+    Ok(Json(v))
+}
+
+/// Restart audit (operator): did this node die, when, and why.
+///
+/// The question that had no answer. A cgroup OOM kill is SIGKILL — the dying
+/// process cannot log it — and systemd has the node back in under a second, so
+/// the platform's own view showed only "a node that is up". A node cycling
+/// every 2-3h was investigated for a whole session as "random unhealthy nodes",
+/// because every symptom (probe failures, dropped trunks, placement gaps) was
+/// visible and the cause was not.
+///
+/// Returns this boot's verdict with the EVIDENCE it was reached from (kernel
+/// line, cgroup counter, boot id, last-heartbeat RSS against the memory
+/// ceiling), the bounded restart history with each previous process's uptime —
+/// the list that makes a 2-3h cycle self-evident rather than an inference —
+/// and the live 24h counters.
+///
+/// NODE-LOCAL, like `/v1/dns/stats`: the marker file, the history file and
+/// `/proc` all belong to the node answering. Through the dashboard's `/ops/*`
+/// proxy you are reading the LEADER's restarts; the fleet view is the gossiped
+/// `NodeInfo::started_ms` / `oom_restarts_24h` / `last_oom_ms` on `/v1/nodes`.
+async fn node_restarts(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(crate::restart_audit::snapshot(&c.node_name)))
+}
+
+/// Health-demotion guard (operator): how often THIS observer withdrew a peer
+/// from DNS/placement, how often it declined to because the peer was still
+/// gossiping, and which peers are currently in a local routing penalty.
+///
+/// `refused_gossip_alive` is the number to read during an incident: a large
+/// value means this node's transports are failing against peers that are
+/// demonstrably alive, i.e. the fault is local — and before the guard existed
+/// every one of those would have been a fleet-visible withdrawal (see
+/// health.rs). NODE-LOCAL, like `/v1/dns/stats`: a health verdict is
+/// per-observer, so this is deliberately one observer's counters.
+async fn mesh_health_guard(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let mut v = crate::health::stats();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("node".into(), json!(c.node_name));
+        obj.insert("region".into(), json!(c.region));
+    }
+    Ok(Json(v))
 }
 
 /// Live heap profile (operator). Answers "which allocation site is growing?"

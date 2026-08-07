@@ -51,6 +51,22 @@
     - Cargo.toml
     - Cargo.lock
 
+# The no-op detector's input on the build host: what this host had BEFORE
+# cargo ran. Cargo does not rewrite an up-to-date binary, so source that did
+# not change yields the SAME sha here and in the canonical artifact -- which is
+# exactly how playbooks/parallel-deploy.yml's verification pass tells "deployed
+# new code" from "deployed nothing and reported ok=".
+- name: Record the binary this host had BEFORE the build
+  ansible.builtin.stat:
+    path: "{{ hive_binary_path }}"
+    get_checksum: true
+    checksum_algorithm: sha256
+  register: _pre_build
+
+- name: Publish the pre-build sha for verification
+  ansible.builtin.set_fact:
+    hive_pre_deploy_sha: "{{ _pre_build.stat.checksum | default('') }}"
+
 - name: Build hive-cloud (release) on the group's build host
   ansible.builtin.command:
     cmd: cargo build --release -p hive-cloud

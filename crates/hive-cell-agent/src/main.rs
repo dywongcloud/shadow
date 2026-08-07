@@ -358,11 +358,19 @@ mod linux {
         write_lock: std::sync::Arc<std::sync::Mutex<()>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let reader = BufReader::new(pipe);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
+            // BOUNDED capture — see `hive_core::logcap`. `lines()` retains an
+            // unbounded String when the child writes without newlines, and the
+            // resulting frame is then serialized and pushed to the HOST, so an
+            // unbounded line here is an unbounded allocation on both sides of
+            // the vsock. Cap it at the source.
+            let mut reader = BufReader::new(pipe);
+            loop {
+                let l = match hive_core::logcap::read_capped_line_blocking(
+                    &mut reader,
+                    hive_core::MAX_LOG_LINE_BYTES,
+                ) {
+                    Ok(Some(l)) => l,
+                    _ => break,
                 };
                 let _guard = write_lock.lock().unwrap();
                 if send(
@@ -370,7 +378,7 @@ mod linux {
                     &AgentEvent::ExecOutput {
                         id: id.clone(),
                         stream: which,
-                        line,
+                        line: l.text,
                     },
                 )
                 .is_err()
@@ -666,15 +674,18 @@ mod linux {
 
         let mut child = cmd.spawn()?;
         if let Some(out) = child.stdout.take() {
-            let reader = BufReader::new(out);
-            for line in reader.lines() {
-                let line = line.unwrap_or_default();
+            // BOUNDED capture — see `hive_core::logcap`.
+            let mut reader = BufReader::new(out);
+            while let Ok(Some(l)) = hive_core::logcap::read_capped_line_blocking(
+                &mut reader,
+                hive_core::MAX_LOG_LINE_BYTES,
+            ) {
                 send(
                     stream,
                     &AgentEvent::Log(LogLine {
                         ts_ms: now_ms(),
                         stream: LogStream::Stdout,
-                        line,
+                        line: l.text,
                     }),
                 )?;
             }

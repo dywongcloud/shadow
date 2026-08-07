@@ -1,0 +1,106 @@
+---
+# CONTENT verification for the UI half -- same contract as
+# hive_platform_fanout/tasks/verify.yml: prove every host serves the bundle
+# this run BUILT, never trust a task's exit code.
+#
+# The UI has its own version of the non-event, and it was already half-written:
+# restart.yml's build-id check reads
+#
+#   failed_when: hostvars[...].hive_canon_build_id is defined and <mismatch>
+#
+# which PASSES whenever the canonical build id is undefined -- i.e. exactly
+# when the UI build play never ran (`--limit` without the ui_builder, `--tags`
+# without the build, a build that failed earlier in a `strategy: free` play).
+# A check that turns itself off in the failure case it exists to catch is worse
+# than no check, because it reports green. Here the missing fact is the FIRST
+# hard failure.
+#
+# Next/Turbopack builds are not deterministic (that is why this role builds
+# once and fans the artifact out), so unlike the backend binary the BUILD_ID is
+# not a useful "did anything change" signal -- only a "is everyone on the same
+# one" signal. The no-op detector therefore lives on the backend half, and this
+# file's job is uniformity plus proof the running server loaded it.
+
+- name: Require a canonical UI build from this run
+  ansible.builtin.assert:
+    that:
+      - hostvars[hive_ui_build_host].hive_canon_build_id is defined
+      - (hostvars[hive_ui_build_host].hive_canon_build_id | default('') | length) > 0
+      - hostvars[hive_ui_build_host].hive_canon_wf_md5 is defined
+    fail_msg: >-
+      NO UI BUNDLE WAS BUILT in this run (build host
+      '{{ hive_ui_build_host }}' published no BUILD_ID), so '{{ hive_name }}'
+      cannot have been deployed -- whatever the task recap says. Re-run with the
+      UI build host included.
+    success_msg: "canonical UI build present ({{ hostvars[hive_ui_build_host].hive_canon_build_id }})"
+
+- name: Read this host's served BUILD_ID and wf-console fingerprint
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      cd "{{ hive_src_dir }}/ui"
+      bid="$(cat .next/BUILD_ID)"
+      wf="$(md5sum node_modules/@workflow/web/build/server/assets/server-build-*.js | md5sum | cut -d' ' -f1)"
+      pid="$(systemctl show -p MainPID --value hive-ui)"
+      if [ -z "$pid" ] || [ "$pid" = "0" ]; then
+        echo "ERR hive-ui has no MainPID (not running)" >&2
+        exit 3
+      fi
+      ts="$(systemctl show -p ExecMainStartTimestamp --value hive-ui)"
+      if [ -z "$ts" ]; then
+        echo "ERR hive-ui reports no ExecMainStartTimestamp" >&2
+        exit 4
+      fi
+      printf '%s %s %s\n' "$bid" "$wf" "$(date -d "$ts" +%s)"
+    executable: /bin/bash
+  register: _verify_ui
+  changed_when: false
+
+- name: Record this host's UI verification facts
+  ansible.builtin.set_fact:
+    hive_verify_ui:
+      host: "{{ hive_name }}"
+      inventory_host: "{{ inventory_hostname }}"
+      canonical_build_id: "{{ hostvars[hive_ui_build_host].hive_canon_build_id }}"
+      build_id: "{{ _verify_ui.stdout.split()[0] }}"
+      canonical_wf_md5: "{{ hostvars[hive_ui_build_host].hive_canon_wf_md5 }}"
+      wf_md5: "{{ _verify_ui.stdout.split()[1] }}"
+      started_epoch: "{{ _verify_ui.stdout.split()[2] | int }}"
+
+- name: Assert this host serves the canonical bundle
+  ansible.builtin.assert:
+    that:
+      - hive_verify_ui.build_id == hive_verify_ui.canonical_build_id
+      - hive_verify_ui.wf_md5 == hive_verify_ui.canonical_wf_md5
+    fail_msg: >-
+      {{ hive_name }}: UI content differs from the canonical build.
+      BUILD_ID={{ hive_verify_ui.build_id }} (canonical
+      {{ hive_verify_ui.canonical_build_id }}),
+      wf-console md5={{ hive_verify_ui.wf_md5 }} (canonical
+      {{ hive_verify_ui.canonical_wf_md5 }}). Round-robin DNS across hosts with
+      different chunk sets is the "mobile endless flicker" incident.
+    success_msg: "{{ hive_name }}: .next + wf-console == canonical build"
+
+# The swap happens before the restart in restart.yml, so a start timestamp
+# after this run began is what proves the RUNNING server loaded the new .next
+# rather than still serving the pre-swap one out of memory.
+- name: Assert hive-ui actually restarted during this run
+  ansible.builtin.assert:
+    that:
+      - (hive_verify_ui.started_epoch | int) >= (hive_deploy_epoch | int)
+    fail_msg: >-
+      {{ hive_name }}: hive-ui has been running since
+      {{ hive_verify_ui.started_epoch }} but this deploy started at
+      {{ hive_deploy_epoch }} -- the process predates the deploy, so it is
+      still serving the bundle it started with.
+    success_msg: "{{ hive_name }}: hive-ui restarted during this run"
+
+- name: Confirm the UI answers on loopback :3002
+  ansible.builtin.uri:
+    url: "http://127.0.0.1:3002/"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _verify_ui_http
+  retries: 6
+  delay: 5
+  until: _verify_ui_http.status in [200, 307, 308]

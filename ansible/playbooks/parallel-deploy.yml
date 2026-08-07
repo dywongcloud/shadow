@@ -49,6 +49,18 @@
 #   ansible-playbook playbooks/parallel-deploy.yml --tags backend       # backend only
 #   ansible-playbook playbooks/parallel-deploy.yml --tags ui            # ui only
 #   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset -- MUST also include each represented glibc group's BUILD host
+#   ansible-playbook playbooks/parallel-deploy.yml -e allow_noop_deploy=true   # permit a run that changes no host's binary content
+#
+# VERIFICATION (the reason a deploy here cannot silently do nothing). After the
+# restart plays, two verification plays compare CONTENT, not task exit codes:
+# every host's on-disk binary AND the image its running process is actually
+# executing (`/proc/<MainPID>/exe`) must equal the sha256 of the artifact built
+# in THIS run, and each unit's start timestamp must be after this run began.
+# A missing canonical fact -- which is what "the build never ran" looks like --
+# is a hard failure, never a skipped comparison. Finally, a run in which NO
+# host's binary content changed is refused outright (`allow_noop_deploy` opts
+# out), because the failure mode this playbook has actually produced three
+# times is a deploy-shaped NON-EVENT with a recap that reads fine.
 #
 #   A --limit that excludes the build host cannot work: the build play targets
 #   glibc239_builder:glibc238_builder (elected as groups['glibc239'][0] /
@@ -131,6 +143,21 @@
       ansible.builtin.set_fact:
         hive_artifact_root: "{{ _artifact_tmp.path }}"
 
+    # Verification baseline: the moment this run began, read from EACH HOST'S
+    # OWN clock rather than the control host's. The later "did the service
+    # actually restart?" assert compares this against systemd's
+    # ExecMainStartTimestamp on the same host, and control-host clock skew
+    # would otherwise make that comparison lie in whichever direction the skew
+    # happens to point.
+    - name: Stamp this run's start time on every host
+      ansible.builtin.command: date +%s
+      changed_when: false
+      register: _deploy_epoch
+
+    - name: Publish the deploy epoch
+      ansible.builtin.set_fact:
+        hive_deploy_epoch: "{{ _deploy_epoch.stdout | int }}"
+
 - name: Backend build (parallel, one host per glibc group)
   hosts: glibc239_builder:glibc238_builder
   become: true
@@ -176,6 +203,76 @@
         name: hive_platform_fanout
         tasks_from: restart
 
+# The check that makes a deploy which changed NOTHING impossible to mistake for
+# success. Every task above can succeed while the fleet still runs the previous
+# binary -- that has happened three separate ways in this playbook's own history
+# (an undefined hostvars fact, the same defect in the cleanup play, and a
+# --limit that silently dropped the build host), each time with a recap that
+# read partially fine and a node whose binary was provably unchanged. So this
+# play ignores exit codes entirely and compares CONTENT: the sha256 of the
+# artifact built in THIS run against what is on disk and, separately, against
+# the image the running process is actually executing.
+#
+# any_errors_fatal: a single unverified host means the fleet is heterogeneous;
+# that is a failed deploy, not a footnote in the recap.
+- name: Backend verification (artifact CONTENT, every host)
+  hosts: platform
+  become: true
+  any_errors_fatal: true
+  tags: [backend]
+  vars:
+    hive_glibc_group: "{{ 'glibc239' if inventory_hostname in groups['glibc239'] else 'glibc238' }}"
+    hive_group_build_host: "{{ groups['glibc239'][0] if hive_glibc_group == 'glibc239' else groups['glibc238'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_platform_fanout
+        tasks_from: verify
+
+    - name: Fleet backend verification summary
+      vars:
+        _v: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_backend') | select('defined') | list }}"
+        _changed: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_backend') | select('defined')
+                      | selectattr('content_changed', 'equalto', 'yes') | list }}"
+      ansible.builtin.debug:
+        msg:
+          - "BACKEND VERIFIED: {{ _v | length }}/{{ ansible_play_hosts | length }} hosts are RUNNING the artifact built in this run"
+          - "content changed on {{ _changed | length }} host(s): {{ _changed | map(attribute='host') | join(', ') if _changed else '(none)' }}"
+          - "artifacts: {{ _v | map(attribute='canonical_sha') | unique | map('truncate', 12, true, '') | join(', ') }}"
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    # A run in which no host's binary content changed deployed nothing. That is
+    # sometimes legitimate (re-running after a mid-deploy failure, source truly
+    # unchanged) and is never something to discover later from a recap, so it
+    # is a hard stop with an explicit opt-out rather than a line of output.
+    - name: Refuse a deploy that changed nothing (no-op detector)
+      vars:
+        _v: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_backend') | select('defined') | list }}"
+        _changed: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_backend') | select('defined')
+                      | selectattr('content_changed', 'equalto', 'yes') | list }}"
+      ansible.builtin.assert:
+        that:
+          - (_v | length) == (ansible_play_hosts | length)
+          - (_changed | length) > 0 or (allow_noop_deploy | default(false) | bool)
+        fail_msg: >-
+          {% if (_v | length) != (ansible_play_hosts | length) %}
+          Only {{ _v | length }} of {{ ansible_play_hosts | length }} hosts produced
+          verification facts -- the rest were never verified, so this run's result is unknown.
+          {% else %}
+          NO-OP DEPLOY: every host already had the exact binary this run built
+          ({{ _v[0].canonical_sha[:12] }}), so nothing was deployed. Either the source
+          never changed, or the build host rebuilt nothing (check that your --limit
+          includes the right builder and that crates/ actually synced). Re-run with
+          -e allow_noop_deploy=true if a no-op was the intent.
+          {% endif %}
+        success_msg: >-
+          {{ _changed | length }}/{{ ansible_play_hosts | length }} hosts took new backend content;
+          all {{ _v | length }} verified against the artifact built this run.
+      run_once: true
+      delegate_to: localhost
+      become: false
+
 - name: UI build (once, on the control-plane leader)
   hosts: ui_builder
   become: true
@@ -219,6 +316,46 @@
     - ansible.builtin.include_role:
         name: hive_ui_fanout
         tasks_from: restart
+
+- name: UI verification (bundle CONTENT, every host)
+  hosts: platform
+  become: true
+  any_errors_fatal: true
+  tags: [ui]
+  vars:
+    hive_ui_build_host: "{{ groups['ui_builder'][0] }}"
+  tasks:
+    - ansible.builtin.include_role:
+        name: hive_ui_fanout
+        tasks_from: verify
+
+    - name: Fleet UI verification summary
+      vars:
+        _v: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_ui') | select('defined') | list }}"
+      ansible.builtin.debug:
+        msg: >-
+          UI VERIFIED: {{ _v | length }}/{{ ansible_play_hosts | length }} hosts serving
+          BUILD_ID {{ _v | map(attribute='build_id') | unique | join(', ') }}
+          (canonical {{ _v[0].canonical_build_id | default('?') }})
+      run_once: true
+      delegate_to: localhost
+      become: false
+
+    - name: Assert every host was UI-verified
+      vars:
+        _v: "{{ ansible_play_hosts | map('extract', hostvars, 'hive_verify_ui') | select('defined') | list }}"
+      ansible.builtin.assert:
+        that:
+          - (_v | length) == (ansible_play_hosts | length)
+          - (_v | map(attribute='build_id') | unique | list | length) == 1
+        fail_msg: >-
+          UI deploy unverified: {{ _v | length }}/{{ ansible_play_hosts | length }} hosts
+          reported, build ids {{ _v | map(attribute='build_id') | unique | join(', ') }}.
+          More than one BUILD_ID behind one round-robin hostname is the "mobile endless
+          flicker" incident.
+      run_once: true
+      delegate_to: localhost
+      become: false
 
 - name: Clean up the control host's scratch artifact directory
   hosts: localhost

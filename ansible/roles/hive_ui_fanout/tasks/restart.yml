@@ -132,6 +132,11 @@
   delay: 5
   until: _ui.status in [200, 307, 308]
 
+# `... is defined and <mismatch>` PASSED whenever the canonical build id was
+# absent -- i.e. precisely when the UI build play never ran and the deploy did
+# not happen. A check that disables itself in its own failure case reports
+# green on the non-event it exists to catch, so the missing fact is now the
+# first hard failure.
 - name: Confirm this host's BUILD_ID matches the canonical build
   ansible.builtin.command:
     cmd: cat .next/BUILD_ID
@@ -139,5 +144,6 @@
   register: _got_build_id
   changed_when: false
   failed_when: >-
-    hostvars[hive_ui_build_host].hive_canon_build_id is defined and
+    hostvars[hive_ui_build_host].hive_canon_build_id is not defined or
+    (hostvars[hive_ui_build_host].hive_canon_build_id | length) == 0 or
     _got_build_id.stdout != hostvars[hive_ui_build_host].hive_canon_build_id

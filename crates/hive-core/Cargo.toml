@@ -9,3 +9,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
+# OPTIONAL and off by default: `logcap`'s async reader is generic over the
+# `tokio::io::AsyncBufRead` TRAIT only — no runtime, no executor, nothing that
+# contradicts this crate's "no async/runtime dependencies" rule for the
+# consumers that don't ask for it (`hive-cell-agent` drains its pipes on plain
+# OS threads and stays tokio-free here).
+tokio = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enabled by the crates that capture subprocess output on a tokio runtime
+# (`hive-backend`, `hive-cloud`).
+async-io = ["dep:tokio"]

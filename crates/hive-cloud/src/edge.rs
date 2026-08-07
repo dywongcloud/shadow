@@ -836,8 +836,17 @@ async fn edge_pipeline_inner(
                                     // order_candidates stops ranking it — otherwise every
                                     // request re-pays the connect budget against a dead node.
                                     if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-                                        cloud.registry.set_health(&cand.node_id, u64::MAX, false);
-                                        tracing::warn!(node = %cand.node_id, "p2p peer marked unhealthy after connect/open timeout");
+                                        // Guarded chokepoint (health.rs): a peer that
+                                        // is still gossiping keeps its fleet-visible
+                                        // health and is only deprioritized locally —
+                                        // one request hitting a stale trunk must not
+                                        // pull a live node out of DNS/placement.
+                                        crate::health::demote(
+                                            &cloud.registry,
+                                            &cand.node_id,
+                                            "p2p forward: connect/open timeout",
+                                            None,
+                                        );
                                     }
                                     /* iroh failed → the other transport gets the next pass */
                                 }
@@ -2014,9 +2023,19 @@ fn order_candidates(
     serving_region: &str,
 ) -> Vec<crate::state::PeerRoute> {
     let regions: Vec<&String> = fs.regions.iter().filter(|r| !r.is_empty()).collect();
+    // A peer whose trunk just timed out sorts LAST within its tier, but is
+    // never removed. This is what the four data-plane call sites actually
+    // wanted when they marked a peer unhealthy on one `DeadPeerTimeout` — stop
+    // re-paying the connect budget against a stale trunk — expressed as a
+    // node-local, time-boxed preference instead of a fleet-visible verdict that
+    // also pulled the node out of DNS and placement (see health.rs). Never a
+    // filter: deprioritizing the only candidate would 404 the deployment, which
+    // is strictly worse than paying one connect budget.
+    let cold = |r: &crate::state::PeerRoute| u8::from(crate::health::is_cold(&r.node_id));
     if regions.is_empty() {
         raw.sort_by_key(|r| {
             (
+                cold(r),
                 if r.region == serving_region { 0u8 } else { 1u8 },
                 r.latency_ms,
             )
@@ -2030,11 +2049,11 @@ fn order_candidates(
     };
     if fs.failover {
         raw.retain(|r| rank(r).is_some());
-        raw.sort_by_key(|r| (rank(r).unwrap_or(usize::MAX) as u16, r.latency_ms));
+        raw.sort_by_key(|r| (cold(r), rank(r).unwrap_or(usize::MAX) as u16, r.latency_ms));
     } else {
         let primary = regions[0].clone();
         raw.retain(|r| r.region.eq_ignore_ascii_case(&primary));
-        raw.sort_by_key(|r| r.latency_ms);
+        raw.sort_by_key(|r| (cold(r), r.latency_ms));
     }
     balance_same_region(raw)
 }
@@ -2103,10 +2122,12 @@ async fn ws_proxy(
     fwd_headers: &[(String, String)],
 ) -> Result<Response, ()> {
     let mut raw = pool.open_raw(node_id, addr_json).await.map_err(|e| {
-        // Pre-send (connect/open) timeout on the raw trunk → mark the peer dead
-        // (#H4) so candidate ranking drops it instead of re-paying the budget.
+        // Pre-send (connect/open) timeout on the raw trunk → stop re-paying the
+        // budget against it. Via the guarded chokepoint (health.rs), which marks
+        // the peer locally cold and only withdraws it fleet-wide when gossip
+        // agrees it is gone.
         if e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some() {
-            registry.set_health(node_id, u64::MAX, false);
+            crate::health::demote(registry, node_id, "ws_proxy: connect/open timeout", None);
         }
     })?;
     // Replay the upgrade request to the owner so its target does the WS handshake.

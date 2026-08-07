@@ -61,6 +61,21 @@ pub struct Build {
 /// navigate to covered with its build logs.
 const SNAPSHOT_BUILD_CAP: usize = 200;
 
+/// Cap on how many builds are retained IN MEMORY. The snapshot was already
+/// bounded; the live map was not, so a node that builds continuously kept every
+/// build it had ever run — with its log lines — until it restarted. Set above
+/// `SNAPSHOT_BUILD_CAP` so nothing that would have been persisted is dropped
+/// from memory first (a build visible after a restart but not before would be
+/// an absurd failure mode).
+const MEMORY_BUILD_CAP: usize = 400;
+
+/// Cap on the bytes retained for ONE log line. The build-output reader already
+/// caps what it takes off the pipe (`hive_core::logcap`), but `log()` is also
+/// called with internally-formatted messages (command echoes, error text that
+/// embeds subprocess output) — a byte bound belongs at the store boundary too,
+/// so no future caller can reintroduce an unbounded line.
+const MAX_BUILD_LOG_LINE_BYTES: usize = 16 * 1024;
+
 #[derive(Default)]
 pub struct BuildStore {
     map: Mutex<HashMap<String, Build>>,
@@ -109,13 +124,52 @@ impl BuildStore {
         }
     }
     fn insert(&self, b: Build) {
-        self.map.lock().insert(b.id.clone(), b);
+        let mut m = self.map.lock();
+        m.insert(b.id.clone(), b);
+        // Bound the live map, not just the persisted snapshot. Evict the oldest
+        // FINISHED builds only — an in-flight build must never lose its record
+        // out from under `log()`/`update()`, which would silently stop
+        // collecting its output.
+        if m.len() > MEMORY_BUILD_CAP {
+            let mut finished: Vec<(u64, String)> = m
+                .values()
+                .filter(|b| b.finished_ms.is_some())
+                .map(|b| (b.started_ms, b.id.clone()))
+                .collect();
+            let over = m.len() - MEMORY_BUILD_CAP;
+            if !finished.is_empty() {
+                finished.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                let mut freed_lines = 0usize;
+                for (_, id) in finished.into_iter().take(over) {
+                    if let Some(old) = m.remove(&id) {
+                        freed_lines += old.lines.len();
+                    }
+                }
+                tracing::debug!(
+                    retained = m.len(),
+                    cap = MEMORY_BUILD_CAP,
+                    freed_lines,
+                    "build store evicted oldest finished builds"
+                );
+            }
+        }
     }
     fn log(&self, id: &str, line: impl Into<String>) {
         if let Some(b) = self.map.lock().get_mut(id) {
+            let mut line: String = line.into();
+            if line.len() > MAX_BUILD_LOG_LINE_BYTES {
+                let dropped = line.len() - MAX_BUILD_LOG_LINE_BYTES;
+                // Cut on a char boundary — `truncate` panics mid-codepoint.
+                let mut cut = MAX_BUILD_LOG_LINE_BYTES;
+                while cut > 0 && !line.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                line.truncate(cut);
+                line.push_str(&format!("…[hive: {dropped} bytes dropped]"));
+            }
             b.lines.push(LogLine {
                 ts_ms: now_ms(),
-                line: line.into(),
+                line,
             });
             // Cap per-build log retention: a chatty build could otherwise grow
             // an unbounded Vec<LogLine> that is then cloned into EVERY 120s
@@ -4499,7 +4553,7 @@ async fn run_streamed(
     env: &std::collections::BTreeMap<String, String>,
 ) -> anyhow::Result<()> {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::BufReader;
 
     // Put the project's local CLIs (node_modules/.bin) first, then a STABLE Node
     // 20–24, then system paths. This ensures `node`/`npm` are a supported version
@@ -4559,23 +4613,39 @@ async fn run_streamed(
     // `redact_secrets`) — same utility, same "redact every value, not just
     // ones flagged sensitive" conservative default.
     let secret_values: Vec<String> = env.values().filter(|v| !v.is_empty()).cloned().collect();
+    // BOUNDED capture. `BufReader::lines()`/`next_line()` splits only on `\n`
+    // and has no length limit, so a build that writes without newlines — a
+    // `\r`-only progress bar (npm/pnpm/pip/curl/`podman pull`), a single-line
+    // source map, a binary accidentally sent to stdout — grew ONE String until
+    // the node died, taking every other tenant on it. Worse here than at the
+    // other capture sites: each line is then `redact_secrets`'d (a second full
+    // copy) and `format!`'d (a third), so an N-byte line cost ~3N. The build
+    // command is tenant-supplied, which makes an unbounded read a
+    // multi-tenant availability hole, not just a leak.
+    //
+    // `read_capped_line` still DRAINS the pipe (the child must never block on
+    // us) but retains at most MAX_LOG_LINE_BYTES, and reports what it dropped.
     let (c1, b1, s1) = (cloud.clone(), bid.to_string(), secret_values.clone());
     let t1 = tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
+        let mut r = BufReader::new(stdout);
+        while let Ok(Some(l)) =
+            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
+        {
             c1.builds.log(
                 &b1,
-                format!("  {}", crate::sandboxes::redact_secrets(&l, &s1)),
+                format!("  {}", crate::sandboxes::redact_secrets(&l.text, &s1)),
             );
         }
     });
     let (c2, b2, s2) = (cloud.clone(), bid.to_string(), secret_values);
     let t2 = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
+        let mut r = BufReader::new(stderr);
+        while let Ok(Some(l)) =
+            hive_core::logcap::read_capped_line(&mut r, hive_core::MAX_LOG_LINE_BYTES).await
+        {
             c2.builds.log(
                 &b2,
-                format!("  {}", crate::sandboxes::redact_secrets(&l, &s2)),
+                format!("  {}", crate::sandboxes::redact_secrets(&l.text, &s2)),
             );
         }
     });
