@@ -106,7 +106,22 @@ hive_extra_peers: []
 hive_container_runtime: "runc"   # bkk/fc_kvm default; fc_pvm hosts typically set runsc (gVisor) in group_vars/fc_pvm.yml
 
 # ---------- Owner ----------
-hive_owner_email: "ops@{{ hive_platform_domain }}"
+# Comma-separated; parsed by ui/app/api/token/route.ts's OWNER_EMAILS
+# (lowercased, split on ",", trimmed). EVERY owner address must live HERE.
+#
+# `HIVE_OWNER_EMAIL` decides `isOwner`, and `isOwner` decides whether the mint
+# assigns the legacy "personal" tenant or isolates the account under
+# `u_<uid>`. An address missing from this list therefore gets a tenant that owns
+# nothing -- the dashboard loads, authenticates, and truthfully shows zero
+# projects.
+#
+# It is written ONLY from this variable: env.local.j2 renders the whole file, so
+# an address hand-added to a node's .env.local survives exactly until the next
+# `--tags ui` run silently resets it to this default. That is not hypothetical --
+# it happened on 2026-08-08 and took the owner's own projects offline on 3 of 4
+# nodes while a 4th (fr, not re-rendered) still worked, which is precisely the
+# kind of split that reads as "it works sometimes".
+hive_owner_email: "ops@{{ hive_platform_domain }},dylanwong007@gmail.com"
 # Platform admins beyond the owner (comma-separated). These emails mint
 # platform_admin JWTs (operator console + public browser-node capability) and
 # are locked to the enterprise plan. Override per-inventory in hosts.ini.
