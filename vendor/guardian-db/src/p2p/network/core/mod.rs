@@ -34,6 +34,48 @@ pub mod key_synchronizer;
 pub mod networking_metrics;
 pub mod ticket_exchange;
 
+/// Ceiling on any single blob this process will materialise in memory.
+///
+/// Deliberately generous: the largest legitimate object here is a platform
+/// snapshot, orders of magnitude under this. Anything past it is a corrupt
+/// length, a hostile/duplicated stream, or a bug — and the only alternatives to
+/// refusing are an OOM kill that takes every tenant on the node with it.
+/// Failing one read loudly is strictly better than losing the process.
+const DEFAULT_MAX_BLOB_BYTES: u64 = 512 * 1024 * 1024;
+
+fn max_blob_bytes() -> u64 {
+    std::env::var("HIVE_MAX_BLOB_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_BLOB_BYTES)
+}
+
+/// `read_to_end` with a hard ceiling.
+///
+/// Reads at most `max_blob_bytes() + 1` so the overflow is DETECTED rather than
+/// inferred, then refuses. Without the `take`, `read_to_end` grows a `Vec` for
+/// as long as the source keeps yielding — the source is a store reader or a
+/// peer, i.e. not something this process controls.
+async fn read_to_end_bounded<R: AsyncRead + Unpin>(
+    reader: R,
+    what: &str,
+) -> std::io::Result<Vec<u8>> {
+    let limit = max_blob_bytes();
+    let mut buf = Vec::new();
+    reader.take(limit.saturating_add(1)).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "{what} exceeds HIVE_MAX_BLOB_BYTES ({limit} bytes) — refusing to \
+                 materialise it in memory"
+            ),
+        ));
+    }
+    Ok(buf)
+}
+
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay
 /// URLs). Returns `None` when unset/empty, in which case the caller keeps
 /// n0's default relay behavior. Mirrors hive-p2p's identical
@@ -1214,15 +1256,34 @@ impl IrohBackend {
     // ╔════════════════════════════════════════════════════════════════════════════════╗
     // ║                              CONTENT OPERATIONS                                   ║
     // ╚════════════════════════════════════════════════════════════════════════════════╝
+    //
+    // MEMORY SAFETY FOR EVERY WHOLE-BLOB READ IN THIS SECTION.
+    //
+    // These were `let mut buffer = Vec::new(); reader.read_to_end(&mut buffer)` with
+    // no ceiling of any kind, which is an OOM with extra steps: the allocation is
+    // linear in whatever the store (or a peer) hands back, and `RawVec` doubles, so
+    // the process reaches for 2x the blob in one contiguous mapping on the way up.
+    //
+    // Witnessed in production, not theorised. fc-bangkok on 2026-08-07, 46 minutes
+    // after a clean restart, held 67.9 GB RSS in exactly TWO anonymous mappings of
+    // 32.2 GB and 30.1 GB. Two, because `cat` additionally did
+    // `Bytes::from(buffer_vec.clone())` to populate the cache — one full extra copy
+    // of a blob it already owned. That pair is the shape of the fleet's ~98 GB kills
+    // (three of them within 0.03% of each other: a process taking everything the
+    // host has, not a leak converging on a number).
+    //
+    // Both halves are fixed here: the read is bounded, and the copy is gone (the
+    // buffer is turned into `Bytes` ONCE and shared by refcount with the cache and
+    // the returned cursor).
 
-    pub async fn add(&self, mut data: Pin<Box<dyn AsyncRead + Send>>) -> Result<AddResponse> {
+
+    pub async fn add(&self, data: Pin<Box<dyn AsyncRead + Send>>) -> Result<AddResponse> {
         let start = Instant::now();
 
         debug!("Adding content via Iroh");
 
-        // Read the data into a buffer.
-        let mut buffer = Vec::new();
-        data.read_to_end(&mut buffer)
+        // Read the data into a buffer, BOUNDED — see `read_to_end_bounded`.
+        let buffer = read_to_end_bounded(data, "content being added")
             .await
             .map_err(|e| GuardianError::Other(format!("Error reading data: {}", e)))?;
 
@@ -1388,7 +1449,11 @@ impl IrohBackend {
                 .await;
 
             // Return the cached data as AsyncRead.
-            let cursor = std::io::Cursor::new(cached_data.to_vec());
+            // `cached_data` is already `Bytes`; `.to_vec()` copied the whole blob
+            // out of the cache on EVERY hit — the hot path, and the one place a
+            // copy is least justified. `Cursor<Bytes>` is an `AsyncRead`, so the
+            // reader shares the cached allocation by refcount instead.
+            let cursor = std::io::Cursor::new(cached_data);
             return Ok(Box::pin(cursor));
         }
 
@@ -1403,10 +1468,9 @@ impl IrohBackend {
                 let store_guard = self.store.read().await;
                 match store_guard.as_ref() {
                     Some(StoreType::Fs(store)) => {
-                        let mut reader = store.reader(hash);
-                        let mut buffer = Vec::new();
-                        match reader.read_to_end(&mut buffer).await {
-                            Ok(_) => Some(Bytes::from(buffer)),
+                        let reader = store.reader(hash);
+                        match read_to_end_bounded(reader, "blob read from the local store").await {
+                            Ok(buffer) => Some(Bytes::from(buffer)),
                             // Local miss. Do NOT fail yet — fall through to a P2P
                             // fetch below. This is the whole availability fix:
                             // previously `cat` was local-only, so a doc entry whose
@@ -1445,13 +1509,10 @@ impl IrohBackend {
                     let store_guard = self.store.read().await;
                     match store_guard.as_ref() {
                         Some(StoreType::Fs(store)) => {
-                            let mut reader = store.reader(hash);
-                            let mut buffer = Vec::new();
-                            reader
-                                .read_to_end(&mut buffer)
+                            let reader = store.reader(hash);
+                            read_to_end_bounded(reader, "blob fetched from peers")
                                 .await
-                                .map_err(Self::map_iroh_error)?;
-                            buffer
+                                .map_err(Self::map_iroh_error)?
                         }
                         None => {
                             return Err(GuardianError::Other(
@@ -1464,8 +1525,16 @@ impl IrohBackend {
         };
 
         // Add the retrieved data to the cache for future lookups.
-        let buffer_bytes = bytes::Bytes::from(buffer_vec.clone());
-        if let Err(e) = self.add_to_cache(hash_str, buffer_bytes).await {
+        //
+        // ONE allocation, shared by refcount. This was
+        // `Bytes::from(buffer_vec.clone())` — a full second copy of a blob we
+        // already owned, purely to hand the cache its own instance. `Bytes` is
+        // refcounted and `Cursor<Bytes>` is an `AsyncRead`, so the cache and the
+        // returned reader can share the same bytes. That clone is half of the
+        // 67.9 GB / two-32-GB-mappings state witnessed on fc-bangkok.
+        let buffer_bytes = bytes::Bytes::from(buffer_vec);
+        let blob_len = buffer_bytes.len();
+        if let Err(e) = self.add_to_cache(hash_str, buffer_bytes.clone()).await {
             warn!("Error adding retrieved content to the cache: {}", e);
         } else {
             debug!(
@@ -1476,8 +1545,7 @@ impl IrohBackend {
 
         debug!(
             "Content {} retrieved, {} bytes (cached for the future)",
-            hash_str,
-            buffer_vec.len()
+            hash_str, blob_len
         );
 
         // Update success metrics.
@@ -1486,10 +1554,10 @@ impl IrohBackend {
 
         // Record the store cat operation in NetworkingMetrics.
         self.networking_metrics
-            .record_cat_operation(duration.as_millis() as f64, buffer_vec.len() as u64)
+            .record_cat_operation(duration.as_millis() as f64, blob_len as u64)
             .await;
 
-        let cursor = std::io::Cursor::new(buffer_vec);
+        let cursor = std::io::Cursor::new(buffer_bytes);
         Ok(Box::pin(cursor))
     }
 
