@@ -158,6 +158,27 @@ export default function NetworkPage() {
 }
 
 /** Format a memory size given in MB. */
+/**
+ * `latency_ms` is a MEASUREMENT when a probe succeeded and a SENTINEL when it
+ * did not. `health.rs` marks an unhealthy peer `set_health(node, u64::MAX,
+ * false)` deliberately — u64::MAX rather than 0 so an unhealthy peer sorts LAST
+ * on any latency key instead of first — and that sentinel was rendered
+ * literally, so the fleet table showed `18446744073709552000ms` (u64::MAX at
+ * JS float precision) beside seven nodes at once. It reads as a catastrophic
+ * measured latency; it means "never measured".
+ *
+ * Anything at or beyond a day is not a round trip, so treat the whole absurd
+ * range as the sentinel rather than pattern-matching one constant — the
+ * backend is free to pick a different "unreachable" marker later.
+ */
+const LATENCY_SENTINEL_FLOOR_MS = 24 * 60 * 60 * 1000;
+
+function formatLatency(ms?: number): string {
+  if (ms === undefined || ms === null || !Number.isFinite(ms)) return "—";
+  if (ms >= LATENCY_SENTINEL_FLOOR_MS) return "unreachable";
+  return `${ms}ms`;
+}
+
 function fmtMem(mb?: number): string {
   if (!mb) return "—";
   if (mb >= 1024) {
@@ -728,7 +749,7 @@ function AnycastRouting() {
               <tr key={n.id}>
                 <Td className="font-medium">{n.name}</Td>
                 <Td><Badge tone="blue">{n.region}</Badge></Td>
-                <Td className="font-mono text-xs">{n.is_self ? "0ms (local)" : `${n.latency_ms ?? 0}ms`}</Td>
+                <Td className="font-mono text-xs">{n.is_self ? "0ms (local)" : formatLatency(n.latency_ms)}</Td>
                 <Td>{n.healthy ? <Badge tone="green">healthy</Badge> : <Badge tone="red">down</Badge>}</Td>
                 <Td>{(any?.serving?.[n.name] ?? 0) > 0 ? <Badge tone="green">● serving</Badge> : <span className="text-xs text-muted">standby</span>}</Td>
               </tr>
