@@ -589,7 +589,7 @@ async fn upsert_presence(
         revision: 0,
     };
     let record = cloud.browser_presence.put(record);
-    echo_presence_to_leader(&cloud, &record);
+    echo_presence_to_peers(&cloud, &record);
     Ok(Json(json!({ "presence": record })))
 }
 
@@ -604,52 +604,69 @@ async fn upsert_presence(
 /// appear at all. Witnessed: fc-bangkok publishing presence 10s earlier, live and
 /// serving, absent from two consecutive dashboard reads.
 ///
-/// The leader specifically, not every node: `list_presence` has followers merge
-/// the leader's view into their own, so making the leader complete makes every
-/// reader complete — at ONE rpc per beat instead of one per node per beat.
+/// EVERY healthy peer, not just the leader.
 ///
-/// Best-effort by construction: it is an accelerator in front of `store_sync`,
-/// never a correctness dependency. A failed echo costs latency, not data — the
-/// snapshot still carries the record — so this never blocks or fails the write.
-fn echo_presence_to_leader(cloud: &Arc<CloudState>, record: &BrowserPresence) {
-    if cloud.is_control_plane_leader() {
-        return;
-    }
-    let leader = cloud.control_plane_leader();
-    if leader.is_empty() || leader == cloud.node_name {
-        return;
-    }
-    let Some((peer_id, addr)) = cloud
+/// This echoed to the leader alone, reasoning that `list_presence` has followers
+/// merge the leader's view, so a complete leader makes every reader complete at
+/// one rpc per beat. That holds only while the leader does not change — and the
+/// leader changes on every fleet restart, which is exactly when browser nodes
+/// re-admit under fresh identities.
+///
+/// What that produced, measured on three dashboard loads seconds apart: one node
+/// answered with 4 browser nodes, another with 5, and the two sets shared just
+/// ONE member. Each node held whatever it had seen directly plus whatever the
+/// leader-of-the-moment had collected, and `adopt` merges per key rather than
+/// replacing, so the fragments never reconciled — which node round-robin picked
+/// decided what the operator saw, and an unlucky pick showed a single node out
+/// of six that were all `online`, `granted` and `serving`.
+///
+/// Fanning out makes every node's view complete, so any node can answer, and a
+/// leadership change reorganises nothing. The cost is real but small: presence
+/// records are tiny and a browser beats about once a minute, so this is a
+/// handful of small rpcs per minute per node, spawned and never awaited.
+///
+/// Best-effort by construction: an accelerator in front of `store_sync`, never a
+/// correctness dependency. A failed echo costs latency, not data.
+fn echo_presence_to_peers(cloud: &Arc<CloudState>, record: &BrowserPresence) {
+    let targets: Vec<(String, String)> = cloud
         .registry
         .nodes()
         .iter()
-        .find(|n| n.name == leader && n.healthy)
-        .and_then(|n| Some((n.peer_id.clone()?, n.iroh_addr.clone()?)))
-    else {
+        .filter(|n| n.healthy && n.name != cloud.node_name)
+        .filter_map(|n| Some((n.peer_id.clone()?, n.iroh_addr.clone()?)))
+        .collect();
+    if targets.is_empty() {
         return;
-    };
+    }
     let Ok(body) = serde_json::to_vec(record) else {
         return;
     };
     let cloud = cloud.clone();
     let endpoint_id = record.endpoint_id.clone();
     tokio::spawn(async move {
-        let ok = crate::gossip::request_to(
-            &cloud,
-            &peer_id,
-            &addr,
-            hive_p2p::GOSSIP_POST,
-            "/v1/browser/presence/mesh-echo",
-            &body,
-            5,
-        )
-        .await
-        .is_some();
-        tracing::debug!(%endpoint_id, ok, "browser presence leader echo");
+        let mut ok = 0usize;
+        let total = targets.len();
+        for (peer_id, addr) in targets {
+            if crate::gossip::request_to(
+                &cloud,
+                &peer_id,
+                &addr,
+                hive_p2p::GOSSIP_POST,
+                "/v1/browser/presence/mesh-echo",
+                &body,
+                5,
+            )
+            .await
+            .is_some()
+            {
+                ok += 1;
+            }
+        }
+        tracing::debug!(%endpoint_id, ok, total, "browser presence peer echo");
     });
 }
 
-/// Receiving side of [`echo_presence_to_leader`], dispatched from
+/// Receiving side of [`echo_presence_to_peers`], dispatched from
 /// `gossip::dispatch`'s `/v1/browser/presence/mesh-echo` POST arm.
 ///
 /// Applies through the same `put` every local write uses, so the store's own
