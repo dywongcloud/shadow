@@ -402,7 +402,7 @@ fn relay_and_public_ip_filter() -> AddrFilter {
 /// `IpAddr::is_global` is still unstable, so the classes are spelled out; when
 /// in doubt the answer is NO — a wrongly-excluded address costs a relayed
 /// connection, a wrongly-included one is published to the world forever.
-fn is_publicly_routable(ip: IpAddr) -> bool {
+pub(crate) fn is_publicly_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let o = v4.octets();

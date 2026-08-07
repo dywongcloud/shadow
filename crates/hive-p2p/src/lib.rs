@@ -3079,10 +3079,57 @@ pub async fn bind_full(
     if let Some(sk) = &secret {
         builder = builder.secret_key(sk.clone());
     }
+    // Seed addresses are FILTERED to what a peer could actually dial.
+    //
+    // This fed every address a peer advertised straight into `MemoryLookup`,
+    // unfiltered — including the RFC1918 10.x/172.16/192.168 addrs that
+    // `peer_iroh.json` is full of (AGENTS.md documents that those are private and
+    // not dialable from another region). Each such address becomes a connection
+    // PATH CANDIDATE that can never complete, and iroh 1.0.x queues candidates in
+    // an unbounded `VecDeque` (`pending_open_paths`, upstream #4390 — still
+    // unfixed in 1.0.3, both community PRs closed unmerged).
+    //
+    // That queue is the fleet's OOM. Measured on fc-hongkong with jemalloc
+    // profiling: 71,680 MiB — 99.8% of live heap — in ONE stack,
+    // `RawVec::finish_grow -> VecDeque::grow -> remote_state::State::open_path_on_conn
+    // -> RemoteStateActor::open_path_on_all_conns`.
+    //
+    // Publishing already applies exactly this filter (`dht::relay_and_public_ip_filter`);
+    // the dial side simply never did. Relay URLs are always kept, so a peer behind
+    // NAT stays reachable — the cost of dropping a private addr is a relayed
+    // connection, which is what actually happened anyway once the direct path
+    // failed. `HIVE_SEED_ALLOW_PRIVATE=1` restores the old behaviour for a
+    // single-VPC deployment where private addrs genuinely are dialable.
+    let allow_private = std::env::var("HIVE_SEED_ALLOW_PRIVATE")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let mut dropped_addrs = 0usize;
     let seed_addrs: Vec<EndpointAddr> = seeds
         .iter()
         .filter_map(|s| serde_json::from_str::<EndpointAddr>(&s.addr_json).ok())
+        .map(|mut a| {
+            if !allow_private {
+                let before = a.addrs.len();
+                a.addrs.retain(|t| match t {
+                    iroh::TransportAddr::Relay(_) => true,
+                    iroh::TransportAddr::Ip(sa) => crate::dht::is_publicly_routable(sa.ip()),
+                    _ => false,
+                });
+                dropped_addrs += before.saturating_sub(a.addrs.len());
+            }
+            a
+        })
+        // A seed with no dialable transport left is not a usable hint; keeping it
+        // would re-create the very candidate churn this filter exists to remove.
+        .filter(|a| !a.addrs.is_empty())
         .collect();
+    if dropped_addrs > 0 {
+        tracing::info!(
+            dropped_addrs,
+            seeds = seed_addrs.len(),
+            "filtered unroutable seed addresses out of the dial candidate set"
+        );
+    }
     let seed_count = seed_addrs.len();
     if !seed_addrs.is_empty() {
         builder = builder.address_lookup(iroh::address_lookup::MemoryLookup::from_endpoint_info(
