@@ -2464,6 +2464,7 @@ async fn run_build(
                 req,
                 cloud.db_domain.clone(),
                 cloud.node_name.clone(),
+                cloud.api_base(),
                 move |d| {
                     if matches!(d.status, crate::databases::DbStatus::Ready) {
                         crate::admin::apply_db_egress(&cloud_ready, &d);

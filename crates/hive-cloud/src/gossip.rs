@@ -259,6 +259,13 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             }
             Vec::new()
         }
+        // Presence write-through to the leader (see `echo_presence_to_leader`).
+        // Ordered BEFORE the GET arm below only for readability — the two are
+        // already disjoint by method — but it must stay ahead of any future
+        // broader `/v1/browser/presence` arm, per the longest-prefix-first rule.
+        p if method == hive_p2p::GOSSIP_POST && p == "/v1/browser/presence/mesh-echo" => {
+            crate::browser_presence::mesh_echo(cloud, body)
+        }
         // Coarse browser presence first-read leader fallback (constellation
         // satellites) — tenant-scoped the same way as the admissions list arm.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/presence") => {
@@ -1102,6 +1109,33 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             match serde_json::from_slice::<serde_json::Value>(body) {
                 Ok(v) => jb(axum::Json(crate::push::sms_direct_mx_exec(v).await)),
                 Err(_) => Vec::new(),
+            }
+        }
+        // libsql/Hrana OWNER PROXY: a managed SQLite database is a FILE on one
+        // node, and every other node forwards here rather than opening a
+        // second, empty copy of it. Longest-prefix-first against the
+        // `/v1/databases/replica` arm below — the two are disjoint (this one
+        // requires the `/hrana-mesh` suffix), but the ordering makes that
+        // explicit rather than incidental. The envelope carries the CLIENT's
+        // own database bearer, which `hrana::mesh_serve` re-checks against
+        // THIS node's replicated record before touching the file (the
+        // `proxy_to_owner` re-check precedent), and refuses to re-proxy.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/databases/")
+            && p.split('?')
+                .next()
+                .unwrap_or_default()
+                .ends_with("/hrana-mesh") =>
+        {
+            let id = p
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("/v1/databases/")
+                .trim_end_matches("/hrana-mesh");
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(env) => jb(axum::Json(crate::hrana::mesh_serve(&cloud, id, &env).await)),
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
         // Cross-region DB replica control (register/remove) over the mesh.

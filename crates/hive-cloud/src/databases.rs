@@ -36,6 +36,19 @@ pub enum DbKind {
     Pubsub,
     /// Secure WebSocket streaming channels (rooms) for realtime apps.
     Realtime,
+    /// Managed SQLite, spoken over the libsql **Hrana** protocol
+    /// (`crate::hrana`) so `@libsql/client` / Turso-compatible drivers connect
+    /// with no adapter. The engine is a FILE on the owning node, not a
+    /// container — there is no port to publish and no process to keep warm.
+    ///
+    /// Distinct from the `browser_db` lane (`crate::browser_db`), which is a
+    /// cr-sqlite CRDT replica per PROJECT, replicated to browsers over
+    /// `Op::CrrSync` and carrying no query endpoint. The two share nothing but
+    /// the word SQLite: different directory, different file name template,
+    /// different identity (database id vs project), and this lane never loads
+    /// the cr-sqlite extension — a direct writer inside a CRR file would
+    /// bypass the clock tables and silently diverge every replica.
+    Sqlite,
 }
 impl DbKind {
     pub fn label(&self) -> &'static str {
@@ -47,8 +60,48 @@ impl DbKind {
             DbKind::Vector => "Vector",
             DbKind::Pubsub => "Pub/Sub",
             DbKind::Realtime => "Realtime",
+            DbKind::Sqlite => "SQLite",
         }
     }
+}
+
+// ---- Managed SQLite (libsql/Hrana) file layout ------------------------------
+
+/// Store layout: `$HIVE_DATA/sqlite-dbs/` — one file per managed SQLite
+/// database, named by [`sqlite_file_name`]. Deliberately NOT
+/// `$HIVE_DATA/browser-dbs/`: those files are cr-sqlite CRRs owned by the
+/// `Op::CrrSync` exchange, and a direct SQL writer in one of them would write
+/// rows the clock tables never see.
+pub fn sqlite_store_dir() -> std::path::PathBuf {
+    crate::persist::data_dir().join("sqlite-dbs")
+}
+
+/// The platform-templated file name for a managed SQLite database.
+///
+/// The template's input is the PLATFORM-ISSUED database id (`db_<hex>`), never
+/// the tenant's project or database NAME — the tenant-volume-isolation rule
+/// applied to a file path. `sqlite_file_path` additionally proves the id has
+/// the issued shape before it is allowed to become a path component, so a
+/// crafted id can never traverse out of the store directory even if one
+/// reached this far.
+pub fn sqlite_file_name(id: &str) -> String {
+    format!("hive-sqlite-{}.db", crate::git::sanitize_tag(id))
+}
+
+/// Absolute path of a managed SQLite database file, or `None` when `id` is not
+/// a platform-issued database id (`db_` + 8..=64 lowercase hex).
+pub fn sqlite_file_path(id: &str) -> Option<std::path::PathBuf> {
+    let hex = id.strip_prefix("db_")?;
+    // Lowercase hex ONLY: `sanitize_tag` lowercases, so accepting mixed case
+    // would map two distinct ids onto one file.
+    if !(8..=64).contains(&hex.len())
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    Some(sqlite_store_dir().join(sqlite_file_name(id)))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +817,28 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
                 format!("{base}/v1/ws/realtime/{}", g("room")),
             ),
         ],
+        // Managed SQLite over libsql/Hrana. Both the Turso-conventional pair
+        // and a plain `DATABASE_URL` (token folded in as `?authToken=`, which
+        // `@libsql/client` parses) so an app needs no code change either way.
+        // `LIBSQL_URL` is written by `with_external_endpoint`; when the DB
+        // gateway domain is off it is the platform-API form, which is why this
+        // reads the stored value instead of rebuilding a host here.
+        DbKind::Sqlite => {
+            let url = g("LIBSQL_URL");
+            let token = g("DB_REST_TOKEN");
+            let dsn = if url.is_empty() || token.is_empty() {
+                url.clone()
+            } else {
+                format!("{url}?authToken={token}")
+            };
+            vec![
+                ("LIBSQL_URL".into(), url.clone()),
+                ("LIBSQL_AUTH_TOKEN".into(), token.clone()),
+                ("TURSO_DATABASE_URL".into(), url),
+                ("TURSO_AUTH_TOKEN".into(), token),
+                ("DATABASE_URL".into(), dsn),
+            ]
+        }
     };
     out.retain(|(_, v)| !v.is_empty());
     out
@@ -844,6 +919,19 @@ fn with_external_endpoint(
             conn.insert("host".into(), db_host.to_string());
             conn.insert("port".into(), "6379".into());
         }
+        // Managed SQLite: the per-database hostname IS the libsql base URL.
+        // `libsql://` is Hrana-over-HTTPS (the scheme rewrites to https in
+        // every client) — NOT a websocket URL — and a bare host has no path,
+        // so the client's RELATIVE resolution of `v2/pipeline` lands exactly
+        // where this server mounts it. That is why the hostname form is the
+        // preferred DSN and the platform-API form (set at provision time)
+        // carries a mandatory trailing slash.
+        DbKind::Sqlite => {
+            conn.insert("LIBSQL_URL".into(), format!("libsql://{db_host}"));
+            conn.insert("endpoint".into(), format!("https://{db_host}"));
+            conn.insert("host".into(), db_host.to_string());
+            conn.insert("port".into(), "443".into());
+        }
         // HTTP-REST kinds (blob/queue/vector/pubsub/realtime): expose the gateway
         // host so their REST/WS URLs are externally reachable over TLS.
         _ => {
@@ -865,6 +953,11 @@ pub fn provision(
     // route its DNS to this node.
     db_domain: String,
     host_node: String,
+    // The public API origin (`CloudState::api_base`). Only the SQLite kind uses
+    // it: with the DB gateway off there is no `<slug>.{db_domain}` hostname, and
+    // an addressless database is not a database — so its libsql base URL falls
+    // back to `{api_base}/v1/sqlite/{id}/`, which is served by the same handler.
+    api_base: String,
     on_ready: impl Fn(Database) + Send + 'static,
 ) -> Database {
     let id = format!("db_{}", uuid::Uuid::new_v4().simple());
@@ -894,12 +987,20 @@ pub fn provision(
         connection: HashMap::new(),
         container: None,
         note: String::new(),
-        replicas: req
-            .replicas
-            .iter()
-            .map(|r| r.trim().to_ascii_lowercase())
-            .filter(|r| !r.is_empty() && *r != region)
-            .collect(),
+        // SQLite has no cross-region replication in this lane: the file is the
+        // system of record on one node, and a second file elsewhere is a
+        // DIVERGENT database, not a replica (the CRDT lane that does solve this
+        // is `browser_db`, and it solves it with cr-sqlite, not file copies).
+        // Requested regions are dropped rather than silently "provisioned".
+        replicas: if req.kind == DbKind::Sqlite {
+            Vec::new()
+        } else {
+            req.replicas
+                .iter()
+                .map(|r| r.trim().to_ascii_lowercase())
+                .filter(|r| !r.is_empty() && *r != region)
+                .collect()
+        },
         role: "primary".into(),
         primary_node: String::new(),
         db_host: db_host.clone(),
@@ -908,7 +1009,7 @@ pub fn provision(
     store.insert(db.clone());
 
     tokio::spawn(async move {
-        let outcome = provision_backing(&store, &id, &req).await;
+        let outcome = provision_backing(&store, &id, &req, &api_base).await;
         store.update(&id, |d| {
             match outcome {
                 Ok((mode, conn, container)) => {
@@ -942,10 +1043,12 @@ async fn provision_backing(
     store: &Arc<DatabaseStore>,
     id: &str,
     req: &ProvisionReq,
+    api_base: &str,
 ) -> Result<(String, HashMap<String, String>, Option<String>), String> {
     match req.kind {
         DbKind::Postgres => provision_postgres(store, id, &req.project).await,
         DbKind::Redis => provision_redis(store, id, &req.project).await,
+        DbKind::Sqlite => provision_sqlite(id, api_base).await,
         DbKind::Blob => {
             let bucket = format!("hive-{}", &id[3..11.min(id.len())]);
             let mut c = HashMap::new();
@@ -1067,6 +1170,11 @@ pub async fn provision_replica_backing(
             Ok((mode, conn, container)) => (conn, container, mode),
             Err(_) => (db.connection.clone(), None, "simulated".into()),
         },
+        // Unreachable by construction (`provision` clears `replicas` for this
+        // kind) and kept explicit so a future replication feature has to make a
+        // deliberate decision here instead of inheriting the `_` arm, which
+        // would register a second EMPTY file as a live replica.
+        DbKind::Sqlite => (db.connection.clone(), None, "simulated".into()),
         // Blob/Queue/Vector/Pubsub/Realtime: in-process on every node; the replica
         // serves from local state kept in sync by the primary's write-mirroring.
         _ => (db.connection.clone(), None, "live".into()),
@@ -1087,6 +1195,72 @@ async fn wait_tcp_ready(port: u32) -> bool {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
     false
+}
+
+/// Provision a managed SQLite database: create its file (so a broken data
+/// directory fails HERE, loudly, instead of on the tenant's first query) and
+/// mint the dedicated Hrana bearer.
+///
+/// There is no container, no port and no keep-warm: the engine is the file plus
+/// the pooled connections `crate::sqlite_pool` opens on demand. That also means
+/// there is no "simulated" mode to fall back to — a database whose file cannot
+/// be created is an ERROR, never a record that pretends to be live.
+async fn provision_sqlite(
+    id: &str,
+    api_base: &str,
+) -> Result<(String, HashMap<String, String>, Option<String>), String> {
+    let path = sqlite_file_path(id).ok_or_else(|| {
+        format!("refusing to derive a file path from a non-platform database id {id:?}")
+    })?;
+    let create = {
+        let path = path.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let conn = hive_crsql::rusqlite::Connection::open(&path).map_err(|e| e.to_string())?;
+            let _: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .await
+    };
+    match create {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(format!("cannot create SQLite database file: {e}")),
+        Err(e) => return Err(format!("SQLite provisioning task failed: {e}")),
+    }
+
+    let mut c = HashMap::new();
+    c.insert("provider".into(), "Hive SQLite (libsql/Hrana)".into());
+    c.insert("engine".into(), "sqlite".into());
+    // The file NAME is safe to show (the dashboard already shows the browser_db
+    // replica name); the absolute path is node-local detail and stays out.
+    c.insert("file".into(), sqlite_file_name(id));
+    // Dedicated, independently-revocable bearer — the same key `db_rest`'s
+    // `credential_matches` treats as the ONLY credential once present, so this
+    // lane never accepts an engine password (it has none) and the token can be
+    // rotated without touching anything else.
+    c.insert("DB_REST_TOKEN".into(), token("dbt"));
+    // Base URL when the DB gateway domain is off. The TRAILING SLASH is
+    // mandatory: libsql clients resolve `v2/pipeline` relatively, so a base
+    // without it silently posts to the parent path (see `crate::hrana`).
+    // `with_external_endpoint` replaces this with `libsql://<slug>.{db_domain}`
+    // when the gateway is on.
+    let base = api_base.trim_end_matches('/');
+    if !base.is_empty() {
+        let scheme_swapped = base
+            .strip_prefix("https://")
+            .map(|rest| format!("libsql://{rest}"))
+            .unwrap_or_else(|| base.to_string());
+        c.insert(
+            "LIBSQL_URL".into(),
+            format!("{scheme_swapped}/v1/sqlite/{id}/"),
+        );
+        c.insert("endpoint".into(), format!("{base}/v1/sqlite/{id}/"));
+    }
+    Ok(("live".into(), c, None))
 }
 
 async fn provision_postgres(

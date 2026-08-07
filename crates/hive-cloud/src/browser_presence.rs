@@ -589,20 +589,134 @@ async fn upsert_presence(
         revision: 0,
     };
     let record = cloud.browser_presence.put(record);
+    echo_presence_to_leader(&cloud, &record);
     Ok(Json(json!({ "presence": record })))
+}
+
+/// Push a freshly-written presence record straight to the control-plane leader.
+///
+/// Presence is written on whichever node the browser posted to, and otherwise
+/// only reaches the rest of the fleet on the periodic `store_sync` snapshot. That
+/// is too slow to be the ONLY path: a record lives 90s, and a browser that
+/// republishes every ~60s can have its record repeatedly miss the snapshot window
+/// on remote nodes, so an operator watching the constellation sees browser nodes
+/// blink in and out — or, for a node whose beat never lands in a snapshot, never
+/// appear at all. Witnessed: fc-bangkok publishing presence 10s earlier, live and
+/// serving, absent from two consecutive dashboard reads.
+///
+/// The leader specifically, not every node: `list_presence` has followers merge
+/// the leader's view into their own, so making the leader complete makes every
+/// reader complete — at ONE rpc per beat instead of one per node per beat.
+///
+/// Best-effort by construction: it is an accelerator in front of `store_sync`,
+/// never a correctness dependency. A failed echo costs latency, not data — the
+/// snapshot still carries the record — so this never blocks or fails the write.
+fn echo_presence_to_leader(cloud: &Arc<CloudState>, record: &BrowserPresence) {
+    if cloud.is_control_plane_leader() {
+        return;
+    }
+    let leader = cloud.control_plane_leader();
+    if leader.is_empty() || leader == cloud.node_name {
+        return;
+    }
+    let Some((peer_id, addr)) = cloud
+        .registry
+        .nodes()
+        .iter()
+        .find(|n| n.name == leader && n.healthy)
+        .and_then(|n| Some((n.peer_id.clone()?, n.iroh_addr.clone()?)))
+    else {
+        return;
+    };
+    let Ok(body) = serde_json::to_vec(record) else {
+        return;
+    };
+    let cloud = cloud.clone();
+    let endpoint_id = record.endpoint_id.clone();
+    tokio::spawn(async move {
+        let ok = crate::gossip::request_to(
+            &cloud,
+            &peer_id,
+            &addr,
+            hive_p2p::GOSSIP_POST,
+            "/v1/browser/presence/mesh-echo",
+            &body,
+            5,
+        )
+        .await
+        .is_some();
+        tracing::debug!(%endpoint_id, ok, "browser presence leader echo");
+    });
+}
+
+/// Receiving side of [`echo_presence_to_leader`], dispatched from
+/// `gossip::dispatch`'s `/v1/browser/presence/mesh-echo` POST arm.
+///
+/// Applies through the same `put` every local write uses, so the store's own
+/// last-writer rule decides: an echo can never overwrite a newer record, and a
+/// replayed or out-of-order echo is inert rather than corrupting. The record is
+/// taken VERBATIM — every field on it was already derived server-side from a
+/// verified session on the originating node (`put_presence` computes
+/// `node_name`, `shard_eligible` and `tenant` itself and never reads them from
+/// the request), and the mesh transport is peer-authenticated.
+pub fn mesh_echo(cloud: &Arc<CloudState>, body: &[u8]) -> Vec<u8> {
+    let Ok(record) = serde_json::from_slice::<BrowserPresence>(body) else {
+        return Vec::new();
+    };
+    cloud.browser_presence.put(record);
+    Vec::new()
 }
 
 async fn list_presence(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {
     let claims = claims_required(claims)?;
     let tenant = crate::admin::norm(&claims.tenant).to_string();
     let local = cloud.browser_presence.list(&tenant, hive_core::now_ms());
-    if local.is_empty() && !cloud.is_control_plane_leader() {
+
+    // A follower consults the leader whenever it is not the leader — NOT only
+    // when its own view is empty.
+    //
+    // The `local.is_empty()` trigger this replaces is the round-robin-reads bug
+    // in its subtlest form: presence is written on whichever node the browser
+    // posted to and then replicates on a periodic store_sync snapshot, so a
+    // follower routinely holds a PARTIAL set. Returning that partial set is
+    // indistinguishable, to the caller, from a complete one — and because the
+    // public dashboard host is round-robin DNS, consecutive loads land on
+    // different followers and show different subsets of the same fleet.
+    // Witnessed: two reads 30s apart returned 4 records then 6, with a live,
+    // serving fc-bangkok browser node absent from both, which reads to an
+    // operator as "my browser nodes disappeared".
+    //
+    // Merged, not replaced: a browser posts to its LOCAL node, so this node can
+    // hold a record the leader has not received yet, while the leader holds the
+    // records this node has not. Union by endpoint id, newest `issued_ms` wins —
+    // the same last-writer rule `put` applies, so a merge can never resurrect a
+    // record that a newer write superseded.
+    if !cloud.is_control_plane_leader() {
         let leader = cloud.control_plane_leader();
         if let Some(value) =
             crate::admin::fetch_from_host(&cloud, &leader, "/v1/browser/presence", &tenant).await
         {
-            return Ok(Json(value));
+            let remote: Vec<BrowserPresence> = value
+                .get("presence")
+                .and_then(|p| serde_json::from_value(p.clone()).ok())
+                .unwrap_or_default();
+            if !remote.is_empty() {
+                let mut merged: BTreeMap<String, BrowserPresence> = BTreeMap::new();
+                for record in local.into_iter().chain(remote) {
+                    match merged.get(&record.endpoint_id) {
+                        Some(seen) if seen.issued_ms >= record.issued_ms => {}
+                        _ => {
+                            merged.insert(record.endpoint_id.clone(), record);
+                        }
+                    }
+                }
+                let merged: Vec<BrowserPresence> = merged.into_values().collect();
+                return Ok(Json(json!({ "presence": merged })));
+            }
         }
+        // Leader unreachable, or it genuinely knows nothing: the local view is
+        // still the honest best answer, never an error.
+        return Ok(Json(json!({ "presence": local })));
     }
     Ok(Json(json!({ "presence": local })))
 }

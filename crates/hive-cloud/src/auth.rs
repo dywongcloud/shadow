@@ -211,7 +211,16 @@ pub async fn require_auth(
         // `{error:{code,retryable}}` contract as every other admission denial;
         // the middleware already inserted verified claims above when present.
         // Item DELETE/accept routes remain protected here.
-        || path == "/v1/browser/admissions";
+        || path == "/v1/browser/admissions"
+        // libsql/Hrana pipeline POSTs carry the DATABASE's own bearer
+        // (`DB_REST_TOKEN`), not a platform JWT — exactly the posture the
+        // `<slug>.{db_domain}` REST surface already has, which never passes
+        // through this middleware at all because it is served off the edge
+        // pipeline. `hrana::serve` fails closed on a wrong/absent token via
+        // `db_rest::credential_matches`, so letting the request reach it is
+        // what makes the two mount points behave identically instead of the
+        // platform-API one 401ing every legitimate libsql client.
+        || path.starts_with("/v1/sqlite/");
     if !is_mutation || open {
         return next.run(req).await;
     }

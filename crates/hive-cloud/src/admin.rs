@@ -330,6 +330,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::sandboxes_api::routes())
         // ---- Storage broker: Firecracker cell data-image snapshots ----
         .merge(crate::storage_api::routes())
+        // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
+        .merge(crate::hrana::routes())
         .with_state(cloud.clone());
     // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
@@ -8357,6 +8359,7 @@ async fn database_create(
         req,
         c.db_domain.clone(),
         c.node_name.clone(),
+        c.api_base(),
         move |d| {
             // EGRESS: auto-inject this DB's connection env into the owning project so
             // its deployments can reach it with zero manual copy-paste. Only when the
@@ -8407,6 +8410,29 @@ async fn database_delete(
         // Tear down any cross-region replicas (before consuming `d.container`).
         if !d.replicas.is_empty() {
             crate::db_replicate::remove_replicas(c.clone(), d.clone());
+        }
+        // Managed SQLite: no container, so the teardown is its own. Streams
+        // first (each holds a pooled connection, and one mid-`BEGIN` holds the
+        // file's write lock), then the pool, then the file — in that order, or
+        // the unlink races a live writer. Only ever on the OWNING node: a peer
+        // has no file to remove and must not invent a path.
+        if d.kind == crate::databases::DbKind::Sqlite && d.host_node == c.node_name {
+            crate::hrana::close_streams(&id);
+            crate::sqlite_pool::close(&id);
+            if let Some(path) = crate::databases::sqlite_file_path(&id) {
+                for suffix in ["", "-wal", "-shm"] {
+                    let p = if suffix.is_empty() {
+                        path.clone()
+                    } else {
+                        std::path::PathBuf::from(format!("{}{suffix}", path.display()))
+                    };
+                    if let Err(e) = std::fs::remove_file(&p) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            tracing::warn!(db = %id, path = %p.display(), error = %e, "could not remove SQLite database file");
+                        }
+                    }
+                }
+            }
         }
         if let Some(container) = d.container {
             // Best-effort teardown of the backing container.

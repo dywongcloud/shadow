@@ -28,7 +28,20 @@ ORIGIN="http://127.0.0.1:${PORT}"
 JS_HEAP_MB="${HIVE_BROWSER_NODE_JS_HEAP_MB:-512}"
 BROKER_WAIT_SECS="${HIVE_BROWSER_NODE_BROKER_WAIT_SECS:-120}"
 HEALTH_POLL_SECS="${HIVE_BROWSER_NODE_HEALTH_POLL_SECS:-30}"
+# Consecutive UNREACHABLE probes (no HTTP response at all) before recycling
+# chrome. Unreachable means the broker is wedged, which a restart genuinely
+# repairs, so this stays fast: 4 x 30s = 2min.
 HEALTH_FAIL_LIMIT="${HIVE_BROWSER_NODE_HEALTH_FAIL_LIMIT:-4}"
+# Consecutive DEGRADED probes (broker answering, but not 200) before recycling.
+# Deliberately far longer than the 4-probe unreachable limit AND far longer than
+# a lease renewal (<=300s) plus an admission retry, because degraded is the
+# state the node clears by itself — 40 x 30s = 20min. Anything shorter turns
+# ordinary self-healing into a restart loop, which is exactly what the old
+# shared 4-probe counter did.
+DEGRADED_LIMIT="${HIVE_BROWSER_NODE_DEGRADED_LIMIT:-40}"
+# Log the degraded detail on the 1st, then every Nth probe, so a long wait
+# leaves evidence without flooding the journal every 30s.
+DEGRADED_LOG_EVERY="${HIVE_BROWSER_NODE_DEGRADED_LOG_EVERY:-10}"
 
 if [[ ! -x "$CHROME_BIN" ]]; then
   echo "hive-browser-node: chrome binary not found/executable: $CHROME_BIN" >&2
@@ -143,6 +156,7 @@ echo "hive-browser-node: starting ${CHROME_BIN} -> ${ORIGIN}/ (js-heap=${JS_HEAP
 CHROME_PID=$!
 
 fails=0
+degraded=0
 while true; do
   sleep "$HEALTH_POLL_SECS"
   if ! kill -0 "$CHROME_PID" 2>/dev/null; then
@@ -163,18 +177,55 @@ while true; do
     # brings the node back either way.
     exit "$(( rc == 0 ? 70 : rc ))"
   fi
-  if curl -fsS --max-time 5 "${ORIGIN}/healthz" >/dev/null 2>&1; then
+  # Two DIFFERENT failures, deliberately handled differently.
+  #
+  # This loop used to probe with `curl -fsS`, where -f turns any HTTP >= 400
+  # into a failure. The broker answers 503 with a JSON body whenever the node is
+  # merely DEGRADED (admission renewing, an artifact briefly unavailable, a
+  # stale heartbeat) — so a live, answering broker was counted as a dead node,
+  # and four polls later the supervisor killed Chrome. That is the churn: hk
+  # recycled 21 times, sp 5, fr 3, while the underlying condition was one the
+  # node clears BY ITSELF on the next lease renewal. Recycling does not fix a
+  # degraded admission; it throws away a warm browser — pinned artifacts, the
+  # OPFS replica, mesh sessions — and the fresh boot can 503 again on its own
+  # admission, which is how a transient blip became a restart loop.
+  #
+  # So: an HTTP RESPONSE of any status proves the broker process is alive and
+  # answering, which is the only thing recycling Chrome could repair. Degraded
+  # is reported and waited out. Only a broker that does not answer at all
+  # (connection refused / timeout — `curl -sS -o /dev/null -w %{http_code}`
+  # yields 000) is a wedge worth recycling for, on the original fast counter.
+  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "${ORIGIN}/healthz" 2>/dev/null || echo 000)"
+  if [[ "$code" != "000" ]]; then
     if (( fails > 0 )); then
-      echo "hive-browser-node: node healthy again after ${fails} failed probe(s)"
+      echo "hive-browser-node: broker reachable again after ${fails} unreachable probe(s)"
     fi
     fails=0
+    if [[ "$code" == "200" ]]; then
+      degraded=0
+      continue
+    fi
+    # Reachable but not healthy. Wait it out — but do not wait FOREVER: a node
+    # wedged degraded indefinitely is genuinely stuck, and that window is
+    # deliberately far longer than a lease renewal so normal self-healing is
+    # never interrupted.
+    degraded=$((degraded + 1))
+    if (( degraded % DEGRADED_LOG_EVERY == 1 )); then
+      detail="$(curl -sS --max-time 5 "${ORIGIN}/healthz" 2>/dev/null || echo '{}')"
+      echo "hive-browser-node: degraded (HTTP ${code}) for $((degraded * HEALTH_POLL_SECS))s, waiting for self-heal: ${detail}" >&2
+    fi
+    if (( degraded >= DEGRADED_LIMIT )); then
+      echo "hive-browser-node: still degraded after $((degraded * HEALTH_POLL_SECS))s — recycling chrome" >&2
+      cleanup
+      exit 75   # EX_TEMPFAIL — systemd Restart=always brings it back
+    fi
     continue
   fi
+  degraded=0
   fails=$((fails + 1))
-  detail="$(curl -sS --max-time 5 "${ORIGIN}/healthz" 2>/dev/null || echo '{}')"
-  echo "hive-browser-node: unhealthy probe ${fails}/${HEALTH_FAIL_LIMIT}: ${detail}" >&2
+  echo "hive-browser-node: broker unreachable, probe ${fails}/${HEALTH_FAIL_LIMIT}" >&2
   if (( fails >= HEALTH_FAIL_LIMIT )); then
-    echo "hive-browser-node: node dead for $((fails * HEALTH_POLL_SECS))s — recycling chrome" >&2
+    echo "hive-browser-node: broker unreachable for $((fails * HEALTH_POLL_SECS))s — recycling chrome" >&2
     cleanup
     exit 75   # EX_TEMPFAIL — systemd Restart=always brings it back
   fi

@@ -6,7 +6,12 @@ license.workspace = true
 description = "rusqlite wrapper for the vendored superfly/cr-sqlite loadable extension (vendor/cr-sqlite) -- CRR (conflict-free replicated relation) tables for the fleet-side + browser-side CRDT sync peers. See vendor/cr-sqlite/VENDOR.md."
 
 [dependencies]
-rusqlite = { version = "0.32", features = ["load_extension", "bundled"] }
+# `column_decltype` exposes `Statement::columns()` (name + declared type).
+# rusqlite has NO default features, so without it there is no way to read a
+# column's decltype -- which the Hrana wire protocol carries on every
+# `StmtResult.cols` entry and `DescribeResult.cols` entry (hive-cloud's
+# `hrana_proto`). Purely additive: same C build, one more accessor.
+rusqlite = { version = "0.32", features = ["load_extension", "bundled", "column_decltype"] }
 anyhow = "1"
 
 # Examples only (live wire-proof witnesses, e.g. examples/wire_proof.rs) --

@@ -39,6 +39,8 @@ mod gitops;
 mod gossip;
 mod gpu_pool;
 mod guardian;
+mod hrana;
+mod hrana_proto;
 mod identity;
 mod incidents;
 mod inference;
@@ -65,6 +67,7 @@ mod sandboxes_platform;
 mod schedule;
 mod secrets;
 mod securelink;
+mod sqlite_pool;
 mod state;
 mod storage_api;
 mod storage_broker;
@@ -1501,6 +1504,7 @@ async fn admin_loopback_forward(
     }
     if !is_mutation
         || req.uri().path() == "/v1/token"
+        || owner_routed(req.uri().path())
         || req.headers().contains_key("x-hive-internal")
         || cloud.is_control_plane_leader()
     {
@@ -1732,7 +1736,9 @@ async fn admin_ingress(
             || path == "/v1/token"
             || path == "/v1/git/webhook"
             || path == "/v1/zkauth/register"
-            || path == "/v1/zkauth/preview-proof";
+            || path == "/v1/zkauth/preview-proof"
+            // Per-database bearer, not a platform JWT — see auth::require_auth.
+            || path.starts_with("/v1/sqlite/");
         if is_mutation && !open {
             // Accept a platform JWT or a dashboard API key (`hive_…`) — the
             // leader's `require_auth` re-verifies either; this gate only
@@ -1764,7 +1770,14 @@ async fn admin_ingress(
     // signing with the fleet-shared secret — no state is written — so login
     // must never depend on leader reachability or distance.
     let is_mutation = matches!(req.method().as_str(), "POST" | "PUT" | "DELETE" | "PATCH");
-    if !is_mutation || req.uri().path() == "/v1/token" {
+    // libsql/Hrana pipelines are OWNER-routed, never leader-routed: the SQLite
+    // file lives on `Database::host_node` and `hrana::serve` proxies there
+    // itself. Forwarding to the leader would add a hop that still has to
+    // proxy — and, worse, would pin an interactive transaction's baton to
+    // whichever node happened to be leader when the stream opened, so a
+    // leadership change mid-transaction would strand it.
+    let owner_routed = req.uri().path().starts_with("/v1/sqlite/");
+    if !is_mutation || owner_routed || req.uri().path() == "/v1/token" {
         return serve_local(admin, req).await;
     }
     // Leader serves locally.

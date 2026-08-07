@@ -79,6 +79,22 @@ pub async fn handle(cloud: Arc<CloudState>, host: String, req: Request) -> Respo
         return with_cors(resp);
     }
 
+    // SQLite speaks libsql/Hrana, not a wire protocol on a published port: its
+    // engine is a FILE on `Database::host_node`, so it has no `local_port` and
+    // its handler does its own owner routing (proxying to that node rather than
+    // opening a second, empty file here). Branch BEFORE the `local_port`
+    // requirement below, which is a Postgres/Redis concept.
+    if db.kind == DbKind::Sqlite {
+        let (_parts, body) = req.into_parts();
+        let bytes = match axum::body::to_bytes(body, BODY_CAP).await {
+            Ok(b) => b,
+            Err(_) => {
+                return with_cors(err(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"))
+            }
+        };
+        return with_cors(crate::hrana::serve(cloud, db, bearer, method, path, bytes).await);
+    }
+
     let Some(local_port) = local else {
         return with_cors(err(
             StatusCode::MISDIRECTED_REQUEST,
@@ -699,7 +715,7 @@ fn col_to_json(
 /// revocable without the engine credential. The `password` fallback applies
 /// only to legacy databases provisioned before dedicated tokens existed.
 /// Constant-time comparison throughout.
-fn credential_matches(db: &Database, bearer: &str) -> bool {
+pub(crate) fn credential_matches(db: &Database, bearer: &str) -> bool {
     let dedicated: Vec<&String> = ["UPSTASH_REDIS_REST_TOKEN", "DB_REST_TOKEN"]
         .iter()
         .filter_map(|k| db.connection.get(*k))
@@ -725,7 +741,7 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-fn bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let v = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let rest = v
         .strip_prefix("Bearer ")
