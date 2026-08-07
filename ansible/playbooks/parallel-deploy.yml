@@ -48,7 +48,16 @@
 #   ansible-playbook playbooks/parallel-deploy.yml -e hive_push_throttle=8     # allow more concurrent big-artifact pushes (needs a well-provisioned uplink)
 #   ansible-playbook playbooks/parallel-deploy.yml --tags backend       # backend only
 #   ansible-playbook playbooks/parallel-deploy.yml --tags ui            # ui only
-#   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset (still 2-phase build/push, serial restart within the subset)
+#   ansible-playbook playbooks/parallel-deploy.yml --limit fc_pvm       # subset -- MUST also include each represented glibc group's BUILD host
+#
+#   A --limit that excludes the build host cannot work: the build play targets
+#   glibc239_builder:glibc238_builder (elected as groups['glibc239'][0] /
+#   groups['glibc238'][0]), so limiting it away means nothing is ever built and
+#   the push then dies with "Could not find or access .../hive-cloud-glibc239 on
+#   the Ansible Controller" -- three phases after the real mistake. Witnessed on
+#   a --limit fr canary. The preflight assert below now catches it up front and
+#   names the host to add. Builders today: va (glibc239), bkk (glibc238), so a
+#   frankfurt-only canary is `--limit fr,va`.
 #
 # Every step below is idempotent (matches hive_platform/hive_ui's own
 # idempotency) so a partial re-run after a mid-deploy failure picks up
@@ -62,6 +71,30 @@
     - name: Elect the first host of each glibc group as its build host
       ansible.builtin.group_by:
         key: "{{ 'glibc239_builder' if inventory_hostname == groups['glibc239'][0] else ('glibc238_builder' if inventory_hostname == groups['glibc238'][0] else 'glibc_follower') }}"
+
+    # Fail HERE, naming the fix, rather than three phases later with an opaque
+    # "Could not find or access .../hive-cloud-glibc239 on the Ansible
+    # Controller". A --limit that keeps hosts of a glibc group but drops that
+    # group's build host builds nothing for them, and the push is the first task
+    # that notices.
+    - name: Assert each represented glibc group's build host is in this run
+      delegate_to: localhost
+      become: false
+      run_once: true
+      ansible.builtin.assert:
+        that:
+          - (ansible_play_hosts_all | intersect(groups['glibc239'] | default([])) | length == 0)
+            or (groups['glibc239'][0] in ansible_play_hosts_all)
+          - (ansible_play_hosts_all | intersect(groups['glibc238'] | default([])) | length == 0)
+            or (groups['glibc238'][0] in ansible_play_hosts_all)
+        fail_msg: >-
+          This run includes hosts from a glibc group without that group's BUILD
+          host, so nothing would be built for them and the push would fail later
+          with an opaque controller-path error. Add the builder to --limit:
+          glibc239 builds on '{{ groups['glibc239'][0] | default('?') }}',
+          glibc238 builds on '{{ groups['glibc238'][0] | default('?') }}'.
+          This run has: {{ ansible_play_hosts_all | join(',') }}.
+        success_msg: "build hosts present for every represented glibc group"
 
     # hive_name is a per-host var, not a hostname -- the control-plane
     # leader (hive_cp_owner_chain's first entry) is identified by matching
@@ -82,9 +115,21 @@
       run_once: true
       register: _artifact_tmp
 
+    # Read the registered value DIRECTLY, not through hostvars['localhost'].
+    #
+    # `delegate_facts: true` governs facts a module SETS (setup, set_fact); it
+    # does not move a `register` result, which is always stored on the inventory
+    # host the task ran for. So `hostvars['localhost']['_artifact_tmp']` never
+    # existed and every run of this playbook died here with
+    # "object of type 'HostVarsVars' has no attribute '_artifact_tmp'" —
+    # witnessed on a --limit fr canary (ok=3 changed=3 failed=1, and the node's
+    # binary provably unchanged afterwards).
+    #
+    # `run_once: true` already copies the registered result to every host in the
+    # play, so the plain name resolves on all of them.
     - name: Publish the artifact root to every host's facts
       ansible.builtin.set_fact:
-        hive_artifact_root: "{{ hostvars['localhost']['_artifact_tmp']['path'] }}"
+        hive_artifact_root: "{{ _artifact_tmp.path }}"
 
 - name: Backend build (parallel, one host per glibc group)
   hosts: glibc239_builder:glibc238_builder
@@ -181,7 +226,18 @@
   gather_facts: false
   tags: [always]
   tasks:
+    # Same defect as the publish task above, one play later: this play's host IS
+    # localhost, which was never in the play that registered `_artifact_tmp`, so
+    # `hostvars['localhost']['_artifact_tmp']` is undefined here too. Read the
+    # already-published `hive_artifact_root` off a platform host instead.
+    #
+    # `default('')` + the `when` guard so a run that failed BEFORE the fact was
+    # published cleans up nothing rather than dying in its own cleanup — a
+    # cleanup task that errors masks the real failure above it.
     - ansible.builtin.file:
-        path: "{{ hostvars['localhost']['_artifact_tmp']['path'] }}"
+        path: "{{ _root }}"
         state: absent
+      vars:
+        _root: "{{ hostvars[groups['platform'][0]]['hive_artifact_root'] | default('') }}"
+      when: _root | length > 0
       run_once: true

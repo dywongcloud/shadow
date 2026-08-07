@@ -15,6 +15,16 @@ bytes = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 iroh = "1"
+# Public mainline-DHT (pkarr/BEP-44) address lookup — see `src/dht.rs` for what
+# becomes publicly resolvable and how it is gated. `iroh-mainline-address-lookup`
+# 0.4 depends on iroh ^1.0 / iroh-dns ^1.0, matching the pins above; it does NOT
+# re-export `n0_mainline`, so `DhtBuilder` needs its own direct dependency.
+iroh-mainline-address-lookup = "0.4"
+n0-mainline = "0.5"
+# The `AddressLookup` trait's `resolve` returns `n0_future::boxed::BoxStream`,
+# so implementing the counting wrapper in `src/dht.rs` requires the same crate
+# iroh itself uses for that alias.
+n0-future = "0.3"
 url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -271,7 +271,34 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     return /^[a-z0-9.-]+$/i.test(first) ? first : "";
   };
   const nodeAngle = (i: number) => -Math.PI / 2 + (i * 2 * Math.PI) / n;
+  // The fleet's OWN headless browser nodes run ON a specific fleet host, and
+  // their `subject` names it (`fleet-browser-node:<node>`, minted server-side
+  // through the internal-token path — a browser cannot assert it).
+  //
+  // Prefer that over `relay_hint`, which answers a DIFFERENT question: which
+  // relay the peer is connected THROUGH. Every fleet browser node relays via
+  // one of the three relay hosts, so relay-anchoring drew the saopaulo,
+  // frankfurt and hongkong browser nodes orbiting bangkok/virginia instead of
+  // their own regions — they were on the map, but nothing tied them to the node
+  // they actually run on, which reads as "no browser node in saopaulo".
+  //
+  // relay_hint remains the anchor for real user browsers, which run on nobody's
+  // fleet host and for which the relay genuinely is the only topological tie.
+  const FLEET_BROWSER_SUBJECT = "fleet-browser-node:";
+  const hostNodeOf = (p: BrowserNode): string => {
+    const subject = (p as { subject?: string }).subject ?? "";
+    return subject.startsWith(FLEET_BROWSER_SUBJECT)
+      ? subject.slice(FLEET_BROWSER_SUBJECT.length).trim()
+      : "";
+  };
   const anchorOf = satellites.map((p) => {
+    const hostNode = hostNodeOf(p);
+    if (hostNode) {
+      const byHost = nodes.findIndex((nd) => nd.name === hostNode);
+      // Fall through to the relay hint only if that node is not on the diagram
+      // (e.g. it dropped out of the registry) — never silently mis-anchor.
+      if (byHost >= 0) return byHost;
+    }
     const hintHost = hostOf(p.relay_hint);
     if (!hintHost) return -1;
     return nodes.findIndex((nd) => hostOf(nd.relay_url) === hintHost || (Boolean(nd.name) && hintHost.includes(nd.name)));

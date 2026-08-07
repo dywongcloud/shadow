@@ -27,6 +27,11 @@ use tokio::sync::Mutex;
 // Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
 pub use iroh::Endpoint;
 
+/// Public mainline-DHT address lookup (`bind_full` registers it; `--dht-probe`
+/// and `GET /v1/mesh/discovery` read it). See the module docs for what becomes
+/// publicly resolvable and every env flag that gates it.
+pub mod dht;
+
 /// Connection-level QUIC idle timeout for trunked connections.
 ///
 /// This deliberately does NOT set a keep-alive interval. `QuicTransportConfig`'s
@@ -3048,18 +3053,26 @@ pub async fn bind_full(
             .expect("UNSPECIFIED v4/v6 with a parsed u16 port is always a bindable socket addr");
         tracing::info!(port, "pinned iroh QUIC bind port (HIVE_IROH_PORT)");
     }
-    if let Some(path) = key_path {
-        builder = builder.secret_key(load_or_create_secret(&path));
+    // Resolved BEFORE the builder so the mainline-DHT publisher below can sign
+    // its pkarr record with the SAME key the endpoint binds with — that identity
+    // is what makes the DHT record's key equal to this node's `EndpointId`.
+    // `None` (no key file: tests/dev, ephemeral identity) keeps iroh's own
+    // generate-on-bind behaviour, exactly as before.
+    let secret = key_path.map(|path| load_or_create_secret(&path));
+    if let Some(sk) = &secret {
+        builder = builder.secret_key(sk.clone());
     }
     let seed_addrs: Vec<EndpointAddr> = seeds
         .iter()
         .filter_map(|s| serde_json::from_str::<EndpointAddr>(&s.addr_json).ok())
         .collect();
+    let seed_count = seed_addrs.len();
     if !seed_addrs.is_empty() {
         builder = builder.address_lookup(iroh::address_lookup::MemoryLookup::from_endpoint_info(
             seed_addrs,
         ));
     }
+    let mut pkarr_count = 0usize;
     for raw in discovery_urls {
         let raw = raw.trim();
         if raw.is_empty() {
@@ -3070,11 +3083,26 @@ pub async fn bind_full(
                 builder = builder
                     .address_lookup(iroh::address_lookup::PkarrPublisher::builder(u.clone()))
                     .address_lookup(iroh::address_lookup::PkarrResolver::builder(u));
+                pkarr_count += 1;
             }
             Err(e) => {
                 tracing::warn!(url = raw, error = %e, "invalid HIVE_DISCOVERY_DNS entry; skipped")
             }
         }
+    }
+    dht::record_providers(seed_count, pkarr_count, n0_discovery);
+    // Public mainline DHT — registered LAST and strictly ADDITIVE. The seed
+    // `MemoryLookup` and any Seer `PkarrResolver` above stay registered and are
+    // consulted in parallel, so a seed/Seer hit still wins on latency and no
+    // code path ever becomes DHT-only. This is the only source that needs no
+    // fleet peer to be reachable first, which is why it is worth having at all
+    // (see `dht`'s module docs, including what becomes publicly resolvable).
+    //
+    // Built here rather than handed to iroh as an `AddressLookupBuilder`: iroh
+    // propagates a builder error out of `bind()`, and a failed DHT socket must
+    // degrade to a WARN, never to "P2P transport disabled".
+    if let Some(lookup) = dht::lookup_from_env(secret.as_ref()).await {
+        builder = builder.address_lookup(lookup);
     }
     let ep = builder.bind().await?;
     Ok(ep)

@@ -29,6 +29,46 @@
     dest: "{{ hive_src_dir }}/ui/.env.local"
     mode: "0640"
 
+# Discover node's DIRECTORY so the systemd unit's PATH can include it.
+#
+# The build tasks below append `{{ ansible_env.PATH }}` (the login PATH), so npm
+# ci / npm run build succeed wherever node lives. The UNIT did not: it hardcoded
+# PATH=/usr/local/bin:/usr/bin:/bin, and `next` is launched through a
+# `#!/usr/bin/env node` shebang. On a host where node is only under nvm
+# (fc-virginia-3: /root/.nvm/versions/node/v22.23.0/bin/node, nothing in
+# /usr/bin or /usr/local/bin) the build therefore PASSED and the service then
+# crash-looped 62 times with "/usr/bin/env: 'node': No such file or directory",
+# status=127 — the dashboard down on that node while every deploy reported
+# success. Build-time and run-time must resolve node the same way.
+- name: Locate the node binary (for the unit's PATH)
+  ansible.builtin.shell: |
+    set -u
+    p="$(command -v node 2>/dev/null || true)"
+    if [ -z "$p" ]; then
+      for c in /usr/local/bin/node /usr/bin/node /opt/node/bin/node; do
+        [ -x "$c" ] && { p="$c"; break; }
+      done
+    fi
+    printf '%s' "$p"
+  args:
+    executable: /bin/bash
+  register: hive_ui_node_which
+  changed_when: false
+  failed_when: false
+
+- name: Require node on the host
+  ansible.builtin.assert:
+    that:
+      - (hive_ui_node_which.stdout | default('') | trim) | length > 0
+    fail_msg: >-
+      node was not found on {{ inventory_hostname }}, so hive-ui cannot start
+      (next is launched via a `#!/usr/bin/env node` shebang). Install node, then
+      re-run.
+
+- name: Record node's directory for the unit PATH
+  ansible.builtin.set_fact:
+    hive_ui_node_dir: "{{ (hive_ui_node_which.stdout | trim) | dirname }}"
+
 - name: npm ci (clean install matching package-lock)
   ansible.builtin.command:
     cmd: npm ci

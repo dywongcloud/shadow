@@ -7,7 +7,11 @@ Wants=network-online.target
 [Service]
 WorkingDirectory={{ hive_src_dir }}/ui
 EnvironmentFile={{ hive_src_dir }}/ui/.env.local
-Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# node's own directory FIRST: `next` starts through a `#!/usr/bin/env node`
+# shebang, and on an nvm-only host node is in neither /usr/bin nor
+# /usr/local/bin, so a fixed PATH here made the service exit 127 in a restart
+# loop while the build (which uses the login PATH) succeeded.
+Environment=PATH={{ hive_ui_node_dir }}:/usr/local/bin:/usr/bin:/bin
 Environment=NODE_ENV=production
 Environment=PORT=3002
 ExecStart={{ hive_src_dir }}/ui/node_modules/.bin/next start -H 127.0.0.1 -p 3002
