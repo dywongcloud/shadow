@@ -6,6 +6,7 @@ import {
   positiveInteger,
   sourceDigest,
 } from "./artifact-policy.js";
+import { wrapArtifactSource } from "./node-runtime.js";
 
 const encoder = new TextEncoder();
 
@@ -162,7 +163,11 @@ export class BrowserFunctionRuntime {
       runner: undefined,
       ready: undefined,
       workerConfig: {
-        source,
+        // Same Node API surface as the worker lane (browser-node-api-runtime),
+        // installed around the source AFTER its digest was verified above.
+        // Nothing is replaced in the native lane's real Worker globals — the
+        // runtime only fills in what the substrate is missing.
+        source: wrapArtifactSource(source),
         mode: policy.mode,
         limits: {
           memoryBytes: policy.memoryBytes,

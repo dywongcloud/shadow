@@ -10,21 +10,33 @@
 //
 // browser-auto-serve-eligible-set: this picker is no longer how work REACHES a
 // node. The first, default option is automatic — the fleet derives this
-// tenant's whole browser-eligible set server-side and refreshes it on every
+// tenant's whole browser-eligible set server-side
+// (`browser_artifacts::eligible_for_tenant`) and re-derives it on every
 // admission renewal, so a function deployed after the node started begins being
-// served without anyone touching this page. What remains here is (a) an
-// explicit "capacity only" refusal and (b) pinning ONE function or database on
-// purpose, which is exactly as narrow as it looks.
+// served without anyone touching this page. What remains here is pinning ONE
+// function or database on purpose, which is exactly as narrow as it looks.
+//
+// bn-picker-drop-capacity-only: there is deliberately NO "serve nothing" option
+// any more. It described a node that served no function AND replicated no
+// database — a state the platform no longer produces for an admitted node:
+// `eligible_for_tenant` hands over the whole serve set unasked, and
+// `browser_db::auto_db_deployment_for_tenant` now rendezvous-hashes the
+// tenant's browser_db projects by endpoint id instead of refusing whenever
+// there is more than one. Offering opt-in-to-uselessness was describing a
+// node shape that had stopped existing, so the option was removed rather than
+// relabelled: every node that starts contributes.
 //
 // browser-node-optional-serve-target: this picker is still NOT a gate — every
-// option, including an empty list, starts a working node. Start never depends
-// on anything chosen here.
+// option, INCLUDING an empty list, starts a working node. Start never depends
+// on anything chosen here. An empty eligible set is not an error and not a
+// choice: it is a tenant that has nothing browser-eligible YET, and the node
+// begins serving on the next lease renewal with no restart.
 //
 // Keyboard: a plain radio group, so arrow keys move between options and Tab
 // enters/leaves the group — no custom key handling to get wrong. The whole
 // card is the <label>, which keeps the click/tap target large on mobile.
 
-import { Database, RadioTower, Radio, Sparkles } from "lucide-react";
+import { Database, RadioTower, Sparkles } from "lucide-react";
 import type { ExcludedDeployment, RunNodeTarget } from "@/lib/run-node-targets";
 
 export interface TargetSelection {
@@ -33,15 +45,16 @@ export interface TargetSelection {
 }
 
 /** What the picker can be set to: the automatic eligible set (the default —
- *  the fleet decides, live), capacity only, or ONE deliberately pinned target. */
-export type PickerSelection = TargetSelection | "auto" | "none";
+ *  the fleet decides, live) or ONE deliberately pinned target. Both serve
+ *  and/or replicate something; there is no third "contributes nothing" shape
+ *  (see bn-picker-drop-capacity-only above). */
+export type PickerSelection = TargetSelection | "auto";
 
 export function targetKey(t: TargetSelection): string {
   return `${t.deployment}\u0000${t.fn}`;
 }
 
 const AUTO_KEY = "\u0000auto";
-const NONE_KEY = "\u0000none";
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
@@ -54,11 +67,12 @@ function formatTimeout(ms: number): string {
 }
 
 function selectionKey(sel: PickerSelection): string {
-  return sel === "auto" ? AUTO_KEY : sel === "none" ? NONE_KEY : targetKey(sel);
+  return sel === "auto" ? AUTO_KEY : targetKey(sel);
 }
 
 export function TargetPicker({
   targets,
+  hasDatabase,
   excluded,
   loading,
   fetchError,
@@ -67,6 +81,14 @@ export function TargetPicker({
   disabled,
 }: {
   targets: RunNodeTarget[];
+  /** Whether this tenant has ANY ready deployment carrying a `browser_db`
+   *  block. Deliberately not derivable from `targets`, which lists a database
+   *  target only for deployments with no browser-eligible function — a project
+   *  that has both contributes a function target and would make the automatic
+   *  option under-describe what this node actually holds. The fleet assigns the
+   *  replica itself (`browser_db::auto_db_deployment_for_tenant`), so this only
+   *  decides whether the copy MENTIONS replication, never which database. */
+  hasDatabase: boolean;
   /** Deployments contributing no selectable target because they aren't ready,
    *  or expose neither a browser-eligible function nor a browser database —
    *  each with the REASON. A bare count told the one person who cared least
@@ -76,9 +98,9 @@ export function TargetPicker({
   excluded: ExcludedDeployment[];
   loading: boolean;
   fetchError: string | null;
-  /** `"auto"` = the automatic eligible set (the default), `"none"` = the
-   *  explicit "serve nothing" choice, an object = one pinned target. All three
-   *  are real, supported ways to run a node — never an unfinished form. */
+  /** `"auto"` = the automatic eligible set (the default and the only unpinned
+   *  shape), an object = one pinned target. Both are real, supported ways to
+   *  run a node — never an unfinished form. */
   selected: PickerSelection;
   onSelect: (sel: PickerSelection) => void;
   /** True while the node is running — the attached target is fixed for the
@@ -107,23 +129,18 @@ export function TargetPicker({
               {loading && !fetchError
                 ? "Checking what this team has…"
                 : eligible === 0
-                  ? "Nothing is browser-eligible in this team yet — the node still joins the mesh and starts serving the moment something is, with no restart."
-                  : `${eligible} browser-eligible function${eligible === 1 ? "" : "s"} right now. New deployments are picked up automatically, within a minute, without restarting the node.`}
+                  ? hasDatabase
+                    ? "No function is browser-eligible in this team yet, so this node starts out replicating the database the fleet assigns it — and picks up the first eligible function on its own, without restarting."
+                    : "Nothing is browser-eligible in this team yet — the node still joins the mesh and starts serving the moment something is, with no restart."
+                  : `${eligible} browser-eligible function${eligible === 1 ? "" : "s"} right now${
+                      hasDatabase ? ", plus a replica of one of this team's browser databases" : ""
+                    }. New deployments are picked up automatically, within a minute, without restarting the node.`}
             </>
           }
         />
-        <Option
-          optionKey={NONE_KEY}
-          checked={selectedKey === NONE_KEY}
-          disabled={disabled}
-          onSelect={() => onSelect("none")}
-          icon={<Radio className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />}
-          title="Nothing — just contribute capacity"
-          detail="Joins the mesh, holds a relay identity and appears on the constellation map. Serves no function and replicates no database."
-        />
         {targets.length > 0 && (
           <p className="mt-1 text-[11px] text-muted">
-            Or pin exactly one thing — this node then serves only that, and nothing new is added to it
+            Or narrow this node to exactly one thing — it then carries only that, and nothing new is added to it
             automatically.
           </p>
         )}
@@ -189,8 +206,9 @@ export function TargetPicker({
         <div className="mt-2 rounded-md border border-dashed border-border-strong p-3 text-xs leading-relaxed text-secondary">
           <p className="font-medium text-fg">Nothing in this team can run in a browser yet.</p>
           <p className="mt-1">
-            That doesn&apos;t stop you running a node — it just runs with no serve lane until something is
-            eligible, and then it picks that up{" "}
+            That doesn&apos;t stop you running a node, and it isn&apos;t an error — start it now and it joins the
+            mesh, holds a relay identity and appears on the constellation map, with an idle serve lane until
+            something is eligible. Then it picks that up{" "}
             <span className="font-medium text-fg">on its own, without restarting</span>. A function becomes
             eligible automatically once it&apos;s a JS or Bun request→response handler that exports{" "}
             <code className="font-mono">module.exports</code> (or ships a <code className="font-mono">browser.js</code>{" "}

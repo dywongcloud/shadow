@@ -1,5 +1,69 @@
 # Changelog
 
+## (pending) — Browser functions run against a real Node API
+
+A browser function may now be written the way a Node function is written. The
+build-time scan that rejected `require(`, `import(`, `process.`, `Buffer`,
+`__dirname`, `__filename`, `Deno.`, `Bun.` and (in quickjs mode) `fetch(` is
+GONE — globally, for every function — and the substrate supplies the surface
+those tokens name instead of refusing the source that used them.
+
+- **`crates/hive-browser/www/node-runtime.js` (new).** Installed in the guest
+  immediately before the artifact function: a CommonJS `require` over the Node
+  builtin set (`path`, `events`, `util`, `stream`, `string_decoder`,
+  `querystring`, `url`, `os`, `assert`, `crypto`, `fs`, `http`/`https`,
+  `buffer`, `process`, `timers`, `perf_hooks`, `vm`, `module`, `async_hooks`,
+  `zlib`, `v8`, …) plus `express`, a real `Buffer` (a `Uint8Array` subclass),
+  `process`, `console`, timers, `URL`/`URLSearchParams`,
+  `TextEncoder`/`TextDecoder`, `atob`/`btoa`, `performance`,
+  `structuredClone`, `AbortController`, `__dirname`/`__filename`. The QuickJS
+  guest had NONE of these — measured against the shipped bundle, its global
+  object is bare ECMAScript, so the old rejection message ("use
+  Uint8Array/TextEncoder, both exist in QuickJS") named an API that was not
+  there.
+- **Not almostnode.** The obvious candidate is a 16 MB browser-hosted Node
+  emulator that owns module resolution, an npm client and dev servers, executes
+  with host-realm `eval`, assigns `globalThis.process`, and references
+  `window`/`document`/`navigator`/`localStorage`/`Worker`/service workers
+  throughout its built bundle — none of which exist in a QuickJS guest, and its
+  own README rates `net`/`tls`/`dns`/`dgram`/`cluster`/`vm`/`v8` "stubs only"
+  and tells you to run untrusted code in a separately-deployed cross-origin
+  iframe. What it genuinely provides for a sandboxed guest is implemented
+  directly here, against this substrate's real primitives.
+- **Both calling conventions, one reconciliation point.** The emitted wrapper
+  passes the handler a `req` that is a SUPERSET of the platform request
+  descriptor and a `res` that is a superset of `ops`, so
+  `(request, ops) => ({status, body})` keeps working byte-identically while
+  `(req, res) => res.json(...)`, an Express app, and
+  `http.createServer(...)` + `server.listen(PORT)` all work as written.
+  `bridge.settle(out)` decides: an explicit non-`res` return value wins,
+  otherwise the response written on `res` is used (including the
+  `return res.json(x)` shape, which returns `res`, not `undefined`).
+- **Unsupported stays LOUD, at the honest boundary.** `net`, `tls`, `dns`,
+  `dgram`, `cluster`, `child_process`, `worker_threads`, `zlib`, outbound
+  `http.request`, `crypto.randomBytes`/`randomUUID` (there is no CSPRNG in the
+  guest, and Math.random is not one), a relative `require('./x')` and any npm
+  dependency each throw a NAMED error at the call — never a silent no-op. The
+  refusal moved from build time to the exact line that cannot work, so a
+  handler that never takes that branch is no longer blocked from deploying.
+- **`process.env` is EMPTY** (`NODE_ENV`, `HIVE_BROWSER_NODE` only) and is never
+  populated from the host: project env and secrets still never ship to a
+  donor's browser. That was the real reason `process.` was banned; it is now
+  enforced where it belongs.
+- **Unchanged on purpose:** the canonical policy digest (both implementations,
+  byte-identical, no new mode and no new host op), admission/capability
+  derivation, tenant ownership checks, and pin()'s size + BLAKE3 + policy-digest
+  verification of artifact bytes. The Node runtime wraps AROUND verified source;
+  it never rewrites it and grants nothing `allowed_ops` did not already grant.
+- **Still rejected at build:** static `import`/`export` STATEMENTS. The artifact
+  is evaluated as one function expression, where they are a hard SyntaxError —
+  permitting them would only defer the failure into every donor's browser, at
+  boot, for every request. CommonJS is the supported form.
+- Published: `ui/scripts/sync-browser-node.mjs` now copies `node-runtime.js`
+  into `ui/public/browser-node/` — it is a STATIC import of
+  worker-function-runtime.js, so omitting it would break the SharedWorker's
+  whole module graph on the fleet while every local check stayed green.
+
 ## (pending) — Browser nodes are dispatched to, not hand-fed
 
 A running browser node now receives whatever browser-eligible work its tenant

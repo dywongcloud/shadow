@@ -86,27 +86,30 @@ pub fn place_for_project(
             let gpu_ok = !needs_gpu || n.gpu_count > 0;
             if n.healthy && region_ok && reachable && gpu_ok {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
+                // Carry BOTH transports whenever both are known. They are
+                // complementary, not alternatives: a security group that blocks
+                // 8786/8787 kills HTTP admin dispatch while the node stays
+                // perfectly healthy over iroh, and a degraded mesh path fails the
+                // reverse way. Filling only one (this used to set `iroh: None` the
+                // moment an admin URL existed, and vice versa) left the dispatcher
+                // with no second option, so a single transport hiccup failed the
+                // whole deploy — witnessed as "✗ fc-sanjose-gpu-1: iroh dispatch
+                // failed" on a node that was otherwise healthy. `dispatch_deploy`
+                // decides preference and falls back.
                 let target = if n.name == cloud.node_name {
                     Target {
                         node: n.name.clone(),
                         admin: None,
                         iroh: None,
                     }
-                } else if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
-                    Target {
-                        node: n.name.clone(),
-                        admin: Some(a),
-                        iroh: None,
-                    }
                 } else {
-                    let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
-                        (Some(id), Some(addr)) => Some((id, addr)),
-                        _ => None,
-                    };
                     Target {
                         node: n.name.clone(),
-                        admin: None,
-                        iroh,
+                        admin: cloud.node_admins.read().get(&n.name).cloned(),
+                        iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
+                            (Some(id), Some(addr)) => Some((id, addr)),
+                            _ => None,
+                        },
                     }
                 };
                 return vec![target];
@@ -169,8 +172,14 @@ pub fn place(
     let me = cloud.node_name.clone();
     let load = load_map(cloud);
     let load_of = |name: &str| -> usize { load.get(name).copied().unwrap_or(0) };
-    // Build the dispatch route for a chosen node: self (both None), HTTP admin URL, or
-    // iroh (id, addr) when no HTTP path exists (NAT'd coordinator → FC over the mesh).
+    // Build the dispatch route for a chosen node: self (both None), else EVERY
+    // transport that node currently has — HTTP admin URL and/or iroh (id, addr).
+    //
+    // Both are filled when both are known. They fail independently (a security
+    // group blocking 8786/8787 kills HTTP while iroh is fine; a degraded mesh path
+    // fails the other way), so populating only the preferred one left the
+    // dispatcher no second option and turned one transport hiccup into a failed
+    // deployment. `dispatch_deploy` prefers HTTP and falls back to iroh.
     let target_of = |n: &NodeInfo| -> Target {
         if n.name == me {
             return Target {
@@ -179,21 +188,13 @@ pub fn place(
                 iroh: None,
             };
         }
-        if let Some(a) = cloud.node_admins.read().get(&n.name).cloned() {
-            return Target {
-                node: n.name.clone(),
-                admin: Some(a),
-                iroh: None,
-            };
-        }
-        let iroh = match (n.peer_id.clone(), n.iroh_addr.clone()) {
-            (Some(id), Some(addr)) => Some((id, addr)),
-            _ => None,
-        };
         Target {
             node: n.name.clone(),
-            admin: None,
-            iroh,
+            admin: cloud.node_admins.read().get(&n.name).cloned(),
+            iroh: match (n.peer_id.clone(), n.iroh_addr.clone()) {
+                (Some(id), Some(addr)) => Some((id, addr)),
+                _ => None,
+            },
         }
     };
     // A node is dispatchable if it's us, we know its HTTP admin URL, OR we can reach it

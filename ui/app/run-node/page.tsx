@@ -21,14 +21,19 @@ import { TargetPicker, type PickerSelection, type TargetSelection } from "./targ
 // that rotates the policy digest under the same name keeps working and a
 // deleted/ineligible target fails visibly and clears instead of replaying.
 // browser-node-optional-serve-target: an EMPTY deployment is the persisted
-// form of "attached to nothing", which is a real choice a node runs on — not
-// an absent one.
-// browser-auto-serve-eligible-set: the persisted shape gains `mode`
-// ("auto" | "none" | "target"). A record written BEFORE this field existed
-// carries an empty deployment for the old "Nothing" option; it restores as
-// "auto" (this build's default) rather than "none" — auto is the same node
-// plus the donor's OWN tenant's eligible functions, resolved server-side, and
-// the page states plainly which mode is live with one click to change it.
+// form of "nothing pinned", which is a real state a node runs on — not an
+// absent one.
+// browser-auto-serve-eligible-set: the persisted shape carries `mode`
+// ("auto" | "target").
+// bn-picker-drop-capacity-only: `mode: "none"` was the third value and is
+// RETIRED — the node it described (serves no function, replicates no database)
+// is not a shape the platform produces any more, now that
+// `browser_artifacts::eligible_for_tenant` derives the serve set unasked and
+// `browser_db::auto_db_deployment_for_tenant` assigns a replica instead of
+// refusing when a tenant has several browser_db projects. Any persisted record
+// with an empty deployment — written by an older build as "none", or by this
+// one as "auto" — restores as "auto". Reading it back as a mode that can no
+// longer be chosen would leave the page unable to render its own selection.
 const TARGET_KEY = "hive_run_node_target";
 const GEO_QUANT_DEGREES = 0.5; // matches the server-side floor — defense in depth, not the only gate
 // Re-derive the fix well before the browser's own 10-minute cache
@@ -71,6 +76,13 @@ export default function RunNodePage() {
     functions?: FunctionLaneStatus | null;
   };
   const serveMode: ServeMode = widened.serveMode ?? "none";
+  // Whether the worker REPORTED a serve lane at all. The `?? "none"` above is a
+  // safe default for every comparison, but it collapses two different worlds:
+  // a session that genuinely asked for the retired capacity-only mode, and a
+  // background worker so old it has no `serveMode` field to report. Telling the
+  // second "you started in serve-nothing mode" is a plain falsehood about a
+  // choice the person never made, so the idle copy below tells them apart.
+  const serveModeReported = widened.serveMode !== undefined;
   const servingList = widened.functions?.serving ?? [];
   const pinnedCount = widened.functions?.pinned.length ?? 0;
   const functionFailures = widened.functions?.failed ?? [];
@@ -164,7 +176,7 @@ export default function RunNodePage() {
         JSON.stringify({
           deployment: typeof sel === "object" ? sel.deployment : "",
           fn: typeof sel === "object" ? sel.fn : "",
-          mode: typeof sel === "object" ? "target" : sel,
+          mode: typeof sel === "object" ? "target" : "auto",
           scope: nextScope,
         }),
       );
@@ -202,16 +214,12 @@ export default function RunNodePage() {
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed.deployment === "string" && typeof parsed.fn === "string") {
-          // An empty deployment is a MODE, never a target named "". `mode` is
-          // authoritative when present; a record written before it existed
-          // restores as "auto" (see TARGET_KEY's note).
-          setSelection(
-            parsed.deployment
-              ? { deployment: parsed.deployment, fn: parsed.fn }
-              : parsed.mode === "none"
-                ? "none"
-                : "auto",
-          );
+          // An empty deployment is a MODE, never a target named "". The only
+          // unpinned mode left is "auto", so a record persisting the retired
+          // "none" restores as "auto" too (see TARGET_KEY's note) — the node it
+          // named would contribute nothing, which is exactly what this build
+          // stopped offering.
+          setSelection(parsed.deployment ? { deployment: parsed.deployment, fn: parsed.fn } : "auto");
           if (parsed.scope === "public" || parsed.scope === "team") setScope(parsed.scope);
         }
       }
@@ -385,22 +393,36 @@ export default function RunNodePage() {
 
   // What this node will actually do, stated before it starts — the honest
   // counterpart to no longer gating Start. Never implies a browser can run
-  // something it cannot: with nothing attached the serve lane is simply idle,
-  // and the reason (an all-servers/containers tenant vs. a deliberate choice)
+  // something it cannot: with nothing eligible the serve lane is simply idle,
+  // and the reason (an all-servers/containers tenant, a session still landing)
   // is named rather than left to be inferred from a disabled button.
   const eligibleCount = targets.filter((t) => t.kind === "function").length;
+  // Whether this tenant has ANY ready deployment with a `browser_db` block —
+  // read straight off the deployment list rather than off `targets`, which
+  // surfaces a database target only for deployments that have no
+  // browser-eligible function. The fleet picks WHICH replica this endpoint
+  // holds (`auto_db_deployment_for_tenant` rendezvous-hashes by endpoint id);
+  // this only decides whether replication is mentioned at all.
+  const hasDatabase = (deployments ?? []).some((d) => d.state === "ready" && !!d.browser_db);
+  // bn-picker-drop-capacity-only: no "serve nothing" branch, because there is
+  // no such selection any more. Every unpinned node is automatic, and automatic
+  // with an empty eligible set is a STATE (nothing eligible yet), not a choice
+  // to be useless — so the copy says what happens next instead of describing a
+  // node that contributes nothing.
   const serveNotice =
-    selection === "none"
-      ? "This node will serve no function — it joins the mesh, holds a relay identity, and appears on the constellation map. Switch to automatic below to also carry this team's browser-eligible work."
-      : selection !== "auto"
-        ? null
-        : authWindow
-          ? "Still signing in — this node starts either way and picks up whatever this team has once the session lands, with no restart."
+    selection !== "auto"
+      ? null
+      : authWindow
+        ? "Still signing in — this node starts either way and picks up whatever this team has once the session lands, with no restart."
+        : eligibleCount === 0 && hasDatabase
+          ? "No function in this team can run in a browser engine yet, so this node starts by replicating the database the fleet assigns it — and starts serving functions on its own the moment one becomes eligible, without restarting."
           : eligibleCount === 0 && excluded.length > 0
             ? "Nothing in this team can run in a browser engine yet, so this node starts with an idle serve lane. It still joins the mesh, holds a relay identity, appears on the constellation map, and counts as donated capacity — and it starts serving on its own the moment something becomes eligible."
             : eligibleCount === 0
               ? "You have nothing browser-eligible deployed yet, so this node starts with an idle serve lane — and picks up your first eligible function automatically, without restarting."
-              : `This node will serve every browser-eligible function in this team (${eligibleCount} right now), and picks up new deployments automatically without restarting.`;
+              : `This node will serve every browser-eligible function in this team (${eligibleCount} right now)${
+                  hasDatabase ? ", plus a replica of one of this team's browser databases" : ""
+                }, and picks up new deployments automatically without restarting.`;
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -445,9 +467,11 @@ export default function RunNodePage() {
       <section className="mb-5 rounded-lg border border-border bg-card p-4">
         <h2 className="mb-1 text-sm font-medium text-fg">What this node serves</h2>
         <p className="mb-3 text-xs leading-relaxed text-secondary">
-          By default this node carries whatever your team has that can run in a browser — decided by the fleet,
-          refreshed every minute, so a function you deploy later starts being served here without restarting
-          anything. Pin one deployment instead, or serve nothing at all; either way it runs.
+          By default this node carries whatever your team has that can run in a browser, plus whichever database
+          the fleet assigns it — decided server-side, refreshed every minute, so a function you deploy later
+          starts being served here without restarting anything. Narrow it to a single deployment if you want to.
+          Either way it contributes: a node whose team has nothing eligible yet joins the mesh now and starts
+          carrying work the moment something is.
         </p>
         {(selectionError || replayError) && (
           <div
@@ -468,6 +492,7 @@ export default function RunNodePage() {
         )}
         <TargetPicker
           targets={targets}
+          hasDatabase={hasDatabase}
           excluded={excluded}
           loading={deploymentsLoading && !deployments}
           fetchError={deploymentsError}
@@ -478,29 +503,25 @@ export default function RunNodePage() {
         <div className="mt-3">
           <Field label="Visibility">
             <select
-              value={selection === "none" ? "team" : scope}
+              value={scope}
               onChange={(e) => chooseScope(e.target.value as "team" | "public")}
               // Visibility decides who may INVOKE what this node serves (and,
               // for a database grant, whether an anonymous donor gets a
-              // read-only replica). With NOTHING served there is nothing to
-              // expose, so the choice is not merely inert — offering "Public"
-              // would send a non-admin into a guaranteed FORBIDDEN
-              // (`public_scope_forbidden`) for a node that exposes nothing.
-              // Automatic serving DOES expose something, so it keeps the
-              // choice: "public + automatic" means every browser-eligible
-              // function this team has, invokable by anyone.
-              disabled={status.lifecycle !== "stopped" || selection === "none"}
+              // read-only replica). It used to be force-disabled for the
+              // retired "serve nothing" selection, where offering "Public"
+              // would have sent a non-admin into a guaranteed FORBIDDEN
+              // (`public_scope_forbidden`) for a node that exposed nothing.
+              // Every remaining selection exposes something — "public +
+              // automatic" means every browser-eligible function this team has,
+              // invokable by anyone — so lifecycle is the only thing that
+              // disables it.
+              disabled={status.lifecycle !== "stopped"}
               className="w-full rounded-md border border-border bg-bg px-2.5 py-1.5 text-sm disabled:opacity-60"
             >
               <option value="team">Team only</option>
               <option value="public">Public (admins &amp; public-node divisions)</option>
             </select>
           </Field>
-          {selection === "none" && (
-            <p className="mt-1 text-[11px] text-muted">
-              Nothing is served, so there is nothing for anyone to invoke — this node runs as team-only.
-            </p>
-          )}
           {selection === "auto" && scope === "public" && (
             <p className="mt-1 text-[11px] text-muted">
               Public + automatic: every browser-eligible function this team has — including ones deployed later —
@@ -583,19 +604,39 @@ export default function RunNodePage() {
           <dd className="truncate font-mono text-secondary">{status.relay ?? "—"}</dd>
           <dt className="text-muted">Admission</dt>
           <dd className="text-secondary">{status.admission}</dd>
-          {/* browser-node-optional-serve-target: a running node that serves
-              nothing is a supported, useful state, so it says so plainly here
+          {/* browser-node-optional-serve-target: a running node with an idle
+              serve lane is a supported state, so it says WHY plainly here
               instead of leaving a blank where a function name would be.
               `serving` is derived by the worker from what is actually PINNED,
-              never from what was requested. */}
+              never from what was requested — and the idle causes
+              (database-only pin, a pin still loading, a retired capacity-only
+              session, a worker too old to report its lane, nothing eligible
+              yet, and nothing handed over yet) are genuinely different things
+              to tell someone, so none is collapsed into the others. */}
           <dt className="text-muted">Serving</dt>
           <dd className="text-secondary">
             {status.lifecycle === "stopped"
               ? "—"
               : !serving
-                ? serveMode !== "auto"
-                  ? "not serving a function — contributing mesh presence and relay capacity"
-                  : // Two different causes, and this page can tell them apart from
+                ? serveMode === "pinned"
+                  ? explicit && explicit.fn === ""
+                    ? "no function — this node is pinned to a database replica only"
+                    : "pinned function not loaded yet — retrying on the next renewal"
+                  : serveMode === "none"
+                    ? // bn-picker-drop-capacity-only: unreachable from THIS
+                      // build's picker. Two distinct pasts land here and the
+                      // remedy is the same, but the cause is not: a session an
+                      // older page really did start capacity-only, versus a
+                      // background worker predating the field entirely (the
+                      // `?? "none"` default above), for which the
+                      // outdated-worker banner further down is the real story.
+                      // Naming the fix beats leaving a running node
+                      // permanently idle with no explanation — but not at the
+                      // cost of blaming someone for a mode they never picked.
+                      serveModeReported
+                      ? "capacity only — started in the retired serve-nothing mode; Stop and Start it to carry this team's work"
+                      : "serve lane unreported — this node's background worker predates automatic serving; Stop and Start it to carry this team's work"
+                    : // Two different causes, and this page can tell them apart from
                     // the deployment list it already polls: the team genuinely has
                     // nothing eligible, versus it does and the fleet hasn't handed
                     // any over yet (a mid-rollout node, a lease still settling).
@@ -730,20 +771,22 @@ export default function RunNodePage() {
                 // automatic node — empty deployment/fn/digest plus
                 // `serveMode: "auto"`, and the server derives the whole
                 // eligible set itself from this tenant's Ready deployments.
-                // "none" keeps the target-less shape exactly as it was: an
-                // admission with no artifact capability and no serve route.
-                const auto = selection === "auto";
+                // bn-picker-drop-capacity-only: `serveMode` is now ALWAYS
+                // "auto". With a pin the worker overrides it to "pinned" from
+                // the non-empty deployment anyway (run-node-worker.js's start
+                // handler), so this is the one honest value: nothing the page
+                // can send asks the fleet for a node that carries nothing.
+                // That also covers the one-render window where a persisted pin
+                // has failed revalidation and the fallback-to-auto effect has
+                // not committed yet — it starts automatic, not empty.
                 start({
                   deployment: selectedTarget?.deployment ?? "",
                   fn: selectedTarget?.fn ?? "",
                   digest: selectedTarget?.policyDigest ?? "",
-                  serveMode: auto ? "auto" : "none",
-                  // Scope only means something when something is served; a
-                  // node serving nothing is always team-only (see the
-                  // Visibility field above), so a stale "public" choice can
-                  // never turn a bare node into a guaranteed
-                  // `public_scope_forbidden`.
-                  scope: selectedTarget || auto ? scope : "team",
+                  serveMode: "auto",
+                  // Every startable selection now exposes something, so the
+                  // chosen scope always applies (see the Visibility field).
+                  scope,
                 });
               }}
               disabled={!canStart || !supported}

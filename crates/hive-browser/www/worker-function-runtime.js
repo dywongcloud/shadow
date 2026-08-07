@@ -19,6 +19,16 @@
 //     (verified against the built bundle: self.location/onmessage/postMessage/
 //     close; emscripten's window/document references are feature-tests that are
 //     false in any worker scope).
+//   * NODE API (browser-node-api-runtime). The QuickJS guest's global object is
+//     bare ECMAScript — measured: no console, no TextEncoder/TextDecoder, no
+//     URL, no timers, no atob/btoa, no crypto, no fetch. node-runtime.js is
+//     evaluated in the guest immediately before the artifact function and
+//     supplies `require`/`process`/`Buffer`/`console`/timers/`URL`/
+//     `TextEncoder` plus the Node builtin module set, so a handler written for
+//     Node (including an Express app or a `(req, res)` listener) runs as
+//     written. It is wrapped AROUND the verified source, never merged into it:
+//     pin()'s size/BLAKE3/policy-digest verification below is unchanged and
+//     still runs against the exact bytes the server described.
 //   * Execution budgets are capped by maxExecBlockMs BELOW the policy ceiling
 //     when necessary: one synchronous guest segment blocks this worker's whole
 //     event loop, including the iroh endpoint driving the relay connection, so
@@ -36,6 +46,7 @@ import {
   registryAbiFor,
   sourceDigestBytes,
 } from "./artifact-policy.js";
+import { wrapArtifactSource } from "./node-runtime.js";
 
 const QUICKJS_INTERRUPT_GRACE_MS = 50;
 const ARTIFACT_SOURCE_MAX_BYTES = 512 * 1024; // build contract caps entries at 256 KiB + fixed envelope
@@ -150,7 +161,16 @@ class InlineFunctionRunner {
       }), controller.signal);
       this.port.postMessage({
         kind: "boot",
-        source: this.artifact.source,
+        // The Node API surface (browser-node-api-runtime) is installed AROUND
+        // the verified artifact, never inside it: `wrapArtifactSource` returns
+        // an expression that installs `require`/`process`/`Buffer`/`console`/
+        // timers/`URL`/`TextEncoder` in the guest and then evaluates to the
+        // artifact function unchanged. The artifact BYTES are untouched — they
+        // were size-checked, BLAKE3-matched and policy-digest-verified by
+        // pin() before this line, and none of that is recomputed or relaxed
+        // here. The runtime is substrate, exactly like `ops`: it grants no
+        // capability the artifact's `allowed_ops` did not already grant.
+        source: wrapArtifactSource(this.artifact.source),
         mode: "quickjs",
         limits: {
           memoryBytes: this.artifact.memoryBytes,

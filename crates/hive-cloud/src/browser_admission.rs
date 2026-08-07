@@ -5,18 +5,18 @@
 //! snapshots and only use the records to program Gateway's browser target layer.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use fluid_gateway::{BrowserScope, BrowserTarget};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::{Arc, OnceLock};
 
 use crate::state::CloudState;
 
@@ -361,6 +361,27 @@ impl BrowserAdmissionStore {
             .filter(|record| record.tenant == tenant && record.expires_ms > now)
             .cloned()
             .collect()
+    }
+
+    /// Every live admission across EVERY tenant, ordered by endpoint id.
+    ///
+    /// The ROLL CALL's inventory view (`roll_call` below) and nothing else: an
+    /// operator-only, read-only sweep needs the whole protocol population, not
+    /// one tenant's slice, and deriving it by iterating tenants would miss any
+    /// record whose tenant contributes no other signal. Deliberately NOT
+    /// exposed beyond this module — every tenant-facing reader keeps going
+    /// through [`Self::list`]/[`Self::get`], which pin the tenant.
+    fn active(&self, now: u64) -> Vec<BrowserAdmission> {
+        let mut out: Vec<BrowserAdmission> = self
+            .inner
+            .lock()
+            .active
+            .values()
+            .filter(|record| record.expires_ms > now)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+        out
     }
 
     fn get(&self, tenant: &str, endpoint_id: &str, now: u64) -> Option<BrowserAdmission> {
@@ -781,6 +802,16 @@ pub fn routes() -> Router<Arc<CloudState>> {
             get(get_admission).delete(revoke_admission),
         )
         .route("/v1/browser/stats", get(browser_stats))
+        .route("/v1/browser/rollcall", get(roll_call_view))
+        // POST, never GET, and the method is the whole design (see
+        // `browser_signals`): `admin_ingress` forwards mutations to the
+        // control-plane leader and serves GETs LOCALLY behind round-robin DNS,
+        // so a mailbox READ over GET would land on an arbitrary node and find
+        // an empty box — AGENTS.md's "Round-robin reads vs leader-forwarded
+        // writes". Both peers' POSTs converge on the one leader, which is what
+        // makes a node-local mailbox correct at all; the read rides the POST's
+        // own reply.
+        .route("/v1/browser/signals", post(browser_signals))
         .route(
             "/v1/browser/deployments/:id/status",
             get(deployment_status),
@@ -904,6 +935,16 @@ async fn browser_stats(State(cloud): State<Arc<CloudState>>, claims: Claims) -> 
         "admissions": cloud.browser_admissions.stats(),
         "presence": cloud.browser_presence.stats(),
         "pool": pool_stats,
+        "signals": signal_stats(),
+        // Counters only — the full roster (which names endpoints and tenants)
+        // lives behind `/v1/browser/rollcall`, so this endpoint stays the
+        // cardinality-free aggregate it was built as. `null` until this node's
+        // first sweep, never a fabricated zero.
+        "roll_call": last_roll_call()
+            .lock()
+            .as_ref()
+            .map(RollCall::summary)
+            .unwrap_or(Value::Null),
     })))
 }
 
@@ -1442,6 +1483,16 @@ async fn admit(
             db_capability
                 .as_ref()
                 .map(|(grant, resolved)| (record.tenant.as_str(), grant, resolved)),
+            MeshSelf {
+                tenant: &record.tenant,
+                endpoint_id: &record.endpoint_id,
+                scope: record.scope,
+                project: record
+                    .db
+                    .as_ref()
+                    .map(|grant| grant.project.as_str())
+                    .unwrap_or_default(),
+            },
         ),
     })))
 }
@@ -1490,6 +1541,7 @@ fn capability_json(
     auto: bool,
     expires_ms: u64,
     db: Option<(&str, &BrowserDbGrant, &fluid_core::ResolvedBrowserDbPolicy)>,
+    me: MeshSelf<'_>,
 ) -> Value {
     let artifact_json = |grant: &ServeGrant| {
         let a = &grant.artifact;
@@ -1539,6 +1591,17 @@ fn capability_json(
     if let Some((tenant, grant, resolved)) = db {
         out["db"] = crate::browser_db::capability_db_json(cloud, tenant, grant, resolved, expires_ms);
     }
+    // The browser↔browser DIRECT lane's peer set (bn-browser-peer-webrtc-mesh)
+    // rides the SAME atomic snapshot, for the same reason `db` and
+    // `trusted_callers` do: a peer grant is live server state, and the donor
+    // reconciles its whole session set from one response rather than
+    // piecemeal. Absent block = no mesh at all (what every pre-upgrade node
+    // answers, and what a fleet with `HIVE_BROWSER_MESH=0` answers), which
+    // run-node-worker.js already treats as "tear the lane down and keep the
+    // relay path".
+    if let Some(mesh) = mesh_capability_json(cloud, me, hive_core::now_ms()) {
+        out["mesh"] = mesh;
+    }
     out
 }
 
@@ -1572,6 +1635,1149 @@ fn trusted_caller_ids(cloud: &Arc<CloudState>) -> Vec<String> {
         }
     }
     ids.into_iter().collect()
+}
+
+// ---------------------------------------------------------------------------
+// The browser↔browser DIRECT lane (bn-browser-peer-webrtc-mesh): server half.
+//
+// Two arms, both strictly additive to the iroh relay path:
+//   * the `mesh` capability block — WHO a donor may address, derived here from
+//     live admissions under the authenticated tenant, exactly like
+//     `trusted_callers` and `db.sync_peers`;
+//   * `POST /v1/browser/signals` — a bounded, authenticated mailbox carrying
+//     offer/answer/ice/bye envelopes between two ALREADY-ADMITTED endpoints.
+//
+// The mailbox moves opaque JSON strings and nothing else. It cannot read a
+// peer's SDP into anything, and it deliberately CANNOT substitute one: the
+// envelope's DTLS fingerprint is signed by the sender's ed25519 endpoint key
+// (`hive_browser::sign_mesh_envelope`) and verified by the receiver against
+// the endpoint id THIS server admitted, so a compromised mailbox can drop or
+// delay a handshake but never sit in the middle of one. That is why the
+// signalling surface is allowed to be a plain HTTP arm at all.
+//
+// Enumeration is impossible by construction: a donor never names a peer. It
+// receives a server-derived set, and `to` is refused unless it is a member of
+// THAT set, re-derived from live state on every single call — never from the
+// caller's cached capability, never from client input.
+// ---------------------------------------------------------------------------
+
+/// Default peer-set ceiling per donor. A browser holds one RTCPeerConnection +
+/// DataChannel per peer, so this is a real per-tab resource bound, not a
+/// formality; `fluid_gateway::MAX_BROWSER_TARGETS_PER_ENDPOINT` has the same
+/// shape for routes. peer-mesh.js caps at 32 independently.
+const MESH_MAX_PEERS: usize = 16;
+const MESH_PEER_HARD_CAP: usize = 32;
+const MESH_ARTIFACTS_PER_PEER: usize = 64;
+const MESH_PROTOCOL_VERSION: u16 = 1;
+
+/// Mailbox bounds. Every one of them is enforced per CALL as well as per
+/// endpoint, so a donor cannot convert the signalling arm into storage.
+const SIGNAL_TTL_MS: u64 = 60_000;
+const SIGNAL_MAX_PER_ENDPOINT: usize = 32;
+const SIGNAL_MAX_PAYLOAD_BYTES: usize = 16 * 1024;
+const SIGNAL_MAX_SEND_PER_CALL: usize = 16;
+const SIGNAL_MAX_DELIVER_PER_CALL: usize = 16;
+/// Hard ceiling on inboxes held at once. Reached only by a fleet with more
+/// live browser peers than this; the least-recently-touched box is evicted,
+/// which costs its owner one handshake retry and never an admission.
+const SIGNAL_MAX_ENDPOINTS: usize = 4096;
+
+/// Is the direct lane offered at all? `HIVE_BROWSER_MESH=0` turns it off
+/// fleet-wide: the capability block disappears and the signalling arm answers
+/// 501 — which is EXACTLY the shape peer-mesh.js already treats as "this fleet
+/// has no signalling arm yet" (dormant lane, relay path untouched), so the
+/// kill switch and the pre-upgrade rollout state are the same code path on the
+/// donor. Never a new client-visible failure mode.
+fn mesh_enabled() -> bool {
+    !matches!(
+        std::env::var("HIVE_BROWSER_MESH").as_deref(),
+        Ok("0") | Ok("false") | Ok("off")
+    )
+}
+
+/// The per-donor degree ceiling. Floored at 2 because the topology below is a
+/// symmetric ring: it spends the budget as `cap/2` successors plus `cap/2`
+/// predecessors, and a budget of 1 cannot be split symmetrically.
+fn mesh_max_peers() -> usize {
+    std::env::var("HIVE_BROWSER_MESH_MAX_PEERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value >= 2)
+        .unwrap_or(MESH_MAX_PEERS)
+        .min(MESH_PEER_HARD_CAP)
+}
+
+/// How many peers ONE member of an `n`-browser tenant is authorized to
+/// address, given the degree ceiling. One formula, two callers (the capability
+/// derivation and the roll call's roster) — a drift between them would make
+/// the roll call report a fan-out the fleet does not actually grant.
+fn mesh_degree(n: usize, cap: usize) -> usize {
+    let others = n.saturating_sub(1);
+    if others <= cap {
+        others
+    } else {
+        (cap / 2) * 2
+    }
+}
+
+fn mesh_poll_ms() -> u64 {
+    std::env::var("HIVE_BROWSER_MESH_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 500)
+        .unwrap_or(1_500)
+}
+
+/// ICE servers offered to donors — OFF by default, deliberately.
+///
+/// The same rule the DNS geo path carries (AGENTS.md: "never re-introduce a
+/// default endpoint"): shipping a default STUN/TURN URL would put a third
+/// party on the connection path of every browser node in the fleet, whether or
+/// not the operator wanted one. With none configured the lane still works
+/// wherever host/server-reflexive candidates suffice (same LAN, open NAT) and
+/// simply fails to connect elsewhere — which is the designed degradation, not
+/// an outage: every consumer falls back to the relay.
+///
+/// `HIVE_BROWSER_ICE_SERVERS` takes either a JSON array of RTCIceServer
+/// objects (the only form that can carry TURN credentials) or a plain
+/// comma-separated URL list. A MALFORMED value yields NO servers rather than a
+/// partially-parsed one — peer-mesh.js re-validates every URL and caps the
+/// list again on receipt, so this is the first of two independent filters.
+fn mesh_ice_servers() -> Vec<Value> {
+    let raw = std::env::var("HIVE_BROWSER_ICE_SERVERS").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    if raw.starts_with('[') {
+        return match serde_json::from_str::<Value>(raw) {
+            Ok(Value::Array(items)) => items
+                .into_iter()
+                .filter(|item| item.get("urls").is_some())
+                .take(8)
+                .collect(),
+            _ => {
+                tracing::warn!("HIVE_BROWSER_ICE_SERVERS is not a JSON array — offering none");
+                Vec::new()
+            }
+        };
+    }
+    raw.split(',')
+        .map(str::trim)
+        .filter(|url| {
+            url.starts_with("stun:") || url.starts_with("turn:") || url.starts_with("turns:")
+        })
+        .take(8)
+        .map(|url| json!({ "urls": [url] }))
+        .collect()
+}
+
+/// The requesting donor's own identity, as the mesh derivation needs it. A
+/// struct rather than four positional args because every field is an
+/// authorization input and mixing two of them up is a capability bug.
+#[derive(Clone, Copy)]
+struct MeshSelf<'a> {
+    tenant: &'a str,
+    endpoint_id: &'a str,
+    scope: BrowserScope,
+    /// The database project THIS donor holds a grant for, or empty. Used only
+    /// to decide whether a peer's db lane is even relevant — a browser holds
+    /// ONE replica, so a peer replicating a different project is a peer with
+    /// no database relationship to us at all.
+    project: &'a str,
+}
+
+/// One authorized peer, fully server-derived.
+struct MeshPeerView {
+    endpoint_id: String,
+    scope: BrowserScope,
+    project: String,
+    /// The peer's effective database access FROM THIS DONOR'S POINT OF VIEW —
+    /// `"none"` unless both sides are Team scope on the same project.
+    db: &'static str,
+    artifacts: Vec<String>,
+}
+
+/// The set of browser endpoints `me` may address, re-derived from LIVE
+/// admissions on every call (capability issue AND every signalling round
+/// trip). Same-tenant only, self excluded.
+///
+/// THE MEMBERSHIP RULE IS SYMMETRIC BY CONSTRUCTION, and that is load-bearing
+/// rather than tidy. Below the degree ceiling every member simply addresses
+/// every other. ABOVE it, the naive "sort and take the first N" is NOT
+/// symmetric — with 20 browsers and a ceiling of 16, the 18th id holds the
+/// 16th in its set while the 16th does not hold the 18th, so the 18th offers
+/// into a mailbox whose owner is required to drop it, forever, on a backoff
+/// that never converges. So the overflow rule is a RING: the sorted endpoint
+/// ids form a cycle and each member takes `cap/2` successors and `cap/2`
+/// predecessors, which makes "B is in A's set" and "A is in B's set" the same
+/// statement (`B` is `d` forward of `A` exactly when `A` is `d` back of `B`)
+/// and still leaves the tenant's peers one connected component. Every node
+/// computes it from the identical replicated admission list, so no agreement
+/// protocol is needed — the same reasoning `inference`'s coordinator election
+/// uses.
+///
+/// The database dimension is deliberately narrower than the fleet lane:
+///   * a Public-scope peer is ALWAYS `"none"`, and so is every peer when the
+///     CALLER is Public scope. Public scope exists so an anonymous donor can
+///     serve functions; the fleet remains the system of record for
+///     `public_read` data, and a browser↔browser export is a lane the tenant
+///     never opted into. Absent capability beats a defensible one.
+///   * projects must match. A browser holds exactly one replica
+///     (`browser_db::auto_db_deployment_for_tenant` refuses to pick among
+///     several for the same reason), so a cross-project db lane could only
+///     ever be a mis-addressed round.
+/// Function artifacts have no such restriction: they are content-addressed and
+/// re-verified byte-for-byte by the receiver (`WorkerFunctionRuntime.pin`
+/// recomputes size + BLAKE3 + the canonical policy digest), so the worst a
+/// peer can do with a digest it holds is waste a round trip.
+fn mesh_peers(cloud: &Arc<CloudState>, me: MeshSelf<'_>, now: u64) -> Vec<MeshPeerView> {
+    let team_scoped_self = me.scope == BrowserScope::Team;
+    let mut records = cloud.browser_admissions.list(me.tenant, now);
+    records.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+    let n = records.len();
+    // Self must be in the list — `admit` puts the record before building the
+    // capability, and the signalling arm resolves the caller from this very
+    // store. If it somehow is not, the ring has no well-defined origin, and an
+    // arbitrary origin would be exactly the asymmetry this rule exists to
+    // prevent: answer "no peers" rather than a set the other half disagrees
+    // with.
+    let Some(index) = records
+        .iter()
+        .position(|record| record.endpoint_id == me.endpoint_id)
+    else {
+        return Vec::new();
+    };
+    let cap = mesh_max_peers();
+    let chosen: Vec<usize> = if n.saturating_sub(1) <= cap {
+        (0..n).filter(|i| *i != index).collect()
+    } else {
+        let half = cap / 2;
+        let mut ring: BTreeSet<usize> = BTreeSet::new();
+        for step in 1..=half {
+            ring.insert((index + step) % n);
+            ring.insert((index + n - step) % n);
+        }
+        ring.remove(&index);
+        ring.into_iter().collect()
+    };
+    let mut peers: Vec<MeshPeerView> = chosen
+        .into_iter()
+        .map(|i| records[i].clone())
+        .map(|record| {
+            let grant = record.db.as_ref();
+            let project = grant.map(|g| g.project.clone()).unwrap_or_default();
+            let db = match (team_scoped_self, record.scope, grant) {
+                (true, BrowserScope::Team, Some(g))
+                    if !me.project.is_empty() && me.project == g.project =>
+                {
+                    match g.access {
+                        BrowserDbAccess::ReadWrite => "read_write",
+                        BrowserDbAccess::ReadOnly => "read_only",
+                    }
+                }
+                _ => "none",
+            };
+            let mut artifacts: Vec<String> = record
+                .serve_entries()
+                .into_iter()
+                .map(|entry| entry.digest)
+                .collect();
+            artifacts.sort();
+            artifacts.dedup();
+            artifacts.truncate(MESH_ARTIFACTS_PER_PEER);
+            MeshPeerView {
+                endpoint_id: record.endpoint_id,
+                scope: record.scope,
+                project,
+                db,
+                artifacts,
+            }
+        })
+        .collect();
+    // Already ring-ordered by construction; sort so the wire order is the same
+    // stable, id-ordered shape every other replicated set in this file uses.
+    peers.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
+    peers
+}
+
+fn mesh_capability_json(cloud: &Arc<CloudState>, me: MeshSelf<'_>, now: u64) -> Option<Value> {
+    if !mesh_enabled() || me.endpoint_id.is_empty() {
+        return None;
+    }
+    let peers = mesh_peers(cloud, me, now);
+    // A donor alone in its tenant gets a block with an empty peer list rather
+    // than no block: the two are different instructions to the worker
+    // (`reconcileMeshLane` tears the lane DOWN on an absent block and on an
+    // empty set alike, but only the block tells it the fleet HAS a signalling
+    // arm). Sending it means the very next renewal, once a second tab joins,
+    // starts the lane with no other state change.
+    Some(json!({
+        "enabled": true,
+        "protocol_version": MESH_PROTOCOL_VERSION,
+        "signal_path": "/v1/browser/signals",
+        "signal_poll_ms": mesh_poll_ms(),
+        "ice_servers": mesh_ice_servers(),
+        "peers": peers
+            .iter()
+            .map(|peer| json!({
+                "endpoint_id": peer.endpoint_id,
+                "scope": match peer.scope {
+                    BrowserScope::Public => "public",
+                    BrowserScope::Team => "team",
+                },
+                "project": peer.project,
+                "db": peer.db,
+                "artifacts": peer.artifacts,
+            }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct SignalMessage {
+    seq: u64,
+    from: String,
+    kind: String,
+    payload: String,
+    sent_ms: u64,
+}
+
+#[derive(Default)]
+struct SignalInbox {
+    touched_ms: u64,
+    messages: VecDeque<SignalMessage>,
+}
+
+#[derive(Default)]
+struct SignalState {
+    seq: u64,
+    boxes: BTreeMap<String, SignalInbox>,
+    delivered_total: u64,
+    refused_total: u64,
+    dropped_total: u64,
+}
+
+impl SignalState {
+    fn next_seq(&mut self) -> u64 {
+        self.seq = self.seq.saturating_add(1);
+        self.seq
+    }
+
+    /// Drop expired envelopes, then empty/idle inboxes, then — only if still
+    /// over the ceiling — the least-recently-touched boxes. Runs on every call
+    /// so the mailbox has no separate sweeper to fall behind.
+    fn prune(&mut self, now: u64) {
+        let floor = now.saturating_sub(SIGNAL_TTL_MS);
+        for inbox in self.boxes.values_mut() {
+            let before = inbox.messages.len();
+            inbox.messages.retain(|message| message.sent_ms >= floor);
+            self.dropped_total = self
+                .dropped_total
+                .saturating_add((before - inbox.messages.len()) as u64);
+        }
+        self.boxes
+            .retain(|_, inbox| !inbox.messages.is_empty() || inbox.touched_ms >= floor);
+        if self.boxes.len() <= SIGNAL_MAX_ENDPOINTS {
+            return;
+        }
+        let mut by_age: Vec<(u64, String)> = self
+            .boxes
+            .iter()
+            .map(|(id, inbox)| (inbox.touched_ms, id.clone()))
+            .collect();
+        by_age.sort();
+        for (_, id) in by_age
+            .into_iter()
+            .take(self.boxes.len() - SIGNAL_MAX_ENDPOINTS)
+        {
+            self.boxes.remove(&id);
+        }
+    }
+}
+
+fn signal_state() -> &'static Mutex<SignalState> {
+    static SIGNALS: OnceLock<Mutex<SignalState>> = OnceLock::new();
+    SIGNALS.get_or_init(|| Mutex::new(SignalState::default()))
+}
+
+#[derive(Deserialize)]
+struct SignalSend {
+    to: String,
+    kind: String,
+    payload: String,
+}
+
+#[derive(Deserialize)]
+struct SignalRequest {
+    endpoint_id: String,
+    /// Proof-of-possession, the SAME shape and the same verifier the admission
+    /// POST uses — the platform session proves WHO the operator is, this
+    /// proves the caller controls the endpoint key it claims to be signalling
+    /// for. Without it a tenant member could drain another member's mailbox.
+    #[serde(default)]
+    challenge_ms: u64,
+    #[serde(default)]
+    signature: String,
+    #[serde(default)]
+    protocol_version: u16,
+    /// Highest inbox seq the caller has consumed. Everything at or below it is
+    /// dropped from the caller's own box — the mailbox holds nothing a peer
+    /// has already read.
+    #[serde(default)]
+    ack_seq: u64,
+    #[serde(default)]
+    send: Vec<SignalSend>,
+}
+
+/// One signalling round trip: deliver this caller's outbound envelopes, drain
+/// its own inbox, in one authenticated POST.
+///
+/// Every refusal direction collapses to the same answer on purpose — unknown
+/// endpoint, foreign tenant, expired admission and a `to` outside the caller's
+/// server-derived peer set are indistinguishable, so this arm can never be
+/// used to probe which browsers exist.
+async fn browser_signals(
+    State(cloud): State<Arc<CloudState>>,
+    claims: Claims,
+    Json(request): Json<SignalRequest>,
+) -> AdmissionResult {
+    if !mesh_enabled() {
+        return Err(AdmissionFailure::terminal(
+            StatusCode::NOT_IMPLEMENTED,
+            "mesh_disabled",
+            "the browser peer mesh is disabled on this fleet",
+        ));
+    }
+    if request.protocol_version != MESH_PROTOCOL_VERSION {
+        return Err(AdmissionFailure::terminal(
+            StatusCode::BAD_REQUEST,
+            "signal_protocol_unsupported",
+            "unsupported browser signalling protocol version",
+        ));
+    }
+    let claims = claims_required(claims).map_err(|(_, message)| {
+        AdmissionFailure::retryable(StatusCode::UNAUTHORIZED, "session_required", message)
+    })?;
+    let tenant = crate::admin::norm(&claims.tenant).to_string();
+    if !hive_browser_proto::valid_blake3_digest(&request.endpoint_id) {
+        return Err(AdmissionFailure::terminal(
+            StatusCode::BAD_REQUEST,
+            "endpoint_id_invalid",
+            "browser endpoint id is malformed",
+        ));
+    }
+    verify_proof_of_possession(&request.endpoint_id, request.challenge_ms, &request.signature)?;
+    let now = hive_core::now_ms();
+    // The caller must STILL hold a live admission under the authenticated
+    // tenant. This is re-read per call, not trusted from the session: a
+    // revoked browser stops being able to signal within one round trip, on
+    // exactly the same store the relay denylist and the gateway routes read.
+    let Some(me) = cloud
+        .browser_admissions
+        .get(&tenant, &request.endpoint_id, now)
+    else {
+        return Err(AdmissionFailure::retryable(
+            StatusCode::FORBIDDEN,
+            "signal_not_admitted",
+            "no live browser admission for this endpoint",
+        ));
+    };
+    let authorized: BTreeSet<String> = mesh_peers(
+        &cloud,
+        MeshSelf {
+            tenant: &tenant,
+            endpoint_id: &me.endpoint_id,
+            scope: me.scope,
+            project: me
+                .db
+                .as_ref()
+                .map(|grant| grant.project.as_str())
+                .unwrap_or_default(),
+        },
+        now,
+    )
+    .into_iter()
+    .map(|peer| peer.endpoint_id)
+    .collect();
+
+    let mut delivered = 0usize;
+    let mut refused = 0usize;
+    let mut state = signal_state().lock();
+    state.prune(now);
+    for entry in request.send.into_iter().take(SIGNAL_MAX_SEND_PER_CALL) {
+        // A peer that legitimately left the set between the caller's last
+        // capability and now is the COMMON case, not an attack — count and
+        // skip rather than failing the whole call, which would also strand the
+        // inbox drain below.
+        if !authorized.contains(&entry.to)
+            || !matches!(entry.kind.as_str(), "offer" | "answer" | "ice" | "bye")
+            || entry.payload.len() > SIGNAL_MAX_PAYLOAD_BYTES
+        {
+            refused += 1;
+            continue;
+        }
+        let seq = state.next_seq();
+        let inbox = state.boxes.entry(entry.to).or_default();
+        inbox.touched_ms = now;
+        // Drop-OLDEST, never drop-newest: a full inbox means the peer is not
+        // draining, and the newest envelope is the one its next poll can still
+        // act on (an offer superseded by a re-offer, the latest ice batch).
+        let evicted = if inbox.messages.len() >= SIGNAL_MAX_PER_ENDPOINT {
+            inbox.messages.pop_front();
+            1
+        } else {
+            0
+        };
+        inbox.messages.push_back(SignalMessage {
+            seq,
+            from: me.endpoint_id.clone(),
+            kind: entry.kind,
+            payload: entry.payload,
+            sent_ms: now,
+        });
+        state.dropped_total = state.dropped_total.saturating_add(evicted);
+        delivered += 1;
+    }
+    let inbox = state.boxes.entry(me.endpoint_id.clone()).or_default();
+    inbox.touched_ms = now;
+    // Drop what the caller has already consumed AND anything from a sender
+    // that is no longer in its peer set. The authorization is checked on BOTH
+    // ends of the mailbox, not just at send: a peer whose admission was
+    // revoked between queueing an envelope and this poll has no business
+    // reaching this browser, and dropping (rather than skipping) keeps a
+    // now-unauthorized envelope from sitting at the head of the queue
+    // occupying a delivery slot until its TTL. peer-mesh.js re-checks `from`
+    // against its own capability as well — same rule, two independent halves.
+    inbox
+        .messages
+        .retain(|message| message.seq > request.ack_seq && authorized.contains(&message.from));
+    let messages: Vec<SignalMessage> = inbox
+        .messages
+        .iter()
+        .take(SIGNAL_MAX_DELIVER_PER_CALL)
+        .cloned()
+        .collect();
+    state.delivered_total = state.delivered_total.saturating_add(delivered as u64);
+    state.refused_total = state.refused_total.saturating_add(refused as u64);
+    let more = state.boxes[&me.endpoint_id].messages.len() > messages.len();
+    drop(state);
+    Ok(Json(json!({
+        "protocol_version": MESH_PROTOCOL_VERSION,
+        "messages": messages,
+        "more": more,
+        "delivered": delivered,
+        "refused": refused,
+        "retry_ms": mesh_poll_ms(),
+    })))
+}
+
+/// Bounded, tenant-free mailbox counters for `/v1/browser/stats` — aggregates
+/// only, same posture as every other counter in this file.
+fn signal_stats() -> Value {
+    let mut state = signal_state().lock();
+    state.prune(hive_core::now_ms());
+    json!({
+        "enabled": mesh_enabled(),
+        "inboxes": state.boxes.len(),
+        "queued": state.boxes.values().map(|b| b.messages.len()).sum::<usize>(),
+        "delivered_total": state.delivered_total,
+        "refused_total": state.refused_total,
+        "dropped_total": state.dropped_total,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The protocol-wide browser ROLL CALL.
+//
+// WHAT THIS IS. A periodic, read-only inventory + drift audit over the browser
+// population: who is admitted, what each is authorized to serve, which
+// database grant each holds, whether presence agrees, and whether this node's
+// gateway routing layer matches the admissions that authorize it.
+//
+// WHY IT IS NOT A NEW PROTOCOL OP, AND NOT A CHANGE TO THE RENEWAL PATH.
+// Both were considered and both are worse:
+//
+//   * A new `hive/browser/0` op ("are you there, what do you serve") would put
+//     one outbound QUIC call per admitted browser on a timer, and could learn
+//     NOTHING the platform is not already told: the admission renewal (a lease
+//     tick of at most `MAX_LEASE_SECS`) already re-derives and re-states the
+//     donor's whole serve set and db grant, and `browser_presence` already
+//     replicates liveness. It would be a second, weaker source of truth for
+//     facts that already replicate — and a source that a wedged tab answers
+//     late or not at all, manufacturing "drift" out of its own timeouts.
+//   * Extending the renewal path would make the sweep per-DONOR (fires when a
+//     browser happens to renew, absent exactly when a browser stops renewing —
+//     the case a roll call exists to catch) and would put audit work on a
+//     latency-sensitive request path that every donor hits every 60s.
+//
+// So the roll call READS the state those two mechanisms already converge, on
+// its own cadence, and reports what disagrees. It writes nothing: a sweep that
+// repairs is a second writer to surfaces (`gw` routing, the admission store)
+// that already have exactly one, and drift whose cause is unknown is not
+// something an audit may resolve by mutating — the same discipline
+// `browser_artifacts::gc` applies when its keep-set looks wrong.
+//
+// EVERY NODE RUNS IT, not the leader alone, because half of what it audits is
+// node-local: the gateway browser target table is programmed per node from
+// replicated admissions, so a route that leaked or never landed is a fact
+// about THIS node and invisible from anywhere else. The inventory half reads
+// the replicated admission/presence stores and is therefore identical on every
+// converged node.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ROLL_CALL_SECS: u64 = 420; // 7 minutes
+const MIN_ROLL_CALL_SECS: u64 = 30;
+const ROLL_CALL_MAX_ROSTER: usize = 512;
+const ROLL_CALL_MAX_DRIFT: usize = 128;
+/// A browser admitted less than this ago has not necessarily published
+/// presence yet (the worker posts it after boot), so a missing presence record
+/// inside this window is a race, not drift. Flagging it would make every
+/// normal start look like a fault.
+const ROLL_CALL_PRESENCE_GRACE_MS: u64 = 90_000;
+
+fn roll_call_interval_secs() -> u64 {
+    match std::env::var("HIVE_BROWSER_ROLL_CALL_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => 0,
+            Ok(secs) => secs.max(MIN_ROLL_CALL_SECS),
+            Err(_) => DEFAULT_ROLL_CALL_SECS,
+        },
+        Err(_) => DEFAULT_ROLL_CALL_SECS,
+    }
+}
+
+/// One disagreement found by a roll call. `kind` is a stable machine-readable
+/// slug (operators alert on it); `detail` is the human half.
+#[derive(Clone, Debug, Serialize)]
+pub struct RollCallDrift {
+    pub kind: &'static str,
+    pub endpoint_id: String,
+    pub tenant: String,
+    pub detail: String,
+}
+
+/// One admitted browser as the roll call sees it.
+#[derive(Clone, Debug, Serialize)]
+pub struct RollCallEntry {
+    pub endpoint_id: String,
+    pub tenant: String,
+    /// The constellation node name presence renders, when a presence record
+    /// exists — empty when this browser is admitted but silent.
+    pub node_name: String,
+    pub presence: String,
+    pub scope: &'static str,
+    pub serves: Vec<BrowserServe>,
+    pub db_project: String,
+    pub db_access: Option<BrowserDbAccess>,
+    /// May this peer hold fragments of GLOBAL platform state? Read from the
+    /// PRESENCE record, which is where it is stamped (from the authenticated
+    /// caller's `platform_admin` claim) — so an admitted-but-silent browser
+    /// reports `false` here, which is also the safe reading: nothing plans
+    /// against a peer with no live presence.
+    pub shard_eligible: bool,
+    /// How many browser peers this endpoint is authorized to address on the
+    /// DIRECT lane right now (bn-browser-peer-webrtc-mesh) — the same
+    /// server-derived set `capability.mesh` carries, counted. `0` means the
+    /// direct lane has nothing to do for this browser (it is alone in its
+    /// tenant, or the mesh is disabled fleet-wide), never that it failed.
+    pub mesh_peers: usize,
+    pub routes: usize,
+    pub issued_ms: u64,
+    pub expires_ms: u64,
+    pub lease_remaining_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct RollCall {
+    pub started_ms: u64,
+    pub took_ms: u64,
+    pub node: String,
+    pub leader: String,
+    pub is_leader: bool,
+    pub interval_secs: u64,
+    pub admitted: usize,
+    pub tenants: usize,
+    pub presence_online: usize,
+    pub presence_live: usize,
+    /// Live presence records this node could not match to any live admission
+    /// under the admitted tenants — a COUNT, not a list, because the presence
+    /// store's cross-tenant view is deliberately not exposed (its per-tenant
+    /// reader pins the tenant, and the roll call is not a reason to widen it).
+    /// Non-zero means "a presence record outlived the admission that
+    /// authorized it", the exact invariant `remove_for_endpoint` exists for.
+    pub presence_orphans: usize,
+    pub serve_entries: usize,
+    pub db_grants: usize,
+    /// Live presence records eligible to hold global state fragments — the
+    /// shard planner's own membership bar, reported here so an operator can
+    /// see it move without reading `browser_db::shard_plan`.
+    pub shard_eligible: usize,
+    pub routes: usize,
+    pub roster_truncated: bool,
+    pub drift_truncated: bool,
+    pub drift: Vec<RollCallDrift>,
+    pub roster: Vec<RollCallEntry>,
+}
+
+impl RollCall {
+    /// The counters only — what `/v1/browser/stats` embeds, and what the log
+    /// line carries. Never the roster: that names endpoints and tenants, and
+    /// `browser_stats` is deliberately cardinality-free.
+    fn summary(&self) -> Value {
+        json!({
+            "started_ms": self.started_ms,
+            "took_ms": self.took_ms,
+            "node": self.node,
+            "interval_secs": self.interval_secs,
+            "admitted": self.admitted,
+            "tenants": self.tenants,
+            "presence_online": self.presence_online,
+            "presence_orphans": self.presence_orphans,
+            "serve_entries": self.serve_entries,
+            "db_grants": self.db_grants,
+            "shard_eligible": self.shard_eligible,
+            "routes": self.routes,
+            "drift": self.drift.len(),
+        })
+    }
+}
+
+fn last_roll_call() -> &'static Mutex<Option<RollCall>> {
+    static LAST: OnceLock<Mutex<Option<RollCall>>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(None))
+}
+
+/// Every Ready, browser-eligible (tenant, deployment, function) → the
+/// descriptor's CURRENT canonical policy digest, built once per sweep.
+///
+/// `browser_artifacts::descriptor_for` answers the same question one entry at
+/// a time by walking every deployment record; calling it per serve entry makes
+/// the sweep quadratic in fleet size for no benefit, so the index is built
+/// once from the identical two replicated sources.
+fn browser_digest_index(cloud: &Arc<CloudState>) -> BTreeMap<(String, String, String), String> {
+    let mut index = BTreeMap::new();
+    for record in cloud.gw.deployment_records() {
+        if record.state != fluid_core::DeployState::Ready {
+            continue;
+        }
+        let tenant = crate::admin::record_tenant(&record.tenant).to_string();
+        for function in &record.manifest.functions {
+            if let Some(artifact) = &function.browser_artifact {
+                index.insert(
+                    (tenant.clone(), record.id.clone(), function.name.clone()),
+                    artifact.policy_digest.clone(),
+                );
+            }
+        }
+    }
+    for deployments in cloud.peer_deployments.read().values() {
+        for info in deployments {
+            if info.state != fluid_core::DeployState::Ready {
+                continue;
+            }
+            let tenant = crate::admin::record_tenant(&info.tenant).to_string();
+            for function in &info.browser_functions {
+                index.insert(
+                    (tenant.clone(), info.id.0.clone(), function.name.clone()),
+                    function.artifact.policy_digest.clone(),
+                );
+            }
+        }
+    }
+    index
+}
+
+/// Run one roll call. Pure read: it takes no lock it does not release and
+/// mutates nothing outside the cached result.
+pub fn roll_call(cloud: &Arc<CloudState>) -> RollCall {
+    let started_ms = hive_core::now_ms();
+    let admissions = cloud.browser_admissions.active(started_ms);
+    let digests = browser_digest_index(cloud);
+    let targets = cloud.gw.browser_targets();
+
+    let mut routes_by_endpoint: BTreeMap<&str, Vec<&BrowserTarget>> = BTreeMap::new();
+    for target in &targets {
+        routes_by_endpoint
+            .entry(target.endpoint_id.as_str())
+            .or_default()
+            .push(target);
+    }
+    let tenants: BTreeSet<&str> = admissions
+        .iter()
+        .map(|record| record.tenant.as_str())
+        .collect();
+    let mut presence: BTreeMap<String, crate::browser_presence::BrowserPresence> = BTreeMap::new();
+    for tenant in &tenants {
+        for record in cloud.browser_presence.list(tenant, started_ms) {
+            presence.insert(record.endpoint_id.clone(), record);
+        }
+    }
+    let presence_live: usize = cloud
+        .browser_presence
+        .stats()
+        .by_state
+        .values()
+        .map(|count| *count as usize)
+        .sum();
+
+    // Direct-lane fan-out, counted from the tenant's population rather than by
+    // re-deriving each browser's peer set (quadratic, for an answer that is the
+    // same arithmetic every time). `mesh_degree` is the SAME formula the
+    // capability derivation spends its budget with.
+    let mut per_tenant: BTreeMap<&str, usize> = BTreeMap::new();
+    for record in &admissions {
+        *per_tenant.entry(record.tenant.as_str()).or_insert(0) += 1;
+    }
+    let peer_cap = mesh_max_peers();
+    let mesh_on = mesh_enabled();
+
+    let mut drift: Vec<RollCallDrift> = Vec::new();
+    let mut roster: Vec<RollCallEntry> = Vec::new();
+    let mut serve_entries = 0usize;
+    let mut db_grants = 0usize;
+    let mut presence_online = 0usize;
+    let mut matched_presence = 0usize;
+    let mut shard_eligible = 0usize;
+
+    for record in &admissions {
+        let entries = record.serve_entries();
+        serve_entries += entries.len();
+        let here = routes_by_endpoint
+            .get(record.endpoint_id.as_str())
+            .map(|targets| targets.as_slice())
+            .unwrap_or(&[]);
+        let live = presence.get(&record.endpoint_id);
+        if live.is_some() {
+            matched_presence += 1;
+        }
+        if live.is_some_and(|p| p.state == "online") {
+            presence_online += 1;
+        }
+        if live.is_some_and(|p| p.shard_eligible) {
+            shard_eligible += 1;
+        }
+        if live.is_none() && started_ms.saturating_sub(record.issued_ms) > ROLL_CALL_PRESENCE_GRACE_MS
+        {
+            drift.push(RollCallDrift {
+                kind: "presence_missing",
+                endpoint_id: record.endpoint_id.clone(),
+                tenant: record.tenant.clone(),
+                detail: format!(
+                    "admitted {}s ago with no live presence record",
+                    started_ms.saturating_sub(record.issued_ms) / 1_000
+                ),
+            });
+        }
+        for entry in &entries {
+            let key = (
+                record.tenant.clone(),
+                entry.deployment.clone(),
+                entry.function.clone(),
+            );
+            match digests.get(&key) {
+                None => drift.push(RollCallDrift {
+                    kind: "serve_descriptor_missing",
+                    endpoint_id: record.endpoint_id.clone(),
+                    tenant: record.tenant.clone(),
+                    detail: format!(
+                        "serves {}/{} but no Ready browser-eligible descriptor exists for it",
+                        entry.deployment, entry.function
+                    ),
+                }),
+                Some(current) if *current != entry.digest => drift.push(RollCallDrift {
+                    kind: "serve_digest_stale",
+                    endpoint_id: record.endpoint_id.clone(),
+                    tenant: record.tenant.clone(),
+                    detail: format!(
+                        "serves {}/{} at {} while the descriptor is {}",
+                        entry.deployment, entry.function, entry.digest, current
+                    ),
+                }),
+                Some(_) => {}
+            }
+            // A serve entry with no matching gateway target means THIS node
+            // never programmed (or has since lost) the route the replicated
+            // admission authorizes — invocations land elsewhere or nowhere.
+            let routed = here.iter().any(|target| {
+                target.deployment == entry.deployment && target.function == entry.function
+            });
+            if !routed {
+                drift.push(RollCallDrift {
+                    kind: "route_missing",
+                    endpoint_id: record.endpoint_id.clone(),
+                    tenant: record.tenant.clone(),
+                    detail: format!(
+                        "authorized to serve {}/{} with no gateway route on this node",
+                        entry.deployment, entry.function
+                    ),
+                });
+            }
+        }
+        if let Some(grant) = &record.db {
+            db_grants += 1;
+            let expected_file = crate::browser_db::replica_file_name(&grant.project);
+            if grant.db_file != expected_file {
+                drift.push(RollCallDrift {
+                    kind: "db_file_mismatch",
+                    endpoint_id: record.endpoint_id.clone(),
+                    tenant: record.tenant.clone(),
+                    detail: format!(
+                        "grant names replica {} but the platform template yields {}",
+                        grant.db_file, expected_file
+                    ),
+                });
+            }
+            if crate::browser_db::db_descriptor_for(cloud, &record.tenant, &record.deployment)
+                .is_none()
+            {
+                drift.push(RollCallDrift {
+                    kind: "db_grant_orphaned",
+                    endpoint_id: record.endpoint_id.clone(),
+                    tenant: record.tenant.clone(),
+                    detail: format!(
+                        "holds a database grant for project {} whose deployment no longer carries a browser_db block",
+                        grant.project
+                    ),
+                });
+            }
+        }
+        roster.push(RollCallEntry {
+            endpoint_id: record.endpoint_id.clone(),
+            tenant: record.tenant.clone(),
+            node_name: live.map(|p| p.node_name.clone()).unwrap_or_default(),
+            presence: live
+                .map(|p| p.state.clone())
+                .unwrap_or_else(|| "absent".to_string()),
+            scope: match record.scope {
+                BrowserScope::Public => "public",
+                BrowserScope::Team => "team",
+            },
+            serves: entries,
+            db_project: record
+                .db
+                .as_ref()
+                .map(|grant| grant.project.clone())
+                .unwrap_or_default(),
+            db_access: record.db.as_ref().map(|grant| grant.access),
+            shard_eligible: live.is_some_and(|p| p.shard_eligible),
+            mesh_peers: if mesh_on {
+                mesh_degree(
+                    per_tenant
+                        .get(record.tenant.as_str())
+                        .copied()
+                        .unwrap_or(0),
+                    peer_cap,
+                )
+            } else {
+                0
+            },
+            routes: here.len(),
+            issued_ms: record.issued_ms,
+            expires_ms: record.expires_ms,
+            lease_remaining_ms: record.expires_ms.saturating_sub(started_ms),
+        });
+    }
+
+    // The other direction: a route this node holds that no live admission
+    // authorizes. `reconcile`/`remove_endpoint` are supposed to make this
+    // impossible, which is exactly why a non-zero count matters — it is a
+    // browser still receiving invocations on a grant that has ended.
+    let live_ids: BTreeSet<&str> = admissions
+        .iter()
+        .map(|record| record.endpoint_id.as_str())
+        .collect();
+    let by_endpoint: BTreeMap<&str, &BrowserAdmission> = admissions
+        .iter()
+        .map(|record| (record.endpoint_id.as_str(), record))
+        .collect();
+    for target in &targets {
+        if !live_ids.contains(target.endpoint_id.as_str()) {
+            drift.push(RollCallDrift {
+                kind: "route_orphaned",
+                endpoint_id: target.endpoint_id.clone(),
+                tenant: target.tenant.clone(),
+                detail: format!(
+                    "gateway routes {}/{} for an endpoint with no live admission",
+                    target.deployment, target.function
+                ),
+            });
+            continue;
+        }
+        let Some(record) = by_endpoint.get(target.endpoint_id.as_str()) else {
+            continue;
+        };
+        let entries = record.serve_entries();
+        let authorized = entries
+            .iter()
+            .find(|entry| entry.deployment == target.deployment && entry.function == target.function);
+        match authorized {
+            None => drift.push(RollCallDrift {
+                kind: "route_unauthorized",
+                endpoint_id: target.endpoint_id.clone(),
+                tenant: target.tenant.clone(),
+                detail: format!(
+                    "gateway routes {}/{} which this endpoint's admission does not authorize",
+                    target.deployment, target.function
+                ),
+            }),
+            Some(entry) if entry.digest != target.digest => drift.push(RollCallDrift {
+                kind: "route_digest_stale",
+                endpoint_id: target.endpoint_id.clone(),
+                tenant: target.tenant.clone(),
+                detail: format!(
+                    "gateway routes {}/{} at {} while the admission authorizes {}",
+                    target.deployment, target.function, target.digest, entry.digest
+                ),
+            }),
+            Some(_) => {}
+        }
+    }
+
+    let drift_truncated = drift.len() > ROLL_CALL_MAX_DRIFT;
+    drift.truncate(ROLL_CALL_MAX_DRIFT);
+    let roster_truncated = roster.len() > ROLL_CALL_MAX_ROSTER;
+    roster.truncate(ROLL_CALL_MAX_ROSTER);
+
+    RollCall {
+        started_ms,
+        took_ms: hive_core::now_ms().saturating_sub(started_ms),
+        node: cloud.node_name.clone(),
+        leader: cloud.control_plane_leader(),
+        is_leader: cloud.is_control_plane_leader(),
+        interval_secs: roll_call_interval_secs(),
+        admitted: admissions.len(),
+        tenants: tenants.len(),
+        presence_online,
+        presence_live,
+        presence_orphans: presence_live.saturating_sub(matched_presence),
+        serve_entries,
+        db_grants,
+        shard_eligible,
+        routes: targets.len(),
+        roster_truncated,
+        drift_truncated,
+        drift,
+        roster,
+    }
+}
+
+/// Run a roll call, cache it for `/v1/browser/rollcall`, and LOG it.
+///
+/// The log line is the half that works with no operator present: a clean sweep
+/// is one INFO line (so the absence of roll calls is itself visible in the
+/// journal), and any disagreement is a WARN naming the drift kinds and their
+/// counts — a roll call nobody reads is not a roll call.
+fn run_and_record(cloud: &Arc<CloudState>) -> RollCall {
+    let result = roll_call(cloud);
+    if result.drift.is_empty() && result.presence_orphans == 0 {
+        tracing::info!(
+            admitted = result.admitted,
+            tenants = result.tenants,
+            online = result.presence_online,
+            serves = result.serve_entries,
+            db_grants = result.db_grants,
+            shard_eligible = result.shard_eligible,
+            routes = result.routes,
+            took_ms = result.took_ms,
+            "browser roll call: clean"
+        );
+    } else {
+        let mut kinds: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in &result.drift {
+            *kinds.entry(entry.kind).or_insert(0) += 1;
+        }
+        tracing::warn!(
+            admitted = result.admitted,
+            tenants = result.tenants,
+            online = result.presence_online,
+            serves = result.serve_entries,
+            db_grants = result.db_grants,
+            shard_eligible = result.shard_eligible,
+            routes = result.routes,
+            presence_orphans = result.presence_orphans,
+            drift = result.drift.len(),
+            truncated = result.drift_truncated,
+            kinds = %kinds
+                .iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            took_ms = result.took_ms,
+            "browser roll call: drift detected"
+        );
+    }
+    *last_roll_call().lock() = Some(result.clone());
+    result
+}
+
+/// The periodic sweep. Every node (see the section header), cadence from
+/// `HIVE_BROWSER_ROLL_CALL_SECS` (default 420s = 7 minutes, floor 30s, `0`
+/// disables). No jitter and no leader election: the pass is a read of
+/// node-local + already-replicated state and contends for nothing, so a fleet
+/// running it in the same second costs exactly as much as one running it
+/// staggered.
+pub fn spawn_roll_call(cloud: Arc<CloudState>) {
+    let secs = roll_call_interval_secs();
+    if secs == 0 {
+        tracing::info!("browser roll call disabled (HIVE_BROWSER_ROLL_CALL_SECS=0)");
+        return;
+    }
+    tokio::spawn(async move {
+        // One early pass so a node that has just booted reports its browser
+        // population without waiting a whole interval — the sweep is read-only,
+        // so an early one costs nothing and answers "did this node come up with
+        // the routes it should have".
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        loop {
+            run_and_record(&cloud);
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        }
+    });
+}
+
+#[derive(Deserialize)]
+struct RollCallQuery {
+    /// Recompute inline instead of serving the last cached sweep.
+    ///
+    /// This is what makes the endpoint honest behind round-robin DNS: the
+    /// cached result is whatever THIS node's timer last produced, and a GET is
+    /// served locally (AGENTS.md), so an operator hitting the public host
+    /// otherwise reads an arbitrary node's arbitrary-age sweep. `?fresh=true`
+    /// is still a pure read — it computes from replicated + node-local state
+    /// and writes nothing but the cache.
+    #[serde(default)]
+    fresh: bool,
+}
+
+/// `GET /v1/browser/rollcall` (operator). Reports THIS node's view and says
+/// so: the inventory half is replicated and identical everywhere once
+/// converged, the routing half is per-node by construction. The dashboard's
+/// `/ops/*` proxy forwards to the control-plane leader, so an operator going
+/// through it always reads the same node's answer.
+async fn roll_call_view(
+    State(cloud): State<Arc<CloudState>>,
+    claims: Claims,
+    Query(query): Query<RollCallQuery>,
+) -> ApiResult {
+    crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
+    let result = if query.fresh {
+        Some(run_and_record(&cloud))
+    } else {
+        last_roll_call().lock().clone()
+    };
+    match result {
+        Some(result) => Ok(Json(json!({ "roll_call": result }))),
+        // No sweep has run yet on this node (it booted seconds ago, or the
+        // cadence is disabled). Never a fabricated empty result: an operator
+        // must be able to tell "nothing admitted" from "never measured".
+        None => Ok(Json(json!({
+            "roll_call": Value::Null,
+            "node": cloud.node_name,
+            "interval_secs": roll_call_interval_secs(),
+            "pending": true,
+        }))),
+    }
 }
 
 async fn list_admissions(State(cloud): State<Arc<CloudState>>, claims: Claims) -> ApiResult {

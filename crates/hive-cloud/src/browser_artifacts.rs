@@ -2,15 +2,32 @@
 //! content-addressed on-disk store, and its guarded GC
 //! (browser-function-artifact-build-contract).
 //!
-//! A function becomes browser-eligible ONLY by opting in via fluid.json
-//! `functions[].browser` ([`fluid_core::BrowserPolicy`]) and surviving
-//! [`bundle`]'s rejection pass. The emitted artifact is ONE deterministic,
-//! self-contained source string — an `async function (request, ops)`
-//! expression in exactly the shape
+//! A function becomes browser-eligible by opting in via fluid.json
+//! `functions[].browser` ([`fluid_core::BrowserPolicy`]) — or automatically,
+//! via `git::infer_browser_entry` — and surviving [`bundle`]'s rejection pass.
+//! The emitted artifact is ONE deterministic, self-contained source string —
+//! an `async function (request, ops)` expression in exactly the shape
 //! `crates/hive-browser/www/pkg/function-worker.js` evaluates — carrying no
-//! env, no imports, and no Node/Bun/Deno runtime surface (the scan below is
-//! what makes "unsupported native/container/runtime dependency" a LOUD build
-//! failure instead of a silent browser-side misexecution).
+//! env and no secrets.
+//!
+//! NODE SURFACE (browser-node-api-runtime): the build does NOT reject Node/Bun
+//! runtime TOKENS. `require(...)`, `process.*`, `Buffer`, `__dirname`,
+//! `__filename`, `import(...)`, `Deno.*`/`Bun.*` references all compile through
+//! to the artifact, because the browser substrate now SUPPLIES a Node API —
+//! `crates/hive-browser/www/node-runtime.js` installs a CommonJS `require`, a
+//! `process`, a real `Buffer`, `console`, timers, `URL`/`URLSearchParams`,
+//! `TextEncoder`/`TextDecoder` and the Node builtin module set inside the
+//! guest before the artifact function is evaluated. A module the substrate
+//! genuinely cannot provide (`net`, `dns`, outbound `http.request`, …) throws a
+//! NAMED error at the point of use rather than being silently no-op'd, which is
+//! the same "loud, at the honest boundary" discipline the removed scan had —
+//! moved from build time to the exact call that cannot work.
+//!
+//! Static ES module syntax (`import x from` / `export …`) is STILL a build
+//! rejection, and that one is a correctness check, not a language-surface one:
+//! the artifact is evaluated as a FUNCTION EXPRESSION, where an `import`
+//! statement is a hard SyntaxError — it would fail identically in every donor's
+//! browser, at boot, for every request.
 //!
 //! Store layout under `persist::data_dir()/browser-artifacts/`:
 //!
@@ -44,7 +61,7 @@ use axum::{
     routing::get,
     Router,
 };
-use fluid_core::{BrowserArtifact, BrowserExecMode, BrowserFunctionRef, FunctionConfig};
+use fluid_core::{BrowserArtifact, BrowserFunctionRef, FunctionConfig};
 
 use crate::state::CloudState;
 
@@ -68,81 +85,6 @@ pub struct BundledArtifact {
     pub descriptor: BrowserArtifact,
     /// Policy-resolution notes (e.g. ceiling clamps) for the build log.
     pub notes: Vec<String>,
-}
-
-/// One native/container/runtime dependency the source scan found, with the
-/// human-facing reason it cannot run inside the browser substrate.
-struct ForbiddenToken {
-    /// Word-boundary needle, e.g. "process." — matched only when the
-    /// preceding character is not identifier-ish (see `contains_token`).
-    needle: &'static str,
-    reason: &'static str,
-}
-
-/// Runtime-surface tokens denied in EVERY mode. An artifact carries no
-/// module system and no host runtime: any of these means the handler depends
-/// on a Node/Bun/Deno/native runtime the browser substrate does not have.
-const FORBIDDEN_ALWAYS: &[ForbiddenToken] = &[
-    ForbiddenToken {
-        needle: "require(",
-        reason: "CommonJS `require(...)` — artifacts are single-file; dependencies must be inlined by the author",
-    },
-    ForbiddenToken {
-        needle: "import(",
-        reason: "dynamic `import(...)` — the artifact has no module loader",
-    },
-    ForbiddenToken {
-        needle: "process.",
-        reason: "Node `process.*` (env/argv/exit) — artifacts get NO environment: project env and secrets must never ship to a donor's browser",
-    },
-    ForbiddenToken {
-        needle: "Buffer",
-        reason: "Node `Buffer` — use Uint8Array/TextEncoder (both exist in QuickJS)",
-    },
-    ForbiddenToken {
-        needle: "__dirname",
-        reason: "Node `__dirname` — no host filesystem exists in the browser substrate",
-    },
-    ForbiddenToken {
-        needle: "__filename",
-        reason: "Node `__filename` — no host filesystem exists in the browser substrate",
-    },
-    ForbiddenToken {
-        needle: "Deno.",
-        reason: "Deno runtime API — the browser substrate is not Deno",
-    },
-    ForbiddenToken {
-        needle: "Bun.",
-        reason: "Bun runtime API (`Bun.serve` etc.) — a browser artifact is a request→response handler, not a server",
-    },
-];
-
-/// Additional tokens denied in QuickJS mode only. The native-mode Worker has
-/// real web globals; the QuickJS guest's ONLY host boundary is numbered ops —
-/// a direct fetch would bypass the metered op path entirely.
-const FORBIDDEN_QUICKJS: &[ForbiddenToken] = &[ForbiddenToken {
-    needle: "fetch(",
-    reason: "direct `fetch(...)` — QuickJS has no web globals; network access must go through an allowed host op",
-}];
-
-/// `needle` appears in `hay` at a token boundary: the character immediately
-/// before the match (if any) is not an identifier character and not `.`/`$`,
-/// so `myprocess.env`, `x.Buffer`, or `this.fetch(` never false-positive,
-/// while `(require("fs"))`, `new Buffer(...)`, and `process.env` do.
-fn contains_token(hay: &str, needle: &str) -> bool {
-    let mut start = 0;
-    while let Some(at) = hay[start..].find(needle) {
-        let at = start + at;
-        let preceded_ok = hay[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | '.')));
-        if preceded_ok {
-            return true;
-        }
-        start = at + needle.len();
-    }
-    false
 }
 
 /// Whether a CommonJS entry assigns a handler the wrapper can resolve —
@@ -306,24 +248,20 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     // before wrapping (and before hashing).
     let user = raw.replace("\r\n", "\n").replace('\r', "\n");
 
+    // The ONLY source-shape rejection left. Node/Bun runtime tokens are no
+    // longer scanned for at all (browser-node-api-runtime: the substrate
+    // supplies `require`/`process`/`Buffer`/… and names what it cannot do at
+    // the call site), but a static `import`/`export` STATEMENT is a hard
+    // SyntaxError inside the function-expression envelope below — it cannot be
+    // "permitted", only deferred into a boot failure in every donor's browser.
     let mut rejections: Vec<String> = Vec::new();
     for line in module_syntax_lines(&user) {
         rejections.push(format!(
-            "line {line}: ES module syntax — the artifact is one self-contained source; assign \
-             the handler to `module.exports` (or `exports.handler`) instead"
+            "line {line}: ES module syntax — the artifact is evaluated as ONE function \
+             expression, where `import`/`export` statements are a SyntaxError; use CommonJS \
+             (`const x = require(\"…\")`, `module.exports = handler`), which the browser Node \
+             runtime supports"
         ));
-    }
-    for token in FORBIDDEN_ALWAYS {
-        if contains_token(&user, token.needle) {
-            rejections.push(format!("{:?}: {}", token.needle, token.reason));
-        }
-    }
-    if resolved.mode == BrowserExecMode::Quickjs {
-        for token in FORBIDDEN_QUICKJS {
-            if contains_token(&user, token.needle) {
-                rejections.push(format!("{:?}: {}", token.needle, token.reason));
-            }
-        }
     }
     // A browser artifact MUST resolve to a request→response handler at runtime:
     // the wrapper below assigns `module.exports`/`exports.handler` and THROWS if
@@ -344,8 +282,8 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     }
     if !rejections.is_empty() {
         return Err(format!(
-            "{} opted into browser execution but its entry {:?} uses unsupported \
-             native/container/runtime dependencies:\n  - {}",
+            "{} is browser-eligible in principle, but its entry {:?} cannot be evaluated as a \
+             browser artifact:\n  - {}",
             name(),
             policy.entry,
             rejections.join("\n  - ")
@@ -360,6 +298,21 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
     // `browser_response` parses. The wrapper is a constant template, so the
     // emitted bytes — and therefore both digests — depend only on the entry
     // source and the policy.
+    //
+    // `__hive_node_bridge` is the ONE hook the Node runtime installs
+    // (node-runtime.js, evaluated in the guest before this function). When it
+    // is absent — a substrate with no Node runtime, e.g. the native-mode DOM
+    // lane — every line below behaves exactly as it did before it existed:
+    // `request`/`ops` are passed through unchanged and the handler's RETURN
+    // value is the response. When it is present the handler additionally gets
+    // Node's `(req, res)` calling convention: `req` is a superset of the
+    // platform request descriptor (so a `(request, ops)` handler still reads
+    // `request.method`/`.path`/`.headers`), `res` is a superset of `ops` (so
+    // `ops.call(...)` still works), and `bridge.settle(out)` is the ONE place
+    // the two conventions are reconciled — an explicit non-`res` return value
+    // always wins (the platform contract, unchanged), otherwise the response
+    // written on `res` is used, including the `return res.json(...)` shape
+    // that returns `res` rather than `undefined`.
     let source = format!(
         "async function (request, ops) {{\n\
          \x20 \"use strict\";\n\
@@ -372,8 +325,11 @@ pub fn bundle(build_dir: &Path, f: &FunctionConfig) -> Result<BundledArtifact, S
          \x20 if (typeof handler !== \"function\") {{\n\
          \x20   throw new TypeError(\"browser entry must assign its handler to module.exports or exports.handler\");\n\
          \x20 }}\n\
-         \x20 const req = typeof request === \"string\" ? JSON.parse(request) : request;\n\
-         \x20 const out = await handler(req, ops);\n\
+         \x20 const bridge = typeof globalThis.__hive_node_bridge === \"function\" ? globalThis.__hive_node_bridge(request, ops) : null;\n\
+         \x20 const req = bridge ? bridge.request : (typeof request === \"string\" ? JSON.parse(request) : request);\n\
+         \x20 const res = bridge ? bridge.response : ops;\n\
+         \x20 let out = await handler(req, res);\n\
+         \x20 if (bridge) out = await bridge.settle(out);\n\
          \x20 if (typeof out === \"string\") return out;\n\
          \x20 if (!out || typeof out !== \"object\") {{\n\
          \x20   throw new TypeError(\"browser handler must return a response object or an envelope string\");\n\

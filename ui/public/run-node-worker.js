@@ -60,8 +60,9 @@
 //    admission that authorized them is gone. A page that never answers is a
 //    supported state: the lane stays dormant and everything uses the relay.
 //
-// 2. A FLEET SIGNALLING MAILBOX — the one server-side arm this feature needs,
-//    owned by crates/hive-cloud. Exact contract this worker calls:
+// 2. A FLEET SIGNALLING MAILBOX. Implemented in
+//    crates/hive-cloud/src/browser_admission.rs (`browser_signals`); this is
+//    the wire contract, stated from the caller's side:
 //
 //      POST /cloud/v1/browser/signals      (header: x-hive-team)
 //      body {
@@ -72,25 +73,32 @@
 //        send: [ { to: "<peer 64hex>", kind: "offer"|"answer"|"ice"|"bye",
 //                  payload: "<JSON string, <= 16 KiB>" } ]   // <= 16 entries
 //      }
-//      200 { messages: [ { seq, from, kind, payload, sent_ms } ], retry_ms? }
+//      200 { messages: [ { seq, from, kind, payload, sent_ms } ],
+//            more, delivered, refused, retry_ms }
 //
-//    Required server-side rules (each mirrors an invariant this codebase
-//    already enforces elsewhere):
+//    The rules the server half enforces (each mirrors an invariant this
+//    codebase already enforces elsewhere):
 //      * POST, never GET. `admin_ingress` forwards mutations to the
 //        control-plane leader but serves GETs LOCALLY behind round-robin DNS,
 //        so a node-local mailbox read over GET reads the wrong node — the
-//        failure class AGENTS.md documents. Reads ride this POST's reply.
+//        failure class AGENTS.md documents. Reads ride this POST's reply, and
+//        both peers' POSTs therefore converge on the one leader.
 //      * The caller must hold a live admission for `endpoint_id` under the
-//        authenticated tenant, proven by the same PoP check `admit` runs.
-//      * `to` must appear in the CALLER's own server-derived mesh peer set.
-//        Anything else — unknown endpoint, foreign tenant, expired admission —
-//        is the identical refusal, so a browser can neither enumerate peers nor
-//        address a stranger.
-//      * The mailbox is bounded per endpoint (drop-oldest; a suggested shape is
-//        32 messages / 16 KiB each / 60s TTL) and consumed by `ack_seq`.
-//      * A fleet without this arm answers 404/405/501, which this worker treats
-//        as "no peer mesh yet", NOT as an error: the lane goes dormant and the
-//        relay path is untouched.
+//        authenticated tenant, re-read per call, proven by the same PoP check
+//        `admit` runs — so a revoked browser stops signalling within one round
+//        trip rather than at its lease boundary.
+//      * `to` must appear in the CALLER's own server-derived mesh peer set,
+//        re-derived from live state on every call and never read from the
+//        caller's cached capability. Unknown endpoint, foreign tenant and
+//        expired admission are the identical refusal, so a browser can neither
+//        enumerate peers nor address a stranger.
+//      * The mailbox is bounded per endpoint (32 messages, 16 KiB each, 60s
+//        TTL, drop-oldest) and consumed by `ack_seq`. `more: true` means the
+//        inbox held more than one round trip's slice — poll again immediately.
+//      * A fleet without this arm (or with HIVE_BROWSER_MESH=0) answers
+//        404/405/501, which this worker treats as "no peer mesh yet", NOT as an
+//        error: the lane goes dormant and the relay path is untouched. The
+//        rollout state and the kill switch are deliberately the same code path.
 //
 //    And the capability half, on the SAME atomic admission response the
 //    artifact/db blocks already ride (`capability.mesh`):
@@ -101,24 +109,27 @@
 //                   db: "read_write"|"read_only"|"none",
 //                   artifacts: ["<policy_digest>", ...] } ] }
 //    Every field SERVER-DERIVED from live admissions under the tenant, exactly
-//    like `trusted_callers` and `db.sync_peers`: `db` must be "none" for a
-//    Public-scope peer (an anonymous donor never writes tenant data) and
-//    `artifacts` never wider than what the peer's own capability authorizes.
-//    Absent block = no mesh, which is what every pre-upgrade node answers.
+//    like `trusted_callers` and `db.sync_peers`: `db` is "none" for a
+//    Public-scope peer, for a Public-scope CALLER, and across projects (a
+//    browser holds one replica), and `artifacts` is never wider than what the
+//    peer's own admission authorizes. `ice_servers` is empty unless the fleet
+//    operator configured HIVE_BROWSER_ICE_SERVERS — there is no default
+//    third-party STUN/TURN on this path, so with none set the lane connects
+//    only where host/reflexive candidates suffice and falls back to the relay
+//    everywhere else. Absent block = no mesh, which is what every pre-upgrade
+//    node answers.
 //
-// 3. TWO DEPLOYMENT PREREQUISITES, both outside this file, both currently
-//    UNMET — until each is done the lane is inert (status.mesh reports
-//    "unavailable"/"predates peer-mesh signing" and every byte keeps riding
-//    the relay, which is the designed degradation, not a crash):
-//      * `ui/scripts/sync-browser-node.mjs` must list "peer-mesh.js" and
-//        "peer-mesh-agent.js" alongside identity.js/artifact-policy.js.
-//        It copies a hand-written allowlist, so an unlisted module is simply
-//        never deployed and `import("./browser-node/peer-mesh.js")` 404s.
-//      * `crates/hive-browser/build.sh` must be re-run and its www/pkg output
-//        published: the signMeshEnvelope/verifyMeshEnvelope pair is new, and
-//        without BOTH halves there is no way to bind a DTLS fingerprint to an
-//        EndpointId — so the feature-detect below correctly refuses to open an
-//        unauthenticated peer lane.
+// 3. A PUBLISHED MODULE PAIR. `ui/scripts/sync-browser-node.mjs` copies a
+//    hand-written allowlist into ui/public/browser-node/, and it now lists
+//    peer-mesh.js + peer-mesh-agent.js — it did not, and because this file
+//    resolves them with a RUNTIME dynamic import against its own deployed
+//    origin, that omission failed no build and 404'd only on the fleet. The
+//    wasm half (signMeshEnvelope/verifyMeshEnvelope) ships in the same pkg/
+//    sync. Both are still FEATURE-DETECTED rather than assumed below: without
+//    both halves of the signature there is no way to bind a DTLS fingerprint
+//    to an EndpointId, and the honest answer to that is no peer lane at all,
+//    never an unauthenticated one. A missing module or an older wasm therefore
+//    degrades to status.mesh "unavailable" with every byte on the relay.
 
 import { loadOrCreateSeed } from "./browser-node/identity.js";
 import { WorkerFunctionRuntime } from "./browser-node/worker-function-runtime.js";
@@ -1706,6 +1717,29 @@ function onMeshPeerPort(port, msg, transferred) {
   pending.resolve(endpoint);
 }
 
+// A fresh page connected, which is a fresh potential agent host. The mesh lane
+// is the ONLY lane that structurally cannot self-host (RTCPeerConnection is
+// Window-only), so a node whose every session failed for want of a page would
+// otherwise sit out its exponential backoff — up to 5 minutes — after the tab
+// that could have served it arrived. Clearing the backoff on the failed
+// sessions and polling now costs one signalling round trip and is the
+// difference between "opens when you open a second tab" and "opens eventually".
+// Deliberately does NOT touch sessions that are open or mid-handshake.
+function noteMeshPortAdded() {
+  const lane = meshLane;
+  if (!lane || !lane.mesh || lane.mesh.closed) return;
+  let woke = false;
+  for (const session of lane.mesh.sessions.values()) {
+    if (session.state === "open" || session.state === "offering" || session.state === "answering") continue;
+    if (!session.retryAfter) continue;
+    session.retryAfter = 0;
+    woke = true;
+  }
+  if (!woke) return;
+  lane.mesh.schedulePoll(0);
+  updateMeshStatus();
+}
+
 // The page hosting the agent went away: its PeerConnections died with it. Drop
 // the agent so the next handshake re-brokers from a surviving page; the peer
 // set, the capability and every fleet path are untouched.
@@ -2481,6 +2515,9 @@ function connectPort(port) {
   if (dbLane && dbLane.state === "error" && !dbLane.nested && !dbLane.endpoint) {
     scheduleDbRespawn(dbLane, 250);
   }
+  // Same reasoning for the peer-mesh lane, which needs a PAGE for its
+  // RTCPeerConnection agent and has no nested fallback at all.
+  noteMeshPortAdded();
   try {
     port.postMessage({ type: "status", status });
   } catch {

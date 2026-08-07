@@ -3,15 +3,32 @@
 import { useEffect, useState, use } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check } from "lucide-react";
+import { ArrowLeft, Copy, Eye, EyeOff, Trash2, Check, Info } from "lucide-react";
 import { Card, Badge, Button, PageHeader } from "@/components/ui";
 import { apiGet, apiSend, usePoll, type Database } from "@/lib/api";
 import { timeAgo, copyText } from "@/lib/utils";
 import { toast } from "@/components/toast";
+import { KindBadge } from "../kind";
+import {
+  managedEndpoint, managedNoEndpointReason, projectFromRouteId, reachOfHost, endpointHost,
+  POOLING_NOTE, REACH_NOTE, type Reach,
+} from "../db-model";
+import { SqliteDatabaseDetail } from "./sqlite-detail";
 
+/**
+ * One storage detail route for every database. The id decides which backend
+ * answers — `sqlite_<project>` is a browser-replicated database (the
+ * `browser_db` contract), anything else is a managed engine record from
+ * `/v1/databases`. Both render the same shell.
+ */
 export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id: string }> }) {
   const params = use(paramsPromise);
-  const id = params.id;
+  const project = projectFromRouteId(params.id);
+  if (project) return <SqliteDatabaseDetail project={project} />;
+  return <ManagedDatabaseDetail id={params.id} />;
+}
+
+function ManagedDatabaseDetail({ id }: { id: string }) {
   const router = useRouter();
   // ADAPTIVE: a ready database record is essentially static — poll fast (3s)
   // only while provisioning, 20s once ready (mutations invalidate the cache,
@@ -86,6 +103,7 @@ export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id:
   // conn may be absent for a still-provisioning or replica record — never let
   // Object.entries throw (that produced a blank page).
   const conn = revealed ?? db.connection ?? {};
+  const endpoint = managedEndpoint(db);
 
   return (
     <div>
@@ -118,19 +136,39 @@ export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id:
         </Card>
       )}
 
-      {/* Primary connection string — the value most people want to copy. */}
+      {/* Primary connection string — the value most people want to copy, with an
+          honest reachability verdict next to it: a loopback DSN is real but only
+          resolves on the node running the engine. */}
       {(() => {
         const primaryKey = conn["DATABASE_URL"] ? "DATABASE_URL" : conn["REDIS_URL"] ? "REDIS_URL" : conn["endpoint"] ? "endpoint" : "";
-        if (!primaryKey) return null;
+        if (!primaryKey) {
+          return (
+            <Card className="mb-4">
+              <div className="mb-2 flex items-center gap-2">
+                <h3 className="text-sm font-semibold">Connection string</h3>
+                <KindBadge kind={db.kind} />
+              </div>
+              <p className="text-sm text-secondary">{managedNoEndpointReason(db)}</p>
+            </Card>
+          );
+        }
+        const reach: Reach = endpoint ? endpoint.reach : "unknown";
         return (
           <Card className="mb-4">
-            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">{primaryKey}</div>
+            <div className="mb-2 flex items-center gap-2">
+              <span className="text-xs font-medium uppercase tracking-wide text-muted">{primaryKey}</span>
+              {reach === "internal" && <span title={REACH_NOTE.internal}><Badge tone="amber">node-local</Badge></span>}
+              {reach === "external" && <span title={REACH_NOTE.external}><Badge tone="green">public</Badge></span>}
+            </div>
             <div className="flex items-center gap-3">
               <code className="min-w-0 flex-1 truncate rounded-md border border-border bg-subtle/50 px-3 py-2 font-mono text-xs">{conn[primaryKey]}</code>
               <Button variant="outline" onClick={() => copy(primaryKey)}>
                 {copied === primaryKey ? <><Check className="h-4 w-4 text-green" /> Copied</> : <><Copy className="h-4 w-4" /> Copy</>}
               </Button>
             </div>
+            {reach === "internal" && (
+              <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">{REACH_NOTE.internal}</p>
+            )}
           </Card>
         );
       })()}
@@ -146,17 +184,37 @@ export function DatabaseDetail({ paramsPromise }: { paramsPromise: Promise<{ id:
           {Object.entries(conn).length === 0 ? (
             <p className="py-2.5 text-xs text-muted">No connection details yet.</p>
           ) : (
-            Object.entries(conn).map(([k, v]) => (
-              <div key={k} className="flex items-center gap-3 py-2.5">
-                <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
-                <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{v}</div>
-                <button onClick={() => copy(k)} className="shrink-0 text-muted hover:text-fg" title={`Copy ${k}`}>
-                  {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
-                </button>
-              </div>
-            ))
+            Object.entries(conn).map(([k, v]) => {
+              // Classify only what we can actually see: a revealed URL by its own
+              // host, and the platform's explicit `INTERNAL_*` naming convention.
+              // A masked value is never guessed at.
+              const rowReach: Reach | null = k.startsWith("INTERNAL_")
+                ? "internal"
+                : revealed && /:\/\//.test(v)
+                ? reachOfHost(endpointHost(v))
+                : null;
+              return (
+                <div key={k} className="flex items-center gap-3 py-2.5">
+                  <div className="w-48 shrink-0 font-mono text-xs text-secondary">{k}</div>
+                  <div className="min-w-0 flex-1 truncate font-mono text-xs text-fg">{v}</div>
+                  {rowReach === "internal" && (
+                    <span title={REACH_NOTE.internal} className="shrink-0"><Badge tone="amber">node-local</Badge></span>
+                  )}
+                  <button onClick={() => copy(k)} className="shrink-0 text-muted hover:text-fg" title={`Copy ${k}`}>
+                    {copied === k ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+                  </button>
+                </div>
+              );
+            })
           )}
         </div>
+        {!revealed && (
+          <p className="mt-3 text-xs text-muted">Reveal secrets to see the real values and which of them are externally reachable.</p>
+        )}
+        <p className="mt-3 flex items-start gap-1.5 text-xs text-muted">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>{POOLING_NOTE}</span>
+        </p>
         {db.container && <p className="mt-3 text-xs text-muted">Backed by container <code className="font-mono">{db.container}</code></p>}
       </Card>
 

@@ -1,41 +1,33 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
-  Database as DbIcon, Plus, X, Loader2, HardDrive, ListOrdered, Boxes, Zap, Radio, Wifi,
-  ChevronRight, ArrowLeft, Search, ExternalLink, Gauge,
+  Database as DbIcon, Plus, X, Loader2, ChevronRight, ArrowLeft, Search, ExternalLink,
+  Gauge, Copy, Check, FileStack, Info,
 } from "lucide-react";
 import { Card, Badge, Button, Input, PageHeader, Table, Th, Td } from "@/components/ui";
 import { BrandIcon, BlobIcon, nativePng } from "@/components/provider-icons";
-import { apiSend, usePoll, type Database, type DbKind } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
+import {
+  apiGet, apiSend, usePoll,
+  type Database, type DbKind, type Deployment, type ProjectSettings, type BrowserDbPolicy,
+} from "@/lib/api";
+import { timeAgo, copyText } from "@/lib/utils";
+import { toast } from "@/components/toast";
 import Image from "next/image";
-import { BrowserDbSection } from "./browser-db-panel";
+import { RedeployModal } from "@/components/redeploy-modal";
+import { KIND_ICON, KindBadge } from "./kind";
+import {
+  KIND_LABEL, POOLING_NOTE, REACH_NOTE, sqliteDatabases, unifiedDatabases,
+  type UnifiedDb, type UnifiedKind,
+} from "./db-model";
+import { BrowserDbConfigForm, emptyPolicy, saveBrowserDb } from "./browser-db-panel";
 
-const KIND_ICON: Record<DbKind, React.ReactNode> = {
-  postgres: <DbIcon className="h-5 w-5" />,
-  redis: <Zap className="h-5 w-5" />,
-  blob: <HardDrive className="h-5 w-5" />,
-  queue: <ListOrdered className="h-5 w-5" />,
-  vector: <Boxes className="h-5 w-5" />,
-  pubsub: <Radio className="h-5 w-5" />,
-  realtime: <Wifi className="h-5 w-5" />,
-};
-
-const KIND_NAME: Record<DbKind, string> = {
-  postgres: "Postgres", redis: "Redis", blob: "Blob", queue: "Queue",
-  vector: "Vector", pubsub: "Pub/Sub", realtime: "Realtime",
-};
-
-function kindBadge(kind: DbKind) {
-  const tone = { postgres: "blue", redis: "red", blob: "amber", queue: "green", vector: "default", pubsub: "blue", realtime: "green" } as const;
-  return <Badge tone={tone[kind] ?? "default"}>{KIND_NAME[kind] ?? kind}</Badge>;
-}
-
-// OpenEdge-native primitives.
-const NATIVE: { kind: DbKind; name: string; desc: string }[] = [
+// Every primitive the platform provisions itself. SQLite sits in this list, not
+// in a section of its own: it is a database, created the same way as the rest.
+const NATIVE: { kind: UnifiedKind; name: string; desc: string }[] = [
   { kind: "postgres", name: "Postgres", desc: "Managed Postgres — instant, branchable." },
+  { kind: "sqlite", name: "SQLite", desc: "Replicated cr-sqlite — a live copy in every admitted browser." },
   { kind: "redis", name: "Redis", desc: "Durable key-value, TCP + REST." },
   { kind: "blob", name: "Blob", desc: "Fast S3-compatible object storage." },
   { kind: "queue", name: "Queue", desc: "Durable FIFO message queue." },
@@ -44,7 +36,11 @@ const NATIVE: { kind: DbKind; name: string; desc: string }[] = [
   { kind: "realtime", name: "Realtime", desc: "Secure WebSocket streaming channels." },
 ];
 
-// Marketplace providers → backed by a native kind.
+// Marketplace providers → backed by a native kind. Each entry names the engine it
+// actually provisions; a provider whose product the platform cannot really stand
+// in for does not belong here (Turso was listed as "Serverless SQLite" while
+// provisioning a Postgres container — the native SQLite entry above is the
+// honest version of that offer).
 interface Provider { id: string; name: string; desc: string; kind: DbKind; color: string }
 const MARKETPLACE: Provider[] = [
   { id: "neon", name: "Neon", desc: "Serverless Postgres", kind: "postgres", color: "#00e599" },
@@ -56,21 +52,77 @@ const MARKETPLACE: Provider[] = [
   { id: "motherduck", name: "MotherDuck", desc: "Analytics database", kind: "postgres", color: "#ff7a45" },
   { id: "convex", name: "Convex", desc: "Reactive database", kind: "postgres", color: "#f3336b" },
   { id: "prisma", name: "Prisma Postgres", desc: "Instant Serverless Postgres", kind: "postgres", color: "#5a67d8" },
-  { id: "turso", name: "Turso", desc: "Serverless SQLite", kind: "postgres", color: "#4ff8d2" },
   { id: "drizzle", name: "Drizzle", desc: "TypeScript ORM (Postgres)", kind: "postgres", color: "#c5f74f" },
   { id: "mongodb", name: "MongoDB Atlas", desc: "Database for developers", kind: "blob", color: "#13aa52" },
 ];
 
-export default function StoragePage() {
-  // ADAPTIVE: the DB list only changes on create/delete/provision — poll fast
-  // (3s) only while a row is actually provisioning, 12s at rest (mutations
-  // invalidate the cache + refresh(), so creates still surface instantly).
+/**
+ * Both halves of the tenant's database list, in one hook so the page never has
+ * to know which backend a row came from.
+ *
+ * The managed list is one endpoint. The SQLite list is assembled from the two
+ * replicated sources that actually decide whether a project HAS one: the
+ * deployment manifests (gossiped `DeploymentInfo.browser_db`, what the fleet
+ * reconciles against) and the dashboard-managed `ProjectSettings.browser_db`
+ * mirror. See `sqliteDatabases`.
+ */
+function useDatabases() {
   const [provisioning, setProvisioning] = useState(false);
-  const { data: dbs, error, refresh } = usePoll<Database[]>("/v1/databases", provisioning ? 3000 : 12000);
+  const { data: managed, error, refresh } = usePoll<Database[]>("/v1/databases", provisioning ? 3000 : 12000);
   useEffect(() => {
-    setProvisioning((dbs ?? []).some((d) => d.status === "provisioning"));
-  }, [dbs]);
+    setProvisioning((managed ?? []).some((d) => d.status === "provisioning"));
+  }, [managed]);
+
+  const { data: deployments } = usePoll<Deployment[]>("/deployments", 15000);
+  const projects = useMemo(
+    () => Array.from(new Set((deployments ?? []).map((d) => d.project))).sort(),
+    [deployments],
+  );
+  const projectsKey = projects.join(",");
+
+  const [settings, setSettings] = useState<Record<string, BrowserDbPolicy | null | undefined>>({});
+  const refreshProject = useCallback(async (project: string) => {
+    try {
+      const s = await apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(project)}/settings`, { fresh: true });
+      setSettings((cur) => ({ ...cur, [project]: s.browser_db ?? null }));
+    } catch {
+      /* leave the stale entry — the next load retries */
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!projects.length) return;
+    let cancelled = false;
+    (async () => {
+      const entries = await Promise.all(
+        projects.map(async (p) => {
+          try {
+            const s = await apiGet<ProjectSettings>(`/v1/projects/${encodeURIComponent(p)}/settings`);
+            return [p, s.browser_db ?? null] as const;
+          } catch {
+            return [p, undefined] as const;
+          }
+        }),
+      );
+      if (!cancelled) setSettings(Object.fromEntries(entries));
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projectsKey]);
+
+  const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings), [deployments, settings]);
+  const rows = useMemo(() => unifiedDatabases(managed ?? [], sqlite), [managed, sqlite]);
+
+  // `managed` null AND no sqlite row = still loading / genuinely nothing. The
+  // page distinguishes those with `error`.
+  return { rows, error, refresh, refreshProject, projects, deployments: deployments ?? [], loaded: managed !== null };
+}
+
+export default function StoragePage() {
+  const { rows, error, refresh, refreshProject, projects, deployments, loaded } = useDatabases();
   const [open, setOpen] = useState(false);
+  const [redeployTarget, setRedeployTarget] = useState<Deployment | null>(null);
+
   // Deep-link: /storage?browse opens the Browse Storage panel directly.
   useEffect(() => {
     if (typeof window !== "undefined" && new URLSearchParams(window.location.search).has("browse")) {
@@ -82,79 +134,197 @@ export default function StoragePage() {
     <div className="pb-24">
       <PageHeader
         title="Storage"
-        desc="Serverless databases provisioned per project — connect them to your projects."
+        desc="Every database in one place — managed engines and browser-replicated SQLite, provisioned per project."
         action={<Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Database</Button>}
       />
 
-      {error && !dbs?.length ? (
+      {error && !rows.length ? (
         <Card className="flex flex-col items-center gap-3 py-16 text-center">
           <DbIcon className="h-8 w-8 text-muted" />
           <div className="text-sm font-medium">Couldn&apos;t load databases</div>
           <p className="max-w-sm text-sm text-secondary">{String(error).replace(/^Error:\s*/, "")}</p>
           <Button variant="outline" onClick={refresh}>Retry</Button>
         </Card>
-      ) : !dbs?.length ? (
+      ) : !rows.length ? (
         <Card className="flex flex-col items-center gap-3 py-16 text-center">
           <DbIcon className="h-8 w-8 text-muted" />
-          <div className="text-sm font-medium">No databases yet</div>
-          <p className="max-w-sm text-sm text-secondary">Provision a serverless database and connect it to a project. Credentials are generated automatically.</p>
+          <div className="text-sm font-medium">{loaded ? "No databases yet" : "Loading databases…"}</div>
+          <p className="max-w-sm text-sm text-secondary">
+            Provision a serverless database and connect it to a project. Credentials are generated automatically —
+            or deploy a replicated SQLite database that lives in your users&apos; browsers.
+          </p>
           <Button onClick={() => setOpen(true)}><Plus className="h-4 w-4" /> Create Database</Button>
         </Card>
       ) : (
-        <Table>
-          <thead><tr><Th>Name</Th><Th>Provider</Th><Th>Type</Th><Th>Project</Th><Th>Region</Th><Th>Status</Th><Th>Created</Th></tr></thead>
-          <tbody>
-            {dbs.map((d) => (
-              <tr key={d.id} className="cursor-pointer hover:bg-subtle">
-                <Td className="font-medium">
-                  <Link href={`/storage/${d.id}`} className="flex items-center gap-2">
-                    <span className="text-muted">{KIND_ICON[d.kind]}</span>{d.name}
-                  </Link>
-                </Td>
-                <Td className="text-secondary">{d.provider || KIND_NAME[d.kind]}</Td>
-                <Td>{kindBadge(d.kind)}</Td>
-                <Td className="text-secondary">{d.project || "—"}</Td>
-                <Td>
-                  <div className="flex flex-wrap items-center gap-1">
-                    <Badge tone="blue">{d.region}</Badge>
-                    {(d.replicas ?? []).map((r) => (
-                      <span key={r} title="read replica"><Badge tone="default">↳ {r}</Badge></span>
-                    ))}
-                  </div>
-                </Td>
-                <Td><StatusBadge status={d.status} mode={d.mode} /></Td>
-                <Td className="text-secondary">{d.created_ms ? `${timeAgo(d.created_ms)} ago` : "—"}</Td>
+        <>
+          <Table>
+            <thead>
+              <tr>
+                <Th>Name</Th><Th>Provider</Th><Th>Type</Th><Th>Project</Th><Th>Region</Th>
+                <Th>Connection</Th><Th>Status</Th><Th>Created</Th>
               </tr>
-            ))}
-          </tbody>
-        </Table>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id} className="cursor-pointer hover:bg-subtle">
+                  <Td className="font-medium">
+                    <Link href={row.href} className="flex items-center gap-2">
+                      <span className="text-muted">{KIND_ICON[row.kind]}</span>{row.name}
+                    </Link>
+                  </Td>
+                  <Td className="text-secondary">{row.provider}</Td>
+                  <Td><KindBadge kind={row.kind} /></Td>
+                  <Td className="text-secondary">{row.project || "—"}</Td>
+                  <Td>
+                    <div className="flex flex-wrap items-center gap-1">
+                      <span title={row.regionTitle}><Badge tone="blue">{row.region}</Badge></span>
+                      {row.replicas.map((r) => (
+                        <span key={r} title="read replica"><Badge tone="default">↳ {r}</Badge></span>
+                      ))}
+                    </div>
+                  </Td>
+                  <Td><ConnectionCell row={row} /></Td>
+                  <Td><StatusBadge row={row} /></Td>
+                  <Td className="text-secondary">
+                    <span title={row.createdTitle}>{row.createdMs ? `${timeAgo(row.createdMs)} ago` : "—"}</span>
+                  </Td>
+                </tr>
+              ))}
+            </tbody>
+          </Table>
+          <p className="mt-3 flex items-start gap-1.5 text-xs text-muted">
+            <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>{POOLING_NOTE}</span>
+          </p>
+        </>
       )}
 
-      {open && <BrowseStorage onClose={() => setOpen(false)} onCreated={() => { setOpen(false); refresh(); }} />}
+      {open && (
+        <BrowseStorage
+          projects={projects}
+          onClose={() => setOpen(false)}
+          onCreated={() => { setOpen(false); refresh(); }}
+          onSqliteSaved={async (project) => {
+            setOpen(false);
+            await refreshProject(project);
+            const target = deployments
+              .filter((d) => d.project === project)
+              .sort((a, b) => b.created_at_ms - a.created_at_ms)[0];
+            if (target) setRedeployTarget(target);
+          }}
+        />
+      )}
 
-      <BrowserDbSection />
+      {redeployTarget && (
+        <RedeployModal
+          deployment={redeployTarget}
+          prodAlias={`${redeployTarget.project}.localhost`}
+          onClose={() => setRedeployTarget(null)}
+        />
+      )}
     </div>
   );
 }
 
-function StatusBadge({ status, mode }: { status: string; mode: string }) {
-  if (status === "provisioning") return <Badge tone="amber"><Loader2 className="h-3 w-3 animate-spin" /> Provisioning</Badge>;
-  if (status === "error") return <Badge tone="red">Error</Badge>;
-  return <Badge tone="green">Ready{mode === "simulated" ? " · sim" : ""}</Badge>;
+function StatusBadge({ row }: { row: UnifiedDb }) {
+  if (row.status === "provisioning") {
+    return (
+      <Badge tone="amber">
+        {row.source === "managed" ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+        {row.statusNote || "Provisioning"}
+      </Badge>
+    );
+  }
+  if (row.status === "error") return <Badge tone="red">Error</Badge>;
+  return <Badge tone="green">Ready{row.statusNote ? ` · ${row.statusNote}` : ""}</Badge>;
 }
 
+/**
+ * The connection cell — the one place the SQLite lane genuinely differs, and it
+ * says so rather than showing a DSN that connects to nothing.
+ *
+ * For a managed engine the ADDRESS shown comes from the unmasked `host`/`port`
+ * keys; the copy button fetches the real credential from
+ * `/v1/databases/:id/credentials` (the list poll masks anything url/token/secret,
+ * so copying the polled value would yield "••••" junk).
+ */
+function ConnectionCell({ row }: { row: UnifiedDb }) {
+  const [copied, setCopied] = useState(false);
 
-/** Vercel-style "Browse Storage" right-side slide-over. */
-function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  if (!row.endpoint) {
+    return (
+      <Link href={row.href} className="text-xs text-muted hover:text-fg" title={row.noEndpointReason}>
+        {row.source === "sqlite" ? "no wire endpoint" : "—"}
+      </Link>
+    );
+  }
+
+  const endpoint = row.endpoint;
+  async function copy(e: React.MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    try {
+      const full = await apiGet<Database>(`/v1/databases/${row.id}/credentials`, { fresh: true });
+      const value = full.connection?.[endpoint.key] ?? "";
+      if (!value) {
+        toast(`No ${endpoint.key} available yet`, {});
+        return;
+      }
+      if (await copyText(value)) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+        toast(`Copied ${endpoint.key}`, { tone: "blue" });
+      } else {
+        toast("Copy failed — open the database and copy manually", {});
+      }
+    } catch (err) {
+      toast(`Couldn't copy: ${String(err).replace(/^Error:\s*/, "")}`, {});
+    }
+  }
+
+  return (
+    <span className="flex items-center gap-1.5">
+      <code className="truncate font-mono text-xs text-secondary" title={`${endpoint.key} · ${endpoint.protocol}`}>
+        {endpoint.address}
+      </code>
+      {endpoint.reach === "internal" && (
+        <span title={REACH_NOTE.internal}><Badge tone="amber">internal</Badge></span>
+      )}
+      <button onClick={copy} className="shrink-0 text-muted hover:text-fg" title={`Copy ${endpoint.key}`}>
+        {copied ? <Check className="h-3.5 w-3.5 text-green" /> : <Copy className="h-3.5 w-3.5" />}
+      </button>
+    </span>
+  );
+}
+
+/** Vercel-style "Browse Storage" right-side slide-over — one create flow for
+ *  every kind, SQLite included. */
+function BrowseStorage({
+  projects,
+  onClose,
+  onCreated,
+  onSqliteSaved,
+}: {
+  projects: string[];
+  onClose: () => void;
+  onCreated: () => void;
+  onSqliteSaved: (project: string) => void;
+}) {
   const [q, setQ] = useState("");
-  const [sel, setSel] = useState<{ kind: DbKind; provider: string } | null>(null);
+  const [sel, setSel] = useState<{ kind: UnifiedKind; provider: string } | null>(null);
   const [step, setStep] = useState<"browse" | "configure">("browse");
-  // configure step
+  // managed-engine configure step
   const [name, setName] = useState("");
   const [project, setProject] = useState("");
   const [region, setRegion] = useState("san-jose");
   const [replicas, setReplicas] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  // sqlite configure step
+  const [sqliteProject, setSqliteProject] = useState("");
+  const [policy, setPolicy] = useState<BrowserDbPolicy>(emptyPolicy());
+  const isSqlite = sel?.kind === "sqlite";
+
   // Live mesh regions for the replica selector (falls back to the known set).
   const { data: catalog } = usePoll<Record<string, { id: string; label: string }[]>>("/v1/regions/catalog", 30000);
   const allRegions: string[] = catalog
@@ -170,6 +340,17 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
   async function create() {
     if (!sel) return;
     setBusy(true);
+    setError("");
+    if (isSqlite) {
+      const err = await saveBrowserDb(sqliteProject || projects[0] || "", policy);
+      if (err) {
+        setError(err.replace(/^Error:\s*/, ""));
+        setBusy(false);
+        return;
+      }
+      onSqliteSaved(sqliteProject || projects[0] || "");
+      return;
+    }
     try {
       await apiSend("POST", "/v1/databases", {
         name: name || `${sel.provider.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-db`,
@@ -180,7 +361,10 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
         replicas: replicas.filter((r) => r !== region),
       });
       onCreated();
-    } catch (e) { alert(String(e)); setBusy(false); }
+    } catch (e) {
+      setError(String(e).replace(/^Error:\s*/, ""));
+      setBusy(false);
+    }
   }
 
   return (
@@ -191,7 +375,11 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
           <div>
             <h2 className="text-xl font-semibold">{step === "browse" ? "Browse Storage" : "Configure"}</h2>
             <p className="mt-1 text-sm text-secondary">
-              {step === "browse" ? "Create databases and stores that you can connect to your projects." : `${sel?.provider} · backed by OpenEdge ${sel ? KIND_NAME[sel.kind] : ""}`}
+              {step === "browse"
+                ? "Create databases and stores that you can connect to your projects."
+                : isSqlite
+                ? "SQLite · replicated to every admitted browser"
+                : `${sel?.provider} · backed by OpenEdge ${sel ? KIND_LABEL[sel.kind] : ""}`}
             </p>
           </div>
           <button onClick={onClose} className="text-muted hover:text-fg"><X className="h-5 w-5" /></button>
@@ -246,13 +434,39 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                 </>
               )}
             </>
+          ) : isSqlite ? (
+            <div className="space-y-4">
+              <div className="flex items-center gap-3 rounded-lg border border-border bg-subtle p-3">
+                <span className="text-secondary"><FileStack className="h-5 w-5" /></span>
+                <div>
+                  <div className="text-sm font-medium">SQLite</div>
+                  <div className="text-xs text-secondary">
+                    cr-sqlite, replicated bidirectionally between the fleet and every admitted browser.
+                  </div>
+                </div>
+              </div>
+              <BrowserDbConfigForm
+                projects={projects}
+                project={sqliteProject || projects[0] || ""}
+                onProjectChange={setSqliteProject}
+                allowProjectPick
+                policy={policy}
+                onPolicyChange={setPolicy}
+              />
+              <p className="flex items-start gap-1.5 text-xs text-muted">
+                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                No connection string is issued: apps read and write this database through the replica in the
+                browser. There is no libsql/Turso wire endpoint and no server-side pool for it.
+              </p>
+              {error && <p className="text-sm text-red-500">{error}</p>}
+            </div>
           ) : (
             <div className="space-y-4">
               <div className="flex items-center gap-3 rounded-lg border border-border bg-subtle p-3">
                 <span className="text-secondary">{sel && KIND_ICON[sel.kind]}</span>
                 <div>
                   <div className="text-sm font-medium">{sel?.provider}</div>
-                  <div className="text-xs text-secondary">Backed by OpenEdge {sel ? KIND_NAME[sel.kind] : ""}</div>
+                  <div className="text-xs text-secondary">Backed by OpenEdge {sel ? KIND_LABEL[sel.kind] : ""}</div>
                 </div>
               </div>
               <div>
@@ -303,6 +517,7 @@ function BrowseStorage({ onClose, onCreated }: { onClose: () => void; onCreated:
                 ) : null}
               </div>
               <p className="flex items-center gap-1.5 text-xs text-muted"><Gauge className="h-3.5 w-3.5" /> Credentials are generated automatically and injected into the project&apos;s environment variables.</p>
+              {error && <p className="text-sm text-red-500">{error}</p>}
             </div>
           )}
         </div>

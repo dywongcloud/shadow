@@ -1,5 +1,5 @@
 ---
-# Headless browser node: ONE per host, on the five hosts in [browser_nodes].
+# Headless browser node: ONE per host, on the six hosts in [browser_nodes].
 # See roles/hive_browser_node/README.md for the auth + caps reasoning.
 
 # ---------- roster gate ----------
@@ -13,6 +13,7 @@ hive_browser_node_allowed:
   - fc-virginia
   - fc-saopaulo
   - fc-frankfurt
+  - fc-hongkong
 
 # ---------- layout ----------
 hive_browser_node_root: /opt/hive-browser-node

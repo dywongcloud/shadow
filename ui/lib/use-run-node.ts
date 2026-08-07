@@ -47,6 +47,80 @@ const DEFAULT_RELAYS = [
 ].join(",");
 const RELAY = process.env.NEXT_PUBLIC_HIVE_BROWSER_RELAY || DEFAULT_RELAYS;
 
+/** The page half of the browser↔browser direct lane (bn-browser-peer-webrtc-mesh).
+ *
+ *  `RTCPeerConnection` is `[Exposed=Window]` — it exists in NEITHER worker
+ *  context this file drives (SharedWorker, and the Web Locks fallback's
+ *  dedicated Worker), so the run-node worker, which owns the node, the
+ *  admission and every capability, structurally cannot open a peer connection
+ *  itself. It brokers one through a connected page exactly like the sqlite
+ *  DedicatedWorker above:
+ *
+ *    worker -> page : { type: "meshPeerRequest", requestId }
+ *    page  -> worker: { type: "meshPeerPort", requestId } + transfer [port]
+ *    worker -> page : { type: "meshPeerDone", requestId }
+ *
+ *  THE PAGE IS NOT TRUSTED WITH POLICY and this broker is deliberately the
+ *  thinnest possible thing: it constructs the agent, hands back a port and
+ *  stops the agent on request or teardown. It never learns a peer id, never
+ *  chooses an ICE server, never sees a capability, an artifact byte or a
+ *  database grant — all of those stay in the worker, which received them
+ *  server-derived over the authenticated admission path. The agent module
+ *  itself (peer-mesh-agent.js) does the one check a page IS uniquely placed to
+ *  make: that a remote SDP's fingerprint is the one the worker verified an
+ *  ed25519 signature over, before the description reaches the DTLS stack.
+ *
+ *  NOT hosting is a fully supported state, and every failure here lands in it:
+ *  no RTCPeerConnection, an unpublished module, a blocked import — the worker's
+ *  own broker timeout fires, `status.mesh` says so honestly, and every byte
+ *  keeps riding the relay. The lane is an optimisation, never a dependency. */
+type MeshAgentModule = { startMeshAgent: (port: MessagePort) => { stop: () => void } };
+
+function createMeshAgentBroker(post: (message: unknown, transfer?: Transferable[]) => void) {
+  let agent: { stop: () => void; requestId: number } | null = null;
+  // Monotonic, so an in-flight import whose request has already been
+  // superseded (or whose page is unmounting) never installs a stale agent —
+  // an orphaned agent holds live PeerConnections after the admission that
+  // authorized them is gone.
+  let generation = 0;
+
+  const end = (requestId?: number) => {
+    generation += 1;
+    if (!agent) return;
+    if (requestId !== undefined && agent.requestId !== requestId) return;
+    try {
+      agent.stop();
+    } catch {
+      /* already stopped */
+    }
+    agent = null;
+  };
+
+  const host = (requestId: number) => {
+    end();
+    if (typeof RTCPeerConnection !== "function") return;
+    const mine = generation;
+    // Loaded from the deployed origin at RUNTIME, never bundled: the module is
+    // a hand-written source published by ui/scripts/sync-browser-node.mjs
+    // alongside the wasm bundle, and the worker imports the same file the same
+    // way. Bundling it here would fork one contract into two builds.
+    const url = `${window.location.origin}/browser-node/peer-mesh-agent.js`;
+    void (import(/* webpackIgnore: true */ /* turbopackIgnore: true */ url) as Promise<MeshAgentModule>)
+      .then((module) => {
+        if (mine !== generation) return;
+        const channel = new MessageChannel();
+        const started = module.startMeshAgent(channel.port1);
+        agent = { stop: () => started.stop(), requestId };
+        post({ type: "meshPeerPort", requestId }, [channel.port2]);
+      })
+      .catch(() => {
+        /* unpublished or blocked: the worker's broker timeout reports it */
+      });
+  };
+
+  return { host, end };
+}
+
 // Web-Locks-fallback owner handoff (bn-ui-sharedworker-owner): unlike a real
 // SharedWorker (which outlives any single tab), a Web Locks re-election spawns
 // a BRAND NEW dedicated Worker with no memory of what was running before —
@@ -119,9 +193,17 @@ export interface StartArgs {
   /** browser-auto-serve-eligible-set: what to serve when NO deployment is
    *  pinned above. `"auto"` (the default) asks the fleet to derive this
    *  tenant's whole browser-eligible set and refresh it on every renewal — the
-   *  node never names what lands in it; `"none"` is capacity only. Ignored
-   *  whenever `deployment` is set: an explicit pin is exactly as narrow as it
-   *  looks. */
+   *  node never names what lands in it. Ignored whenever `deployment` is set:
+   *  an explicit pin is exactly as narrow as it looks, and the worker derives
+   *  `"pinned"` from the non-empty deployment regardless of this field.
+   *
+   *  bn-picker-drop-capacity-only: `"none"` (serve nothing, replicate nothing)
+   *  is RETIRED as a request — nothing in the UI produces it any more. The
+   *  union still carries it because `readLastStart` parses records written by
+   *  older builds that could, and those are upgraded to `"auto"` on replay
+   *  rather than resurrecting a node that contributes nothing. The wire value
+   *  itself stays valid for the worker (`serve_mode`), so this is a UI
+   *  retirement, not a protocol change. */
   serveMode?: "auto" | "none";
   scope?: "team" | "public";
 }
@@ -266,11 +348,15 @@ export function useRunNode() {
         deployment: "",
         fn: "",
         digest: "",
-        // browser-auto-serve-eligible-set: an unpinned node replays the serve
-        // MODE it was running with. A record persisted before this field
-        // existed replays as "auto" — this build's default, and still nothing
-        // but the donor's own tenant's Ready deployments.
-        serveMode: last.serveMode ?? "auto",
+        // browser-auto-serve-eligible-set: an unpinned node replays automatic.
+        // bn-picker-drop-capacity-only: deliberately NOT `last.serveMode` any
+        // more. A record persisted by an older build can say "none", and
+        // replaying that verbatim would silently hand back a node that serves
+        // no function and replicates no database — after the picker's own
+        // persisted selection had already been migrated to "auto", so the page
+        // would claim automatic while the handoff ran capacity-only. One
+        // meaning for an unpinned node, on both persisted records.
+        serveMode: "auto",
         scope: last.scope ?? "team",
         team: currentTeam(),
       });
@@ -340,12 +426,21 @@ export function useRunNode() {
         dbBridge.worker.terminate();
         dbBridge = null;
       };
+      // peer-mesh agent broker — same shape as the db bridge above, and for
+      // the same structural reason (a worker global scope lacks the
+      // constructor). Re-created per wired port so a reconnect never posts a
+      // transferred port into a dead channel.
+      let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
 
       const wire = (p: MessagePort) => {
         sendRef.current = (msg) => p.postMessage(msg);
+        meshBroker?.end();
+        meshBroker = createMeshAgentBroker((message, transfer) => p.postMessage(message, transfer ?? []));
         p.onmessage = (e: MessageEvent) => {
           const msg = e.data;
           if (msg && msg.type === "status") applyIncomingStatus(msg.status);
+          else if (msg && msg.type === "meshPeerRequest") meshBroker?.host(msg.requestId);
+          else if (msg && msg.type === "meshPeerDone") meshBroker?.end(msg.requestId);
           else if (msg && msg.type === "dbWorkerRequest") {
             endDbBridge();
             try {
@@ -467,6 +562,11 @@ export function useRunNode() {
         document.removeEventListener("freeze", reportVisibility);
         document.removeEventListener("resume", reportVisibility);
         endDbBridge();
+        // An agent left running after its host page unmounts keeps
+        // PeerConnections (and their ICE) alive for a node that may already be
+        // gone. The worker also sends `meshPeerDone` on its own teardown; this
+        // covers the direction the worker cannot see.
+        meshBroker?.end();
         port.postMessage({ type: "visibility", visible: false, unloading: true });
         port.close();
         sendRef.current = () => {};
@@ -521,12 +621,27 @@ export function useRunNode() {
       };
       const onPageShow = () => reportVisibility();
 
+      // The peer-mesh agent broker is needed HERE TOO, and this is the one
+      // place the two lanes differ: the db lane's sqlite worker nests directly
+      // in a dedicated Worker (which has `Worker`), so this branch never
+      // brokered one — but `RTCPeerConnection` is Window-only, so a dedicated
+      // Worker cannot host a peer connection any more than a SharedWorker can.
+      // Only the OWNER tab wires this, because only it holds the real Worker
+      // reference; a non-owner tab has no channel to receive the request on.
+      let meshBroker: ReturnType<typeof createMeshAgentBroker> | null = null;
+
       const wireOwnerWorker = (worker: Worker) => {
+        meshBroker?.end();
+        meshBroker = createMeshAgentBroker((message, transfer) => worker.postMessage(message, transfer ?? []));
         worker.onmessage = (e: MessageEvent) => {
           const msg = e.data;
           if (msg && msg.type === "status") {
             applyIncomingStatus(msg.status);
             statusChannel.postMessage(msg.status);
+          } else if (msg && msg.type === "meshPeerRequest") {
+            meshBroker?.host(msg.requestId);
+          } else if (msg && msg.type === "meshPeerDone") {
+            meshBroker?.end(msg.requestId);
           }
         };
         // Worker crash recovery (bn-ui-sharedworker-owner, the row's 3rd
@@ -606,6 +721,7 @@ export function useRunNode() {
         document.removeEventListener("resume", reportVisibility);
         sendRef.current({ type: "visibility", tabId: myTabId, visible: false, unloading: true });
         cancelled = true;
+        meshBroker?.end();
         statusChannel.close();
         controlChannel.close();
         reconnectRef.current = () => {};

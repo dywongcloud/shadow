@@ -1244,6 +1244,13 @@ async fn main() -> anyhow::Result<()> {
     // derived schema) present, and reap inert replicas only past the 30-day
     // grace window with the blast-radius guards — see browser_db.rs.
     browser_db::spawn_reconcile(cloud.clone());
+    // Protocol-wide browser ROLL CALL: a periodic read-only inventory + drift
+    // audit over the admitted browser population (who is present, what each
+    // serves, which db grant each holds) against this node's own gateway
+    // routing. Every node, because the routing half is node-local — see
+    // browser_admission::spawn_roll_call. Cadence: HIVE_BROWSER_ROLL_CALL_SECS
+    // (default 420s, `0` disables).
+    browser_admission::spawn_roll_call(cloud.clone());
 
     // Public gateway, wrapped in the edge pipeline.
     let public = fluid_gateway::public_router(gw.clone()).layer(

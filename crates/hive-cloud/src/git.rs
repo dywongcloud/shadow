@@ -2682,6 +2682,15 @@ async fn fanout_remote(
         log(format!("→ {}: dispatching deploy (via {route})", t.node));
         // Dispatch over HTTP admin (preferred) OR the iroh mesh (NAT'd coordinator →
         // FC nodes, the SSH tunnels are gone). Both return `{ "build_id": ... }`.
+        // Each transport is attempted in turn rather than one being chosen and
+        // its failure ending the deploy. HTTP admin is preferred (cheaper, and
+        // it carries the same signed delegation token), iroh is the fallback —
+        // and vice versa when only iroh exists. `attempt_failures` collects the
+        // REAL reason from each so a total failure names what actually went
+        // wrong; the previous code discarded it and logged a bare
+        // "iroh dispatch failed", which said nothing about whether the peer was
+        // unreachable, the request timed out, or the response was unparseable.
+        let mut attempt_failures: Vec<String> = Vec::new();
         let resp_json: Option<serde_json::Value> = if let Some(admin) = &t.admin {
             // `x-hive-team` alone is only trusted by the target's `tenant()`
             // resolver in UNENFORCED/dev mode — under JWT enforcement (every
@@ -2704,35 +2713,67 @@ async fn fanout_remote(
             match rb.json(&dreq).timeout(Duration::from_secs(15)).send().await {
                 Ok(r) => r.json::<serde_json::Value>().await.ok(),
                 Err(e) => {
-                    log(format!("✗ {}: dispatch failed: {e}", t.node));
-                    all_ok = false;
-                    continue;
-                }
-            }
-        } else if let Some((id, addr)) = &t.iroh {
-            let body = serde_json::to_vec(&dreq).unwrap_or_default();
-            let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
-            match crate::gossip::request_to(
-                cloud,
-                id,
-                addr,
-                hive_p2p::GOSSIP_POST,
-                &path,
-                &body,
-                20,
-            )
-            .await
-            {
-                Some(b) => serde_json::from_slice(&b).ok(),
-                None => {
-                    log(format!("✗ {}: iroh dispatch failed", t.node));
-                    all_ok = false;
-                    continue;
+                    attempt_failures.push(format!("http: {e}"));
+                    None
                 }
             }
         } else {
+            None
+        };
+        // Fall back to the mesh when HTTP produced nothing (never attempted, or
+        // attempted and failed). This is the path that matters on nodes whose
+        // 8786/8787 is firewalled off — healthy over iroh, unreachable over HTTP.
+        let resp_json: Option<serde_json::Value> = match resp_json {
+            Some(v) => Some(v),
+            None if t.iroh.is_some() => {
+                let (id, addr) = t.iroh.as_ref().expect("checked is_some");
+                if t.admin.is_some() {
+                    log(format!("→ {}: HTTP dispatch failed, retrying via iroh", t.node));
+                }
+                let body = serde_json::to_vec(&dreq).unwrap_or_default();
+                let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
+                match crate::gossip::request_to(
+                    cloud,
+                    id,
+                    addr,
+                    hive_p2p::GOSSIP_POST,
+                    &path,
+                    &body,
+                    20,
+                )
+                .await
+                {
+                    Some(b) => match serde_json::from_slice(&b) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            attempt_failures.push(format!("iroh: unparseable reply ({e})"));
+                            None
+                        }
+                    },
+                    None => {
+                        attempt_failures
+                            .push("iroh: no reply (peer unreachable over the mesh, or timed out after 20s)".into());
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let Some(resp_json) = resp_json else {
+            if attempt_failures.is_empty() {
+                // Neither transport was even available: the node advertised no
+                // admin URL and no iroh address, so there was nothing to try.
+                attempt_failures.push("no dispatch route (node advertises neither an admin URL nor an iroh address)".into());
+            }
+            log(format!(
+                "✗ {}: deploy dispatch failed — {}",
+                t.node,
+                attempt_failures.join("; ")
+            ));
+            all_ok = false;
             continue;
         };
+        let resp_json = Some(resp_json);
         let target_bid = resp_json
             .as_ref()
             .and_then(|v| v.get("build_id").and_then(|x| x.as_str()).map(String::from));

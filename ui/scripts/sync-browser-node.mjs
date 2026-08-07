@@ -41,9 +41,15 @@ for (const f of readdirSync(srcPkg)) {
 // existed in crates/hive-browser/www/ and neither was ever copied to
 // ui/public/browser-node/, so the deployed worker imported a path that was never
 // published.
+//
+// node-runtime.js is a STATIC import of worker-function-runtime.js
+// (browser-node-api-runtime): omitting it does not 404 one lane, it fails the
+// SharedWorker's whole module graph on the fleet while every local check stays
+// green — the same publishing gap as peer-mesh*.js, one step louder.
 for (const f of [
   "identity.js",
   "artifact-policy.js",
+  "node-runtime.js",
   "worker-function-runtime.js",
   "peer-mesh.js",
   "peer-mesh-agent.js",

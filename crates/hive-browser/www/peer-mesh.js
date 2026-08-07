@@ -238,7 +238,7 @@ export class PeerMesh {
     // dropped leaves no trace in it. That distinction is the answer to the one
     // question this lane exists to answer ("did any byte actually go direct, or
     // did it all fall back to the relay?"), so it is a counter, not a gauge.
-    this.stats = { framesIn: 0, framesOut: 0, bytesIn: 0, bytesOut: 0, artifactHits: 0, crrRounds: 0, direct: 0 };
+    this.stats = { framesIn: 0, framesOut: 0, bytesIn: 0, bytesOut: 0, artifactHits: 0, crrRounds: 0, direct: 0, signalRefused: 0 };
   }
 
   summary() {
@@ -257,6 +257,12 @@ export class PeerMesh {
       crrRounds: this.stats.crrRounds,
       bytesIn: this.stats.bytesIn,
       bytesOut: this.stats.bytesOut,
+      // Envelopes the fleet mailbox DECLINED to deliver — nearly always a peer
+      // that left the authorized set between the capability we hold and the
+      // server's live re-derivation, which is normal churn. A number that
+      // climbs without any peer ever reaching "open" is the honest signal that
+      // this node is addressing peers the server does not agree it may.
+      signalRefused: this.stats.signalRefused,
       error: this.error,
     };
   }
@@ -392,6 +398,9 @@ export class PeerMesh {
         send: sending.map((e) => ({ to: e.to, kind: e.kind, payload: JSON.stringify(e.payload) })),
       });
       this.error = null;
+      if (Number.isSafeInteger(reply && reply.refused) && reply.refused > 0) {
+        this.stats.signalRefused += reply.refused;
+      }
       const messages = Array.isArray(reply && reply.messages) ? reply.messages : [];
       for (const message of messages) {
         if (Number.isSafeInteger(message.seq) && message.seq > this.ackSeq) this.ackSeq = message.seq;
@@ -402,6 +411,13 @@ export class PeerMesh {
           this.noteSession(message.from, (s) => { s.error = String(error?.message ?? error).slice(0, 200); });
         }
       }
+      // The mailbox delivers a bounded slice per round trip and says so. A
+      // backed-up inbox (both peers handshaking at once, or a tab returning
+      // from suspension) must drain NOW rather than one slice per poll
+      // interval — at the idle cadence that is 15s per slice, long enough for
+      // the offerer's handshake timeout to fire on envelopes already sitting
+      // here.
+      if (reply && reply.more === true) this.pollAgain = true;
       this.onChange();
     } catch (error) {
       // A fleet with no signalling arm yet answers 404/405/501. That is a

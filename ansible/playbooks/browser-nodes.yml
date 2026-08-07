@@ -27,7 +27,7 @@
 #   ansible browser_nodes -m systemd -a 'name=hive-browser-node state=stopped enabled=false'
 #   ansible browser_nodes -m systemd -a 'name=hive-browser-node-broker state=stopped enabled=false'
 
-- name: Preflight — the browser-node roster is exactly the five intended hosts
+- name: Preflight — the browser-node roster is exactly the six intended hosts
   hosts: browser_nodes
   gather_facts: false
   run_once: true
@@ -37,7 +37,7 @@
     # host, a duplicate, or a missing region. The role re-checks per host, but
     # a run that is going to install on the wrong machine should fail before it
     # touches any machine.
-    - name: Assert the group resolves to exactly the five expected nodes
+    - name: Assert the group resolves to exactly the six expected nodes
       # delegate_to localhost: this is an inventory check, and it must be able
       # to fail BEFORE any SSH connection is attempted -- a run aimed at the
       # wrong machines should never reach the machines.
@@ -45,15 +45,16 @@
       become: false
       ansible.builtin.assert:
         that:
-          - (groups['browser_nodes'] | length) == 5
+          - (groups['browser_nodes'] | length) == 6
           - (groups['browser_nodes'] | map('extract', hostvars, 'hive_name') | sort)
-            == ['fc-bangkok', 'fc-frankfurt', 'fc-sanjose', 'fc-saopaulo', 'fc-virginia']
+            == ['fc-bangkok', 'fc-frankfurt', 'fc-hongkong', 'fc-sanjose',
+                'fc-saopaulo', 'fc-virginia']
         fail_msg: >-
           [browser_nodes] resolved to
           {{ groups['browser_nodes'] | map('extract', hostvars, 'hive_name') | list }} —
           expected exactly fc-bangkok, fc-sanjose, fc-virginia, fc-saopaulo,
-          fc-frankfurt, one each. Fix inventory/hosts.ini, not this assert.
-        success_msg: "browser-node roster verified: 5 hosts, one per node."
+          fc-frankfurt, fc-hongkong, one each. Fix inventory/hosts.ini, not this assert.
+        success_msg: "browser-node roster verified: 6 hosts, one per node."
 
 - name: Headless browser node (capped, unattended)
   hosts: browser_nodes
