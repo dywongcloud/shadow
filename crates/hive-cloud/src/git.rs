@@ -52,6 +52,19 @@ pub struct Build {
     /// never merely the last-finishing build (latest-push-wins).
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Human-readable reason a build reached `Error`, structured (not just a
+    /// buried log line) so a caller can answer "why did this fail" without
+    /// re-deriving it by parsing `lines`. This field DID NOT EXIST before —
+    /// any reader pulling `build["error"]` off the raw record always got the
+    /// zero-value `""` no matter what actually failed, because there was
+    /// nothing to clear: the key was never modeled. Witnessed live: 10
+    /// consecutive `internet-structure` build failures, each with a full
+    /// diagnostic message sitting in `lines` (e.g. "lost contact with remote
+    /// build after 400 failed polls") and an empty top-level error every
+    /// time. `#[serde(default)]` so pre-existing persisted records without
+    /// this key still deserialize.
+    #[serde(default)]
+    pub error: Option<String>,
     #[serde(default)]
     pub lines: Vec<LogLine>,
 }
@@ -115,10 +128,12 @@ impl BuildStore {
             if matches!(b.state, DeployState::Queued | DeployState::Building) {
                 b.state = DeployState::Error;
                 b.finished_ms.get_or_insert_with(now_ms);
+                let msg = "build interrupted: node restarted while the build was in flight";
                 b.lines.push(LogLine {
                     ts_ms: now_ms(),
-                    line: "build interrupted: node restarted while the build was in flight".into(),
+                    line: msg.into(),
                 });
+                b.error.get_or_insert_with(|| msg.into());
             }
             m.entry(b.id.clone()).or_insert(b);
         }
@@ -726,6 +741,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         deployment_id: None,
         alias: None,
         superseded_by: None,
+        error: None,
         lines: Vec::new(),
     });
 
@@ -789,10 +805,12 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                     }
                 });
             } else {
-                cloud.builds.log(&bid, format!("Error: {e}"));
+                let err_text = e.to_string();
+                cloud.builds.log(&bid, format!("Error: {err_text}"));
                 cloud.builds.update(&bid, |b| {
                     b.state = DeployState::Error;
                     b.finished_ms = Some(now_ms());
+                    b.error = Some(err_text.clone());
                 });
                 crate::webhooks::dispatch(
                     &cloud.webhooks,
@@ -962,6 +980,7 @@ pub(crate) fn redeploy_on_host(
         deployment_id: None,
         alias: None,
         superseded_by: None,
+        error: None,
         lines: Vec::new(),
     });
     cloud.build_cancels.register(&id);
@@ -2923,6 +2942,28 @@ async fn mirror_remote_build(
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
+    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
+    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+    // anonymous tenant, `build_owned_by` never matched the build's real
+    // team, and every poll 404'd — INCLUDING every poll against a target
+    // build that had already finished. Verified live: 400/400 polls failed
+    // for a target build that reached `ready` in under 3 seconds, on a
+    // reachable node, every single time. This is not a mesh-health symptom;
+    // it silently broke remote-build status mirroring for every
+    // fanout-placed deployment on the whole fleet, always burning the full
+    // 10-minute deadline regardless of how fast the actual remote build was.
+    // `mesh_team_qs` is the SAME delegation-token minting already used for
+    // every other mesh-internal proxied read (`fetch_from_host` and
+    // friends) — the coordinator knows the real owning team from its own
+    // local build record, so it can assert it the same way.
+    let team = cloud
+        .builds
+        .get(bid)
+        .map(|b| cloud.projects.team_of(&b.project))
+        .unwrap_or_default();
+    let team_qs = crate::admin::mesh_team_qs(&team);
     loop {
         tokio::time::sleep(Duration::from_millis(1500)).await;
         // `cancel_build` already fired the kill (local process group or, for a
@@ -2938,9 +2979,10 @@ async fn mirror_remote_build(
         }
         // Poll the target's build over the SAME transport we dispatched on.
         let v: Option<serde_json::Value> = if let Some(admin) = &target.admin {
+            let sep = if team_qs.is_empty() { "" } else { "?" };
             match cloud
                 .http
-                .get(format!("{admin}/v1/builds/{target_bid}"))
+                .get(format!("{admin}/v1/builds/{target_bid}{sep}{team_qs}"))
                 .timeout(Duration::from_secs(8))
                 .send()
                 .await
@@ -2955,12 +2997,13 @@ async fn mirror_remote_build(
             // the deploy in the first place — an iroh dial that has to fall back
             // through a relay can exceed it, and then every single poll returns
             // None while the remote build has actually already finished.
+            let sep = if team_qs.is_empty() { "" } else { "?" };
             crate::gossip::request_to(
                 cloud,
                 id,
                 addr,
                 hive_p2p::GOSSIP_GET,
-                &format!("/v1/builds/{target_bid}"),
+                &format!("/v1/builds/{target_bid}{sep}{team_qs}"),
                 &[],
                 20,
             )
@@ -7386,6 +7429,7 @@ mod tests {
             deployment_id: None,
             alias: None,
             superseded_by: None,
+            error: None,
             lines: Vec::new(),
         });
         store.log("dpl-test", "building…");
