@@ -68,38 +68,55 @@ export async function githubConnectionDetail(entity: string): Promise<GithubDeta
   const token = await getGithubAppToken();
   if (token) {
     const user = await rest.ghUser(token);
-    const live = !!user?.login;
-    let hasOrg = false;
-    let installUrl: string | undefined;
-    if (live) {
+    // ONLY a token that GitHub itself just answered for is allowed to decide
+    // this. A token can fail here two ways, and only one of them is caught by
+    // the expiry check in `getGithubAppToken`: an EXPIRED token is refreshed or
+    // cleared there, but a REVOKED one (user removed the authorization, the App
+    // was uninstalled and reinstalled, the secret was rotated) keeps a perfectly
+    // valid-looking `exp` in the future and is handed back as live.
+    //
+    // This block used to `return connected: live` unconditionally, so that dead
+    // cookie SHORT-CIRCUITED the installation fallback below — the one piece of
+    // state that exists precisely to answer "still connected" without a browser.
+    // The user-visible result was a permanent "Your GitHub authorization is no
+    // longer valid — reconnect" that reconnecting could not durably fix: the new
+    // cookie worked until it expired or was revoked, and then the same dead-end
+    // returned, with a valid App installation sitting right there unread.
+    //
+    // So a NOT-live token now falls THROUGH to the installation record instead
+    // of reporting a verdict it is not entitled to give.
+    if (user?.login) {
       const [orgs, installs] = await Promise.all([rest.ghOrgs(token), rest.ghInstallations(token)]);
-      hasOrg = orgs.length > 0 || installs.some((i) => i.account_type === "Organization");
+      const hasOrg = orgs.length > 0 || installs.some((i) => i.account_type === "Organization");
       const slug = installs.find((i) => i.app_slug)?.app_slug;
-      installUrl = slug ? `https://github.com/apps/${slug}/installations/new` : "https://github.com/settings/installations";
+      const installUrl = slug
+        ? `https://github.com/apps/${slug}/installations/new`
+        : "https://github.com/settings/installations";
       // Cache login/slug on the bundle for cheap display next time.
       const bundle = await readTokenBundle();
       if (bundle && (bundle.login !== user.login || (slug && bundle.slug !== slug))) {
         await updateBundleMeta({ login: user.login, slug }).catch(() => {});
       }
+      return {
+        configured: true,
+        connected: true,
+        entity,
+        login: user.login,
+        // GitHub Apps have no OAuth scopes; capabilities come from App permissions
+        // + installations. Private-repo access is what the App grants by design.
+        scopes: [],
+        hasPrivateAccess: true,
+        hasOrgScope: hasOrg,
+        live: true,
+        provider: "github-app",
+        via: "user-token",
+        installUrl,
+      };
     }
-    return {
-      configured: true,
-      connected: live,
-      entity,
-      login: user?.login ?? null,
-      // GitHub Apps have no OAuth scopes; capabilities come from App permissions
-      // + installations. Private-repo access is what the App grants by design.
-      scopes: [],
-      hasPrivateAccess: live,
-      hasOrgScope: hasOrg,
-      live,
-      provider: "github-app",
-      via: "user-token",
-      installUrl,
-    };
   }
 
-  // No usable per-browser cookie (fresh browser, expired, different machine).
+  // No usable per-browser cookie (fresh browser, expired, different machine,
+  // or — see above — one GitHub just refused).
   // The cookie was NEVER the source of truth — ask GitHub's REAL installation
   // record server-to-server with the App's own identity (the SAME source the
   // node's webhook/token-resolution path uses — see github-installation.ts).
