@@ -9,17 +9,18 @@
 //! improvement over that specific baseline — see the security posture note
 //! below for what it is not.
 //!
-//! **Status as of 2026-08-08: process sandboxing and filesystem staging are
-//! proven working end to end on fc-frankfurt's real kernel. Networking has a
-//! full implementation — a small forked litebox patch (wildcard-bind fix +
-//! per-invocation guest IP/gateway) plus a per-cell TUN device plus a
-//! bind-rewrite shim for Node/Bun's residual explicit-loopback case (see
-//! "Networking" below) — but that implementation has NOT yet been proven
-//! live: `smoke_test`'s network-check phase exercises the whole pipeline,
-//! but has not yet actually been run against a real host.
-//! `HIVE_LITEBOX_VERIFIED=1` must stay unset fleet-wide until
-//! `--litebox-probe` has genuinely passed the network check for real, not
-//! merely compiled.**
+//! **Status as of 2026-08-08: `--litebox-probe` PASSES for real on
+//! fc-frankfurt, both checks — the syscall rewriter, and a full HTTP round
+//! trip through the real per-cell-TUN + patched-litebox + bind-shim
+//! pipeline. Beyond the probe, a full `provision` -> `deliver_build` ->
+//! `start_function` deployment (a real app with a local `require()`, the
+//! exact production code path, not the probe's own inline server) was run
+//! live and answered a real `curl` with the correct app-specific response.
+//! `HIVE_LITEBOX_VERIFIED` is still NOT set on any node — enabling it for
+//! real tenant traffic is a separate, deliberate decision from proving the
+//! mechanism works, and this backend still is not Firecracker/gVisor-grade
+//! isolation (see "Security posture" below) regardless of how well the
+//! mechanics now work.**
 //!
 //! ## Mechanism
 //!
@@ -157,13 +158,20 @@
 //! eventually used, and the branch itself is unstable/undocumented — not a
 //! dependency to take today.
 //!
-//! **This implementation compiles, the litebox patch applies cleanly, and
-//! the bind-shim's rewrite logic is locally verified — but the patched
-//! litebox binary + the TUN-per-cell pipeline have NOT yet been run live.**
-//! `smoke_test`'s network phase exercises the whole real pipeline — a real
-//! TUN device, the patched litebox, a real Node HTTP server, a real
-//! host-side TCP round trip — and is what must genuinely PASS, live, before
-//! `HIVE_LITEBOX_VERIFIED=1` is safe to set anywhere.
+//! **Proven live on fc-frankfurt (2026-08-08), not just compiled.**
+//! `smoke_test`'s network phase (a real TUN device, the patched litebox, a
+//! real Node HTTP server, a real host-side TCP round trip) PASSES, and
+//! separately, a full `provision`/`deliver_build`/`start_function`
+//! deployment of a real app answered a real `curl` correctly. Getting there
+//! took three real bugs found and fixed by live testing, not design review
+//! — `setup_cell_net`'s `set -e` aborting on a harmless `ip link del`,
+//! litebox's own `SIGINT`/`SIGALRM` disposition assertion tripping under a
+//! parent with no controlling terminal, and `wait_tcp_ready`'s per-loop (not
+//! per-attempt) deadline check letting one slow `connect()` blow the whole
+//! budget — see this crate's git history for the exact fixes. Two of these
+//! (the signal assertion, the connect timeout) are general hazards for ANY
+//! process this crate spawns over a real network path, not litebox-specific
+//! quirks — worth remembering if this pattern gets reused elsewhere.
 //!
 //! ## Scope: `start_function` only, never `run_build`
 //!

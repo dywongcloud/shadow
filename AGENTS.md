@@ -359,12 +359,20 @@ releases).
   broker, genuinely fixing loopback, but its own access-control policy
   hard-DENIES wildcard binds by design (its own unit test confirms it) — the
   patch above is a permanent requirement regardless of which litebox
-  architecture is eventually used. This implementation compiles, the patch
-  applies cleanly, and the shim's rewrite logic is locally verified, but the
-  patched litebox + TUN-per-cell pipeline has NOT yet been run live —
-  `--litebox-probe`'s new network check is what closes that loop;
-  `HIVE_LITEBOX_VERIFIED=1` stays unset fleet-wide until it genuinely passes
-  on a real host.
+  architecture is eventually used. **Proven live on fc-frankfurt
+  (2026-08-08):** `--litebox-probe` PASSES both checks for real, and a full
+  `provision`/`deliver_build`/`start_function` deployment of a real app
+  (local `require()` included) answered a real `curl` correctly. Getting
+  there took three real bugs live testing found, not design review —
+  `setup_cell_net`'s `set -e` aborting on a harmless `ip link del`, litebox's
+  own `SIGINT`/`SIGALRM` disposition assertion tripping under a parent with
+  no controlling terminal, and `wait_tcp_ready`'s per-loop (not per-attempt)
+  deadline check letting one slow `connect()` blow the whole budget — see
+  `crates/hive-backend/src/litebox.rs`'s module doc and git history for the
+  fixes; two of these are general hazards for any process this crate spawns
+  over a real network path, not litebox-specific. `HIVE_LITEBOX_VERIFIED=1`
+  is STILL not set on any node — enabling it for real tenant traffic is a
+  separate, deliberate decision from proving the mechanism works.
 - **Security posture is honest, not oversold, and must stay that way.**
   Litebox measurably beats `MockBackend` (seccomp-bpf denies non-allowlisted
   syscalls at the real kernel boundary; mock has none) but is NOT
