@@ -318,7 +318,7 @@ pub struct LiteboxBackend {
     /// branch).
     containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
     ctnl_tasks: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
-    /// Per-cell network namespace/veth/TUN state — see [`LiteboxNet`]. Set
+    /// Per-cell TUN device state — see [`LiteboxNet`]. Set
     /// up in `provision` (before the port is known), torn down in
     /// `terminate`. Absent for CONTAINER cells, which never touch this path.
     cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
@@ -333,8 +333,19 @@ pub struct LiteboxBackend {
 
 /// The Node bind-rewrite shim's source, embedded at compile time so the
 /// runtime binary is fully self-contained (no separate ansible deploy step
-/// to keep in sync) — see `bind_shim_path`'s doc.
+/// to keep in sync) — see `stage_bind_shim`'s doc.
 const NODE_BIND_SHIM_JS: &str = include_str!("litebox-bind-shim.js");
+/// Where `NODE_OPTIONS=--require` finds the shim INSIDE the guest — a plain
+/// filename with no leading path landing at the tar's root when staged
+/// (proven live: this is exactly how `deliver_build`'s app tar entries
+/// resolve, e.g. `hello.txt` -> guest `/hello.txt`). This is a GUEST path,
+/// deliberately distinct from the HOST scratch path `stage_bind_shim` writes
+/// the same content to before tar-ing it in — the guest cannot see the host
+/// path at all (see module doc, "Guest filesystem"), confirmed live: an
+/// earlier version of this code pointed `NODE_OPTIONS` at the host path and
+/// every launch failed with `Cannot find module
+/// '/tmp/hive-litebox-cells/hive-litebox-bind-shim.js'`.
+const GUEST_BIND_SHIM_PATH: &str = "/hive-litebox-bind-shim.js";
 
 impl LiteboxBackend {
     pub fn new(cfg: LiteboxConfig) -> Self {
@@ -350,12 +361,44 @@ impl LiteboxBackend {
         }
     }
 
-    /// Path the embedded Node bind-rewrite shim gets written to on this
-    /// host (idempotent — `start_function` writes it fresh before every
-    /// launch, cheap and guarantees it can never silently go stale against
-    /// the binary's own embedded copy).
-    fn bind_shim_path(&self) -> PathBuf {
+    /// HOST scratch path the embedded shim's content is written to before
+    /// being tar'd into a guest-visible tar by `stage_bind_shim` — never
+    /// referenced by `NODE_OPTIONS` directly, see [`GUEST_BIND_SHIM_PATH`].
+    fn bind_shim_host_scratch_path(&self) -> PathBuf {
         self.cfg.root.join("hive-litebox-bind-shim.js")
+    }
+
+    /// Write the embedded shim to the host scratch path, then append it
+    /// into `tar_path` at [`GUEST_BIND_SHIM_PATH`]'s bare filename so it
+    /// becomes visible to the guest at that exact absolute path.
+    async fn stage_bind_shim(&self, tar_path: &Path) -> anyhow::Result<()> {
+        let host_path = self.bind_shim_host_scratch_path();
+        if let Some(parent) = host_path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        tokio::fs::write(&host_path, NODE_BIND_SHIM_JS).await?;
+        let dir = host_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("bind shim scratch path has no parent"))?;
+        let name = host_path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("bind shim scratch path has no filename"))?;
+        let out = Command::new("tar")
+            .arg("-C")
+            .arg(dir)
+            .arg("-rf")
+            .arg(tar_path)
+            .arg(name)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "tar failed staging the bind shim into {}: {}",
+            tar_path.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        Ok(())
     }
 
     /// Allocate a fresh TUN device + real `/30` for one cell — mirrors
@@ -382,9 +425,18 @@ impl LiteboxBackend {
 
         // Recreate fresh every time (delete any stale device from a prior
         // cell at this index) — same idempotency shape as
-        // FirecrackerBackend::setup_cell_net's tap recreation.
+        // FirecrackerBackend::setup_cell_net's tap recreation, deliberately
+        // WITHOUT `set -e`: `ip link del` on a not-yet-existing device (the
+        // overwhelmingly common case — `net_idx` only increases) exits
+        // non-zero even with its message silenced by `2>/dev/null`, and
+        // `set -e` would abort the whole script right there, before ever
+        // reaching `ip tuntap add` — reproduced live on fc-frankfurt
+        // (2026-08-08). Bare `&&` chaining (matching
+        // FirecrackerBackend::setup_cell_net exactly) makes the harmless
+        // `del` failure a non-issue: the script's own exit status is
+        // whatever the LAST command in the chain returns.
         let script = format!(
-            "set -e; export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
+            "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
              ip link del {tun_dev} 2>/dev/null; \
              ip tuntap add dev {tun_dev} mode tun && \
              ip addr add {host_ip}/30 dev {tun_dev} && \
@@ -521,6 +573,10 @@ impl LiteboxBackend {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        // Stage the bind-rewrite shim into every cell's tar unconditionally
+        // (cheap — one small JS file) rather than trying to detect whether
+        // this deployment's runtime will actually use it.
+        self.stage_bind_shim(&tmp).await?;
         tokio::fs::rename(&tmp, &combined).await?;
         Ok(combined)
     }
@@ -533,11 +589,11 @@ impl LiteboxBackend {
     /// produced the exact expected output via the sandboxed process's real
     /// stdout.
     ///
-    /// **(b) Network check** — sets up a real, throwaway namespace/veth/TUN
+    /// **(b) Network check** — sets up a real, throwaway per-cell TUN device
     /// (the exact `LiteboxNet` machinery `provision`/`start_function` use),
-    /// runs a real Node HTTP server through the FULL pipeline (rewriter +
-    /// bind-rewrite shim + DNAT), and makes a real HTTP round trip from the
-    /// host. A PASS here is what actually licenses `HIVE_LITEBOX_VERIFIED=1`
+    /// runs a real Node HTTP server through the FULL pipeline (patched
+    /// litebox + bind-rewrite shim), and makes a real HTTP round trip from
+    /// the host. A PASS here is what actually licenses `HIVE_LITEBOX_VERIFIED=1`
     /// — see the module doc's "Networking" section for exactly what this
     /// closes and what it still doesn't cover (Bun/Python bind-rewrite,
     /// sustained concurrency under real load).
@@ -591,6 +647,7 @@ impl LiteboxBackend {
         }
         let marker = format!("litebox-smoke-{}", now_ms());
         let mut cmd = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut cmd);
         cmd.arg("-Z").arg("--rewrite-syscalls");
         if !deps.is_empty() {
             cmd.arg(format!("--initial-files={}", tar_path.display()));
@@ -642,23 +699,24 @@ impl LiteboxBackend {
         if let Some(parent) = tar_path.parent() {
             tokio::fs::create_dir_all(parent).await.ok();
         }
-        if !deps.is_empty() {
-            let mut cmd = Command::new("tar");
-            cmd.arg("-h").arg("--absolute-names").arg("-cf").arg(&tar_path);
-            for d in &deps {
-                cmd.arg(d);
-            }
-            let out = cmd
-                .output()
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
-            anyhow::ensure!(
-                out.status.success(),
-                "tar failed staging node's deps for the network smoke test: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        tokio::fs::write(self.bind_shim_path(), NODE_BIND_SHIM_JS).await?;
+        // Always build the tar (never conditional on `deps` being non-empty
+        // — it always needs at least the bind shim) and always pass
+        // `--initial-files`, so the guest can find it.
+        let out = Command::new("tar")
+            .arg("-h")
+            .arg("--absolute-names")
+            .arg("-cf")
+            .arg(&tar_path)
+            .args(&deps)
+            .output()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "tar failed staging node's deps for the network smoke test: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        self.stage_bind_shim(&tar_path).await?;
 
         let marker = format!("litebox-net-smoke-{}", now_ms());
         // A wildcard bind (`.listen(PROBE_PORT)`, no host) is the exact case
@@ -671,14 +729,13 @@ impl LiteboxBackend {
             format!("require('http').createServer((q,r)=>{{r.end('{marker}')}}).listen({PROBE_PORT});");
 
         let mut cmd = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut cmd);
         cmd.arg("-Z")
             .arg("--rewrite-syscalls")
             .arg("--forward-env")
-            .arg(format!("--tun-device-name={}", net.tun_dev));
-        if !deps.is_empty() {
-            cmd.arg(format!("--initial-files={}", tar_path.display()));
-        }
-        cmd.arg("--")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
+            .arg(format!("--initial-files={}", tar_path.display()))
+            .arg("--")
             .arg(&node_bin)
             .arg("-e")
             .arg(&script)
@@ -687,27 +744,52 @@ impl LiteboxBackend {
             .env("HOME", "/")
             .env("LITEBOX_GUEST_IP", &net.guest_ip)
             .env("LITEBOX_GATEWAY_IP", &net.host_ip)
-            .env(
-                "NODE_OPTIONS",
-                format!("--require {}", self.bind_shim_path().display()),
-            )
+            .env("NODE_OPTIONS", format!("--require {GUEST_BIND_SHIM_PATH}"))
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!("failed to spawn litebox runner for the network smoke test: {e}")
         })?;
+        // Drain both pipes concurrently in the background so a chatty guest
+        // can never fill the pipe buffer and deadlock the process — captured
+        // for the failure message below, not printed live.
+        use tokio::io::AsyncReadExt;
+        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
+        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf).await;
+            buf
+        });
 
         let addr = format!("{}:{PROBE_PORT}", net.guest_ip);
         if let Err(e) = crate::mock::wait_tcp_ready(&addr, Duration::from_secs(10)).await {
             let _ = child.start_kill();
             let _ = child.wait().await;
-            return Err(e.context("litebox network smoke test: server never became reachable"));
+            let out = stdout_task.await.unwrap_or_default();
+            let err = stderr_task.await.unwrap_or_default();
+            return Err(e.context(format!(
+                "litebox network smoke test: server never became reachable (guest stdout: {:?}, \
+                 stderr: {:?})",
+                String::from_utf8_lossy(&out).trim(),
+                String::from_utf8_lossy(&err).trim(),
+            )));
         }
 
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let round_trip = async {
+        use tokio::io::AsyncWriteExt;
+        // Bounded: an unresponsive guest must fail loudly, not hang this
+        // probe forever. litebox's own userspace TCP stack has no kernel
+        // socket behind it — if the guest process dies mid-response without
+        // a chance to send a real FIN over the TUN link, `read_to_end` would
+        // otherwise wait for an EOF that can never arrive.
+        let round_trip = tokio::time::timeout(Duration::from_secs(10), async {
             let mut stream = tokio::net::TcpStream::connect(&addr).await?;
             stream
                 .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
@@ -715,17 +797,26 @@ impl LiteboxBackend {
             let mut resp = Vec::new();
             stream.read_to_end(&mut resp).await?;
             anyhow::Ok(resp)
-        }
-        .await;
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("litebox network smoke test: HTTP round trip timed out"))
+        .and_then(|r| r);
         let _ = child.start_kill();
         let _ = child.wait().await;
+        let out = stdout_task.await.unwrap_or_default();
+        let err = stderr_task.await.unwrap_or_default();
+        let guest_output = format!(
+            "guest stdout: {:?}, stderr: {:?}",
+            String::from_utf8_lossy(&out).trim(),
+            String::from_utf8_lossy(&err).trim(),
+        );
 
-        let resp = round_trip?;
+        let resp = round_trip.map_err(|e| e.context(guest_output.clone()))?;
         let resp_text = String::from_utf8_lossy(&resp);
         anyhow::ensure!(
             resp_text.contains(&marker),
             "litebox network smoke test: real HTTP round trip completed but the response was \
-             wrong — got: {resp_text:?}, want a body containing {marker:?}"
+             wrong — got: {resp_text:?}, want a body containing {marker:?} ({guest_output})"
         );
         Ok(())
     }
@@ -734,6 +825,31 @@ impl LiteboxBackend {
 impl Default for LiteboxBackend {
     fn default() -> Self {
         LiteboxBackend::new(LiteboxConfig::default())
+    }
+}
+
+/// litebox's own `register_exception_handlers` (`litebox_platform_linux_
+/// userland/src/lib.rs`) installs handlers for `SIGINT`/`SIGALRM` and
+/// ASSERTS the PREVIOUS disposition was `SIG_DFL` — a real, reproducible
+/// crash (`assertion left == right failed: signal 2 handler already
+/// installed`) whenever that isn't true, confirmed live on fc-frankfurt
+/// (2026-08-08): a process spawned with no controlling terminal (`setsid`,
+/// and — the actual production case — any child of a process itself run
+/// without a tty, e.g. over SSH without `-t` or under systemd) commonly
+/// inherits a non-default SIGINT disposition. `pre_exec` runs in the forked
+/// child before exec, the same technique `crate::mock::apply_rlimits`
+/// already uses, so litebox always starts from a clean slate regardless of
+/// what its parent's own disposition happened to be.
+fn reset_signal_dispositions_before_exec(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            for sig in [libc::SIGINT, libc::SIGALRM] {
+                if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
     }
 }
 
@@ -977,16 +1093,18 @@ impl CellBackend for LiteboxBackend {
                 )
             })?;
 
-        // Preload the bind-rewrite shim for Node/Bun (see module doc's
-        // "Networking" section + litebox-bind-shim.js's own doc comment):
-        // even with the wildcard-bind patch applied, an app that explicitly
-        // hardcodes a loopback address still needs rewriting to this cell's
-        // real guest IP — TUN can never bridge host<->guest loopback.
-        // Python is not covered yet — see `crate::litebox`'s tracking note.
-        tokio::fs::write(self.bind_shim_path(), NODE_BIND_SHIM_JS).await?;
+        // The bind-rewrite shim (see module doc's "Networking" section +
+        // litebox-bind-shim.js's own doc comment) is already staged into
+        // `initial_files` by `ensure_combined_tar` -> `stage_bind_shim`;
+        // only Node/Bun actually preload it. Even with the wildcard-bind
+        // patch applied, an app that explicitly hardcodes a loopback
+        // address still needs rewriting to this cell's real guest IP — TUN
+        // can never bridge host<->guest loopback. Python is not covered
+        // yet — see `crate::litebox`'s tracking note.
         let is_node = matches!(func.runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun);
 
         let mut cmd = Command::new(&self.cfg.runner_bin);
+        reset_signal_dispositions_before_exec(&mut cmd);
         cmd.arg("-Z")
             .arg("--rewrite-syscalls")
             .arg("--forward-env")
@@ -1017,10 +1135,7 @@ impl CellBackend for LiteboxBackend {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         if is_node {
-            cmd.env(
-                "NODE_OPTIONS",
-                format!("--require {}", self.bind_shim_path().display()),
-            );
+            cmd.env("NODE_OPTIONS", format!("--require {GUEST_BIND_SHIM_PATH}"));
         }
 
         let child = cmd.spawn().map_err(|e| {

@@ -82,11 +82,14 @@
     chdir: "{{ litebox_src_dir }}"
   environment:
     PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
-  args:
-    # Pinned commit -> a rebuild is only needed when litebox_commit changes
-    # and an operator clears this path. Same idempotency shape
-    # roles/firecracker_kvm uses for build-rootfs.sh.
-    creates: "{{ litebox_src_dir }}/target/release/litebox_runner_linux_userland"
+  # No `creates:` guard here on purpose: the clone above force-resets tracked
+  # files to pristine on every run and the patch task then re-applies
+  # networking.patch on top -- "the binary already exists at this path" is
+  # NOT the same as "the binary reflects the currently patched source"
+  # (bit us once: a stale pre-patch binary silently got re-staged because
+  # the file existed). `cargo build` is already incremental/idempotent on
+  # its own -- an unchanged source tree rebuilds in well under a second --
+  # so there is no real idempotency cost to just always invoking it.
   async: 1800
   poll: 15
 

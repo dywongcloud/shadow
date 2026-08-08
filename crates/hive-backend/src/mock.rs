@@ -647,11 +647,27 @@ pub(crate) async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Res
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = String::from("unknown");
     while tokio::time::Instant::now() < deadline {
-        match tokio::net::TcpStream::connect(addr).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
+        // Bound EACH individual attempt, not just the overall loop: the
+        // `while` condition is only re-checked BETWEEN iterations, so a
+        // single hung `connect()` can blow through the whole budget before
+        // the loop ever gets a chance to notice. Loopback callers (every
+        // existing one — Mock/Firecracker's container and child-process
+        // paths) never actually hit this, since a closed loopback port
+        // answers with an immediate ECONNREFUSED — but a real network path
+        // (litebox's per-cell TUN address) can have a destination that
+        // silently drops SYNs instead of rejecting them, and the OS's own
+        // default SYN-retry timeout is on the order of a minute, not
+        // milliseconds. Reproduced live on fc-frankfurt (2026-08-08): a
+        // 10s-budget wait_tcp_ready call hung for 60+ seconds.
+        let per_attempt = Duration::from_secs(2).min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        match tokio::time::timeout(per_attempt, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(_)) => return Ok(()),
+            Ok(Err(e)) => {
                 last = e.to_string();
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => {
+                last = format!("connect attempt exceeded {per_attempt:?}");
             }
         }
     }
