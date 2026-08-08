@@ -339,7 +339,9 @@ pub fn func_key(deployment: &str, function: &str) -> String {
 ///     point; Bun's own event loop has the identical characteristic).
 ///   * python — the GIL serializes CPU work, so cap concurrency lower (scale out).
 ///   * container / microVM — process/cgroup-level pressure varies; moderate cap.
-///   * wasm / unknown — trust the configured value (sandbox limits already apply).
+///   * wasm / wasmer / unknown — trust the configured value (sandbox limits
+///     already apply; a single `wasmer run --net` guest is single-process
+///     like Node, so no reason to cap it lower by default).
 /// Only ever LOWERS toward a runtime-appropriate ceiling; never raises above the
 /// deployment's configured `max_concurrency`.
 pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
@@ -347,7 +349,7 @@ pub fn recommended_safe_concurrency(runtime: &str, configured_max: u32) -> u32 {
         "node" | "nodejs" | "js" | "bun" | "edge" | "isolate" | "edge-isolate" => configured_max,
         "python" | "py" => configured_max.min(8),
         "container" | "docker" | "microvm" | "firecracker" => configured_max.min(16),
-        "wasm" | "wasi" => configured_max,
+        "wasm" | "wasi" | "wasmer" | "wasix" => configured_max,
         _ => configured_max,
     };
     cap.max(1)

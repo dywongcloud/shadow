@@ -171,6 +171,65 @@
     - name: Verify node:sqlite is now loadable
       ansible.builtin.command: /usr/local/bin/node -e "require('node:sqlite')"
 
+# Wasmer (hive_core::Runtime::Wasmer): `wasmer run --net --forward-host-env
+# <entry>.wasm` is the start_cmd the build pipeline emits for an explicit
+# `runtime: "wasmer"` function (see git.rs's detect_wasmer_start_cmd) — it
+# runs as an ordinary host process under whichever backend placed the cell
+# (Mock/Litebox today; Firecracker needs the binary baked into the guest
+# rootfs image separately, not covered here), exactly like node/bun/python
+# need no dedicated backend of their own. Live-verified end-to-end on this
+# exact pinned version: a real axum+tokio server built with `cargo wasix
+# build --release` (target wasm32-wasmer-wasi) bound a real socket and
+# served a real HTTP request under `wasmer run --net`, with
+# `--forward-host-env` correctly carrying the dynamically-assigned $PORT
+# from the spawning process into the guest. The release tarball bundles
+# every compiler backend (Cranelift/LLVM/Singlepass/V8) and is ~250MB
+# uncompressed — a real, one-time cost against the fleet's actively-managed
+# disk headroom (see AGENTS.md "Storage capacity & placement"), same class
+# of tradeoff as installing Node itself.
+- name: Check whether wasmer v7.2.1 is already installed
+  ansible.builtin.command: /usr/local/bin/wasmer --version
+  register: hive_wasmer_check
+  failed_when: false
+  changed_when: false
+
+- name: Install Wasmer v7.2.1 from the official release tarball (sha256-verified)
+  when: hive_wasmer_check.rc != 0 or 'wasmer 7.2.1' not in hive_wasmer_check.stdout
+  block:
+    - name: Download wasmer v7.2.1 linux-amd64 tarball with checksum
+      ansible.builtin.get_url:
+        url: "https://github.com/wasmerio/wasmer/releases/download/v7.2.1/wasmer-linux-amd64.tar.gz"
+        dest: /tmp/wasmer-v7.2.1-linux-amd64.tar.gz
+        checksum: "sha256:c46d6ff34a12b40d2e57bfc2ccbb8b9e209b0987ab305233619798b264a6bae5"
+
+    - name: Create versioned install dir /usr/local/wasmer-v7.2.1
+      ansible.builtin.file:
+        path: /usr/local/wasmer-v7.2.1
+        state: directory
+        mode: "0755"
+
+    - name: Extract wasmer v7.2.1 into /usr/local/wasmer-v7.2.1
+      ansible.builtin.unarchive:
+        src: /tmp/wasmer-v7.2.1-linux-amd64.tar.gz
+        dest: /usr/local/wasmer-v7.2.1
+        remote_src: true
+        creates: /usr/local/wasmer-v7.2.1/bin/wasmer
+
+    - name: Symlink wasmer into /usr/local/bin
+      ansible.builtin.file:
+        src: /usr/local/wasmer-v7.2.1/bin/wasmer
+        dest: /usr/local/bin/wasmer
+        state: link
+        force: true
+
+    - name: Remove the tarball
+      ansible.builtin.file:
+        path: /tmp/wasmer-v7.2.1-linux-amd64.tar.gz
+        state: absent
+
+    - name: Verify wasmer is now runnable
+      ansible.builtin.command: /usr/local/bin/wasmer --version
+
 - name: podman socket enabled (git.rs / sandboxes_platform.rs shell out to podman directly, not via the socket, but keep it available for tooling)
   ansible.builtin.systemd:
     name: podman.socket

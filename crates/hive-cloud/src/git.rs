@@ -3485,6 +3485,29 @@ async fn build_via_fdi(
         ));
     }
 
+    // An explicit Wasmer runtime is a precompiled `.wasm` artifact: no `npm
+    // install`, no framework build step, and no `fluid_build::plan_build`
+    // call at all (there is no package.json for any of it to act on, and
+    // `detect()` has no Wasmer preset — a `.wasm`-only project falls
+    // through to its own "unknown -> static" default, which would
+    // mislabel the dashboard's Build settings AND, left to reach the
+    // `Primitive::Static` arm further down, silently serve the project as
+    // a static site with no function at all). Short-circuits before any
+    // of that runs — an explicit `runtime: "wasmer"` config must win over
+    // every auto-detection step below, the same precedence every other
+    // explicit runtime choice already gets.
+    if runtime_override == Some(hive_core::Runtime::Wasmer) {
+        let Some(start) = detect_wasmer_start_cmd(dir).await else {
+            anyhow::bail!(
+                "runtime \"wasmer\" is set, but no `.wasm` entry module was found — \
+                 expected server.wasm / app.wasm / main.wasm, or exactly one *.wasm \
+                 file at the project root"
+            );
+        };
+        log(format!("Provisioning Wasmer server: `{}`.", start.join(" ")));
+        return Ok(function_manifest(project, start, runtime_override));
+    }
+
     let plan = fluid_build::plan_build(
         dir,
         fwo.as_deref(),
@@ -3943,6 +3966,11 @@ fn static_manifest(project: &str, static_dir: &str) -> Manifest {
 
 /// The command that boots the built app's production server.
 async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Vec<String> {
+    if runtime == Some(hive_core::Runtime::Wasmer) {
+        if let Some(cmd) = detect_wasmer_start_cmd(dir).await {
+            return cmd;
+        }
+    }
     let bun = runtime == Some(hive_core::Runtime::Bun);
     if let Ok(pkg) = tokio::fs::read_to_string(dir.join("package.json")).await {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) {
@@ -3982,6 +4010,51 @@ async fn detect_start_cmd(dir: &Path, runtime: Option<hive_core::Runtime>) -> Ve
     } else {
         vec!["npm".into(), "start".into()]
     }
+}
+
+/// Locate a Wasmer function's compiled `.wasm` entry module and build its
+/// `wasmer run` invocation. Conventional names first (`server.wasm` /
+/// `app.wasm` / `main.wasm`, mirroring the `server.js`/`app.py` convention
+/// above); otherwise a SINGLE `*.wasm` file at the project root is
+/// unambiguous. `--net` (live-verified against a real `cargo wasix build`
+/// axum server) grants the guest socket access — WASIX's own opt-in gate,
+/// analogous to a container needing `-p` published ports — and
+/// `--forward-host-env` carries the backend-assigned `$PORT` (and any
+/// project env vars) from the spawning process into the guest; the port is
+/// chosen at COLD-START time by fluid-compute, long after this build-time
+/// detection runs, so it can never be baked into `--env PORT=<literal>`
+/// here. Returns `None` (never a guess) when no `.wasm` entry is found or
+/// more than one sits at the root with no convention name to disambiguate —
+/// callers fall back to the generic Node/npm detection below, which will
+/// itself fail loudly (no server to start) rather than silently running the
+/// wrong module.
+async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
+    let wasmer_run = |entry: String| {
+        vec![
+            "wasmer".to_string(),
+            "run".to_string(),
+            "--net".to_string(),
+            "--forward-host-env".to_string(),
+            entry,
+        ]
+    };
+    for entry in ["server.wasm", "app.wasm", "main.wasm"] {
+        if dir.join(entry).exists() {
+            return Some(wasmer_run(entry.to_string()));
+        }
+    }
+    let mut rd = tokio::fs::read_dir(dir).await.ok()?;
+    let mut found: Option<String> = None;
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".wasm") {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(name);
+        }
+    }
+    found.map(wasmer_run)
 }
 
 /// Find a STABLE Node 20–24 bin dir, preferring it over an unstable system node

@@ -142,6 +142,23 @@ pub enum Runtime {
     Python,
     /// Podman container (the `__container__` start_cmd sentinel).
     Container,
+    /// A compiled WebAssembly/WASIX module executed via the `wasmer` CLI
+    /// (`wasmer run --net --forward-host-env <module>.wasm`). Runs as an
+    /// ordinary host process under whichever backend placed it (Mock,
+    /// Litebox, Firecracker) — Wasmer needs no dedicated `CellBackend`,
+    /// exactly like Node/Bun/Python don't. Live-verified: a real
+    /// axum+tokio server built with `cargo wasix build --release`
+    /// (target `wasm32-wasmer-wasi`) binds and serves a real HTTP
+    /// request under `wasmer run --net`, and `--forward-host-env`
+    /// correctly carries the dynamically-assigned `$PORT` from the
+    /// spawning backend into the guest — no build-time port baking.
+    /// Guest code MUST bind `0.0.0.0`, never a literal `127.0.0.1`:
+    /// unlike Node/Bun (which get a host-injected `_listen2` shim to
+    /// rescue a hardcoded-loopback bind, see `litebox.rs`), a compiled
+    /// `.wasm` module cannot be monkeypatched, so a loopback-bound guest
+    /// is unreachable through Litebox's per-cell TUN device the same way
+    /// an unshimmed Node app would be.
+    Wasmer,
     /// Anything else — a raw command/binary, or genuinely unknown.
     Command,
 }
@@ -161,6 +178,7 @@ impl Runtime {
             Runtime::Bun => "bun",
             Runtime::Python => "python",
             Runtime::Container => "container",
+            Runtime::Wasmer => "wasmer",
             Runtime::Command => "command",
         }
     }
@@ -177,6 +195,7 @@ impl Runtime {
             "bun" => Some(Runtime::Bun),
             "python" | "py" => Some(Runtime::Python),
             "container" | "docker" | "microvm" | "firecracker" => Some(Runtime::Container),
+            "wasmer" | "wasm" | "wasix" | "wasi" => Some(Runtime::Wasmer),
             "" | "auto" | "command" => None,
             _ => None,
         }
@@ -202,6 +221,7 @@ impl Runtime {
             "bun" | "bunx" => Runtime::Bun,
             "node" | "npm" | "npx" | "pnpm" | "yarn" | "next" => Runtime::Node,
             "python" | "python3" => Runtime::Python,
+            "wasmer" => Runtime::Wasmer,
             _ => Runtime::Command,
         }
     }
