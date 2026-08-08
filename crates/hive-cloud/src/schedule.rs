@@ -72,6 +72,7 @@ pub fn place_for_project(
     is_container: bool,
     stateful: bool,
     needs_gpu: bool,
+    needs_wasm: bool,
 ) -> Vec<Target> {
     if let Some(holder) = cloud.leases.owner_of(project) {
         let nodes = cloud.registry.nodes();
@@ -84,7 +85,12 @@ pub fn place_for_project(
                 || cloud.node_admins.read().contains_key(&n.name)
                 || (n.peer_id.is_some() && n.iroh_addr.is_some());
             let gpu_ok = !needs_gpu || n.gpu_count > 0;
-            if n.healthy && region_ok && reachable && gpu_ok {
+            // Stickiness must not out-rank capability: a lease held from before
+            // the project switched to `runtime: "wasmer"` would otherwise pin
+            // every redeploy to a node that cannot execute it. Same predicate
+            // `place` uses, by construction — see `wasm_capable`.
+            let wasm_ok = wasm_capable(n, needs_wasm);
+            if n.healthy && region_ok && reachable && gpu_ok && wasm_ok {
                 tracing::info!(project = %project, holder = %holder, "placement: sticking with current lease holder for redeploy");
                 // Carry BOTH transports whenever both are known. They are
                 // complementary, not alternatives: a security group that blocks
@@ -116,7 +122,26 @@ pub fn place_for_project(
             }
         }
     }
-    place(cloud, regions, is_container, stateful, needs_gpu)
+    place(cloud, regions, is_container, stateful, needs_gpu, needs_wasm)
+}
+
+/// May `n` host a deployment whose functions run on `Runtime::Wasmer`?
+///
+/// ONE definition, called from both `place`'s capability filter and
+/// `place_for_project`'s lease-stickiness fast path, because those two answering
+/// differently is precisely how a capability gate springs a leak: stickiness
+/// would keep pinning redeploys to the node a project was leased to before it
+/// switched runtimes, routing around the filter entirely.
+///
+/// `None` is NOT CAPABLE, deliberately unlike the `disk_free_gb == 0`
+/// unknown-so-admit rule. A peer that does not report the field is running a
+/// binary from before Wasmer support existed, on a rootfs built before wasmer
+/// was ever staged into it — known-incapable, not unknown. Admitting it hands
+/// the deployment to a node guaranteed to fail every cold start forever; an
+/// empty candidate set and an honest refusal is strictly better, the same call
+/// `gpu_count == 0` already makes.
+pub fn wasm_capable(n: &NodeInfo, needs_wasm: bool) -> bool {
+    !needs_wasm || n.wasm_runtime == Some(true)
 }
 
 /// Minimum free disk (GiB) a node must report to be eligible for new placement.
@@ -167,6 +192,16 @@ pub fn place(
     // which is strictly worse than the explicit empty-placement failure the
     // caller already handles for "nothing eligible".
     needs_gpu: bool,
+    // The project's functions run on `Runtime::Wasmer`: only nodes ADVERTISING
+    // a reachable wasmer binary (`NodeInfo::wasm_runtime == Some(true)`, from
+    // the boot `detect_wasm_runtime` probe) are capable. Same rule and same
+    // reasoning as `needs_gpu` directly above, and it is not hypothetical: the
+    // first cut of Wasmer support installed the binary on the HOST while every
+    // fleet node is Firecracker, which execs `start_cmd` inside the microVM
+    // GUEST — so every placement was onto a node guaranteed to ENOENT on every
+    // cold start, forever, and the tenant was told to debug their own app.
+    // Empty placement plus an honest error is strictly better.
+    needs_wasm: bool,
 ) -> Vec<Target> {
     let nodes = cloud.registry.nodes(); // self first
     let me = cloud.node_name.clone();
@@ -211,6 +246,11 @@ pub fn place(
     // Non-container functions still want a Firecracker microVM node.
     let capable = |n: &NodeInfo| -> bool {
         if needs_gpu && n.gpu_count == 0 {
+            return false;
+        }
+        // Wasmer capability, same hard-filter shape as the GPU gate above.
+        // See `wasm_capable` for why `None` excludes rather than admits.
+        if !wasm_capable(n, needs_wasm) {
             return false;
         }
         // DISK ADMISSION FLOOR. Placement used to be entirely disk-blind: it
@@ -413,6 +453,12 @@ mod tests {
     ) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
+            // These placement fixtures are all non-Wasmer, so `None` — the
+            // value a node that never ran the probe reports — is the honest
+            // one, and it keeps them on the not-capable path. A test that
+            // means "this node CAN run wasm" must set `Some(true)` explicitly,
+            // the same rule `disk_free_gb` already carries.
+            wasm_runtime: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

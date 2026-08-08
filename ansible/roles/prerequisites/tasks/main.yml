@@ -173,28 +173,45 @@
 
 # Wasmer (hive_core::Runtime::Wasmer): `wasmer run --net --forward-host-env
 # <entry>.wasm` is the start_cmd the build pipeline emits for an explicit
-# `runtime: "wasmer"` function (see git.rs's detect_wasmer_start_cmd) — it
-# runs as an ordinary host process under whichever backend placed the cell
-# (Mock/Litebox today; Firecracker needs the binary baked into the guest
-# rootfs image separately, not covered here), exactly like node/bun/python
-# need no dedicated backend of their own. Live-verified end-to-end on this
-# exact pinned version: a real axum+tokio server built with `cargo wasix
-# build --release` (target wasm32-wasmer-wasi) bound a real socket and
-# served a real HTTP request under `wasmer run --net`, with
-# `--forward-host-env` correctly carrying the dynamically-assigned $PORT
-# from the spawning process into the guest. The release tarball bundles
-# every compiler backend (Cranelift/LLVM/Singlepass/V8) and is ~250MB
-# uncompressed — a real, one-time cost against the fleet's actively-managed
-# disk headroom (see AGENTS.md "Storage capacity & placement"), same class
-# of tradeoff as installing Node itself.
+# `runtime: "wasmer"` function (see git.rs's detect_wasmer_start_cmd).
+#
+# WHERE THIS BINARY IS USEFUL, PRECISELY — this distinction is the whole
+# reason the feature's first cut was broken. A cell's `start_cmd` is exec'd
+# against DIFFERENT filesystems depending on the backend:
+#   * mock / litebox — spawned on the HOST, so this install is what runs.
+#   * firecracker    — `hive-cell-agent` runs as PID1 INSIDE the microVM and
+#                      execs against the GUEST rootfs, where this host install
+#                      is completely invisible. Those nodes need wasmer baked
+#                      into the rootfs IMAGE instead; see
+#                      `ansible/roles/firecracker_kvm` (`hive_wasmer_in_rootfs`)
+#                      and `scripts/build-rootfs.sh`'s WASMER_TARBALL.
+# A node only advertises `NodeInfo::wasm_runtime` when the probe finds wasmer
+# on the filesystem that node actually execs against (hive-cloud's
+# `detect_wasm_runtime`), and placement hard-filters on it — so a node missing
+# it is simply never chosen, rather than failing every cold start.
+#
+# Live-verified end-to-end on this exact pinned version: a real axum+tokio
+# server built with `cargo wasix build --release` (target wasm32-wasmer-wasi)
+# bound a real socket and served a real HTTP request under `wasmer run --net`,
+# with `--forward-host-env` correctly carrying the dynamically-assigned $PORT
+# into the guest.
+#
+# DISK: only `bin/wasmer` is installed — 200 MiB. The full tarball extracts to
+# 861 MiB, but 560 MiB of that is `lib/libwasmer*.a` static archives for
+# EMBEDDING wasmer in another program, which `wasmer run` never opens. Given
+# AGENTS.md's "Storage capacity & placement" incident (fc-sanjose reached 0
+# bytes free and took 9 customer deployments down), shipping 660 MiB of unused
+# artifacts to every node is not a rounding error.
 - name: Check whether wasmer v7.2.1 is already installed
   ansible.builtin.command: /usr/local/bin/wasmer --version
   register: hive_wasmer_check
   failed_when: false
   changed_when: false
 
+# Exact-version test, NOT a substring: `'wasmer 7.2.1' not in stdout` would
+# also accept a future `wasmer 7.2.10` and silently skip the install.
 - name: Install Wasmer v7.2.1 from the official release tarball (sha256-verified)
-  when: hive_wasmer_check.rc != 0 or 'wasmer 7.2.1' not in hive_wasmer_check.stdout
+  when: hive_wasmer_check.rc != 0 or hive_wasmer_check.stdout.strip() != 'wasmer 7.2.1'
   block:
     - name: Download wasmer v7.2.1 linux-amd64 tarball with checksum
       ansible.builtin.get_url:
@@ -204,15 +221,18 @@
 
     - name: Create versioned install dir /usr/local/wasmer-v7.2.1
       ansible.builtin.file:
-        path: /usr/local/wasmer-v7.2.1
+        path: /usr/local/wasmer-v7.2.1/bin
         state: directory
         mode: "0755"
 
-    - name: Extract wasmer v7.2.1 into /usr/local/wasmer-v7.2.1
+    # `extra_opts` limits extraction to the CLI only (see the DISK note above).
+    - name: Extract only bin/wasmer from the v7.2.1 tarball
       ansible.builtin.unarchive:
         src: /tmp/wasmer-v7.2.1-linux-amd64.tar.gz
         dest: /usr/local/wasmer-v7.2.1
         remote_src: true
+        extra_opts:
+          - "bin/wasmer"
         creates: /usr/local/wasmer-v7.2.1/bin/wasmer
 
     - name: Symlink wasmer into /usr/local/bin

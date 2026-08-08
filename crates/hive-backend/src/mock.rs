@@ -187,6 +187,19 @@ pub(crate) async fn run_build_process(
     })
 }
 
+/// Is `prog` executable via `path` — the SAME `PATH` string handed to the child,
+/// not this process's own, so a hit here means the child really can exec it.
+/// A program containing a separator is a path, not a PATH lookup (matching
+/// `execvp` semantics), and is tested directly.
+fn bin_on_path(prog: &str, path: &str) -> bool {
+    if prog.contains('/') {
+        return std::path::Path::new(prog).is_file();
+    }
+    path.split(':')
+        .filter(|d| !d.is_empty())
+        .any(|d| std::path::Path::new(d).join(prog).is_file())
+}
+
 fn sys_log(sink: &LogSink, line: impl Into<String>) {
     let _ = sink.send(LogLine {
         ts_ms: now_ms(),
@@ -529,7 +542,33 @@ impl CellBackend for MockBackend {
         let is_container = joined.contains("podman")
             || joined.contains("docker")
             || joined.contains("container run ");
-        let ready_timeout = if is_container { 60 } else { 15 };
+        // A Wasmer function's FIRST start on a node compiles the whole module
+        // ahead-of-time (Cranelift) before it can listen; only later starts hit
+        // wasmer's on-disk artifact cache. The 40ms cold start measured for this
+        // runtime was a CACHE HIT and says nothing about the uncached compile of
+        // a large module, so the short bucket is the wrong default here — it
+        // would turn a slow first compile into a warm-fail streak and open the
+        // deployment's circuit against an app that is fine.
+        let is_wasm = func.runtime == hive_core::Runtime::Wasmer;
+        let ready_timeout = if is_container || is_wasm { 60 } else { 15 };
+
+        // The declared interpreter must exist on the filesystem THIS backend
+        // execs against (the host, here) — checked before spawning so the
+        // failure names the node fault and its remedy. Without this the spawn
+        // fails with a bare ENOENT that `classify_lease_error` cannot tell from
+        // an app fault, and the tenant is told to debug an entrypoint that is
+        // correct. Placement's capability filter should make this unreachable;
+        // reaching it means the gossiped capability and the real filesystem
+        // disagree. See `hive_core::fault::NODE_RUNTIME_MISSING`.
+        if is_wasm && !bin_on_path(&func.start_cmd[0], &path) {
+            anyhow::bail!(
+                "{}: this node has no `{}` binary on PATH, so a runtime=\"wasmer\" \
+                 deployment cannot start here — install the wasmer CLI on this node \
+                 (operator remedy; not an application fault)",
+                hive_core::fault::NODE_RUNTIME_MISSING,
+                func.start_cmd[0],
+            );
+        }
 
         let mut cmd = Command::new(&func.start_cmd[0]);
         cmd.args(&func.start_cmd[1..])

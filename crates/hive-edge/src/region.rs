@@ -184,6 +184,30 @@ pub struct NodeInfo {
     /// fields are informational for everything else (dashboard, capacity sums).
     #[serde(default)]
     pub gpu_count: u32,
+    /// Can this node actually EXECUTE a `Runtime::Wasmer` function — i.e. does a
+    /// `wasmer` binary exist on the filesystem the function's `start_cmd` is
+    /// spawned against? Probed at boot (`hive-cloud`'s `detect_wasm_runtime`),
+    /// which is backend-aware because the answer differs by WHERE the process
+    /// runs: a Firecracker cell execs inside the microVM GUEST rootfs
+    /// (`hive-cell-agent` does `Command::new(start_cmd[0])` with a fixed guest
+    /// PATH), so a host-side `/usr/local/bin/wasmer` is invisible to it; a
+    /// Mock/Litebox cell execs against the host. Checking the wrong one is
+    /// exactly the bug this field exists to prevent.
+    ///
+    /// `None` = NOT REPORTED, and here that is deliberately treated as NOT
+    /// CAPABLE rather than as unknown-so-admit. This is the opposite of the
+    /// `disk_free_gb == 0` / `gpu_free_mb == None` rule above, and the
+    /// difference is real: an unknown DISK reading may still have space, so
+    /// admitting and letting the cold-start floor catch it costs one failed
+    /// start; but a peer that does not report this field is by construction
+    /// running a binary predating Wasmer support, on a rootfs built before
+    /// wasmer was ever staged into it — it is KNOWN-incapable, not unknown.
+    /// Admitting it would hand every Wasmer deployment to a node guaranteed to
+    /// ENOENT on every cold start, forever. Empty placement plus an honest
+    /// error beats that, which is the same call `gpu_count == 0` already makes
+    /// (deliberately no silent fallback to a node that cannot serve).
+    #[serde(default)]
+    pub wasm_runtime: Option<bool>,
     /// Marketing model name of the first GPU (e.g. "Tesla T4"); hosts are
     /// homogeneous in practice, and a mixed host still reports a usable name.
     #[serde(default)]
@@ -651,6 +675,11 @@ mod tests {
     fn node(id: &str, region: &str, latency: u64, healthy: bool) -> NodeInfo {
         NodeInfo {
             gpu_count: 0,
+            // These fixtures exercise region/latency selection, never Wasmer
+            // placement — `None` is the honest value here (it is exactly what a
+            // node that never ran the probe reports) and keeps them on the
+            // not-capable path, which is what a non-Wasmer test node is.
+            wasm_runtime: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: id.into(),

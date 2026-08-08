@@ -432,6 +432,7 @@ fn node_fault_marker(es: &str) -> Option<&'static str> {
         hive_core::fault::NODE_IMAGE_MISSING,
         hive_core::fault::NODE_BACKEND_UNAVAILABLE,
         hive_core::fault::NODE_LOCK_POOL_EXHAUSTED,
+        hive_core::fault::NODE_RUNTIME_MISSING,
     ] {
         if es.contains(marker) {
             return Some(marker);

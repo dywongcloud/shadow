@@ -1109,6 +1109,18 @@ async fn run_build(
         // sub-builds skip both of this coordinator's gates.
         let known_container = req.image_ref.is_some();
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
+        // Pre-build placement, so there is no manifest yet — the only Wasmer
+        // signal available this early is an explicit runtime in Project
+        // Settings. A project that declares `runtime: "wasmer"` ONLY in a
+        // vercel.json inside the repo is not knowable until after checkout, and
+        // is caught by the post-build fanout gate and the cold-start refusal
+        // instead. Partial knowledge used honestly: it can only ever REMOVE
+        // incapable nodes, never add one.
+        let known_wasm = cloud
+            .projects
+            .get_if_set(&project)
+            .map(|s| hive_core::Runtime::from_config_str(&s.build.runtime))
+            == Some(Some(hive_core::Runtime::Wasmer));
         let targets = crate::schedule::place_for_project(
             cloud,
             &project,
@@ -1116,6 +1128,7 @@ async fn run_build(
             known_container,
             known_container,
             needs_gpu,
+            known_wasm,
         );
         // A GPU deployment must NEVER fall through to this node when placement
         // found no GPU-capable target. Everywhere else an empty `targets` means
@@ -2096,6 +2109,15 @@ async fn run_build(
     // `lease.rs`), or `FunctionConfig::needs_raw_proxy()` (gRPC/TCP/UDP — a
     // Postgres or Minecraft-style stateful protocol even when NOT containerized).
     let is_stateful = is_container || manifest.functions.iter().any(|f| f.needs_raw_proxy());
+    // Captured for the same reason and at the same point as `is_stateful`: the
+    // multi-region fanout below needs it after `manifest` has moved. Resolved
+    // through `Runtime::resolve` (config value wins, else argv basename) rather
+    // than a bare string compare, so a function whose runtime was inferred from
+    // a `wasmer …` start_cmd counts too.
+    let is_wasm = manifest
+        .functions
+        .iter()
+        .any(|f| hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer);
 
     // ---- Stateful fanout-replica guard (the remote sub-build side) ---------
     // The coordinator's two placement gates cannot cover the pure-remote fanout
@@ -2707,7 +2729,14 @@ async fn run_build(
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
-        let targets = crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu);
+        let targets = crate::schedule::place(
+            cloud,
+            &regions,
+            false,
+            is_stateful,
+            needs_gpu,
+            is_wasm,
+        );
         if targets
             .iter()
             .any(|t| t.admin.is_none() && t.iroh.is_none())
@@ -3497,11 +3526,31 @@ async fn build_via_fdi(
     // every auto-detection step below, the same precedence every other
     // explicit runtime choice already gets.
     if runtime_override == Some(hive_core::Runtime::Wasmer) {
+        // An explicitly configured install/build command is NOT silently
+        // dropped just because this path skips framework detection. The user
+        // set it deliberately (vercel.json > project settings, the precedence
+        // this function documents at the top), and a `.wasm` very often IS the
+        // output of a build step — `cargo wasix build --release`, `tinygo
+        // build`, `wasm-pack`. Discarding it without a word would leave the
+        // deployment serving a stale committed artifact, or nothing at all,
+        // with a green build and no explanation.
+        let wasm_env = cloud.projects.env_map(project);
+        if let Some(cmd) = inst.as_deref().filter(|s| !s.trim().is_empty()) {
+            log(format!("Running configured install command: `{cmd}`."));
+            run_streamed(dir, cmd, cloud, bid, &wasm_env).await?;
+        }
+        if let Some(cmd) = bld.as_deref().filter(|s| !s.trim().is_empty()) {
+            log(format!("Running configured build command: `{cmd}`."));
+            run_streamed(dir, cmd, cloud, bid, &wasm_env).await?;
+        }
+        // Resolved AFTER the build step above, so a `.wasm` the build just
+        // produced is found rather than only one committed to the repo.
         let Some(start) = detect_wasmer_start_cmd(dir).await else {
             anyhow::bail!(
                 "runtime \"wasmer\" is set, but no `.wasm` entry module was found — \
                  expected server.wasm / app.wasm / main.wasm, or exactly one *.wasm \
-                 file at the project root"
+                 file at the project root (a file must start with the \\0asm magic \
+                 to count; a Git-LFS pointer or truncated download does not)"
             );
         };
         log(format!("Provisioning Wasmer server: `{}`.", start.join(" ")));
@@ -4039,7 +4088,7 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
         ]
     };
     for entry in ["server.wasm", "app.wasm", "main.wasm"] {
-        if dir.join(entry).exists() {
+        if is_wasm_module(&dir.join(entry)).await {
             return Some(wasmer_run(entry.to_string()));
         }
     }
@@ -4047,7 +4096,7 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
     let mut found: Option<String> = None;
     while let Ok(Some(e)) = rd.next_entry().await {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.ends_with(".wasm") {
+        if name.ends_with(".wasm") && is_wasm_module(&e.path()).await {
             if found.is_some() {
                 return None;
             }
@@ -4055,6 +4104,29 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
         }
     }
     found.map(wasmer_run)
+}
+
+/// Is `p` a real WebAssembly module — a regular file whose first four bytes are
+/// the `\0asm` magic? A `.wasm` NAME proves nothing: an unresolved Git-LFS
+/// pointer, a directory, a truncated download or an HTML error page saved by a
+/// fetch step all carry the extension and none of them can be executed.
+///
+/// Checked at BUILD time on purpose. This runtime's build path compiles nothing
+/// and runs nothing (a `.wasm` is already compiled), so without this check the
+/// first thing that ever opens the file is a cold start on some other node —
+/// turning a bad artifact into a green build, a Ready deployment and a
+/// permanent per-request crash loop, instead of one loud build failure. Cheap:
+/// a 4-byte read of a file already on local disk.
+async fn is_wasm_module(p: &Path) -> bool {
+    use tokio::io::AsyncReadExt;
+    if !tokio::fs::metadata(p).await.map(|m| m.is_file()).unwrap_or(false) {
+        return false;
+    }
+    let Ok(mut f) = tokio::fs::File::open(p).await else {
+        return false;
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).await.is_ok() && &magic == b"\0asm"
 }
 
 /// Find a STABLE Node 20–24 bin dir, preferring it over an unstable system node

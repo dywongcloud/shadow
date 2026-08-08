@@ -65,6 +65,20 @@ pub mod fault {
     /// This NODE's container lock pool is empty and nothing was reclaimable, so
     /// no container can start here until `num_locks` is raised + renumbered.
     pub const NODE_LOCK_POOL_EXHAUSTED: &str = "NodeLockPoolExhausted";
+    /// The interpreter/runtime this deployment declares is not installed on the
+    /// filesystem this NODE execs cells against. Operator remedy: provision the
+    /// runtime (for Firecracker that means the GUEST rootfs image, not the
+    /// host). Not app breakage, not host exhaustion.
+    ///
+    /// Placement is supposed to make this unreachable — `schedule::place`
+    /// hard-filters on `NodeInfo::wasm_runtime` exactly like it does on
+    /// `gpu_count` — so reaching it means the capability probe and the real
+    /// filesystem disagree (a rootfs replaced under a running node, a stale
+    /// gossiped record, `HIVE_WASM_RUNTIME=1` set on a node without the
+    /// binary). It exists because that disagreement must surface as an
+    /// operator-actionable node fault rather than as `CAPACITY_EXHAUSTED` or,
+    /// worse, as advice to the tenant to go debug their own entrypoint.
+    pub const NODE_RUNTIME_MISSING: &str = "NodeRuntimeMissing";
     /// The DEPLOYMENT's own process never reached a listening state — it exited,
     /// or it never bound its port inside the start budget. An app fault: bad
     /// entrypoint, missing env, a crash on boot.

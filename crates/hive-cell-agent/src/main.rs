@@ -406,6 +406,25 @@ mod linux {
         }
     }
 
+    /// The PATH this agent hands a FUNCTION process. Named once so the
+    /// pre-flight existence check below and the spawn itself can never drift
+    /// apart — a check against a different PATH than the exec uses is worse
+    /// than no check. (The build-process spawns elsewhere in this module set
+    /// the same value inline; they are deliberately left alone here, since
+    /// nothing pre-flights against them.)
+    const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    /// Is `prog` executable inside this guest via `path`? A program containing a
+    /// separator is a path, not a PATH lookup (`execvp` semantics).
+    fn guest_bin_exists(prog: &str, path: &str) -> bool {
+        if prog.contains('/') {
+            return std::path::Path::new(prog).is_file();
+        }
+        path.split(':')
+            .filter(|d| !d.is_empty())
+            .any(|d| std::path::Path::new(d).join(prog).is_file())
+    }
+
     /// Launch the function server and bridge `CELL_FUNCTION_PORT` (vsock) to it.
     fn start_function(launch: &FunctionLaunch) -> std::io::Result<()> {
         if launch.start_cmd.is_empty() {
@@ -420,13 +439,32 @@ mod linux {
             .unwrap_or_else(|| "/build".to_string());
         let _ = std::fs::create_dir_all(&workdir);
 
+        // The interpreter must exist INSIDE THE GUEST. This is the single most
+        // important thing about running a non-Node runtime on Firecracker and
+        // the exact bug the first cut of Wasmer support shipped: wasmer was
+        // installed on the HOST, but this agent is PID1 inside the microVM and
+        // execs against the GUEST rootfs, so the host copy is invisible here.
+        // Checked before spawning so the failure names the node fault and its
+        // remedy (bake it into the rootfs image — see scripts/build-rootfs.sh)
+        // instead of surfacing as a bare ENOENT that the gateway cannot
+        // distinguish from the deployment's own entrypoint being wrong.
+        let prog = &launch.start_cmd[0];
+        if !guest_bin_exists(prog, GUEST_PATH) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "{}: `{prog}` is not installed in this cell's guest image — \
+                     the deployment's runtime must be baked into the rootfs \
+                     (operator remedy; not an application fault)",
+                    hive_core::fault::NODE_RUNTIME_MISSING,
+                ),
+            ));
+        }
+
         let mut cmd = Command::new(&launch.start_cmd[0]);
         cmd.args(&launch.start_cmd[1..])
             .current_dir(&workdir)
-            .env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            )
+            .env("PATH", GUEST_PATH)
             .env("HOME", "/root")
             .env("PORT", launch.port.to_string())
             .envs(launch.env.iter())

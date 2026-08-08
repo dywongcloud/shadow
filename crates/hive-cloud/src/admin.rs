@@ -1286,7 +1286,22 @@ pub(crate) async fn deployment_resources(
         .map(|f| {
             json!({
                 "name": f.name,
-                "runtime": if f.runtime == "edge" { "Edge" } else if f.runtime == "container" { "Container" } else { "Node" },
+                // Resolve through the canonical `Runtime` (config value wins,
+                // else argv basename) instead of comparing raw strings with an
+                // `else "Node"` catch-all — that catch-all reported every
+                // Python and Wasmer function to the dashboard as "Node", a
+                // WRONG label rather than a missing one, on exactly the read
+                // path an operator uses to diagnose why a function will not
+                // start. `Command` keeps the historical label for a bare
+                // binary, which is what the old `else` arm actually meant.
+                "runtime": match hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) {
+                    _ if f.runtime == "edge" => "Edge",
+                    hive_core::Runtime::Container => "Container",
+                    hive_core::Runtime::Bun => "Bun",
+                    hive_core::Runtime::Python => "Python",
+                    hive_core::Runtime::Wasmer => "Wasmer",
+                    hive_core::Runtime::Node | hive_core::Runtime::Command => "Node",
+                },
                 "region": c.region,
                 "memory_mib": f.memory_mib,
                 "max_duration_secs": f.max_duration_secs,

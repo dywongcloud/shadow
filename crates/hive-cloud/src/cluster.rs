@@ -252,6 +252,7 @@ mod tests {
     fn node(name: &str, peer_id: Option<&str>, healthy: bool) -> hive_edge::NodeInfo {
         hive_edge::NodeInfo {
             gpu_count: 0,
+            wasm_runtime: None,
             gpu_model: None,
             gpu_vram_mb: 0,
             id: name.into(),

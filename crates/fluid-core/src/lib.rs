@@ -2352,6 +2352,22 @@ pub enum FailureClass {
     /// self-heal already reclaims what it safely can, and this class is what is
     /// left when it reclaimed nothing.
     NodeLockPoolExhausted,
+    /// THIS NODE does not have the interpreter/runtime this deployment declares
+    /// (e.g. a `runtime: "wasmer"` function on a node with no `wasmer` binary on
+    /// the filesystem its cells exec against). 503.
+    ///
+    /// Split from every class around it because each names a different remedy
+    /// and this one's is "provision the runtime on this node" — for Firecracker
+    /// specifically that means the GUEST rootfs image, since the cell agent
+    /// execs inside the microVM and a host-side install is invisible to it.
+    /// Without its own class this lands in [`FailureClass::DeploymentCircuitOpen`]
+    /// (the cold starts DO circuit the pool), which tells the tenant to go debug
+    /// an entrypoint that is perfectly fine — the same inversion
+    /// [`FailureClass::NodeImageMissing`] exists to prevent, one layer up.
+    ///
+    /// Placement's capability filter is meant to make this unreachable; see
+    /// `hive_core::fault::NODE_RUNTIME_MISSING` for when it still fires.
+    NodeRuntimeMissing,
     /// No healthy peer in the mesh can serve this deployment. 503.
     NoHealthyPeer,
     /// No healthy node in the deployment's configured region(s). 503.
@@ -2390,6 +2406,7 @@ impl FailureClass {
             | FailureClass::NodeImageMissing
             | FailureClass::NodeBackendUnavailable
             | FailureClass::NodeLockPoolExhausted
+            | FailureClass::NodeRuntimeMissing
             | FailureClass::NoHealthyPeer
             | FailureClass::NoHealthyRegion => 503,
             FailureClass::RuntimeTunnelFailed
@@ -2408,6 +2425,7 @@ impl FailureClass {
             FailureClass::NodeImageMissing => "NODE_IMAGE_MISSING",
             FailureClass::NodeBackendUnavailable => "NODE_BACKEND_UNAVAILABLE",
             FailureClass::NodeLockPoolExhausted => "NODE_LOCK_POOL_EXHAUSTED",
+            FailureClass::NodeRuntimeMissing => "NODE_RUNTIME_MISSING",
             FailureClass::NoHealthyPeer => "NO_HEALTHY_PEER",
             FailureClass::NoHealthyRegion => "NO_HEALTHY_REGION",
             FailureClass::RuntimeTunnelFailed => "RUNTIME_TUNNEL_FAILED",

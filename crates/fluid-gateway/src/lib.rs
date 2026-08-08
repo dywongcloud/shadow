@@ -2622,6 +2622,14 @@ fn classify_lease_error(es: &str) -> fluid_core::FailureClass {
         // resource fault whose only remedy is `num_locks` + `podman system
         // renumber`, which no amount of free disk or memory substitutes for.
         fluid_core::FailureClass::NodeLockPoolExhausted
+    } else if es.contains(hive_core::fault::NODE_RUNTIME_MISSING) {
+        // The declared interpreter is not on the filesystem this node execs
+        // cells against. Checked BEFORE the circuit arm below for the same
+        // reason NODE_IMAGE_MISSING is: the failing cold starts also open the
+        // pool's circuit, so both markers ride the same error string, and only
+        // this one names a remedy the operator can act on. Left to fall
+        // through it would tell the tenant to debug an entrypoint that works.
+        fluid_core::FailureClass::NodeRuntimeMissing
     } else if es.contains("DeploymentCircuitOpen")
         || es.contains(hive_core::fault::DEPLOYMENT_START_FAILED)
     {

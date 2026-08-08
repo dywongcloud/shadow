@@ -61,3 +61,67 @@
   # same `cargo build --release` when -p is omitted; add
   # `-p hive-cell-agent` to hive_platform's build task if you need it here
   # and it isn't already installed).
+
+# ---------------------------------------------------------------------------
+# Wasmer inside the GUEST (hive_core::Runtime::Wasmer on a Firecracker node)
+# ---------------------------------------------------------------------------
+# `hive-cell-agent` runs as PID1 INSIDE the microVM and execs the function's
+# `start_cmd[0]` against the GUEST PATH, so the host's /usr/local/bin/wasmer
+# (installed by roles/prerequisites) is invisible to a Firecracker cell. Wasmer
+# functions on these nodes therefore require the CLI baked into the rootfs
+# IMAGE, which is what this block does.
+#
+# OPT-IN (`hive_wasmer_in_rootfs`, default false) on purpose, for two reasons:
+#   1. It adds ~200 MiB to a 4096 MiB image every cell on the node boots from.
+#   2. Enabling it REBUILDS default.ext4 on an already-provisioned host. The
+#      task above is guarded by `creates: default.ext4` and so is inert
+#      forever once a node is provisioned -- deliberately, because that image
+#      is the base every running microVM boots from. Rebuilding it is an
+#      operator decision, not something a routine converge should do silently.
+#
+# Doing nothing is SAFE, not broken: without the marker file the node's
+# `detect_wasm_runtime` probe reports `wasm_runtime: None`, placement's hard
+# filter never selects it for a Wasmer deployment, and the tenant gets an
+# honest "no capable node" refusal instead of a permanent cold-start crash
+# loop misattributed to their application.
+- name: Wasmer in the guest rootfs (opt-in; rebuilds default.ext4)
+  when: hive_wasmer_in_rootfs | default(false) | bool
+  block:
+    - name: Download wasmer v7.2.1 tarball for guest staging (sha256-verified)
+      ansible.builtin.get_url:
+        url: "https://github.com/wasmerio/wasmer/releases/download/v7.2.1/wasmer-linux-amd64.tar.gz"
+        dest: /tmp/wasmer-guest-v7.2.1.tar.gz
+        checksum: "sha256:c46d6ff34a12b40d2e57bfc2ccbb8b9e209b0987ab305233619798b264a6bae5"
+
+    # `creates:` is the capability MARKER, not the image: the image already
+    # exists on every provisioned node, so guarding on it would make this
+    # permanently inert -- the exact trap that made the host-only install
+    # useless. build-rootfs.sh writes the marker only after a clean unmount.
+    - name: Rebuild the default rootfs with the wasmer CLI staged into the guest
+      ansible.builtin.command:
+        cmd: bash {{ hive_src_dir }}/scripts/build-rootfs.sh node:20-slim default 4096
+        creates: /var/lib/hive/rootfs/default.wasmer
+      environment:
+        ROOTFS_DIR: /var/lib/hive/rootfs
+        AGENT_BIN: /usr/local/bin/hive-cell-agent
+        WASMER_TARBALL: /tmp/wasmer-guest-v7.2.1.tar.gz
+
+    - name: Remove the guest-staging tarball
+      ansible.builtin.file:
+        path: /tmp/wasmer-guest-v7.2.1.tar.gz
+        state: absent
+
+    # The marker is what hive-cloud's detect_wasm_runtime stats to decide
+    # whether this node may advertise the capability at all.
+    - name: Confirm the wasm capability marker exists
+      ansible.builtin.stat:
+        path: /var/lib/hive/rootfs/default.wasmer
+      register: hive_wasmer_marker
+
+    - name: Fail if the rootfs rebuild did not produce a capability marker
+      ansible.builtin.fail:
+        msg: >-
+          build-rootfs.sh completed but /var/lib/hive/rootfs/default.wasmer is
+          missing — the node would boot advertising no wasm capability. Check
+          the build output before retrying.
+      when: not hive_wasmer_marker.stat.exists

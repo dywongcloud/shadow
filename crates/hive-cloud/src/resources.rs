@@ -33,6 +33,56 @@ pub fn capacity() -> (u32, u64, u64) {
 /// never an error, so a CPU-only node's boot is unaffected. `HIVE_GPUS`
 /// (`count,model,vram_mb`, e.g. `2,Tesla T4,30720`) overrides the probe for
 /// dev/testing exactly like `HIVE_GEO` overrides geolocation.
+/// Can this node actually EXECUTE a `Runtime::Wasmer` function? Answers the
+/// question `NodeInfo::wasm_runtime` advertises, and it is BACKEND-AWARE
+/// because the honest answer depends entirely on WHICH FILESYSTEM the
+/// function's `start_cmd` is spawned against:
+///
+///   * `firecracker` — `hive-cell-agent` runs as PID1 INSIDE the microVM and
+///     does `Command::new(start_cmd[0])` against a fixed guest PATH, so the
+///     only filesystem that matters is the GUEST ROOTFS. A host-side
+///     `/usr/local/bin/wasmer` is completely invisible to it. This is the
+///     distinction that made the first cut of this feature ship broken:
+///     ansible installed wasmer on the host, every fleet node is Firecracker,
+///     and every cold start would have ENOENT'd inside a guest built from
+///     `node:20-slim`. We therefore probe the rootfs IMAGE, not the host.
+///   * anything else (`mock`, `litebox`) — the process is spawned against the
+///     HOST filesystem, so a host PATH lookup is the correct question.
+///
+/// `HIVE_WASM_RUNTIME=1|0` overrides the probe (dev/testing, and the operator
+/// escape hatch for a rootfs this probe cannot introspect), exactly like
+/// `HIVE_GPUS` overrides `detect_gpus`.
+pub fn detect_wasm_runtime(backend: &str) -> Option<bool> {
+    if let Ok(v) = std::env::var("HIVE_WASM_RUNTIME") {
+        let v = v.trim();
+        return Some(v == "1" || v.eq_ignore_ascii_case("true"));
+    }
+    if backend == "firecracker" {
+        // The guest rootfs is an ext4 image; mounting it to look inside needs
+        // root and a loop device, which boot must not depend on. Provisioning
+        // (`ansible/roles/firecracker_kvm`, `scripts/build-rootfs.sh`) instead
+        // drops a marker next to the image naming what was staged into it, so
+        // the probe is a cheap stat of a file the image BUILDER wrote — the
+        // builder is the only thing that actually knows.
+        let dir = std::env::var("HIVE_ROOTFS_DIR")
+            .unwrap_or_else(|_| "/var/lib/hive/rootfs".to_string());
+        let base = std::env::var("HIVE_CELL_IMAGE").unwrap_or_else(|_| "default".to_string());
+        let marker = std::path::Path::new(&dir).join(format!("{base}.wasmer"));
+        return Some(marker.exists());
+    }
+    Some(which_on_path("wasmer").is_some())
+}
+
+/// First match for `name` on the process PATH. Deliberately the same
+/// resolution the spawned child gets (it inherits this process's PATH), so a
+/// hit here means the child really can exec it.
+fn which_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(name))
+        .find(|c| c.is_file())
+}
+
 pub fn detect_gpus() -> (u32, Option<String>, u64) {
     if let Ok(v) = std::env::var("HIVE_GPUS") {
         let mut it = v.splitn(3, ',');

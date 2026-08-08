@@ -433,6 +433,12 @@ async fn main() -> anyhow::Result<()> {
     // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
     // gossip so placement can target GPU hosts for gpu-requesting functions.
     let gpus = resources::detect_gpus();
+    // Wasmer-runtime probe, same shape and same purpose as the GPU probe above:
+    // advertise a real capability so placement never hands a deployment to a
+    // node that cannot execute it. Backend-aware — see `detect_wasm_runtime`,
+    // which checks the GUEST rootfs on Firecracker and the HOST PATH elsewhere,
+    // because that is where the respective backends actually exec `start_cmd`.
+    let wasm_rt = resources::detect_wasm_runtime(&backend_name);
     // Tier 4: bind a REAL iroh P2P endpoint (QUIC + relay/DNS discovery) so this
     // node has a real peer id and can serve/accept Hive tunnels across networks.
     // Best-effort with a timeout: if it can't bind (offline), the node still boots
@@ -717,14 +723,23 @@ async fn main() -> anyhow::Result<()> {
         last_oom_ms: crate::restart_audit::last_oom_ms(),
         backend: backend_name.clone(),
         gpu_count: gpus.0,
+        wasm_runtime: wasm_rt,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
     };
     tracing::info!(
         cores = cap.0, mem_mb = cap.1, disk_gb = cap.2, backend = %backend_name,
         gpus = gpus.0, gpu_model = gpus.1.as_deref().unwrap_or("-"), gpu_vram_mb = gpus.2,
+        wasm_runtime = wasm_rt.unwrap_or(false),
         "node host capacity"
     );
+    if wasm_rt != Some(true) {
+        tracing::info!(
+            backend = %backend_name,
+            "no wasmer runtime on the filesystem this node's functions exec against — \
+             Runtime::Wasmer deployments will not be placed here (see detect_wasm_runtime)"
+        );
+    }
     let registry = NodeRegistry::new(me);
     // Populate this node's own relay_url now that `registry` exists (mirrors
     // `set_self_guardian_addr`'s post-boot fill-in pattern) — it rides along in
