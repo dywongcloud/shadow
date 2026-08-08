@@ -278,18 +278,20 @@ hard-resets the host (previous section), so the only remaining fallback was
 builds `litebox_runner_linux_userland` from a pinned commit; litebox ships no
 releases).
 
-- **Two-tier verification, same shape as PVM, and the same trap: a Tier-2
-  PASS is not the whole bar.** `LiteboxBackend::is_supported()` (Tier 1,
-  existence-only) gates `--litebox-probe` (Tier 2: a REAL program through the
-  live rewriter, bring-up only, never on a node carrying traffic — mirrors
-  `pvm_run_smoke_test`'s gating exactly). But the probe deliberately never
-  touches the network, so a PASS proves only the syscall-rewriter mechanism —
-  see the networking finding below. `HIVE_LITEBOX_VERIFIED=1` (a systemd
-  drop-in, `ansible/roles/litebox`'s `litebox_verified` var, default `false`)
-  is the separate manual override that actually selects the backend;
-  `HIVE_FORCE_MOCK=1` still suppresses Firecracker exactly as before and now
-  falls through to Litebox first if verified, Mock otherwise — no existing
-  node's behavior changes without a new, deliberate opt-in.
+- **Two-tier verification, same shape as PVM.** `LiteboxBackend::is_supported()`
+  (Tier 1, existence-only) gates `--litebox-probe` (Tier 2, bring-up only,
+  never on a node carrying traffic — mirrors `pvm_run_smoke_test`'s gating
+  exactly), which now runs TWO real checks: the syscall rewriter, and (added
+  2026-08-08, see the networking entry below) a full per-cell-TUN +
+  patched-litebox + bind-shim round trip — a real Node HTTP server, a real
+  host-side TCP connection, a real response. `HIVE_LITEBOX_VERIFIED=1` (a
+  systemd drop-in, `ansible/roles/litebox`'s `litebox_verified` var, default
+  `false`) is the separate manual override that actually selects the
+  backend, taken only after BOTH checks genuinely pass live — not merely
+  after the code compiles. `HIVE_FORCE_MOCK=1` still suppresses Firecracker
+  exactly as before and now falls through to Litebox first if verified, Mock
+  otherwise — no existing node's behavior changes without a new, deliberate
+  opt-in.
 - **Scope is `start_function` only — `run_build` stays a plain unsandboxed
   host process, byte-identical to `MockBackend`'s pipeline
   (`crate::mock::run_build_process`, shared by both).** Confirmed directly
@@ -310,27 +312,59 @@ releases).
   open shared object file" for that one library while others load fine —
   easy to misdiagnose as a partial/flaky failure when it is fully
   deterministic per file.
-- **Networking does not work yet, for real deployments, at all — this is the
-  actual blocker, not a rough edge.** `127.0.0.1` loopback is explicitly
-  unsupported upstream (litebox's own test comment: "We do not support
-  loopback yet"), which breaks every other backend's addressing convention
-  (`CellEndpoint::Tcp("127.0.0.1:<port>")`). A TUN device
-  (`litebox_platform_linux_userland/scripts/tun-setup.sh`, one-time host
-  setup, a private `/24`) does give the host real L3 reachability to the
-  guest's IP — but ONLY when the guest app binds EXPLICITLY to that exact
-  address; a wildcard/`0.0.0.0` bind (what virtually every real Node/Express
-  app does, and the only shape every other backend requires) silently does
-  not work — the app reports itself listening, the host's connect still gets
-  ECONNREFUSED, with no guest-side syscall ever observed. Not fixable from
-  this crate alone: the bind address is tenant code, and whether litebox's
-  TCP stack can be made to accept a wildcard bind is an upstream question.
-  The concurrent-multi-cell IP/TUN model is ALSO unverified (a
-  `tun-setup.sh` device is not `IFF_MULTI_QUEUE`). Until both resolve,
-  `HIVE_LITEBOX_VERIFIED=1` must stay unset fleet-wide — enabling it today
-  would select this backend for real deployments whose servers then time out
-  on every request, which is worse than the mock baseline it would replace.
-  Full finding: `crates/hive-backend/src/litebox.rs`'s module doc,
-  "Networking" section.
+- **Networking needed a real fix, and the root cause was smaller than it first
+  looked — a small forked litebox patch beats building an isolation layer
+  around litebox's bugs.** Three compounding constraints, all confirmed
+  directly from litebox's own source (`crates/hive-backend/src/litebox.rs`'s
+  module doc, "Networking" section, has the full narrative): (1) TUN cannot
+  bridge host<->guest loopback, architecturally, ever — not a litebox defect.
+  (2) The wildcard-bind failure WAS a litebox bug, not a smoltcp limitation:
+  `litebox/src/net/mod.rs`'s `bind()`/`listen()` never used smoltcp's own
+  `None` ("any address") sentinel, always building `Some(addr)` even for an
+  unspecified address — smoltcp 0.12.0 (litebox's exact pinned version)
+  already fully supports wildcard listening. (3) The guest's IP AND gateway
+  were HARDCODED AT COMPILE TIME (`INTERFACE_IP_ADDR = 10.0.0.2`,
+  `GATEWAY_IP_ADDR = 10.0.0.1`), both already marked `// TODO: Make this
+  configurable` by litebox's own authors — every concurrent litebox process
+  claimed the identical guest address. **The fix:**
+  `ansible/roles/litebox/files/networking.patch` (rationale in that
+  directory's `PATCHES.md`) fixes constraints 2 and 3 directly in litebox —
+  three wildcard-bind call sites now map an unspecified address to smoltcp's
+  `None`, and `Network::new`/`LinuxShimBuilder::build` gained an additive
+  `_with_addrs`/`_with_net_config` sibling reading `LITEBOX_GUEST_IP`/
+  `LITEBOX_GATEWAY_IP` from the environment (unset = byte-identical to
+  upstream, so litebox's own test suite needs no changes). With constraint 3
+  fixed, constraint 1's real solution falls out for free: every cell just
+  gets its own real, directly-routable TUN `/30`
+  (`setup_cell_net`/`teardown_cell_net` in `litebox.rs`) — the exact same
+  `net_idx`-allocated pattern `FirecrackerBackend::setup_cell_net` already
+  uses for microVMs (`mode=tun` instead of `mode=tap`, no kernel `ip=`
+  cmdline since litebox reads the two env vars directly) — with NO network
+  namespace, veth pair, or DNAT/iptables rule needed at all, since a TUN
+  device is a real point-to-point link the kernel routes to automatically.
+  Loopback (constraint 1) still needs a narrow residual fix — apps that
+  explicitly hardcode `127.0.0.1` — via a preload shim
+  (`litebox-bind-shim.js`, embedded via `include_str!`) patching Node's
+  `net.Server.prototype._listen2` (the internal, POST-overload-
+  normalization method every `.listen()` shape funnels into — a
+  deliberately preserved monkeypatch seam per Node's own source comment,
+  stable v10-v24, the same technique New Relic's Node agent has run since
+  ~2012), verified against every real `.listen()` shape through Node's
+  actual overload-resolution code (not a hand-rolled reimplementation of
+  it). **Node/Bun only — Python is not covered** (its ecosystem doesn't
+  converge on one bind mechanism the way Node does; most real Python
+  servers run behind a WSGI/ASGI server like gunicorn/uvicorn). **Do not
+  switch to litebox's own in-flight rewrite instead** — an unstable,
+  undocumented branch (`ulitebox`) replaces smoltcp/TUN with a real-socket
+  broker, genuinely fixing loopback, but its own access-control policy
+  hard-DENIES wildcard binds by design (its own unit test confirms it) — the
+  patch above is a permanent requirement regardless of which litebox
+  architecture is eventually used. This implementation compiles, the patch
+  applies cleanly, and the shim's rewrite logic is locally verified, but the
+  patched litebox + TUN-per-cell pipeline has NOT yet been run live —
+  `--litebox-probe`'s new network check is what closes that loop;
+  `HIVE_LITEBOX_VERIFIED=1` stays unset fleet-wide until it genuinely passes
+  on a real host.
 - **Security posture is honest, not oversold, and must stay that way.**
   Litebox measurably beats `MockBackend` (seccomp-bpf denies non-allowlisted
   syscalls at the real kernel boundary; mock has none) but is NOT

@@ -236,11 +236,13 @@ struct Args {
     #[arg(long = "acme-txt-selftest")]
     acme_txt_selftest: Option<String>,
     /// Operator diagnostic: run Litebox's Tier-2 functional smoke test
-    /// (`LiteboxBackend::smoke_test` — a real program through the live
-    /// syscall rewriter, not just an existence check) then exit without
-    /// starting a node. BRING-UP ONLY: never run this against a node already
-    /// carrying live traffic — mirrors `pvm_run_smoke_test`'s gating
-    /// (AGENTS.md "PVM kernels"). A pass is what licenses an operator to set
+    /// (`LiteboxBackend::smoke_test` — TWO real checks: the syscall
+    /// rewriter, then a full namespace+veth+TUN+DNAT+bind-shim network round
+    /// trip) then exit without starting a node. BRING-UP ONLY: never run
+    /// this against a node already carrying live traffic — it creates a
+    /// real (throwaway) network namespace and iptables rules, mirrors
+    /// `pvm_run_smoke_test`'s gating (AGENTS.md "PVM kernels"). A pass on
+    /// BOTH checks is what licenses an operator to set
     /// `HIVE_LITEBOX_VERIFIED=1` on this host; this flag never sets it
     /// itself. Non-zero exit on failure, so it composes into a shell check.
     #[arg(long = "litebox-probe")]
@@ -278,11 +280,11 @@ async fn main() -> anyhow::Result<()> {
         match be.smoke_test().await {
             Ok(()) => {
                 println!(
-                    "litebox smoke test: PASS (syscall rewriter only) — this does NOT mean \
-                     HIVE_LITEBOX_VERIFIED=1 is safe to set. Networking is a separate, currently \
-                     unresolved gap (litebox has no loopback support and no proven wildcard-bind \
-                     path) — see hive_backend::litebox's module doc, \"Networking\" section, \
-                     before enabling this backend for real traffic."
+                    "litebox smoke test: PASS — both the syscall rewriter AND a full real HTTP \
+                     round trip through the namespace+veth+TUN+DNAT+bind-shim networking pipeline \
+                     succeeded. Safe to set HIVE_LITEBOX_VERIFIED=1 on this host, per what \
+                     hive_backend::litebox's module doc's \"Networking\" section documents this \
+                     covers (Node/Bun only — Python is not covered yet)."
                 );
                 return Ok(());
             }

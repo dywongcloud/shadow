@@ -10,12 +10,16 @@
 //! below for what it is not.
 //!
 //! **Status as of 2026-08-08: process sandboxing and filesystem staging are
-//! proven working end to end on fc-frankfurt's real kernel; network-facing
-//! serving (`start_function`'s actual production purpose) is NOT yet
-//! functional — see "Networking" below. `HIVE_LITEBOX_VERIFIED=1` must stay
-//! unset fleet-wide until that gap closes; setting it today would select
-//! this backend for real deployments whose HTTP servers would then time out
-//! on every request.**
+//! proven working end to end on fc-frankfurt's real kernel. Networking has a
+//! full implementation — a small forked litebox patch (wildcard-bind fix +
+//! per-invocation guest IP/gateway) plus a per-cell TUN device plus a
+//! bind-rewrite shim for Node/Bun's residual explicit-loopback case (see
+//! "Networking" below) — but that implementation has NOT yet been proven
+//! live: `smoke_test`'s network-check phase exercises the whole pipeline,
+//! but has not yet actually been run against a real host.
+//! `HIVE_LITEBOX_VERIFIED=1` must stay unset fleet-wide until
+//! `--litebox-probe` has genuinely passed the network check for real, not
+//! merely compiled.**
 //!
 //! ## Mechanism
 //!
@@ -56,45 +60,110 @@
 //! for the same reason (the guest fs is a fresh in-memory snapshot every
 //! process, nothing persists back to the host).
 //!
-//! ## Networking — NOT yet functional for ordinary apps (open gap)
+//! ## Networking
 //!
-//! **`127.0.0.1` loopback is explicitly unsupported by litebox today** —
-//! confirmed directly from upstream's own test comment
-//! (`litebox_shim_linux/src/syscalls/net.rs`: "We do not support loopback
-//! yet"), and reproduced live: a sandboxed process reported itself
-//! listening, yet a host connection to `127.0.0.1:<port>` got an immediate
-//! ECONNREFUSED with no guest-side syscall ever observed. This breaks EVERY
-//! other backend's addressing convention (`CellEndpoint::Tcp("127.0.0.1:
-//! <port>")`, what the gateway's tunnel-fronting code dials universally).
+//! Three real constraints, discovered live on fc-frankfurt (2026-08-08) and
+//! confirmed by reading litebox's own source, shape everything below:
 //!
-//! Real networking needs a TUN device (litebox ships an official one-time
-//! setup script, `litebox_platform_linux_userland/scripts/tun-setup.sh` —
-//! `ip tuntap add dev tun99 mode tun` + a private `/24`, e.g. `10.0.0.1`
-//! host-side, `10.0.0.2` guest-side) passed via `--tun-device-name`. Proven
-//! live on fc-frankfurt (2026-08-08) once set up: the host CAN reach the
-//! guest's IP — but only when the guest app binds EXPLICITLY to that exact
-//! address (`.listen(port, '10.0.0.2', ...)`). A wildcard/`0.0.0.0` bind —
-//! what virtually every real Node/Express/Fastify app does by default, and
-//! the only bind shape every OTHER backend on this platform requires
-//! (`FunctionLaunch`'s own doc: "The process MUST listen on $PORT" — no
-//! address requirement) — silently does not work: the app reports itself
-//! listening, but the host's connection attempt still gets ECONNREFUSED.
-//! This is not an integration bug on this crate's side; it is litebox's
-//! current TCP implementation only matching an exact configured address.
+//! 1. **`127.0.0.1` loopback is architecturally impossible over a TUN
+//!    device.** A TUN device is a real point-to-point IP link, not a
+//!    loopback interface — this is true of any TUN-isolated stack, not a
+//!    litebox defect, and no litebox patch can change it. Confirmed live: a
+//!    sandboxed process reported itself listening on `127.0.0.1`; the
+//!    host's connection attempt got an immediate ECONNREFUSED with no
+//!    guest-side syscall ever observed.
+//! 2. **The guest only accepted connections to an EXPLICIT bind address —
+//!    litebox's own bug, not a smoltcp limitation.** `litebox/src/net/
+//!    mod.rs`'s `bind()`/`listen()` unconditionally built
+//!    `smoltcp::wire::IpListenEndpoint { addr: Some(addr), .. }`, even for a
+//!    wildcard/omitted-host bind (what real Node/Express apps do by
+//!    default). smoltcp itself already fully supports wildcard listening
+//!    (`IpListenEndpoint.addr: Option<Address>`, `None` = "any address",
+//!    confirmed against smoltcp 0.12.0 — litebox's own exact pinned
+//!    version) — litebox's integration code simply never used the sentinel
+//!    it was already given the means to use.
+//! 3. **The guest's IP and gateway were HARDCODED at compile time, not
+//!    configurable per instance** — `litebox/src/net/mod.rs`:
+//!    `const INTERFACE_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 2);` /
+//!    `const GATEWAY_IP_ADDR: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);`, both
+//!    already marked `// TODO: Make this configurable` by litebox's own
+//!    authors. Every concurrent litebox process therefore claimed the
+//!    identical guest address.
 //!
-//! Two further open questions block a real fix, neither resolved yet:
-//! (1) whether litebox's guest stack can be made to accept a wildcard bind
-//! at all (would need either an upstream litebox change or a rewrite of the
-//! guest's own bind address, which this crate cannot control — the address
-//! comes from tenant code); (2) the concurrent-multi-cell IP/TUN model — a
-//! `tun-setup.sh`-created device is NOT `IFF_MULTI_QUEUE`, so how (or
-//! whether) more than one simultaneously-running cell gets a distinct,
-//! reachable guest address is unverified. Until both are resolved,
-//! `start_function`'s plain-function path will cold-start the guest process
-//! successfully and then time out waiting for it to become reachable —
-//! exactly the `DEPLOYMENT_START_FAILED` shape, indistinguishable from a
-//! genuinely broken deployment. **Do not set `HIVE_LITEBOX_VERIFIED=1` on
-//! any node until this section is updated to say otherwise.**
+//! **Constraints 2 and 3 are fixed with a small, forked patch to litebox
+//! itself** (`ansible/roles/litebox/files/networking.patch`, applied by the
+//! ansible role right after cloning, before build — see that directory's
+//! `PATCHES.md` for the full rationale and exactly what upstream commit
+//! it's diffed against): the wildcard-bind sites now map an unspecified
+//! address to smoltcp's `None` sentinel instead of `Some(0.0.0.0)`, and
+//! `Network::new`/`LinuxShimBuilder::build` gained an additive
+//! `_with_addrs`/`_with_net_config` sibling that
+//! `litebox_runner_linux_userland` calls, reading `LITEBOX_GUEST_IP`/
+//! `LITEBOX_GATEWAY_IP` from the environment (unset = byte-identical to
+//! upstream's hardcoded defaults, so every other caller — including
+//! litebox's own test suite — needs no changes at all).
+//!
+//! **With constraint 3 fixed, constraint 1's real solution falls out for
+//! free: every cell just gets its own real, directly-routable TUN address,
+//! the exact same pattern `FirecrackerBackend::setup_cell_net` already uses
+//! for microVMs** (a per-cell `/30`, `net_idx`-allocated — `mode=tun`
+//! instead of `mode=tap`, no kernel `ip=` cmdline since litebox reads the
+//! two env vars directly instead). No network namespace, veth pair, or
+//! DNAT/iptables rule is needed at all — a TUN device is a real
+//! point-to-point link, so the moment this host assigns itself the `/30`'s
+//! other half, the kernel routes to the guest's address directly:
+//!
+//! - `provision` allocates a fresh TUN device (`setup_cell_net`,
+//!   [`LiteboxNet`]'s doc) with a unique `/30` (e.g. host `10.88.0.1`,
+//!   guest `10.88.0.2`).
+//! - `start_function` launches the runner directly (no wrapper process)
+//!   with `--tun-device-name=<tun>` plus `LITEBOX_GUEST_IP`/
+//!   `LITEBOX_GATEWAY_IP` set to this cell's own pair, and the tunnel this
+//!   backend fronts the function with dials `net.guest_ip:<port>` directly
+//!   — entirely encapsulated here; no other subsystem needs to know a
+//!   litebox cell's address scheme differs from `127.0.0.1`.
+//! - `terminate` deletes the TUN device; nothing else to clean up.
+//!
+//! **Loopback (constraint 1) still needs a narrow fix for the minority of
+//! apps that explicitly hardcode it** (`.listen(port, '127.0.0.1')` — a
+//! wildcard-bind app is already reachable at the guest's real address once
+//! the litebox patch is applied, with no shim needed at all).
+//! `litebox-bind-shim.js` (embedded via `include_str!`, written fresh
+//! before every launch) monkey-patches Node's `net.Server.prototype.
+//! _listen2` — the internal, POST-overload-normalization method every real
+//! `.listen()` call shape funnels into, a deliberately preserved
+//! monkeypatch seam per Node's own source comment, stable across Node
+//! v10–v24, and the same technique New Relic's Node agent has run in
+//! production since ~2012 — so an explicit loopback (or, belt-and-suspenders,
+//! wildcard) bind transparently becomes this cell's real guest address.
+//! Zero tenant code changes, preloaded via `NODE_OPTIONS=--require`.
+//! Verified against every real `.listen()` shape (options-object form,
+//! callback-as-second-arg, unix sockets and fd handles correctly left
+//! untouched) with a standalone local test harness before shipping — see
+//! that file's own doc comment. **Not yet extended to Python** (the
+//! ecosystem is far more heterogeneous — most real Python servers run
+//! behind a WSGI/ASGI server like gunicorn/uvicorn, each with its own bind
+//! mechanism, unlike Node's tight convergence on `net.Server`) — a Python
+//! deployment on this backend will not be reachable until that's built.
+//!
+//! **Do not wait for litebox's own in-flight rewrite instead of the above.**
+//! An unreleased, actively-churning litebox branch (`ulitebox`, not `main`)
+//! replaces the whole smoltcp/TUN stack with a broker process issuing real
+//! host socket syscalls — genuinely fixing loopback (a real host socket
+//! *is* reachable at `127.0.0.1`) — but its own access-control policy
+//! (`litebox_broker_core::policy::authorize_socket_bind`) hard-DENIES
+//! wildcard binds by design, confirmed by its own unit test. Constraint 2's
+//! fix is therefore permanent regardless of which litebox architecture is
+//! eventually used, and the branch itself is unstable/undocumented — not a
+//! dependency to take today.
+//!
+//! **This implementation compiles, the litebox patch applies cleanly, and
+//! the bind-shim's rewrite logic is locally verified — but the patched
+//! litebox binary + the TUN-per-cell pipeline have NOT yet been run live.**
+//! `smoke_test`'s network phase exercises the whole real pipeline — a real
+//! TUN device, the patched litebox, a real Node HTTP server, a real
+//! host-side TCP round trip — and is what must genuinely PASS, live, before
+//! `HIVE_LITEBOX_VERIFIED=1` is safe to set anywhere.
 //!
 //! ## Scope: `start_function` only, never `run_build`
 //!
@@ -212,6 +281,31 @@ impl Default for LiteboxConfig {
     }
 }
 
+/// Per-cell TUN device + real, distinct guest IP. litebox's guest IP/gateway
+/// used to be HARDCODED at compile time (`litebox/src/net/mod.rs`:
+/// `INTERFACE_IP_ADDR = 10.0.0.2`, `GATEWAY_IP_ADDR = 10.0.0.1`) — every
+/// concurrent cell would otherwise claim the identical guest address.
+/// `ansible/roles/litebox/files/networking.patch` fixes this at the source
+/// (adds `LITEBOX_GUEST_IP`/`LITEBOX_GATEWAY_IP` env-var overrides, additive
+/// and backward-compatible — see that patch's own doc, `files/PATCHES.md`),
+/// so each cell can simply be handed its own real `/30` directly, no network
+/// namespace or veth pair needed at all — the exact same allocator shape
+/// `FirecrackerBackend::setup_cell_net` already uses for microVMs (a per-cell
+/// `/30` + TAP device instead of TUN, `net_idx`-derived).
+#[derive(Clone)]
+struct LiteboxNet {
+    /// TUN device name, unique per cell.
+    tun_dev: String,
+    /// This host's end of the point-to-point link (what the guest's default
+    /// route points at).
+    host_ip: String,
+    /// The guest's own IP on that link — what `start_function`'s tunnel
+    /// dials directly; reachable from the host with zero NAT/forwarding,
+    /// since a TUN device is a real point-to-point link and the kernel
+    /// routes to it the moment `host_ip` is assigned.
+    guest_ip: String,
+}
+
 pub struct LiteboxBackend {
     cfg: LiteboxConfig,
     /// Long-lived function processes (the litebox runner itself — guest and
@@ -224,8 +318,23 @@ pub struct LiteboxBackend {
     /// branch).
     containers: Arc<AsyncMutex<HashMap<CellId, String>>>,
     ctnl_tasks: Arc<AsyncMutex<HashMap<CellId, tokio::task::JoinHandle<()>>>>,
+    /// Per-cell network namespace/veth/TUN state — see [`LiteboxNet`]. Set
+    /// up in `provision` (before the port is known), torn down in
+    /// `terminate`. Absent for CONTAINER cells, which never touch this path.
+    cell_nets: Arc<AsyncMutex<HashMap<CellId, LiteboxNet>>>,
+    /// Monotonic allocator for the per-cell veth `/30` (mirrors
+    /// `FirecrackerBackend::net_idx` exactly — same derivation, same 16384
+    /// slot space, wraps rather than errors since a wrapped slot is only a
+    /// real collision if an old cell at that index is somehow still alive,
+    /// which `terminate` prevents).
+    net_idx: Arc<std::sync::atomic::AtomicUsize>,
     sampler: Arc<crate::CpuSampler>,
 }
+
+/// The Node bind-rewrite shim's source, embedded at compile time so the
+/// runtime binary is fully self-contained (no separate ansible deploy step
+/// to keep in sync) — see `bind_shim_path`'s doc.
+const NODE_BIND_SHIM_JS: &str = include_str!("litebox-bind-shim.js");
 
 impl LiteboxBackend {
     pub fn new(cfg: LiteboxConfig) -> Self {
@@ -235,7 +344,87 @@ impl LiteboxBackend {
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
             ctnl_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+            cell_nets: Arc::new(AsyncMutex::new(HashMap::new())),
+            net_idx: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             sampler: Arc::new(crate::CpuSampler::new()),
+        }
+    }
+
+    /// Path the embedded Node bind-rewrite shim gets written to on this
+    /// host (idempotent — `start_function` writes it fresh before every
+    /// launch, cheap and guarantees it can never silently go stale against
+    /// the binary's own embedded copy).
+    fn bind_shim_path(&self) -> PathBuf {
+        self.cfg.root.join("hive-litebox-bind-shim.js")
+    }
+
+    /// Allocate a fresh TUN device + real `/30` for one cell — mirrors
+    /// `FirecrackerBackend::setup_cell_net`'s allocator exactly (same
+    /// `net_idx`-derived third/base octet split, same 16384-slot space,
+    /// `mode=tun` instead of `mode=tap`). No namespace or veth pair: since
+    /// `networking.patch` makes litebox's guest IP configurable per
+    /// invocation (see [`LiteboxNet`]'s doc), each cell can just own a real,
+    /// distinct address directly — the host routes to it the moment the
+    /// device's host-side address is assigned, no NAT/forwarding needed.
+    /// Returns `None` (never panics/propagates) on any setup failure so a
+    /// host missing `ip`/CAP_NET_ADMIN/`/dev/net/tun` degrades to "this cell
+    /// has no network" rather than failing the whole cell — the caller
+    /// (`provision`) is what turns that into a hard error for non-container
+    /// cells, since a networkless litebox cell cannot serve anything.
+    async fn setup_cell_net(&self, id: &CellId) -> Option<LiteboxNet> {
+        use std::sync::atomic::Ordering;
+        let i = self.net_idx.fetch_add(1, Ordering::SeqCst) % 16384;
+        let third = ((i >> 6) & 0xff) as u8;
+        let base = ((i & 0x3f) as u8) * 4;
+        let host_ip = format!("10.88.{third}.{}", base + 1);
+        let guest_ip = format!("10.88.{third}.{}", base + 2);
+        let tun_dev = format!("lbt{i}");
+
+        // Recreate fresh every time (delete any stale device from a prior
+        // cell at this index) — same idempotency shape as
+        // FirecrackerBackend::setup_cell_net's tap recreation.
+        let script = format!(
+            "set -e; export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; \
+             ip link del {tun_dev} 2>/dev/null; \
+             ip tuntap add dev {tun_dev} mode tun && \
+             ip addr add {host_ip}/30 dev {tun_dev} && \
+             ip link set {tun_dev} up"
+        );
+        let ok = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!(
+                    "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {tun_dev} 2>/dev/null"
+                ))
+                .status()
+                .await;
+            return None;
+        }
+        let net = LiteboxNet {
+            tun_dev,
+            host_ip,
+            guest_ip,
+        };
+        self.cell_nets.lock().await.insert(id.clone(), net.clone());
+        Some(net)
+    }
+
+    /// Tear down a cell's TUN device (best-effort; no netns/veth/iptables
+    /// state exists to clean up alongside it).
+    async fn teardown_cell_net(&self, id: &CellId) {
+        if let Some(net) = self.cell_nets.lock().await.remove(id) {
+            let script = format!(
+                "export PATH=/usr/sbin:/sbin:/usr/bin:/bin:$PATH; ip link del {} 2>/dev/null",
+                net.tun_dev
+            );
+            let _ = Command::new("/bin/sh").arg("-c").arg(&script).status().await;
         }
     }
 
@@ -336,33 +525,43 @@ impl LiteboxBackend {
         Ok(combined)
     }
 
-    /// Tier 2: REAL functional proof — runs a trivial dynamically-linked
-    /// program (`/bin/echo`, staged with its real `ldd` closure — see module
-    /// doc's "Guest filesystem" section for why an unstaged dependency is a
-    /// hard failure, not a degraded one) through the live rewriter and
-    /// checks it produced the exact expected output via the sandboxed
-    /// process's real stdout.
+    /// Tier 2: REAL functional proof, TWO checks.
     ///
-    /// **A PASS here proves the syscall-rewriter mechanism only — it does
-    /// NOT prove `start_function` can serve a real deployment.** It
-    /// deliberately never touches the network, because networking is a
-    /// separately-gated, currently-unresolved capability — see the module
-    /// doc's "Networking" section. Do not read a PASS as "safe to set
-    /// `HIVE_LITEBOX_VERIFIED=1`"; that section states the actual bar.
+    /// **(a) Rewriter check** — runs a trivial dynamically-linked program
+    /// (`/bin/echo`, staged with its real `ldd` closure — see module doc's
+    /// "Guest filesystem" section) through the live rewriter and checks it
+    /// produced the exact expected output via the sandboxed process's real
+    /// stdout.
+    ///
+    /// **(b) Network check** — sets up a real, throwaway namespace/veth/TUN
+    /// (the exact `LiteboxNet` machinery `provision`/`start_function` use),
+    /// runs a real Node HTTP server through the FULL pipeline (rewriter +
+    /// bind-rewrite shim + DNAT), and makes a real HTTP round trip from the
+    /// host. A PASS here is what actually licenses `HIVE_LITEBOX_VERIFIED=1`
+    /// — see the module doc's "Networking" section for exactly what this
+    /// closes and what it still doesn't cover (Bun/Python bind-rewrite,
+    /// sustained concurrency under real load).
     ///
     /// **Bring-up only. Never call this against a node already carrying live
     /// traffic** — mirrors `pvm_run_smoke_test`'s gating in `AGENTS.md`
     /// exactly: a smoke test that itself exercises an unproven isolation
-    /// path is the kind of check that can wedge the very host serving
-    /// traffic. The verdict here is NOT auto-applied to backend selection;
-    /// an operator runs this once via the `--litebox-probe` CLI flag during
-    /// bring-up — see `main.rs`'s backend-selection chain.
+    /// path (here: creates a real network namespace + iptables rules) is
+    /// the kind of check that can wedge the very host serving traffic. The
+    /// verdict here is NOT auto-applied to backend selection; an operator
+    /// runs this once via the `--litebox-probe` CLI flag during bring-up —
+    /// see `main.rs`'s backend-selection chain.
     pub async fn smoke_test(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.is_supported(),
             "litebox runner binary not present at {} (or not on Linux) — nothing to smoke-test",
             self.cfg.runner_bin.display()
         );
+        self.rewriter_smoke_test().await?;
+        self.network_smoke_test().await?;
+        Ok(())
+    }
+
+    async fn rewriter_smoke_test(&self) -> anyhow::Result<()> {
         let probe_bin = resolve_bin("echo").await;
         let deps = ldd_closure(&probe_bin).await.unwrap_or_default();
         let tar_path = self.cfg.root.join("litebox-smoke-deps.tar");
@@ -403,15 +602,130 @@ impl LiteboxBackend {
             .map_err(|e| anyhow::anyhow!("failed to spawn litebox runner: {e}"))?;
         anyhow::ensure!(
             out.status.success(),
-            "litebox smoke test exited non-zero ({}); stderr: {}",
+            "litebox rewriter smoke test exited non-zero ({}); stderr: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         anyhow::ensure!(
             stdout.trim() == marker,
-            "litebox smoke test ran but stdout did not match — the sandboxed process's output \
-             was not reliably delivered to the host. got: {stdout:?}, want: {marker:?}"
+            "litebox rewriter smoke test ran but stdout did not match — the sandboxed process's \
+             output was not reliably delivered to the host. got: {stdout:?}, want: {marker:?}"
+        );
+        Ok(())
+    }
+
+    async fn network_smoke_test(&self) -> anyhow::Result<()> {
+        let probe_id = CellId::new();
+        let net = self.setup_cell_net(&probe_id).await.ok_or_else(|| {
+            anyhow::anyhow!(
+                "litebox network smoke test: failed to set up a TUN device — needs `ip`, \
+                 CAP_NET_ADMIN, and /dev/net/tun"
+            )
+        })?;
+        let result = self.network_smoke_test_inner(&net).await;
+        self.teardown_cell_net(&probe_id).await;
+        result
+    }
+
+    async fn network_smoke_test_inner(&self, net: &LiteboxNet) -> anyhow::Result<()> {
+        const PROBE_PORT: u16 = 18080;
+
+        let node_bin = resolve_bin("node").await;
+        anyhow::ensure!(
+            node_bin.exists(),
+            "litebox network smoke test: no `node` binary found on PATH — cannot probe \
+             networking without a runtime to serve through it"
+        );
+        let deps = ldd_closure(&node_bin).await?;
+        let tar_path = self.cfg.root.join("litebox-network-smoke-deps.tar");
+        if let Some(parent) = tar_path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        if !deps.is_empty() {
+            let mut cmd = Command::new("tar");
+            cmd.arg("-h").arg("--absolute-names").arg("-cf").arg(&tar_path);
+            for d in &deps {
+                cmd.arg(d);
+            }
+            let out = cmd
+                .output()
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to run tar: {e}"))?;
+            anyhow::ensure!(
+                out.status.success(),
+                "tar failed staging node's deps for the network smoke test: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        tokio::fs::write(self.bind_shim_path(), NODE_BIND_SHIM_JS).await?;
+
+        let marker = format!("litebox-net-smoke-{}", now_ms());
+        // A wildcard bind (`.listen(PROBE_PORT)`, no host) is the exact case
+        // `networking.patch` fixes natively — this proves the patch, not
+        // just the TUN plumbing around it. The bind-rewrite shim is ALSO
+        // preloaded (harmless no-op for this wildcard case, but proves the
+        // shim mechanism itself didn't break — see `LiteboxBackend`'s
+        // module doc, "Networking").
+        let script =
+            format!("require('http').createServer((q,r)=>{{r.end('{marker}')}}).listen({PROBE_PORT});");
+
+        let mut cmd = Command::new(&self.cfg.runner_bin);
+        cmd.arg("-Z")
+            .arg("--rewrite-syscalls")
+            .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev));
+        if !deps.is_empty() {
+            cmd.arg(format!("--initial-files={}", tar_path.display()));
+        }
+        cmd.arg("--")
+            .arg(&node_bin)
+            .arg("-e")
+            .arg(&script)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", "/")
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
+            .env(
+                "NODE_OPTIONS",
+                format!("--require {}", self.bind_shim_path().display()),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("failed to spawn litebox runner for the network smoke test: {e}")
+        })?;
+
+        let addr = format!("{}:{PROBE_PORT}", net.guest_ip);
+        if let Err(e) = crate::mock::wait_tcp_ready(&addr, Duration::from_secs(10)).await {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(e.context("litebox network smoke test: server never became reachable"));
+        }
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let round_trip = async {
+            let mut stream = tokio::net::TcpStream::connect(&addr).await?;
+            stream
+                .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .await?;
+            let mut resp = Vec::new();
+            stream.read_to_end(&mut resp).await?;
+            anyhow::Ok(resp)
+        }
+        .await;
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+
+        let resp = round_trip?;
+        let resp_text = String::from_utf8_lossy(&resp);
+        anyhow::ensure!(
+            resp_text.contains(&marker),
+            "litebox network smoke test: real HTTP round trip completed but the response was \
+             wrong — got: {resp_text:?}, want a body containing {marker:?}"
         );
         Ok(())
     }
@@ -507,6 +821,21 @@ impl CellBackend for LiteboxBackend {
         tokio::fs::create_dir_all(&root).await?;
         if !self.cfg.provision_latency.is_zero() {
             tokio::time::sleep(self.cfg.provision_latency).await;
+        }
+        // CONTAINER cells bypass litebox's TUN networking entirely (they run
+        // via host podman, with podman's own network) — see module doc.
+        // Every other cell needs it set up now, before the port is known
+        // (mirrors FirecrackerBackend::provision calling setup_cell_net
+        // before boot) — a plain function cell with no network can never
+        // serve anything, so a setup failure is a hard provision error
+        // here, not a silent degrade like Firecracker's egress-only case.
+        if spec.container.is_none() {
+            anyhow::ensure!(
+                self.setup_cell_net(&spec.id).await.is_some(),
+                "litebox: failed to set up this cell's TUN device (needs `ip`, CAP_NET_ADMIN, \
+                 and /dev/net/tun) — see hive_backend::litebox's module doc, \"Networking\" \
+                 section"
+            );
         }
         Ok(CellHandle {
             id: spec.id.clone(),
@@ -629,10 +958,39 @@ impl CellBackend for LiteboxBackend {
         let bin = resolve_bin(&func.start_cmd[0]).await;
         let initial_files = self.ensure_combined_tar(&cell.image, &bin).await?;
 
+        // This cell's TUN device + real, distinct guest IP, set up in
+        // `provision` — see module doc's "Networking" section (litebox's
+        // guest IP is patched to be per-invocation configurable, so no
+        // namespace/veth isolation is needed — each cell just gets its own
+        // real address directly).
+        let net = self
+            .cell_nets
+            .lock()
+            .await
+            .get(&cell.id)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "litebox: cell {} has no TUN device (provision should have set one up) — \
+                     this is a bug, not a runtime condition",
+                    cell.id
+                )
+            })?;
+
+        // Preload the bind-rewrite shim for Node/Bun (see module doc's
+        // "Networking" section + litebox-bind-shim.js's own doc comment):
+        // even with the wildcard-bind patch applied, an app that explicitly
+        // hardcodes a loopback address still needs rewriting to this cell's
+        // real guest IP — TUN can never bridge host<->guest loopback.
+        // Python is not covered yet — see `crate::litebox`'s tracking note.
+        tokio::fs::write(self.bind_shim_path(), NODE_BIND_SHIM_JS).await?;
+        let is_node = matches!(func.runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun);
+
         let mut cmd = Command::new(&self.cfg.runner_bin);
         cmd.arg("-Z")
             .arg("--rewrite-syscalls")
             .arg("--forward-env")
+            .arg(format!("--tun-device-name={}", net.tun_dev))
             .arg(format!("--initial-files={}", initial_files.display()))
             .arg("--")
             .arg(&bin)
@@ -647,11 +1005,23 @@ impl CellBackend for LiteboxBackend {
             .env("PORT", func.port.to_string())
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/")
+            // Read by ansible/roles/litebox/files/networking.patch's
+            // litebox_runner_linux_userland change — gives THIS cell its own
+            // real, distinct guest identity instead of every cell defaulting
+            // to the same hardcoded 10.0.0.2/10.0.0.1.
+            .env("LITEBOX_GUEST_IP", &net.guest_ip)
+            .env("LITEBOX_GATEWAY_IP", &net.host_ip)
             .envs(&func.env)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if is_node {
+            cmd.env(
+                "NODE_OPTIONS",
+                format!("--require {}", self.bind_shim_path().display()),
+            );
+        }
 
         let child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
@@ -661,7 +1031,7 @@ impl CellBackend for LiteboxBackend {
         })?;
         self.funcs.lock().await.insert(cell.id.clone(), child);
 
-        let func_addr = format!("127.0.0.1:{}", func.port);
+        let func_addr = format!("{}:{}", net.guest_ip, func.port);
         if let Err(e) = crate::mock::wait_tcp_ready(&func_addr, Duration::from_secs(15)).await {
             if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
                 let _ = child.start_kill();
@@ -713,6 +1083,9 @@ impl CellBackend for LiteboxBackend {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
+        // Deleting the namespace also destroys its TUN device and every
+        // iptables rule inside it — nothing else to clean up per cell.
+        self.teardown_cell_net(&cell.id).await;
         let _ = tokio::fs::remove_dir_all(&cell.root).await;
         Ok(())
     }

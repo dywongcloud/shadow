@@ -1,0 +1,122 @@
+diff --git a/litebox/src/net/mod.rs b/litebox/src/net/mod.rs
+index de31c04e..73016b0e 100644
+--- a/litebox/src/net/mod.rs
++++ b/litebox/src/net/mod.rs
+@@ -93,23 +93,35 @@ where
+     /// and the created `Network` handle is expected to be shared across all usage over the
+     /// system.
+     pub fn new(litebox: &LiteBox<Platform>) -> Self {
++        Self::new_with_addrs(litebox, None, None)
++    }
++
++    /// Same as [`Self::new`], but lets the caller override the interface/gateway
++    /// addresses instead of the fixed `INTERFACE_IP_ADDR`/`GATEWAY_IP_ADDR`
++    /// defaults (`None` = use the default). Needed by any caller that runs more
++    /// than one `Network` on the same host at once (each one needs a distinct
++    /// address to be independently reachable).
++    pub fn new_with_addrs(
++        litebox: &LiteBox<Platform>,
++        interface_ip: Option<Ipv4Addr>,
++        gateway_ip: Option<Ipv4Addr>,
++    ) -> Self {
++        let interface_ip = interface_ip.unwrap_or(INTERFACE_IP_ADDR);
++        let gateway_ip = gateway_ip.unwrap_or(GATEWAY_IP_ADDR);
+         let mut device = phy::Device::new(litebox.x.platform);
+         let config = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
+         let mut interface =
+             smoltcp::iface::Interface::new(config, &mut device, smoltcp::time::Instant::ZERO);
+         interface.update_ip_addrs(|ip_addrs| {
+             match ip_addrs.push(smoltcp::wire::IpCidr::new(
+-                smoltcp::wire::IpAddress::Ipv4(INTERFACE_IP_ADDR),
++                smoltcp::wire::IpAddress::Ipv4(interface_ip),
+                 24,
+             )) {
+                 Ok(()) => {}
+                 Err(_) => unreachable!(),
+             }
+         });
+-        match interface
+-            .routes_mut()
+-            .add_default_ipv4_route(GATEWAY_IP_ADDR)
+-        {
++        match interface.routes_mut().add_default_ipv4_route(gateway_ip) {
+             Ok(None) => {}
+             _ => unreachable!(),
+         }
+@@ -1175,7 +1187,8 @@ where
+                 }
+                 socket_handle.tcp_mut().server_socket = Some(TcpServerSpecific {
+                     ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+-                        addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
++                        addr: (!addr.ip().is_unspecified())
++                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                         port: new_port,
+                     },
+                     backlog: None,
+@@ -1188,7 +1201,8 @@ where
+                     .allocate_local_port(addr.port())
+                     .map_err(|_| BindError::PortAlreadyInUse(addr.port()))?;
+                 let local_endpoint = smoltcp::wire::IpListenEndpoint {
+-                    addr: Some(smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
++                    addr: (!addr.ip().is_unspecified())
++                            .then(|| smoltcp::wire::IpAddress::Ipv4(*addr.ip())),
+                     port: lp.port(),
+                 };
+                 let socket: &mut udp::Socket = self.socket_set.get_mut(socket_handle.handle);
+@@ -1261,7 +1275,7 @@ where
+                     }
+                     handle.server_socket = Some(TcpServerSpecific {
+                         ip_listen_endpoint: smoltcp::wire::IpListenEndpoint {
+-                            addr: Some(smoltcp::wire::IpAddress::v4(0, 0, 0, 0)),
++                            addr: None,
+                             port,
+                         },
+                         backlog: None,
+diff --git a/litebox_runner_linux_userland/src/lib.rs b/litebox_runner_linux_userland/src/lib.rs
+index 746469b5..890925e8 100644
+--- a/litebox_runner_linux_userland/src/lib.rs
++++ b/litebox_runner_linux_userland/src/lib.rs
+@@ -313,7 +313,17 @@ pub fn run(cli_args: CliArgs) -> Result<()> {
+ 
+     let initial_file_system = std::sync::Arc::new(initial_file_system);
+ 
+-    let shim = shim_builder.build();
++    // Per-invocation network identity override (fleet-hive patch): lets many
++    // concurrent litebox processes on one host each own a distinct,
++    // independently-reachable address instead of all defaulting to the same
++    // hardcoded 10.0.0.2/10.0.0.1. Unset = identical to upstream behavior.
++    let parse_ipv4_env = |name: &str| -> Option<core::net::Ipv4Addr> {
++        std::env::var(name).ok()?.parse().ok()
++    };
++    let shim = shim_builder.build_with_net_config(
++        parse_ipv4_env("LITEBOX_GUEST_IP"),
++        parse_ipv4_env("LITEBOX_GATEWAY_IP"),
++    );
+ 
+     let shutdown = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+     let net_worker = if cli_args.tun_device_name.is_some() {
+diff --git a/litebox_shim_linux/src/lib.rs b/litebox_shim_linux/src/lib.rs
+index a3bcb921..62fc0910 100644
+--- a/litebox_shim_linux/src/lib.rs
++++ b/litebox_shim_linux/src/lib.rs
+@@ -228,7 +228,19 @@ impl<Platform: ShimPlatform> LinuxShimBuilder<Platform> {
+ 
+     /// Build the shim.
+     pub fn build<FS: ShimFS>(self) -> LinuxShim<Platform, FS> {
+-        let mut net = Network::new(&self.litebox);
++        self.build_with_net_config(None, None)
++    }
++
++    /// Same as [`Self::build`], but lets the caller override this instance's
++    /// interface/gateway addresses (`None` = use `Network::new`'s default of
++    /// `10.0.0.2`/`10.0.0.1`). Needed to run more than one shim on the same
++    /// host at once, each independently reachable.
++    pub fn build_with_net_config<FS: ShimFS>(
++        self,
++        interface_ip: Option<core::net::Ipv4Addr>,
++        gateway_ip: Option<core::net::Ipv4Addr>,
++    ) -> LinuxShim<Platform, FS> {
++        let mut net = Network::new_with_addrs(&self.litebox, interface_ip, gateway_ip);
+         net.set_platform_interaction(litebox::net::PlatformInteraction::Manual);
+         let global = Arc::new(GlobalState {
+             platform: self.platform,

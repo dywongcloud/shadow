@@ -17,14 +17,14 @@ litebox_src_dir: "/root/litebox-src"
 # makes LiteboxBackend::is_supported() pass). It does NOT enable the backend
 # by itself.
 #
-# DO NOT flip this to true yet on any host. A `--litebox-probe` PASS (Tier 2)
-# proves only the syscall-rewriter mechanism, NOT that start_function can
-# serve real traffic — verified live on fc-frankfurt 2026-08-08 that
-# networking is a SEPARATE, currently unresolved gap (litebox has no
-# loopback support at all, and no proven way to make an ordinary
-# wildcard-bind app reachable even with its TUN-device path). See
-# crates/hive-backend/src/litebox.rs's module doc, "Networking" section, for
-# the full finding and what must be true before this default may change.
-# Mirrors the PVM canary program's manual-gate discipline (AGENTS.md "PVM
-# kernels": "KVM_CREATE_VM succeeding does NOT mean microVMs work").
+# Flip to true ONLY after running `hive-cloud --litebox-probe` on THIS
+# specific host and getting a real PASS on BOTH of its checks (the syscall
+# rewriter, and the full per-cell-TUN + patched-litebox + bind-shim network
+# round trip added 2026-08-08 -- see crates/hive-backend/src/litebox.rs's
+# module doc, "Networking" section, for exactly what that proves and what it
+# still doesn't: Python is not covered by the bind-rewrite shim yet, and
+# sustained concurrency under real production load has not been separately
+# load tested). Mirrors the PVM canary program's manual-gate discipline
+# (AGENTS.md "PVM kernels": "KVM_CREATE_VM succeeding does NOT mean microVMs
+# work").
 litebox_verified: false

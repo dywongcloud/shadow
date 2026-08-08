@@ -20,6 +20,25 @@
 # confirming a real functional PASS. See crates/hive-backend/src/litebox.rs's
 # module doc and crates/hive-cloud/src/main.rs's backend-selection chain.
 
+- name: Assert networking prerequisites for the per-cell TUN pipeline
+  ansible.builtin.command:
+    cmd: "{{ item }}"
+  loop:
+    - "which ip"
+    - "test -c /dev/net/tun"
+  changed_when: false
+  # Every plain-function cell gets its own TUN device with its own
+  # independently-configured guest IP (see crates/hive-backend/src/
+  # litebox.rs's module doc, "Networking" -- litebox's guest IP/gateway are
+  # hardcoded at compile time upstream; files/networking.patch makes them
+  # configurable per invocation, so no netns/veth isolation layer is needed
+  # -- each cell just gets a distinct real address directly, the same way
+  # FirecrackerBackend::setup_cell_net gives each microVM its own TAP). Both
+  # prerequisites are confirmed present on fc-frankfurt already; asserting
+  # here turns a missing prerequisite into a clear failure on a NEW target
+  # host instead of a confusing runtime error the first time a function
+  # tries to start.
+
 - name: Ensure the litebox source directory's parent exists
   ansible.builtin.file:
     path: "{{ litebox_src_dir | dirname }}"
@@ -32,6 +51,30 @@
     dest: "{{ litebox_src_dir }}"
     version: "{{ litebox_commit }}"
     force: true
+
+- name: Copy the fleet-hive networking patch to the target host (wildcard bind + per-invocation guest IP/gateway)
+  ansible.builtin.copy:
+    src: networking.patch
+    dest: "{{ litebox_src_dir }}/../litebox-networking.patch"
+    mode: "0644"
+
+- name: Apply it (git apply -- clone above always resets tracked files to pristine, so this is idempotent every run)
+  ansible.builtin.command:
+    cmd: git apply ../litebox-networking.patch
+    chdir: "{{ litebox_src_dir }}"
+  register: _patch_apply
+  changed_when: true
+  failed_when: false
+
+- name: Fail loudly if the patch no longer applies cleanly (litebox_commit moved -- re-diff files/networking.patch, see files/PATCHES.md)
+  ansible.builtin.assert:
+    that: _patch_apply.rc == 0
+    fail_msg: >-
+      files/networking.patch (see files/PATCHES.md) no longer applies cleanly
+      against litebox_commit={{ litebox_commit }}: {{ _patch_apply.stderr }}
+      -- re-diff it against the new pin before proceeding. Building unpatched
+      would silently ship the wildcard-bind bug and the hardcoded
+      single-instance guest IP back.
 
 - name: Build litebox_runner_linux_userland (release) -- long-running, first build is the slow one
   ansible.builtin.command:
