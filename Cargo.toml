@@ -101,6 +101,14 @@ hive-zkauth = { path = "crates/hive-zkauth" }
 # real 3-way diff before merging).
 [patch.crates-io]
 guardian-db = { path = "vendor/guardian-db" }
+# iroh #4390: `pending_open_paths` (remote_state.rs) is an unbounded VecDeque
+# with no dedup — still unbounded upstream in 1.0.3, both community fix PRs
+# closed unmerged. Measured cause of a real production OOM (71,680 MiB, 99.8%
+# of live heap, in one stack). vendor/iroh/CHANGES.md documents the exact
+# 3-line patch: dedup-on-push + a 256-entry cap. Byte-identical to upstream
+# 1.0.2 otherwise — re-diff against the next iroh bump before updating the
+# version pin, the same discipline as the guardian-db patch above.
+iroh = { path = "vendor/iroh" }
 
 [profile.release]
 opt-level = 3
