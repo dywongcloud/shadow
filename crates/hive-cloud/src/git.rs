@@ -1222,15 +1222,41 @@ async fn run_build(
             // and the user just sees a failed build. (This is the bug that dropped a
             // healthy project when a relocating redeploy errored.)
             let cancelled = !ok && cloud.build_cancels.is_cancelled(bid);
+            // Honest wording. "Keeping the existing deployment in place" is a
+            // claim that something is still serving, and it is FALSE for a
+            // project's first-ever deploy attempt — there is nothing to keep.
+            // Witnessed live: internet-structure failed every attempt (0
+            // deployment records, ever) and every failure log line still said
+            // "keeping the existing deployment in place", which reads as "your
+            // site is fine" to an operator watching a genuinely-down project.
+            let had_prior_deployment = cloud
+                .gw
+                .deployment_records()
+                .iter()
+                .any(|r| r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready)
+                || cloud
+                    .peer_deployments
+                    .read()
+                    .values()
+                    .flatten()
+                    .any(|d| d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready);
             if ok {
                 cleanup_non_targets(cloud, &project, &names).await;
             } else if cancelled {
-                log("Build cancelled by user — keeping the existing deployment in place.".into());
+                log(if had_prior_deployment {
+                    "Build cancelled by user — keeping the existing deployment in place.".into()
+                } else {
+                    "Build cancelled by user.".to_string()
+                });
             } else {
-                log(
+                log(if had_prior_deployment {
                     "Build failed — keeping the existing deployment in place (no relocation)."
-                        .into(),
-                );
+                        .to_string()
+                } else {
+                    "Build failed — this project has no prior successful deployment, so nothing \
+                     is currently serving."
+                        .to_string()
+                });
             }
             cloud.builds.update(bid, |b| {
                 b.state = if ok {
