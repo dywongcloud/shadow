@@ -1,0 +1,88 @@
+---
+# Build + stage Microsoft's LiteBox (https://github.com/microsoft/litebox) —
+# an unprivileged Linux syscall-sandboxing library — for hive-cloud's Litebox
+# CellBackend (crates/hive-backend/src/litebox.rs). Targets nodes where
+# neither real Firecracker microVMs nor the PVM software-virt fallback can
+# safely run (see that module's doc comment and AGENTS.md's "PVM kernels"
+# section for why fc-frankfurt specifically is in that state today).
+#
+# litebox ships no release binaries, so it's built from source the same way
+# hive_platform builds hive-cloud itself (rustup already installed
+# fleet-wide by roles/prerequisites) — its own, independent Cargo workspace,
+# built standalone rather than added as a workspace member (it is not on
+# crates.io and its own crate graph has no reason to be pulled into every
+# hive-cloud compile).
+#
+# This role ONLY builds + stages the runner binary (Tier 1: makes the
+# backend's existence check pass). It does NOT enable the backend — that is
+# a SEPARATE, deliberate operator decision (litebox_verified=true) taken
+# only after running `hive-cloud --litebox-probe` on this host and
+# confirming a real functional PASS. See crates/hive-backend/src/litebox.rs's
+# module doc and crates/hive-cloud/src/main.rs's backend-selection chain.
+
+- name: Ensure the litebox source directory's parent exists
+  ansible.builtin.file:
+    path: "{{ litebox_src_dir | dirname }}"
+    state: directory
+    mode: "0755"
+
+- name: Clone litebox at the pinned commit
+  ansible.builtin.git:
+    repo: "{{ litebox_repo_url }}"
+    dest: "{{ litebox_src_dir }}"
+    version: "{{ litebox_commit }}"
+    force: true
+
+- name: Build litebox_runner_linux_userland (release) -- long-running, first build is the slow one
+  ansible.builtin.command:
+    cmd: cargo build --release --bin litebox_runner_linux_userland
+    chdir: "{{ litebox_src_dir }}"
+  environment:
+    PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
+  args:
+    # Pinned commit -> a rebuild is only needed when litebox_commit changes
+    # and an operator clears this path. Same idempotency shape
+    # roles/firecracker_kvm uses for build-rootfs.sh.
+    creates: "{{ litebox_src_dir }}/target/release/litebox_runner_linux_userland"
+  async: 1800
+  poll: 15
+
+- name: Confirm the runner binary was produced
+  ansible.builtin.stat:
+    path: "{{ litebox_src_dir }}/target/release/litebox_runner_linux_userland"
+  register: _litebox_bin
+  failed_when: not _litebox_bin.stat.exists
+
+- name: Install the runner binary to /usr/local/bin/litebox-runner
+  ansible.builtin.copy:
+    src: "{{ litebox_src_dir }}/target/release/litebox_runner_linux_userland"
+    dest: /usr/local/bin/litebox-runner
+    mode: "0755"
+    remote_src: true
+  # No restart notify here on purpose: hive-node only reads this binary's
+  # PATH at its own startup, and only when HIVE_LITEBOX_VERIFIED=1 is also
+  # set. Staging the binary must never itself disturb an already-running
+  # node — only actually flipping backend selection (the drop-in tasks
+  # below) may restart it.
+
+- name: Ensure the systemd drop-in directory exists (when verified)
+  ansible.builtin.file:
+    path: /etc/systemd/system/hive-node.service.d
+    state: directory
+    mode: "0755"
+  when: litebox_verified | bool
+
+- name: Write litebox-verified.conf (opt-in, only after a real --litebox-probe PASS)
+  ansible.builtin.template:
+    src: litebox-verified.conf.j2
+    dest: /etc/systemd/system/hive-node.service.d/litebox-verified.conf
+    mode: "0644"
+  when: litebox_verified | bool
+  notify: [reload systemd, restart hive-node]
+
+- name: Remove litebox-verified.conf when not verified (safe default direction)
+  ansible.builtin.file:
+    path: /etc/systemd/system/hive-node.service.d/litebox-verified.conf
+    state: absent
+  when: not (litebox_verified | bool)
+  notify: [reload systemd, restart hive-node]

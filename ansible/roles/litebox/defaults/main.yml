@@ -1,0 +1,30 @@
+---
+# Pinned litebox commit (microsoft/litebox). Bump deliberately, re-diff
+# against the module doc's security-posture claims in
+# crates/hive-backend/src/litebox.rs, and re-verify with --litebox-probe
+# before rolling — litebox's own Provider-trait surface is still under
+# active churn upstream (see the litebox-api research this role's commit
+# was grounded on).
+litebox_repo_url: "https://github.com/microsoft/litebox"
+litebox_commit: "e7984422ce1aab181305ac7b9085c3e84e7bb27c"
+litebox_src_dir: "/root/litebox-src"
+
+# Whether this host's HIVE_LITEBOX_VERIFIED=1 systemd drop-in should be
+# applied — i.e. whether hive-cloud's backend-selection chain is allowed to
+# actually pick Litebox on this node (crates/hive-cloud/src/main.rs).
+#
+# Default FALSE: this role only builds + stages the runner binary (Tier 1 —
+# makes LiteboxBackend::is_supported() pass). It does NOT enable the backend
+# by itself.
+#
+# DO NOT flip this to true yet on any host. A `--litebox-probe` PASS (Tier 2)
+# proves only the syscall-rewriter mechanism, NOT that start_function can
+# serve real traffic — verified live on fc-frankfurt 2026-08-08 that
+# networking is a SEPARATE, currently unresolved gap (litebox has no
+# loopback support at all, and no proven way to make an ordinary
+# wildcard-bind app reachable even with its TUN-device path). See
+# crates/hive-backend/src/litebox.rs's module doc, "Networking" section, for
+# the full finding and what must be true before this default may change.
+# Mirrors the PVM canary program's manual-gate discipline (AGENTS.md "PVM
+# kernels": "KVM_CREATE_VM succeeding does NOT mean microVMs work").
+litebox_verified: false

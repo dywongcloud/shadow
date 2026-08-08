@@ -131,46 +131,7 @@ impl FirecrackerBackend {
 
     /// PATH for invoking podman on a Linux Firecracker host (systemd units run with
     /// a minimal env). Covers the standard distro locations.
-    const PODMAN_PATH: &'static str =
-        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-
-    /// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
-    /// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
-    /// the runtime to pass to `podman --runtime` ONLY when it's actually resolvable
-    /// on this host, so a misconfigured/missing runtime gracefully falls back to
-    /// podman's default (crun/runc) instead of failing every container cold start.
-    fn container_runtime() -> Option<String> {
-        let v = std::env::var("HIVE_CONTAINER_RUNTIME").ok()?;
-        let v = v.trim();
-        if v.is_empty() {
-            return None;
-        }
-        // Resolve to a concrete binary so we can verify it exists. An explicit path
-        // is used as-is; a bare name is searched in the standard runtime locations.
-        let candidates: Vec<String> = if v.contains('/') {
-            vec![v.to_string()]
-        } else {
-            [
-                "/usr/local/bin",
-                "/usr/bin",
-                "/usr/local/sbin",
-                "/usr/sbin",
-                "/bin",
-            ]
-            .iter()
-            .map(|d| format!("{d}/{v}"))
-            .collect()
-        };
-        if let Some(path) = candidates
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-        {
-            Some(path)
-        } else {
-            tracing::warn!(runtime = %v, "HIVE_CONTAINER_RUNTIME set but binary not found — using podman default runtime");
-            None
-        }
-    }
+    const PODMAN_PATH: &'static str = crate::PODMAN_PATH;
 
     /// Remove run dirs for cells that are NOT live (no entry in `procs` for microVM
     /// cells, nor in `containers` for host-podman cells) and whose dir hasn't been
@@ -432,7 +393,7 @@ impl FirecrackerBackend {
     fn rootfs_for(&self, image: &str) -> PathBuf {
         self.cfg
             .rootfs_dir
-            .join(format!("{}.ext4", sanitize_image(image)))
+            .join(format!("{}.ext4", crate::sanitize_image(image)))
     }
 
     /// Per-deployment build-output ext4 (the artifact `deliver_build` packs and
@@ -441,7 +402,7 @@ impl FirecrackerBackend {
     fn data_image_for(&self, image: &str) -> PathBuf {
         self.cfg
             .rootfs_dir
-            .join(format!("{}.data.ext4", sanitize_image(image)))
+            .join(format!("{}.data.ext4", crate::sanitize_image(image)))
     }
 
     /// Locate a deployment's data image on disk for the storage broker
@@ -489,7 +450,7 @@ impl FirecrackerBackend {
         self.cfg
             .rootfs_dir
             .join("snapshots")
-            .join(format!("snaps-{}", sanitize_image(deployment_id)))
+            .join(format!("snaps-{}", crate::sanitize_image(deployment_id)))
     }
 
     /// Idempotently enable IP forwarding + NAT so guest microVMs (172.16/16) can
@@ -653,19 +614,6 @@ struct CellNet {
 /// Guest path the per-deployment build output is mounted at (the agent mounts
 /// `/dev/vdb` here; the function server runs with this as its working dir).
 pub const DELIVERED_WORKDIR: &str = "/build";
-
-fn sanitize_image(image: &str) -> String {
-    image
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
 
 /// Copy `src` to `dst`, preferring a copy-on-write REFLINK clone over a full
 /// block-level copy when the host filesystem supports it (XFS formatted with
@@ -1082,7 +1030,7 @@ impl CellBackend for FirecrackerBackend {
                 .get(3)
                 .map(|s| s.as_str())
                 .filter(|s| !s.is_empty());
-            let runtime = Self::container_runtime();
+            let runtime = crate::container_runtime();
             if let Some(rt) = &runtime {
                 tracing::info!(cell = %cell.id, runtime = %rt, "running container under sandbox runtime");
             }

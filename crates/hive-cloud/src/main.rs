@@ -97,6 +97,7 @@ use clap::Parser;
 use fluid_compute::{Fluid, FluidConfig};
 use fluid_gateway::Gateway;
 use hive_backend::firecracker::{FirecrackerBackend, FirecrackerConfig};
+use hive_backend::litebox::LiteboxBackend;
 use hive_backend::mock::{MockBackend, MockConfig};
 use hive_backend::CellBackend;
 use hive_controlplane::{BoxConfig, Hive, HiveConfig};
@@ -234,6 +235,16 @@ struct Args {
     /// order. The seed ages out on the store's own TTL like any challenge.
     #[arg(long = "acme-txt-selftest")]
     acme_txt_selftest: Option<String>,
+    /// Operator diagnostic: run Litebox's Tier-2 functional smoke test
+    /// (`LiteboxBackend::smoke_test` — a real program through the live
+    /// syscall rewriter, not just an existence check) then exit without
+    /// starting a node. BRING-UP ONLY: never run this against a node already
+    /// carrying live traffic — mirrors `pvm_run_smoke_test`'s gating
+    /// (AGENTS.md "PVM kernels"). A pass is what licenses an operator to set
+    /// `HIVE_LITEBOX_VERIFIED=1` on this host; this flag never sets it
+    /// itself. Non-zero exit on failure, so it composes into a shell check.
+    #[arg(long = "litebox-probe")]
+    litebox_probe: bool,
 }
 
 #[tokio::main]
@@ -262,6 +273,25 @@ async fn main() -> anyhow::Result<()> {
     if !args.dht_probe.is_empty() {
         return dht_probe::run_cli(&args.dht_probe).await;
     }
+    if args.litebox_probe {
+        let be = hive_backend::litebox::LiteboxBackend::default();
+        match be.smoke_test().await {
+            Ok(()) => {
+                println!(
+                    "litebox smoke test: PASS (syscall rewriter only) — this does NOT mean \
+                     HIVE_LITEBOX_VERIFIED=1 is safe to set. Networking is a separate, currently \
+                     unresolved gap (litebox has no loopback support and no proven wildcard-bind \
+                     path) — see hive_backend::litebox's module doc, \"Networking\" section, \
+                     before enabling this backend for real traffic."
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("litebox smoke test: FAIL — {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     // Restart audit — FIRST thing after the diagnostics, before any subsystem
     // can wedge or overwrite state. A node killed by the cgroup OOM killer is
@@ -275,11 +305,17 @@ async fn main() -> anyhow::Result<()> {
     // fail the boot. See restart_audit.rs.
     restart_audit::audit_boot(&args.name);
 
-    // Shared isolation backend. The ONLY component that is allowed to be mocked
-    // (and only when a real microVM host isn't available): we auto-select the real
-    // Firecracker microVM backend whenever the host supports it (Linux + /dev/kvm),
-    // and fall back to the sandboxed child-process MockBackend otherwise (e.g. local
-    // dev on macOS). `HIVE_FORCE_MOCK=1` forces the mock for local development.
+    // Shared isolation backend: a ranked chain, Firecracker -> Litebox -> Mock.
+    // `HIVE_FORCE_MOCK=1` suppresses Firecracker specifically (its ORIGINAL,
+    // still-preserved purpose: fc-frankfurt sets this because its `/dev/kvm` +
+    // firecracker binary both pass the existence check below while a real
+    // microVM *boot* has hard-reset that host three times — see AGENTS.md's
+    // "PVM kernels" section). It does NOT mean "force mock no matter what":
+    // when a verified Litebox backend is available it is a strictly better
+    // fallback than the mock's zero isolation, so it is tried first. A node
+    // with no Litebox binary/verification falls through to mock exactly as
+    // before — zero behavior change for every node except one deliberately
+    // opted in via `HIVE_LITEBOX_VERIFIED=1`.
     let force_mock = std::env::var("HIVE_FORCE_MOCK")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -295,20 +331,44 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let firecracker = Arc::new(FirecrackerBackend::new(fc_cfg));
-    // Backend kind ("firecracker"|"mock") captured alongside the backend — gossiped
-    // so the placement scheduler only auto-targets real-microVM nodes (never the
-    // local/mock Mac nodes). `sandbox_fc` retains the CONCRETE type (Sandboxes'
-    // exec/kill methods are Firecracker-specific, not part of the generic
-    // `CellBackend` trait object every other subsystem sees).
+    // Backend kind ("firecracker"|"litebox"|"mock") captured alongside the
+    // backend — gossiped so the placement scheduler only auto-targets
+    // real-microVM nodes (never the local/mock Mac nodes). `sandbox_fc`
+    // retains the CONCRETE type (Sandboxes' exec/kill methods are
+    // Firecracker-specific, not part of the generic `CellBackend` trait
+    // object every other subsystem sees).
     let sandbox_fc_supported = firecracker.is_supported() && !force_mock;
     let sandbox_fc: Option<Arc<FirecrackerBackend>> =
         sandbox_fc_supported.then(|| firecracker.clone());
+    // Litebox Tier 2: NEVER auto-detected live (see `LiteboxBackend::smoke_test`'s
+    // doc comment and AGENTS.md's PVM two-tier precedent) — an operator runs
+    // `--litebox-probe` once during bring-up on an idle node and only then
+    // sets `HIVE_LITEBOX_VERIFIED=1`. Tier 1 (`is_supported`, existence-only)
+    // still gates it so a verified-elsewhere env var copied onto a node that
+    // never got the runner binary staged doesn't silently no-op into mock.
+    let litebox = Arc::new(LiteboxBackend::default());
+    let litebox_verified = std::env::var("HIVE_LITEBOX_VERIFIED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let litebox_supported = litebox.is_supported() && litebox_verified && !sandbox_fc_supported;
     let (backend, backend_name): (Arc<dyn CellBackend>, &'static str) = if sandbox_fc_supported {
         tracing::info!("isolation backend: Firecracker microVM (real, Linux + /dev/kvm)");
         (firecracker, "firecracker")
+    } else if litebox_supported {
+        // See `hive_backend::litebox`'s module doc for the full, honest
+        // security posture — this beats mock's zero isolation but is NOT
+        // Firecracker/gVisor-grade; never silently substituted for either.
+        tracing::warn!(
+            "isolation backend: Litebox (unprivileged syscall sandbox, HIVE_LITEBOX_VERIFIED=1) \
+             — real microVMs unavailable/suppressed on this host. NOT a hardware isolation \
+             boundary; see hive_backend::litebox module doc for the full security posture."
+        );
+        (litebox, "litebox")
     } else {
-        if force_mock {
-            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — runtime is mocked for local development");
+        if force_mock && !litebox_verified {
+            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1, no verified Litebox) — runtime is mocked for local development");
+        } else if force_mock {
+            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — Litebox verified but its runner binary is missing on this host (Tier 1 check failed)");
         } else {
             tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
         }

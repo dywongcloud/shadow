@@ -15,6 +15,7 @@
 
 pub mod container_cli;
 pub mod firecracker;
+pub mod litebox;
 pub mod mock;
 pub mod snapshot;
 
@@ -673,6 +674,66 @@ fn is_static_ip_failure(net: &Option<serde_json::Value>, stderr: &str) -> bool {
 /// same as any other cell). Shared by the mock + Firecracker backends so Firecracker
 /// nodes can run containers outside their microVMs. Returns the podman container
 /// name (for teardown), the tunnel endpoint, and the accept-loop task handle.
+/// Make a logical image name safe as a single filename component. Shared by
+/// every backend that caches a per-image artifact on disk (Firecracker's
+/// rootfs/data images, Litebox's initial-files tar).
+pub(crate) fn sanitize_image(image: &str) -> String {
+    image
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// PATH for invoking podman on a Linux host (systemd units run with a
+/// minimal env). Covers the standard distro locations. Shared by every
+/// backend that runs containers via host podman (Firecracker, Litebox).
+pub(crate) const PODMAN_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Optional container sandbox runtime — gVisor (`runsc`) for stronger isolation.
+/// Opt-in via `HIVE_CONTAINER_RUNTIME` (a runtime name or absolute path). Returns
+/// the runtime to pass to `podman --runtime` ONLY when it's actually resolvable
+/// on this host, so a misconfigured/missing runtime gracefully falls back to
+/// podman's default (crun/runc) instead of failing every container cold start.
+/// Shared by every backend that runs containers via host podman.
+pub(crate) fn container_runtime() -> Option<String> {
+    let v = std::env::var("HIVE_CONTAINER_RUNTIME").ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    // Resolve to a concrete binary so we can verify it exists. An explicit path
+    // is used as-is; a bare name is searched in the standard runtime locations.
+    let candidates: Vec<String> = if v.contains('/') {
+        vec![v.to_string()]
+    } else {
+        [
+            "/usr/local/bin",
+            "/usr/bin",
+            "/usr/local/sbin",
+            "/usr/sbin",
+            "/bin",
+        ]
+        .iter()
+        .map(|d| format!("{d}/{v}"))
+        .collect()
+    };
+    if let Some(path) = candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    {
+        Some(path)
+    } else {
+        tracing::warn!(runtime = %v, "HIVE_CONTAINER_RUNTIME set but binary not found — using podman default runtime");
+        None
+    }
+}
+
 pub(crate) async fn podman_run_container(
     cell_id: &CellId,
     image: &str,

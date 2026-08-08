@@ -54,6 +54,13 @@
     - role: hive_platform
       tags: [hive_platform, platform]
 
+- name: Litebox syscall-sandbox backend (nodes where no microVM path is safe)
+  hosts: litebox
+  become: true
+  roles:
+    - role: litebox
+      tags: [litebox]
+
 - name: Platform dashboard UI (Next.js on loopback :3002)
   hosts: platform
   become: true

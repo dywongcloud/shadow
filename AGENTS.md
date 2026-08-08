@@ -267,6 +267,82 @@ Cloud VMs with no `vmx`/`svm` get `/dev/kvm` from the out-of-tree PVM kernel
   crash there leaves the node with no hive-cloud at all) and the
   `--skip-tags smoke_test` workaround: `recall("PVM smoke-test hazards")`.
 
+## Litebox (nodes where no microVM path is safe at all)
+
+`hive_backend::litebox::LiteboxBackend` — a third `CellBackend`, Firecracker
+-> Litebox -> Mock in `main.rs`'s ranked selection — for hosts like
+fc-frankfurt where PVM's `KVM_CREATE_VM` passes but a real microVM boot
+hard-resets the host (previous section), so the only remaining fallback was
+`HIVE_FORCE_MOCK=1`, i.e. zero isolation. Wraps Microsoft's
+[litebox](https://github.com/microsoft/litebox) (`ansible/roles/litebox`
+builds `litebox_runner_linux_userland` from a pinned commit; litebox ships no
+releases).
+
+- **Two-tier verification, same shape as PVM, and the same trap: a Tier-2
+  PASS is not the whole bar.** `LiteboxBackend::is_supported()` (Tier 1,
+  existence-only) gates `--litebox-probe` (Tier 2: a REAL program through the
+  live rewriter, bring-up only, never on a node carrying traffic — mirrors
+  `pvm_run_smoke_test`'s gating exactly). But the probe deliberately never
+  touches the network, so a PASS proves only the syscall-rewriter mechanism —
+  see the networking finding below. `HIVE_LITEBOX_VERIFIED=1` (a systemd
+  drop-in, `ansible/roles/litebox`'s `litebox_verified` var, default `false`)
+  is the separate manual override that actually selects the backend;
+  `HIVE_FORCE_MOCK=1` still suppresses Firecracker exactly as before and now
+  falls through to Litebox first if verified, Mock otherwise — no existing
+  node's behavior changes without a new, deliberate opt-in.
+- **Scope is `start_function` only — `run_build` stays a plain unsandboxed
+  host process, byte-identical to `MockBackend`'s pipeline
+  (`crate::mock::run_build_process`, shared by both).** Confirmed directly
+  from upstream source (`litebox_shim_linux/src/syscalls/process.rs`):
+  `sys_clone`'s `fork` path is not implemented yet. A build script is
+  fork/exec-heavy by nature (`git clone`, `npm install` each spawn many
+  children), so wrapping it would fail on the first forked subprocess.
+- **The guest filesystem is a fully separate, explicitly-populated tree —
+  proven live, not inferred from the CLI's host-side existence checks.** A
+  sandboxed `cat` could not read a file that genuinely existed on the host at
+  the identical path. Every file the guest needs — its own binary's full
+  `ldd` closure AND the deployment's entire source tree — must be staged via
+  `--initial-files=<tar>`; `deliver_build`/`start_function` build and cache
+  this. **Dereference symlinks when staging (`tar -h`).** A shared-library
+  SONAME (`libz.so.1`) is very often a symlink to the real versioned file
+  (`libz.so.1.3.1.zlib-ng`); without `-h` the guest gets a dangling symlink
+  whose target was never staged, and the dynamic linker fails with "cannot
+  open shared object file" for that one library while others load fine —
+  easy to misdiagnose as a partial/flaky failure when it is fully
+  deterministic per file.
+- **Networking does not work yet, for real deployments, at all — this is the
+  actual blocker, not a rough edge.** `127.0.0.1` loopback is explicitly
+  unsupported upstream (litebox's own test comment: "We do not support
+  loopback yet"), which breaks every other backend's addressing convention
+  (`CellEndpoint::Tcp("127.0.0.1:<port>")`). A TUN device
+  (`litebox_platform_linux_userland/scripts/tun-setup.sh`, one-time host
+  setup, a private `/24`) does give the host real L3 reachability to the
+  guest's IP — but ONLY when the guest app binds EXPLICITLY to that exact
+  address; a wildcard/`0.0.0.0` bind (what virtually every real Node/Express
+  app does, and the only shape every other backend requires) silently does
+  not work — the app reports itself listening, the host's connect still gets
+  ECONNREFUSED, with no guest-side syscall ever observed. Not fixable from
+  this crate alone: the bind address is tenant code, and whether litebox's
+  TCP stack can be made to accept a wildcard bind is an upstream question.
+  The concurrent-multi-cell IP/TUN model is ALSO unverified (a
+  `tun-setup.sh` device is not `IFF_MULTI_QUEUE`). Until both resolve,
+  `HIVE_LITEBOX_VERIFIED=1` must stay unset fleet-wide — enabling it today
+  would select this backend for real deployments whose servers then time out
+  on every request, which is worse than the mock baseline it would replace.
+  Full finding: `crates/hive-backend/src/litebox.rs`'s module doc,
+  "Networking" section.
+- **Security posture is honest, not oversold, and must stay that way.**
+  Litebox measurably beats `MockBackend` (seccomp-bpf denies non-allowlisted
+  syscalls at the real kernel boundary; mock has none) but is NOT
+  Firecracker/gVisor-grade: guest and enforcement share one address space,
+  upstream's own doc says the rewriter "should not be considered a security
+  boundary," a full sandbox escape was fixed very recently (litebox #1006:
+  a raw `syscall` opcode constructed at runtime via `mmap`+write+`mprotect`
+  ran unmediated on the host), and JIT-generated syscalls are an admitted,
+  unclosed gap — directly relevant since Node.js is built on V8, a JIT. Full
+  reasoning in the module doc's "Security posture" section; never let this
+  backend be silently substituted for Firecracker capability anywhere.
+
 ## Bringing a node into the mesh
 
 - **Seed `HIVE_BOOTSTRAP_PEERS` with ADDRESSED peers, never bare node ids.** The

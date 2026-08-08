@@ -76,6 +76,117 @@ impl Default for MockBackend {
     }
 }
 
+/// Run a build job as a plain host process — the un-sandboxed build pipeline
+/// shared by [`MockBackend`] and the Litebox backend (`crate::litebox`).
+///
+/// Litebox reuses this VERBATIM rather than wrapping build steps in its own
+/// sandbox: a build script is fundamentally fork/exec-heavy (`git clone`
+/// forks+execs `git`, `npm install` forks+execs dozens of child processes),
+/// and litebox's own `sys_clone` handler explicitly does not support `fork`
+/// yet (`litebox_shim_linux/src/syscalls/process.rs`: "exit_signal is
+/// ignored because we don't support fork yet; we just validate it"). Wrapping
+/// this pipeline in the litebox runner would not work today, so it stays a
+/// plain host process for both backends — litebox's isolation is scoped to
+/// `start_function`'s single long-lived process instead, see `crate::litebox`.
+pub(crate) async fn run_build_process(
+    cell: &CellHandle,
+    job: &BuildJob,
+    sink: LogSink,
+    cache_root: &PathBuf,
+) -> anyhow::Result<BuildResult> {
+    let started_at_ms = now_ms();
+    sys_log(
+        &sink,
+        format!(
+            "[{}] starting build {} (image={}, {}vcpu/{}MiB)",
+            cell.id, job.id, cell.image, cell.resources.vcpus, cell.resources.mem_mib
+        ),
+    );
+
+    // Assemble the script: optional fetch, then each user command.
+    let mut steps: Vec<String> = Vec::new();
+    if !job.repo.is_empty() {
+        // `git_ref_clone_arg` is a controlled flag ("" or "--branch <ref>"),
+        // so it is interpolated raw; only the repo URL is quoted.
+        steps.push(format!(
+            "git clone --depth 1 {} {} . 2>&1 || (echo 'clone failed' && exit 1)",
+            job.git_ref_clone_arg(),
+            shell_quote(&job.repo)
+        ));
+    }
+    steps.extend(job.commands.iter().cloned());
+
+    let mem_mib = cell.resources.mem_mib;
+    let timeout = Duration::from_secs(job.resources.timeout_secs.max(1));
+
+    // Build cache: restore cached paths before the build (the "instant
+    // npm install" trick from Netlify/Hive).
+    if let Some(key) = &job.cache_key {
+        if !job.cache_paths.is_empty() {
+            let summary = restore_cache(cache_root, key, &job.cache_paths, &cell.root);
+            sys_log(&sink, format!("build cache restore [{key}]: {summary}"));
+        }
+    }
+
+    // Run all steps under one wall-clock budget; `set -e` semantics: stop on
+    // first non-zero exit.
+    let run = async {
+        let mut last_code = 0i32;
+        for (i, step) in steps.iter().enumerate() {
+            sys_log(&sink, format!("$ {}", step));
+            let code = run_step(&cell.root, step, &job.env, mem_mib, &sink, i).await?;
+            last_code = code;
+            if code != 0 {
+                break;
+            }
+        }
+        anyhow::Ok(last_code)
+    };
+
+    let (exit_code, timed_out) = match tokio::time::timeout(timeout, run).await {
+        Ok(Ok(code)) => (code, false),
+        Ok(Err(e)) => {
+            sys_log(&sink, format!("build error: {e}"));
+            (-1, false)
+        }
+        Err(_) => {
+            sys_log(&sink, format!("build exceeded timeout of {timeout:?}"));
+            (-1, true)
+        }
+    };
+
+    // Save cache after a successful build.
+    if exit_code == 0 && !timed_out {
+        if let Some(key) = &job.cache_key {
+            if !job.cache_paths.is_empty() {
+                let summary = save_cache(cache_root, key, &job.cache_paths, &cell.root);
+                sys_log(&sink, format!("build cache save [{key}]: {summary}"));
+            }
+        }
+    }
+
+    let finished_at_ms = now_ms();
+    sys_log(
+        &sink,
+        format!(
+            "[{}] build {} finished: exit={} timed_out={} ({}ms)",
+            cell.id,
+            job.id,
+            exit_code,
+            timed_out,
+            finished_at_ms.saturating_sub(started_at_ms)
+        ),
+    );
+
+    Ok(BuildResult {
+        job_id: job.id.clone(),
+        exit_code,
+        timed_out,
+        started_at_ms,
+        finished_at_ms,
+    })
+}
+
 fn sys_log(sink: &LogSink, line: impl Into<String>) {
     let _ = sink.send(LogLine {
         ts_ms: now_ms(),
@@ -123,99 +234,7 @@ impl CellBackend for MockBackend {
         job: &BuildJob,
         sink: LogSink,
     ) -> anyhow::Result<BuildResult> {
-        let started_at_ms = now_ms();
-        sys_log(
-            &sink,
-            format!(
-                "[{}] starting build {} (image={}, {}vcpu/{}MiB)",
-                cell.id, job.id, cell.image, cell.resources.vcpus, cell.resources.mem_mib
-            ),
-        );
-
-        // Assemble the script: optional fetch, then each user command.
-        let mut steps: Vec<String> = Vec::new();
-        if !job.repo.is_empty() {
-            // `git_ref_clone_arg` is a controlled flag ("" or "--branch <ref>"),
-            // so it is interpolated raw; only the repo URL is quoted.
-            steps.push(format!(
-                "git clone --depth 1 {} {} . 2>&1 || (echo 'clone failed' && exit 1)",
-                job.git_ref_clone_arg(),
-                shell_quote(&job.repo)
-            ));
-        }
-        steps.extend(job.commands.iter().cloned());
-
-        let mem_mib = cell.resources.mem_mib;
-        let timeout = Duration::from_secs(job.resources.timeout_secs.max(1));
-
-        // Build cache: restore cached paths before the build (the "instant
-        // npm install" trick from Netlify/Hive).
-        if let Some(key) = &job.cache_key {
-            if !job.cache_paths.is_empty() {
-                let summary =
-                    restore_cache(&self.cfg.cache_root, key, &job.cache_paths, &cell.root);
-                sys_log(&sink, format!("build cache restore [{key}]: {summary}"));
-            }
-        }
-
-        // Run all steps under one wall-clock budget; `set -e` semantics: stop on
-        // first non-zero exit.
-        let run = async {
-            let mut last_code = 0i32;
-            for (i, step) in steps.iter().enumerate() {
-                sys_log(&sink, format!("$ {}", step));
-                let code = run_step(&cell.root, step, &job.env, mem_mib, &sink, i).await?;
-                last_code = code;
-                if code != 0 {
-                    break;
-                }
-            }
-            anyhow::Ok(last_code)
-        };
-
-        let (exit_code, timed_out) = match tokio::time::timeout(timeout, run).await {
-            Ok(Ok(code)) => (code, false),
-            Ok(Err(e)) => {
-                sys_log(&sink, format!("build error: {e}"));
-                (-1, false)
-            }
-            Err(_) => {
-                sys_log(&sink, format!("build exceeded timeout of {timeout:?}"));
-                (-1, true)
-            }
-        };
-
-        // Save cache after a successful build.
-        if exit_code == 0 && !timed_out {
-            if let Some(key) = &job.cache_key {
-                if !job.cache_paths.is_empty() {
-                    let summary =
-                        save_cache(&self.cfg.cache_root, key, &job.cache_paths, &cell.root);
-                    sys_log(&sink, format!("build cache save [{key}]: {summary}"));
-                }
-            }
-        }
-
-        let finished_at_ms = now_ms();
-        sys_log(
-            &sink,
-            format!(
-                "[{}] build {} finished: exit={} timed_out={} ({}ms)",
-                cell.id,
-                job.id,
-                exit_code,
-                timed_out,
-                finished_at_ms.saturating_sub(started_at_ms)
-            ),
-        );
-
-        Ok(BuildResult {
-            job_id: job.id.clone(),
-            exit_code,
-            timed_out,
-            started_at_ms,
-            finished_at_ms,
-        })
+        run_build_process(cell, job, sink, &self.cfg.cache_root).await
     }
 
     async fn start_function(
@@ -624,7 +643,7 @@ impl CellBackend for MockBackend {
     }
 }
 
-async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Result<()> {
+pub(crate) async fn wait_tcp_ready(addr: &str, timeout: Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last = String::from("unknown");
     while tokio::time::Instant::now() < deadline {
