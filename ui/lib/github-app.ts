@@ -247,6 +247,23 @@ export async function readTokenBundle(): Promise<GhAppTokenBundle | null> {
  * The live first-party access token for this request, auto-refreshing an expired
  * one (cookie updated in place — route-handler context required). Returns null
  * when not connected / refresh impossible, so callers fall back to Composio.
+ *
+ * CALL THIS ONLY FROM A ROUTE HANDLER (or another mutable-cookie context), and
+ * treat that as a real invariant rather than a style preference. GitHub rotates
+ * refresh tokens SINGLE-USE: a successful refresh invalidates the token that
+ * bought it and returns the replacement exactly once, in this response. The
+ * `setTokenCookie` below is therefore the only thing that keeps the chain
+ * alive, and its `catch` swallows a read-only-context failure — so a refresh
+ * driven from a Server Component or middleware would burn the old refresh token,
+ * hand back a working access token for that ONE request, and persist nothing,
+ * leaving the cookie holding a refresh token GitHub has already retired. Every
+ * later refresh then fails and the user is told to reconnect, on a cadence set
+ * by the access token's 8h life — indistinguishable from a revoked App.
+ *
+ * Audited 2026-08-08: every caller reaches this through `app/api/**\/route.ts`
+ * or `app/oauth/github/callback/route.ts`, all Route Handlers, so the branch is
+ * currently unreachable. The comment exists so the next caller added outside
+ * that set is a deliberate decision instead of a silent regression.
  */
 export async function getGithubAppToken(): Promise<string | null> {
   const b = await readTokenBundle();
