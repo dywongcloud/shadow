@@ -525,10 +525,19 @@ impl LiteboxBackend {
 
     async fn ensure_combined_tar(&self, image: &str, bin: &Path) -> anyhow::Result<PathBuf> {
         let app_tar = self.app_tar_path(image);
+        // Carries `NODE_IMAGE_MISSING` for the same reason the Firecracker path
+        // does: this is a per-node ARTIFACT that should be here and is not, so
+        // the remedy is to reprovision/redeliver on this node — not to read the
+        // app's logs, and not to add capacity. Without a marker every fault this
+        // backend raises falls into `classify_lease_error`'s catch-all and is
+        // published as CAPACITY_EXHAUSTED, which on fc-frankfurt (the one node
+        // serving real tenant traffic on litebox) means every backend failure
+        // there currently blames the host for having no room.
         anyhow::ensure!(
             app_tar.exists(),
-            "litebox: no delivered build staged for image {image} — deliver_build must run \
+            "{}: litebox: no delivered build staged for image {image} — deliver_build must run \
              before start_function (app tar missing at {})",
+            hive_core::fault::NODE_IMAGE_MISSING,
             app_tar.display()
         );
         let combined = self.combined_tar_path(image, bin);
@@ -1080,6 +1089,20 @@ impl CellBackend for LiteboxBackend {
         // overwrites it before handing FunctionLaunch to its guest agent — the
         // guest sees `cell.image`'s tar rooted at "/" instead (see module doc).
         let bin = resolve_bin(&func.start_cmd[0]).await;
+        // The interpreter must exist on the HOST here — this backend stages the
+        // binary's own ldd closure into the guest tar, so a name that resolves
+        // to nothing produces a confusing staging failure rather than an
+        // actionable one. Same preflight and same marker as the mock and
+        // cell-agent paths, so a missing runtime is reported as an operator
+        // remedy instead of falling into the CAPACITY_EXHAUSTED catch-all.
+        anyhow::ensure!(
+            bin.is_file(),
+            "{}: `{}` is not installed on this node, so a runtime=\"{}\" deployment \
+             cannot start here (operator remedy; not an application fault)",
+            hive_core::fault::NODE_RUNTIME_MISSING,
+            func.start_cmd[0],
+            func.runtime.as_str(),
+        );
         let initial_files = self.ensure_combined_tar(&cell.image, &bin).await?;
 
         // This cell's TUN device + real, distinct guest IP, set up in

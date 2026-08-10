@@ -354,6 +354,19 @@ pub fn place(
                 tracing::warn!(region = %region, "placement: no GPU-capable node in this region — not widening (gpu request)");
                 continue;
             }
+            // Same rule, same reason, for the wasm runtime. The widening below
+            // deliberately falls back to `cands` (health/region only) when
+            // nothing passes `capable()`, which is right for a node that is
+            // merely resource-poor — but WRONG for a hard capability: widening
+            // hands the deployment to a node with no `wasmer` binary at all,
+            // which is exactly the empty-placement-beats-guaranteed-failure rule
+            // the gpu arm above encodes. Without this the `capable()` filter was
+            // decorative on this path: it removed the incapable nodes and then
+            // the fallback put them straight back.
+            if needs_wasm && eligibles.is_empty() {
+                tracing::warn!(region = %region, "placement: no wasm-capable node in this region — not widening (wasmer runtime)");
+                continue;
+            }
             let mut pool = if eligibles.is_empty() {
                 cands
             } else {
@@ -406,6 +419,11 @@ pub fn place(
         // git.rs) — hosting locally would put it on a GPU-less node.
         if needs_gpu {
             tracing::warn!("placement: gpu requested but no healthy GPU-capable node is reachable");
+        }
+        if needs_wasm {
+            tracing::warn!(
+                "placement: wasmer runtime requested but no healthy wasm-capable node is reachable"
+            );
         }
         return Vec::new();
     }

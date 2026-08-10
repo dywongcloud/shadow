@@ -1389,7 +1389,17 @@ async fn connect_agent(uds: &str, timeout: Duration) -> anyhow::Result<UnixStrea
             }
         }
     }
-    anyhow::bail!("could not reach cell agent on {uds}: {last_err}")
+    // An unreachable in-guest agent is a NODE fault, not an app fault and not
+    // saturation: the microVM booted but its PID1 never answered on the vsock
+    // socket, which means the guest ROOTFS is wrong (no /sbin/hive-cell-agent,
+    // or one that cannot run) — reprovision the image. Unmarked, this landed in
+    // `classify_lease_error`'s catch-all and published CAPACITY_EXHAUSTED on the
+    // fleet's dominant backend, sending operators to look for space on a node
+    // that had plenty.
+    anyhow::bail!(
+        "{}: could not reach cell agent on {uds}: {last_err}",
+        hive_core::fault::NODE_IMAGE_MISSING
+    )
 }
 
 async fn try_connect_once(uds: &str) -> anyhow::Result<UnixStream> {

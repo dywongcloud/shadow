@@ -1160,6 +1160,34 @@ async fn run_build(
             tracing::warn!(project = %project, gpu_nodes, "deploy refused: gpu requested, no GPU-capable target");
             return Err(anyhow::anyhow!(msg));
         }
+        // Same refusal for the wasm runtime, and for the identical reason the GPU
+        // arm above exists. An empty `targets` otherwise means "host locally",
+        // which is the right default for an ordinary deployment but puts a
+        // Wasmer function on a node with no `wasmer` binary — every cold start
+        // then fails NODE_RUNTIME_MISSING forever. `schedule::wasm_capable` is a
+        // HARD filter precisely so this case is reachable; without a loud
+        // refusal here the filter just produced an empty set that the caller
+        // quietly ignored, and the capability gate's own doc comment promised a
+        // guarantee the code did not keep.
+        if known_wasm && targets.is_empty() {
+            let capable_nodes = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| n.wasm_runtime == Some(true))
+                .count();
+            let msg = format!(
+                "{} {} {}",
+                format_args!(
+                    "this project declares runtime \"wasmer\", but no healthy node currently advertises a wasmer runtime ({capable_nodes} wasm-capable node(s) known to the mesh)."
+                ),
+                "The deploy was NOT placed on a node without it, because every cold start there would fail with NODE_RUNTIME_MISSING.",
+                "Bake wasmer into a node's guest image (hive_wasmer_in_rootfs) or install the wasmer CLI on a mock/litebox node, then redeploy."
+            );
+            log(msg.clone());
+            tracing::warn!(project = %project, capable_nodes, "deploy refused: wasmer requested, no wasm-capable target");
+            return Err(anyhow::anyhow!(msg));
+        }
         // #3: surface the auto-chosen region(s) in Function Settings — when a
         // project has none configured (new project), persist where the scheduler
         // placed it so the dashboard shows that region pre-selected/checked.
