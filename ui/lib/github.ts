@@ -223,14 +223,22 @@ export async function createRepo(
 async function resolveWriterToken(
   owner: string,
   repo: string
-): Promise<{ token?: string; appError?: string }> {
+): Promise<{
+  token?: string;
+  /** WHICH credential produced the token — reported in write failures, because
+   *  "Resource not accessible by integration" means very different things for a
+   *  browser cookie (possibly minted against a previous App) than for the App's
+   *  own installation token, and the remedies differ accordingly. */
+  via?: "user-token" | "installation";
+  appError?: string;
+}> {
   const userToken = await getGithubAppToken();
-  if (userToken) return { token: userToken };
+  if (userToken) return { token: userToken, via: "user-token" };
   if (!installationAuthConfigured()) return {};
   const r = await installationTokenForRepo(owner, repo);
   if (r.ok) {
     return r.token
-      ? { token: r.token }
+      ? { token: r.token, via: "installation" }
       : { appError: `GitHub App is not installed on ${owner}/${repo} — no installation token available` };
   }
   return { appError: r.error };
@@ -273,9 +281,72 @@ export async function commitFiles(
     managedPrefixes?: string[];
   }
 ): Promise<CommitResult> {
-  const { token, appError } = await resolveWriterToken(opts.owner, opts.repo);
-  if (token) return rest.ghCommitFiles(token, opts);
+  const { token, via, appError } = await resolveWriterToken(opts.owner, opts.repo);
+  if (token) {
+    const r = await rest.ghCommitFiles(token, opts);
+    return r.ok ? r : { ...r, error: await explainWriteFailure(r.error, opts.owner, opts.repo, via) };
+  }
   return writerFallback(await composio.commitFiles(entity, opts), appError);
+}
+
+/**
+ * Turn GitHub's opaque write refusals into something an operator can act on.
+ *
+ * "Resource not accessible by integration" is the single most confusing error
+ * this integration can produce: it is what GitHub returns for BOTH "the App
+ * lacks a permission" and "this credential cannot reach that repository at
+ * all", and passed through raw it names neither the repo nor the credential,
+ * so it reads as a platform bug. Every write path here therefore says WHICH
+ * repo, WHICH credential was used, and — crucially — whether the App is even
+ * installed on that owner, which is the usual answer once permissions are
+ * granted (an App installed on one account simply cannot see another account's
+ * or an org's repos, and a browser cookie minted against a PREVIOUS App is
+ * valid-looking but reaches nothing under the current one).
+ *
+ * Best-effort and never throws: a diagnosis that fails must not replace a real
+ * error with its own.
+ */
+async function explainWriteFailure(
+  raw: string | undefined,
+  owner: string,
+  repo: string,
+  via: "user-token" | "installation" | undefined
+): Promise<string> {
+  const base = raw || "write failed";
+  if (!/not accessible by integration|Resource not accessible|404|Not Found/i.test(base)) {
+    return `${base} (repo ${owner}/${repo}, credential: ${via ?? "unknown"})`;
+  }
+  let installedOn = "";
+  try {
+    if (installationAuthConfigured()) {
+      const inst = await listAppInstallations();
+      if (inst.ok) {
+        const accounts = inst.installations
+          .map((i) => i.account_login)
+          .filter((l): l is string => !!l);
+        installedOn = accounts.length
+          ? `The App is installed on: ${accounts.join(", ")}.`
+          : "The App is not installed on ANY account yet.";
+        if (accounts.length && !accounts.some((a) => a.toLowerCase() === owner.toLowerCase())) {
+          installedOn += ` It is NOT installed on "${owner}", which is why this write was refused.`;
+        }
+      }
+    }
+  } catch {
+    /* diagnosis is best-effort */
+  }
+  const hint =
+    via === "user-token"
+      ? "This used your browser's GitHub authorization; if you recently switched GitHub Apps, sign out and reconnect GitHub so the token is minted against the current App."
+      : "This used the App's own installation credential.";
+  return [
+    `GitHub refused the write to ${owner}/${repo}: ${base}.`,
+    installedOn,
+    hint,
+    "Install the App on that account/org, or choose a repository it can reach.",
+  ]
+    .filter(Boolean)
+    .join(" ");
 }
 
 export async function createRepoWebhook(
@@ -285,8 +356,11 @@ export async function createRepoWebhook(
   url: string,
   secret?: string
 ): Promise<{ ok: boolean; error?: string }> {
-  const { token, appError } = await resolveWriterToken(owner, repo);
-  if (token) return rest.ghCreateWebhook(token, owner, repo, url, secret);
+  const { token, via, appError } = await resolveWriterToken(owner, repo);
+  if (token) {
+    const r = await rest.ghCreateWebhook(token, owner, repo, url, secret);
+    return r.ok ? r : { ...r, error: await explainWriteFailure(r.error, owner, repo, via) };
+  }
   return writerFallback(await composio.createRepoWebhook(entity, owner, repo, url, secret), appError);
 }
 
@@ -297,8 +371,11 @@ export async function setRepoVariable(
   name: string,
   value: string
 ): Promise<{ ok: boolean; error?: string }> {
-  const { token, appError } = await resolveWriterToken(owner, repo);
-  if (token) return rest.ghSetRepoVariable(token, owner, repo, name, value);
+  const { token, via, appError } = await resolveWriterToken(owner, repo);
+  if (token) {
+    const r = await rest.ghSetRepoVariable(token, owner, repo, name, value);
+    return r.ok ? r : { ...r, error: await explainWriteFailure(r.error, owner, repo, via) };
+  }
   return writerFallback(await composio.setRepoVariable(entity, owner, repo, name, value), appError);
 }
 
