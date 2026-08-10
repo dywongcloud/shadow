@@ -36,7 +36,11 @@ cd "$REPO_ROOT/ansible"
 report() {
   for k in vault_github_app_client_id vault_github_app_client_secret \
            vault_github_app_id vault_github_app_redirect_uri "$KEYVAR"; do
-    v=$(ansible-vault view "$VAULT" 2>/dev/null | grep -E "^$k:" | sed -E "s/^$k:[[:space:]]*//" | tr -d '"')
+    # Strip BOTH quote styles: this script writes single-quoted YAML (double
+    # quotes would interpret the key's `\n` escapes), so a `"`-only strip
+    # reported every value as 2 chars longer than it is — cosmetic, but it makes
+    # a correct vault look wrong at exactly the moment you are checking it.
+    v=$(ansible-vault view "$VAULT" 2>/dev/null | grep -E "^$k:" | sed -E "s/^$k:[[:space:]]*//" | sed -E "s/^['\"](.*)['\"]$/\1/")
     if [ -z "$v" ]; then printf '  %-32s EMPTY\n' "$k"; else printf '  %-32s SET (%d chars)\n' "$k" "${#v}"; fi
   done
 }
