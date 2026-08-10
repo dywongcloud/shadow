@@ -1,0 +1,25 @@
+---
+# gVisor (runsc) — the container runtime the fleet runs under
+# (HIVE_CONTAINER_RUNTIME=runsc), pinned rather than tracked.
+#
+# WHY PINNED: this role used to fetch `release/latest` with no checksum. Because
+# `get_url` does not re-download when `dest` already exists, every node froze at
+# whatever `latest` meant on the day it was provisioned and no converge could
+# move it — which is exactly the spread measured across the fleet
+# (release-20260622.0 / 20260721.0 / 20260727.0 on different nodes, for a
+# security-critical sandbox, with nothing recording why). A mutable URL also
+# means nobody can say which bytes a converge will install.
+#
+# TO BUMP: change `hive_runsc_version`, then replace the matching checksum with
+# gVisor's own published one for that release:
+#   curl -s https://storage.googleapis.com/gvisor/releases/release/<ver>/<arch>/runsc.sha512
+# The install task sets `force: true`, so a version change actually reinstalls;
+# the checksum is what makes that safe.
+hive_runsc_version: "20260727.0"
+
+# Keyed by `ansible_architecture` so an aarch64 node cannot silently install an
+# x86_64 binary whose checksum would then fail confusingly. Add the arch here
+# before adding a node of that arch — an unlisted arch fails the task loudly,
+# which is the correct direction for a sandbox binary.
+hive_runsc_sha512:
+  x86_64: "ab99ea1b0e2d169ec95473ea6c44abdac9b6b63d9c483f898487fd2b3c32d63bfa9ea104a3d5eed217b90cfc880ceb7a1130a9f7daef6e50656b6e028a8f52e3"

@@ -261,11 +261,28 @@
 # container/DB deployment fails at launch -- discovered live on a fresh node
 # that had the runsc env set but no gVisor binary. Install + register it with
 # podman so the runsc runtime the node is configured for actually exists.
+# PINNED + CHECKSUMMED, and both halves matter. This used to fetch
+# `release/latest` with no checksum, which is precisely the mechanism that
+# produced the observed fleet spread (runsc release-20260622.0 through
+# 20260727.0 across nodes): `get_url` does NOT re-download when `dest` already
+# exists, so each node froze at whatever `latest` happened to mean on its
+# provisioning day and no converge could ever move it — drifting apart on the
+# way in, and unupdatable afterwards. A mutable URL also means the bytes a
+# converge installs are not the bytes anyone reviewed.
+#
+# `hive_runsc_version` is the single place to bump it; the checksum is
+# gVisor's own published `runsc.sha512` for that exact release, so a wrong or
+# tampered download fails the task instead of becoming this node's container
+# runtime. Bumping the version alone will NOT reinstall over an existing
+# binary (same `get_url` semantics) — `force: true` is set so a version change
+# actually lands, and the checksum is what makes that safe.
 - name: Install gVisor runsc (the container runtime the fleet's HIVE_CONTAINER_RUNTIME=runsc needs)
   ansible.builtin.get_url:
-    url: "https://storage.googleapis.com/gvisor/releases/release/latest/{{ ansible_architecture }}/runsc"
+    url: "https://storage.googleapis.com/gvisor/releases/release/{{ hive_runsc_version }}/{{ ansible_architecture }}/runsc"
     dest: /usr/local/bin/runsc
     mode: "0755"
+    force: true
+    checksum: "sha512:{{ hive_runsc_sha512[ansible_architecture] }}"
 
 - name: Register runsc as a podman runtime
   ansible.builtin.blockinfile:
