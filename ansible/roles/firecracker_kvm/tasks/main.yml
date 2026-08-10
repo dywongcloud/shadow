@@ -161,3 +161,25 @@
           missing — the node would boot advertising no wasm capability. Check
           the build output before retrying.
       when: not hive_wasmer_marker.stat.exists
+
+    # The marker on disk is not the advertised capability. `hive-node` gossips
+    # `NodeInfo::wasm_runtime`, and a build predating the refresh loop probes it
+    # ONCE at boot — so on such a binary the bake completes, ansible reports
+    # `changed`, the assertion above passes, and the node still advertises
+    # `false` forever with nothing saying "restart me". Newer builds re-probe on
+    # the disk-refresh tick and pick it up within ~30s on their own; the restart
+    # makes the bake land immediately and correctly on BOTH, which matters
+    # because this role has no way to know which binary the node is running.
+    - name: Restart hive-node so the capability probe re-runs
+      ansible.builtin.systemd:
+        name: hive-node
+        state: restarted
+
+    - name: Wait for hive-node to come back healthy after the restart
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8786/healthz
+        status_code: 200
+      register: hive_wasmer_health
+      retries: 30
+      delay: 2
+      until: hive_wasmer_health.status is defined and hive_wasmer_health.status == 200

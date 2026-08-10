@@ -477,6 +477,27 @@ impl NodeRegistry {
         me.gpu_free_mb = gpu_free_mb;
     }
 
+    /// Refresh whether this node can execute `Runtime::Wasmer` functions.
+    ///
+    /// Refreshed on a timer, not only at boot, because the underlying fact moves
+    /// UNDER a running process in both directions and each direction is a real
+    /// fault. Baking wasmer into the guest rootfs writes the capability marker
+    /// while `hive-node` keeps running, so a boot-only value left the node
+    /// advertising `false` after a successful bake — the operator sees ansible
+    /// report `changed`, the marker assertion pass, and every Wasmer deployment
+    /// still refused, with nothing anywhere saying "restart me". The reverse is
+    /// worse: any later `build-rootfs.sh` run WITHOUT `WASMER_TARBALL` (a
+    /// re-provision, a base-image refresh) removes the marker, and a boot-only
+    /// value would keep advertising `true` for an image whose guest no longer has
+    /// the binary — placement then routes Wasmer work to a node that can only
+    /// fail it, which is precisely the blocker the capability gate exists to
+    /// prevent. The probe is one `Path::exists()` on firecracker and a PATH scan
+    /// otherwise, so re-running it on the existing refresh tick costs nothing.
+    pub fn set_self_wasm_runtime(&self, wasm_runtime: Option<bool>) {
+        let mut me = self.me.write();
+        me.wasm_runtime = wasm_runtime;
+    }
+
     /// Refresh this node's restart-audit counters (see `hive-cloud`'s
     /// `restart_audit`). Refreshed on a timer, not only at boot, because the
     /// 24h window slides: a node that OOMed 25 hours ago must stop advertising

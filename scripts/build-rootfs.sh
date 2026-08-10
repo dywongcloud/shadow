@@ -43,11 +43,32 @@ WORK="$(mktemp -d)"
 MNT="$WORK/mnt"
 mkdir -p "$MNT"
 
-echo ">> creating ${SIZE_MIB}MiB ext4 at $OUT"
-dd if=/dev/zero of="$OUT" bs=1M count="$SIZE_MIB" status=none
-mkfs.ext4 -F -q "$OUT"
-sudo mount -o loop "$OUT" "$MNT"
-trap 'sudo umount "$MNT" 2>/dev/null || true; docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
+# BUILD ASIDE, THEN RENAME. Never dd/mkfs over $OUT itself: on an already
+# provisioned node that path IS the live base image, and every cold start copies
+# it (`FirecrackerBackend::provision` -> reflink_or_copy(base, overlay)) with
+# only an existence check ahead of the copy — which `dd` satisfies the instant it
+# creates the file. Writing in place therefore gave a multi-minute window where
+# arriving cold starts copied a zeroed or half-populated filesystem, booted a
+# microVM with no /sbin/hive-cell-agent, never reached FunctionReady, and
+# surfaced as DEPLOYMENT_START_FAILED — telling the tenant to debug an entrypoint
+# that was perfectly correct. Already-RUNNING microVMs were unaffected (they hold
+# their own per-cell overlay), so the blast radius was precisely the cold starts
+# during the rebuild.
+#
+# `mv` within one directory is an atomic rename: a cold start either copies the
+# whole OLD image or the whole NEW one, never a torn one, and a copy already in
+# flight completes against the old inode. This is the same tmp+rename the
+# per-deployment path next door already uses (`deliver_build` writes
+# `<image>.ext4.tmp` then renames) — the base-image path simply never got it.
+OUT_TMP="${OUT}.tmp"
+echo ">> creating ${SIZE_MIB}MiB ext4 at $OUT_TMP (renamed onto $OUT at the end)"
+sudo rm -f "$OUT_TMP"
+dd if=/dev/zero of="$OUT_TMP" bs=1M count="$SIZE_MIB" status=none
+mkfs.ext4 -F -q "$OUT_TMP"
+sudo mount -o loop "$OUT_TMP" "$MNT"
+# Clean up the PARTIAL image on any failure — a half-built .tmp left behind
+# would otherwise be renamed by a later run that assumes it is complete.
+trap 'sudo umount "$MNT" 2>/dev/null || true; sudo rm -f "$OUT_TMP"; docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
 
 echo ">> unpacking container fs into image"
 docker export "$CID" | sudo tar -x -C "$MNT"
@@ -81,9 +102,16 @@ if [ -n "$WASMER_TARBALL" ]; then
 fi
 
 sudo umount "$MNT"
+# THE ONLY MOMENT THE LIVE BASE CHANGES, and it changes in one atomic step.
+# Everything above built $OUT_TMP; a cold start racing this rename copies either
+# the whole old image or the whole new one.
+sudo mv -f "$OUT_TMP" "$OUT"
 trap 'docker rm -f "$CID" >/dev/null 2>&1 || true; rm -rf "$WORK"' EXIT
-# Write the capability marker only AFTER a clean unmount, so a failed build
-# never leaves a node advertising a capability its image does not have.
+# Marker LAST — after the clean unmount AND after the image is actually in
+# place. `$MARKER` was removed up front, so a build that dies anywhere between
+# leaves the node advertising NO wasm capability, which is the safe direction:
+# placement simply skips it instead of routing Wasmer work to an image that
+# never got the binary.
 if [ -n "$WASMER_TARBALL" ]; then
   printf '%s\n' "$WVER" | sudo tee "$MARKER" >/dev/null
   echo ">> wrote capability marker: $MARKER"

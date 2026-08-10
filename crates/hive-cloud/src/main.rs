@@ -1252,7 +1252,7 @@ async fn main() -> anyhow::Result<()> {
     // between this pair, etc). See `spawn_anti_entropy_loop`'s doc comment.
     spawn_anti_entropy_loop(cloud.clone());
     spawn_geo_refresh(cloud.registry.clone());
-    spawn_disk_refresh(cloud.registry.clone());
+    spawn_disk_refresh(cloud.registry.clone(), backend_name.clone());
     spawn_memory_pressure_alarm();
 
     // Billing meter loop: periodically converts measured fleet compute usage into
@@ -2416,19 +2416,30 @@ fn resolve_public_ip(detected: Option<String>) -> Option<String> {
 ///
 /// Cheap by construction: one `statvfs`-class read per tick, no CPU sampling.
 /// `HIVE_DISK_REFRESH_SECS` (default 30) tunes it; 0 disables.
-fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>) {
+fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>, backend_name: String) {
     let interval = Duration::from_secs(env_u64("HIVE_DISK_REFRESH_SECS", 30));
     if interval.is_zero() {
         return;
     }
     crate::supervise::spawn_supervised("disk-refresh", move || {
         let registry = registry.clone();
+        let backend_name = backend_name.clone();
         async move {
             loop {
                 tokio::time::sleep(interval).await;
                 crate::supervise::beat("disk-refresh");
                 registry.set_self_disk_free(crate::resources::disk_free_gb());
                 registry.set_self_gpu_free(crate::resources::measured_gpu_free_mb());
+                // Same tick, same reason: the wasm capability moves UNDER a
+                // running process in both directions. Baking wasmer into the
+                // guest rootfs writes the marker while this process keeps
+                // running (so a boot-only value stays false after a successful
+                // bake and every Wasmer deploy is still refused), and a later
+                // rootfs rebuild WITHOUT wasmer removes it (so a boot-only value
+                // keeps claiming true for an image that lost the binary, which
+                // routes Wasmer work onto a node that can only fail it). One
+                // Path::exists() on firecracker, a PATH scan elsewhere.
+                registry.set_self_wasm_runtime(crate::resources::detect_wasm_runtime(&backend_name));
                 // Same tick, same reason as the disk figure: the restart
                 // audit's 24h window SLIDES, so a boot-time-only value goes
                 // stale in the direction that matters (a node keeps

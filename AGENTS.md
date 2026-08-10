@@ -370,9 +370,20 @@ releases).
   deadline check letting one slow `connect()` blow the whole budget — see
   `crates/hive-backend/src/litebox.rs`'s module doc and git history for the
   fixes; two of these are general hazards for any process this crate spawns
-  over a real network path, not litebox-specific. `HIVE_LITEBOX_VERIFIED=1`
-  is STILL not set on any node — enabling it for real tenant traffic is a
-  separate, deliberate decision from proving the mechanism works.
+  over a real network path, not litebox-specific. **`HIVE_LITEBOX_VERIFIED=1`
+  IS now set on fc-frankfurt, which serves the `frankfurt` region on
+  `backend=litebox` with real tenant traffic** (live registry, 2026-08-09).
+  That was the deliberate decision this paragraph used to say was still
+  pending, and three consequences follow from it that are easy to miss.
+  (1) The flag exists only as an out-of-band systemd drop-in:
+  `ansible/roles/litebox/defaults/main.yml` still declares
+  `litebox_verified: false`, so re-running that role SILENTLY DOWNGRADES the
+  node to `MockBackend` — a backend swap no one asked for, on a node carrying
+  traffic. (2) Nothing a tenant or operator reads discloses the isolation
+  tier, while placement's region widening is what puts work there. (3)
+  `LiteboxBackend` emits no `hive_core::fault` markers, so every node fault
+  on that node publishes `CAPACITY_EXHAUSTED` — the misattribution the
+  fault-marker contract exists to prevent. Treat all three as open.
 - **Security posture is honest, not oversold, and must stay that way.**
   Litebox measurably beats `MockBackend` (seccomp-bpf denies non-allowlisted
   syscalls at the real kernel boundary; mock has none) but is NOT
@@ -430,6 +441,53 @@ releases).
   SYN-proxies, so a closed port reads OPEN. Witnessed: a laptop reported
   hk:3340 open while every fleet vantage correctly reported it unreachable.
   Probe from a fleet node, always.
+
+## Wasmer runtime & node capability gating
+
+- **A runtime is only usable where its interpreter exists, and "where" is
+  backend-specific.** `Runtime::Wasmer` (opt in with `runtime: "wasmer"`;
+  the build finds `server.wasm`/`app.wasm`/`main.wasm` or a single root
+  `*.wasm`, verifies the `\0asm` magic, and emits
+  `wasmer run --net --forward-host-env <entry>.wasm`) needs no dedicated
+  `CellBackend` — but it does need the binary on the filesystem the cell
+  actually execs against, and those differ: Mock/Litebox spawn on the HOST,
+  while Firecracker's `hive-cell-agent` is PID1 INSIDE the microVM and execs
+  against the GUEST rootfs. The first cut shipped wasmer to the host on an
+  all-Firecracker fleet — every placement was onto a node guaranteed to
+  ENOENT on every cold start, and the tenant was told to debug their app.
+- **Capability is PROBED and ADVERTISED, never assumed.**
+  `resources::detect_wasm_runtime` is backend-aware (stats
+  `<image>.wasmer` next to the rootfs on firecracker — mounting an ext4 at
+  boot would need root and a loop device — and scans the host PATH
+  otherwise); it rides `NodeInfo::wasm_runtime` and is re-probed on the
+  disk-refresh tick, NOT only at boot, because the fact moves under a running
+  process in both directions: a bake writes the marker while the node runs,
+  and a later rootfs rebuild without wasmer removes it.
+- **`None` here means NOT CAPABLE, deliberately unlike `disk_free_gb == 0` /
+  `gpu_free_mb == None`.** An unknown disk may still have space, so admitting
+  costs one failed start; a peer not reporting this field is running a binary
+  predating the runtime on a rootfs built before wasmer existed — known
+  incapable. `schedule::wasm_capable` is ONE predicate used by both `place`
+  and `place_for_project`'s lease-stickiness path, so stickiness cannot pin a
+  redeploy to a node the filter would reject.
+- **A missing runtime is a NODE fault.** `fault::NODE_RUNTIME_MISSING` →
+  `FailureClass::NodeRuntimeMissing` (503), classified BEFORE the circuit arm
+  for the same reason `NODE_IMAGE_MISSING` is: both markers ride the same
+  error string and only this one names an operator remedy. Preflights exist
+  on BOTH exec paths (mock host spawn, cell-agent guest spawn) so the failure
+  is never a bare ENOENT.
+- **The rootfs bake is an operator decision, not a converge.**
+  `hive_wasmer_in_rootfs` is opt-in and REBUILDS `default.ext4` — the image
+  every microVM on the node boots from. `build-rootfs.sh` builds to `.tmp`
+  and atomically renames (running microVMs hold their own overlay and are
+  safe; before the rename an in-flight cold start could copy a zeroed image
+  and surface as `DEPLOYMENT_START_FAILED`, blaming the tenant). The
+  `creates:` guard is the MARKER, never the image — guarding on the image
+  makes the task permanently inert on an already-provisioned node.
+- **`hive-cell-agent` is a SEPARATE binary that only reaches a guest through a
+  rootfs rebuild.** The fleet rollout builds it, but shipping the hive-cloud
+  binary does NOT deliver agent-side changes; they land on the next
+  `build-rootfs.sh`. Anything written in the agent is unshipped until then.
 
 ## Serverless GPU
 

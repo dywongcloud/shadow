@@ -67,9 +67,22 @@
   ansible.builtin.set_fact:
     hive_pre_deploy_sha: "{{ _pre_build.stat.checksum | default('') }}"
 
-- name: Build hive-cloud (release) on the group's build host
+# `-p hive-cell-agent` alongside hive-cloud: the agent is the guest's PID1 and
+# is a SEPARATE binary that this rollout previously never built, so agent-side
+# code could be committed, merged and "rolled out" while no node had it — the
+# guest-side NODE_RUNTIME_MISSING preflight added for the Wasmer runtime shipped
+# exactly that way, compiled and undelivered. The role next door already names
+# this gap ("add `-p hive-cell-agent` to hive_platform's build task if you need
+# it here").
+#
+# Building it does not by itself reach a running guest: the agent is baked INTO
+# the rootfs image, so it lands only on the next `build-rootfs.sh` run, which
+# reads it from AGENT_BIN=/usr/local/bin/hive-cell-agent. Building + installing
+# it here is what makes that rebuild pick up CURRENT code instead of whatever
+# bootstrap-guest.sh happened to compile at node bring-up.
+- name: Build hive-cloud + hive-cell-agent (release) on the group's build host
   ansible.builtin.command:
-    cmd: cargo build --release -p hive-cloud
+    cmd: cargo build --release -p hive-cloud -p hive-cell-agent
     chdir: "{{ hive_src_dir }}"
   environment:
     PATH: "{{ ansible_env.HOME }}/.cargo/bin:{{ ansible_env.PATH }}"
