@@ -1,7 +1,22 @@
 ---
 # Vars specific to hosts with REAL hardware /dev/kvm (bare metal, or a cloud
 # VM with nested virtualization enabled). See roles/firecracker_kvm.
-firecracker_version: "v1.13.0"
+# v1.16.1 is the newest UPSTREAM stable release and is outside both known
+# advisories. The previous pin here was v1.13.0, which sits inside BOTH,
+# confirmed against GitHub's own advisory data rather than a headline:
+#   CVE-2026-5747 (HIGH, virtio-pci OOB write, guest->host RCE — the escape a
+#     multi-tenant host most needs not to have): vulnerable ">=1.13.0, <=1.14.3,
+#     1.15.0", patched 1.14.4 / 1.15.1.
+#   CVE-2026-1386 (MEDIUM, jailer symlink -> arbitrary host file overwrite):
+#     vulnerable "< v1.13.1", patched v1.13.2.
+# bkk and hk currently RUN v1.17.0-dev, which is not an upstream release tag at
+# all (it is the DecOperations/firecracker-next fork build) and so was never
+# fetchable from the URL this var feeds — the pin and reality had silently
+# diverged, and the install task's `copy` clobbers on checksum difference, so a
+# converge would have DOWNGRADED both nodes onto the vulnerable build with
+# nothing louder than a `changed` line. The assert added alongside this in
+# roles/firecracker_kvm/tasks/main.yml now refuses that downgrade outright.
+firecracker_version: "v1.16.1"
 firecracker_arch: "x86_64"     # or aarch64
 firecracker_kernel_url: "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.12/{{ firecracker_arch }}/vmlinux-6.1.128"
 hive_container_runtime: "runc"
