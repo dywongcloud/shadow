@@ -282,8 +282,28 @@ impl Default for LiteboxConfig {
             .unwrap_or_else(|_| PathBuf::from("/usr/local/bin/litebox-runner"));
         LiteboxConfig {
             runner_bin,
+            // `root` is per-cell RUNTIME scratch, recreated on every provision
+            // and removed on terminate — temp is correct for it.
             root: std::env::temp_dir().join("hive-litebox-cells"),
-            cache_root: std::env::temp_dir().join("hive-litebox-cache"),
+            // `cache_root` is NOT scratch: it holds the DELIVERED build tar,
+            // the one artifact `start_function` cannot run without
+            // (`ensure_combined_tar` bails when it is missing). Under
+            // `temp_dir()` a reboot or a tmp sweep deletes it while the
+            // replicated deployment RECORD survives, so the node then refuses
+            // to start a deployment it still believes it hosts — the exact
+            // failure AGENTS.md records for `git::deploy_root()`, which was
+            // moved off `$TMPDIR` for this reason after it 404'd a live
+            // deployment. Same rule, same fix: durable by default, under the
+            // node's data dir alongside firecracker's `/var/lib/hive/rootfs`,
+            // with an env override for local dev.
+            cache_root: std::env::var("HIVE_LITEBOX_CACHE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    PathBuf::from(
+                        std::env::var("HIVE_DATA").unwrap_or_else(|_| "/var/lib/hive".to_string()),
+                    )
+                    .join("litebox-cache")
+                }),
             provision_latency: Duration::from_millis(0),
         }
     }

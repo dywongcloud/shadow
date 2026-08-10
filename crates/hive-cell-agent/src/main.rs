@@ -514,8 +514,26 @@ mod linux {
         let _child = cmd.spawn()?;
 
         // Wait for the function to bind its port.
+        //
+        // RUNTIME-AWARE, because 30s is not a neutral number for every runtime.
+        // A Wasmer guest compiles its whole module ahead-of-time (Cranelift)
+        // before it can listen, and on THIS backend that is always a cache MISS:
+        // every provision copies a fresh per-cell overlay from the base image
+        // and terminate discards it, so wasmer's on-disk artifact cache never
+        // survives to a second start. The ~40ms cold start measured for this
+        // runtime elsewhere was a cache HIT and says nothing about the first
+        // compile of a real module. The mock backend already gives wasm the
+        // longer budget for exactly this reason; the guest had no such branch,
+        // so a slow compile timed out, the agent reported FunctionError, and the
+        // gateway published DEPLOYMENT_START_FAILED — telling the tenant to
+        // debug an app that was merely still compiling, while the pool's
+        // crash-loop circuit opened against it.
         let fport = launch.port;
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let ready_secs = match launch.runtime {
+            hive_core::Runtime::Wasmer => 60,
+            _ => 30,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(ready_secs);
         loop {
             if TcpStream::connect(("127.0.0.1", fport)).is_ok() {
                 break;

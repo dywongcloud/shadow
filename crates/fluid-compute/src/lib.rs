@@ -639,6 +639,18 @@ impl Fluid {
         self.backend.name()
     }
 
+    /// Where the active backend expects a DELIVERED build to appear inside a
+    /// cell, or `None` when its cells read the host build dir directly.
+    ///
+    /// This is the honest test for "does this backend need `deliver_build` to
+    /// run", and callers should branch on it rather than on `backend_name()`.
+    /// A name comparison silently excludes any backend added later: gating
+    /// delivery on `== "firecracker"` made the whole delivery step dead for
+    /// LiteboxBackend, whose `start_function` hard-requires the artifact.
+    pub fn delivered_workdir(&self) -> Option<&'static str> {
+        self.backend.delivered_workdir()
+    }
+
     /// Make a built deployment available to the cells that will serve it (see
     /// [`hive_backend::CellBackend::deliver_build`]). No-op for same-host backends.
     pub async fn deliver_build(

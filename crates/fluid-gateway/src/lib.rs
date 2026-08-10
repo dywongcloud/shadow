@@ -362,6 +362,14 @@ impl Gateway {
         self.fluid.backend_name()
     }
 
+    /// Where the active backend expects a DELIVERED build inside a cell, or
+    /// `None` when its cells read the host build dir directly. Branch on THIS,
+    /// not on `backend_name()`, to decide whether `deliver_build` must run — a
+    /// name comparison silently excludes any backend added later.
+    pub fn delivered_workdir(&self) -> Option<&'static str> {
+        self.fluid.delivered_workdir()
+    }
+
     /// Pack a built deployment's output so the serving cells can reach it (only
     /// meaningful for an isolated backend; a no-op for the same-host mock).
     pub async fn deliver_build(

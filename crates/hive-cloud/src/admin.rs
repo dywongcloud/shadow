@@ -4398,6 +4398,38 @@ async fn git_webhook(
         match &secret {
             Some(s) => {
                 if !verify_github_sig(s.as_bytes(), &body, sig) {
+                    // WARN, because this rejection used to be completely silent
+                    // and it has two very different causes that look identical
+                    // from outside: a forged/replayed delivery (correctly
+                    // refused, nothing to do) or a SECRET MISMATCH between the
+                    // UI that installed the hook and the backend that verifies
+                    // it — under which every real GitHub delivery is dropped and
+                    // auto-deploy is dead platform-wide, with no log, no event
+                    // and no incident to notice it by. The repo/event context is
+                    // what lets an operator tell the two apart: a mismatch shows
+                    // a steady stream from THEIR OWN repos.
+                    let repo = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("repository")
+                                .and_then(|r| r.get("full_name"))
+                                .and_then(|n| n.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_default();
+                    let event = headers
+                        .get("x-github-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("");
+                    tracing::warn!(
+                        repo = %repo,
+                        event = %event,
+                        "webhook REJECTED: HMAC signature did not verify. Either a forged \
+                         delivery, or GITHUB_WEBHOOK_SECRET differs between the UI that \
+                         installed this hook and this backend — in which case every genuine \
+                         delivery is being dropped and git auto-deploy is inert. Compare the \
+                         value both halves read (the RUNNING process env, not the unit file)."
+                    );
                     return Err((StatusCode::UNAUTHORIZED, "bad signature".into()));
                 }
             }

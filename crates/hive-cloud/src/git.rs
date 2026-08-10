@@ -2414,22 +2414,47 @@ async fn run_build(
         }
     }
 
-    // For an isolated backend (Firecracker), a serving microVM cannot see the
-    // host build dir the mock backend serves from. Pack the build output into a
-    // per-deployment artifact the cell mounts at /build, and point this
-    // deployment's function pool at that image. No-op for the same-host mock.
-    // SKIP for containers: they serve from the OCI image (podman), not a microVM
-    // data disk, so there's nothing to deliver.
-    if !build_failed && !is_container && cloud.gw.backend_name() == "firecracker" {
+    // An ISOLATED backend cannot see the host build dir the mock backend serves
+    // from, so the build output has to be packed into a per-deployment artifact
+    // the cell reads instead, with the function pool pointed at that image.
+    //
+    // Gated on the backend's OWN declared capability, `delivered_workdir()`, not
+    // on its NAME. The name test hardcoded "firecracker", which silently made
+    // this whole block dead for LiteboxBackend — and litebox's `start_function`
+    // hard-requires it (`ensure_combined_tar` bails with "no delivered build
+    // staged for image …"), so a litebox node could not serve a non-container
+    // function deployment AT ALL. fc-frankfurt runs backend=litebox with real
+    // tenant traffic, which is exactly the node that could least afford it.
+    // `delivered_workdir()` is the right discriminator by construction: it is
+    // `Some` precisely for the backends whose cells cannot see the host build
+    // dir (firecracker's fixed guest path, litebox's "/"), and `None` for the
+    // same-host mock, which needs no delivery.
+    //
+    // SKIP for containers: they serve from the OCI image (podman), not from a
+    // delivered artifact, so there is nothing to deliver.
+    if !build_failed && !is_container && cloud.gw.delivered_workdir().is_some() {
         let image = format!("dpl-{}", sanitize_tag(bid));
         match cloud.gw.deliver_build(&image, &build_dir).await {
             Ok(()) => {
-                log("Delivered build output to a microVM image (Firecracker).".into());
+                log(format!(
+                    "Delivered build output to an isolated-cell image ({}).",
+                    cloud.gw.backend_name()
+                ));
                 manifest.image = Some(image);
             }
-            Err(e) => log(format!(
-                "WARN: could not deliver build to microVM ({e}); serving may fail."
-            )),
+            // Loud, and it FAILS the build. This used to be a WARN that let the
+            // deployment register as Ready with nothing delivered — on a backend
+            // that hard-requires the artifact, every cold start then failed with
+            // a message about a missing tar, long after the build said success.
+            // A deployment that cannot possibly start is a build failure.
+            Err(e) => {
+                let msg = format!(
+                    "could not deliver the build to an isolated cell image on backend {}: {e}",
+                    cloud.gw.backend_name()
+                );
+                log(format!("ERROR: {msg}"));
+                return Err(anyhow::anyhow!(msg));
+            }
         }
     }
 
@@ -6547,6 +6572,7 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
     let mut n_git = 0u32; // git-sourced projects actually polled this cycle
     let mut n_deployed = 0u32; // projects whose HEAD advanced -> build started
+    let mut n_skipped = 0u32; // git projects whose remote HEAD could not be read
     for project in projects {
         // Fleet-aware source; skip non-git (zip `upload://`, image `image://`)
         // and never-deployed / unbound projects.
@@ -6581,7 +6607,28 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
             Some(h) if !h.is_empty() => h,
             // Branch not found / remote unreachable / auth failure: skip this
             // cycle, retry next tick. Never treated as "no commit -> deploy".
-            _ => continue,
+            //
+            // WARN, not debug and not silent. This arm is the single point where
+            // "my pushes stopped deploying" becomes invisible: it swallows an
+            // auth failure identically to a renamed branch, and the fleet runs
+            // RUST_LOG=info so a debug line would not be read even if one
+            // existed (the function's own doc claimed one that was never
+            // written). The token-presence flag is the actionable half — with no
+            // App private key and no GITHUB_TOKEN on a node, EVERY private repo
+            // lands here forever, and without this line nothing anywhere says so.
+            _ => {
+                n_skipped += 1;
+                tracing::warn!(
+                    project = %project,
+                    branch = %branch,
+                    had_token = token.is_some(),
+                    "git poll: could not read the remote HEAD — branch missing, remote \
+                     unreachable, or auth failed. Auto-deploy for this project is INERT \
+                     until it resolves. A private repo with had_token=false has no \
+                     credential on this node (GitHub App private key or GITHUB_TOKEN)."
+                );
+                continue;
+            }
         };
 
         // Baseline: the in-memory last-seen SHA if we've observed this project
@@ -6675,11 +6722,24 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
         );
         n_deployed += 1;
     }
-    tracing::debug!(
-        git_projects = n_git,
-        deployed = n_deployed,
-        "git_poll: cycle complete"
-    );
+    // INFO when anything was skipped, so a fleet at RUST_LOG=info sees that
+    // auto-deploy is silently not running for some projects; debug otherwise, to
+    // keep a healthy cycle quiet.
+    if n_skipped > 0 {
+        tracing::info!(
+            git_projects = n_git,
+            deployed = n_deployed,
+            unreadable = n_skipped,
+            "git_poll: cycle complete — {n_skipped} project(s) could not be polled (see the \
+             per-project warnings above); auto-deploy is inert for those"
+        );
+    } else {
+        tracing::debug!(
+            git_projects = n_git,
+            deployed = n_deployed,
+            "git_poll: cycle complete"
+        );
+    }
 }
 
 /// True when two commit strings refer to the same commit, tolerant of one being
