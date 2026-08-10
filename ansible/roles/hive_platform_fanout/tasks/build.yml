@@ -106,8 +106,32 @@
   ansible.builtin.set_fact:
     hive_group_build_sha256: "{{ _sha.stdout.split(' ')[0] }}"
 
-- name: Fetch the canonical binary to the control host
+# COMPRESS BEFORE IT CROSSES THE OPERATOR'S UPLINK. Every byte of this rollout
+# goes through the control host twice — once down on this fetch, then once up
+# per target on the push — and both legs are the operator machine's own link.
+# push.yml's comment already names that as the residential-uplink problem
+# roll-backend-fleet.sh exists to avoid, and throttles the push half; the FETCH
+# half had no mitigation at all, and it is the half that hung: a ~117 MiB pull
+# from the Bangkok build host sat with the SSH session alive and zero bytes
+# landing for over an hour, twice, blocking the whole fleet rollout while the
+# Virginia build host's identical fetch completed fine.
+#
+# Measured, not assumed: gzip -6 on this binary is 3.91x (257 MiB -> 66 MiB on a
+# debug build; the release binary is ~117 MiB -> ~30 MiB). That is ~30 MiB down
+# and 6x~30 MiB up instead of 117 and 6x117 — the same 4x off both legs, for the
+# cost of a few seconds of CPU on hosts that just spent minutes compiling.
+#
+# The integrity check is UNCHANGED and still covers the real artifact:
+# `hive_group_build_sha256` is the sha of the UNCOMPRESSED binary, taken above,
+# and push.yml verifies it after decompressing on the target. So compression is
+# purely a transport concern and cannot mask a corrupted transfer.
+- name: Compress the canonical binary for transport (on the build host)
+  ansible.builtin.shell:
+    cmd: "gzip -6 -c {{ hive_binary_path }} > {{ hive_binary_path }}.gz"
+  changed_when: true
+
+- name: Fetch the COMPRESSED binary to the control host
   ansible.builtin.fetch:
-    src: "{{ hive_binary_path }}"
-    dest: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}"
+    src: "{{ hive_binary_path }}.gz"
+    dest: "{{ hive_artifact_root }}/hive-cloud-{{ hive_glibc_group }}.gz"
     flat: true
