@@ -82,6 +82,9 @@ export async function POST(req: NextRequest) {
     // The repo is linked but the platform state the tree is built from could
     // not be read — committing now would push a GUTTED scaffold (see the sync
     // route). Loud failure; the user can retry the sync once reads recover.
+    console.error(
+      `[gitops/init] refusing to commit a partial tree repo=${fullName} team=${team}: platform state unreadable (${failures.join(", ")})`
+    );
     return NextResponse.json(
       { ok: false, repo: fullName, created, error: `platform state unreadable (${failures.join(", ")}) — refusing to commit a partial config tree` },
       { status: 502 }
@@ -98,6 +101,15 @@ export async function POST(req: NextRequest) {
     managedPrefixes: ["projects/"],
   });
   if (!result.ok) {
+    // LOG IT, don't only return it. This route's failures were visible ONLY in
+    // the response body, so a browser console showed a bare
+    // `api/gitops/init:1 502` and the node's journal showed nothing at all —
+    // leaving neither the user nor an operator able to say why. GitOps setup is
+    // exactly the flow where the cause (which repo, which credential, whether
+    // the App can reach that owner) is the whole answer.
+    console.error(
+      `[gitops/init] commit failed repo=${fullName} branch=${branch} team=${team} created=${created}: ${result.error}`
+    );
     // The repo is still linked; report so the UI can show the error + retry sync.
     return NextResponse.json({ ok: false, repo: fullName, created, error: result.error }, { status: 502 });
   }
