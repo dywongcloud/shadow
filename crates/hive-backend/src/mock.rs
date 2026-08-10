@@ -571,7 +571,34 @@ impl CellBackend for MockBackend {
         }
 
         let mut cmd = Command::new(&func.start_cmd[0]);
-        cmd.args(&func.start_cmd[1..])
+        cmd
+            // CLEARED, NEVER INHERITED. `Command` inherits the parent's whole
+            // environment by default, so without this a tenant's function process
+            // received THIS NODE's env — `HIVE_SECRET_KEY` (the fleet-shared
+            // at-rest key), `HIVE_JWT_SECRET` and `HIVE_INTERNAL_TOKEN` (enough to
+            // mint platform sessions and speak to the internal admin surface AS
+            // the platform), and whatever else the unit sets.
+            //
+            // The "mock is dev-only" premise that made inheriting look acceptable
+            // is FALSE on this fleet: `fc-sanjose`, `fc-sanjose-cvm-1` and
+            // `fc-sanjose-cvm-2` all report `backend: "mock"` in the live node
+            // registry and are ordinary placement candidates carrying real tenant
+            // deployments, and the region catalog additionally advertises the
+            // mock-backed `los-angeles` region as publicly selectable.
+            //
+            // Both sibling backends already do exactly this and say why —
+            // `litebox.rs`'s `.env_clear()` ("would otherwise hand this node's own
+            // process secrets to sandboxed tenant code") and `hive-cell-agent`,
+            // which builds the guest env from nothing. Mock was the only path
+            // left leaking, and it is the one with the WEAKEST isolation, so it
+            // needed the guard most.
+            //
+            // Everything the function legitimately needs is set explicitly below
+            // (PORT/PATH/HOME + the deployment's own `func.env`), plus
+            // NODE_COMPILE_CACHE further down — so this removes only what a
+            // tenant was never entitled to read.
+            .env_clear()
+            .args(&func.start_cmd[1..])
             .current_dir(&workdir)
             .env("PORT", func.port.to_string())
             .env("PATH", path)

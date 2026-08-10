@@ -4366,9 +4366,32 @@ async fn git_webhook(
         .get("x-hub-signature-256")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let allow_unsigned = std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // The opt-in is honored ONLY while no secret is configured. Its documented
+    // purpose is legacy hooks installed before the signing secret existed, which
+    // carry no signature — that is a pre-secret condition by construction. Left
+    // ungated it did something far larger: with a secret configured and this flag
+    // set, an unsigned delivery was accepted, so an attacker did not need to forge
+    // a signature at all — merely OMIT the header — and signature verification
+    // became unreachable for anyone who bothered.
+    //
+    // That was live, not theoretical: an ansible-invisible drop-in
+    // (`hive-node.service.d/webhook-unsigned.conf`) set it on 10 of 14 fleet
+    // nodes, including the control-plane leader, while the main unit correctly
+    // configured a secret. A public unsigned POST to `/v1/git/webhook` on the
+    // round-robin host returned 200 while the same request WITH a bogus signature
+    // correctly returned 401 — i.e. presenting no credential beat presenting a
+    // wrong one, and the webhook clones and deploys attacker-named source into a
+    // victim project WITH that project's env injected.
+    //
+    // Gating on `secret.is_none()` keeps the escape hatch working for the case it
+    // was written for (genuine local/dev with no secret provisioned) and makes it
+    // inert everywhere the fleet has one. A legacy unsigned hook on a
+    // secret-configured node is now rejected with the existing message, which
+    // already names the remedy: reconnect GitHub to re-sign it.
+    let allow_unsigned = secret.is_none()
+        && std::env::var("GITHUB_WEBHOOK_ALLOW_UNSIGNED")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     if !sig.is_empty() {
         // Signed: verify against the secret. A signed delivery with no secret
         // configured can't be verified — accept only under the opt-in.
