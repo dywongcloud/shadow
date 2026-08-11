@@ -8769,6 +8769,25 @@ async fn database_create(
         require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &req.project)?;
     }
     let project = req.project.clone();
+    // Idempotency: provision() itself always mints a fresh id with no dedup
+    // check, so a client double-submit (double-click, a retry racing a slow
+    // response) silently created exact duplicate databases — witnessed live,
+    // three identical blob databases under one project, ~90s apart. A
+    // same-tenant, same-project, same-name, same-kind, non-error database
+    // already existing means this create is a retry of one that already
+    // landed: return that database (unmasked, so the caller still gets
+    // usable connection credentials) instead of minting another.
+    if let Some(existing_id) = c
+        .databases
+        .list(Some(&project))
+        .into_iter()
+        .find(|d| d.team == req.team && d.name == req.name && d.kind == req.kind && !matches!(d.status, crate::databases::DbStatus::Error))
+        .map(|d| d.id)
+    {
+        if let Some(existing) = c.databases.get_raw(&existing_id) {
+            return Ok(Json(json!(existing)));
+        }
+    }
     let db = crate::databases::provision(
         c.databases.clone(),
         c.region.clone(),
