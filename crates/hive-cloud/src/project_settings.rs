@@ -168,6 +168,46 @@ pub struct InferenceSpec {
     pub pool: bool,
 }
 
+/// Dashboard-managed configuration for a CONTAINER-runtime project (a
+/// single-Dockerfile deploy, not a compose service — compose already
+/// configures per-service via its own YAML) — the persisted equivalent of
+/// `git.rs`'s `fluid.json` `container` override block (`ContainerOverride`:
+/// same field set, same string formats for `memory`/`cpus`). Follows the
+/// `inference`/`browser_db` sync discipline exactly: an explicit fluid.json
+/// `container` block always wins over this on the next build; this is what
+/// lets a container project be configured from the dashboard alone with no
+/// git push. All fields optional — `None` means "use the platform default"
+/// for that one field, independent of the others.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContainerSettings {
+    /// The port the container listens on inside the image.
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Wire protocol: "http" (default), "tcp", "udp", or "grpc" — see
+    /// `fluid_core::ServiceProtocol`. Get this wrong (e.g. "udp" for a
+    /// TCP-only game server) and the deployment silently never becomes
+    /// reachable, even though it builds and runs successfully.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Memory ceiling, e.g. "4g", "2048m" — same format as `ContainerOverride::memory`.
+    #[serde(default)]
+    pub memory: Option<String>,
+    /// CPU quota, e.g. "2.0", "0.5" — same format as `ContainerOverride::cpus`.
+    #[serde(default)]
+    pub cpus: Option<String>,
+    /// Max-PIDs ceiling (fork-bomb guard) — same as `ContainerOverride::pids`.
+    #[serde(default)]
+    pub pids: Option<u32>,
+    /// Mount path for the automatic persistent volume INSIDE the container
+    /// (platform default: `/data`, see `container_volume_path()`). Lets a
+    /// project whose image expects data somewhere else (not every image
+    /// follows the `/data` convention `itzg/minecraft-server` uses) redirect
+    /// the durable volume without a node-wide `HIVE_CONTAINER_VOLUME_PATH`
+    /// override affecting every OTHER project on the node too.
+    #[serde(default)]
+    pub volume_mount_path: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
     #[serde(default)]
@@ -192,6 +232,14 @@ pub struct ProjectSettings {
     /// dashboard alone, with no git push required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_db: Option<fluid_core::BrowserDbPolicy>,
+    /// Dashboard-managed container config (port/protocol/resource ceilings +
+    /// volume mount path) for a container-runtime project. Only meaningful
+    /// when the project's current deployment actually runs a `container`
+    /// function — see [`ContainerSettings`]. Same `Option` discipline as
+    /// `inference`/`browser_db`: presence is the opt-in, an explicit
+    /// fluid.json `container` block always wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerSettings>,
     #[serde(default)]
     pub domains: Vec<String>,
     /// Team that owns this project (slug). Defaults to "personal".
@@ -267,6 +315,7 @@ impl Default for ProjectSettings {
             functions: FunctionSettings::default(),
             inference: None,
             browser_db: None,
+            container: None,
             domains: Vec::new(),
             team: default_team(),
             production_branch: String::new(),
@@ -384,6 +433,15 @@ impl ProjectStore {
     pub fn set_browser_db(&self, project: &str, spec: Option<fluid_core::BrowserDbPolicy>) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().browser_db = spec;
+    }
+
+    /// See [`ProjectSettings::container`]. `None` clears the dashboard-managed
+    /// config — it does not touch an explicit fluid.json `container` block,
+    /// which still wins on the next build (the `browser_db`/`set_browser_db`
+    /// precedent).
+    pub fn set_container(&self, project: &str, spec: Option<ContainerSettings>) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().container = spec;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {

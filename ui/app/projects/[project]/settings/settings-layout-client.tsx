@@ -5,8 +5,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { Triangle } from "@/components/ui";
 import { cn } from "@/lib/utils";
+import { usePoll, type Deployment } from "@/lib/api";
 
-const sections = [
+const baseSections = [
   { slug: "", label: "General" },
   { slug: "git", label: "Git" },
   { slug: "environment-variables", label: "Environment Variables" },
@@ -21,6 +22,14 @@ const sections = [
   { slug: "team", label: "Team & Privacy" },
 ];
 
+/** A function's `browser_ineligible` reason names "container" only for the
+ *  `runtime: "container"` case (see git.rs's build pipeline) — the list
+ *  endpoint carries no cleaner boolean, so this is the signal the dashboard
+ *  already has on hand without an extra request. */
+function isContainerDeployment(dep: Deployment | null | undefined): boolean {
+  return !!dep?.browser_ineligible?.some((b) => b.reason.includes("container"));
+}
+
 export function SettingsLayout(props: {
   children: React.ReactNode;
   paramsPromise: Promise<{ project: string }>;
@@ -32,6 +41,16 @@ export function SettingsLayout(props: {
   const pathname = usePathname();
   const name = decodeURIComponent(params.project);
   const base = `/projects/${encodeURIComponent(name)}/settings`;
+
+  // Only meaningful for a container-runtime project — a function/serverless
+  // project has no image, no volume, no port/protocol ceiling to configure
+  // here (that's already Functions + Network's job).
+  const { data: deps } = usePoll<Deployment[]>("/deployments", 10000);
+  const mine = (deps ?? []).filter((d) => d.project === name);
+  const dep = mine.find((d) => d.production) ?? mine.sort((a, b) => b.created_at_ms - a.created_at_ms)[0] ?? null;
+  const sections = isContainerDeployment(dep)
+    ? [...baseSections.slice(0, 5), { slug: "container", label: "Container" }, ...baseSections.slice(5)]
+    : baseSections;
 
   return (
     <div>

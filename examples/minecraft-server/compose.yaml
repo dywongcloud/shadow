@@ -1,0 +1,19 @@
+services:
+  mc:
+    image: itzg/minecraft-server:latest
+    pull_policy: daily
+    tty: true
+    stdin_open: true
+    ports:
+      # The `/tcp` suffix is required, not decorative: it's what tells the
+      # platform this is a raw TCP service (Minecraft speaks its own binary
+      # protocol, not HTTP) and gets it a real public port allocation. A bare
+      # "25565:25565" with no suffix is treated as an ordinary HTTP service
+      # and never gets a raw port at all -- see the README.
+      - "25565:25565/tcp"
+    environment:
+      EULA: "TRUE"
+    volumes:
+      # World data survives redeploys and container restarts -- see the
+      # README's "Persistence" section for exactly what this maps to.
+      - ./data:/data

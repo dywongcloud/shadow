@@ -72,12 +72,14 @@ pub struct ParsedService {
     pub env: BTreeMap<String, String>,
     /// Transport/application protocol for `port`, parsed from the compose port's
     /// `/tcp` or `/udp` short-syntax suffix (or the long-syntax `protocol:` key), e.g.
-    /// `"5432:5432/udp"` -> `Udp`. No suffix, or an explicit `/tcp`, both normalize to
+    /// `"5432:5432/udp"` -> `Udp`, `"25565:25565/tcp"` -> `Tcp`. No suffix normalizes to
     /// `Http` — Compose's implicit-default transport, and the pre-existing behavior for
-    /// the overwhelming common case (a web service listening HTTP-over-TCP). Only an
-    /// explicit `udp` component is unambiguous signal for the raw-splice proxy path
-    /// (`FunctionConfig::needs_raw_proxy`): a bare `/tcp` carries no extra information
-    /// since TCP is already Compose's default transport for an ordinary HTTP service.
+    /// the overwhelming common case (a web service listening HTTP-over-TCP). An explicit
+    /// `/tcp` is the ONLY way to declare a raw non-HTTP TCP service (Minecraft,
+    /// Postgres-wire, …) through plain compose `ports:` syntax — it must NOT collapse
+    /// into the same `Http` bucket as "unspecified", or nothing could ever opt into the
+    /// raw-splice proxy path (`FunctionConfig::needs_raw_proxy`) without the separate
+    /// `x-shadw-expose` extension.
     pub protocol: ServiceProtocol,
     /// Explicit opt-in for external routing when this service is NOT the primary
     /// entrypoint (`x-shadw-expose`). See [`ComposeExpose`]; default is internal-only.
@@ -223,11 +225,17 @@ fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)>
 /// Split a compose port string's optional transport suffix, e.g. `"5432:5432/udp"`
 /// -> (`"5432:5432"`, `Udp`). Mirrors the pre-existing `s.split('/').next()`
 /// stripping (any single `/`-delimited suffix), now CLASSIFYING it instead of
-/// silently discarding it: `udp` -> `Udp`; anything else (`tcp`, absent, or an
-/// unrecognized value) -> `Http`, Compose's implicit-default transport.
+/// silently discarding it: `udp` -> `Udp`, `tcp` -> `Tcp` (both explicit
+/// transport markers are equally unambiguous signal for the raw-splice proxy
+/// path — there is no other way to declare a non-HTTP TCP service, e.g.
+/// Minecraft/Postgres-wire, through plain compose `ports:` syntax, so an
+/// explicit `/tcp` must not collapse into the same bucket as "unspecified");
+/// no suffix (or any other unrecognized value) -> `Http`, Compose's
+/// implicit-default transport, unchanged.
 fn split_proto_suffix(s: &str) -> (&str, ServiceProtocol) {
     match s.split_once('/') {
         Some((bare, proto)) if proto.eq_ignore_ascii_case("udp") => (bare, ServiceProtocol::Udp),
+        Some((bare, proto)) if proto.eq_ignore_ascii_case("tcp") => (bare, ServiceProtocol::Tcp),
         Some((bare, _)) => (bare, ServiceProtocol::Http),
         None => (s, ServiceProtocol::Http),
     }

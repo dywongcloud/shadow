@@ -157,6 +157,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/browser-db",
             put(project_browser_db_put).delete(project_browser_db_delete),
         )
+        .route(
+            "/v1/projects/:project/container",
+            put(project_container_put).delete(project_container_delete),
+        )
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route(
@@ -775,6 +779,57 @@ async fn project_browser_db_delete(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_browser_db(&project, None);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `PUT /v1/projects/:project/container` — dashboard-managed container config
+/// (port/protocol/memory/cpus/pids/volume mount path) for a project running
+/// the `container` runtime. Same "settings apply going forward" contract as
+/// `project_browser_db_put`: this alone changes nothing already deployed —
+/// git.rs's produce_manifest merges it (fluid.json wins per-field) on the
+/// NEXT deploy; the caller follows a successful save with
+/// `/v1/projects/:project/redeploy` to apply it immediately, same as the
+/// browser-db flow.
+async fn project_container_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(spec): Json<crate::project_settings::ContainerSettings>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // A deploy-input boundary: an unparseable protocol string must 400 here
+    // with a clear message rather than silently falling back to "http" at
+    // build time, which is exactly the class of mistake that broke the
+    // 'minecwaft' project in production (protocol=udp on a TCP-only port,
+    // accepted with no complaint because nothing ever validated it).
+    if let Some(p) = &spec.protocol {
+        if p.parse::<fluid_core::ServiceProtocol>().is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("protocol {p:?} must be one of: http, tcp, udp, grpc"),
+            ));
+        }
+    }
+    c.projects.set_container(&project, Some(spec));
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `DELETE /v1/projects/:project/container` — clears the dashboard-managed
+/// config. Like `project_browser_db_delete`, this alone changes nothing
+/// already deployed; it stops the NEXT deploy from carrying it (unless
+/// fluid.json itself still declares a `container` block, which always wins
+/// per-field).
+async fn project_container_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_container(&project, None);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }

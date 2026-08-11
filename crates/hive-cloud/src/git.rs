@@ -3369,23 +3369,46 @@ async fn produce_manifest(
         let image = format!("hive-{}-{}", safe_project, &commit[..commit.len().min(7)]);
         // Railway-style overrides from an optional `fluid.json` { "container": {...} }:
         // explicit listen port + wire protocol (http/grpc/tcp/…). Falls back to the
-        // Dockerfile `EXPOSE`/`ENV PORT` (then 8080) and protocol "http".
+        // Dockerfile `EXPOSE`/`ENV PORT` (then 8080) and protocol "http". Per field,
+        // an explicit fluid.json value wins outright; where fluid.json leaves a field
+        // unset, the dashboard-managed `ProjectSettings::container` applies instead
+        // (the `inference`/`browser_db` precedent) — lets a container project be
+        // configured from the dashboard alone, no git push required.
         let ovr = match tokio::fs::read_to_string(dir.join("fluid.json")).await {
             Ok(s) => parse_container_override(&s),
             Err(_) => ContainerOverride::default(),
         };
-        let exposed = match ovr.port {
+        let settings = cloud.projects.get(project).container;
+        let exposed = match ovr.port.or_else(|| settings.as_ref().and_then(|s| s.port)) {
             Some(p) => p,
             None => parse_expose(&dockerfile).await.unwrap_or(8080),
         };
-        let protocol = ovr.protocol.unwrap_or_else(|| "http".to_string());
+        let protocol = ovr
+            .protocol
+            .or_else(|| settings.as_ref().and_then(|s| s.protocol.clone()))
+            .unwrap_or_else(|| "http".to_string());
         // Memory/cpus/pids ceilings: an explicit fluid.json `container.memory`/
-        // `cpus`/`pids`, else 0/0.0 = "use the node's generous default" (never
-        // the old hardcoded 512m that OOM-killed real monolith containers).
-        // These are baked into the manifest.
-        let mem_mib = ovr.memory.as_deref().map(parse_mem_mib).unwrap_or(0);
-        let cpus = ovr.cpus.as_deref().map(parse_cpus_quota).unwrap_or(0.0);
-        let pids = ovr.pids.unwrap_or(0);
+        // `cpus`/`pids`, else the dashboard-managed setting, else 0/0.0 = "use the
+        // node's generous default" (never the old hardcoded 512m that OOM-killed
+        // real monolith containers). These are baked into the manifest.
+        let mem_mib = ovr
+            .memory
+            .as_deref()
+            .or_else(|| settings.as_ref().and_then(|s| s.memory.as_deref()))
+            .map(parse_mem_mib)
+            .unwrap_or(0);
+        let cpus = ovr
+            .cpus
+            .as_deref()
+            .or_else(|| settings.as_ref().and_then(|s| s.cpus.as_deref()))
+            .map(parse_cpus_quota)
+            .unwrap_or(0.0);
+        let pids = ovr
+            .pids
+            .or_else(|| settings.as_ref().and_then(|s| s.pids))
+            .unwrap_or(0);
+        // Volume mount path has no fluid.json equivalent — dashboard-only.
+        let volume_path = settings.as_ref().and_then(|s| s.volume_mount_path.clone());
         let t1 = now_ms();
         // Single-image build, no compose networking involved (unlike
         // `build_compose_manifest`, which stays on podman — see that
@@ -3431,7 +3454,14 @@ async fn produce_manifest(
             now_ms().saturating_sub(t1)
         ));
         Ok(container_manifest(
-            project, &image, exposed, &protocol, mem_mib, cpus, pids,
+            project,
+            &image,
+            exposed,
+            &protocol,
+            mem_mib,
+            cpus,
+            pids,
+            volume_path.as_deref(),
         ))
     } else if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         let mut m = Manifest::from_json(&s)?;
@@ -5490,8 +5520,17 @@ fn wild(p: &[u8], s: &[u8]) -> bool {
     }
 }
 
-/// The mount point for the automatic per-container persistent volume (env-tunable).
-fn container_volume_path() -> String {
+/// The mount point for the automatic per-container persistent volume.
+/// `project_override` — a project's dashboard-managed
+/// `ContainerSettings::volume_mount_path` (see `project_settings.rs`) — wins
+/// when set; falls back to the node-wide `HIVE_CONTAINER_VOLUME_PATH` env,
+/// then `/data`. The per-project override exists because not every image
+/// follows the `/data` convention `itzg/minecraft-server` uses, and a
+/// node-wide env var would misconfigure every OTHER project on the node too.
+fn container_volume_path(project_override: Option<&str>) -> String {
+    if let Some(p) = project_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return p.to_string();
+    }
     std::env::var("HIVE_CONTAINER_VOLUME_PATH")
         .ok()
         .map(|s| s.trim().to_string())
@@ -5503,7 +5542,7 @@ fn container_volume_path() -> String {
 /// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
 /// (+ optional service suffix for compose), so a container's data survives instance
 /// restarts and redeploys. Merged into the compose network cfg when present.
-fn container_volume_cfg(project: &str, service: Option<&str>) -> String {
+fn container_volume_cfg(project: &str, service: Option<&str>, volume_path: Option<&str>) -> String {
     let mut name = format!("hive-vol-{}", sanitize_tag(project));
     if let Some(svc) = service.filter(|s| !s.is_empty()) {
         name.push('-');
@@ -5518,7 +5557,7 @@ fn container_volume_cfg(project: &str, service: Option<&str>) -> String {
     let (net, subnet, gw) = project_net(project);
     serde_json::json!({
         "vol": name,
-        "volpath": container_volume_path(),
+        "volpath": container_volume_path(volume_path),
         "net": net,
         "subnet": subnet,
         "gw": gw,
@@ -5552,6 +5591,7 @@ fn container_manifest(
     memory_mib: u32,
     cpus: f64,
     pids: u32,
+    volume_path: Option<&str>,
 ) -> Manifest {
     // `protocol` is a free-form string here (Railway-style `fluid.json` override for
     // the Dockerfile-build path, or an already-resolved wire string from an image
@@ -5573,7 +5613,7 @@ fn container_manifest(
                 "__container__".into(),
                 image.to_string(),
                 internal.to_string(),
-                container_volume_cfg(project, None),
+                container_volume_cfg(project, None, volume_path),
             ],
             env: Default::default(),
             vcpus: 1,
@@ -5723,6 +5763,15 @@ async fn image_container_manifest(
             None => (8080, protocol_override.unwrap_or_default()),
         },
     };
+    // An image deploy has no fluid.json to read a `container` override from at
+    // all, so the dashboard-managed `ProjectSettings::container` is the ONLY
+    // way to redirect the automatic volume's mount path here (unlike the
+    // Dockerfile-build path, which also honors an explicit fluid.json value).
+    let volume_path = cloud
+        .projects
+        .get(project)
+        .container
+        .and_then(|s| s.volume_mount_path);
     log(format!(
         "Container port {port}/{protocol}{}. Attaching persistent volume (≥1 GB) at {}.",
         if port_override.is_some() || protocol_override.is_some() {
@@ -5730,7 +5779,7 @@ async fn image_container_manifest(
         } else {
             " (from image ExposedPorts)"
         },
-        container_volume_path(),
+        container_volume_path(volume_path.as_deref()),
     ));
     let mut manifest = container_manifest(
         project,
@@ -5740,6 +5789,7 @@ async fn image_container_manifest(
         memory_mib,
         cpus,
         pids,
+        volume_path.as_deref(),
     );
     // A full multi-port declaration REPLACES the single-port ports list built
     // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
@@ -5959,8 +6009,14 @@ async fn build_compose_manifest(
             "alias": svc.name,
             "hosts": hosts,
             // Automatic per-service persistent volume (keyed by project+service).
+            // Dashboard `ProjectSettings::container.volume_mount_path` is
+            // deliberately NOT consulted here — a compose stack can have
+            // several services with different mount-path needs, so a single
+            // project-level override wouldn't generalize; a compose service
+            // that needs a non-default path sets it directly in its own
+            // Dockerfile/image, same as any other compose deployment target.
             "vol": format!("hive-vol-{}-{}", sanitize_tag(project), sanitize_tag(&svc.name)),
-            "volpath": container_volume_path(),
+            "volpath": container_volume_path(None),
         })
         .to_string();
         let is_primary = Some(&svc.name) == primary.as_ref();
@@ -6009,12 +6065,25 @@ async fn build_compose_manifest(
             max_duration_secs: 300,
             protocol: resolved_protocol,
             // Only an explicit `x-shadw-expose` opt-in publishes a raw external proxy
-            // target for a NON-PRIMARY service — the primary is already reachable via
-            // its `/` route, and every unopted-in service stays internal-only
-            // (unchanged default behavior: a private DB sidecar never becomes public
-            // just because it declares `ports:`).
+            // target for a NON-PRIMARY service — every unopted-in secondary service
+            // stays internal-only (unchanged default behavior: a private DB sidecar
+            // never becomes public just because it declares `ports:`).
+            //
+            // The PRIMARY service is different: when it's a raw-protocol service
+            // (Minecraft, Postgres-wire, …), the block below skips its HTTP `/`
+            // route BECAUSE it expects the raw public port allocation to carry
+            // traffic instead — that allocation is driven by THIS `ports` list
+            // (`raw_ports::allocate_raw_ports_coordinated` only allocates for specs
+            // it finds here), so a primary raw service must get one even with no
+            // `x-shadw-expose` (which only makes sense for a NON-primary opt-in).
+            // Previously this case fell through to the `else` branch below and
+            // stayed permanently unallocated — the primary service's own log line
+            // a few lines down ("reachable through its allocated raw public port
+            // instead") was a promise the code never kept.
             ports: if svc.expose.enabled {
                 vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
+            } else if is_primary && resolved_protocol.needs_raw_proxy() {
+                vec![PortSpec::single(svc.port, resolved_protocol)]
             } else {
                 Vec::new()
             },
@@ -6889,6 +6958,7 @@ mod tests {
             0,
             0.0,
             0,
+            None,
         );
         let f = &m.functions[0];
         assert_eq!(f.runtime, "container");
@@ -7159,7 +7229,7 @@ mod tests {
 
     #[test]
     fn container_manifest_carries_protocol() {
-        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0, 0.0, 0);
+        let m = container_manifest("proj", "img:tag", 50051, "grpc", 0, 0.0, 0, None);
         assert_eq!(m.functions.len(), 1);
         assert_eq!(m.functions[0].protocol_or_http(), "grpc");
         assert!(m.functions[0].needs_raw_proxy());
@@ -7195,7 +7265,7 @@ mod tests {
         assert_eq!(parse_mem_mib("512"), 512);
         assert_eq!(parse_mem_mib(""), 0);
         assert_eq!(parse_mem_mib("garbage"), 0);
-        let m = container_manifest("proj", "img:tag", 8080, "http", 4096, 0.0, 0);
+        let m = container_manifest("proj", "img:tag", 8080, "http", 4096, 0.0, 0, None);
         assert_eq!(m.functions[0].memory_mib, 4096);
     }
 
@@ -7222,7 +7292,7 @@ mod tests {
             0.0,
             "zero must not sneak through as a real override"
         );
-        let m = container_manifest("proj", "img:tag", 8080, "http", 0, 4.0, 2048);
+        let m = container_manifest("proj", "img:tag", 8080, "http", 0, 4.0, 2048, None);
         assert_eq!(m.functions[0].cpus, 4.0);
         assert_eq!(m.functions[0].pids, 2048);
     }

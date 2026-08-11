@@ -952,6 +952,24 @@ export interface ProjectSettings {
    *  (this mirror only reflects what the dashboard itself last wrote, or what
    *  the last deploy synced back from an explicit fluid.json block). */
   browser_db?: BrowserDbPolicy | null;
+  /** Dashboard-managed container config (resource ceilings + volume mount
+   *  path) for a project running the `container` runtime. Only meaningful
+   *  when the project's current deployment actually is one — see the
+   *  Container settings page. Port/protocol are configured separately via
+   *  the Network settings page (an immediate, no-redeploy live edit),
+   *  not here. */
+  container?: ContainerSettings | null;
+}
+
+/** See `ProjectSettings.container`. Mirrors
+ *  `hive_cloud::project_settings::ContainerSettings` field-for-field. */
+export interface ContainerSettings {
+  port?: number | null;
+  protocol?: string | null;
+  memory?: string | null;
+  cpus?: string | null;
+  pids?: number | null;
+  volume_mount_path?: string | null;
 }
 
 // ---- Browser-replicated database (browser_db contract) ----
