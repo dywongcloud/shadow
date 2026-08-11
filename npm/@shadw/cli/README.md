@@ -1,18 +1,20 @@
-# shadw
+# @shadw/cli
 
 Command-line interface for the [shadw](https://shadw.cloud) peer-to-peer cloud.
 
 ```sh
-npx shadw --help
-npx shadw auth login
-npx shadw deploy
-npx shadw projects list
+npx @shadw/cli --help
+npx @shadw/cli auth login
+npx @shadw/cli deploy
+npx @shadw/cli projects list
 ```
 
-Or install it:
+`npx @shadw/cli <args>` runs the `shadw` command (npm resolves a scoped
+package's sole `bin` entry regardless of name — the same mechanism
+`@angular/cli`/`@vue/cli` use). Once installed, the command is just `shadw`:
 
 ```sh
-npm install -g shadw
+npm install -g @shadw/cli
 shadw --help
 ```
 
@@ -23,10 +25,10 @@ binary for your platform automatically:
 
 | Platform | Package | Status |
 |---|---|---|
-| macOS (Apple Silicon) | `shadw-cli-darwin-arm64` | ✅ published |
-| macOS (Intel) | `shadw-cli-darwin-x64` | ✅ published |
-| Linux (x64) | `shadw-cli-linux-x64` | 🚧 built by CI on next release |
-| Linux (arm64) | `shadw-cli-linux-arm64` | 🚧 built by CI on next release |
+| macOS (Apple Silicon) | `@shadw/cli-darwin-arm64` | ✅ published |
+| macOS (Intel) | `@shadw/cli-darwin-x64` | ✅ published |
+| Linux (x64) | `@shadw/cli-linux-x64` | 🚧 built by CI on next release |
+| Linux (arm64) | `@shadw/cli-linux-arm64` | 🚧 built by CI on next release |
 
 If your platform's package isn't published yet, `shadw` will tell you exactly
 that (rather than a confusing generic error) and point you here.
@@ -42,7 +44,7 @@ shadw --json           # scriptable output
 
 `shadw auth login` saves your API key to `~/.shadw/config.json`.
 
-See also: [`shadw-node`](https://www.npmjs.com/package/shadw-node) — boot a
+See also: [`@shadw/node`](https://www.npmjs.com/package/@shadw/node) — boot a
 real local platform node to point this CLI at.
 
 ## Source

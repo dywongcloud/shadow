@@ -2,7 +2,7 @@
 "use strict";
 
 /**
- * `npx shadw-node` — boot a real shadw platform node locally, as easily as
+ * `npx @shadw/node` — boot a real shadw platform node locally, as easily as
  * any other npx dev tool. This is the actual `hive-cloud` server binary
  * (the same one every fleet node runs), not a simulation of one.
  *
@@ -26,8 +26,8 @@ const path = require("path");
 const os = require("os");
 
 const PLATFORM_MAP = {
-  darwin: { arm64: "shadw-node-darwin-arm64", x64: "shadw-node-darwin-x64" },
-  linux: { arm64: "shadw-node-linux-arm64", x64: "shadw-node-linux-x64" },
+  darwin: { arm64: "@shadw/node-darwin-arm64", x64: "@shadw/node-darwin-x64" },
+  linux: { arm64: "@shadw/node-linux-arm64", x64: "@shadw/node-linux-x64" },
 };
 
 function fail(message) {
@@ -68,15 +68,15 @@ if (userArgs.includes("--help") || userArgs.includes("-h")) {
       "shadw-node — boot a real shadw platform node locally.",
       "",
       "Usage:",
-      "  npx shadw-node                 boot a single local dev node with sane defaults",
-      "  npx shadw-node <hive-cloud args>   full control, no injected defaults",
+      "  npx @shadw/node                 boot a single local dev node with sane defaults",
+      "  npx @shadw/node <hive-cloud args>   full control, no injected defaults",
       "",
       "With no arguments, this runs:",
       "  HIVE_FORCE_MOCK=1 HIVE_DATA=~/.shadw-node hive-cloud \\",
       "    --name local --listen 127.0.0.1:8787 --admin 127.0.0.1:8786",
       "",
       "Then the admin API is at http://127.0.0.1:8786 and shadw (the CLI) will",
-      "talk to it by default -- try `npx shadw auth login` against it, or just",
+      "talk to it by default -- try `npx @shadw/cli auth login` against it, or just",
       "`curl http://127.0.0.1:8786/healthz`.",
       "",
     ].join("\n")

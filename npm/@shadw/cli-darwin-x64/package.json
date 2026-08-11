@@ -1,9 +1,9 @@
 {
-  "name": "shadw-cli-darwin-arm64",
+  "name": "@shadw/cli-darwin-x64",
   "version": "0.1.0",
-  "description": "shadw prebuilt binary for darwin/arm64 (platform package for shadw-cli — install shadw-cli instead)",
+  "description": "shadw prebuilt binary for darwin/x64 (platform package for @shadw/cli — install @shadw/cli instead)",
   "os": ["darwin"],
-  "cpu": ["arm64"],
+  "cpu": ["x64"],
   "bin": { "shadw": "bin/shadw" },
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/dywongcloud/hive.git" }

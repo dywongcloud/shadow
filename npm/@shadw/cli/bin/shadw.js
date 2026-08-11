@@ -17,8 +17,8 @@
 const { spawnSync } = require("child_process");
 
 const PLATFORM_MAP = {
-  darwin: { arm64: "shadw-cli-darwin-arm64", x64: "shadw-cli-darwin-x64" },
-  linux: { arm64: "shadw-cli-linux-arm64", x64: "shadw-cli-linux-x64" },
+  darwin: { arm64: "@shadw/cli-darwin-arm64", x64: "@shadw/cli-darwin-x64" },
+  linux: { arm64: "@shadw/cli-linux-arm64", x64: "@shadw/cli-linux-x64" },
 };
 
 function resolveBinary() {

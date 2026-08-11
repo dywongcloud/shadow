@@ -1,13 +1,14 @@
 name: Release npm CLI packages
 
-# Builds shadw (crates/shadw-cli) and shadw-node (crates/hive-cloud, wrapped)
-# for every supported platform and publishes them to npm. This is the CI half
-# of scripts/build-npm-pkg.sh — the SAME script a local darwin build already
-# uses (see that script's own header), run here on real macOS and Linux
-# runners for the platforms a single macOS dev machine cannot cross-compile:
-# darwin-arm64/x64 were built and locally verified (npm pack + install into a
-# scratch prefix + real exec, including actually booting a node and getting
-# healthz back) without CI; linux-x64/arm64 need this workflow to exist at all.
+# Builds @shadw/cli (crates/shadw-cli) and @shadw/node (crates/hive-cloud,
+# wrapped) for every supported platform and publishes them to npm. This is the
+# CI half of scripts/build-npm-pkg.sh — the SAME script a local darwin build
+# already uses (see that script's own header), run here on real macOS and
+# Linux runners for the platforms a single macOS dev machine cannot
+# cross-compile: darwin-arm64/x64 are built and locally verified (npm pack +
+# install into a scratch prefix + real exec, including actually booting a node
+# and getting healthz back) without CI; linux-x64/arm64 need this workflow to
+# exist at all.
 #
 # Trigger is a dedicated tag namespace (`cli-v*`), not the bare `v*` a lot of
 # repos use — this repo's own release cadence for the platform itself must
@@ -53,18 +54,23 @@ jobs:
 
       # Both binaries, same script, same shape it already builds locally —
       # see that script's header for why this is the single source of truth.
-      - name: Build shadw (crates/shadw-cli)
-        run: ./scripts/build-npm-pkg.sh shadw-cli shadw shadw-cli ${{ matrix.target }} ${{ matrix.npm_os }} ${{ matrix.npm_cpu }}
+      # PKG_BASE carries the @shadw scope; build-npm-pkg.sh forms
+      # "${PKG_BASE}-${npm_os}-${npm_cpu}" as both the npm package NAME and
+      # the npm/<name> directory path, so passing "@shadw/cli" here produces
+      # exactly npm/@shadw/cli-darwin-arm64 — the same nested-scope layout
+      # the local darwin build already uses.
+      - name: Build @shadw/cli (crates/shadw-cli)
+        run: ./scripts/build-npm-pkg.sh shadw-cli shadw @shadw/cli ${{ matrix.target }} ${{ matrix.npm_os }} ${{ matrix.npm_cpu }}
 
-      - name: Build shadw-node (crates/hive-cloud)
-        run: ./scripts/build-npm-pkg.sh hive-cloud hive-cloud shadw-node ${{ matrix.target }} ${{ matrix.npm_os }} ${{ matrix.npm_cpu }}
+      - name: Build @shadw/node (crates/hive-cloud)
+        run: ./scripts/build-npm-pkg.sh hive-cloud hive-cloud @shadw/node ${{ matrix.target }} ${{ matrix.npm_os }} ${{ matrix.npm_cpu }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: npm-pkgs-${{ matrix.npm_os }}-${{ matrix.npm_cpu }}
           path: |
-            npm/shadw-cli-${{ matrix.npm_os }}-${{ matrix.npm_cpu }}/
-            npm/shadw-node-${{ matrix.npm_os }}-${{ matrix.npm_cpu }}/
+            npm/@shadw/cli-${{ matrix.npm_os }}-${{ matrix.npm_cpu }}/
+            npm/@shadw/node-${{ matrix.npm_os }}-${{ matrix.npm_cpu }}/
 
   publish:
     needs: build
@@ -85,7 +91,7 @@ jobs:
       - name: Verify every platform package got a real binary from the matrix
         run: |
           set -euo pipefail
-          for d in npm/shadw-cli-* npm/shadw-node-*; do
+          for d in npm/@shadw/cli-* npm/@shadw/node-*; do
             bin="$(node -pe "Object.values(require('./$d/package.json').bin)[0]")"
             test -s "$d/$bin" || { echo "missing/empty binary in $d"; exit 1; }
             chmod +x "$d/$bin"
@@ -95,18 +101,20 @@ jobs:
       # optionalDependencies pin an EXACT version (see build-npm-pkg.sh), so
       # platform packages must publish before the dispatchers that depend on
       # them, or a client installing mid-release could get a dispatcher with
-      # no matching platform package yet.
+      # no matching platform package yet. The globs below match only the
+      # "-<os>-<cpu>" suffixed platform dirs, not the bare npm/@shadw/cli or
+      # npm/@shadw/node dispatcher dirs (those have no trailing "-*" segment).
       - name: Publish platform packages
         run: |
-          for d in npm/shadw-cli-* npm/shadw-node-*; do
+          for d in npm/@shadw/cli-* npm/@shadw/node-*; do
             npm publish "$d" --access public
           done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-      - name: Publish dispatcher packages (shadw, shadw-node)
+      - name: Publish dispatcher packages (@shadw/cli, @shadw/node)
         run: |
-          npm publish npm/shadw --access public
-          npm publish npm/shadw-node --access public
+          npm publish npm/@shadw/cli --access public
+          npm publish npm/@shadw/node --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

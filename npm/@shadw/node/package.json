@@ -1,15 +1,15 @@
 {
-  "name": "shadw-node",
+  "name": "@shadw/node",
   "version": "0.1.0",
   "description": "Boot a real shadw platform node locally, as easily as any other npx dev tool",
   "bin": { "shadw-node": "bin/shadw-node.js" },
   "engines": { "node": ">=16" },
   "os": ["darwin", "linux"],
   "optionalDependencies": {
-    "shadw-node-darwin-arm64": "0.1.0",
-    "shadw-node-darwin-x64": "0.1.0",
-    "shadw-node-linux-x64": "0.1.0",
-    "shadw-node-linux-arm64": "0.1.0"
+    "@shadw/node-darwin-arm64": "0.1.0",
+    "@shadw/node-darwin-x64": "0.1.0",
+    "@shadw/node-linux-x64": "0.1.0",
+    "@shadw/node-linux-arm64": "0.1.0"
   },
   "license": "MIT",
   "repository": { "type": "git", "url": "git+https://github.com/dywongcloud/hive.git" },

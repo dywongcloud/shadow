@@ -1,0 +1,10 @@
+{
+  "name": "@shadw/node-darwin-x64",
+  "version": "0.1.0",
+  "description": "hive-cloud prebuilt binary for darwin/x64 (platform package for @shadw/node — install @shadw/node instead)",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "bin": { "hive-cloud": "bin/hive-cloud" },
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/dywongcloud/hive.git" }
+}
