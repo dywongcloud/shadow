@@ -154,12 +154,19 @@ export function WorldChoropleth({
             <path
               key={f.id != null ? String(f.id) : f.properties.name}
               d={d}
+              // Colors sampled pixel-exact from the reference design
+              // (screenshots of the "shadw Nodes" map, dark bg): inactive
+              // stroke #808080, hover fill #b3b3b3, active fill/stroke pure
+              // white — verified via a histogram of the reference PNGs, not
+              // eyeballed. Light mode mirrors the same contrast weight
+              // (black instead of white, a darker gray instead of #b3b3b3)
+              // since the reference itself is dark-mode only.
               className={
                 hovered
-                  ? "fill-slate-400 stroke-slate-400 dark:fill-slate-500 dark:stroke-slate-500"
+                  ? "fill-[#4d4d4d] stroke-[#4d4d4d] dark:fill-[#b3b3b3] dark:stroke-[#b3b3b3]"
                   : active
-                    ? "fill-slate-900 stroke-slate-900 dark:fill-white dark:stroke-white"
-                    : "fill-transparent stroke-slate-300 dark:stroke-slate-700"
+                    ? "fill-black stroke-black dark:fill-white dark:stroke-white"
+                    : "fill-transparent stroke-[#808080]"
               }
               strokeWidth={0.6}
               // SVG shapes with an unpainted fill (fill-transparent, the
@@ -246,7 +253,8 @@ export function WorldChoropleth({
           from the reference design, enriched with the real live node count. */}
       {hover && (
         <div
-          className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded-md bg-slate-700/95 px-2.5 py-1 text-xs font-medium text-white shadow-lg dark:bg-slate-600/95"
+          // #707070 — sampled pixel-exact from the reference tooltip.
+          className="pointer-events-none absolute z-10 -translate-x-1/2 -translate-y-full rounded-md bg-[#707070] px-2.5 py-1 text-xs font-medium text-white shadow-lg"
           style={{ left: `${hover.x}%`, top: `${hover.y}%`, marginTop: -8 }}
         >
           {hover.name}
