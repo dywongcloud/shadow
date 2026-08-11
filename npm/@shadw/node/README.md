@@ -47,8 +47,8 @@ what you're doing and want the real backend-selection logic to run.
 
 | Platform | Package | Status |
 |---|---|---|
-| macOS (Apple Silicon) | `@shadw/node-darwin-arm64` | ✅ built + locally verified (real node booted, `healthz` answered) |
-| macOS (Intel) | `@shadw/node-darwin-x64` | ✅ built |
+| macOS (Apple Silicon) | `@shadw/node-darwin-arm64` | ✅ published, locally verified (real node booted via `npx @shadw/node`, `healthz` answered) |
+| macOS (Intel) | `@shadw/node-darwin-x64` | ✅ published |
 | Linux (x64) | `@shadw/node-linux-x64` | 🚧 built by CI (`.github/workflows/release-npm-cli.yml`) on the next `cli-v*` tag |
 | Linux (arm64) | `@shadw/node-linux-arm64` | 🚧 built by CI on the next `cli-v*` tag |
 
