@@ -113,3 +113,8 @@ iroh = { path = "vendor/iroh" }
 [profile.release]
 opt-level = 3
 lto = "thin"
+# Debug symbols stripped from every release binary — real, measured saving on
+# hive-cloud (the largest binary in this workspace, shipped in npm packages):
+# 76.0 -> 62.9 MiB (~17%). Backtraces from a release crash already come from
+# the panic message + RUST_BACKTRACE, not from symbols in the shipped binary.
+strip = true

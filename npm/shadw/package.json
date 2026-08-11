@@ -1,0 +1,17 @@
+{
+  "name": "shadw",
+  "version": "0.1.0",
+  "description": "Command-line interface for the shadw peer-to-peer cloud (deploy, projects, domains, databases, workflows, observability)",
+  "bin": { "shadw": "bin/shadw.js" },
+  "engines": { "node": ">=16" },
+  "os": ["darwin", "linux"],
+  "optionalDependencies": {
+    "shadw-cli-darwin-arm64": "0.1.0",
+    "shadw-cli-darwin-x64": "0.1.0",
+    "shadw-cli-linux-x64": "0.1.0",
+    "shadw-cli-linux-arm64": "0.1.0"
+  },
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/dywongcloud/hive.git" },
+  "homepage": "https://shadw.cloud"
+}

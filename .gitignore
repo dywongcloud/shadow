@@ -2,6 +2,13 @@ target/
 .env
 .env.local
 
+# npm platform-package binaries: build artifacts of scripts/build-npm-pkg.sh
+# (the same rule as target/ above — reproducible, never committed). The two
+# hand-written JS dispatcher shims are real source and stay tracked.
+npm/*/bin/*
+!npm/shadw/bin/*.js
+!npm/shadw-node/bin/*.js
+
 # Browser crsqlite wasm build scratch (wa-sqlite checkout at a pinned commit,
 # sqlite amalgamation cache, node-flavored wire-proof build) -- recreated by
 # crates/hive-browser/www/sqlite/build-sqlite.sh, never committed.
