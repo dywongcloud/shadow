@@ -441,6 +441,25 @@ releases).
   SYN-proxies, so a closed port reads OPEN. Witnessed: a laptop reported
   hk:3340 open while every fleet vantage correctly reported it unreachable.
   Probe from a fleet node, always.
+- **An address that is probably-undialable is still strictly better than NO
+  address — never let a peer-address filter empty the set.** Filtering peer
+  addresses on the dial path to publicly-routable-only (to starve iroh's
+  unbounded `pending_open_paths` queue, #4390) fixed the leak and PARTITIONED
+  THE FLEET: every ansible-rolled node lost the ability to dial anyone
+  (`retain_dialable` let the set go empty, reasoning `connect` would fail
+  fast and fall through to fresh discovery — wrong on this fleet, since
+  discovery has nothing to resolve against with `HIVE_DISCOVERY_N0=0`; see
+  "a node can only re-learn an address from a peer it can reach" above).
+  fc-lax/lax2/lax3 (not in the ansible inventory, never received the filter)
+  were the only peers hk could still see, which is what made the signature
+  unambiguous. If a dial-side filter is ever revisited: filter ONLY when at
+  least one transport survives and keep the ORIGINAL set otherwise, never
+  drop a seed for lacking a public addr, and roll it to ONE node first,
+  checking `/v1/mesh` `isolated`/`visible_healthy_peers` before fanning out
+  — a mesh-connectivity change rolled to all nodes at once with no canary and
+  no post-roll mesh assertion took the fleet down for the length of the
+  rollout before an operator noticed. Prefer fixing the actual defect (bound
+  the queue) over starving it of input — bounding cannot partition anything.
 
 ## Wasmer runtime & node capability gating
 
