@@ -20,6 +20,7 @@ const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
 // Team/account-level tabs — shown when NO project/deployment is selected.
 const teamTabs = [
   { href: "/", label: "Projects" },
+  { href: "/regions", label: "Regions" },
   { href: "/workflows", label: "Workflows" },
   { href: "/storage", label: "Storage" },
   { href: "/observability", label: "Observability" },

@@ -75,6 +75,11 @@ export default function RegionsPage() {
   const [query, setQuery] = useState("");
   const [activeRegion, setActiveRegion] = useState<string | null>(null);
   const [connectFlash, setConnectFlash] = useState(false);
+  // Pressing Enter in the search box reveals which countries have a real
+  // live node (green fill on the map) — matches the reference design's
+  // press-Enter-to-search behavior. Clearing the query resets it, so the
+  // map doesn't stay stuck "activated" once the search is abandoned.
+  const [activated, setActivated] = useState(false);
   const scopedList = activeRegion ? list.filter((n) => n.region === activeRegion) : list;
   // browser peers carry no region label, so a region filter hides them all —
   // memoized so it's not a fresh [] reference on every render (it feeds the
@@ -163,14 +168,18 @@ export default function RegionsPage() {
       <Card className="mb-5 overflow-hidden p-0">
         <RegionsCommandBar
           query={query}
-          onQueryChange={setQuery}
+          onQueryChange={(v) => {
+            setQuery(v);
+            if (!v.trim()) setActivated(false);
+          }}
+          onSubmit={() => setActivated(true)}
           regions={regions.map((r) => ({ value: r, label: displayRegion(r) }))}
           activeRegion={activeRegion}
           onRegionSelect={setActiveRegion}
           onConnectClick={handleConnectClick}
         />
         <div className="relative overflow-hidden">
-          <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} />
+          <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} activated={activated} />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
             {markers.length} node{markers.length === 1 ? "" : "s"} live on the mesh

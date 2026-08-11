@@ -24,6 +24,7 @@ export interface RegionPill {
 export function RegionsCommandBar({
   query,
   onQueryChange,
+  onSubmit,
   regions,
   activeRegion,
   onRegionSelect,
@@ -31,6 +32,10 @@ export function RegionsCommandBar({
 }: {
   query: string;
   onQueryChange: (v: string) => void;
+  /** Fired on Enter in the search field — reveals which countries have a
+   *  real live node (green fill), matching the reference design's
+   *  press-Enter-to-search behavior. */
+  onSubmit?: () => void;
   regions: RegionPill[];
   activeRegion: string | null;
   onRegionSelect: (region: string | null) => void;
@@ -41,6 +46,9 @@ export function RegionsCommandBar({
       <input
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") onSubmit?.();
+        }}
         placeholder="Enter a Shadow Node or Peer ID"
         className="w-full border-0 border-b border-border bg-transparent pb-2 text-sm text-fg placeholder:text-muted focus:border-border-strong focus:outline-none"
       />
