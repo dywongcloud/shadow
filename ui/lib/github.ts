@@ -239,7 +239,13 @@ async function resolveWriterToken(
   if (r.ok) {
     return r.token
       ? { token: r.token, via: "installation" }
-      : { appError: `GitHub App is not installed on ${owner}/${repo} — no installation token available` };
+      : {
+          appError:
+            `The GitHub App is not installed on ${owner} (no installation token for ${owner}/${repo}). ` +
+            `Install it on that account or organization at ` +
+            `https://github.com/settings/installations, then retry — or pick a repository under an ` +
+            `account where it is already installed.`,
+        };
   }
   return { appError: r.error };
 }
@@ -255,6 +261,25 @@ function writerFallback(
 ): CommitResult {
   if (r.ok || !appError) return r;
   if (!composio.composioConfigured()) return { ok: false, error: appError };
+  // WHICH REASON LEADS MATTERS. Composio is the LEGACY provider; once the
+  // GitHub App's server-to-server identity is configured, the App is the real
+  // one and its reason is the actionable one. This used to lead with Composio's
+  // message, so a tenant whose App simply is not installed on the target owner
+  // was shown `Composio: Execution of toolkit 'GITHUB' is temporarily disabled
+  // by the administrator` — a third party's operational notice, about a
+  // provider they are not using, naming nothing they can act on — while the
+  // real cause sat after a semicolon.
+  //
+  // With the App configured, lead with the App's reason and keep Composio's as
+  // trailing context (it still explains why the fallback did not rescue the
+  // write). With only Composio configured, its message is the whole truth and
+  // still leads.
+  if (installationAuthConfigured()) {
+    return {
+      ok: false,
+      error: `${appError} (legacy Composio fallback also failed: ${r.error || "composio write failed"})`,
+    };
+  }
   return { ok: false, error: `${r.error || "composio write failed"}; github-app installation path: ${appError}` };
 }
 
