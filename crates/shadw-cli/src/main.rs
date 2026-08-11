@@ -11,14 +11,47 @@ use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use client::{Client, Config};
 use output::Out;
+use owo_colors::{OwoColorize, Stream};
 use serde_json::{json, Value};
 use std::time::Duration;
+
+/// The shadw logo — rendered in green on the landing screen (bare
+/// invocation / `--help`). Color is gated by `if_supports_color`, so a
+/// non-tty or `NO_COLOR` run gets the same art, plain.
+const BANNER: &str = r#"⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣘⡘⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠇⡇⢱⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠳⡢⣄⠀⠀⠀⠀⠀⠀⢸⠄⡇⠸⠀⠀⠀⠀⠀⠀⢀⡤⡾⠁⠀⠀⠀
+⠀⠀⠀⠀⢹⣢⡉⠢⡀⠀⠀⠀⢸⠄⡇⢘⠃⠀⠀⠀⡠⠊⡑⣹⠁⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠱⡜⢄⠘⢢⡀⠀⢸⠁⡇⢸⡄⠀⣠⠊⢀⠌⡴⠁⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠱⡀⠡⡀⠑⡄⠸⠄⡇⢸⠀⡔⠁⡐⠁⡲⠁⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠈⢢⡈⢂⠘⡜⡇⡇⣘⡜⠠⠊⣠⠊⠀⠀⠀⠀⠀⠀⠀⠀
+⠑⠲⢖⡯⠘⣀⠒⠂⠤⢽⡦⡑⠜⢏⠀⡟⠔⡡⣖⡡⠤⠰⠒⣒⠒⣒⣶⠖⠂
+⠀⠀⠀⠉⠓⠲⠅⣉⣀⡐⠠⠉⠊⣼⣼⡤⠚⠩⠀⠂⢀⣉⠰⠔⠒⠉⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡌⡻⢹⡜⡟⢯⡩⣛⢭⡉⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⣠⣾⣳⠥⠒⠁⠀⡇⠀⠙⠲⢕⣞⣦⡀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠈⠉⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠉⠀⠀⠀⠀⠀⠀⠀"#;
+
+/// Bare invocation or `--help`/`-h` is the CLI's landing screen — show the
+/// logo there, not on every ordinary command (which would be noisy for
+/// scripting/interactive daily use). Checked against raw argv, before clap
+/// parses anything, since both cases otherwise exit inside `Cli::parse()`.
+fn maybe_print_banner() {
+    let first_arg = std::env::args().nth(1);
+    let landing = matches!(first_arg.as_deref(), None | Some("--help") | Some("-h"));
+    if !landing {
+        return;
+    }
+    println!("{}", BANNER.if_supports_color(Stream::Stdout, |t| t.green()));
+    println!();
+}
 
 #[derive(Parser)]
 #[command(
     name = "shadw",
     version,
-    about = "Command-line interface for the shadw peer-to-peer cloud"
+    about = "Command-line interface for the shadw peer-to-peer cloud",
+    arg_required_else_help = true
 )]
 struct Cli {
     /// API base URL (env: SHADW_API_URL). Default http://127.0.0.1:8786.
@@ -412,6 +445,7 @@ struct ApiArgs {
 
 #[tokio::main]
 async fn main() {
+    maybe_print_banner();
     let cli = Cli::parse();
     let out = Out { json: cli.json };
     let explicit_token = cli.token.is_some()
@@ -423,7 +457,8 @@ async fn main() {
     // plain API-key flow or an explicit --token/env token.
     c.ensure_fresh_token(explicit_token).await;
     if let Err(e) = run(cli, &c, out).await {
-        eprintln!("error: {e:#}");
+        let prefix = "error:".if_supports_color(Stream::Stderr, |t| t.red());
+        eprintln!("{prefix} {e:#}");
         std::process::exit(1);
     }
 }
