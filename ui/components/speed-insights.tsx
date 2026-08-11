@@ -4,13 +4,17 @@ import { useMemo, useState } from "react";
 import dynamic from "next/dynamic";
 import { ChevronDown, Calendar, CheckCircle2, AlertTriangle, XCircle, ChevronRight, ExternalLink, Maximize2 } from "lucide-react";
 import { Card } from "@/components/ui";
-import { usePoll } from "@/lib/api";
+import { usePoll, type RumSummary, type VitalPercentiles } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import Image from "next/image";
 
 const LineChart = dynamic(() => import("@tremor/react").then((m) => m.LineChart), { ssr: false });
 
 // ---- web-vitals model (Core Web Vitals + RES) ----
+// UI-only types stay local; the wire shapes (VitalPercentiles, RouteScore,
+// RumSummary) moved to lib/api.ts as the one source of truth for the
+// GET /v1/speed-insights contract, shared with lib/observability-data.ts's
+// server-side fetch and the new cached route handler.
 type Rating = "great" | "needs" | "poor";
 
 interface Vital {
@@ -20,29 +24,6 @@ interface Vital {
   // 0..1 position of the value within the poor→great scale (for the mini bar).
   pos: number;
   rating: Rating;
-}
-
-interface VitalPercentiles {
-  fcp: number | null;
-  lcp: number | null;
-  cls: number | null;
-  inp: number | null;
-  ttfb: number | null;
-}
-interface RouteScore {
-  route: string;
-  count: number;
-  res: number | null;
-  p75: VitalPercentiles;
-}
-interface RumSummary {
-  sample_count: number;
-  res: number | null;
-  p75: VitalPercentiles;
-  p90: VitalPercentiles;
-  p95: VitalPercentiles;
-  p99: VitalPercentiles;
-  routes: RouteScore[];
 }
 
 // Real User Monitoring, backed by GET /v1/speed-insights (the
@@ -83,7 +64,7 @@ const RANGE_MINUTES: Record<(typeof RANGES)[number], number> = {
   "Last 30 Days": 43_200,
 };
 
-export function SpeedInsights() {
+export function SpeedInsights({ initial = null }: { initial?: RumSummary | null } = {}) {
   const [device, setDevice] = useState<"Desktop" | "Mobile">("Desktop");
   const [pct, setPct] = useState<(typeof PERCENTILES)[number]>("P75");
   const [range, setRange] = useState<(typeof RANGES)[number]>("Last 7 Days");
@@ -91,6 +72,8 @@ export function SpeedInsights() {
   const { data } = usePoll<RumSummary>(
     `/v1/speed-insights?minutes=${RANGE_MINUTES[range]}&device=${device.toLowerCase()}`,
     15_000,
+    true,
+    initial,
   );
 
   const res = data?.res ?? null;

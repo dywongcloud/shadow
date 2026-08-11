@@ -476,10 +476,17 @@ export async function apiDeployViaServerRoute<T>(routePath: string, body: Record
  *  only worth refreshing while some UI affordance (a dropdown, a panel) is
  *  actually open. The initial fetch and team-change refresh always run either
  *  way, so the caller's data is never stale-forever. */
-export function usePoll<T>(path: string, intervalMs = 3000, active = true) {
-  const [data, setData] = useState<T | null>(null);
+export function usePoll<T>(path: string, intervalMs = 3000, active = true, initial: T | null = null) {
+  // `initial` seeds the first paint from a server component's prefetch, same
+  // pattern and same reason as useOpsPoll's identical param: render real data
+  // immediately instead of a blank/skeleton state while the first client poll
+  // is in flight. The poll still fires normally on mount to pick up anything
+  // that changed between the server fetch and hydration. Additive — every
+  // existing call site omits this argument and gets `null`, i.e. today's
+  // behavior unchanged.
+  const [data, setData] = useState<T | null>(initial);
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(initial === null);
 
   const load = useCallback(async (fresh: boolean) => {
     // Snapshot the tenant THIS request is for. `apiGet` resolves with data
@@ -1193,6 +1200,31 @@ export interface Metrics {
   status_distribution: Record<string, number>;
   top_paths: { path: string; count: number }[];
   projects: { project: string; requests: number }[];
+}
+
+// ---- Speed Insights (RUM) — wire shapes for GET /v1/speed-insights. One
+// source of truth: previously duplicated privately inside speed-insights.tsx.
+export interface VitalPercentiles {
+  fcp: number | null;
+  lcp: number | null;
+  cls: number | null;
+  inp: number | null;
+  ttfb: number | null;
+}
+export interface RouteScore {
+  route: string;
+  count: number;
+  res: number | null;
+  p75: VitalPercentiles;
+}
+export interface RumSummary {
+  sample_count: number;
+  res: number | null;
+  p75: VitalPercentiles;
+  p90: VitalPercentiles;
+  p95: VitalPercentiles;
+  p99: VitalPercentiles;
+  routes: RouteScore[];
 }
 
 // ---- Incidents / ops ----

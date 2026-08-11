@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { backend } from "@/lib/gitops-server";
-import { resolveEntity } from "@/lib/composio";
+import { resolveTeam, fetchMetricsSummary, BackendFetchError } from "@/lib/observability-data";
 
 /**
  * CACHED observability summary — the server-side seam Observability and Speed
@@ -55,7 +54,13 @@ const SWR = 300;
 /** Windows the UI offers. Anything else is rejected rather than forwarded, so a
  *  crafted `minutes` cannot turn this into an unbounded backend query — and so
  *  the cache cannot be fragmented into unbounded distinct keys by a caller. */
-const ALLOWED_MINUTES = new Set([15, 60, 360, 1440, 10080]);
+// 720 (12h) is the OBSERVABILITY PAGE'S OWN DEFAULT range
+// (ui/app/observability/observability-client.tsx's `useState(720)`) — it was
+// missing here, which meant the page's default view would 400 against this
+// route the moment anything called it with no explicit `minutes` override.
+// Found by cross-referencing this allow-list against its one real consumer,
+// not by inspection of this file alone.
+const ALLOWED_MINUTES = new Set([15, 60, 360, 720, 1440, 10080]);
 
 export async function GET(req: NextRequest) {
   const raw = req.nextUrl.searchParams.get("minutes");
@@ -67,35 +72,18 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  const team = req.headers.get("x-hive-team") || (await resolveEntity()) || "personal";
+  const team = await resolveTeam(req.headers.get("x-hive-team"));
 
-  let r: Response;
+  let data: unknown;
   try {
-    r = await backend(`/v1/metrics?minutes=${minutes}`, team);
+    data = await fetchMetricsSummary(team, minutes);
   } catch (e: unknown) {
     // A summary is a CONVENIENCE over the live poll, which still runs. Failing
     // it must not blank the page, so report the fault honestly and let the
     // client fall back to polling rather than throwing a 500 at the shell.
-    const msg = e instanceof Error ? e.message : String(e);
-    return NextResponse.json(
-      { ok: false, error: `metrics backend unreachable: ${msg}` },
-      { status: 503, headers: { "cache-control": "no-store" } }
-    );
-  }
-
-  if (!r.ok) {
-    return NextResponse.json(
-      { ok: false, error: `metrics backend returned ${r.status}` },
-      { status: r.status === 401 || r.status === 403 ? r.status : 502, headers: { "cache-control": "no-store" } }
-    );
-  }
-
-  const data = await r.json().catch(() => null);
-  if (data == null) {
-    return NextResponse.json(
-      { ok: false, error: "metrics backend returned a malformed body" },
-      { status: 502, headers: { "cache-control": "no-store" } }
-    );
+    const status = e instanceof BackendFetchError ? e.status : 502;
+    const message = e instanceof Error ? e.message : String(e);
+    return NextResponse.json({ ok: false, error: message }, { status, headers: { "cache-control": "no-store" } });
   }
 
   return NextResponse.json(
