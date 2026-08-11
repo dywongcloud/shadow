@@ -233,6 +233,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             get(database_get).delete(database_delete),
         )
         .route("/v1/databases/:id/credentials", get(database_credentials))
+        .route("/v1/databases/:id/rotate", post(database_rotate))
         .route(
             "/v1/projects/:project/databases",
             get(databases_for_project),
@@ -8894,6 +8895,34 @@ async fn database_delete(
     c.databases.remove_db_and_purge_data(&id, &t);
     crate::persist::persist(&c);
     Ok(Json(json!({ "removed": id })))
+}
+
+/// Regenerate a Blob database's access credentials without touching the
+/// underlying data or bucket identity -- the fix for a leaked credential
+/// (log, transcript, accidental print) that doesn't warrant losing the data.
+async fn database_rotate(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
+    let Some(d) = c.databases.get_raw(&id) else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    if norm(&d.team) != t {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let Some(rotated) = crate::databases::rotate_blob_credentials(&c.databases, &id) else {
+        return Err(StatusCode::BAD_REQUEST);
+    };
+    // Refresh the egress env with the new credentials so deployments pick
+    // up the rotated values on their next restart instead of the stale ones.
+    if !rotated.project.is_empty() {
+        apply_db_egress(&c, &rotated);
+    }
+    crate::persist::persist(&c);
+    Ok(Json(json!(rotated)))
 }
 
 /// Mesh-internal: register or remove a cross-region REPLICA of a database on this

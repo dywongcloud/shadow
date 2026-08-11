@@ -1136,6 +1136,27 @@ pub fn provision(
     db
 }
 
+/// Regenerate a Blob database's access credentials in place (same bucket,
+/// same endpoint — only the auth material rotates). For when a credential
+/// leaked (e.g. into a log) and the fix is invalidating it without deleting
+/// the underlying data. Returns the updated, unmasked record so the caller
+/// gets the fresh credentials; `None` if the id is unknown or not a Blob DB.
+pub fn rotate_blob_credentials(store: &Arc<DatabaseStore>, id: &str) -> Option<Database> {
+    let d = store.get_raw(id)?;
+    if d.kind != DbKind::Blob {
+        return None;
+    }
+    store.update(id, |d| {
+        d.connection
+            .insert("access_key_id".into(), token("AKIA"));
+        d.connection
+            .insert("secret_access_key".into(), token("hbsk"));
+        d.connection
+            .insert("read_write_token".into(), token("blob_rw"));
+    });
+    store.get_raw(id)
+}
+
 async fn provision_backing(
     store: &Arc<DatabaseStore>,
     id: &str,
