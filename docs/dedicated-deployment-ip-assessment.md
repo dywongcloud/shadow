@@ -42,35 +42,62 @@ per deployment — just software choosing which address to bind. This is
 the only path that's genuinely a code problem rather than a procurement
 one.
 
-## What's unverified — and why this session doesn't claim more
+## What's verified — resolved 2026-08-05, with live evidence
 
-Whether any current fleet node actually has a routed IPv6 prefix beyond
-its own single address is **not established**. Nothing in
-`ansible/inventory/hosts.ini.example` or the ansible roles provisions or
-records one; the codebase's only IPv6 awareness (`dns_geo.rs`,
-`dns_probe.rs`, `dnsserver.rs`) is about serving AAAA *records* for
-existing addresses, not about a per-deployment address pool. Confirming
-this needs a real `ip -6 addr` (or equivalent) on an actual fleet node —
-SSH access this session doesn't have. **Do not treat this document's
-absence of a "yes, node X has a /64" finding as evidence there is one, or
-that there isn't** — it's genuinely unconfirmed.
+The previous version of this document left "does any fleet node have a
+routed IPv6 prefix" **unverified**, for lack of SSH/API access. That gap is
+now closed, at every layer the doc's own next-step section named, with
+real (not assumed) evidence:
 
-## Recommended next step (not taken here)
+- **OS layer (fc-bangkok, live SSH):** `ip -6 addr show scope global` →
+  empty, no global IPv6 address configured on any interface. `ip -6 route
+  show` → only auto-configured link-local (`fe80::/64`) routes; no global
+  route present.
+- **Instance layer (Tencent Cloud API, `cvm.tencentcloudapi.com`
+  `DescribeInstances`, signed TC3-HMAC-SHA256, no SDK):** fc-bangkok's
+  instance (`ins-ldme28ac`) reports `IPv6Addresses: []`. Swept with no
+  filter across every Tencent region the fleet occupies —
+  `na-siliconvalley` (16 instances / 5 VPCs, covers sj/sj2/gpusj1-3/
+  cvmsj1-2), `na-ashburn` (7 instances / 2 VPCs, covers va/va2/va3),
+  `eu-frankfurt` (1 instance, fr), `ap-hongkong` (8 instances, hk) —
+  **every instance in every region reports `IPv6Addresses: []`**, matched
+  against `ansible/inventory/hosts.ini` by public IP.
+- **Network layer (`vpc.tencentcloudapi.com` `DescribeVpcs`/
+  `DescribeSubnets`):** fc-bangkok's VPC (`vpc-a1yzanws`) and subnet
+  (`subnet-hhyd2oux`) both report `Ipv6CidrBlock: ""` and
+  `Ipv6CidrBlockSet: []` — confirming no IPv6 CIDR has ever been
+  allocated at the network level, not merely unconfigured on an
+  interface. This is the exact "routed vs. configured" distinction the
+  original recommendation called out.
 
-1. On a real fleet node: check for a routed IPv6 prefix (`ip -6 addr
-   show`, and check the cloud provider's console/API for what's actually
-   routed, not just what's configured — a provider can route a prefix
-   without an interface being configured for all of it yet).
-2. If one exists: extend `raw_ports::RawPortAllocation` with an optional
-   bound IPv6 address, add a matching bind alongside each `0.0.0.0` call
-   in `raw_proxy.rs`/`raw_ports.rs`'s probe, and surface the assigned
-   address next to the existing `public_port` in the deployment record and
-   the dashboard's Network settings / raw-port-connections display.
-3. If none exists: this becomes an infrastructure request (ask the
-   hosting provider for routed IPv6 per node), not a follow-up coding
-   task — track it as that, not as "someone forgot to implement it."
+**Conclusion: no fleet node, on any provider region this platform runs in,
+has any IPv6 allocation at all — not a routed prefix, not even a single
+address.** This is a definitive "none exists," not an absence of
+evidence.
+
+## Recommended next step — updated
+
+Per this document's own decision tree, step 3 now applies as a confirmed
+finding rather than a fallback:
+
+1. ~~Check for a routed IPv6 prefix~~ — **done, see above: none exists,
+   anywhere in the fleet.**
+2. ~~If one exists, extend `raw_ports`/`raw_proxy` with an IPv6 bind~~ —
+   **does not apply**. Writing that code now, with no live prefix
+   anywhere to bind against, would be unverifiable — no real execution
+   could ever exercise it in this environment, which is exactly the
+   "half-built stub" this document opened by refusing to ship.
+3. **This is an infrastructure request, not a coding task.** Making
+   dedicated IPv6 real requires actually provisioning a routed `/64` (or
+   larger) on the VPC(s) above via Tencent Cloud's console/API
+   (`AssignIpv6CidrBlock` on each VPC, then a subnet-level IPv6 CIDR) —
+   a real, billable, production-network change to live VPCs carrying
+   tenant traffic, not a reversible local edit. That decision belongs to
+   the operator, not to an unattended code change.
 
 No code changes were made under this PRD row. Implementing a fake
 "dedicated IP" that's actually still the shared node address under a
 different label would be worse than not shipping anything — it would
-look done while providing nothing a user asked for.
+look done while providing nothing a user asked for. IPv4 dedicated
+addressing remains what it always was: a per-address purchase/attach
+decision with the same provider, orthogonal to this investigation.
