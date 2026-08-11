@@ -41,12 +41,24 @@ interface GhDetail {
 interface Template {
   name: string;
   desc: string;
-  repo: string; // git URL
-  root?: string; // subdir for monorepo examples
-  branch?: string;
   tag: string; // framework label for the monogram fallback
   color: string;
   icon?: string; // real logo path (in /public/frameworks)
+  // Git-clone template: repo URL (+ optional monorepo subdir/branch). Exactly
+  // one of `repo` or `image` is set per entry — never both.
+  repo?: string;
+  root?: string;
+  branch?: string;
+  // Pre-built container-image template — skips clone + build entirely (the
+  // `/v1/deploy/image` path). `port`/`protocol`/`env`/`memory` seed the
+  // configure screen so a game server or database needs no manual port
+  // entry, while staying fully editable there (real port-mapping support,
+  // not a fixed/hidden value).
+  image?: string;
+  port?: number;
+  protocol?: string;
+  env?: Record<string, string>;
+  memory?: string;
 }
 
 // Vercel-style starters: official `vercel/vercel` examples (built from the
@@ -68,6 +80,12 @@ const TEMPLATES: Template[] = [
   { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-typescript-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
   { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26", icon: "/frameworks/html5.png" },
   { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
+  // Pre-built image, not a git clone — see `examples/minecraft-server/` in
+  // this repo for the equivalent compose.yaml and the raw-TCP/`/tcp`-suffix
+  // explanation. Real Java Edition server (itzg/minecraft-server), a
+  // world-standard, actively-maintained public image — EULA=TRUE is
+  // Mojang's own required acceptance flag, not a platform invention.
+  { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
 ];
 
 function slug(s: string) {
@@ -319,43 +337,70 @@ export default function NewProjectPage() {
   // (/v1/deploy/image → start_named_deploy) creates the project, runs a build that
   // pulls the image + auto-detects the port (or uses the override) + attaches a
   // persistent ≥1 GB volume + injects env, and registers a real deployment.
-  async function deployFromImage(ref: string) {
+  // Shared core: both the unified source bar's free-form image deploy AND an
+  // image-based template's configure screen (Minecraft, etc.) POST through
+  // here — one place that actually calls /v1/deploy/image, so the two entry
+  // points can never drift on what fields they send.
+  async function runImageDeploy(opts: {
+    image: string;
+    project?: string;
+    port?: number;
+    protocol?: string;
+    memory?: string;
+    cpus?: string;
+    ports?: { container_port: number; protocol: string; label?: string }[];
+    env?: Record<string, string>;
+    template?: Template | null;
+  }) {
     setDeploying(true);
     setError("");
-    const env = urlEnv();
-    const p = parseInt(port, 10);
     try {
-      const filledExtras = extraPorts.filter((r) => r.port.trim());
-      const ports = filledExtras.length
-        ? [
-            { container_port: p, protocol: protocol || "http", label: undefined },
-            ...filledExtras.map((r) => ({
-              container_port: parseInt(r.port, 10),
-              protocol: r.protocol || "tcp",
-              label: r.label.trim() || undefined,
-            })),
-          ].filter((s) => Number.isFinite(s.container_port) && s.container_port > 0)
-        : undefined;
       const res = await apiSend<{ build_id: string; project: string }>("POST", "/v1/deploy/image", {
-        image: ref,
+        image: opts.image,
         creator: "you",
-        project: name.trim() ? slug(name) : undefined,
-        port: Number.isFinite(p) && p > 0 ? p : undefined,
-        protocol: protocol || undefined,
-        memory: memory.trim() || undefined,
-        cpus: cpus.trim() || undefined,
-        ports,
-        env: Object.keys(env).length ? env : undefined,
+        project: opts.project,
+        port: opts.port,
+        protocol: opts.protocol,
+        memory: opts.memory,
+        cpus: opts.cpus,
+        ports: opts.ports,
+        env: opts.env && Object.keys(opts.env).length ? opts.env : undefined,
       });
-      const guessed = slug(ref.split("/").pop()?.split(":")[0] || "app");
-      const proj = res.project || (name.trim() ? slug(name) : guessed);
+      const guessed = slug(opts.image.split("/").pop()?.split(":")[0] || "app");
+      const proj = res.project || opts.project || guessed;
       addPendingBuild({ id: res.build_id, project: proj, team: currentTeam(), env: "production" });
-      setPreparing({ template: null, team: currentTeam(), src: ref, dest: `${GIT_SCOPE}/${proj}` });
+      setPreparing({ template: opts.template ?? null, team: currentTeam(), src: opts.image, dest: `${GIT_SCOPE}/${proj}` });
       setTimeout(() => router.push(`/deploy/${res.build_id}`), PREPARING_MS);
     } catch (e) {
       setError(String(e));
       setDeploying(false);
     }
+  }
+
+  async function deployFromImage(ref: string) {
+    const env = urlEnv();
+    const p = parseInt(port, 10);
+    const filledExtras = extraPorts.filter((r) => r.port.trim());
+    const ports = filledExtras.length
+      ? [
+          { container_port: p, protocol: protocol || "http", label: undefined },
+          ...filledExtras.map((r) => ({
+            container_port: parseInt(r.port, 10),
+            protocol: r.protocol || "tcp",
+            label: r.label.trim() || undefined,
+          })),
+        ].filter((s) => Number.isFinite(s.container_port) && s.container_port > 0)
+      : undefined;
+    await runImageDeploy({
+      image: ref,
+      project: name.trim() ? slug(name) : undefined,
+      port: Number.isFinite(p) && p > 0 ? p : undefined,
+      protocol: protocol || undefined,
+      memory: memory.trim() || undefined,
+      cpus: cpus.trim() || undefined,
+      ports,
+      env,
+    });
   }
 
   async function connectGithub() {
@@ -381,7 +426,17 @@ export default function NewProjectPage() {
 
   // ----- Configure screen (after a template is selected) -----
   if (selected) {
-    return <ConfigureTemplate template={selected} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo, selected.branch, name, selected.root, env, selected)} deploying={deploying} error={error} />;
+    return selected.image ? (
+      <ConfigureImageTemplate
+        template={selected}
+        onBack={() => setSelected(null)}
+        onCreate={(opts) => runImageDeploy({ ...opts, image: selected.image!, template: selected })}
+        deploying={deploying}
+        error={error}
+      />
+    ) : (
+      <ConfigureTemplate template={selected as Template & { repo: string }} onBack={() => setSelected(null)} onCreate={(name, env) => deploy(selected.repo!, selected.branch, name, selected.root, env, selected)} deploying={deploying} error={error} />
+    );
   }
 
   return (
@@ -651,7 +706,9 @@ function ConfigureTemplate({
   deploying,
   error,
 }: {
-  template: Template;
+  // A git-clone template always has `repo` — only ConfigureImageTemplate
+  // (routed by `selected.image` at the call site) handles an image template.
+  template: Template & { repo: string };
   onBack: () => void;
   onCreate: (projectName: string, env: Record<string, string>) => void;
   deploying: boolean;
@@ -851,6 +908,219 @@ function ConfigureTemplate({
 
       <div className="mt-6 text-center">
         <Link href="/new" onClick={onBack} className="text-sm text-secondary hover:text-fg">Import a different Git Repository →</Link>
+      </div>
+    </div>
+  );
+}
+
+/** Configure screen for a pre-built container-image template (Minecraft,
+ *  etc.) — the git-clone `ConfigureTemplate` above doesn't fit: there's no
+ *  repo/branch to show, and the real per-template surface this needs is
+ *  port + protocol + extra ports (RCON, a query port, …) + env, all
+ *  pre-filled from the template but fully editable — real port mapping,
+ *  not a hidden fixed value. */
+function ConfigureImageTemplate({
+  template,
+  onBack,
+  onCreate,
+  deploying,
+  error,
+}: {
+  template: Template;
+  onBack: () => void;
+  onCreate: (opts: {
+    project?: string;
+    port?: number;
+    protocol?: string;
+    memory?: string;
+    ports?: { container_port: number; protocol: string; label?: string }[];
+    env?: Record<string, string>;
+  }) => void;
+  deploying: boolean;
+  error: string;
+}) {
+  const [projectName, setProjectName] = useState(slug(template.name));
+  const [port, setPort] = useState(String(template.port ?? ""));
+  const [protocol, setProtocol] = useState(template.protocol ?? "tcp");
+  const [memory, setMemory] = useState(template.memory ?? "");
+  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>([]);
+  const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>(() => {
+    const rows = Object.entries(template.env ?? {}).map(([key, value]) => ({ key, value }));
+    return rows.length ? rows : [{ key: "", value: "" }];
+  });
+  const [team, setTeam] = useState<string>(() => currentTeam());
+  useEffect(() => {
+    const sync = () => setTeam(currentTeam());
+    window.addEventListener("hive-team-changed", sync);
+    return () => window.removeEventListener("hive-team-changed", sync);
+  }, []);
+
+  const buildEnv = () => {
+    const out: Record<string, string> = {};
+    for (const { key, value } of envVars) if (key.trim()) out[key.trim()] = value;
+    return out;
+  };
+
+  return (
+    <div className="mx-auto max-w-2xl">
+      <button onClick={onBack} className="mb-6 inline-flex items-center gap-2 text-sm text-secondary hover:text-fg">
+        <ArrowLeft className="h-4 w-4" /> Back
+      </button>
+
+      <Card className="p-6 sm:p-8">
+        <h1 className="mb-6 text-2xl font-semibold tracking-tight">New Project</h1>
+
+        <div className="mb-6 flex items-start gap-4 rounded-xl border border-border bg-subtle/40 p-4">
+          <Monogram t={template} />
+          <div className="min-w-0 flex-1">
+            <div className="font-semibold">{template.name}</div>
+            <div className="mt-0.5 text-sm text-secondary">{template.desc}</div>
+            <div className="mt-2 font-mono text-xs text-muted">{template.image}</div>
+          </div>
+        </div>
+
+        <p className="mb-6 text-sm text-secondary">
+          A pre-built image — no build step. The platform pulls it directly and attaches a persistent
+          volume at <span className="font-mono">/data</span> that survives redeploys.
+        </p>
+
+        <div className="mb-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div>
+            <label className="mb-1.5 block text-sm text-secondary">Project Name</label>
+            <Input value={projectName} placeholder="auto-generated if blank" onChange={(e) => setProjectName(slug(e.target.value))} />
+          </div>
+          <div>
+            <label className="mb-1.5 block text-sm text-secondary">Team</label>
+            <TeamSelect value={team} onChange={setTeam} />
+          </div>
+        </div>
+
+        {/* Port mapping — the container port + protocol this template's
+            primary service listens on. A raw TCP/UDP protocol gets its own
+            dedicated public port allocated at deploy time (shown on the
+            deployment page); HTTP-family protocols ride the shared
+            gateway instead. */}
+        <div className="mb-5">
+          <label className="mb-1.5 block text-sm text-secondary">Port mapping</label>
+          <div className="flex items-center gap-2">
+            <Input className="w-32" placeholder="Container port" value={port} onChange={(e) => setPort(e.target.value.replace(/[^0-9]/g, ""))} />
+            <select
+              value={protocol}
+              onChange={(e) => setProtocol(e.target.value)}
+              className="rounded-md border border-border bg-card px-2 py-2 text-sm"
+            >
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="ws">WebSocket</option>
+              <option value="wss">WebSocket (TLS)</option>
+              <option value="grpc">gRPC</option>
+              <option value="tcp">Raw TCP (databases, game servers)</option>
+              <option value="udp">Raw UDP (e.g. Minecraft Bedrock)</option>
+            </select>
+            <Input className="w-28" placeholder="Memory (e.g. 3g)" value={memory} onChange={(e) => setMemory(e.target.value)} />
+          </div>
+          {(protocol === "tcp" || protocol === "udp") && (
+            <p className="mt-1.5 text-xs text-muted">
+              A raw {protocol.toUpperCase()} service gets its own public <span className="font-mono">host:port</span> —
+              shown on the deployment page once built.
+            </p>
+          )}
+          {extraPorts.map((row, i) => (
+            <div key={i} className="mt-2 flex items-center gap-2">
+              <Input className="w-32 text-xs" placeholder="Extra port" value={row.port}
+                onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, port: e.target.value.replace(/[^0-9]/g, "") } : r)))} />
+              <select
+                value={row.protocol}
+                onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, protocol: e.target.value } : r)))}
+                className="rounded-md border border-border bg-card px-2 py-1.5 text-xs"
+              >
+                <option value="tcp">Raw TCP</option>
+                <option value="udp">Raw UDP</option>
+                <option value="grpc">gRPC</option>
+                <option value="http">HTTP</option>
+              </select>
+              <Input className="flex-1 text-xs" placeholder="Label (optional, e.g. rcon)" value={row.label}
+                onChange={(e) => setExtraPorts((c) => c.map((r, j) => (j === i ? { ...r, label: e.target.value } : r)))} />
+              <button type="button" className="text-muted hover:text-fg" onClick={() => setExtraPorts((c) => c.filter((_, j) => j !== i))}>
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setExtraPorts((c) => [...c, { port: "", protocol: "tcp", label: "" }])}
+            className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-secondary hover:bg-subtle"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add another port
+          </button>
+        </div>
+
+        {/* Environment Variables — pre-filled from the template (e.g. this
+            image's required EULA=TRUE) but fully editable/removable. */}
+        <div className="mb-6">
+          <label className="mb-1.5 flex items-center gap-2 text-sm text-secondary">
+            <KeyRound className="h-4 w-4 text-muted" /> Environment Variables
+          </label>
+          <div className="flex flex-col gap-2">
+            {envVars.map((row, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <Input value={row.key} placeholder="KEY" className="flex-1 font-mono text-xs"
+                  onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)))} />
+                <Input value={row.value} placeholder="value" className="flex-1 font-mono text-xs"
+                  onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))} />
+                <button type="button" className="shrink-0 rounded-md p-2 text-muted hover:bg-subtle hover:text-fg"
+                  onClick={() => setEnvVars((rows) => (rows.length <= 1 ? [{ key: "", value: "" }] : rows.filter((_, j) => j !== i)))}>
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={() => setEnvVars((rows) => [...rows, { key: "", value: "" }])}
+            className="mt-3 inline-flex items-center gap-1.5 rounded-md border border-border px-2.5 py-1.5 text-xs text-secondary hover:bg-subtle"
+          >
+            <Plus className="h-3.5 w-3.5" /> Add Variable
+          </button>
+        </div>
+
+        {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
+
+        <Button
+          onClick={async () => {
+            if (typeof window !== "undefined") {
+              await switchTeam(team === "personal" ? "__personal__" : team);
+            }
+            const p = parseInt(port, 10);
+            const filledExtras = extraPorts.filter((r) => r.port.trim());
+            const ports = filledExtras.length
+              ? [
+                  { container_port: p, protocol: protocol || "tcp", label: undefined },
+                  ...filledExtras.map((r) => ({
+                    container_port: parseInt(r.port, 10),
+                    protocol: r.protocol || "tcp",
+                    label: r.label.trim() || undefined,
+                  })),
+                ].filter((s) => Number.isFinite(s.container_port) && s.container_port > 0)
+              : undefined;
+            onCreate({
+              project: projectName.trim() ? slug(projectName) : undefined,
+              port: Number.isFinite(p) && p > 0 ? p : undefined,
+              protocol: protocol || undefined,
+              memory: memory.trim() || undefined,
+              ports,
+              env: buildEnv(),
+            });
+          }}
+          disabled={deploying}
+          className="w-full justify-center bg-fg py-2.5 text-bg"
+        >
+          {deploying ? <><Loader2 className="h-4 w-4 animate-spin" /> Creating…</> : "Create"}
+        </Button>
+      </Card>
+
+      <div className="mt-6 text-center">
+        <Link href="/new" onClick={onBack} className="text-sm text-secondary hover:text-fg">Choose a different template →</Link>
       </div>
     </div>
   );

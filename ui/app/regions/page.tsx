@@ -2,10 +2,13 @@
 
 import { Cpu, Radio, Database } from "lucide-react";
 import { Card, Badge, PageHeader, Table, Th, Td } from "@/components/ui";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { usePoll, type NodeInfo } from "@/lib/api";
-import { timeAgo } from "@/lib/utils";
-import { RegionMap, type MapMarker, type SatelliteMarker, PALETTE, GPU_COLOR } from "@/components/region-map";
+import { timeAgo, cn } from "@/lib/utils";
+import { type MapMarker, type SatelliteMarker, PALETTE, GPU_COLOR } from "@/components/region-map";
+import { WorldChoropleth } from "@/components/world-choropleth";
+import { RegionsCommandBar } from "@/components/regions-command-bar";
+import { useNodeEventLog } from "@/lib/node-event-log";
 import type { BrowserPresence } from "@/lib/run-node-client";
 
 // Coarse continent classifier — mirrors hive_edge::continent_of so the UI labels
@@ -66,12 +69,29 @@ export default function RegionsPage() {
   }, []);
   const regions = Array.from(new Set(list.map((n) => n.region))).sort();
 
+  // Command bar: a region-pill filter and a free-text search that highlights
+  // (never hides) a match on the map — matching the reference design's
+  // filter pills + search box, adapted onto real region/node data.
+  const [query, setQuery] = useState("");
+  const [activeRegion, setActiveRegion] = useState<string | null>(null);
+  const [connectFlash, setConnectFlash] = useState(false);
+  const scopedList = activeRegion ? list.filter((n) => n.region === activeRegion) : list;
+  // browser peers carry no region label, so a region filter hides them all —
+  // memoized so it's not a fresh [] reference on every render (it feeds the
+  // highlightId useMemo below).
+  const scopedPresence = useMemo(
+    () => (activeRegion ? [] : (presenceFeed?.presence ?? [])),
+    [activeRegion, presenceFeed],
+  );
+
+  const eventLog = useNodeEventLog(nodes);
+
   // One colored marker per node, placed at its REAL reported coordinates. Nodes
   // sharing a location are fanned out + uniquely colored by the map component.
   // GPU nodes are pinned to GPU_COLOR; capability flags drive the small
   // relay/GuardianDB badges so the constellation shows which nodes provide
   // which mesh services, not just where they are located.
-  const markers: MapMarker[] = list
+  const markers: MapMarker[] = scopedList
     .filter((n) => typeof n.lat === "number" && typeof n.lon === "number")
     .map((n, i) => ({
       id: n.id,
@@ -86,11 +106,11 @@ export default function RegionsPage() {
 
   // Color lookup so the table swatches match the map markers.
   const colorByNode: Record<string, string> = {};
-  list.forEach((n, i) => { colorByNode[n.id] = nodeColor(n, i); });
+  scopedList.forEach((n, i) => { colorByNode[n.id] = nodeColor(n, i); });
 
   // Satellites: only records with a shared (non-null) location — a browser
   // that declined location sharing still runs, it just never gets a dot.
-  const satellites: SatelliteMarker[] = presence
+  const satellites: SatelliteMarker[] = scopedPresence
     .filter((p) => typeof p.lat === "number" && typeof p.lon === "number")
     .map((p) => ({
       id: p.endpoint_id,
@@ -100,6 +120,33 @@ export default function RegionsPage() {
       state: p.state,
       ageMs: p.located_ms ? now - p.located_ms : undefined,
     }));
+
+  // First node or browser peer whose name/id/city/region matches the search
+  // box — drawn with an emphasis ring on the map, never used to hide anything
+  // else (a wrong/partial query should never make the fleet look smaller).
+  const highlightId = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    const node = scopedList.find(
+      (n) =>
+        n.name.toLowerCase().includes(q) ||
+        n.id.toLowerCase().includes(q) ||
+        (n.peer_id ?? "").toLowerCase().includes(q) ||
+        (n.city ?? "").toLowerCase().includes(q) ||
+        (n.country ?? "").toLowerCase().includes(q),
+    );
+    if (node) return node.id;
+    const sat = scopedPresence.find(
+      (p) => p.display_label.toLowerCase().includes(q) || p.endpoint_id.toLowerCase().includes(q),
+    );
+    return sat?.endpoint_id ?? null;
+  }, [query, scopedList, scopedPresence]);
+
+  function handleConnectClick() {
+    document.getElementById("connect-a-node")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    setConnectFlash(true);
+    window.setTimeout(() => setConnectFlash(false), 1600);
+  }
 
   return (
     <div>
@@ -112,10 +159,18 @@ export default function RegionsPage() {
         {!regions.length && <span className="text-sm text-muted">discovering…</span>}
       </div>
 
-      {/* Live geographic map of the mesh. */}
-      <Card className="mb-5 p-0">
-        <div className="relative overflow-hidden rounded-xl bg-slate-50 dark:bg-[#070b14]">
-          <RegionMap markers={markers} satellites={satellites} autoColor />
+      {/* Command bar + live geographic choropleth of the mesh. */}
+      <Card className="mb-5 overflow-hidden p-0">
+        <RegionsCommandBar
+          query={query}
+          onQueryChange={setQuery}
+          regions={regions.map((r) => ({ value: r, label: displayRegion(r) }))}
+          activeRegion={activeRegion}
+          onRegionSelect={setActiveRegion}
+          onConnectClick={handleConnectClick}
+        />
+        <div className="relative overflow-hidden">
+          <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
             {markers.length} node{markers.length === 1 ? "" : "s"} live on the mesh
@@ -144,6 +199,26 @@ export default function RegionsPage() {
             </span>
           </div>
         </div>
+        {/* Log — real, live-derived join/leave/health transitions diffed from
+            the /v1/nodes poll (see lib/node-event-log.ts); never fabricated
+            lines. Matches the reference design's log panel below the map. */}
+        <div className="max-h-40 overflow-y-auto border-t border-border px-4 py-2 font-mono text-[11px] leading-5 text-secondary">
+          {eventLog.length === 0 && <div className="text-muted">No mesh events observed yet this session.</div>}
+          {eventLog.map((e) => (
+            <div key={e.key} className="flex gap-2">
+              <span className="shrink-0 text-muted">{timeAgo(e.ts)}</span>
+              <span
+                className={cn(
+                  e.tone === "join" && "text-emerald-600 dark:text-emerald-400",
+                  e.tone === "leave" && "text-muted",
+                  e.tone === "warn" && "text-amber-600 dark:text-amber-400",
+                )}
+              >
+                {e.message}
+              </span>
+            </div>
+          ))}
+        </div>
       </Card>
 
       <Table>
@@ -153,7 +228,7 @@ export default function RegionsPage() {
           </tr>
         </thead>
         <tbody>
-          {list.map((n) => {
+          {scopedList.map((n) => {
             const loc = n.city ? `${n.city}${n.country ? `, ${n.country}` : ""}` : "—";
             const continent = typeof n.lat === "number" && typeof n.lon === "number"
               ? continentOf(n.lat, n.lon) : "Unknown";
@@ -219,11 +294,19 @@ export default function RegionsPage() {
               </tr>
             );
           })}
-          {!list.length && <tr><Td className="text-muted">No nodes.</Td></tr>}
+          {!scopedList.length && (
+            <tr><Td className="text-muted">{list.length ? `No nodes in ${displayRegion(activeRegion ?? "")}.` : "No nodes."}</Td></tr>
+          )}
         </tbody>
       </Table>
 
-      <Card className="mt-4 text-sm text-muted">
+      <Card
+        id="connect-a-node"
+        className={cn(
+          "mt-4 text-sm text-muted transition-shadow",
+          connectFlash && "ring-2 ring-accent",
+        )}
+      >
         Add a node: run <code className="text-fg">hive-cloud --name node-c --peer http://&lt;this-mac-ip&gt;:8786</code> on
         another machine. Its region is auto-derived from its real location.
       </Card>

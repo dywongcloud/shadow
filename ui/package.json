@@ -16,6 +16,7 @@
     "@xyflow/react": "^12.11.2",
     "cbor-x": "^1.6.4",
     "clsx": "2.1.1",
+    "d3-geo": "3.1.1",
     "express": "^5.2.1",
     "geist": "^1.7.2",
     "lucide-react": "0.424.0",
@@ -23,12 +24,16 @@
     "next-themes": "^0.4.6",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
-    "tailwind-merge": "2.5.2"
+    "tailwind-merge": "2.5.2",
+    "topojson-client": "3.1.0",
+    "world-atlas": "2.0.2"
   },
   "devDependencies": {
+    "@types/d3-geo": "3.1.1",
     "@types/node": "20.14.14",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@types/topojson-client": "3.1.5",
     "autoprefixer": "10.4.20",
     "eslint": "^9",
     "eslint-config-next": "^16.2.10",

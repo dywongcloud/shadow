@@ -10,7 +10,9 @@ import Image from "next/image";
 export interface CloneTemplate {
   name: string;
   desc: string;
-  repo: string;
+  // Git-clone templates carry `repo` (+ optional monorepo subdir/branch); a
+  // pre-built image template has neither — see the `repo`-gated branch below.
+  repo?: string;
   root?: string;
   branch?: string;
   tag: string;
@@ -78,7 +80,7 @@ export function PreparingDeployment({
       {/* Collapsed New Project summary */}
       <Card className="mb-6 p-6 sm:p-8">
         <h1 className="mb-6 text-2xl font-semibold tracking-tight">New Project</h1>
-        {template ? (
+        {template && template.repo ? (
           <div className="flex items-start gap-4 rounded-xl border border-border bg-subtle/40 p-4">
             <Monogram t={template} />
             <div className="min-w-0 flex-1">
@@ -95,6 +97,18 @@ export function PreparingDeployment({
                 <span className="flex items-center gap-1.5 text-secondary"><GitBranch className="h-3.5 w-3.5" /> {template.branch || "main"}</span>
                 {template.root && <span className="flex items-center gap-1.5 text-secondary"><FolderGit2 className="h-3.5 w-3.5" /> {template.root}</span>}
               </div>
+            </div>
+          </div>
+        ) : template ? (
+          // Pre-built image template (no git clone) — the monogram + name/desc
+          // still identify what's being prepared, without any GitHub-specific
+          // chrome that would misrepresent an image pull as a clone.
+          <div className="flex items-center gap-3 rounded-xl border border-border bg-subtle/40 p-4">
+            <Monogram t={template} />
+            <div className="min-w-0 flex-1">
+              <div className="font-semibold">{template.name}</div>
+              <div className="mt-0.5 text-sm text-secondary">{template.desc}</div>
+              <div className="mt-1 font-mono text-xs text-muted">{src}</div>
             </div>
           </div>
         ) : (
