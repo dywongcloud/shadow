@@ -22,11 +22,15 @@ interface WebdavTokenResp {
  * reveal. Masked by default with a reveal toggle since it's a real
  * credential (the database-detail page's Reveal-secrets precedent).
  *
- * The backend hands back a path relative to ITS OWN origin
- * (`/v1/drive/webdav/<project>`) — not the dashboard's. `/cloud/:path*` is
- * this dashboard's own same-origin proxy straight to that backend
- * (`next.config.mjs`'s rewrite), so prefixing with it is a real, working
- * mount URL rather than an invented domain.
+ * The backend hands back a FULLY QUALIFIED URL against its own public API
+ * host (`CloudState::api_base()`), not a relative path — a real WebDAV
+ * client (Finder/Explorer/rclone/davfs2) is a native OS network client with
+ * no CORS restriction, so it must NOT go through the dashboard's same-origin
+ * `/cloud` proxy (that proxy exists only to avoid CORS for the dashboard's
+ * own browser-side fetches, and does not reliably pass through WebDAV's
+ * non-standard methods like PROPFIND/MKCOL — confirmed live: PROPFIND
+ * through `/cloud` times out, the same request against the direct API host
+ * answers correctly).
  */
 export function WebdavPanel({ project }: { project: string }) {
   const [cred, setCred] = useState<WebdavTokenResp | null>(null);
@@ -58,9 +62,6 @@ export function WebdavPanel({ project }: { project: string }) {
     }
   }
 
-  const relPath = cred?.webdav_url ?? `/v1/drive/webdav/${project}`;
-  const url = typeof window !== "undefined" ? `${window.location.origin}/cloud${relPath}` : relPath;
-
   return (
     <Card>
       <div className="mb-3">
@@ -71,8 +72,12 @@ export function WebdavPanel({ project }: { project: string }) {
         </p>
       </div>
       <div className="flex flex-col gap-3">
-        <CopyField label="Server address" value={url} copied={copied === "address"} onCopy={() => copy("address", url)} />
-        <CopyField label="Username" value={project} copied={copied === "username"} onCopy={() => copy("username", project)} />
+        {cred && (
+          <>
+            <CopyField label="Server address" value={cred.webdav_url} copied={copied === "address"} onCopy={() => copy("address", cred.webdav_url)} />
+            <CopyField label="Username" value={project} copied={copied === "username"} onCopy={() => copy("username", project)} />
+          </>
+        )}
         <div>
           <div className="mb-1 block text-xs font-medium text-secondary">Password</div>
           {cred ? (

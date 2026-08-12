@@ -580,7 +580,15 @@ async fn webdav_token_mint(
         "project": project,
         "username": project,
         "password": token,
-        "webdav_url": format!("/v1/drive/webdav/{project}"),
+        // A real WebDAV client (Finder/Explorer/rclone/davfs2) is a native OS
+        // network client, not a browser page -- it has no CORS restriction
+        // and no reason to route through the dashboard's same-origin `/cloud`
+        // proxy (which exists ONLY to avoid CORS for the dashboard's own
+        // browser-side fetches, and does not reliably pass through WebDAV's
+        // non-standard methods like PROPFIND/MKCOL). Hand back the real,
+        // directly-reachable API host so a client mounts against it, not a
+        // relative path the frontend would have to guess how to qualify.
+        "webdav_url": format!("{}/v1/drive/webdav/{project}", c.api_base()),
     })))
 }
 
