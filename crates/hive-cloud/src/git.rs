@@ -2001,7 +2001,9 @@ async fn run_build(
 
     // Inject project env vars + function settings.
     let env = cloud.projects.env_map(&manifest.project);
-    let fsettings = cloud.projects.get(&manifest.project).functions;
+    let project_settings = cloud.projects.get(&manifest.project);
+    let dedicated_ipv4_alloc = project_settings.dedicated_ipv4;
+    let fsettings = project_settings.functions;
     if !env.is_empty() {
         log(format!("Loaded {} environment variable(s).", env.len()));
     }
@@ -2017,6 +2019,22 @@ async fn run_build(
         // is preserved — settings can only turn GPU ON, never strip a
         // function's own declared need.
         f.gpu = f.gpu || fsettings.gpu;
+        // Dedicated public IPv4 is a PAID add-on, not a free fluid.json
+        // opt-in like GPU: the project setting is the ONLY source (an
+        // assignment, not an OR) — a fluid.json author can no longer
+        // self-grant the feature by writing `dedicatedIpv4: true` in their
+        // own manifest. The setting itself is only ever flipped on by
+        // `tencent_eip::provision_from_checkout` after a real purchase.
+        f.dedicated_ipv4 = fsettings.dedicated_ipv4;
+        // Stamp (or clear) the actual allocated address alongside the flag —
+        // every redeploy re-adopts the SAME claim from `ProjectSettings`
+        // rather than purchasing a new one (`Manifest::dedicated_ipv4_binding`
+        // hoists whichever function carries this onto `DeploymentInfo`).
+        f.dedicated_ipv4_alloc = if f.dedicated_ipv4 {
+            dedicated_ipv4_alloc.clone()
+        } else {
+            None
+        };
         // Fluid Compute (the project's `fluid_enabled` toggle): when ON (default),
         // one warm instance serves MANY concurrent requests (in-instance
         // concurrency — ideal for I/O-bound work like LLM/DB calls that sit idle

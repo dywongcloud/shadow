@@ -112,6 +112,7 @@ openraft = { version = "0.9", optional = true }
 # feature). Off by default; mounts /v1/zkauth/* and is not part of real auth.
 hive-zkauth = { workspace = true, optional = true }
 rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
+dav-server = { version = "0.11.0", default-features = false }
 
 [features]
 # `zkauth` is DEFAULT-ON: it implements preview-deployment access protection

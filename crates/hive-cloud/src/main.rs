@@ -23,6 +23,7 @@ mod databases;
 mod db_gateway;
 mod db_replicate;
 mod db_rest;
+mod dedicated_ipv4_listener;
 mod discovery;
 mod dns;
 mod dns_geo;
@@ -79,6 +80,7 @@ mod store_sync;
 mod supervise;
 mod svcgraph;
 mod teams;
+mod tencent_eip;
 mod udp_relay;
 mod vercel_dns;
 mod webhooks;
@@ -1593,6 +1595,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+
+        // Dedicated public IPv4 addon (paid): one additional HTTPS listener
+        // per address this node owns, reusing this SAME `public` router (edge
+        // pipeline + SNI resolver included) — never a bare TCP splice, which
+        // would bypass WAF/bot defense entirely. See
+        // `dedicated_ipv4_listener.rs`'s module doc for the full reasoning.
+        dedicated_ipv4_listener::spawn(cloud.clone(), public.clone());
     }
 
     tracing::info!(region=%region, node=%args.name, public=%args.listen, admin=%args.admin, tls=%tls_addr, "hive-cloud node up");

@@ -131,6 +131,15 @@ pub struct FunctionSettings {
     /// settings from before this field existed deserializes to off.
     #[serde(default)]
     pub gpu: bool,
+    /// Dedicated public IPv4: this project's functions get a real Tencent
+    /// Cloud EIP purchased/associated at deploy time (`hive-cloud::tencent_eip`),
+    /// mirroring `gpu`'s shape exactly. Default off; absent in stored settings
+    /// from before this field existed deserializes to off. Settings can only
+    /// turn this ON, never strip a function's own declared
+    /// `fluid.json functions[].dedicatedIpv4` need (the `gpu` OR-merge
+    /// precedent, `git.rs`).
+    #[serde(default)]
+    pub dedicated_ipv4: bool,
 }
 fn default_vcpus() -> u32 {
     1
@@ -149,6 +158,7 @@ impl Default for FunctionSettings {
             vcpus: 1,
             memory_mib: 2048,
             gpu: false,
+            dedicated_ipv4: false,
         }
     }
 }
@@ -240,6 +250,16 @@ pub struct ProjectSettings {
     /// fluid.json `container` block always wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container: Option<ContainerSettings>,
+    /// The project's paid dedicated public IPv4 allocation, if the addon was
+    /// purchased (`tencent_eip::provision_from_checkout`). This — not a
+    /// fluid.json flag — is now the ONLY source that can turn
+    /// `FunctionConfig::dedicated_ipv4` on for a deploy (`git.rs`'s merge):
+    /// a tenant declaring `functions[].dedicatedIpv4` in fluid.json can no
+    /// longer self-grant the feature for free. `None` until purchased; stays
+    /// `Some` across redeploys so the manifest re-adopts the same address
+    /// instead of buying a second one (`Manifest::dedicated_ipv4_binding`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_ipv4: Option<fluid_core::DedicatedIpv4>,
     #[serde(default)]
     pub domains: Vec<String>,
     /// Team that owns this project (slug). Defaults to "personal".
@@ -316,6 +336,7 @@ impl Default for ProjectSettings {
             inference: None,
             browser_db: None,
             container: None,
+            dedicated_ipv4: None,
             domains: Vec::new(),
             team: default_team(),
             production_branch: String::new(),
@@ -442,6 +463,17 @@ impl ProjectStore {
     pub fn set_container(&self, project: &str, spec: Option<ContainerSettings>) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().container = spec;
+    }
+
+    /// See [`ProjectSettings::dedicated_ipv4`]. Called exactly once per
+    /// project by `tencent_eip::provision_from_checkout` on a successful
+    /// allocation — this row IS the durable idempotency claim (replicated
+    /// fleet-wide via `store_sync::REGISTRY`'s "projects" entry), so a
+    /// second confirmation firing for the same project is a no-op read, not
+    /// a second Tencent purchase.
+    pub fn set_dedicated_ipv4(&self, project: &str, alloc: Option<fluid_core::DedicatedIpv4>) {
+        let mut m = self.map.write();
+        m.entry(project.to_string()).or_default().dedicated_ipv4 = alloc;
     }
 
     pub fn set_git_ci(&self, project: &str, status: GitCiStatus) {

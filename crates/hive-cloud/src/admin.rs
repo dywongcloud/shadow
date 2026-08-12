@@ -3609,47 +3609,71 @@ pub(crate) async fn dispatch_project_delete(
     if node == c.node_name {
         return; // local copy already handled by the caller
     }
-    // Bind out of the lock FIRST so no parking_lot guard is held across the await
-    // (the spawned cascade future must be `Send`).
-    let admin = c.node_admins.read().get(node).cloned();
-    if let Some(admin) = admin {
-        let _ = c
-            .http
-            .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
-            .header("x-hive-team", team.to_string())
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await;
-        return;
-    }
-    // iroh mesh path: resolve the peer's cryptographic identity + address from the
-    // registry and dispatch the delete as a gossip POST (team rides as `?team=`).
-    let target = c
-        .registry
-        .nodes()
-        .into_iter()
-        .find(|n| n.name == node)
-        .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
-    if let Some((id, addr)) = target {
-        let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
-        // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
-        if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-            .await
-            .is_none()
-        {
+    // A delete is a ONE-SHOT broadcast — unlike a database write mirror
+    // (`db_replicate::send_mirrored`), there is no "next delete" to naturally
+    // retry a dropped attempt, so a single failed hop here left the peer
+    // serving the deleted project FOREVER. Try HTTP admin first (when known),
+    // fall back to the iroh mesh on failure instead of the two being mutually
+    // exclusive by transport availability, and retry the whole pair a few
+    // times with backoff so one transient blip on both transports in the same
+    // instant doesn't strand the peer either.
+    const ATTEMPTS: u32 = 3;
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+        }
+        // Bind out of the lock FIRST so no parking_lot guard is held across the
+        // await (the spawned cascade future must be `Send`).
+        let admin = c.node_admins.read().get(node).cloned();
+        if let Some(admin) = &admin {
+            let ok = c
+                .http
+                .delete(format!("{admin}/v1/projects/{project}?cascade=false"))
+                .header("x-hive-team", team.to_string())
+                .timeout(std::time::Duration::from_secs(15))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false);
+            if ok {
+                return;
+            }
+        }
+        // iroh mesh path: resolve the peer's cryptographic identity + address from
+        // the registry and dispatch the delete as a gossip POST (team rides as
+        // `?team=`). Tried even when an admin URL exists — a node reachable over
+        // one transport but not the other should not be abandoned.
+        let target = c
+            .registry
+            .nodes()
+            .into_iter()
+            .find(|n| n.name == node)
+            .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+        if let Some((id, addr)) = target {
+            let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
+            // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
+            if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
+                .await
+                .is_some()
+            {
+                return;
+            }
+        } else if admin.is_none() {
             tracing::warn!(
                 node,
                 project,
-                "project delete dispatch over iroh failed (peer will be retried on next delete)"
+                "project delete: no route to hosting node (no admin URL, no iroh identity)"
             );
+            return; // no route exists at all; retrying won't help until routes change
         }
-    } else {
-        tracing::warn!(
-            node,
-            project,
-            "project delete: no route to hosting node (no admin URL, no iroh identity)"
-        );
     }
+    tracing::warn!(
+        node,
+        project,
+        attempts = ATTEMPTS,
+        "project delete dispatch failed on every transport after retries — peer may keep \
+         serving the deleted project until it receives a delete for another reason"
+    );
 }
 
 /// LOCAL-ONLY project teardown used by the mesh delete arm (the receiving side of
@@ -11267,7 +11291,7 @@ pub(crate) async fn billing_ledger(
 
 #[derive(Deserialize)]
 struct CheckoutReq {
-    /// "plan" | "credits"
+    /// "plan" | "credits" | "addon"
     #[serde(default = "default_kind")]
     kind: String,
     #[serde(default)]
@@ -11275,6 +11299,13 @@ struct CheckoutReq {
     /// For credit top-ups, the amount in cents.
     #[serde(default)]
     amount_cents: Option<u64>,
+    /// For `kind == "addon"`: which addon (only `tencent_eip::SKU` is real today).
+    #[serde(default)]
+    sku: Option<String>,
+    /// For `kind == "addon"`: the target resource id (a project name, for
+    /// "dedicated_ipv4") — must be a project the caller's tenant owns.
+    #[serde(default)]
+    target: Option<String>,
 }
 fn default_kind() -> String {
     "plan".into()
@@ -11285,31 +11316,55 @@ async fn billing_checkout(
     headers: HeaderMap,
     claims: Option<axum::Extension<crate::auth::Claims>>,
     Json(req): Json<CheckoutReq>,
-) -> Json<Value> {
+) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let (plan, amount, label, price_id) = if req.kind == "credits" {
-        let amt = req.amount_cents.unwrap_or(1000);
-        (
-            "".to_string(),
-            amt,
-            format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
-            None,
-        )
-    } else {
-        let plan = req.plan.unwrap_or_else(|| "pro".into());
-        let spec = crate::billing::plan_spec(&plan);
-        (
-            plan,
-            spec.price_cents,
-            format!("OpenEdge {} plan", spec.name),
-            spec.stripe_price_id,
-        )
+    let mut target = String::new();
+    let (plan, amount, label, price_id): (String, u64, String, Option<String>) = match req
+        .kind
+        .as_str()
+    {
+        "credits" => {
+            let amt = req.amount_cents.unwrap_or(1000);
+            (
+                "".to_string(),
+                amt,
+                format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
+                None,
+            )
+        }
+        "addon" => {
+            if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
+                return Err(StatusCode::BAD_REQUEST);
+            }
+            target = req.target.clone().unwrap_or_default();
+            if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
+                return Err(StatusCode::FORBIDDEN);
+            }
+            (
+                "".to_string(),
+                crate::tencent_eip::PRICE_CENTS,
+                format!("Dedicated IPv4 — {target}"),
+                crate::tencent_eip::price_id(),
+            )
+        }
+        _ => {
+            let plan = req.plan.unwrap_or_else(|| "pro".into());
+            let spec = crate::billing::plan_spec(&plan);
+            (
+                plan,
+                spec.price_cents,
+                format!("OpenEdge {} plan", spec.name),
+                spec.stripe_price_id.map(|s| s.to_string()),
+            )
+        }
     };
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
-    // path always did for this case.
-    if amount == 0 {
+    // path always did for this case. Never reachable for "addon" (`PRICE_CENTS`
+    // is a nonzero const), guarded explicitly anyway since `apply_plan_everywhere`
+    // would be the wrong effect entirely for an addon purchase.
+    if amount == 0 && req.kind != "addon" {
         apply_plan_everywhere(&c, &t, &plan);
         let acc = c.billing.account(&t);
         c.audit.record(
@@ -11321,9 +11376,18 @@ async fn billing_checkout(
             "switched to a free plan (no checkout needed)",
         );
         crate::persist::persist(&c);
-        return Json(json!({ "url": "", "mock": false, "applied": true, "account": acc }));
+        return Ok(Json(
+            json!({ "url": "", "mock": false, "applied": true, "account": acc }),
+        ));
     }
-    let co = c.billing.open_checkout(&t, &req.kind, &plan, amount);
+    let sku = if req.kind == "addon" {
+        crate::tencent_eip::SKU
+    } else {
+        ""
+    };
+    let co = c
+        .billing
+        .open_checkout_full(&t, &req.kind, &plan, amount, sku, &target);
 
     // Real Stripe Checkout when configured; otherwise the local mock checkout.
     if crate::billing::stripe_configured() {
@@ -11331,20 +11395,26 @@ async fn billing_checkout(
         let success = format!("{base}/billing?success={}", co.id);
         let cancel = format!("{base}/billing?canceled=1");
         match crate::billing::stripe_checkout(
-            &c.http, price_id, amount, &label, &success, &cancel, &co.id,
+            &c.http,
+            price_id.as_deref(),
+            amount,
+            &label,
+            &success,
+            &cancel,
+            &co.id,
         )
         .await
         {
             Ok((url, stripe_session_id)) => {
                 c.billing.attach_stripe_session(&co.id, &stripe_session_id);
-                return Json(json!({ "url": url, "mock": false, "session": co.id }));
+                return Ok(Json(json!({ "url": url, "mock": false, "session": co.id })));
             }
             Err(e) => tracing::warn!(error=%e, "stripe checkout failed; falling back to mock"),
         }
     }
-    Json(
+    Ok(Json(
         json!({ "url": format!("/billing/checkout?session={}", co.id), "mock": true, "session": co.id }),
-    )
+    ))
 }
 
 pub(crate) async fn billing_checkout_get(
@@ -11409,10 +11479,24 @@ async fn billing_confirm(
         .billing
         .confirm_checkout(&req.session)
         .ok_or(StatusCode::NOT_FOUND)?;
-    // `confirm_checkout` only moves the billing half; mirror it into the team
-    // record so a completed upgrade is not half-applied.
-    if co.kind != "credits" {
-        apply_plan_everywhere(&c, &co.tenant, &co.plan);
+    // `confirm_checkout` only moves the billing half; the effect for a
+    // completed "plan"/"addon" checkout is dispatched here — never inside
+    // `confirm_checkout` itself, same single-writer split as the "credits"
+    // branch it already draws.
+    let mut addon_error: Option<String> = None;
+    match co.kind.as_str() {
+        "credits" => {}
+        "addon" => {
+            if let Err(e) = crate::tencent_eip::provision_from_checkout(&c, &co).await {
+                // Payment already succeeded (verified above) and the checkout
+                // is already consumed — never fail this request over a
+                // provisioning error, which would read as "you weren't
+                // charged." Surface it instead so the caller can retry/support.
+                tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed after payment confirmed");
+                addon_error = Some(e);
+            }
+        }
+        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
     }
     if !stripe_customer.is_empty() || !stripe_subscription.is_empty() {
         c.billing
@@ -11432,7 +11516,9 @@ async fn billing_confirm(
         ),
     );
     crate::persist::persist(&c);
-    Ok(Json(json!({ "ok": true, "account": acc })))
+    Ok(Json(
+        json!({ "ok": true, "account": acc, "addon_error": addon_error }),
+    ))
 }
 
 /// Stripe's server-to-server notification of billing events — the
@@ -11486,8 +11572,16 @@ async fn billing_webhook(
                 .unwrap_or("");
             if !checkout_id.is_empty() {
                 if let Some((co, _acc)) = c.billing.confirm_checkout(checkout_id) {
-                    if co.kind != "credits" {
-                        apply_plan_everywhere(&c, &co.tenant, &co.plan);
+                    match co.kind.as_str() {
+                        "credits" => {}
+                        "addon" => {
+                            if let Err(e) =
+                                crate::tencent_eip::provision_from_checkout(&c, &co).await
+                            {
+                                tracing::error!(checkout = %co.id, tenant = %co.tenant, error = %e, "dedicated_ipv4 provisioning failed (stripe webhook path)");
+                            }
+                        }
+                        _ => apply_plan_everywhere(&c, &co.tenant, &co.plan),
                     }
                     let customer = obj.get("customer").and_then(|s| s.as_str()).unwrap_or("");
                     let subscription = obj

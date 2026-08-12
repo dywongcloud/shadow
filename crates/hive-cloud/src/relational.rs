@@ -123,6 +123,8 @@ pub(crate) async fn init_schema() {
             kind TEXT NOT NULL, \
             plan TEXT NOT NULL, \
             amount_cents BIGINT NOT NULL, \
+            sku TEXT NOT NULL DEFAULT '', \
+            target TEXT NOT NULL DEFAULT '', \
             stripe_session_id TEXT NOT NULL DEFAULT '', \
             created_ms BIGINT NOT NULL\
         )",
@@ -196,6 +198,7 @@ pub(crate) async fn init_schema() {
     // manual step (previously this only ran inside the admin-triggered
     // `backfill_billing_normalize` endpoint).
     reconcile_billing_accounts_schema(&mut session).await;
+    reconcile_billing_checkouts_schema(&mut session).await;
 }
 
 /// Attempts to bring up a single table before giving up and logging loudly —
@@ -533,6 +536,7 @@ pub(crate) async fn upsert_billing(
     let now = hive_core::now_ms();
     let mut s = session(db).await;
     reconcile_billing_accounts_schema(&mut s).await;
+    reconcile_billing_checkouts_schema(&mut s).await;
 
     let mut sql = String::from("BEGIN;");
     sql.push_str(&build_account_sql(account, now));
@@ -669,16 +673,20 @@ fn build_checkouts_sql(checkouts: &[crate::billing::Checkout]) -> String {
     let mut sql = String::new();
     for co in checkouts {
         sql.push_str(&format!(
-            "INSERT INTO billing_checkouts (id, tenant, kind, plan, amount_cents, stripe_session_id, created_ms) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}) \
+            "INSERT INTO billing_checkouts (id, tenant, kind, plan, amount_cents, sku, target, \
+             stripe_session_id, created_ms) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}) \
              ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant, kind = excluded.kind, \
-             plan = excluded.plan, amount_cents = excluded.amount_cents, \
-             stripe_session_id = excluded.stripe_session_id, created_ms = excluded.created_ms;",
+             plan = excluded.plan, amount_cents = excluded.amount_cents, sku = excluded.sku, \
+             target = excluded.target, stripe_session_id = excluded.stripe_session_id, \
+             created_ms = excluded.created_ms;",
             q(&co.id),
             q(&co.tenant),
             q(&co.kind),
             q(&co.plan),
             co.amount_cents,
+            q(&co.sku),
+            q(&co.target),
             q(&co.stripe_session_id),
             co.created_ms,
         ));
@@ -811,6 +819,46 @@ async fn reconcile_billing_accounts_schema(
     }
     if all_ok {
         BILLING_ACCOUNTS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `billing_checkouts`' `sku`/`target` columns (the dedicated-IPv4 addon
+/// work), added the same ALTER-based way `billing_accounts` is — unlike the
+/// table's original five columns, which were safe under a plain `CREATE
+/// TABLE IF NOT EXISTS` because the table itself was brand new at the time
+/// (see `BILLING_ACCOUNTS_NEW_COLUMNS`'s doc comment), `billing_checkouts`
+/// now already EXISTS on every real node, so a later `CREATE TABLE IF NOT
+/// EXISTS` adding columns to that same DDL string is a no-op there — these
+/// two columns need their own reconciliation to actually land.
+const BILLING_CHECKOUTS_NEW_COLUMNS: &[(&str, &str)] = &[("sku", "TEXT"), ("target", "TEXT")];
+
+/// See `BILLING_ACCOUNTS_SCHEMA_RECONCILED` — same memoization discipline,
+/// separate flag because these are two independent tables that can finish
+/// reconciling at different times.
+static BILLING_CHECKOUTS_SCHEMA_RECONCILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// See `reconcile_billing_accounts_schema` — identical shape, called from
+/// the same three sites (`init_schema()`, `backfill_billing_normalize`,
+/// unconditionally from `upsert_billing`).
+async fn reconcile_billing_checkouts_schema(
+    s: &mut Session<guardian_db::sql::GuardianRelationalStorage>,
+) {
+    if BILLING_CHECKOUTS_SCHEMA_RECONCILED.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let mut all_ok = true;
+    for (col, ty) in BILLING_CHECKOUTS_NEW_COLUMNS {
+        let ddl = format!(
+            "ALTER TABLE billing_checkouts ADD COLUMN IF NOT EXISTS {col} {ty} NOT NULL DEFAULT ''"
+        );
+        if let Err(e) = exec(s, &ddl).await {
+            all_ok = false;
+            tracing::warn!(column = col, error = %e, "relational: ALTER TABLE billing_checkouts add column failed");
+        }
+    }
+    if all_ok {
+        BILLING_CHECKOUTS_SCHEMA_RECONCILED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -971,6 +1019,7 @@ pub(crate) async fn backfill_billing_normalize(force: bool) -> Result<serde_json
     // and the rest of it can assume the schema is already correct, focusing
     // purely on data migration.
     reconcile_billing_accounts_schema(&mut s).await;
+    reconcile_billing_checkouts_schema(&mut s).await;
 
     let already_migrated: std::collections::HashSet<String> = if force {
         std::collections::HashSet::new()
@@ -1498,6 +1547,8 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("kind", "text"),
                 col("plan", "text"),
                 col("amount_cents", "bigint"),
+                col("sku", "text"),
+                col("target", "text"),
                 col("stripe_session_id", "text"),
                 col("created_ms", "bigint"),
             ],

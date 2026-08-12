@@ -330,6 +330,14 @@ pub struct BillingAccount {
     /// downgrade event can no longer undo a grant.
     #[serde(default)]
     pub tier_locked_plan: Option<String>,
+    /// One-off addon charges (e.g. "Dedicated IPv4 — myapp") for the
+    /// CURRENT (in-progress) period, folded into `build_invoice`'s output
+    /// alongside the subscription/usage lines it already computes — this is
+    /// the whole mechanism, no separate invoice-line store: cleared back to
+    /// empty on period rollover, right after the closing invoice snapshot
+    /// (which still includes them) is built.
+    #[serde(default)]
+    pub addon_lines: Vec<InvoiceLine>,
 }
 
 impl BillingAccount {
@@ -349,6 +357,7 @@ impl BillingAccount {
             period_end_ms: now + MONTH_MS,
             updated_ms: now,
             tier_locked_plan: None,
+            addon_lines: Vec::new(),
         }
     }
     pub fn remaining_included(&self) -> u64 {
@@ -384,10 +393,17 @@ pub struct LedgerEntry {
 pub struct Checkout {
     pub id: String,
     pub tenant: String,
-    /// "plan" | "credits"
+    /// "plan" | "credits" | "addon"
     pub kind: String,
     pub plan: String,
     pub amount_cents: u64,
+    /// The addon SKU (e.g. "dedicated_ipv4"). Empty unless `kind == "addon"`.
+    #[serde(default)]
+    pub sku: String,
+    /// The addon's target resource id (a project name, for "dedicated_ipv4").
+    /// Empty unless `kind == "addon"`.
+    #[serde(default)]
+    pub target: String,
     /// The REAL Stripe Checkout Session id (`cs_...`), set once the real
     /// session is created. Empty for a mock (no-Stripe) checkout. Lets
     /// confirmation verify actual payment with Stripe instead of trusting an
@@ -509,6 +525,10 @@ impl BillingStore {
             };
             acc.included_cents = plan_spec(effective).included_cents;
             acc.updated_ms = now;
+            // The closing snapshot above already carries this period's addon
+            // lines (`build_invoice` read `acc` before this clear runs) — the
+            // new period starts with none of its own.
+            acc.addon_lines.clear();
             Some(closing)
         } else {
             None
@@ -827,6 +847,36 @@ impl BillingStore {
         self.account(tenant)
     }
 
+    /// Record a one-off addon charge (e.g. dedicated-IPv4 provisioning) onto
+    /// the tenant's CURRENT invoice — `description`/`amount_cents` become an
+    /// `InvoiceLine` on `BillingAccount::addon_lines`, which `build_invoice`
+    /// already folds into both the live draft and (on rollover) the
+    /// finalized invoice `relational::upsert_billing` persists. Also logs a
+    /// ledger entry purely for visibility in the billing ledger view — the
+    /// ledger's `balance_after_cents` is unaffected (an addon charge is
+    /// billed on the invoice, not drawn from prepaid balance).
+    pub fn record_addon_charge(&self, tenant: &str, description: &str, amount_cents: i64) {
+        let tenant = if tenant.is_empty() {
+            "personal"
+        } else {
+            tenant
+        };
+        let bal;
+        {
+            let mut m = self.accounts.write();
+            let acc = m
+                .entry(tenant.to_string())
+                .or_insert_with(|| BillingAccount::default_for(tenant));
+            acc.addon_lines.push(InvoiceLine {
+                description: description.to_string(),
+                amount_cents,
+            });
+            acc.updated_ms = now_ms();
+            bal = acc.balance_cents;
+        }
+        self.ledger_push(tenant, "addon_charge", amount_cents, bal, description);
+    }
+
     /// Charge compute usage: consume the monthly included allowance first, then
     /// prepaid balance. On Hobby (no overage) a charge that would go negative is
     /// rejected. Returns Ok(account) or Err(reason).
@@ -925,12 +975,29 @@ impl BillingStore {
         plan: &str,
         amount_cents: u64,
     ) -> Checkout {
+        self.open_checkout_full(tenant, kind, plan, amount_cents, "", "")
+    }
+
+    /// Same as [`Self::open_checkout`], carrying an addon SKU + target
+    /// (project id) — the fields `kind == "addon"` needs to resolve pricing
+    /// and dispatch provisioning on confirmation. Empty for "plan"/"credits".
+    pub fn open_checkout_full(
+        &self,
+        tenant: &str,
+        kind: &str,
+        plan: &str,
+        amount_cents: u64,
+        sku: &str,
+        target: &str,
+    ) -> Checkout {
         let c = Checkout {
             id: format!("co_{}", &Uuid::new_v4().simple().to_string()[..18]),
             tenant: tenant.to_string(),
             kind: kind.to_string(),
             plan: plan.to_string(),
             amount_cents,
+            sku: sku.to_string(),
+            target: target.to_string(),
             stripe_session_id: String::new(),
             created_ms: now_ms(),
         };
@@ -1006,10 +1073,14 @@ impl BillingStore {
     /// log) witnessed in production. One writer only.
     pub fn confirm_checkout(&self, id: &str) -> Option<(Checkout, BillingAccount)> {
         let c = self.checkouts.write().remove(id)?;
-        let acc = if c.kind == "credits" {
-            self.add_credits(&c.tenant, c.amount_cents, "Credit top-up (checkout)")
-        } else {
-            self.account(&c.tenant)
+        let acc = match c.kind.as_str() {
+            "credits" => self.add_credits(&c.tenant, c.amount_cents, "Credit top-up (checkout)"),
+            // "plan" and "addon" both leave the account untouched here — plan
+            // application (`apply_plan_everywhere`) and addon provisioning
+            // (`tencent_eip::provision_from_checkout`) are the CALLER's job,
+            // the same single-writer split the "credits" branch above already
+            // draws for itself.
+            _ => self.account(&c.tenant),
         };
         Some((c, acc))
     }
@@ -1165,6 +1236,7 @@ fn build_invoice(acc: &BillingAccount, usage_cents: i64, status: &str) -> Invoic
             });
         }
     }
+    lines.extend(acc.addon_lines.iter().cloned());
     let subtotal: i64 = lines.iter().map(|l| l.amount_cents).sum();
     let num = format!(
         "INV-{}",

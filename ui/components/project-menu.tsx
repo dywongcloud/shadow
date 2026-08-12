@@ -63,11 +63,12 @@ export function ProjectMenu({
 
   async function del(e: React.MouseEvent) {
     stop(e);
+    if (busy) return;
     if (!confirm(`Delete "${project}" and ALL its deployments? This cannot be undone.`)) return;
     setBusy(true);
+    setOpen(false);
     try {
       await apiSend("DELETE", `/v1/projects/${encodeURIComponent(project)}`);
-      setOpen(false);
       onChange?.();
       router.refresh();
     } catch (err) {
@@ -96,7 +97,7 @@ export function ProjectMenu({
             <button onClick={(e) => { stop(e); setOpen(false); router.push(`/projects/${encodeURIComponent(project)}/settings`); }} className={item}>
               <Settings className="h-3.5 w-3.5" /> Settings
             </button>
-            <button onClick={del} className={`${item} text-red-600 dark:text-red-400`}>
+            <button onClick={del} disabled={busy} className={`${item} text-red-600 dark:text-red-400 disabled:cursor-not-allowed disabled:opacity-50`}>
               <Trash2 className="h-3.5 w-3.5" /> Delete Project
             </button>
           </div>,

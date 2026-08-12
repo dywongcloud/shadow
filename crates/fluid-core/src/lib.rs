@@ -273,6 +273,28 @@ pub struct RawPortBinding {
     pub label: Option<String>,
 }
 
+/// A single Tencent Cloud EIP (Elastic IP) purchased and associated for a
+/// deployment that opted into `functions[].dedicated_ipv4` — one dotted-quad
+/// address the function is reachable on, distinct from the shared edge IPs.
+/// `tencent_eip_id` ("eip-xxxxxxxx") is the idempotency anchor: it is the
+/// handle every `AssociateAddress`/`ReleaseAddresses` call needs, and its
+/// presence in the durable claim registry (`hive-cloud::tencent_eip`) is what
+/// stops a redeploy or a crash-retry from purchasing a second address for the
+/// same (project, function). `owner_node` names the node whose CVM NIC the
+/// address is actually associated with — only that node may bind it
+/// (`raw_proxy.rs`); every other node keeps binding the wildcard address for
+/// the same public port, so cross-node splice still works.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedicatedIpv4 {
+    pub address: String,
+    pub tencent_eip_id: String,
+    pub region: String,
+    #[serde(default)]
+    pub owner_node: String,
+    #[serde(default)]
+    pub allocated_ms: u64,
+}
+
 /// A serverless function within a deployment. The server process must listen on
 /// `$PORT` and speak HTTP/1.1.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -391,6 +413,24 @@ pub struct FunctionConfig {
     /// [`DeploymentInfo::browser_ineligible`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_ineligible_reason: Option<String>,
+    /// Opt-in to a dedicated public IPv4 address for this function (fluid.json
+    /// `functions[].dedicatedIpv4` / the dashboard function-settings toggle),
+    /// mirroring [`FunctionConfig::gpu`]'s shape. `false`/absent = today's
+    /// behavior exactly: the function is reached only through the shared edge
+    /// IPs. Deploy time purchases (or re-adopts, on a redeploy) a real Tencent
+    /// Cloud EIP via `hive-cloud::tencent_eip`; no placement filter follows
+    /// from this flag — unlike GPU, any node can hold an EIP.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dedicated_ipv4: bool,
+    /// The allocated address, stamped onto the manifest by the deploy path
+    /// once `tencent_eip::claim_or_allocate` succeeds — the same
+    /// stamp-before-`deploy_full` shape [`RawPortBinding::public_port`] uses,
+    /// so [`Manifest::dedicated_ipv4_binding`] can hoist it onto
+    /// [`DeploymentInfo::dedicated_ipv4`] exactly like `raw_port_bindings`
+    /// hoists ports. `None` until allocation succeeds and for every function
+    /// that never opted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_ipv4_alloc: Option<DedicatedIpv4>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -466,6 +506,8 @@ impl Default for FunctionConfig {
             browser: None,
             browser_artifact: None,
             browser_ineligible_reason: None,
+            dedicated_ipv4: false,
+            dedicated_ipv4_alloc: None,
         }
     }
 }
@@ -1680,6 +1722,18 @@ impl Manifest {
         out
     }
 
+    /// The deployment's dedicated public IPv4 allocation, if any function
+    /// opted in and the deploy-time claim succeeded — hoisted from whichever
+    /// function carries a stamp, the same manifest-then-`view_of` shape
+    /// [`Manifest::raw_port_bindings`] uses. `DeploymentInfo` carries a single
+    /// slot (not one per function): today's contract is at most one dedicated
+    /// address per deployment, so the first stamped function wins.
+    pub fn dedicated_ipv4_binding(&self) -> Option<DedicatedIpv4> {
+        self.functions
+            .iter()
+            .find_map(|f| f.dedicated_ipv4_alloc.clone())
+    }
+
     /// Resolve a request path to a route target using longest-prefix match.
     /// Falls back to Static if nothing matches.
     pub fn resolve(&self, path: &str) -> RouteTarget {
@@ -2262,6 +2316,15 @@ pub struct DeploymentInfo {
     /// HTTP-only deployments and for peers running older binaries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub raw_ports: Vec<RawPortBinding>,
+    /// The deployment's dedicated public IPv4 (fluid.json
+    /// `functions[].dedicatedIpv4`), if any function opted in and the deploy
+    /// path's Tencent EIP purchase/associate succeeded. Hoisted here for the
+    /// same reason as `raw_ports`: `raw_proxy.rs`'s bind reconcile loop on
+    /// EVERY node needs the address to decide which local IP to bind, and DNS
+    /// / the dashboard need it fleet-wide. `None` for every deployment with no
+    /// opt-in and for peers running older binaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedicated_ipv4: Option<DedicatedIpv4>,
     /// Browser-eligible functions with their build-stamped artifact descriptors
     /// (digest metadata only, never bytes — see [`BrowserArtifact`]). Carried
     /// here for the same reason as `raw_ports`: the control-plane leader

@@ -2940,6 +2940,8 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         // carries the `public_port` → deployment mapping to every edge node
         // (the generic raw proxy's routing table).
         raw_ports: d.manifest.raw_port_bindings(),
+        // Dedicated public IPv4, hoisted the same way as `raw_ports` above.
+        dedicated_ipv4: d.manifest.dedicated_ipv4_binding(),
         // Browser-eligible functions + their artifact descriptors, so the
         // admission-validating leader can tie a donor's digest to a real build
         // artifact for deployments hosted on OTHER nodes.
