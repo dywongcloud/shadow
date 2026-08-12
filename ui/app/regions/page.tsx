@@ -178,7 +178,7 @@ export default function RegionsPage() {
           onRegionSelect={setActiveRegion}
           onConnectClick={handleConnectClick}
         />
-        <div className="relative overflow-hidden">
+        <div className="relative overflow-hidden bg-white dark:bg-black">
           <WorldChoropleth markers={markers} satellites={satellites} highlightId={highlightId} activated={activated} />
           <div className="absolute bottom-2 left-3 flex items-center gap-1.5 text-[11px] text-secondary">
             <span className="flex h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
