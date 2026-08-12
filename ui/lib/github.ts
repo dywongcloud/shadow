@@ -342,6 +342,8 @@ async function explainWriteFailure(
     return `${base} (repo ${owner}/${repo}, credential: ${via ?? "unknown"})`;
   }
   let installedOn = "";
+  let orgIsInstalled = false;
+  let ownerIsOrg = false;
   try {
     if (installationAuthConfigured()) {
       const inst = await listAppInstallations();
@@ -349,10 +351,14 @@ async function explainWriteFailure(
         const accounts = inst.installations
           .map((i) => i.account_login)
           .filter((l): l is string => !!l);
+        orgIsInstalled = accounts.some((a) => a.toLowerCase() === owner.toLowerCase());
+        ownerIsOrg = inst.installations.some(
+          (i) => i.account_login?.toLowerCase() === owner.toLowerCase() && i.account_type === "Organization"
+        );
         installedOn = accounts.length
           ? `The App is installed on: ${accounts.join(", ")}.`
           : "The App is not installed on ANY account yet.";
-        if (accounts.length && !accounts.some((a) => a.toLowerCase() === owner.toLowerCase())) {
+        if (accounts.length && !orgIsInstalled) {
           installedOn += ` It is NOT installed on "${owner}", which is why this write was refused.`;
         }
       }
@@ -360,15 +366,45 @@ async function explainWriteFailure(
   } catch {
     /* diagnosis is best-effort */
   }
-  const hint =
+  let hint =
     via === "user-token"
       ? "This used your browser's GitHub authorization; if you recently switched GitHub Apps, sign out and reconnect GitHub so the token is minted against the current App."
       : "This used the App's own installation credential.";
+  let scopedToInstallation = false;
+  // The App IS installed on this org, so a "not accessible" refusal on a
+  // user-token write isn't "wrong App, needs reconnect" — GitHub resolves a
+  // user-to-server token's access live per call (no cached installation to
+  // mismatch), so the SAME token that reads this org also writes under it.
+  // The real gap is the installation's OWN scope: either this repo isn't in
+  // its repository selection, or a permission update is pending approval.
+  // Probe that directly instead of defaulting every user-token refusal to a
+  // reconnect hint that fixes neither case.
+  if (via === "user-token" && orgIsInstalled) {
+    try {
+      const probe = await installationTokenForRepo(owner, repo);
+      const settingsUrl = ownerIsOrg
+        ? `https://github.com/organizations/${owner}/settings/installations`
+        : "https://github.com/settings/installations";
+      if (probe.ok && probe.token === null) {
+        hint =
+          `The App is installed on "${owner}" but not granted access to "${repo}" — an org admin must add this ` +
+          `repository under the installation's repository selection at ${settingsUrl}.`;
+        scopedToInstallation = true;
+      } else if (probe.ok && probe.token) {
+        hint =
+          `The App's installation on "${owner}" can reach "${repo}" but lacks a permission this write needs — ` +
+          `an org admin must approve the pending permission update for the App at ${settingsUrl}.`;
+        scopedToInstallation = true;
+      }
+    } catch {
+      /* diagnosis is best-effort — keep the reconnect hint as the fallback */
+    }
+  }
   return [
     `GitHub refused the write to ${owner}/${repo}: ${base}.`,
     installedOn,
     hint,
-    "Install the App on that account/org, or choose a repository it can reach.",
+    scopedToInstallation ? "" : "Install the App on that account/org, or choose a repository it can reach.",
   ]
     .filter(Boolean)
     .join(" ");

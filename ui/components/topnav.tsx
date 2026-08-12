@@ -23,6 +23,7 @@ const teamTabs = [
   { href: "/regions", label: "Regions" },
   { href: "/workflows", label: "Workflows" },
   { href: "/storage", label: "Storage" },
+  { href: "/drive", label: "Drive" },
   { href: "/observability", label: "Observability" },
   { href: "/cdn", label: "CDN" },
   { href: "/integrations", label: "Integrations" },

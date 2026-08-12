@@ -444,6 +444,46 @@ export async function apiSend<T>(method: string, path: string, body?: unknown): 
 }
 
 /**
+ * PUT raw bytes to a binary endpoint (Drive file uploads, `/v1/drive/:project/file`).
+ * `apiSend` always JSON-encodes its body, which would corrupt real file bytes —
+ * this is the byte-body sibling: same auth/team header, same honest
+ * server-message error surfacing, same write-invalidates-cache contract. Not
+ * a `CONFIG_PATHS` match (drive files are runtime data, not declarative
+ * config — the sandboxes carve-out precedent), so it never fires a GitOps
+ * sync. A generous 120s timeout: uploads are the one write whose duration
+ * scales with payload size, not with backend work.
+ */
+export async function apiPutBytes<T>(path: string, bytes: Blob | ArrayBuffer, contentType: string): Promise<T> {
+  const r = await fetchWithTimeout(`${BASE}${path}`, {
+    method: "PUT",
+    headers: { "content-type": contentType || "application/octet-stream", ...teamHeaders() },
+    body: bytes,
+  }, 120_000);
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error(detail?.trim() ? detail.trim() : `PUT ${path} -> ${r.status}`);
+  }
+  invalidateApiCache();
+  return r.json();
+}
+
+/**
+ * GET raw bytes from a binary endpoint (Drive file downloads). `apiGet`
+ * always parses the response as JSON, which throws on a real file body —
+ * this is the byte-body sibling, same auth/team header + error surfacing,
+ * deliberately uncached (a `Blob` isn't the small JSON payload the shared
+ * GET cache is sized for).
+ */
+export async function apiGetBytes(path: string): Promise<Blob> {
+  const r = await fetchWithTimeout(`${BASE}${path}`, { headers: teamHeaders() }, 60_000);
+  if (!r.ok) {
+    const detail = await r.text().catch(() => "");
+    throw new Error(detail?.trim() ? detail.trim() : `GET ${path} -> ${r.status}`);
+  }
+  return r.blob();
+}
+
+/**
  * POST a deploy through a same-origin Next server route (`/api/git/deploy` or
  * `/api/projects/:project/redeploy`) instead of straight to the backend. The
  * server route attaches the signed-in user's connected-GitHub token so the build
@@ -853,6 +893,24 @@ export interface Deployment {
    *  block is exactly that — which is what makes a database-only browser node
    *  possible (see `lib/run-node-targets.ts`). */
   browser_db?: BrowserDbPolicy | null;
+  /** This deployment's dedicated public IPv4 (the paid `dedicated_ipv4`
+   *  addon), once purchased AND attached by a deploy — `DeploymentInfo.
+   *  dedicated_ipv4`, gossiped fleet-wide for the same reason `raw_ports` is.
+   *  Absent until a deploy after purchase actually stamps it — see
+   *  `ProjectSettings.dedicated_ipv4`, which reflects the purchase itself and
+   *  can be set here `undefined` (purchased, awaiting the next deploy). */
+  dedicated_ipv4?: DedicatedIpv4;
+}
+
+/** A dedicated, static public IPv4 address (a real Tencent Cloud EIP)
+ *  purchased for a project. Mirrors `fluid_core::DedicatedIpv4` field-for-
+ *  field. */
+export interface DedicatedIpv4 {
+  address: string;
+  tencent_eip_id: string;
+  region: string;
+  owner_node?: string;
+  allocated_ms?: number;
 }
 
 /** One browser-eligible function of a deployment, with its build-stamped
@@ -959,6 +1017,13 @@ export interface ProjectSettings {
    *  the Network settings page (an immediate, no-redeploy live edit),
    *  not here. */
   container?: ContainerSettings | null;
+  /** The project's paid dedicated public IPv4 allocation, if purchased
+   *  (`hive_cloud::tencent_eip::provision_from_checkout`). `null`/absent
+   *  until purchased; stays set across redeploys (the same address is
+   *  re-adopted, never re-purchased). This is the PURCHASE record — it can
+   *  be set here while a `Deployment.dedicated_ipv4` is still absent, which
+   *  means "purchased, awaiting the next deploy to actually attach it". */
+  dedicated_ipv4?: DedicatedIpv4 | null;
 }
 
 /** See `ProjectSettings.container`. Mirrors

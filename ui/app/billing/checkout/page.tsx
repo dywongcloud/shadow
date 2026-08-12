@@ -12,6 +12,8 @@ interface Checkout {
   kind: string;
   plan: string;
   amount_cents: number;
+  sku?: string;
+  target?: string;
 }
 
 function usd(c: number) {
@@ -34,14 +36,33 @@ function CheckoutInner() {
     setPaying(true);
     try {
       await apiSend("POST", "/v1/billing/confirm", { session });
-      router.replace("/billing?success=1");
+      if (co?.kind === "addon" && co.target) {
+        router.replace(`/projects/${encodeURIComponent(co.target)}/settings/network?addon_success=${encodeURIComponent(co.id)}`);
+      } else {
+        router.replace("/billing?success=1");
+      }
     } catch (e) {
       setErr(String(e));
       setPaying(false);
     }
   }
 
-  const title = co?.kind === "credits" ? "Add compute credits" : `${co?.plan ? co.plan[0].toUpperCase() + co.plan.slice(1) : ""} plan`;
+  const title =
+    co?.kind === "credits"
+      ? "Add compute credits"
+      : co?.kind === "addon"
+        ? co.sku === "dedicated_ipv4"
+          ? `Dedicated IPv4 — ${co.target}`
+          : co.sku || "Add-on"
+        : `${co?.plan ? co.plan[0].toUpperCase() + co.plan.slice(1) : ""} plan`;
+
+  function cancel() {
+    if (co?.kind === "addon" && co.target) {
+      router.replace(`/projects/${encodeURIComponent(co.target)}/settings/network?addon_canceled=1`);
+    } else {
+      router.replace("/billing?canceled=1");
+    }
+  }
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-bg px-4">
@@ -76,7 +97,7 @@ function CheckoutInner() {
             <Button onClick={pay} disabled={paying} className="w-full justify-center bg-fg py-2.5 text-bg">
               {paying ? <Loader2 className="h-4 w-4 animate-spin" /> : `Pay ${usd(co.amount_cents)}`}
             </Button>
-            <button onClick={() => router.replace("/billing?canceled=1")} className="mt-3 w-full text-center text-xs text-muted hover:text-fg">
+            <button onClick={cancel} className="mt-3 w-full text-center text-xs text-muted hover:text-fg">
               Cancel
             </button>
             <p className="mt-4 text-center text-[11px] text-muted">

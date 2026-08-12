@@ -11395,8 +11395,23 @@ async fn billing_checkout(
     // Real Stripe Checkout when configured; otherwise the local mock checkout.
     if crate::billing::stripe_configured() {
         let base = std::env::var("PUBLIC_URL").unwrap_or_else(|_| "http://localhost:3000".into());
-        let success = format!("{base}/billing?success={}", co.id);
-        let cancel = format!("{base}/billing?canceled=1");
+        // An addon purchase is scoped to a project (e.g. dedicated_ipv4) --
+        // land the buyer back where they bought it, not on the unrelated
+        // billing overview page, which has nothing to show for it.
+        let (success, cancel) = if req.kind == "addon" && !target.is_empty() {
+            let enc =
+                percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
+                    .to_string();
+            (
+                format!("{base}/projects/{enc}/settings/network?addon_success={}", co.id),
+                format!("{base}/projects/{enc}/settings/network?addon_canceled=1"),
+            )
+        } else {
+            (
+                format!("{base}/billing?success={}", co.id),
+                format!("{base}/billing?canceled=1"),
+            )
+        };
         match crate::billing::stripe_checkout(
             &c.http,
             price_id.as_deref(),

@@ -1,11 +1,12 @@
 "use client";
 
 import { use, useEffect, useMemo, useState } from "react";
-import { Globe, Plus, Server, X } from "lucide-react";
-import { Button, SettingCard } from "@/components/ui";
+import { Globe, Loader2, Plus, Server, Wifi, X, Zap } from "lucide-react";
+import { Badge, Button, SettingCard } from "@/components/ui";
 import { RawPortConnections } from "@/components/raw-port-connections";
-import { apiSend, usePoll, type Deployment, type RawPortBinding } from "@/lib/api";
+import { apiSend, usePoll, type Deployment, type ProjectSettings, type RawPortBinding } from "@/lib/api";
 import { deploymentHost } from "@/lib/deploy-url";
+import { timeAgo } from "@/lib/utils";
 
 /** One editable port row (string-typed while being edited; validated on save). */
 interface PortRow {
@@ -39,6 +40,15 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const params = use(paramsPromise);
   const project = decodeURIComponent(params.project);
   const { data: deps } = usePoll<Deployment[]>("/deployments", 5000);
+  // The purchase record (survives across redeploys) — separate from the
+  // deployment-stamped `dedicated_ipv4` below, which only appears once a
+  // deploy AFTER purchase actually attaches the address. Polled so a return
+  // from Stripe checkout (or the webhook completing) reflects here with no
+  // manual refresh.
+  const { data: pSettings, refresh: refreshSettings } = usePoll<ProjectSettings>(
+    `/v1/projects/${encodeURIComponent(project)}/settings`,
+    5000
+  );
 
   const dep = useMemo(() => {
     const mine = (deps ?? []).filter((d) => d.project === project);
@@ -73,6 +83,42 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
   const host = dep ? deploymentHost(dep.alias, dep.region_code) : "";
   const displayDep = dep ? { ...dep, raw_ports: savedBindings ?? dep.raw_ports } : null;
   const hasRawPorts = !!displayDep?.raw_ports?.length;
+
+  // Dedicated IPv4: two independent signals, deliberately not collapsed into
+  // one. `purchasedIp` is the durable purchase record (ProjectSettings —
+  // survives redeploys); `activeIp` is what's actually stamped onto the
+  // CURRENT deployment (only true once a deploy after purchase attaches it).
+  // Purchased-but-not-yet-attached is a real, honest "Pending" state, never
+  // shown as either "none" or "active".
+  const purchasedIp = pSettings?.dedicated_ipv4 ?? null;
+  const activeIp = displayDep?.dedicated_ipv4 ?? null;
+  const [ipBusy, setIpBusy] = useState(false);
+  const [ipErr, setIpErr] = useState("");
+
+  async function buyDedicatedIpv4() {
+    setIpErr("");
+    setIpBusy(true);
+    try {
+      // Mirrors billing/page.tsx's checkout() exactly — same endpoint, same
+      // response shape, same applied/url branching (an addon's price is
+      // never zero, but the "applied" case is handled anyway rather than
+      // assumed away).
+      const r = await apiSend<{ url: string; mock: boolean; applied?: boolean }>(
+        "POST",
+        "/v1/billing/checkout",
+        { kind: "addon", sku: "dedicated_ipv4", target: project }
+      );
+      if (r.applied) {
+        setIpBusy(false);
+        refreshSettings();
+        return;
+      }
+      window.location.href = r.url;
+    } catch (e) {
+      setIpErr(String(e instanceof Error ? e.message : e));
+      setIpBusy(false);
+    }
+  }
 
   function edit(i: number, patch: Partial<PortRow>) {
     setRows((r) => r.map((row, n) => (n === i ? { ...row, ...patch } : row)));
@@ -127,6 +173,60 @@ export function NetworkSettings({ paramsPromise }: { paramsPromise: Promise<{ pr
           </span>
         ) : (
           <span className="text-sm text-muted">No production deployment yet.</span>
+        )}
+      </SettingCard>
+
+      <SettingCard
+        title="Dedicated IPv4"
+        desc="A real, static public IPv4 address for this project — useful when a downstream service needs to allowlist a fixed address (a partner API, a firewalled database, some game clients)."
+        footer={
+          activeIp
+            ? "Attached to the current production deployment. It's re-adopted automatically on every future redeploy — never re-purchased."
+            : purchasedIp
+            ? "Purchased — it attaches automatically on this project's next build. Push a commit, or redeploy from the Deployments page, to activate it now."
+            : undefined
+        }
+      >
+        {!pSettings ? (
+          <span className="text-sm text-muted">Loading…</span>
+        ) : activeIp ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="green">Active</Badge>
+              <span className="inline-flex items-center gap-1.5 font-mono text-sm">
+                <Wifi className="h-3.5 w-3.5 shrink-0 text-muted" /> {activeIp.address}
+              </span>
+            </div>
+            <div className="text-xs text-secondary">
+              {activeIp.region ? `${activeIp.region} · ` : ""}
+              <span className="font-mono">{activeIp.tencent_eip_id}</span>
+              {activeIp.allocated_ms ? ` · allocated ${timeAgo(activeIp.allocated_ms)}` : ""}
+            </div>
+          </div>
+        ) : purchasedIp ? (
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge tone="amber">Pending</Badge>
+              <span className="inline-flex items-center gap-1.5 font-mono text-sm">
+                <Wifi className="h-3.5 w-3.5 shrink-0 text-muted" /> {purchasedIp.address}
+              </span>
+            </div>
+            <div className="text-xs text-secondary">
+              {purchasedIp.region ? `${purchasedIp.region} · ` : ""}
+              <span className="font-mono">{purchasedIp.tencent_eip_id}</span>
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-3">
+            <span className="text-sm text-muted">No dedicated IPv4 purchased for this project yet.</span>
+            {ipErr && <div className="rounded-lg border border-red-500/30 bg-red-500/5 p-3 text-sm text-red-500">{ipErr}</div>}
+            <div>
+              <Button onClick={buyDedicatedIpv4} disabled={ipBusy}>
+                {ipBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Zap className="h-4 w-4" />}
+                Buy Dedicated IPv4
+              </Button>
+            </div>
+          </div>
         )}
       </SettingCard>
 
