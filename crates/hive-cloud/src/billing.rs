@@ -43,6 +43,11 @@ pub struct PlanSpec {
     pub max_sandbox_env_vars: u32,
     /// Max exposed ports per sandbox, 0 = unlimited.
     pub max_sandbox_ports: u32,
+    /// Max total live bytes across a project's shadw drive (design §4), 0 =
+    /// unlimited. Enforced only at the `PUT file` handler (`drive_api.rs`),
+    /// matching this file's existing per-quota-site enforcement pattern
+    /// rather than a centralized check.
+    pub max_drive_bytes: u64,
     pub features: &'static [&'static str],
 }
 
@@ -70,6 +75,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_mounts: 3,
         max_sandbox_env_vars: 50,
         max_sandbox_ports: 4,
+        max_drive_bytes: 1024 * 1024 * 1024,
         features: &[
             "$5 of included compute / month",
             "1 concurrent build",
@@ -91,6 +97,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_mounts: 5,
         max_sandbox_env_vars: 100,
         max_sandbox_ports: 8,
+        max_drive_bytes: 25 * 1024 * 1024 * 1024,
         features: &[
             "$20 of included compute / month",
             "Pay-as-you-go beyond included",
@@ -114,6 +121,7 @@ pub const PLANS: &[PlanSpec] = &[
         max_sandbox_mounts: 0,
         max_sandbox_env_vars: 0,
         max_sandbox_ports: 0,
+        max_drive_bytes: 0,
         features: &[
             "$1,000 of included compute / month",
             "Automatic multi-region fail-over",
@@ -155,6 +163,10 @@ pub fn plan_max_sandbox_env_vars(plan: &str) -> u32 {
 /// Max exposed ports per sandbox on a plan (0 = unlimited).
 pub fn plan_max_sandbox_ports(plan: &str) -> u32 {
     plan_spec(plan).max_sandbox_ports
+}
+/// Max total live shadw drive bytes for a project on a plan (0 = unlimited).
+pub fn plan_max_drive_bytes(plan: &str) -> u64 {
+    plan_spec(plan).max_drive_bytes
 }
 
 /// The usage rate card — the SINGLE source of truth for metered pricing (the UI

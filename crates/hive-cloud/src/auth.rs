@@ -220,7 +220,13 @@ pub async fn require_auth(
         // `db_rest::credential_matches`, so letting the request reach it is
         // what makes the two mount points behave identically instead of the
         // platform-API one 401ing every legitimate libsql client.
-        || path.starts_with("/v1/sqlite/");
+        || path.starts_with("/v1/sqlite/")
+        // WebDAV clients (Finder/Explorer/davfs2) only speak HTTP
+        // Basic/Digest, never a bearer JWT — `drive_webdav.rs`'s own
+        // Basic-auth check (the project's hashed drive access token) fails
+        // closed with 401 before any filesystem call reaches `dav_server`,
+        // the same shape as `/v1/sqlite/`'s per-database bearer above.
+        || path.starts_with("/v1/drive/webdav/");
     if !is_mutation || open {
         return next.run(req).await;
     }

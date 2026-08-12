@@ -341,6 +341,9 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::storage_api::routes())
         // ---- Managed SQLite over libsql/Hrana (per-database bearer, owner-proxied) ----
         .merge(crate::hrana::routes())
+        // ---- shadw drive v1: REST + WebDAV (relational metadata, owner-routed bytes) ----
+        .merge(crate::drive_api::routes())
+        .merge(crate::drive_webdav::routes())
         .with_state(cloud.clone());
     // EXPERIMENT: anonymous team/role membership (only with `--features zkauth`).
     #[cfg(feature = "zkauth")]
@@ -3875,7 +3878,7 @@ fn host_nodes_for_project(c: &Arc<CloudState>, project: &str) -> Vec<String> {
 /// JSON (blob objects). Kept deliberately simple — HTTP admin URL only — since
 /// its callers all fall back to their existing not-found behaviour when it
 /// returns `None`, so it can never make a read worse than it is today.
-async fn fetch_bytes_from_host(
+pub(crate) async fn fetch_bytes_from_host(
     c: &Arc<CloudState>,
     node: &str,
     path: &str,

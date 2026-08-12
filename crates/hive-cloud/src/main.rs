@@ -31,6 +31,9 @@ mod dht_probe;
 mod dns_probe;
 mod dnsserver;
 mod docstore;
+mod drive_api;
+mod drive_blobs;
+mod drive_webdav;
 mod edge;
 mod enterprise;
 mod enterprise_api;
@@ -1905,7 +1908,9 @@ async fn admin_ingress(
             || path == "/v1/zkauth/register"
             || path == "/v1/zkauth/preview-proof"
             // Per-database bearer, not a platform JWT — see auth::require_auth.
-            || path.starts_with("/v1/sqlite/");
+            || path.starts_with("/v1/sqlite/")
+            // WebDAV Basic-auth, not a platform JWT — see auth::require_auth.
+            || path.starts_with("/v1/drive/webdav/");
         if is_mutation && !open {
             // Accept a platform JWT or a dashboard API key (`hive_…`) — the
             // leader's `require_auth` re-verifies either; this gate only

@@ -102,6 +102,20 @@ iroh = "1"
 # the full in-process listener API (default features `metrics` + `tls-ring` stay
 # on too).
 iroh-relay = { version = "1.0.2", features = ["server"] }
+# shadw drive (bn-shadw-drive-v1): per-node content-addressed blob store for
+# drive file bytes, addressed by the same BLAKE3 hash `drive_nodes.content_hash`
+# stores. Already resolved in Cargo.lock at this exact version (guardian-db's
+# own vendored FsStore uses it) -- this is the first DIRECT import from
+# hive-cloud, used purely as a local on-disk store (`FsStore::load`); no ALPN
+# acceptor or second iroh::Endpoint is stood up. Cross-node fetch-on-miss goes
+# over the EXISTING admin/gossip proxy transport (drive_api.rs), the same
+# owner-routed shape Hrana/SQLite already use -- not iroh-blobs' own wire
+# protocol, which would need its own Router/Endpoint plumbing beyond v1 scope.
+iroh-blobs = "0.103.0"
+# Already in the tree transitively (axum/iroh-blobs/dav-server all pull it);
+# made direct here for drive_blobs.rs/drive_webdav.rs's own `bytes::Bytes`
+# usage, matching the `percent-encoding`/`hex` precedent above.
+bytes = "1"
 
 # Optional: production-grade Raft consensus (full log + state machine). The
 # always-on lightweight coordinator in cluster.rs is the default; `--features
@@ -112,6 +126,12 @@ openraft = { version = "0.9", optional = true }
 # feature). Off by default; mounts /v1/zkauth/* and is not part of real auth.
 hive-zkauth = { workspace = true, optional = true }
 rust_decimal = { version = "1.42.1", features = ["db-tokio-postgres"] }
+# shadw drive (bn-shadw-drive-v1): WebDAV protocol handler mounted at
+# /v1/drive/webdav/:project (drive_webdav.rs). A genuine new dependency (not
+# previously resolved anywhere in the tree). `default-features = false` skips
+# `localfs`/`memfs` (libc/lru/parking_lot/reflink-copy) -- this crate supplies
+# its own `DavFileSystem` impl (`DriveFs`) backed by drive_api.rs's storage,
+# never dav-server's bundled filesystem backends.
 dav-server = { version = "0.11.0", default-features = false }
 
 [features]

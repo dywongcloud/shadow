@@ -34,6 +34,7 @@
 //! the critical path" convention as `guardian::replicate`).
 
 use guardian_db::sql::{ExecResult, Session, SqlValue};
+use serde::{Deserialize, Serialize};
 
 use crate::guardian::SqlDb;
 
@@ -167,6 +168,60 @@ pub(crate) async fn init_schema() {
             production BIGINT NOT NULL, \
             created_at_ms BIGINT NOT NULL, \
             updated_ms BIGINT NOT NULL\
+        )",
+        ),
+        // shadw drive (bn-shadw-drive-v1) -- see the "Drive" section below for
+        // every query helper. `parent_id` is '' for a top-level entry (no
+        // materialized root row); `deleted_at` is a tombstone (0 = live),
+        // LWW-safe under this table's own CRDT merge -- a hard delete racing a
+        // concurrent rename is undefined in any LWW store, so tombstone-then-GC
+        // is the only safe shape (AGENTS.md's own drive_nodes doc). `owner_node`
+        // is NOT in the design doc's abbreviated column list but is required
+        // for the doc's own fetch-on-miss mechanism ("resolved from
+        // drive_nodes") to have anything to resolve.
+        (
+            "drive_nodes",
+            "CREATE TABLE IF NOT EXISTS drive_nodes (\
+            id TEXT PRIMARY KEY, \
+            project TEXT NOT NULL, \
+            parent_id TEXT NOT NULL, \
+            name TEXT NOT NULL, \
+            kind TEXT NOT NULL, \
+            size_bytes BIGINT NOT NULL DEFAULT 0, \
+            mime TEXT NOT NULL DEFAULT '', \
+            content_hash TEXT NOT NULL DEFAULT '', \
+            owner_user TEXT NOT NULL DEFAULT '', \
+            owner_node TEXT NOT NULL DEFAULT '', \
+            mtime BIGINT NOT NULL, \
+            ctime BIGINT NOT NULL, \
+            deleted_at BIGINT NOT NULL DEFAULT 0\
+        )",
+        ),
+        // `token_hash` (SHA-256, apikeys.rs's own convention) rather than the
+        // raw capability token -- a DB dump must not hand out live share links.
+        (
+            "drive_shares",
+            "CREATE TABLE IF NOT EXISTS drive_shares (\
+            id TEXT PRIMARY KEY, \
+            node_id TEXT NOT NULL, \
+            token_hash TEXT NOT NULL, \
+            scope TEXT NOT NULL, \
+            expires_at BIGINT NOT NULL, \
+            created_ms BIGINT NOT NULL\
+        )",
+        ),
+        // One long-lived, revocable WebDAV Basic-auth credential per project
+        // (design §3). Lives in the SAME replicated table every node's Basic
+        // auth check reads, so the check succeeds regardless of which
+        // round-robin node the WebDAV client's TCP connection lands on --
+        // not named in the design's storage-model section, but required for
+        // its own WebDAV auth requirement to work from any node at all.
+        (
+            "drive_tokens",
+            "CREATE TABLE IF NOT EXISTS drive_tokens (\
+            project TEXT PRIMARY KEY, \
+            token_hash TEXT NOT NULL, \
+            created_ms BIGINT NOT NULL\
         )",
         ),
     ] {
@@ -1455,6 +1510,417 @@ pub(crate) async fn sync_deployments(node: &str, deps: &[fluid_core::DeploymentI
 }
 
 // ---------------------------------------------------------------------------
+// Drive (shadw drive v1) — one-level CRUD primitives against drive_nodes /
+// drive_shares / drive_tokens. Multi-segment path walking (mkdir -p style
+// resolution of "/a/b/c") lives in drive_api.rs, which calls these one row at
+// a time — this module stays a thin, single-purpose storage primitive layer,
+// matching every other table above.
+// ---------------------------------------------------------------------------
+
+/// A single `drive_nodes` row. `kind` is `"file"` or `"dir"`; `parent_id` is
+/// `""` for a top-level entry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DriveNode {
+    pub id: String,
+    pub project: String,
+    pub parent_id: String,
+    pub name: String,
+    pub kind: String,
+    #[serde(default)]
+    pub size_bytes: i64,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub content_hash: String,
+    #[serde(default)]
+    pub owner_user: String,
+    #[serde(default)]
+    pub owner_node: String,
+    pub mtime: i64,
+    pub ctime: i64,
+    #[serde(default)]
+    pub deleted_at: i64,
+}
+
+const DRIVE_NODE_COLUMNS: &str = "id, project, parent_id, name, kind, size_bytes, mime, \
+     content_hash, owner_user, owner_node, mtime, ctime, deleted_at";
+
+fn drive_node_from_row(v: serde_json::Value) -> Option<DriveNode> {
+    serde_json::from_value(v).ok()
+}
+
+/// The live (non-tombstoned) child named `name` directly under `parent_id`.
+pub(crate) async fn drive_resolve(project: &str, parent_id: &str, name: &str) -> Option<DriveNode> {
+    let db = crate::guardian::sql_db().await.ok()?;
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT {DRIVE_NODE_COLUMNS} FROM drive_nodes WHERE project = {} AND parent_id = {} AND name = {} AND deleted_at = 0",
+        q(project),
+        q(parent_id),
+        q(name),
+    );
+    let res = exec(&mut s, &query).await.ok()?;
+    rows_to_json_objects(&res).into_iter().find_map(drive_node_from_row)
+}
+
+/// Look up a node by its own id, regardless of tombstone state (callers that
+/// already resolved an id — e.g. a share grant — must still see a since-
+/// deleted target so they can report it as gone rather than crash).
+pub(crate) async fn drive_get(id: &str) -> Option<DriveNode> {
+    let db = crate::guardian::sql_db().await.ok()?;
+    let mut s = session(db).await;
+    let query = format!("SELECT {DRIVE_NODE_COLUMNS} FROM drive_nodes WHERE id = {}", q(id));
+    let res = exec(&mut s, &query).await.ok()?;
+    rows_to_json_objects(&res).into_iter().find_map(drive_node_from_row)
+}
+
+/// Every live child directly under `parent_id`, directories first then files,
+/// each lexically ordered (AGENTS.md's "lexical ordering for deterministic
+/// tie-breaking").
+pub(crate) async fn drive_list_children(project: &str, parent_id: &str) -> Vec<DriveNode> {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return Vec::new();
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT {DRIVE_NODE_COLUMNS} FROM drive_nodes WHERE project = {} AND parent_id = {} AND deleted_at = 0 ORDER BY kind, name",
+        q(project),
+        q(parent_id),
+    );
+    let Ok(res) = exec(&mut s, &query).await else {
+        return Vec::new();
+    };
+    rows_to_json_objects(&res)
+        .into_iter()
+        .filter_map(drive_node_from_row)
+        .collect()
+}
+
+pub(crate) enum DriveWriteError {
+    /// The target name exists and is a directory (file write) or a file
+    /// (mkdir) — the two kinds can never occupy the same (parent, name) slot.
+    WrongKind,
+}
+
+/// Upsert a file's bytes-side metadata at `(project, parent_id, name)`: update
+/// the existing row (preserving its id, so a share link minted against it
+/// keeps working across an overwrite) if one is live there, else insert a
+/// fresh row. Last-write-wins by construction (design §6's v1 scope) — no
+/// locking, no read-modify-write races beyond ordinary CRDT LWW merge.
+pub(crate) async fn drive_put_file(
+    project: &str,
+    parent_id: &str,
+    name: &str,
+    size_bytes: u64,
+    mime: &str,
+    content_hash: &str,
+    owner_user: &str,
+    owner_node: &str,
+) -> Result<DriveNode, DriveWriteError> {
+    let now = hive_core::now_ms() as i64;
+    let existing = drive_resolve(project, parent_id, name).await;
+    if let Some(row) = &existing {
+        if row.kind != "file" {
+            return Err(DriveWriteError::WrongKind);
+        }
+    }
+    let Ok(db) = crate::guardian::sql_db().await else {
+        // GuardianDB not ready: synthesize an in-memory-only row so the
+        // caller's response is still coherent, but it will never be found by
+        // a later read — the same best-effort posture every other write in
+        // this module has (a failure here never blocks the mutation it
+        // mirrors).
+        return Ok(DriveNode {
+            id: existing.map(|e| e.id).unwrap_or_else(|| format!("dnode_{}", uuid::Uuid::new_v4().simple())),
+            project: project.into(),
+            parent_id: parent_id.into(),
+            name: name.into(),
+            kind: "file".into(),
+            size_bytes: size_bytes as i64,
+            mime: mime.into(),
+            content_hash: content_hash.into(),
+            owner_user: owner_user.into(),
+            owner_node: owner_node.into(),
+            mtime: now,
+            ctime: now,
+            deleted_at: 0,
+        });
+    };
+    let mut s = session(db).await;
+    let id = existing
+        .as_ref()
+        .map(|e| e.id.clone())
+        .unwrap_or_else(|| format!("dnode_{}", uuid::Uuid::new_v4().simple()));
+    let ctime = existing.as_ref().map(|e| e.ctime).unwrap_or(now);
+    let query = format!(
+        "INSERT INTO drive_nodes ({DRIVE_NODE_COLUMNS}) VALUES ({}, {}, {}, {}, 'file', {}, {}, {}, {}, {}, {}, {}, 0) \
+         ON CONFLICT (id) DO UPDATE SET size_bytes = excluded.size_bytes, mime = excluded.mime, \
+         content_hash = excluded.content_hash, owner_user = excluded.owner_user, owner_node = excluded.owner_node, \
+         mtime = excluded.mtime, deleted_at = 0",
+        q(&id),
+        q(project),
+        q(parent_id),
+        q(name),
+        size_bytes,
+        q(mime),
+        q(content_hash),
+        q(owner_user),
+        q(owner_node),
+        now,
+        ctime,
+    );
+    let node = DriveNode {
+        id,
+        project: project.into(),
+        parent_id: parent_id.into(),
+        name: name.into(),
+        kind: "file".into(),
+        size_bytes: size_bytes as i64,
+        mime: mime.into(),
+        content_hash: content_hash.into(),
+        owner_user: owner_user.into(),
+        owner_node: owner_node.into(),
+        mtime: now,
+        ctime,
+        deleted_at: 0,
+    };
+    if let Err(e) = exec(&mut s, &query).await {
+        tracing::debug!(project, name, error = %e, "relational: drive_put_file failed (non-fatal)");
+    }
+    Ok(node)
+}
+
+/// Idempotent directory create: returns the existing dir if one is already
+/// live at this slot, errors [`DriveWriteError::WrongKind`] if a file
+/// occupies it, else inserts a fresh row.
+pub(crate) async fn drive_mkdir(
+    project: &str,
+    parent_id: &str,
+    name: &str,
+    owner_user: &str,
+) -> Result<DriveNode, DriveWriteError> {
+    if let Some(existing) = drive_resolve(project, parent_id, name).await {
+        return if existing.kind == "dir" {
+            Ok(existing)
+        } else {
+            Err(DriveWriteError::WrongKind)
+        };
+    }
+    let now = hive_core::now_ms() as i64;
+    let id = format!("dnode_{}", uuid::Uuid::new_v4().simple());
+    let node = DriveNode {
+        id: id.clone(),
+        project: project.into(),
+        parent_id: parent_id.into(),
+        name: name.into(),
+        kind: "dir".into(),
+        size_bytes: 0,
+        mime: String::new(),
+        content_hash: String::new(),
+        owner_user: owner_user.into(),
+        owner_node: String::new(),
+        mtime: now,
+        ctime: now,
+        deleted_at: 0,
+    };
+    if let Ok(db) = crate::guardian::sql_db().await {
+        let mut s = session(db).await;
+        let query = format!(
+            "INSERT INTO drive_nodes ({DRIVE_NODE_COLUMNS}) VALUES ({}, {}, {}, {}, 'dir', 0, '', '', {}, '', {}, {}, 0)",
+            q(&id),
+            q(project),
+            q(parent_id),
+            q(name),
+            q(owner_user),
+            now,
+            now,
+        );
+        if let Err(e) = exec(&mut s, &query).await {
+            tracing::debug!(project, name, error = %e, "relational: drive_mkdir failed (non-fatal)");
+        }
+    }
+    Ok(node)
+}
+
+/// Tombstone a node (file or, per design §1, a directory too — the API layer
+/// decides whether to require an empty directory first).
+pub(crate) async fn drive_tombstone(id: &str) {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "UPDATE drive_nodes SET deleted_at = {} WHERE id = {}",
+        hive_core::now_ms(),
+        q(id),
+    );
+    if let Err(e) = exec(&mut s, &query).await {
+        tracing::debug!(id, error = %e, "relational: drive_tombstone failed (non-fatal)");
+    }
+}
+
+/// Re-parent/rename a node in place (id, and any share link against it,
+/// unchanged).
+pub(crate) async fn drive_move(id: &str, new_parent_id: &str, new_name: &str) {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "UPDATE drive_nodes SET parent_id = {}, name = {}, mtime = {} WHERE id = {}",
+        q(new_parent_id),
+        q(new_name),
+        hive_core::now_ms(),
+        q(id),
+    );
+    if let Err(e) = exec(&mut s, &query).await {
+        tracing::debug!(id, error = %e, "relational: drive_move failed (non-fatal)");
+    }
+}
+
+/// Sum of `size_bytes` across every live file in `project` — the quota-check
+/// read. Summed in Rust rather than SQL `SUM()` to avoid depending on this
+/// embedded engine's exact aggregate-result numeric type; a project's live
+/// file count is small enough for v1 that this costs nothing real.
+pub(crate) async fn drive_bytes_used(project: &str) -> u64 {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return 0;
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT size_bytes FROM drive_nodes WHERE project = {} AND kind = 'file' AND deleted_at = 0",
+        q(project),
+    );
+    let Ok(res) = exec(&mut s, &query).await else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for r in &res {
+        if let ExecResult::Rows { rows, .. } = r {
+            for row in rows {
+                let n = match row.first() {
+                    Some(SqlValue::Int8(n)) => *n as u64,
+                    Some(SqlValue::Int4(n)) => *n as u64,
+                    _ => 0,
+                };
+                total += n;
+            }
+        }
+    }
+    total
+}
+
+/// A resolved `drive_shares` row. `scope` is stored (schema-complete for a
+/// future write-consuming endpoint per design §6) but deliberately not
+/// projected here: v1's one consumer, `drive_api::share_get`, always only
+/// reads regardless of the grant's scope, so carrying an unused field would
+/// be dead code, not future-proofing.
+pub(crate) struct DriveShare {
+    pub node_id: String,
+    pub expires_at: i64,
+}
+
+/// Mint a share grant against `node_id`, keyed by the SHA-256 of the
+/// capability token (apikeys.rs's own "hash, never store the secret"
+/// convention — a share link is exactly as sensitive as an API key).
+pub(crate) async fn drive_share_mint(node_id: &str, token_hash: &str, scope: &str, expires_at: i64) -> String {
+    let id = format!("dshare_{}", uuid::Uuid::new_v4().simple());
+    if let Ok(db) = crate::guardian::sql_db().await {
+        let mut s = session(db).await;
+        let query = format!(
+            "INSERT INTO drive_shares (id, node_id, token_hash, scope, expires_at, created_ms) VALUES ({}, {}, {}, {}, {}, {})",
+            q(&id),
+            q(node_id),
+            q(token_hash),
+            q(scope),
+            expires_at,
+            hive_core::now_ms(),
+        );
+        if let Err(e) = exec(&mut s, &query).await {
+            tracing::debug!(node_id, error = %e, "relational: drive_share_mint failed (non-fatal)");
+        }
+    }
+    id
+}
+
+/// Resolve a presented share token's hash to its grant. Any row is returned
+/// regardless of expiry — the caller (drive_api.rs) is the one place that
+/// decides "expired" vs "revoked" vs "valid", so it can answer honestly
+/// rather than this layer collapsing both into one not-found.
+pub(crate) async fn drive_share_resolve(token_hash: &str) -> Option<DriveShare> {
+    let db = crate::guardian::sql_db().await.ok()?;
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT node_id, expires_at FROM drive_shares WHERE token_hash = {}",
+        q(token_hash),
+    );
+    let res = exec(&mut s, &query).await.ok()?;
+    for r in &res {
+        if let ExecResult::Rows { rows, .. } = r {
+            if let Some(row) = rows.first() {
+                let node_id = match row.first() {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    _ => continue,
+                };
+                let expires_at = match row.get(1) {
+                    Some(SqlValue::Int8(n)) => *n,
+                    Some(SqlValue::Int4(n)) => *n as i64,
+                    _ => 0,
+                };
+                return Some(DriveShare { node_id, expires_at });
+            }
+        }
+    }
+    None
+}
+
+/// Set (mint or rotate) the one WebDAV Basic-auth credential for `project`.
+pub(crate) async fn drive_token_set(project: &str, token_hash: &str) {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return;
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "INSERT INTO drive_tokens (project, token_hash, created_ms) VALUES ({}, {}, {}) \
+         ON CONFLICT (project) DO UPDATE SET token_hash = excluded.token_hash, created_ms = excluded.created_ms",
+        q(project),
+        q(token_hash),
+        hive_core::now_ms(),
+    );
+    if let Err(e) = exec(&mut s, &query).await {
+        tracing::debug!(project, error = %e, "relational: drive_token_set failed (non-fatal)");
+    }
+}
+
+/// Constant-time verify a presented WebDAV Basic-auth token hash against
+/// `project`'s stored one.
+pub(crate) async fn drive_token_verify(project: &str, token_hash: &str) -> bool {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return false;
+    };
+    let mut s = session(db).await;
+    let query = format!(
+        "SELECT token_hash FROM drive_tokens WHERE project = {}",
+        q(project),
+    );
+    let Ok(res) = exec(&mut s, &query).await else {
+        return false;
+    };
+    for r in &res {
+        if let ExecResult::Rows { rows, .. } = r {
+            if let Some(SqlValue::Text(stored)) = rows.first().and_then(|row| row.first()) {
+                let a = stored.as_bytes();
+                let b = token_hash.as_bytes();
+                if a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0 {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
 // Admin "view as PostgreSQL" browser — read-only introspection + query
 // ---------------------------------------------------------------------------
 
@@ -1606,6 +2072,43 @@ pub(crate) fn known_tables() -> Vec<SqlTableInfo> {
                 col("production", "bigint"),
                 col("created_at_ms", "bigint"),
                 col("updated_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "drive_nodes",
+            columns: vec![
+                col("id", "text"),
+                col("project", "text"),
+                col("parent_id", "text"),
+                col("name", "text"),
+                col("kind", "text"),
+                col("size_bytes", "bigint"),
+                col("mime", "text"),
+                col("content_hash", "text"),
+                col("owner_user", "text"),
+                col("owner_node", "text"),
+                col("mtime", "bigint"),
+                col("ctime", "bigint"),
+                col("deleted_at", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "drive_shares",
+            columns: vec![
+                col("id", "text"),
+                col("node_id", "text"),
+                col("token_hash", "text"),
+                col("scope", "text"),
+                col("expires_at", "bigint"),
+                col("created_ms", "bigint"),
+            ],
+        },
+        SqlTableInfo {
+            name: "drive_tokens",
+            columns: vec![
+                col("project", "text"),
+                col("token_hash", "text"),
+                col("created_ms", "bigint"),
             ],
         },
     ]

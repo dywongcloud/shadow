@@ -182,6 +182,36 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 crate::browser_artifacts::mesh_get(cloud, &tenant, digest).await
             }
         }
+        // shadw drive (bn-shadw-drive-v1) file bytes: the tenant-gated
+        // `GET /v1/drive/:project/file` proxy's mesh fallback for a NAT'd
+        // owner node. The owner re-runs `project_owned_by` against its own
+        // replicated state before serving (the `browser_artifacts::mesh_get`
+        // precedent) — `mesh_tenant` carries the signed delegation token, so
+        // an empty tenant (unsigned/expired) never resolves anything.
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/drive/mesh-file/") => {
+            let tenant = mesh_tenant(p);
+            let project = qparam(p, "project").unwrap_or_default();
+            let path = qparam(p, "path")
+                .map(|v| percent_encoding::percent_decode_str(&v).decode_utf8_lossy().to_string())
+                .unwrap_or_default();
+            if tenant.is_empty() || project.is_empty() {
+                Vec::new()
+            } else {
+                crate::drive_api::mesh_get_file(cloud, &tenant, &project, &path).await
+            }
+        }
+        // shadw drive share-link bytes: deliberately UNAUTHENTICATED (the
+        // token hash itself is the capability, re-derived independently by
+        // the owner from the SAME replicated `drive_shares` row — no tenant
+        // to carry at all).
+        p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/drive/mesh-share/") => {
+            let token = qparam(p, "token").unwrap_or_default();
+            if token.is_empty() {
+                Vec::new()
+            } else {
+                crate::drive_api::mesh_share_get(&token).await
+            }
+        }
         // Accept-side browser admission recheck is identity-only and must
         // precede the tenant-scoped endpoint arm below.
         p if method == hive_p2p::GOSSIP_GET && p.starts_with("/v1/browser/admissions/accept/") => {
