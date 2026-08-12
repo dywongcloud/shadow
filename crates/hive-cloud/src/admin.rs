@@ -676,7 +676,12 @@ async fn project_build_put(
     Path(project): Path<String>,
     Json(build): Json<crate::project_settings::BuildConfig>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: a settings PUT on a project name that
+    // has no row yet materializes one via set_build's underlying
+    // .entry().or_default(), defaulting to UNTAGGED_TENANT unless claimed
+    // here with the tenant require_project already verified.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     c.projects.set_build(&project, build);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -706,7 +711,10 @@ async fn project_functions_put(
     Path(project): Path<String>,
     Json(mut f): Json<crate::project_settings::FunctionSettings>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: claim an unowned row rather than
+    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     // Enforce plan limits: runtime cap (Enterprise = 1h) and Enterprise-only
     // automatic multi-region fail-over.
     let plan = team_plan(&c, &project);
@@ -738,7 +746,10 @@ async fn project_browser_db_put(
     Path(project): Path<String>,
     Json(policy): Json<fluid_core::BrowserDbPolicy>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: claim an unowned row rather than
+    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     // Validate table identifiers at save time so a typo 400s right here.
     // `BrowserDbPolicy::resolve` clamps/drops invalid entries instead of
     // failing (correct for a REPLICATED spec another binary might read with
@@ -799,7 +810,10 @@ async fn project_container_put(
     Path(project): Path<String>,
     Json(spec): Json<crate::project_settings::ContainerSettings>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: claim an unowned row rather than
+    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     // A deploy-input boundary: an unparseable protocol string must 400 here
     // with a clear message rather than silently falling back to "http" at
     // build time, which is exactly the class of mistake that broke the
@@ -1051,8 +1065,20 @@ async fn project_git_ci_put(
     Path(project): Path<String>,
     Json(mut status): Json<crate::project_settings::GitCiStatus>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     status.checked_ms = hive_core::now_ms();
+    // `set_git_ci`'s underlying `.entry(project).or_default()` materializes a
+    // row for a project that doesn't have one yet -- and this handler fires
+    // right after a project's FIRST git import, potentially before the
+    // deploy path (which is what normally calls set_team) ever runs for it.
+    // Left unclaimed, that row defaults to UNTAGGED_TENANT and stays that
+    // way forever if the import never leads to a completed deploy (e.g. no
+    // GitHub OAuth connection, as `set_git_ci`'s own doc comment already
+    // describes). require_project already resolved the caller's real tenant
+    // (optimistically trusting it for an unknown project) — claim ownership
+    // with it, the same way the deploy path does, instead of discarding it.
+    // A no-op when the row is already correctly owned.
+    c.projects.set_team(&project, &t);
     c.projects.set_git_ci(&project, status);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
@@ -1065,7 +1091,10 @@ async fn project_env_put(
     Path(project): Path<String>,
     Json(v): Json<crate::project_settings::EnvVar>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: claim an unowned row rather than
+    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     // Keep-secret + upsert-by-key semantics live in `put_env` (see there).
     c.projects.put_env(&project, v);
     crate::persist::persist(&c);
@@ -6326,7 +6355,10 @@ async fn project_cron_enabled_put(
     Path(project): Path<String>,
     Json(b): Json<CronToggle>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    // See project_git_ci_put's comment: claim an unowned row rather than
+    // leaving it UNTAGGED_TENANT once require_project has verified the caller.
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
     c.projects.set_cron_enabled(&project, b.enabled);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
