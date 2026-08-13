@@ -102,7 +102,29 @@ async fn handler(
         .strip_prefix(prefix)
         .build_handler();
     let resp = dav.handle(req).await;
-    resp.map(axum::body::Body::new)
+    // `dav_server::body::Body`'s `HttpBody` impl never overrides `size_hint()`
+    // (dav-server-0.11.0/src/body.rs), so hyper always falls back to
+    // `Transfer-Encoding: chunked` — even for its fully-buffered `Bytes`
+    // variant, which is every response this handler ever produces (v1 has no
+    // true streaming; `ReadFile`/`WriteFile` already hold whole-file buffers
+    // in memory, see their own doc comments). Windows' built-in WebDAV
+    // Mini-Redirector (Explorer's "Map network drive"/"Add a network
+    // location") is well known to reject or hang on chunked WebDAV responses
+    // — it requires `Content-Length`. Buffering here costs nothing beyond
+    // what's already materialized and lets every response carry an honest
+    // Content-Length instead.
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(axum::body::Body::new(body), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let mut out = Response::from_parts(parts, axum::body::Body::from(bytes.clone()));
+    out.headers_mut().remove(axum::http::header::TRANSFER_ENCODING);
+    out.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from_str(&bytes.len().to_string())
+            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("0")),
+    );
+    out
 }
 
 #[derive(Clone)]

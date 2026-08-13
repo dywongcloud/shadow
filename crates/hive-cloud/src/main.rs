@@ -1631,9 +1631,8 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Mutations that are routed to a database's OWNER node, not to the
-/// control-plane leader — the one class of POST that must never be forwarded
-/// by either leader gate.
+/// Mutations that must never be forwarded to the control-plane leader by
+/// either leader gate — two DISTINCT rationales share this one bypass.
 ///
 /// A managed SQLite database is a FILE on `Database::host_node`, and
 /// `hrana::serve` proxies to that node itself. Sending its pipeline POSTs to
@@ -1644,9 +1643,23 @@ async fn main() -> anyhow::Result<()> {
 /// (`/v1/databases/<id>/hrana-mesh`) is itself a POST and would be bounced
 /// straight back to the leader instead of being served by the owner it was
 /// deliberately addressed to.
+///
+/// shadw drive (`/v1/drive/*`, both the REST surface and the WebDAV mount)
+/// needs no owner at all: every write lands in `relational::drive_*`, which
+/// is GuardianDB's CRDT last-write-wins relational store — safe to apply from
+/// ANY node, by the store's own design (see `relational::drive_put_file`'s
+/// doc comment). Leader-forwarding it bought zero correctness and cost a
+/// real round trip on every single PUT/DELETE — measured as the direct cause
+/// of "copying/moving files is slow" over WebDAV, since a Windows Explorer
+/// drag-drop of many small files serializes one leader-forward hop per file.
+/// WebDAV's own non-CRUD methods (MKCOL/COPY/MOVE/PROPFIND/LOCK/UNLOCK)
+/// already bypassed this gate by accident (the `is_mutation` classifier below
+/// only recognizes POST/PUT/DELETE/PATCH) — this makes PUT/DELETE consistent
+/// with them instead of the other way around.
 fn owner_routed(path: &str) -> bool {
     path.starts_with("/v1/sqlite/")
         || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
+        || path.starts_with("/v1/drive/")
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
