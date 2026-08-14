@@ -202,11 +202,26 @@ fn prune_dumps(keep: usize) {
 ///   well above the ~1–1.8 GB idle band so a normal node never pays for it,
 ///   and well below the ~93 GiB kill point so there is time to sample.
 /// * `HIVE_MEM_DUMP_MB`  (default 8192) — write a profile.
+/// * `HIVE_MEM_RESTART_MB` (default 16384) — self-restart. A confirmed real
+///   leak (not fragmentation — see the module doc's "80 MB live vs 1.09 GB
+///   RSS" contrast, which does NOT hold here: a live profile taken during a
+///   real burst sampled ~9.9 GiB of live-allocated bytes against ~11.3 GiB
+///   RSS, i.e. genuinely leaked memory, not idle pages) left unattended
+///   crosses into real OOM territory and drags the node's mesh connectivity
+///   down with it — measured live: a node at this RSS band stops answering
+///   gossip promptly enough to be reachable, and peers correctly mark it
+///   isolated. `Restart=always` in the systemd unit means a clean exit here
+///   is a full recovery, not a crash — this mirrors the exact manual
+///   `systemctl restart hive-node` recovery already proven live, just
+///   automatic instead of requiring an operator to notice. Set above
+///   `HIVE_MEM_DUMP_MB` so a profile is always captured before the exit that
+///   would otherwise erase the evidence.
 /// * `HIVE_MEM_WATCH_SECS` (default 15) — tick interval. Must be short relative
 ///   to the burst (minutes), or the watchdog samples only the corpse.
 /// * `HIVE_MEM_DUMP_COOLDOWN_SECS` (default 120), `HIVE_MEM_DUMP_KEEP` (8).
 ///
-/// `HIVE_MEM_WATCH=0` disables it entirely.
+/// `HIVE_MEM_WATCH=0` disables it entirely. `HIVE_MEM_RESTART_MB=0` disables
+/// only the restart tier — arm/dump still run.
 pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>) {
     if std::env::var("HIVE_MEM_WATCH").ok().as_deref() == Some("0") {
         tracing::info!("memory watchdog disabled (HIVE_MEM_WATCH=0)");
@@ -215,6 +230,11 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>) {
     let interval = std::time::Duration::from_secs(env_u64("HIVE_MEM_WATCH_SECS", 15));
     let arm_bytes = env_u64("HIVE_MEM_ARM_MB", 3072) * 1024 * 1024;
     let dump_bytes = env_u64("HIVE_MEM_DUMP_MB", 8192) * 1024 * 1024;
+    let restart_bytes = std::env::var("HIVE_MEM_RESTART_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(16384 * 1024 * 1024);
     let cooldown_ms = env_u64("HIVE_MEM_DUMP_COOLDOWN_SECS", 120) * 1000;
     let keep = env_u64("HIVE_MEM_DUMP_KEEP", 8) as usize;
 
@@ -250,6 +270,25 @@ pub fn spawn(hive: std::sync::Arc<hive_controlplane::Hive>) {
                     LAST_DUMP_MS.store(now, Ordering::Relaxed);
                     dump_profile(rss, keep);
                 }
+            }
+
+            if restart_bytes > 0 && rss >= restart_bytes {
+                tracing::error!(
+                    rss_mb = rss / 1024 / 1024,
+                    restart_mb = restart_bytes / 1024 / 1024,
+                    "memory watchdog: RSS crossed the restart threshold — dumping a final \
+                     profile, flushing state, and exiting for a clean systemd restart \
+                     (Restart=always) rather than waiting for the kernel OOM killer"
+                );
+                // One last profile, ignoring the normal cooldown — this exit is about
+                // to make the process (and its heap) unavailable to inspect.
+                dump_profile(rss, keep);
+                // The background persister writes on its own cadence; without an
+                // explicit flush here, whatever changed since its last tick is lost
+                // on exit — the exact hazard `persist::flush_blocking`'s SIGTERM
+                // call site already exists to close, reused here for the same reason.
+                crate::persist::flush_blocking();
+                std::process::exit(17);
             }
         }
     });
