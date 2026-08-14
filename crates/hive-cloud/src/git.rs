@@ -7,6 +7,7 @@
 //! `GET /v1/builds/:id` to stream the logs as they appear.
 
 use base64::Engine;
+use futures::StreamExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -733,7 +734,19 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         project: project.clone(),
         repo_url: req.repo_url.clone(),
         branch: req.branch.clone().unwrap_or_default(),
-        commit: String::new(),
+        // Pre-seeded from the request's PINNED commit when the caller already
+        // knows it (the webhook and git-poll paths both set `req.commit` to
+        // the exact target SHA) — never left empty until `run_build` resolves
+        // it post-clone. `commit_eq` treats an empty string as "never equal"
+        // by design (an unpinned build has no target to compare against), so
+        // leaving this at `""` made every already-building-this-commit guard
+        // (the webhook dup-delivery guard in admin.rs, and this function's
+        // own `already_building` check in `git_poll_one`) dead code for the
+        // whole window between build creation and clone completion —
+        // precisely when a near-simultaneous duplicate delivery is most
+        // likely to land. `run_build` still overwrites this with the
+        // resolved commit later (line ~1771), a no-op when it already matches.
+        commit: req.commit.clone().unwrap_or_default(),
         commit_message: String::new(),
         state: DeployState::Building,
         started_ms: now_ms(),
@@ -744,6 +757,13 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
         error: None,
         lines: Vec::new(),
     });
+    // Durability: a redeploy never registers a placeholder (`disarm()` below
+    // returns None for it), so without this the Build record above lives only
+    // in `cloud.builds`' in-memory Mutex until the next periodic
+    // `spawn_metrics_persist_loop` tick (default 120s) — a crash/OOM-kill in
+    // that window loses the record entirely rather than leaving it reconcilable
+    // on boot. Cheap: `persist` only bumps a dirty flag for a background writer.
+    crate::persist::persist(&cloud);
 
     crate::webhooks::dispatch(
         &cloud.webhooks,
@@ -804,6 +824,11 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                         b.finished_ms.get_or_insert_with(now_ms);
                     }
                 });
+                // Same durability gap as the insert above: a redeploy's failure/
+                // cancel never runs the placeholder-disarm persist either, so this
+                // terminal state would otherwise sit in-memory-only until the next
+                // periodic flush.
+                crate::persist::persist(&cloud);
             } else {
                 let err_text = e.to_string();
                 cloud.builds.log(&bid, format!("Error: {err_text}"));
@@ -812,6 +837,7 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
                     b.finished_ms = Some(now_ms());
                     b.error = Some(err_text.clone());
                 });
+                crate::persist::persist(&cloud);
                 crate::webhooks::dispatch(
                     &cloud.webhooks,
                     &wh_project,
@@ -2689,6 +2715,14 @@ async fn run_build(
         b.deployment_id = Some(info.id.to_string());
         b.alias = Some(info.alias.clone());
     });
+    // Persist HERE, not only at the tail of this function: `deploy_full` above
+    // already minted the (in-memory-only) Deployment record, and this update
+    // just settled the Build record's terminal state — both are the durable
+    // facts a crash/OOM-kill must not lose. The ~230 lines between here and the
+    // function's own tail persist (cron/workflow-manifest/env-wiring/audit) are
+    // all best-effort follow-up that a crash mid-way should never cost the
+    // deployment record itself.
+    crate::persist::persist(cloud);
 
     // Issue #2: derive the intelligent service graph ASYNC, off the deploy path. It
     // reads the checked-out repo (kept for live deployments), detects the framework,
@@ -6652,162 +6686,77 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
     });
 }
 
+/// One project's outcome from a single `git_poll_cycle` pass — folded into the
+/// cycle's aggregate counters after every project's check has run, so the
+/// concurrent fan-out below never needs a shared mutable counter.
+enum GitPollOutcome {
+    /// Not a git source, or a never-deployed/unbound project — not counted.
+    NotGit,
+    /// A real git project this cycle inspected but took no further action on
+    /// (empty tracked branch, HEAD unchanged, or a build already in flight).
+    Polled,
+    /// HEAD could not be read (branch missing, remote unreachable, auth failed).
+    RemoteUnreadable,
+    /// HEAD advanced past the deployed commit; a build was started.
+    Deployed,
+}
+
+/// Concurrent `git_poll_one` fan-out width, per cycle. Unlike the fleet/peer
+/// fan-outs this pattern was borrowed from (`vercel_dns.rs`, `gpu_pool.rs`,
+/// `admin.rs` — all bounded by the ~14-node fleet roster), the input here is
+/// `cloud.projects` — platform-wide and, on the "enterprise" plan tier,
+/// literally unbounded per tenant (`billing.rs`'s `plan_max_projects`). An
+/// unbounded `join_all` over that set forks one OS `git ls-remote` subprocess
+/// PER PROJECT simultaneously on the single control-plane leader every tick —
+/// real FD/process-table/socket pressure that scales with tenant-controlled
+/// project count, not with anything this node's own resources bound.
+/// `buffer_unordered` keeps the "one slow remote can't block another" property
+/// the unbounded version was written for, while capping how many `git`
+/// subprocesses exist at once; `HIVE_GIT_POLL_CONCURRENCY` overrides the
+/// default for a fleet running an unusually large git-sourced project count.
+fn git_poll_concurrency() -> usize {
+    std::env::var("HIVE_GIT_POLL_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(16)
+}
+
 /// One poll pass over every git-sourced project. Never panics: a per-project
 /// failure (unreachable remote, missing branch, auth failure) is logged at debug
 /// and skipped so it can't wedge the other projects or the loop.
+///
+/// Each project's check does its own network round trip (`git ls-remote`, up to
+/// a 20s timeout) before deciding whether to deploy. A bounded concurrent
+/// fan-out (see [`git_poll_concurrency`]) means one project's stale/slow check
+/// never blocks another's — while capping the simultaneous `git` subprocess
+/// count regardless of how many git-sourced projects the platform has.
 async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
+    let outcomes: Vec<GitPollOutcome> = futures::stream::iter(projects.into_iter().map(|project| {
+        let cloud = Arc::clone(cloud);
+        async move { git_poll_one(&cloud, project).await }
+    }))
+    .buffer_unordered(git_poll_concurrency())
+    .collect()
+    .await;
+
     let mut n_git = 0u32; // git-sourced projects actually polled this cycle
     let mut n_deployed = 0u32; // projects whose HEAD advanced -> build started
     let mut n_skipped = 0u32; // git projects whose remote HEAD could not be read
-    for project in projects {
-        // Fleet-aware source; skip non-git (zip `upload://`, image `image://`)
-        // and never-deployed / unbound projects.
-        let Some(src) = crate::admin::git_for_project_fleet(cloud, &project) else {
-            continue;
-        };
-        if !src.is_real_git() {
-            continue;
-        }
-        n_git += 1;
-        // Tracked branch: the project's production branch, else the deployment's
-        // own branch. Empty => nothing to poll.
-        let branch = {
-            let pb = cloud.projects.production_branch_of(&project);
-            if pb.is_empty() {
-                src.branch.clone()
-            } else {
-                pb
-            }
-        };
-        if branch.is_empty() {
-            continue;
-        }
-
-        // Token for a PRIVATE github repo (public repos need none): the same
-        // resolution `git_webhook` uses — a GitHub App installation token first,
-        // else a node-wide GITHUB_TOKEN. Carried into both the `ls-remote` read
-        // and the deploy request's clone.
-        let token = resolve_git_poll_token(&src.repo_url).await;
-
-        let head = match git_ls_remote_head(&src.repo_url, &branch, token.as_deref()).await {
-            Some(h) if !h.is_empty() => h,
-            // Branch not found / remote unreachable / auth failure: skip this
-            // cycle, retry next tick. Never treated as "no commit -> deploy".
-            //
-            // WARN, not debug and not silent. This arm is the single point where
-            // "my pushes stopped deploying" becomes invisible: it swallows an
-            // auth failure identically to a renamed branch, and the fleet runs
-            // RUST_LOG=info so a debug line would not be read even if one
-            // existed (the function's own doc claimed one that was never
-            // written). The token-presence flag is the actionable half — with no
-            // App private key and no GITHUB_TOKEN on a node, EVERY private repo
-            // lands here forever, and without this line nothing anywhere says so.
-            _ => {
+    for outcome in outcomes {
+        match outcome {
+            GitPollOutcome::NotGit => {}
+            GitPollOutcome::Polled => n_git += 1,
+            GitPollOutcome::RemoteUnreadable => {
+                n_git += 1;
                 n_skipped += 1;
-                tracing::warn!(
-                    project = %project,
-                    branch = %branch,
-                    had_token = token.is_some(),
-                    "git poll: could not read the remote HEAD — branch missing, remote \
-                     unreachable, or auth failed. Auto-deploy for this project is INERT \
-                     until it resolves. A private repo with had_token=false has no \
-                     credential on this node (GitHub App private key or GITHUB_TOKEN)."
-                );
-                continue;
             }
-        };
-
-        // Baseline: the in-memory last-seen SHA if we've observed this project
-        // before, else the currently-deployed commit. This is what makes the
-        // FIRST poll after a boot deploy shoomoo-style undeployed pushes (deployed
-        // != HEAD) while leaving already-current projects alone (deployed == HEAD).
-        let baseline = cloud
-            .git_poll_seen
-            .read()
-            .get(&project)
-            .cloned()
-            .unwrap_or_else(|| src.commit.clone());
-
-        if commit_eq(&head, &baseline) {
-            // Up to date: record HEAD so subsequent cycles are a cheap compare.
-            cloud.git_poll_seen.write().insert(project.clone(), head);
-            continue;
+            GitPollOutcome::Deployed => {
+                n_git += 1;
+                n_deployed += 1;
+            }
         }
-
-        // A genuine advance. Don't stack on a build for this exact commit that's
-        // already in flight LOCALLY (best-effort — a build placed on a peer node
-        // isn't in this leader's list; the SHA-dedup below is the real guard).
-        let already_building = cloud.builds.list().iter().any(|b| {
-            b.project == project
-                && matches!(b.state, DeployState::Queued | DeployState::Building)
-                && commit_eq(&b.commit, &head)
-        });
-        // Record BEFORE enqueue so a slow build can't be re-enqueued next tick and
-        // a real webhook + this poller can't double-fire (whoever deploys HEAD
-        // first, the other sees deployed == HEAD and skips).
-        cloud
-            .git_poll_seen
-            .write()
-            .insert(project.clone(), head.clone());
-        if already_building {
-            continue;
-        }
-
-        let root_dir = Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
-        let req = GitDeployRequest {
-            repo_url: src.repo_url.clone(),
-            branch: Some(branch.clone()).filter(|b| !b.is_empty()),
-            // Pin the EXACT polled SHA (same race protection as the webhook path).
-            commit: Some(head.clone()),
-            head_repo_url: None, // polling only ever tracks the project's own repo
-            project: Some(project.clone()),
-            creator: Some("git-poll".into()),
-            production: true, // legacy field; classification uses target/branch
-            target: None,     // branch-classified: production branch => production
-            use_cache: true,
-            root_dir,
-            env: None,        // env comes from the project store on a push redeploy
-            no_fanout: false, // coordinator deploy: schedule + fanout to placement
-            fanout_secondary: false,
-            build_config: None,
-            function_settings: None,
-            redeploy: false,
-            zip_b64: None,
-            image_ref: None,
-            image_port: None,
-            image_protocol: None,
-            image_memory: None,
-            image_cpus: None,
-            image_pids: None,
-            image_ports: None,
-            git_token: token,
-        };
-        let build_id = start_build(cloud.clone(), req);
-        let ev = cloud.event(
-            &cloud.region,
-            "DEPLOY",
-            &format!("{project}.localhost"),
-            "/",
-            200,
-            "git-poll",
-            &format!(
-                "git-poll {} {} @ {}",
-                src.repo_url,
-                branch,
-                head.chars().take(7).collect::<String>()
-            ),
-        );
-        cloud.record(ev);
-        tracing::info!(
-            project = %project,
-            repo = %src.repo_url,
-            branch = %branch,
-            commit = %head,
-            build = %build_id,
-            "git_poll: tracked branch advanced past the deployed commit — auto-deploy started (no webhook installed)"
-        );
-        n_deployed += 1;
     }
     // INFO when anything was skipped, so a fleet at RUST_LOG=info sees that
     // auto-deploy is silently not running for some projects; debug otherwise, to
@@ -6829,10 +6778,165 @@ async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     }
 }
 
+/// One project's check-and-maybe-deploy, factored out of `git_poll_cycle` so it
+/// can run concurrently with every other project's — every side effect
+/// (`git_poll_seen` dedup, the already-building guard, `start_build`) is
+/// unchanged from the prior serial loop, just scoped to a single project.
+async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcome {
+    // Fleet-aware source; skip non-git (zip `upload://`, image `image://`)
+    // and never-deployed / unbound projects.
+    let Some(src) = crate::admin::git_for_project_fleet(cloud, &project) else {
+        return GitPollOutcome::NotGit;
+    };
+    if !src.is_real_git() {
+        return GitPollOutcome::NotGit;
+    }
+    // Tracked branch: the project's production branch, else the deployment's
+    // own branch. Empty => nothing to poll.
+    let branch = {
+        let pb = cloud.projects.production_branch_of(&project);
+        if pb.is_empty() {
+            src.branch.clone()
+        } else {
+            pb
+        }
+    };
+    if branch.is_empty() {
+        return GitPollOutcome::Polled;
+    }
+
+    // Token for a PRIVATE github repo (public repos need none): the same
+    // resolution `git_webhook` uses — a GitHub App installation token first,
+    // else a node-wide GITHUB_TOKEN. Carried into both the `ls-remote` read
+    // and the deploy request's clone.
+    let token = resolve_git_poll_token(&src.repo_url).await;
+
+    let head = match git_ls_remote_head(&src.repo_url, &branch, token.as_deref()).await {
+        Some(h) if !h.is_empty() => h,
+        // Branch not found / remote unreachable / auth failure: skip this
+        // cycle, retry next tick. Never treated as "no commit -> deploy".
+        //
+        // WARN, not debug and not silent. This arm is the single point where
+        // "my pushes stopped deploying" becomes invisible: it swallows an
+        // auth failure identically to a renamed branch, and the fleet runs
+        // RUST_LOG=info so a debug line would not be read even if one
+        // existed (the function's own doc claimed one that was never
+        // written). The token-presence flag is the actionable half — with no
+        // App private key and no GITHUB_TOKEN on a node, EVERY private repo
+        // lands here forever, and without this line nothing anywhere says so.
+        _ => {
+            tracing::warn!(
+                project = %project,
+                branch = %branch,
+                had_token = token.is_some(),
+                "git poll: could not read the remote HEAD — branch missing, remote \
+                 unreachable, or auth failed. Auto-deploy for this project is INERT \
+                 until it resolves. A private repo with had_token=false has no \
+                 credential on this node (GitHub App private key or GITHUB_TOKEN)."
+            );
+            return GitPollOutcome::RemoteUnreadable;
+        }
+    };
+
+    // Baseline: the in-memory last-seen SHA if we've observed this project
+    // before, else the currently-deployed commit. This is what makes the
+    // FIRST poll after a boot deploy shoomoo-style undeployed pushes (deployed
+    // != HEAD) while leaving already-current projects alone (deployed == HEAD).
+    let baseline = cloud
+        .git_poll_seen
+        .read()
+        .get(&project)
+        .cloned()
+        .unwrap_or_else(|| src.commit.clone());
+
+    if commit_eq(&head, &baseline) {
+        // Up to date: record HEAD so subsequent cycles are a cheap compare.
+        cloud.git_poll_seen.write().insert(project.clone(), head);
+        return GitPollOutcome::Polled;
+    }
+
+    // A genuine advance. Don't stack on a build for this exact commit that's
+    // already in flight LOCALLY (best-effort — a build placed on a peer node
+    // isn't in this leader's list; the SHA-dedup below is the real guard).
+    let already_building = cloud.builds.list().iter().any(|b| {
+        b.project == project
+            && matches!(b.state, DeployState::Queued | DeployState::Building)
+            && commit_eq(&b.commit, &head)
+    });
+    // Record BEFORE enqueue so a slow build can't be re-enqueued next tick and
+    // a real webhook + this poller can't double-fire (whoever deploys HEAD
+    // first, the other sees deployed == HEAD and skips).
+    cloud
+        .git_poll_seen
+        .write()
+        .insert(project.clone(), head.clone());
+    if already_building {
+        return GitPollOutcome::Polled;
+    }
+
+    let root_dir = Some(cloud.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
+    let req = GitDeployRequest {
+        repo_url: src.repo_url.clone(),
+        branch: Some(branch.clone()).filter(|b| !b.is_empty()),
+        // Pin the EXACT polled SHA (same race protection as the webhook path).
+        commit: Some(head.clone()),
+        head_repo_url: None, // polling only ever tracks the project's own repo
+        project: Some(project.clone()),
+        creator: Some("git-poll".into()),
+        production: true, // legacy field; classification uses target/branch
+        target: None,     // branch-classified: production branch => production
+        use_cache: true,
+        root_dir,
+        env: None,        // env comes from the project store on a push redeploy
+        no_fanout: false, // coordinator deploy: schedule + fanout to placement
+        fanout_secondary: false,
+        build_config: None,
+        function_settings: None,
+        redeploy: false,
+        zip_b64: None,
+        image_ref: None,
+        image_port: None,
+        image_protocol: None,
+        image_memory: None,
+        image_cpus: None,
+        image_pids: None,
+        image_ports: None,
+        git_token: token,
+    };
+    let build_id = start_build(cloud.clone(), req);
+    let ev = cloud.event(
+        &cloud.region,
+        "DEPLOY",
+        &format!("{project}.localhost"),
+        "/",
+        200,
+        "git-poll",
+        &format!(
+            "git-poll {} {} @ {}",
+            src.repo_url,
+            branch,
+            head.chars().take(7).collect::<String>()
+        ),
+    );
+    cloud.record(ev);
+    tracing::info!(
+        project = %project,
+        repo = %src.repo_url,
+        branch = %branch,
+        commit = %head,
+        build = %build_id,
+        "git_poll: tracked branch advanced past the deployed commit — auto-deploy started (no webhook installed)"
+    );
+    GitPollOutcome::Deployed
+}
+
 /// True when two commit strings refer to the same commit, tolerant of one being
 /// an abbreviated prefix of the other (a deployment record may store a short
 /// SHA while `ls-remote` returns the full 40-char one). Empty never matches.
-fn commit_eq(a: &str, b: &str) -> bool {
+///
+/// `pub(crate)`: `admin::git_webhook` reuses this for its own already-building
+/// dedup, matching `git_poll_cycle`'s.
+pub(crate) fn commit_eq(a: &str, b: &str) -> bool {
     if a.is_empty() || b.is_empty() {
         return false;
     }

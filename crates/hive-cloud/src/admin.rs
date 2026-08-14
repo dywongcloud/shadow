@@ -4731,6 +4731,38 @@ async fn git_webhook(
         } else {
             branch.clone()
         };
+
+        // Already-building guard, matching `git_poll_cycle`'s (git.rs) — a
+        // webhook delivery firing near-simultaneously with a poll tick (or a
+        // redelivered/duplicate webhook) for the same commit would otherwise
+        // start a full duplicate build: production safety is already covered
+        // by `deploy_full`'s superseded-by veto (only the newest-started build
+        // goes live), but the loser still burns a full clone+install+build and
+        // fires a spurious `deployment.error` webhook when it's vetoed. Only
+        // guards when the commit is actually known at receipt time (every real
+        // `push`/`pull_request` payload carries one; a malformed/edge-case
+        // delivery with an empty SHA can't be deduped this way and falls
+        // through to start a build as before — an honest under-cover, not a
+        // silent one).
+        if !commit.is_empty() {
+            let already_building = c.builds.list().iter().any(|b| {
+                b.project == project
+                    && matches!(
+                        b.state,
+                        fluid_core::DeployState::Queued | fluid_core::DeployState::Building
+                    )
+                    && crate::git::commit_eq(&b.commit, &commit)
+            });
+            if already_building {
+                tracing::info!(
+                    project = %project,
+                    commit = %commit,
+                    "git_webhook: a build for this exact commit is already in flight — skipping duplicate"
+                );
+                continue;
+            }
+        }
+
         let root_dir = Some(c.projects.root_dir_of(&project)).filter(|s| !s.is_empty());
         let req = fluid_core::GitDeployRequest {
             repo_url: git.repo_url.clone(),
