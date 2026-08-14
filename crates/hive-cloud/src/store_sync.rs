@@ -36,6 +36,7 @@
 //! rosters already replicate over.
 
 use crate::state::CloudState;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// One replicated store: its wire name plus serialize/adopt function pointers.
@@ -550,7 +551,11 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         .filter(|n| !n.is_self && n.healthy)
         .filter_map(|n| Some((n.name, n.peer_id?, n.iroh_addr?)))
         .collect();
-    peers.truncate(3);
+    // 5, not 3: the non-merge-store adoption below now requires 2 INDEPENDENT
+    // peers to corroborate identical bytes before adopting (see below) — a
+    // wider candidate set makes that quorum reachable even when one or two
+    // queried peers are momentarily slow/unreachable.
+    peers.truncate(5);
     if peers.is_empty() {
         tracing::warn!(
             "store_sync: promoted to leader with no reachable peers to reconcile against \
@@ -560,7 +565,6 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         return;
     }
     let peer_names: Vec<String> = peers.iter().map(|(n, _, _)| n.clone()).collect();
-    let local_snapshots: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
 
     let mut fetches = Vec::with_capacity(REGISTRY.len() * peers.len());
     for (store_idx, store) in REGISTRY.iter().enumerate() {
@@ -591,6 +595,20 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         by_store[store_idx].push((peer_name, bytes));
     }
 
+    // Freshly re-read right HERE, after the (up to 10s) peer round trip above
+    // — not once before it. `admin_ingress` starts serving/forwarding writes
+    // to this node the instant `is_control_plane_leader()` flips true
+    // (state.rs, no caching, no coordination with this function), which
+    // typically happens well before this loop even starts, let alone
+    // finishes its network wait. A snapshot taken before the wait cannot see
+    // a write that legitimately landed locally during it, so comparing
+    // against one risks silently discarding an already-200'd write under a
+    // peer's (necessarily pre-promotion, i.e. stale) snapshot — the exact
+    // scenario this whole mechanism exists to guard against, turned back on
+    // itself. Re-reading here shrinks that window from "up to 10s" to the
+    // (now negligible) gap between this line and each store's `adopt()` call.
+    let local_snapshots: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
+
     let mut adopted: Vec<&'static str> = Vec::new();
     for (store_idx, store) in REGISTRY.iter().enumerate() {
         if MERGE_STORES.contains(&store.name) {
@@ -612,23 +630,52 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
             }
             continue;
         }
-        let best = by_store[store_idx]
-            .iter()
-            .max_by_key(|(_, b)| b.len())
-            .filter(|(_, b)| b.len() > local_snapshots[store_idx].len());
-        let Some((peer_name, bytes)) = best else {
+        // Wholesale-replace stores (apikeys/teams/billing/webhooks/domains/
+        // integrations/enterprise SSO secrets/identity/... — everything not
+        // in MERGE_STORES) get NO per-record provenance or signature check
+        // (this module's own doc: the sole boundary is "must be a trusted
+        // mesh member"), so trusting whichever single arbitrary peer answers
+        // fastest with the longest payload would let ANY ONE reachable
+        // trusted node — not necessarily one that was ever the control-plane
+        // leader, merely one that is alive and answers
+        // `GET /v1/store-snapshot/<name>` — become the adopted source of
+        // truth for fleet-wide secrets the instant some OTHER node gets
+        // promoted (a real, non-rare trigger: leadership flapping happens on
+        // this fleet with no node compromise involved at all). Requiring at
+        // least 2 INDEPENDENT peers to report byte-identical content raises
+        // that bar to "collude two already-trusted mesh members" while
+        // costing nothing in the legitimate recovery case: a genuinely
+        // fresher state that reached the outgoing leader before it stepped
+        // down had already replicated to every follower via the ordinary
+        // 60s store_sync pull loop, so more than one surviving peer holds it
+        // — a single lone responder is the anomalous case, not the common one.
+        let mut by_bytes: HashMap<&[u8], Vec<&str>> = HashMap::new();
+        for (peer_name, bytes) in &by_store[store_idx] {
+            by_bytes
+                .entry(bytes.as_slice())
+                .or_default()
+                .push(peer_name.as_str());
+        }
+        let best = by_bytes
+            .into_iter()
+            .filter(|(bytes, corroborators)| {
+                bytes.len() > local_snapshots[store_idx].len() && corroborators.len() >= 2
+            })
+            .max_by_key(|(bytes, _)| bytes.len());
+        let Some((bytes, corroborators)) = best else {
             continue;
         };
         if let Some(n) = (store.adopt)(cloud, bytes) {
             adopted.push(store.name);
             tracing::warn!(
                 store = store.name,
-                from_peer = %peer_name,
+                from_peers = ?corroborators,
                 local_bytes = local_snapshots[store_idx].len(),
                 peer_bytes = bytes.len(),
                 adopted_count = n,
-                "store_sync: promotion reconciliation adopted a peer's richer snapshot -- \
-                 this node's own copy may have missed writes the outgoing leader accepted"
+                "store_sync: promotion reconciliation adopted a peer-corroborated richer \
+                 snapshot -- this node's own copy may have missed writes the outgoing leader \
+                 accepted"
             );
         }
     }
