@@ -358,7 +358,7 @@ async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
     let cache = std::mem::take(&mut stream.cache);
     let out = stream
         .conn
-        .call(move |c| execute_pipeline(c, requests, cache, version))
+        .call(move |c| execute_pipeline(c, requests, cache, version, false))
         .await;
     let (results, closed) = match out {
         Ok(o) => {
@@ -406,7 +406,7 @@ async fn cursor(db: &Database, version: u8, body: &[u8]) -> Response {
     let cache = stream.cache.clone();
     let out = stream
         .conn
-        .call(move |c| crate::hrana_proto::execute_cursor(c, batch, &cache, version))
+        .call(move |c| crate::hrana_proto::execute_cursor(c, batch, &cache, version, false))
         .await;
     let entries = match out {
         Ok(e) => e,

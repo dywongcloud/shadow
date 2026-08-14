@@ -101,11 +101,15 @@ fn result_ok(response: Value) -> Value {
 /// Execute a whole pipeline's `requests` array against one connection.
 /// `version` gates the v3-only requests (`get_autocommit`, the `is_autocommit`
 /// batch condition) so a v2 client can never observe a v3 response shape.
+/// `read_only` is an ADDITIONAL, connection-independent enforcement layer —
+/// see [`deny_if_forbidden_read_only_stmt`]'s doc for why a mutable
+/// `PRAGMA query_only` alone is not a sufficient boundary.
 pub fn execute_pipeline(
     conn: &mut Connection,
     requests: Vec<Value>,
     mut cache: SqlCache,
     version: u8,
+    read_only: bool,
 ) -> ExecOutput {
     let mut results = Vec::with_capacity(requests.len());
     let mut closed = false;
@@ -122,6 +126,7 @@ pub fn execute_pipeline(
                 req.get("stmt").cloned().unwrap_or(Value::Null),
             ) {
                 Ok(stmt) => resolve_sql(&stmt, &cache)
+                    .and_then(|sql| deny_if_forbidden_read_only_stmt(&sql, read_only).map(|_| sql))
                     .and_then(|sql| execute_stmt(conn, &sql, &stmt))
                     .map(|r| json!({ "type": "execute", "result": r })),
                 Err(e) => Err(format!("malformed stmt: {e}")),
@@ -129,10 +134,16 @@ pub fn execute_pipeline(
             "batch" => match serde_json::from_value::<Batch>(
                 req.get("batch").cloned().unwrap_or(Value::Null),
             ) {
-                Ok(batch) => execute_batch(conn, batch, &cache, version)
+                Ok(batch) => execute_batch(conn, batch, &cache, version, read_only)
                     .map(|r| json!({ "type": "batch", "result": r })),
                 Err(e) => Err(format!("malformed batch: {e}")),
             },
+            "sequence" if read_only => Err(
+                "\"sequence\" (multi-statement execute_batch) is not permitted on a read-only \
+                 browser_db session — a single string can hide an arbitrary later statement \
+                 (e.g. a PRAGMA) past a leading-keyword check; use \"execute\" instead"
+                    .to_string(),
+            ),
             "sequence" => sql_from_req(&req, &cache).and_then(|sql| {
                 conn.execute_batch(&sql)
                     .map(|_| json!({ "type": "sequence" }))
@@ -170,6 +181,47 @@ pub fn execute_pipeline(
         closed,
         cache,
     }
+}
+
+/// A read-only session's ONLY enforcement point that isn't a mutable
+/// per-connection PRAGMA. `PRAGMA query_only=ON` is not a real boundary: it
+/// is a session-scoped setting toggled by ordinary SQL text, and SQLite does
+/// not gate PRAGMA execution behind the flag it itself controls, so
+/// `PRAGMA query_only=OFF` sent over the same read-only-scoped connection
+/// silently re-enables writes for the rest of the request. `ATTACH`/`DETACH`
+/// are denied for the same reason (attaching a second database file sidesteps
+/// this file's own `max_bytes` cap and any path-scoping assumption entirely).
+/// Every raw SQL string reaching `conn.execute`/`conn.prepare` from a
+/// read-only-scoped pipeline must pass through here first — never trust
+/// `stmt.readonly()` post hoc, since PRAGMA/ATTACH survive that check too.
+fn deny_if_forbidden_read_only_stmt(sql: &str, read_only: bool) -> Result<(), String> {
+    if !read_only {
+        return Ok(());
+    }
+    let mut s = sql;
+    loop {
+        s = s.trim_start();
+        if let Some(rest) = s.strip_prefix("--") {
+            s = rest.split_once('\n').map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("/*") {
+            s = rest.split_once("*/").map(|(_, r)| r).unwrap_or("");
+            continue;
+        }
+        break;
+    }
+    let first_word: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if matches!(first_word.as_str(), "PRAGMA" | "ATTACH" | "DETACH") {
+        return Err(format!(
+            "{first_word} is not permitted on a read-only browser_db session"
+        ));
+    }
+    Ok(())
 }
 
 fn store_sql(req: &Value, cache: &mut SqlCache) -> Result<(), String> {
@@ -556,6 +608,7 @@ pub fn execute_cursor(
     batch: Value,
     cache: &SqlCache,
     version: u8,
+    read_only: bool,
 ) -> Vec<Value> {
     let parsed = match serde_json::from_value::<Batch>(batch) {
         Ok(b) => b,
@@ -566,7 +619,7 @@ pub fn execute_cursor(
             })]
         }
     };
-    let result = match execute_batch(conn, parsed, cache, version) {
+    let result = match execute_batch(conn, parsed, cache, version, read_only) {
         Ok(r) => r,
         Err(e) => {
             return vec![json!({
@@ -606,6 +659,7 @@ fn execute_batch(
     batch: Batch,
     cache: &SqlCache,
     version: u8,
+    read_only: bool,
 ) -> Result<Value, String> {
     let n = batch.steps.len();
     let mut states: Vec<StepState> = vec![StepState::Skipped; n];
@@ -629,7 +683,10 @@ fn execute_batch(
         if !run {
             continue;
         }
-        match resolve_sql(&step.stmt, cache).and_then(|sql| execute_stmt(conn, &sql, &step.stmt)) {
+        match resolve_sql(&step.stmt, cache)
+            .and_then(|sql| deny_if_forbidden_read_only_stmt(&sql, read_only).map(|_| sql))
+            .and_then(|sql| execute_stmt(conn, &sql, &step.stmt))
+        {
             Ok(r) => {
                 states[i] = StepState::Ok;
                 step_results[i] = r;

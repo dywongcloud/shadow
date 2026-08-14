@@ -221,6 +221,12 @@ pub async fn require_auth(
         // what makes the two mount points behave identically instead of the
         // platform-API one 401ing every legitimate libsql client.
         || path.starts_with("/v1/sqlite/")
+        // browser_db's libsql/Hrana + Upstash REST surface carries the
+        // project's own minted `browser_db_rest` bearer, not a platform
+        // JWT — exactly the `/v1/sqlite/` posture above.
+        // `browser_db_rest::serve` fails closed on a wrong/absent token via
+        // `browser_db_rest::credential_scope`.
+        || path.starts_with("/v1/browser-db/")
         // WebDAV clients (Finder/Explorer/davfs2) only speak HTTP
         // Basic/Digest, never a bearer JWT — `drive_webdav.rs`'s own
         // Basic-auth check (the project's hashed drive access token) fails

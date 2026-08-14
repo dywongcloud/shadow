@@ -1181,6 +1181,32 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
                 Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
+        // browser_db libsql/Hrana + Upstash REST OWNER PROXY
+        // (bn-browser-db-rest): the exact `/v1/databases/*/hrana-mesh` shape
+        // above, addressed by project instead of database id since there is
+        // no `Database` record here — `browser_db_rest::mesh_serve`
+        // re-derives the elected owner and the credential scope from THIS
+        // node's own replicated state before touching the file.
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.split('?')
+                .next()
+                .unwrap_or_default()
+                .ends_with("/browser-db/rest-mesh") =>
+        {
+            let project = p
+                .split('?')
+                .next()
+                .unwrap_or_default()
+                .trim_start_matches("/v1/projects/")
+                .trim_end_matches("/browser-db/rest-mesh");
+            match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(env) => jb(axum::Json(
+                    crate::browser_db_rest::mesh_serve(&cloud, project, &env).await,
+                )),
+                Err(e) => jb(axum::Json(serde_json::json!({ "error": e.to_string() }))),
+            }
+        }
         // Cross-region DB replica control (register/remove) over the mesh.
         p if method == hive_p2p::GOSSIP_POST && p.starts_with("/v1/databases/replica") => {
             match serde_json::from_slice::<serde_json::Value>(body) {

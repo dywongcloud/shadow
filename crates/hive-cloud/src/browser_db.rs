@@ -261,6 +261,53 @@ pub fn auto_db_deployment_for_tenant(
     by_project.remove(&chosen).map(|(_, id)| id)
 }
 
+/// The resolved-source-of-truth `browser_db` opt-in for a project — the exact
+/// two-source (local Ready records + gossiped peer view), Ready-deployment-
+/// derived resolution [`opted_in_projects`] already performs for the
+/// reconcile loop and the fleet-fleet sync grant, exposed here so the
+/// libsql/Hrana + Upstash REST surface (`browser_db_rest`) can never observe
+/// a DIFFERENT spec than the CRR sync protocol does for the identical
+/// project — one opt-in source, every consumer.
+pub(crate) fn policy_for_project(cloud: &Arc<CloudState>, project: &str) -> Option<BrowserDbPolicy> {
+    opted_in_projects(cloud).remove(project)
+}
+
+/// Deterministic REST-owner election for `browser_db_rest`'s libsql/Hrana +
+/// Upstash REST surface (bn-browser-db-rest): every node computes the SAME
+/// answer from the gossiped registry, so cold-starting a REST request needs
+/// no coordinator and no election round trip — the identical
+/// `inference::coordinator_for` / `lease::hrw_owner` rendezvous-hashing
+/// pattern this file already reuses above for
+/// [`auto_db_deployment_for_tenant`] and [`hrw_rank`].
+///
+/// Unlike GPU-coordinator election there is no capability filter: any
+/// healthy node can hold (or lazily create) a `browser_db` replica file, so
+/// the roster is every healthy node's name — deduped and SORTED (`BTreeSet`)
+/// so the input is order-independent across nodes, which is what makes the
+/// hash agree fleet-wide. An election landing on a node with no local
+/// replica yet self-heals on its first request (`browser_db_rest`'s local
+/// serve path opens-or-creates via `hive_crsql::open` + [`ensure_schema`]),
+/// exactly mirroring how [`reconcile_replicas`] backfills a fresh node.
+///
+/// Falls back to THIS node when the registry has no healthy peer yet (a
+/// single just-booted node has not gossiped itself healthy on its very
+/// first tick) — the failure direction is "serve it locally", never "500
+/// with nobody to serve it".
+pub fn rest_owner_for_project(cloud: &Arc<CloudState>, project: &str) -> Option<String> {
+    let members: BTreeSet<String> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| n.healthy)
+        .map(|n| n.name)
+        .collect();
+    if members.is_empty() {
+        return Some(cloud.node_name.clone());
+    }
+    let members: Vec<String> = members.into_iter().collect();
+    crate::lease::hrw_owner(project, &members)
+}
+
 /// What one sync round is allowed to do, resolved fresh per request from the
 /// live admission + the live descriptor (never from wire input).
 struct RoundGrant {
@@ -843,7 +890,7 @@ async fn operator_sync_http(
 /// `crsql_changes`, so both replica halves derive it from the SAME
 /// replicated spec — this is the fleet half (the browser half gets it
 /// verbatim in the admission's `db` capability block).
-fn ensure_schema(
+pub(crate) fn ensure_schema(
     conn: &hive_crsql::rusqlite::Connection,
     resolved: &ResolvedBrowserDbPolicy,
 ) -> anyhow::Result<()> {
@@ -857,15 +904,40 @@ fn ensure_schema(
 /// Every opted-in project visible to this node: local Ready records whose
 /// manifest carries the block, plus the gossiped peer view — the same two
 /// sources [`db_descriptor_for`] consults. Keyed by project (database
-/// identity IS the project, contract §1); the spec from the local record
-/// wins on a tie (fresher than the peer view).
+/// identity IS the project, contract §1).
+///
+/// A project accumulates MULTIPLE Ready deployment records permanently — a
+/// superseded deployment stays `Ready`, servable via its own preview alias;
+/// `production: bool` is the only field distinguishing the live one. Picking
+/// "whichever Ready record the iteration happens to visit last" (the
+/// previous behavior: peer loop `or_insert_with` = first-peer-wins, local
+/// loop unconditional `insert` = always overwrites) resolves the wrong spec
+/// as soon as a project has been redeployed even once — the normal,
+/// permanent steady state for any active project. A stale non-production
+/// record's schema silently overriding the current production one corrupts
+/// the on-disk replica (`CREATE TABLE IF NOT EXISTS` is a permanent no-op
+/// once any version of the table exists), and a stale `public_read: true`
+/// left in effect after a redeploy disabled it keeps minting working public
+/// tokens indefinitely — directly undermining this module's own "re-checked
+/// live on every request" security claim.
+///
+/// Precedence, encoded as a linear priority so a single max-by-priority pass
+/// captures it: PRODUCTION always beats non-production regardless of source
+/// (peer vs local), and within the same production-ness the LOCAL record
+/// wins (fresher than the gossiped peer view) — priority 0/1/2/3 for
+/// peer-non-prod / local-non-prod / peer-prod / local-prod respectively.
 fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolicy> {
-    let mut out = BTreeMap::new();
+    let mut out: BTreeMap<String, (BrowserDbPolicy, u8)> = BTreeMap::new();
+    let mut consider = |project: String, spec: &BrowserDbPolicy, priority: u8| {
+        if out.get(&project).is_none_or(|(_, p)| priority >= *p) {
+            out.insert(project, (spec.clone(), priority));
+        }
+    };
     for deployments in cloud.peer_deployments.read().values() {
         for info in deployments {
             if info.state == fluid_core::DeployState::Ready {
                 if let Some(spec) = &info.browser_db {
-                    out.entry(info.project.clone()).or_insert_with(|| spec.clone());
+                    consider(info.project.clone(), spec, if info.production { 2 } else { 0 });
                 }
             }
         }
@@ -873,11 +945,11 @@ fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolic
     for record in cloud.gw.deployment_records() {
         if record.state == fluid_core::DeployState::Ready {
             if let Some(spec) = &record.manifest.browser_db {
-                out.insert(record.project.clone(), spec.clone());
+                consider(record.project.clone(), spec, if record.production { 3 } else { 1 });
             }
         }
     }
-    out
+    out.into_iter().map(|(project, (spec, _))| (project, spec)).collect()
 }
 
 /// Periodic reconcile: for every opted-in project, ensure the replica file

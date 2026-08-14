@@ -14,6 +14,7 @@ mod billing;
 mod browser_admission;
 mod browser_artifacts;
 mod browser_db;
+mod browser_db_rest;
 // bn-impl-relay-byte-metering (module declaration; sibling-owned file, flagged)
 mod browser_metering;
 mod browser_presence;
@@ -1662,6 +1663,12 @@ fn owner_routed(path: &str) -> bool {
     path.starts_with("/v1/sqlite/")
         || (path.starts_with("/v1/databases/") && path.ends_with("/hrana-mesh"))
         || path.starts_with("/v1/drive/")
+        // browser_db's libsql/Hrana + Upstash REST surface (bn-browser-db-rest):
+        // owner-ROUTED to the elected REST owner (`browser_db::rest_owner_for_project`),
+        // never leader-forwarded — the `/v1/sqlite/` precedent, computed rather
+        // than stored since there is no `Database` record to carry a host_node.
+        || path.starts_with("/v1/browser-db/")
+        || (path.starts_with("/v1/projects/") && path.ends_with("/browser-db/rest-mesh"))
 }
 
 /// Loopback-admin mutation forwarding (the admin_ingress leader rule, applied
@@ -1924,6 +1931,9 @@ async fn admin_ingress(
             || path == "/v1/zkauth/preview-proof"
             // Per-database bearer, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/sqlite/")
+            // Per-project browser_db REST bearer, not a platform JWT — see
+            // auth::require_auth.
+            || path.starts_with("/v1/browser-db/")
             // WebDAV Basic-auth, not a platform JWT — see auth::require_auth.
             || path.starts_with("/v1/drive/webdav/");
         if is_mutation && !open {

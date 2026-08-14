@@ -326,6 +326,8 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .merge(crate::browser_artifacts::routes())
         // ---- Browser-replicated database exchange (fleet-initiated pull) ----
         .merge(crate::browser_db::routes())
+        // ---- browser_db libsql/Hrana + Upstash REST surface (owner-proxied) ----
+        .merge(crate::browser_db_rest::routes())
         // ---- Coarse browser presence (constellation satellites) ----
         .merge(crate::browser_presence::routes())
         // ---- Per-tenant browser relay byte metering (operator; metering only, never bills) ----

@@ -218,6 +218,22 @@ pub struct ContainerSettings {
     pub volume_mount_path: Option<String>,
 }
 
+/// A minted REST/Hrana credential for a project's `browser_db` replica
+/// (`browser_db_rest`, bn-browser-db-rest) — the `drive_api::webdav_token_mint`
+/// pattern applied to this surface: shown once at mint time, stored here only
+/// as its SHA-256 hash, checked constant-time by
+/// `browser_db_rest::credential_scope`. Structurally separate from the
+/// QUIC-endpoint-identity admission lease `browser_admission` issues for the
+/// CRR sync protocol — this is a plain bearer token for the REST/Hrana HTTP
+/// surface, mirroring `db_rest`'s per-database `DB_REST_TOKEN` credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BrowserDbRestToken {
+    /// SHA-256 hex of the plaintext token — the plaintext itself is never
+    /// stored anywhere, shown to the caller exactly once at mint time.
+    pub hash: String,
+    pub created_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectSettings {
     #[serde(default)]
@@ -242,6 +258,17 @@ pub struct ProjectSettings {
     /// dashboard alone, with no git push required.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub browser_db: Option<fluid_core::BrowserDbPolicy>,
+    /// Team-scope (read+write) REST/Hrana credential for this project's
+    /// `browser_db` replica, if minted. See [`BrowserDbRestToken`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_db_rest_team: Option<BrowserDbRestToken>,
+    /// Public-scope (read-only) REST/Hrana credential — mintable only while
+    /// `browser_db.public_read` is enabled (mirrors the CRR admission's own
+    /// Public-scope gate); re-checked live on every request, not just at
+    /// mint time, so disabling `public_read` later immediately stops this
+    /// token from reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser_db_rest_public: Option<BrowserDbRestToken>,
     /// Dashboard-managed container config (port/protocol/resource ceilings +
     /// volume mount path) for a container-runtime project. Only meaningful
     /// when the project's current deployment actually runs a `container`
@@ -335,6 +362,8 @@ impl Default for ProjectSettings {
             functions: FunctionSettings::default(),
             inference: None,
             browser_db: None,
+            browser_db_rest_team: None,
+            browser_db_rest_public: None,
             container: None,
             dedicated_ipv4: None,
             domains: Vec::new(),
@@ -454,6 +483,25 @@ impl ProjectStore {
     pub fn set_browser_db(&self, project: &str, spec: Option<fluid_core::BrowserDbPolicy>) {
         let mut m = self.map.write();
         m.entry(project.to_string()).or_default().browser_db = spec;
+    }
+
+    /// Mint/rotate/clear one of this project's `browser_db` REST credentials.
+    /// `public` selects which of the two independent slots (team vs public
+    /// scope) is written — the `drive_api::webdav_token_mint` pattern,
+    /// doubled for the two admission scopes this surface must respect.
+    pub fn set_browser_db_rest_token(
+        &self,
+        project: &str,
+        public: bool,
+        token: Option<BrowserDbRestToken>,
+    ) {
+        let mut m = self.map.write();
+        let s = m.entry(project.to_string()).or_default();
+        if public {
+            s.browser_db_rest_public = token;
+        } else {
+            s.browser_db_rest_team = token;
+        }
     }
 
     /// See [`ProjectSettings::container`]. `None` clears the dashboard-managed
