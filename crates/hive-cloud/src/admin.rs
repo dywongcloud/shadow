@@ -11397,9 +11397,7 @@ async fn billing_checkout(
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
-    // path always did for this case. Never reachable for "addon" (`PRICE_CENTS`
-    // is a nonzero const), guarded explicitly anyway since `apply_plan_everywhere`
-    // would be the wrong effect entirely for an addon purchase.
+    // path always did for this case.
     if amount == 0 && req.kind != "addon" {
         apply_plan_everywhere(&c, &t, &plan);
         let acc = c.billing.account(&t);
@@ -11415,6 +11413,42 @@ async fn billing_checkout(
         return Ok(Json(
             json!({ "url": "", "mock": false, "applied": true, "account": acc }),
         ));
+    }
+    // Same $0 shortcut for an addon (currently `tencent_eip::PRICE_CENTS == 0`,
+    // an operator-set testing price, never assumed permanent): route through
+    // the SAME `open_checkout_full` -> `confirm_checkout` -> `provision_from_checkout`
+    // sequence the paid path uses below, just without the Stripe session that
+    // a $0 amount could never produce anyway. `provision_from_checkout` is
+    // already idempotent on `ProjectSettings::dedicated_ipv4` (see its own doc
+    // comment), so this is safe to hit more than once for the same project.
+    if amount == 0 && req.kind == "addon" {
+        let co = c
+            .billing
+            .open_checkout_full(&t, &req.kind, &plan, amount, crate::tencent_eip::SKU, &target);
+        let (co, _acc) = c
+            .billing
+            .confirm_checkout(&co.id)
+            .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+        match crate::tencent_eip::provision_from_checkout(&c, &co).await {
+            Ok(alloc) => {
+                c.audit.record(
+                    &t,
+                    "user",
+                    "addon_purchase",
+                    "billing",
+                    &co.sku,
+                    &format!("dedicated_ipv4 for {target} (testing price, $0)"),
+                );
+                crate::persist::persist(&c);
+                return Ok(Json(
+                    json!({ "url": "", "mock": false, "applied": true, "dedicated_ipv4": alloc }),
+                ));
+            }
+            Err(e) => {
+                tracing::error!(checkout = %co.id, tenant = %t, error = %e, "dedicated_ipv4 provisioning failed ($0 testing path)");
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+        }
     }
     let sku = if req.kind == "addon" {
         crate::tencent_eip::SKU

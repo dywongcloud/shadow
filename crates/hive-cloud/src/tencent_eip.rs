@@ -44,11 +44,18 @@ pub fn price_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Informational/mock-checkout price (USD cents/mo) used for the checkout's
-/// own `amount_cents` bookkeeping and the invoice line — mirrors how
-/// `PlanSpec::price_cents` is the informational amount even though the real
-/// charge is governed by the Stripe price object once `price_id()` is set.
-pub const PRICE_CENTS: u64 = 1000;
+/// Price (USD cents/mo) used for the checkout's own `amount_cents`
+/// bookkeeping and the invoice line — mirrors how `PlanSpec::price_cents` is
+/// the informational amount even though a real charge (once one exists)
+/// would be governed by the Stripe price object once `price_id()` is set.
+///
+/// Temporarily 0 for testing (operator decision, not a permanent price):
+/// `admin::billing_checkout`'s `amount == 0` branch applies ANY $0 purchase
+/// (plan or addon) immediately, no Stripe round-trip — Stripe rejects a $0
+/// line item outright, so this is also the only way to exercise the addon
+/// checkout path at all while the price is zero. Restore a nonzero value
+/// here to re-enable real billing for this addon.
+pub const PRICE_CENTS: u64 = 0;
 
 /// Idempotent addon provisioning — see the module doc for the full contract.
 /// `co.target` is the project id (validated as tenant-owned by the caller at
