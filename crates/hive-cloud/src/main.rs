@@ -1270,6 +1270,8 @@ async fn main() -> anyhow::Result<()> {
     // `HIVE_BILLING_COORDINATOR_NODE` remains as an explicit manual PIN override.
     spawn_billing_meter_loop(cloud.clone());
 
+    spawn_promotion_reconcile_loop(cloud.clone());
+
     // Relational mirror: teams/members/deployments + full billing backfill into
     // the fleet-replicated SQL view (see spawn_relational_mirror_loop's doc).
     spawn_relational_mirror_loop(cloud.clone());
@@ -3781,6 +3783,28 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
     }
 }
 
+fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_millis(env_u64("HIVE_PROMOTION_RECONCILE_POLL_MS", 2000));
+    crate::supervise::spawn_supervised("promotion-reconcile", move || {
+        let cloud = cloud.clone();
+        async move {
+            let mut tick = tokio::time::interval(interval);
+            let mut was_leader = false;
+            loop {
+                tick.tick().await;
+                crate::supervise::beat("promotion-reconcile");
+                let cp_leader = cloud.control_plane_leader() == cloud.node_name
+                    && !cloud.mesh_health().isolated;
+                let just_promoted = cp_leader && !was_leader;
+                was_leader = cp_leader;
+                if just_promoted {
+                    store_sync::reconcile_on_promotion(&cloud).await;
+                }
+            }
+        }
+    });
+}
+
 /// Relational mirror loop — keeps the admin "view as PostgreSQL" browser's
 /// teams / team_members / deployments tables (and a FULL billing_accounts
 /// backfill) populated from live store snapshots. The metering loop's
@@ -3824,6 +3848,9 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
+            let mut last_peer_lookup_warn = std::time::Instant::now()
+                .checked_sub(Duration::from_secs(3600))
+                .unwrap_or_else(std::time::Instant::now);
             loop {
                 tick.tick().await;
                 crate::supervise::beat("relational-mirror");
@@ -3915,6 +3942,16 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                                 }
                             }
                         }
+                    } else if last_peer_lookup_warn.elapsed() >= Duration::from_secs(300) {
+                        tracing::warn!(
+                            leader = %leader,
+                            "store follower-sync: no healthy, addressable registry entry for \
+                             the control-plane leader -- this node cannot pull \
+                             store_sync::REGISTRY snapshots and its local copies \
+                             (projects/teams/billing/etc.) will silently drift stale until \
+                             this resolves"
+                        );
+                        last_peer_lookup_warn = std::time::Instant::now();
                     }
                 }
                 let billing_authority = match &billing_pin {

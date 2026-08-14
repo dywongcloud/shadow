@@ -506,6 +506,8 @@ pub static REGISTRY: &[SyncedStore] = &[
     },
 ];
 
+pub static MERGE_STORES: &[&str] = &["browser_admissions", "browser_presence"];
+
 /// Rate-limit config wire shape — deliberately config-only (see the registry
 /// entry above for why the live counters are excluded).
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -538,4 +540,102 @@ pub fn serve(cloud: &Arc<CloudState>, name: &str) -> Vec<u8> {
         .find(|s| s.name == name)
         .map(|s| (s.snapshot)(cloud))
         .unwrap_or_default()
+}
+
+pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
+    let mut peers: Vec<(String, String, String)> = cloud
+        .registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && n.healthy)
+        .filter_map(|n| Some((n.name, n.peer_id?, n.iroh_addr?)))
+        .collect();
+    peers.truncate(3);
+    if peers.is_empty() {
+        tracing::warn!(
+            "store_sync: promoted to leader with no reachable peers to reconcile against \
+             -- starting from local state only; any write the outgoing leader accepted in \
+             its trailing sync window, if unpulled by every other peer too, is unrecoverable"
+        );
+        return;
+    }
+    let peer_names: Vec<String> = peers.iter().map(|(n, _, _)| n.clone()).collect();
+    let local_snapshots: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
+
+    let mut fetches = Vec::with_capacity(REGISTRY.len() * peers.len());
+    for (store_idx, store) in REGISTRY.iter().enumerate() {
+        for (peer_name, peer_id, addr) in &peers {
+            let path = format!("/v1/store-snapshot/{}", store.name);
+            fetches.push(async move {
+                let bytes = crate::gossip::request_to(
+                    cloud,
+                    peer_id,
+                    addr,
+                    hive_p2p::GOSSIP_GET,
+                    &path,
+                    &[],
+                    10,
+                )
+                .await;
+                (store_idx, peer_name.clone(), bytes)
+            });
+        }
+    }
+    let results = futures::future::join_all(fetches).await;
+    let mut by_store: Vec<Vec<(String, Vec<u8>)>> = vec![Vec::new(); REGISTRY.len()];
+    for (store_idx, peer_name, resp) in results {
+        let Some(bytes) = resp else { continue };
+        if bytes.is_empty() {
+            continue;
+        }
+        by_store[store_idx].push((peer_name, bytes));
+    }
+
+    let mut adopted: Vec<&'static str> = Vec::new();
+    for (store_idx, store) in REGISTRY.iter().enumerate() {
+        if MERGE_STORES.contains(&store.name) {
+            for (peer_name, bytes) in &by_store[store_idx] {
+                if bytes == &local_snapshots[store_idx] {
+                    continue;
+                }
+                if let Some(n) = (store.adopt)(cloud, bytes) {
+                    adopted.push(store.name);
+                    tracing::warn!(
+                        store = store.name,
+                        from_peer = %peer_name,
+                        local_bytes = local_snapshots[store_idx].len(),
+                        peer_bytes = bytes.len(),
+                        adopted_count = n,
+                        "store_sync: promotion reconciliation merged a peer's snapshot"
+                    );
+                }
+            }
+            continue;
+        }
+        let best = by_store[store_idx]
+            .iter()
+            .max_by_key(|(_, b)| b.len())
+            .filter(|(_, b)| b.len() > local_snapshots[store_idx].len());
+        let Some((peer_name, bytes)) = best else {
+            continue;
+        };
+        if let Some(n) = (store.adopt)(cloud, bytes) {
+            adopted.push(store.name);
+            tracing::warn!(
+                store = store.name,
+                from_peer = %peer_name,
+                local_bytes = local_snapshots[store_idx].len(),
+                peer_bytes = bytes.len(),
+                adopted_count = n,
+                "store_sync: promotion reconciliation adopted a peer's richer snapshot -- \
+                 this node's own copy may have missed writes the outgoing leader accepted"
+            );
+        }
+    }
+    tracing::info!(
+        peers = ?peer_names,
+        stores_checked = REGISTRY.len(),
+        stores_adopted = ?adopted,
+        "store_sync: promotion reconciliation complete"
+    );
 }

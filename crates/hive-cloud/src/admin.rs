@@ -654,17 +654,16 @@ async fn project_settings_get(
     Path(project): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    // Settings rows are node-local. When THIS node has no row (reads are served
-    // by whichever node DNS picked; the row lives on the node that deployed the
-    // project), answering with the local defaults silently shows the user empty
-    // settings. Proxy to the hosting node instead — it has the row, so it
-    // answers directly (no re-proxy loop) — and fall back to local defaults
-    // only if the host is unreachable.
     if crate::admin::record_tenant(&c.projects.team_of(&project)) == UNTAGGED_TENANT {
+        let path = format!("/v1/projects/{project}/settings");
+        if !c.is_control_plane_leader() {
+            let leader = c.control_plane_leader();
+            if let Some(v) = fetch_from_host(&c, &leader, &path, &t).await {
+                return Ok(Json(v));
+            }
+        }
         if let Some(node) = host_node_for_project(&c, &project) {
-            if let Some(v) =
-                fetch_from_host(&c, &node, &format!("/v1/projects/{project}/settings"), &t).await
-            {
+            if let Some(v) = fetch_from_host(&c, &node, &path, &t).await {
                 return Ok(Json(v));
             }
         }
