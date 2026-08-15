@@ -2493,7 +2493,7 @@ impl PeerPool {
             // `to_vec` per attempt so a retry still owns the headers.
             let resp = match tokio::time::timeout(
                 firstbyte_budget(),
-                client.request(method, path, headers.to_vec(), body),
+                client.request(method, path, headers.to_vec(), body, firstbyte_budget()),
             )
             .await
             {

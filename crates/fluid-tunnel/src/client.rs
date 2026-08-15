@@ -152,6 +152,7 @@ impl TunnelClient {
         path: &str,
         headers: Vec<(String, String)>,
         body: &[u8],
+        head_timeout: std::time::Duration,
     ) -> anyhow::Result<TunnelResponse> {
         anyhow::ensure!(!self.is_closed(), "tunnel closed");
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -182,7 +183,19 @@ impl TunnelClient {
             .send(Frame::new(id, FrameKind::Request, payload))
             .map_err(|_| anyhow::anyhow!("tunnel writer gone"))?;
 
-        let meta = match tokio::time::timeout(std::time::Duration::from_secs(30), head_rx).await {
+        // MUST be the caller's own per-invocation budget (the deployment's
+        // `max_duration_secs`, default 300s at the fluid-gateway call site),
+        // never a shorter hardcoded value: a previous fixed 30s here fired
+        // BEFORE the gateway's own `tokio::time::timeout(max_dur, ...)` around
+        // this whole call could ever see a real over-budget timeout, so every
+        // request past 30s (well within budget for an LLM/webhook call) hit
+        // this branch's `Err`, was misread as "the function never answered",
+        // and got retried — while the ORIGINAL invocation was still running
+        // server-side with no cancellation signal, silently duplicating side
+        // effects (this is the "shoomoo incident" `proxy_function` documents:
+        // `last_err = "timed out waiting for response head"` was this branch,
+        // not a real transport failure).
+        let meta = match tokio::time::timeout(head_timeout, head_rx).await {
             Ok(Ok(r)) => r?,
             Ok(Err(_)) => {
                 self.shared.pending.lock().remove(&id);

@@ -2541,7 +2541,14 @@ async fn proxy_function(
         };
 
         tracing::debug!(cell = %cell, reused, attempt, "dispatching request over tunnel");
-        let req_fut = client.request(method.as_str(), path_q, hvec.clone(), &body);
+        // `head_timeout` MUST equal `max_dur`: the inner tunnel wait and this
+        // outer `tokio::time::timeout` guard the SAME budget, and if the inner
+        // one is ever shorter it fires first, turning a legitimately-slow
+        // (but within-budget) invocation into a spurious "upstream_silent"
+        // retry below instead of the correct, no-retry FUNCTION_INVOCATION_TIMEOUT
+        // 504 at line ~2550. See client.rs's `request` doc for the incident
+        // this caused.
+        let req_fut = client.request(method.as_str(), path_q, hvec.clone(), &body, max_dur);
         match tokio::time::timeout(max_dur, req_fut).await {
             Err(_) => {
                 // Exceeded max duration — 504, do not reroute (the instance is
@@ -2552,7 +2559,7 @@ async fn proxy_function(
             }
             Ok(Ok(resp)) => {
                 tracing::debug!(cell = %cell, status = resp.status, "got response head");
-                return build_response(lease, cell, reused, attempt, resp).await;
+                return build_response(lease, cell, reused, attempt, resp, max_dur).await;
             }
             Ok(Err(e)) => {
                 last_err = e.to_string();
@@ -2568,6 +2575,20 @@ async fn proxy_function(
                     // response-head timeout, nack, overload. The transport is
                     // fine; the function is what didn't answer.
                     upstream_silent = true;
+                    // The instance may already be MID-EXECUTION (it received
+                    // the request over the still-open tunnel; we just gave up
+                    // waiting for a response). Looping back to `lease()` and
+                    // retrying a non-idempotent method here is the exact
+                    // "BROWSER_EXECUTION_UNCERTAIN" hazard this function
+                    // already refuses to risk for the browser path above
+                    // (lines ~2477-2490) — replaying a POST/PUT/PATCH/DELETE
+                    // risks a second LLM call, a second Telegram send, a
+                    // second charge. Fail explicitly instead of silently
+                    // duplicating a side effect; GET/HEAD are always safe to
+                    // retry and fall through to the loop as before.
+                    if method != Method::GET && method != Method::HEAD {
+                        break;
+                    }
                 }
             }
         }
@@ -2676,6 +2697,7 @@ async fn build_response(
     reused: bool,
     attempt: usize,
     mut resp: fluid_tunnel::TunnelResponse,
+    max_dur: Duration,
 ) -> Response {
     let mut hdrs = HeaderMap::new();
     // Stream incrementally for ANY response the function didn't declare a fixed
@@ -2777,9 +2799,13 @@ async fn build_response(
     }
 
     // Buffered path: collect the whole body, return a sized response. Bounded by
-    // a max-duration so a stalled upstream becomes a 504 rather than hanging.
+    // the deployment's OWN max_duration_secs (default 300s), matching the head
+    // wait above — a fixed 30s here truncated any legitimately slow-but-within-
+    // budget non-streaming response (e.g. a large buffered JSON body assembled
+    // from a slow upstream call) the exact same way the old fixed 30s head
+    // timeout did for the head itself.
     let mut buf = Vec::new();
-    let drained = tokio::time::timeout(Duration::from_secs(30), async {
+    let drained = tokio::time::timeout(max_dur, async {
         while let Some(chunk) = resp.body.recv().await {
             buf.extend_from_slice(&chunk);
         }

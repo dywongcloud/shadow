@@ -2037,7 +2037,23 @@ async fn run_build(
         for (k, v) in &env {
             f.env.insert(k.clone(), v.clone());
         }
-        f.max_duration_secs = fsettings.default_max_duration_secs;
+        // A fluid.json-declared `max_duration_secs` must WIN over the project-level
+        // dashboard default — settings can only fill in what a function left
+        // unset, never silently discard what it explicitly asked for (the exact
+        // "settings can only turn GPU ON, never strip a function's own declared
+        // need" precedent a few lines below). This was previously an unconditional
+        // overwrite: every deploy silently replaced a real fluid.json
+        // `max_duration_secs` (e.g. 60 for a bot that legitimately needs an LLM
+        // round trip) with whatever the project's dashboard default happened to
+        // be, with no way for the manifest's own declaration to survive even one
+        // redeploy. `FunctionConfig::default().max_duration_secs` (300, serde's
+        // own fallback when fluid.json omits the field) can't be distinguished
+        // from a developer explicitly writing 300 — falling back to the project
+        // setting in that one case is a no-op (300 already IS the default), so
+        // every OTHER explicit value is preserved with no observable downside.
+        if f.max_duration_secs == fluid_core::FunctionConfig::default().max_duration_secs {
+            f.max_duration_secs = fsettings.default_max_duration_secs;
+        }
         f.vcpus = fsettings.vcpus.max(1);
         f.memory_mib = fsettings.memory_mib;
         // Serverless GPU: the project-level toggle marks every function; a
