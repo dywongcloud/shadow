@@ -160,6 +160,7 @@ async fn concurrent_requests_do_not_leak_context() {
                     &path,
                     vec![("x-ctx".into(), ctx.clone())],
                     body.as_bytes(),
+                    Duration::from_secs(15),
                 ),
             )
             .await
@@ -215,7 +216,7 @@ async fn tunnel_meters_bytes_in_and_out() {
     let body = vec![b'z'; 1000];
     for i in 0..10 {
         let resp = client
-            .request("POST", &format!("/p/{i}"), vec![], &body)
+            .request("POST", &format!("/p/{i}"), vec![], &body, Duration::from_secs(10))
             .await
             .expect("request failed");
         assert_eq!(resp.status, 200);
@@ -273,7 +274,7 @@ async fn many_concurrent_requests_over_one_tunnel() {
             let path = format!("/req/{i}");
             let resp = tokio::time::timeout(
                 Duration::from_secs(10),
-                c.request("GET", &path, vec![], b""),
+                c.request("GET", &path, vec![], b"", Duration::from_secs(10)),
             )
             .await
             .expect("request timed out")
