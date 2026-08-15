@@ -1,518 +1,1483 @@
-# shadw.cloud
-
-**shadw.cloud** is a self-hosted, peer-to-peer cloud: deploy serverless
-functions, containers and static sites to a mesh of your own machines, connected
-over **Iroh QUIC**. No data center, no public IPs — nodes find each other and
-serve the world.
-
-Under the hood it's a Rust reverse-engineering of **Hive** (Vercel's builds
-infrastructure, [blog post](https://vercel.com/blog/a-deep-dive-into-hive-vercels-builds-infrastructure))
-plus **Fluid** compute, wired into one node binary and a Vercel-style dashboard.
-
-It reproduces Hive's components — Control Plane, per-Hive API, Box Daemon, Cell
-Daemon, warm pools, scheduler, autoscaler, and the cell lifecycle — behind a
-pluggable isolation backend:
-
-- **mock** — a cell is a sandboxed child-process build. Runs anywhere (incl.
-  macOS / Apple Silicon) so you can exercise the whole control plane today.
-- **firecracker** — a cell is a real Firecracker microVM. It runs anywhere a KVM
-  interface is available: an **M3/M4 Mac** via a Lima nested-virt VM, a **bare-metal
-  Linux box** with real `/dev/kvm`, or even an **ordinary cloud VM without nested
-  virtualization** via **PVM** (see [Firecracker without KVM (PVM)](#firecracker-without-kvm-on-plain-cloud-vms-pvm)).
-
-See [ARCHITECTURE.md](./ARCHITECTURE.md) for the concept→code map and the build
-lifecycle.
-
-shadw.cloud is two layers that share one isolation backend (`CellBackend`):
-
-- **Hive** (builds) — turn a git repo into build output.
-- **Fluid** (serving) — deploy static assets + functions, served with **Fluid
-  compute**: long-lived instances that each handle many concurrent requests,
-  stay warm, autoscale, and scale to zero.
-
-## The unified cloud (the `hive-cloud` node + dashboard)
-
-Everything is wired into **one node binary** (the `hive-cloud` crate) you can run
-across machines as a single shadw.cloud, fronted by a **Vercel-style dashboard**.
-
-```bash
-# 1) Run a node (builds + Fluid serving + edge + cron + workflows + regions)
-cargo run -p hive-cloud -- --region sfo1 --name node-a   # public :8787, admin :8786
-
-# 2) Deploy an app (static + Python function)
-./target/debug/fluidctl deploy examples/hello            # FLUID_ADMIN=http://127.0.0.1:8786
-
-# 3) Run the dashboard (Next.js + Tremor, looks like Vercel)
-cd ui && npm install && npm run dev                       # http://localhost:3000
-
-# 4) Add another MacBook to the same cloud (different region)
-cargo run -p hive-cloud -- --region iad1 --name node-b --peer http://<mac-a-ip>:8786
-```
-
-One node serves, at `:8787` (public) and `:8786` (admin), the full surface:
-
-| Vercel feature | Here |
-| --- | --- |
-| Builds + Sandbox | Hive control plane + `POST /v1/sandbox` (run code in a cell) |
-| Fluid compute | multiplexed-tunnel instances, autoscale, scale-to-zero, cost meter |
-| In-function concurrency | many concurrent requests per instance (reuse before provision) |
-| Concurrency scaling | per-region **burst limit** (1000/10s) → `503 FUNCTION_THROTTLED`; plan caps 30k/100k (`/v1/concurrency`) |
-| Max duration | per-function `max_duration_secs` (Vercel default 300s) → 504 on over-budget |
-| Error isolation | one failing/over-budget request never takes down others on the instance |
-| WAF | managed SQLi/XSS/traversal signatures + custom rules (`/v1/waf`) |
-| Bot management | UA classification, allow good / block bad (`/v1/bot`) |
-| CDN | edge cache, states **`x-hive-cache: HIT/MISS/STALE/REVALIDATED`**, **stale-while-revalidate**, header precedence `Vercel-CDN-Cache-Control` > `CDN-Cache-Control` > `Cache-Control` |
-| Routing | redirects (308) + rewrites before cache (`/v1/routing`) |
-| Cron | scheduled function invocations (`/v1/cron`) |
-| Workflows | durable multi-step runs (`/v1/workflows`) |
-| Previews | every deployment gets `<deployment-id>.localhost` |
-| Regions | `--region` label + multi-node HTTP-gossip mesh (`/v1/nodes`) |
-| P2P | `hive-p2p` runs the function tunnel over iroh QUIC |
-| Observability | live edge event log (`/v1/logs`) + Overview analytics |
-
-Edge request pipeline (per request, mirroring Vercel's CDN layering):
-**routing (redirects/rewrites) → firewall (WAF + bots) → concurrency admission →
-CDN cache (HIT/STALE/MISS + SWR) → compute**, tagged with `x-hive-region`.
-
-Verified live end-to-end: `/old`→**308**, `/blog/x` rewritten to the function,
-`/api/cached` **MISS→HIT**, SQLi & sqlmap UA → **403**, 15 concurrent vs
-burst-limit 5 → **3×200 / 12×503 FUNCTION_THROTTLED**, over-budget request →
-**504** while normal requests keep returning 200 (error isolation), sandbox runs
-code, cron fires on schedule. (Docs studied: concurrency-scaling, fluid-compute,
-how-vercel-cdn-works.)
-
-The dashboard (`ui/`) proxies `/cloud/*` to a node's admin API and has pages for
-Overview, Deployments, Functions, Regions, Firewall, Cron, Workflows,
-Observability, and Sandbox — dark/Geist, shadcn-style components, Tremor charts.
-
-## Layout
-
-```
-crates/
-  hive-core         shared types: ids, jobs, lifecycle FSMs, wire/agent protocol
-  hive-backend      CellBackend trait + mock + firecracker + function-serving
-  hive-controlplane build scheduler, warm pool, autoscaler, lifecycle
-  hive-api          per-Hive HTTP API (submit / status / stream logs)
-  hive-cell-agent   the cell daemon (in-guest; build runner + function bridge)
-  hived             a Hive build node
-  hivectl           build CLI
-
-  fluid-core        deployment / function / route model (fluid.json)
-  fluid-tunnel      one multiplexed tunnel per instance (stream-id framing, metrics, nack)
-  fluid-compute     the Fluid pool: in-function concurrency, autoscale, scale-to-zero
-  fluid-gateway     public router: static serving + function proxy over tunnels
-  fluidd            serving daemon (gateway + pool + admin API)
-  fluidctl          deploy CLI
-  hive-p2p          distribute the infra over iroh QUIC peer-to-peer
-  hive-edge         WAF, bot management, CDN cache, cron, workflows, regions
-  hive-cloud        the unified node binary (one cloud across MacBooks)
-ui/                 Vercel-style dashboard (Next.js + TypeScript + Tremor)
-examples/hello/     a deployable app (static page + Python function)
-scripts/            Lima config + guest bootstrap for the Firecracker path
-```
-
-## Quick start (mock backend — works on your Mac now)
-
-```bash
-cargo build
-
-# Start a Hive node with a warm pool of 2 "node:20" cells.
-RUST_LOG=info,hive_controlplane=debug \
-  ./target/debug/hived --warm node:20=2 --listen 127.0.0.1:8080 &
-
-# Watch the cluster (warm pool fills in the background).
-./target/debug/hivectl status
-
-# Submit a build that lands on a warm cell and follow its logs.
-./target/debug/hivectl submit --image node:20 \
-  -c 'echo hello from the cell' -c 'uname -a' --follow
-```
-
-You'll see a warm-pool hit report a `provision_latency` of a few milliseconds,
-versus hundreds for an image with no warm pool — the same lever Hive uses to
-turn a ~90s cold provision into a ~5s start.
-
-### Build cache (faster repeat builds)
-
-Like Netlify/Hive's shared cache + overlay filesystem, builds can restore/save
-directories keyed by a cache key (e.g. a lockfile hash) — so an unchanged
-`package.json` skips `npm install`:
-
-```bash
-hivectl submit --image node:20 --cache-key "$(shasum package-lock.json)" \
-  --cache-path node_modules \
-  -c 'test -d node_modules || npm ci' -c 'npm run build' --follow
-```
-
-First build is a cache miss (installs + saves); the next build with the same key
-restores `node_modules` into the fresh single-use cell before the build runs.
-
-### Try it
-
-```bash
-cargo test                      # 8 build + Fluid tests (lifecycle, pool, cache, cost)
-hivectl submit --help           # all submit flags (resources, env, repo, cache, ...)
-hivectl status                  # boxes, cells, jobs
-```
-
-## Deploy like Vercel — Fluid compute (works on your Mac now)
-
-```bash
-cargo build
-
-# Start the serving daemon (public :8787, admin :8786).
-./target/debug/fluidd &
-
-# Deploy the example app (a static page + a Python function).
-./target/debug/fluidctl deploy examples/hello
-
-# Static route:
-curl localhost:8787/
-
-# Function route (proxied to a long-lived server in a cell):
-curl localhost:8787/api/hello
-#  -> {"msg":"hello from a Fluid function","pid":12170,...}
-#  response header  x-fluid-instance: cell-c981d91d   (which instance served it)
-```
-
-### The Fluid behaviors (all verified)
-
-`fluid.json` declares the knobs: `max_concurrency` (requests per instance),
-`min_instances` (keep-warm), `max_instances` (ceiling), `idle_ttl_secs`
-(scale-to-zero).
-
-- **In-function concurrency + autoscale** — 8 concurrent slow requests against a
-  function with `max_concurrency=5, max_instances=3`:
-  ```
-  responses per instance:
-     5 cell-c981d91d   <- one instance handled 5 concurrent requests
-     2 cell-f6064604   <- pool autoscaled to 3 instances for the overflow
-     1 cell-092ce497
-  ```
-- **Reuse before provision** — requests route to the least-loaded running
-  instance; warm hits return in ~3ms with no cold start.
-- **Scale-to-zero** — idle instances drain back to `min_instances` after
-  `idle_ttl` (set `min_instances: 0` to go fully to zero).
-- **Streaming responses** — the gateway streams bytes as the function emits them
-  (LLM-style token streaming), no buffering:
-  ```bash
-  curl -N localhost:8787/api/stream   # SSE chunks arrive ~200ms apart
-  ```
-- **`waitUntil` background work** — a function can respond immediately and keep
-  working before its connection closes; the client isn't blocked, and the
-  instance stays accounted as active:
-  ```bash
-  curl localhost:8787/api/bg          # returns in ~3ms; instance works ~0.6s more
-  ```
-- **Active-CPU cost metering** — Fluid bills shared instance-time, not per-request
-  wall time. The meter reports the savings vs traditional 1:1 serverless:
-  ```bash
-  fluidctl stats   # traditional_ms vs fluid_ms vs savings_pct
-  ```
-  Under concurrency (5 requests sharing one instance), this is ~80% — the "up to
-  85%" story from Vercel's writeups.
-- **One multiplexed tunnel per instance** — each instance is reached over a
-  single persistent connection that carries many concurrent requests (stream-id
-  framing), plus in-band metrics and `nack`. Proven by deterministic concurrency
-  tests (`fluid-tunnel` 200-concurrent, `fluid-gateway` 100-concurrent
-  end-to-end). Reuse stats at `GET :8786/tunnels`; responses carry
-  `x-fluid-reused`.
-- **Peer-to-peer infra (iroh)** — the same tunnel runs over an iroh QUIC P2P
-  connection, so an instance anywhere is reachable by endpoint id:
-  ```bash
-  cargo run -p hive-p2p --bin p2p-demo
-  #  request 0: status=200 body={"served_over":"iroh-p2p", ...}   ← routed P2P
-  #  OK: 5 requests routed over an iroh P2P tunnel
-  ```
-- **Self-healing routing** — a health-probe loop reaps unreachable instances,
-  and if a request hits a dead instance the gateway marks it dead (`nack`) and
-  **reroutes** to a healthy/new one. Verified by killing an instance mid-flight:
-  ```
-  request #1  x-fluid-instance: cell-efd9b1ff   (pid 65228)
-  <kill the function process>
-  request #2  x-fluid-instance: cell-2e6a17aa   x-fluid-rerouted: 1   (pid 65308)  ✅ still 200
-  stats: dead_reaped 1
-  ```
-
-Inspect live: `fluidctl stats` and `fluidctl ls`.
-
-This is the faithful Fluid model from Vercel's writeups: instances are
-"serverless servers" that multiplex concurrent requests, the router prefers
-reusing existing instances and cold-starts only on saturation, and idle capacity
-is reclaimed. (Routing here opens one connection per request for simplicity;
-real Fluid keeps persistent TCP tunnels and routes by function id for >99%
-connection reuse.)
-
-## Real microVMs (firecracker backend, on an M3/M4)
-
-Requires macOS 13+ on an M3/M4 (hardware nested virtualization) and
-[Lima](https://lima-vm.io) ≥ 1.0.
-
-```bash
-# 1. Boot an aarch64 Linux VM that exposes /dev/kvm to the guest.
-limactl start --name=hive ./scripts/lima-hive.yaml
-limactl shell hive
-
-# 2. Inside the guest: install firecracker, fetch a kernel, build binaries,
-#    and bake a default rootfs (with the cell agent as init).
-bash ~/<path-to-repo>/hive/scripts/bootstrap-guest.sh
-
-# 3. Run a real Hive (cells = Firecracker microVMs) and submit a build.
-sudo RUST_LOG=info hived --backend firecracker --warm default=2 &
-hivectl submit --image default -c 'uname -a' -c 'cat /etc/os-release' --follow
-```
-
-Here each cell is a genuine microVM: the box daemon spawns `firecracker`,
-configures it over its REST API, and talks to `hive-cell-agent` (the cell
-daemon) over **vsock**.
-
-### Verified on real hardware
-
-This was run end-to-end on an **Apple M3 Pro** (macOS 26.3, Lima 2.1, nested
-virtualization) booting **real Firecracker v1.13 microVMs**:
-
-```
-$ hivectl submit --image default -c 'uname -a' -c 'echo PID1=$(cat /proc/1/comm)' --follow
-» [cell-412f4681] connected to cell agent; dispatching build
-$ uname -a
-Linux (none) 6.1.102 #1 SMP aarch64 GNU/Linux     # guest kernel, not the 6.8 host
-$ echo PID1=$(cat /proc/1/comm)
-PID1=hive-cell-agent                              # our cell daemon is the VM's init
-job → Succeeded (provision_latency=6005ms)        # cold: full microVM boot
-```
-
-The warm pool reproduces Hive's headline number in miniature — same image,
-pre-booted cell:
-
-| Path | provision latency |
-| --- | --- |
-| cold (boot microVM on demand) | **6005 ms** |
-| warm (pre-booted pool)        | **1 ms** |
-
-Gotchas worth knowing if you reproduce it:
-- The per-cell run dir **must be disk-backed**, not tmpfs — `/run` is tmpfs and
-  too small for the rootfs copy (`hived --fc-run-dir /var/lib/hive/run`).
-- Boot args need `root=/dev/vda rw` (Firecracker exposes the rootfs as `/dev/vda`).
-- Firecracker's API keeps the HTTP connection open, so the client parses the
-  response by `Content-Length` rather than reading to EOF.
-- The rootfs must be glibc-based (Ubuntu/Debian) to match the dynamically-linked
-  agent — not Alpine/musl.
-
-## Public ingress over real DNS (shadw.cloud / *.shadw.app)
-
-Public ingress is plain DNS + self-terminated TLS (`HIVE_INGRESS=dns`, the
-default — ngrok is fully retired; see `RUNBOOK.md` for the migration history):
-
-- **`shadw.cloud`** (and `api.` / `admin.`) — the platform: dashboard, developer
-  API, ops console. Round-robin A records across every public fleet node.
-- **`*.shadw.app`** — deployments: a deployment routes by its **subdomain**
-  (the first host label), so `https://my-app.shadw.app/` reaches the gateway
-  and serves the `my-app` deployment exactly like `http://my-app.localhost:8787/`
-  does locally.
-
-Every node terminates TLS itself (ACME DNS-01 wildcard via `acme.rs`) and runs
-the same edge: whichever node DNS hands the request to inspects the `Host`,
-looks up the deployment's owning node in the gossip registry, and either serves
-it locally or transparently proxies it over the iroh QUIC mesh (with
-region-aware failover). Net effect: **hit any node, reach any deployment** —
-and ingress has no single point of failure. The authoritative DNS server
-(`dnsserver.rs`) answers health-aware A/AAAA for the deploy zone, and the
-Vercel DNS reconciler (`vercel_dns.rs`) keeps the platform zone's records in
-sync with fleet health.
-
-Preview-unlock redirects detect a public wildcard host and bounce to the public
-dashboard origin (`HIVE_PUBLIC_DASHBOARD_URL`, `https://shadw.cloud`) rather
-than `localhost`.
-
-## Firecracker without KVM on plain cloud VMs (PVM)
-
-Firecracker is a Type‑2 VMM: it asks the host's **KVM** subsystem (`/dev/kvm`) to
-create a VM, and KVM in turn programs the CPU's hardware virtualization extensions
-(Intel **VT‑x**/`vmx` or AMD‑V/`svm`). On bare metal those extensions are present;
-on an Apple Silicon Mac, Lima's `vz` VM enables **nested virtualization** so the
-guest sees them too. But a stock cloud VM almost never exposes nested virt — the
-hypervisor hides VT‑x/AMD‑V from your instance — so KVM has nothing to initialize,
-`/dev/kvm` never appears, and Firecracker can't start.
-
-You can see exactly that on our Virginia node, an AMD Tencent CVM: **no hardware
-virtualization is exposed to the guest, yet `/dev/kvm` exists anyway.**
+# Autheo.dev
+
+> **The developer cloud for a distributed internet.**
+
+Autheo.dev is the developer platform and infrastructure layer built on top of the Autheo network.
+
+It gives developers a familiar cloud experience—deploy applications, APIs, functions, containers, databases, AI workloads, game servers, and edge services—while the underlying infrastructure can run across a distributed fabric of cloud servers, private infrastructure, edge nodes, and community-provided compute.
+
+Instead of treating the data center as the boundary of the cloud, Autheo treats **the network itself as the cloud**.
+
+The goal is simple:
+
+**Build once. Deploy anywhere. Run closer to users. Pay for the resources actually used.**
+
+---
+
+## What is Autheo.dev?
+
+Autheo.dev combines a modern developer experience with a distributed compute and networking fabric.
+
+At the application layer, it feels familiar:
+
+- Git-based deployments
+- Serverless functions
+- Long-running services
+- Static sites
+- APIs
+- Containers
+- Databases and persistent data
+- Cron jobs and workflows
+- Preview deployments
+- Logs and observability
+- Domains and routing
+- AI inference and agents
+- Game servers and real-time workloads
+
+Underneath that experience is a distributed infrastructure stack designed around:
+
+- **Distributed compute**
+- **Edge execution**
+- **MicroVM isolation**
+- **Peer-to-peer networking**
+- **Local-first data**
+- **CRDT-based synchronization**
+- **Content-addressed and replicated state**
+- **Secure identity**
+- **Node reputation**
+- **Resource discovery**
+- **Programmable infrastructure markets**
+- **Autheo network settlement**
+
+The result is a cloud that does not require every workload to live inside a centralized hyperscale region.
+
+---
+
+# The Autheo Developer Cloud
+
+Autheo.dev can be understood as a stack of cooperating layers:
 
 ```text
-$ grep -c -E 'svm|vmx' /proc/cpuinfo      # AMD‑V / VT‑x available to this VM?
-0                                          #   → none. No nested virt.
-$ lsmod | grep kvm
-kvm_pvm   53248  4
-kvm      1404928  1 kvm_pvm                #   → kvm_amd is NOT loaded; kvm_pvm is.
-$ ls -l /dev/kvm
-crw-rw-rw- 1 root kvm 10, 232 /dev/kvm     #   → the KVM device is present regardless.
+┌──────────────────────────────────────────────────────────────┐
+│                       Developer Experience                   │
+│  CLI · SDKs · Git · Dashboard · APIs · Templates · Docs     │
+├──────────────────────────────────────────────────────────────┤
+│                         Application Runtime                  │
+│  Functions · Containers · Static Apps · Services · AI        │
+├──────────────────────────────────────────────────────────────┤
+│                       Distributed Compute                    │
+│  Fluid Compute · Warm Pools · Autoscaling · MicroVMs         │
+├──────────────────────────────────────────────────────────────┤
+│                       Compute Fabric                         │
+│  Cloud · Edge · Private · Community · Mobile/IoT Nodes       │
+├──────────────────────────────────────────────────────────────┤
+│                         Data Fabric                           │
+│  CRDTs · Local State · Replication · Storage · Databases     │
+├──────────────────────────────────────────────────────────────┤
+│                         Network Fabric                        │
+│  Iroh/QUIC · P2P · Relays · DNS · Anycast · Edge Routing     │
+├──────────────────────────────────────────────────────────────┤
+│                    Identity & Trust Layer                     │
+│  Node Identity · Encryption · Veritsa · Attestation          │
+├──────────────────────────────────────────────────────────────┤
+│                     Resource Marketplace                      │
+│  Compute · Storage · Bandwidth · Hosting · $THEO             │
+├──────────────────────────────────────────────────────────────┤
+│                         Autheo Network                         │
+│             Cosmos SDK · IBC · EVM · CometBFT                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### What PVM is, and how it conjures `/dev/kvm`
+Each layer is independently useful, but the important property is that they work together.
 
-**PVM (Paged Virtual Machine)** is a *software* hypervisor (from loophole labs /
-the upstream Linux PVM project) that runs guests **without any hardware
-virtualization support**. Instead of trapping into VT‑x/AMD‑V root mode, PVM runs
-the guest **paravirtualized**: a cooperating, PVM‑aware guest kernel runs
-de‑privileged, and privileged operations (page‑table changes, mode switches,
-hypercalls) are mediated by the host. Crucially, PVM is implemented as a **KVM
-"vendor" backend** — a kernel module (`kvm-pvm.ko`) that plugs into the generic
-`kvm` core exactly where `kvm-intel`/`kvm-amd` normally would:
+A developer can deploy an application without needing to understand where every machine is located. The platform determines where workloads should run based on availability, latency, capacity, policy, cost, reputation, and workload requirements.
+
+---
+
+# From Cloud Regions to a Compute Fabric
+
+Traditional cloud infrastructure looks approximately like this:
 
 ```text
-$ modinfo kvm_pvm | egrep 'filename|depends'
-filename: /lib/modules/6.12.33-pvm+/kernel/arch/x86/kvm/kvm-pvm.ko
-depends:  kvm
+Developer
+    │
+    ▼
+Cloud Provider
+    │
+    ├── Region
+    │    ├── Data Center
+    │    │    ├── VM
+    │    │    ├── Container
+    │    │    └── Database
+    │    └── Network
+    │
+    └── CDN / Edge
 ```
 
-Because it sits behind the same `kvm` core, **it exposes the identical `/dev/kvm`
-ioctl ABI** (`KVM_CREATE_VM`, `KVM_CREATE_VCPU`, `KVM_RUN`, memory‑region and CPUID
-ioctls, …). That is the whole trick: any VMM that speaks KVM — QEMU, cloud‑hypervisor,
-**Firecracker** — keeps working, because from userspace `/dev/kvm` looks and behaves
-like real KVM. PVM just satisfies those ioctls in software + paravirt instead of
-with silicon.
+Autheo expands the model:
 
-### The two-kernel split (why a stock guest kernel won't boot)
-
-PVM requires cooperation on **both** sides, so two different kernels are involved:
-
-- **Host kernel** — a PVM‑patched kernel (ours: `6.12.33-pvm+`) that provides the
-  host side and loads `kvm` + `kvm-pvm`. Once it's booted, `/dev/kvm` is available
-  even though `/proc/cpuinfo` shows neither `svm` nor `vmx`.
-- **Guest kernel** — must be **PVM‑aware**. A normal `vmlinux` (or a Firecracker‑CI
-  kernel) will *not* boot under PVM, because the guest has to drive PVM's
-  paravirt interface rather than expect hardware virt. Ours is built with:
-
-  ```text
-  CONFIG_PVM_GUEST=y        # the PVM paravirt guest port
-  CONFIG_PARAVIRT_XXL=y     # full paravirt-ops (MMU, CPU, IRQ) the guest hooks into
-  CONFIG_HYPERVISOR_GUEST=y
-  CONFIG_KVM_GUEST=y
-  ```
-
-  This is why each microVM boots our `vmlinux-pvm-guest` image, not the generic
-  kernel we use on hardware‑KVM nodes.
-
-### The Firecracker fork
-
-We run the **PVM fork of Firecracker**
-([loopholelabs/firecracker @ `main-live-migration-pvm`](https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm),
-`v1.13.0-dev`). Because `/dev/kvm` is preserved, the vast majority of Firecracker
-is untouched; the fork carries the PVM‑specific bits of vCPU/CPUID/segment setup
-and the live‑migration work the branch is named for. (PVM's design — a fully
-software‑defined CPU state — makes microVMs cleanly migratable between hosts.)
-
-### What our node had to do (almost nothing)
-
-Because PVM presents `/dev/kvm`, the Firecracker backend's capability probe —
-`is_supported()` = *Linux + `/dev/kvm` + a `firecracker` binary* — **passes with no
-change**, so a PVM node auto‑selects the real microVM backend exactly like bare
-metal:
-
-```
-isolation backend: Firecracker microVM (real, Linux + /dev/kvm)
-control plane starting hive=hive-virginia ... backend="firecracker"
+```text
+                         Autheo Network
+                              │
+                    Distributed Control Plane
+                              │
+        ┌─────────────────────┼─────────────────────┐
+        │                     │                     │
+     Cloud Nodes          Edge Nodes          Private Nodes
+        │                     │                     │
+    ┌───┼───┐             ┌───┼───┐           ┌───┼───┐
+    │   │   │             │   │   │           │   │   │
+   VM  VM  VM            VM  ARM  IoT        VM  GPU  LAN
+        │                     │                     │
+        └─────────────────────┼─────────────────────┘
+                              │
+                         P2P Network
+                              │
+                           Users
 ```
 
-The only PVM‑specific accommodation is the **guest kernel cmdline**. PVM's emulated
-platform stalls if the guest probes the legacy i8042 keyboard controller, so we
-disable it — overridable per node via the **`HIVE_FC_BOOT_ARGS`** env var, keeping
-`init=/sbin/hive-cell-agent` so the cell agent is PID 1:
+A compute node does not have to be a traditional data center server.
 
+It can be:
+
+- A cloud VM
+- Bare-metal infrastructure
+- A regional edge server
+- A private enterprise machine
+- An on-premise cluster
+- A workstation
+- A dedicated community node
+- An ARM device
+- An IoT/edge gateway
+- Specialized accelerator infrastructure
+
+The network can therefore turn otherwise isolated resources into a programmable compute fabric.
+
+---
+
+# The Core Idea: Separate the Application From the Machine
+
+Developers should describe **what an application needs**, not manually select every server that executes it.
+
+For example:
+
+```json
+{
+  "runtime": "node",
+  "memory": "1Gi",
+  "cpu": "1",
+  "maxConcurrency": 50,
+  "minInstances": 0,
+  "regions": ["nearest"],
+  "gpu": false
+}
 ```
-HIVE_FC_BOOT_ARGS="console=ttyS0 reboot=k panic=1 pci=off \
-  i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd \
-  root=/dev/vda rw init=/sbin/hive-cell-agent"
+
+The platform resolves those requirements against available infrastructure.
+
+The scheduler can consider:
+
+- Geographic proximity
+- Network latency
+- Current utilization
+- Available CPU
+- Available memory
+- Accelerator availability
+- Node health
+- Node reputation
+- Pricing
+- Data locality
+- Deployment policy
+- Tenant policy
+- Compliance requirements
+- Power/resource availability
+
+The developer gets an application endpoint.
+
+The fabric handles the infrastructure.
+
+---
+
+# Fluid Compute
+
+Autheo's serving model uses a **Fluid Compute** architecture rather than treating every request as a completely independent serverless execution.
+
+A running function instance can process multiple concurrent requests.
+
+```text
+                    Incoming Requests
+                   /   /   |   \   \
+                  ▼   ▼    ▼    ▼   ▼
+              ┌────────────────────────┐
+              │    Running Instance    │
+              │                        │
+              │  Request A             │
+              │  Request B             │
+              │  Request C             │
+              │  Request D             │
+              │                        │
+              └────────────────────────┘
+                         │
+                    Reuse Instance
 ```
 
-Everything downstream is identical to the hardware‑KVM path: the per‑deployment
-build is delivered into the cell as a **virtio‑blk data disk** (mounted at
-`/build`), and the gateway reaches the function through the **vsock** tunnel to the
-in‑guest cell agent. End‑to‑end, our Virginia CVM serves deployments from genuine
-Firecracker microVMs over PVM.
+The scheduler attempts to reuse capacity before creating additional instances.
 
-### Trade‑offs
+When an instance becomes saturated:
 
-- **Pro:** real VM isolation (a separate guest kernel, not a shared one like
-  containers) on commodity cloud VMs that can't do nested virt — no special
-  instance type, no bare metal.
-- **Con:** software virtualization has CPU overhead versus hardware KVM, so it's
-  best for I/O‑bound / serverless workloads (our case) rather than CPU‑pinned ones.
-- **Verify it's actually PVM on any node:** `grep -E 'svm|vmx' /proc/cpuinfo` (empty),
-  `lsmod | grep kvm_pvm`, `ls -l /dev/kvm`, `firecracker --version`.
-
-Background reading: Alex Ellis,
-["How to run Firecracker without KVM on regular cloud VMs"](https://blog.alexellis.io/how-to-run-firecracker-without-kvm-on-regular-cloud-vms/),
-and the [PVM Firecracker fork](https://github.com/loopholelabs/firecracker/tree/main-live-migration-pvm).
-
-## Multi-node data & mesh networking
-
-Every `hived` instance runs a real, gossiped iroh-QUIC mesh (`hive-p2p`), plus an
-embedded [GuardianDB](https://github.com/wmaslonek/guardian-db) node (vendored at
-`vendor/guardian-db`, patched for self-hosted relays) for tenant/control-plane
-state — projects, teams, billing, domains.
-
-**Relational data (`crates/hive-cloud/src/relational.rs`).** Rare-write, needs-
-fleet-consistent-reads state (project→team ownership, billing account/ledger/
-invoices) is mirrored into GuardianDB's native SQL layer (`guardian_db::sql`,
-built on `iroh-docs` range-reconciliation) via a plain relational schema —
-writes dual-write best-effort alongside the existing in-memory store; reads
-prefer the relational mirror, falling back to local state. High-frequency
-per-request metrics are deliberately NOT put through this path — they're
-fanned out live on read instead (`GET /v1/metrics`, no `local=true`) since a
-replicated write-path for every request would be far too hot.
-
-**Per-node relay.** Every node embeds its own `iroh-relay` listener
-(`--relay-port`, default 3341; `HIVE_OWN_RELAY_PORT` env override) and
-gossips its URL as part of its `NodeInfo`. When dialing a peer, the relay
-actually used is chosen by `hive-edge`'s `select_relay_hint`: the target's
-own relay first, else the geographically-nearest peer's relay, else the
-central `relay.shadw.cloud` backstop — closing the class of bug where a
-node with no relay of its own (and a stale cached connect hint) could never
-reach a peer across a NAT/firewall boundary. This is additive to, not a
-replacement for, the standalone TLS+QUIC-capable `iroh-relay` processes a
-few nodes run today (the embedded listener is plain HTTP only for now).
-
-**Guardian-db anti-entropy.** Every node runs a periodic loop
-(`HIVE_ANTI_ENTROPY_INTERVAL_SECS`, default 60s): pick one random healthy
-peer, exchange per-key content-hash "heads" over `GET /v1/guardian/heads`,
-and for any namespace whose heads differ, trigger a targeted
-`iroh_docs::Doc::start_sync` reconciliation against that peer (not a full
-resync) — the CRDT equivalent of Dynamo-style read-repair. Convergence and
-divergence are both logged (`"synced N missing entries from peer X"` /
-`"heads already match"`) at `info`/`debug` level under the `hive_cloud`
-target.
-
-**Env-var secret detection.** `ProjectStore::put_env` auto-detects common
-credential shapes (GitHub/AWS/Stripe/npm/Slack/Google/Anthropic/OpenAI
-token prefixes, PEM blocks, JWTs) in a value and forces `sensitive: true`
-regardless of the caller's flag, so a user forgetting to check "Sensitive"
-can't leak a real token in plaintext through the settings/gitops read paths.
-
-**Admin Data Browser — Tables (PostgreSQL) view.** Alongside the existing
-document-collection browser (`/admin/data`), a view toggle switches to a
-read-only view of the relational mirror above as real typed SQL tables:
-`GET /v1/admin/sql/tables` lists the known tables + columns, `POST
-/v1/admin/sql/query` runs a query (a picked table defaults to `SELECT *
-FROM <table> LIMIT 200`, or type your own). Enforced SELECT-only
-server-side — mutating keywords are rejected anywhere in the query (not
-just as the first token) and multi-statement input is rejected outright, so
-this can never become a second, less-guarded write path alongside the
-document browser's own PUT/POST/DELETE endpoints. The Data Browser's reads
-(both views) are also client-cached for 15s now — clicking between
-collections/tables no longer re-fetches every click.
-
-## hived flags
-
+```text
+Instance A
+   │
+   ├── Request 1
+   ├── Request 2
+   ├── Request 3
+   └── Request 4
+          │
+          ▼
+       Saturated
+          │
+          ▼
+   Provision Instance B
 ```
---backend mock|firecracker      isolation backend (default mock)
---listen ADDR                   API bind address (default 127.0.0.1:8080)
---boxes N                       number of boxes (default 2)
---box-vcpus N / --box-mem-mib N per-box capacity
---warm IMAGE=COUNT              warm-pool target per image (repeatable)
---max-concurrent N              max concurrent builds
---mock-provision-ms N           (mock) simulated cold-boot latency
+
+When demand falls:
+
+```text
+Instance A ── active
+Instance B ── active
+Instance C ── idle
+                  │
+                  ▼
+             idle timeout
+                  │
+                  ▼
+             scale to zero
+```
+
+This improves both performance and infrastructure utilization.
+
+## Instance reuse
+
+Requests preferentially route to instances that are already running.
+
+This avoids unnecessary provisioning and reduces cold-start frequency.
+
+## Bytecode and build caching
+
+Compiled artifacts and build outputs can be reused between executions and deployments where safe.
+
+Caching reduces repeated initialization work and avoids rebuilding identical application state unnecessarily.
+
+## Warm pools
+
+Frequently used runtimes can maintain pre-initialized capacity.
+
+Instead of:
+
+```text
+Request
+  ↓
+Create VM
+  ↓
+Boot kernel
+  ↓
+Start runtime
+  ↓
+Load application
+  ↓
+Handle request
+```
+
+the platform can do:
+
+```text
+Warm VM
+  ↓
+Load application
+  ↓
+Handle request
+```
+
+The same principle applies to build environments.
+
+Warm capacity is therefore a first-class infrastructure primitive.
+
+---
+
+# MicroVM Compute
+
+Workloads can execute inside isolated microVMs.
+
+The primary isolation model is based around **Firecracker-style microVMs**.
+
+```text
+Host
+│
+├── Control Plane
+│
+├── Scheduler
+│
+├── Gateway
+│
+├── Firecracker
+│    ├── MicroVM A
+│    │    └── Application
+│    │
+│    ├── MicroVM B
+│    │    └── Function
+│    │
+│    └── MicroVM C
+│         └── Build
+│
+└── Network Fabric
+```
+
+A microVM provides a stronger isolation boundary than a conventional shared-process container while remaining lightweight enough for serverless and edge workloads.
+
+The architecture supports a pluggable execution backend.
+
+A development environment can use a lightweight process/sandbox backend, while production infrastructure can use real microVM isolation.
+
+---
+
+# Builds as Infrastructure
+
+Application deployment begins with a build.
+
+The build system turns source code into an immutable deployment artifact.
+
+```text
+Git Repository
+      │
+      ▼
+Build Request
+      │
+      ▼
+Scheduler
+      │
+      ▼
+Warm Build Environment
+      │
+      ├── Dependency Cache
+      ├── Source
+      └── Build Tools
+      │
+      ▼
+Build Artifact
+      │
+      ▼
+Deployment
+```
+
+Build environments can be isolated using microVMs.
+
+Build caches can reuse expensive dependencies such as:
+
+- `node_modules`
+- package-manager caches
+- compiler artifacts
+- framework build output
+- language dependencies
+- intermediate assets
+
+A lockfile or content-derived cache key can determine whether an artifact can safely be restored.
+
+This turns repeated deployments into incremental operations rather than completely fresh environments.
+
+---
+
+# The Request Path
+
+An application request moves through the distributed edge before reaching compute.
+
+A simplified request path is:
+
+```text
+User
+ │
+ ▼
+DNS / Edge Discovery
+ │
+ ▼
+Regional / Nearest Node
+ │
+ ▼
+Routing
+ │
+ ├── Redirects
+ └── Rewrites
+ │
+ ▼
+Security
+ │
+ ├── WAF
+ ├── Bot Management
+ └── Policy
+ │
+ ▼
+Cache
+ │
+ ├── HIT ───────────────► Response
+ │
+ ├── STALE ─────────────► Serve + Revalidate
+ │
+ └── MISS
+       │
+       ▼
+Concurrency Admission
+       │
+       ▼
+Fluid Compute
+       │
+       ▼
+Existing Instance?
+     /       \
+   yes        no
+    │          │
+    ▼          ▼
+  Reuse     Provision
+    │          │
+    └────┬─────┘
+         ▼
+     MicroVM / Runtime
+         │
+         ▼
+       Response
+```
+
+This is important because compute is only one part of the platform.
+
+Autheo.dev combines:
+
+**DNS + routing + security + caching + scheduling + compute + networking.**
+
+---
+
+# Edge Computing
+
+The closest compute node is not necessarily the cheapest node, and the cheapest node is not necessarily the best node.
+
+The scheduler can balance multiple objectives.
+
+For latency-sensitive workloads:
+
+```text
+User
+ │
+ ▼
+Nearest Edge
+ │
+ ▼
+Function
+```
+
+For workloads requiring specialized resources:
+
+```text
+User
+ │
+ ▼
+Edge Gateway
+ │
+ ▼
+Network Fabric
+ │
+ ▼
+GPU / High-Memory Node
+ │
+ ▼
+Function
+```
+
+For private applications:
+
+```text
+Internet
+   │
+   ▼
+Autheo Edge
+   │
+   ▼
+Private Network
+   │
+   ▼
+Enterprise Node
+```
+
+This allows one deployment model to cover public cloud, edge, private cloud, and hybrid environments.
+
+---
+
+# Peer-to-Peer Networking
+
+The compute fabric uses peer-to-peer networking to connect nodes without requiring every node to expose a public IP address.
+
+The network is based around encrypted QUIC connections and peer discovery.
+
+Conceptually:
+
+```text
+Node A
+  │
+  │ QUIC
+  ▼
+Node B
+  │
+  │
+  ├──────────► Node C
+  │
+  └──────────► Relay
+```
+
+Iroh-style networking provides:
+
+- Cryptographic node identity
+- QUIC transport
+- Peer-to-peer connectivity
+- NAT traversal
+- Relay fallback
+- Encrypted communication
+- Multiplexed streams
+
+The network can therefore connect machines behind ordinary residential, enterprise, or cloud NAT.
+
+The result is a fabric rather than a collection of isolated servers.
+
+---
+
+# Local-First Infrastructure
+
+Autheo does not assume every operation must travel to a centralized database.
+
+Applications and infrastructure components can maintain local state and synchronize it across peers.
+
+```text
+                 ┌───────────────┐
+                 │   Node A      │
+                 │ Local State   │
+                 └───────┬───────┘
+                         │
+                       CRDT
+                         │
+            ┌────────────┴────────────┐
+            │                         │
+      ┌─────▼─────┐             ┌─────▼─────┐
+      │   Node B  │             │   Node C  │
+      │ Local DB  │             │ Local DB  │
+      └───────────┘             └───────────┘
+```
+
+This enables:
+
+- Local reads
+- Offline operation
+- Peer synchronization
+- Eventual convergence
+- Reduced centralized database traffic
+- Regional autonomy
+- Resilient distributed state
+
+High-frequency ephemeral metrics do not need to become globally replicated database writes.
+
+Control-plane state can be synchronized separately from hot request telemetry.
+
+---
+
+# CRDT-Based Data Fabric
+
+Autheo uses CRDT-style synchronization for distributed state where eventual convergence is appropriate.
+
+Instead of requiring every node to synchronously agree with a central database:
+
+```text
+Node A ── write
+Node B ── write
+Node C ── write
+
+        ↓
+
+   Synchronization
+
+        ↓
+
+All nodes converge
+```
+
+This model is useful for:
+
+- Configuration
+- Metadata
+- Deployment state
+- Registry information
+- Distributed documents
+- Offline-first applications
+- Peer state
+- Control-plane information
+
+It is not intended to replace every relational database.
+
+Different classes of data require different consistency models.
+
+---
+
+# Control Plane and Data Plane
+
+Autheo separates coordination from execution.
+
+## Control plane
+
+The control plane manages:
+
+- Projects
+- Deployments
+- Users
+- Domains
+- Policies
+- Scheduling
+- Node membership
+- Resource availability
+- Billing
+- Marketplace state
+- Configuration
+
+## Data plane
+
+The data plane performs the actual work:
+
+- HTTP requests
+- Function execution
+- Container workloads
+- Builds
+- AI inference
+- Storage operations
+- Network forwarding
+- Edge processing
+
+This separation allows the compute fabric to remain distributed while still providing a coherent developer experience.
+
+---
+
+# Node Architecture
+
+A typical Autheo compute node can be viewed as:
+
+```text
+┌──────────────────────────────────────────────┐
+│                 Autheo Node                  │
+├──────────────────────────────────────────────┤
+│ Identity / Trust                             │
+├──────────────────────────────────────────────┤
+│ P2P Networking / QUIC / Relay                │
+├──────────────────────────────────────────────┤
+│ Node Registry / Gossip                       │
+├──────────────────────────────────────────────┤
+│ Scheduler / Resource Manager                 │
+├──────────────────────────────────────────────┤
+│ Warm Pool / Autoscaler                       │
+├──────────────────────────────────────────────┤
+│ Runtime Manager                              │
+│   ├── Functions                              │
+│   ├── Containers                             │
+│   └── MicroVMs                               │
+├──────────────────────────────────────────────┤
+│ Local Cache / Storage                        │
+├──────────────────────────────────────────────┤
+│ CRDT / Replicated State                      │
+├──────────────────────────────────────────────┤
+│ Edge Gateway                                 │
+│   ├── DNS                                    │
+│   ├── Routing                                │
+│   ├── WAF                                    │
+│   ├── CDN                                    │
+│   └── Observability                          │
+└──────────────────────────────────────────────┘
+```
+
+Nodes can join different roles depending on their available hardware and policies.
+
+---
+
+# Scheduling the Fabric
+
+The scheduler is the bridge between application requirements and physical resources.
+
+A deployment produces a workload specification.
+
+The scheduler discovers suitable nodes.
+
+```text
+Application Requirements
+          │
+          ▼
+     Scheduler
+          │
+   ┌──────┼────────┐
+   ▼      ▼        ▼
+Latency  Capacity  Policy
+   │      │        │
+   └──────┼────────┘
+          ▼
+      Candidate Nodes
+          │
+          ▼
+   Reputation / Cost
+          │
+          ▼
+     Selected Node
+          │
+          ▼
+     Runtime / VM
+```
+
+The scheduling model can evolve from simple regional placement toward a marketplace-aware scheduler that considers real-time resource prices.
+
+---
+
+# Veritsa: Node Reputation
+
+A distributed cloud needs a way to distinguish between nodes.
+
+Autheo's **Veritsa** reputation system provides a trust visualization and score for nodes participating in the network.
+
+A node's reputation can incorporate observable network behavior such as:
+
+- Uptime
+- Successful workloads
+- Reliability
+- Response consistency
+- Resource availability
+- Failed jobs
+- Routing behavior
+- Historical service quality
+- Verification and attestation signals
+
+Reputation should not be treated as a single permanent identity score.
+
+It is a dynamic signal used by scheduling and marketplace systems.
+
+Conceptually:
+
+```text
+                    Node
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+       Reliability  Capacity  History
+          │          │          │
+          └──────────┼──────────┘
+                     ▼
+                  Veritsa
+                     │
+                     ▼
+             Trust / Quality Signal
+                     │
+                     ▼
+                Scheduler
 ```
 
 ---
 
-**shadw.cloud** — the peer-to-peer cloud.
+# Identity and Security
+
+Distributed infrastructure requires strong identities.
+
+Nodes communicate using cryptographic identities rather than relying exclusively on IP addresses.
+
+Security primitives can include:
+
+- TLS 1.3
+- QUIC
+- Cryptographic node identities
+- Secure peer authentication
+- Capability-based access
+- Secrets management
+- Encrypted state
+- MicroVM isolation
+- Optional confidential-compute/enclave execution
+- Post-quantum key agreement
+
+The architecture is designed to support modern post-quantum cryptography, including ML-KEM-based key establishment where appropriate.
+
+---
+
+# Marketplace: Compute as a Resource
+
+Autheo turns compute into a programmable resource market.
+
+Instead of infrastructure being available only through a centralized provider:
+
+```text
+Provider
+   │
+   └── Hardware
+         │
+         ▼
+     Marketplace
+         │
+         ▼
+      Developer
+```
+
+resource providers can contribute:
+
+- CPU
+- Memory
+- GPU
+- Storage
+- Bandwidth
+- Hosting capacity
+- Edge capacity
+- Specialized hardware
+
+Developers purchase execution and infrastructure capacity.
+
+The native **$THEO** token provides the economic coordination layer for the Autheo ecosystem.
+
+The objective is not speculation for its own sake.
+
+The objective is to create a native market where infrastructure has a measurable supply, demand, cost, and utilization.
+
+---
+
+# A Compute Economy
+
+A distributed compute market can dynamically express resource scarcity.
+
+For example:
+
+```text
+High GPU Demand
+      │
+      ▼
+Higher Resource Price
+      │
+      ▼
+More Providers Incentivized
+      │
+      ▼
+More Available Capacity
+      │
+      ▼
+Market Equilibrium
+```
+
+Likewise, inexpensive unused capacity can become economically useful.
+
+A workstation that would otherwise sit idle can become a compute provider.
+
+A regional edge server can sell capacity during periods of low private utilization.
+
+A data center can expose spare capacity without becoming the only place workloads can run.
+
+---
+
+# Why a Native Compute Market Matters
+
+Cloud infrastructure has traditionally hidden the underlying resource market behind provider-specific pricing.
+
+Autheo exposes more of that market.
+
+The platform can eventually price workloads based on:
+
+- CPU time
+- Memory usage
+- GPU time
+- Storage
+- Bandwidth
+- Duration
+- Geographic location
+- Latency requirements
+- Availability guarantees
+- Node reputation
+- Current demand
+
+The developer still receives a simple deployment experience.
+
+The complexity lives inside the infrastructure scheduler and marketplace.
+
+---
+
+# Autheo Network Integration
+
+Autheo.dev is designed to operate as a developer-facing infrastructure layer on top of the Autheo network.
+
+The broader network architecture provides:
+
+- Cosmos SDK infrastructure
+- CometBFT consensus
+- Interchain communication through IBC
+- EVM-compatible application execution
+- Native network economics
+- Validator infrastructure
+- Programmable settlement
+
+This creates a separation of concerns:
+
+```text
+Application
+    │
+    ▼
+Autheo.dev
+    │
+    ├── Compute
+    ├── Storage
+    ├── Networking
+    ├── Identity
+    ├── Marketplace
+    └── Developer APIs
+    │
+    ▼
+Autheo Network
+    │
+    ├── Settlement
+    ├── Identity / Accounts
+    ├── Interoperability
+    └── Network Consensus
+```
+
+The blockchain does not need to execute every HTTP request.
+
+Instead, the network provides the coordination and settlement layer while the distributed compute fabric executes workloads off-chain.
+
+---
+
+# Why This Architecture
+
+The architecture is built around several observations.
+
+### 1. Compute is increasingly distributed
+
+Users and businesses already operate machines outside traditional data centers.
+
+### 2. Edge computing reduces distance
+
+Running workloads closer to users can reduce latency and unnecessary network transit.
+
+### 3. Utilization matters
+
+A server that is idle most of the day represents unused infrastructure.
+
+Fluid-style concurrency and marketplace scheduling can increase utilization.
+
+### 4. Not every workload belongs in a hyperscale region
+
+Some applications require:
+
+- Local execution
+- Private infrastructure
+- Regional sovereignty
+- Low latency
+- Offline capability
+- Specialized hardware
+
+### 5. Modern virtualization makes small compute units practical
+
+MicroVMs make isolated workloads small enough to schedule dynamically.
+
+### 6. P2P networking makes infrastructure composable
+
+Nodes can communicate without requiring every participant to operate a conventional public-facing server.
+
+### 7. Cryptographic identity changes the unit of infrastructure
+
+The network can reason about a node as an identity with capabilities and reputation rather than merely an IP address.
+
+---
+
+# Sustainable Infrastructure
+
+Autheo's distributed model also creates a path toward more resource-efficient computing.
+
+Traditional hyperscale data centers concentrate enormous amounts of:
+
+- Electricity
+- Cooling
+- Water
+- Networking
+- Hardware
+
+A distributed compute fabric can place workloads closer to demand and make better use of infrastructure that already exists.
+
+Potential benefits include:
+
+- Higher utilization of existing hardware
+- Less unnecessary long-distance traffic
+- Smaller regional compute installations
+- More local renewable generation
+- Distributed solar-powered compute sites
+- Edge execution
+- Lower dependence on water-intensive centralized cooling
+- Better matching of capacity to local demand
+
+The goal is not simply to move data centers.
+
+It is to rethink where computing happens.
+
+---
+
+# What Developers Can Build
+
+Autheo.dev is intended to support workloads ranging from ordinary web applications to distributed systems.
+
+### Web applications
+
+```text
+Next.js / React / Svelte / Vue
+        │
+        ▼
+Autheo.dev
+        │
+        ├── Static Assets
+        ├── Functions
+        ├── Database
+        └── Edge
+```
+
+### APIs and SaaS
+
+Long-running or serverless services can coexist on the same fabric.
+
+### AI applications
+
+- Inference
+- Agents
+- Streaming responses
+- Model gateways
+- GPU workloads
+- Distributed AI services
+
+### Game infrastructure
+
+- Minecraft servers
+- Multiplayer servers
+- Matchmaking
+- Real-time state
+- Regional game nodes
+
+### Edge and IoT
+
+- Local processing
+- Sensor aggregation
+- Device coordination
+- Low-latency APIs
+- Offline-first applications
+
+### Private cloud
+
+Organizations can operate their own nodes while still participating in a broader application and resource fabric.
+
+---
+
+# Developer Experience
+
+The infrastructure should feel boring from the developer's perspective.
+
+A developer should be able to:
+
+```bash
+autheo login
+
+autheo deploy
+
+autheo logs
+
+autheo domains
+
+autheo scale
+
+autheo regions
+
+autheo nodes
+```
+
+The dashboard provides the visual equivalent:
+
+```text
+Overview
+├── Deployments
+├── Functions
+├── Compute
+├── Nodes
+├── Regions
+├── Domains
+├── Storage
+├── Data
+├── Marketplace
+├── Firewall
+├── Cron
+├── Workflows
+├── Logs
+└── Usage
+```
+
+The complexity of the underlying distributed system should not become application-level complexity.
+
+---
+
+# A Deployment Lifecycle
+
+A complete deployment can be understood as:
+
+```text
+                    Developer
+                        │
+                        ▼
+                   Git / CLI
+                        │
+                        ▼
+                  Deployment API
+                        │
+                        ▼
+                     Build
+                        │
+                        ▼
+                 Build Cache
+                        │
+                        ▼
+                 Immutable Artifact
+                        │
+                        ▼
+                    Scheduler
+                        │
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+           Cloud       Edge      Private
+             │          │          │
+             └──────────┼──────────┘
+                        ▼
+                    MicroVM
+                        │
+                        ▼
+                  Fluid Instance
+                        │
+                        ▼
+                    P2P Mesh
+                        │
+                        ▼
+                      Users
+```
+
+A deployment is therefore not permanently bound to one machine.
+
+The deployment is an application identity plus an executable artifact plus policy.
+
+The fabric determines where it should run.
+
+---
+
+# Resilience
+
+A distributed platform should assume that individual machines fail.
+
+If a node disappears:
+
+```text
+Node A
+  │
+  └── deployment
+       │
+       ▼
+    FAILURE
+       │
+       ▼
+Registry detects unhealthy node
+       │
+       ▼
+Scheduler selects replacement
+       │
+       ▼
+Node B
+       │
+       ▼
+Deployment restored
+```
+
+Persistent state is synchronized independently from compute instances.
+
+This allows compute to remain ephemeral.
+
+A function can disappear.
+
+A machine can disappear.
+
+The application does not necessarily disappear with it.
+
+---
+
+# Observability
+
+Distributed systems require visibility across both applications and infrastructure.
+
+Autheo.dev can expose:
+
+- Deployment logs
+- Function logs
+- Request traces
+- Node health
+- Region health
+- Compute utilization
+- Instance reuse
+- Cold starts
+- Warm-pool utilization
+- Cache hits/misses
+- Network paths
+- Marketplace costs
+- Resource consumption
+- Reputation signals
+
+The objective is to make the distributed fabric observable without exposing unnecessary infrastructure complexity.
+
+---
+
+# Architecture Principles
+
+Autheo.dev is built around several principles.
+
+## Local first
+
+Prefer local execution and local state when possible.
+
+## Distributed by default
+
+Infrastructure should not require a single central machine.
+
+## Secure by isolation
+
+Use strong workload boundaries such as microVMs.
+
+## Reuse before provisioning
+
+Use existing capacity before creating new capacity.
+
+## Compute is ephemeral
+
+Do not make application correctness depend on a specific machine.
+
+## State is independent
+
+Persistent state should outlive individual compute instances.
+
+## Network is programmable
+
+Nodes should be addressable by identity and capability, not only location.
+
+## Infrastructure is a market
+
+Unused resources can become productive resources.
+
+## Developer experience stays simple
+
+Distributed infrastructure should not force developers to become distributed-systems engineers.
+
+---
+
+# Repository Structure
+
+The implementation is organized around independent infrastructure components.
+
+A representative architecture looks like:
+
+```text
+autheo/
+├── core/
+│   ├── identity
+│   ├── types
+│   ├── protocols
+│   └── lifecycle
+│
+├── compute/
+│   ├── scheduler
+│   ├── runtime
+│   ├── fluid-compute
+│   ├── autoscaler
+│   ├── warm-pool
+│   └── microvm
+│
+├── build/
+│   ├── build-control-plane
+│   ├── build-runner
+│   ├── cache
+│   └── artifacts
+│
+├── network/
+│   ├── p2p
+│   ├── quic
+│   ├── relay
+│   ├── discovery
+│   ├── dns
+│   └── edge
+│
+├── data/
+│   ├── crdt
+│   ├── replication
+│   ├── storage
+│   └── databases
+│
+├── security/
+│   ├── isolation
+│   ├── secrets
+│   ├── attestation
+│   └── pqc
+│
+├── marketplace/
+│   ├── resource-registry
+│   ├── pricing
+│   ├── settlement
+│   └── usage-metering
+│
+├── reputation/
+│   └── veritsa
+│
+├── sdk/
+│
+├── cli/
+│
+├── dashboard/
+│
+└── docs/
+```
+
+The exact implementation may evolve, but the architectural separation is intentional.
+
+---
+
+# Relationship to Autheo
+
+Autheo.dev is the developer-facing expression of the broader Autheo ecosystem.
+
+The network provides the foundation for identity, settlement, interoperability, and decentralized coordination.
+
+Autheo.dev turns those primitives into infrastructure developers can actually use.
+
+```text
+                    AUTHEO
+             Decentralized Network
+                      │
+          ┌───────────┴───────────┐
+          │                       │
+       Protocol               Economics
+          │                       │
+          └───────────┬───────────┘
+                      │
+                 AUTHEO.DEV
+              Developer Cloud
+                      │
+       ┌──────────────┼──────────────┐
+       │              │              │
+    Compute         Data         Networking
+       │              │              │
+       └──────────────┼──────────────┘
+                      │
+                 Applications
+                      │
+                    Users
+```
+
+---
+
+# The Long-Term Vision
+
+Today's cloud is primarily a collection of provider-owned regions.
+
+The next generation can be a **programmable global compute fabric**.
+
+Autheo.dev is designed toward that model.
+
+Instead of:
+
+```text
+Application
+    ↓
+One Cloud Provider
+    ↓
+One Region
+    ↓
+One Infrastructure Stack
+```
+
+the model becomes:
+
+```text
+                         Application
+                              │
+                              ▼
+                       Autheo Developer Cloud
+                              │
+               ┌──────────────┼──────────────┐
+               │              │              │
+             Cloud           Edge          Private
+               │              │              │
+        ┌──────┴──────┐      │       ┌──────┴──────┐
+        │             │      │       │             │
+       CPU           GPU    ARM     Enterprise   Local
+        │             │      │       │             │
+        └──────────────┴──────┴───────┴─────────────┘
+                              │
+                         P2P Fabric
+                              │
+                         Autheo Network
+                              │
+                       Resource Market
+                              │
+                            $THEO
+```
+
+The end state is not merely another cloud provider.
+
+It is an infrastructure layer where **compute, storage, networking, identity, data, and economic coordination become programmable resources on a global distributed fabric.**
+
+---
+
+# Getting Started
+
+Start with the developer documentation at **autheo.dev**.
+
+The documentation is organized around the major components of the platform:
+
+1. **Developer Platform** — projects, deployments, APIs, CLI and dashboard
+2. **Compute** — functions, containers, Fluid Compute and microVMs
+3. **Networking** — P2P, QUIC, DNS, edge routing and service discovery
+4. **Data** — local-first state, CRDTs, replication and storage
+5. **Security** — identity, isolation, secrets and post-quantum cryptography
+6. **Marketplace** — compute resources, pricing, providers and $THEO settlement
+7. **Reputation** — Veritsa node trust and service quality
+8. **Autheo Network** — Cosmos SDK, IBC, EVM and network infrastructure
+
+---
+
+# Contributing
+
+Autheo.dev is intended to be built as an open infrastructure ecosystem.
+
+Contributions can span:
+
+- Runtime engineering
+- Rust infrastructure
+- Web development
+- Distributed systems
+- P2P networking
+- MicroVMs
+- Cryptography
+- Databases
+- Edge computing
+- AI infrastructure
+- Developer tooling
+- Documentation
+- Node operation
+- Resource provisioning
+
+The platform becomes more useful as more developers build on it and more infrastructure becomes available to the fabric.
+
+---
+
+# License
+
+See the individual repository components for their applicable licenses and third-party dependencies.
+
+---
+
+## Autheo.dev
+
+**A developer cloud for a distributed internet.**
+
+**Compute anywhere. Data everywhere. Build once. Run closer.**
