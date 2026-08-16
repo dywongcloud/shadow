@@ -4,7 +4,7 @@
 
 Autheo.dev is the developer platform and infrastructure layer built on top of the Autheo network.
 
-It gives developers a familiar cloud experience—deploy applications, APIs, functions, containers, databases, AI workloads, game servers, and edge services—while the underlying infrastructure can run across a distributed fabric of cloud servers, private infrastructure, edge nodes, and community-provided compute.
+It gives developers a comprehensive SDK toolkit in with traditional cloud experience—deploy applications, APIs, functions, containers, databases, AI workloads, game servers, and edge services—while the underlying infrastructure can run across a distributed fabric of cloud servers, private infrastructure, edge nodes, and community-provided compute.
 
 Instead of treating the data center as the boundary of the cloud, Autheo treats **the network itself as the cloud**.
 
@@ -60,7 +60,7 @@ Autheo.dev can be understood as a stack of cooperating layers:
 ```text
 ┌──────────────────────────────────────────────────────────────┐
 │                       Developer Experience                   │
-│  CLI · SDKs · Git · Dashboard · APIs · Templates · Docs     │
+│  CLI · SDKs · Git · Dashboard · APIs · Templates · Docs      │
 ├──────────────────────────────────────────────────────────────┤
 │                         Application Runtime                  │
 │  Functions · Containers · Static Apps · Services · AI        │
@@ -71,26 +71,26 @@ Autheo.dev can be understood as a stack of cooperating layers:
 │                       Compute Fabric                         │
 │  Cloud · Edge · Private · Community · Mobile/IoT Nodes       │
 ├──────────────────────────────────────────────────────────────┤
-│                         Data Fabric                           │
+│                         Data Fabric                          │
 │  CRDTs · Local State · Replication · Storage · Databases     │
 ├──────────────────────────────────────────────────────────────┤
-│                         Network Fabric                        │
+│                         Network Fabric                       │
 │  Iroh/QUIC · P2P · Relays · DNS · Anycast · Edge Routing     │
 ├──────────────────────────────────────────────────────────────┤
-│                    Identity & Trust Layer                     │
+│                    Identity & Trust Layer                    │
 │  Node Identity · Encryption · veritas · Attestation          │
 ├──────────────────────────────────────────────────────────────┤
-│                     Resource Marketplace                      │
+│                     Resource Marketplace                     │
 │  Compute · Storage · Bandwidth · Hosting · $THEO             │
 ├──────────────────────────────────────────────────────────────┤
-│                         Autheo Network                         │
-│             Cosmos SDK · IBC · EVM · CometBFT                 │
+│                         Autheo Network                       │
+│             Cosmos SDK · IBC · EVM · CometBFT                │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 Each layer is independently useful, but the important property is that they work together.
 
-A developer can deploy an application without needing to understand where every machine is located. The platform determines where workloads should run based on availability, latency, capacity, policy, cost, reputation, and workload requirements.
+A developer can deploy an application without needing to understand where every machine is located, the platform can intelligently determine where workloads should run optimally based on availability, latency, capacity, policy, cost, reputation, and workload requirements.
 
 ---
 
@@ -140,16 +140,19 @@ A compute node does not have to be a traditional data center server.
 
 It can be:
 
-- A cloud VM
 - Bare-metal infrastructure
+- Semi-used gaming PC
 - A regional edge server
 - A private enterprise machine
-- An on-premise cluster
+- An on-premise Rasp-Pi or GPU cluster
 - A workstation
 - A dedicated community node
 - An ARM device
 - An IoT/edge gateway
 - Specialized accelerator infrastructure
+- A cloud VM
+- Microcontroller (ESP, STM)
+
 
 The network can therefore turn otherwise isolated resources into a programmable compute fabric.
 
@@ -200,7 +203,47 @@ The fabric handles the infrastructure.
 
 # Fluid Compute
 
+
 Autheo's serving model uses a **Fluid Compute** architecture rather than treating every request as a completely independent serverless execution.
+
+Fluid Compute separates **compute capacity** from **individual requests**.
+
+Instead of creating a new execution environment for every request:
+
+```text
+Request A → VM A
+Request B → VM B
+Request C → VM C
+Request D → VM D
+```
+
+the platform maintains reusable capacity:
+
+```text
+                         WARM COMPUTE POOL
+
+             ┌─────────────┐
+             │  Warm VM A  │
+             └──────┬──────┘
+                    │
+             ┌──────┼──────┐
+             │      │      │
+          Request  Request Request
+             A       C       E
+
+
+             ┌─────────────┐
+             │  Warm VM B  │
+             └──────┬──────┘
+                    │
+             ┌──────┼──────┐
+             │      │      │
+          Request  Request Request
+             B       D       F
+```
+
+The execution environment remains available after an invocation finishes. The next compatible workload can therefore use an environment that has already completed initialization.
+
 
 A running function instance can process multiple concurrent requests.
 
@@ -254,7 +297,7 @@ Instance C ── idle
              scale to zero
 ```
 
-This improves both performance and infrastructure utilization.
+This improves both performance and infrastructure utilization. 
 
 ## Instance reuse
 
@@ -512,7 +555,7 @@ This allows one deployment model to cover public cloud, edge, private cloud, and
 
 The compute fabric uses peer-to-peer networking to connect nodes without requiring every node to expose a public IP address.
 
-The network is based around encrypted QUIC connections and peer discovery.
+The network is based around encrypted QUIC connections, iroh hole-punching/relays and peer discovery.
 
 Conceptually:
 
@@ -529,10 +572,10 @@ Node B
   └──────────► Relay
 ```
 
-Iroh-style networking provides:
+Iroh-powered networking provides:
 
 - Cryptographic node identity
-- QUIC transport
+- P2P QUIC transport
 - Peer-to-peer connectivity
 - NAT traversal
 - Relay fallback
@@ -693,7 +736,7 @@ A typical Autheo compute node can be viewed as:
 └──────────────────────────────────────────────┘
 ```
 
-Nodes can join different roles depending on their available hardware and policies.
+Nodes can join different roles depending on their available hardware and policies, users can provision part of their physical hardware as determined by them with easy interface.
 
 ---
 
@@ -1278,7 +1321,7 @@ The implementation is organized around independent infrastructure components.
 A representative architecture looks like:
 
 ```text
-autheo/
+autheo.dev/
 ├── core/
 │   ├── identity
 │   ├── types
