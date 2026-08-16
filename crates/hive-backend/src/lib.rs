@@ -16,6 +16,7 @@
 pub mod container_cli;
 pub mod firecracker;
 pub mod litebox;
+pub mod litebox_macos;
 pub mod mock;
 pub mod snapshot;
 
