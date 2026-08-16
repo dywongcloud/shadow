@@ -78,7 +78,7 @@ Autheo.dev can be understood as a stack of cooperating layers:
 │  Iroh/QUIC · P2P · Relays · DNS · Anycast · Edge Routing     │
 ├──────────────────────────────────────────────────────────────┤
 │                    Identity & Trust Layer                     │
-│  Node Identity · Encryption · Veritsa · Attestation          │
+│  Node Identity · Encryption · veritas · Attestation          │
 ├──────────────────────────────────────────────────────────────┤
 │                     Resource Marketplace                      │
 │  Compute · Storage · Bandwidth · Hosting · $THEO             │
@@ -733,11 +733,11 @@ The scheduling model can evolve from simple regional placement toward a marketpl
 
 ---
 
-# Veritsa: Node Reputation
+# veritas: Node Reputation
 
 A distributed cloud needs a way to distinguish between nodes.
 
-Autheo's **Veritsa** reputation system provides a trust visualization and score for nodes participating in the network.
+Autheo's **veritas** reputation system provides a trust visualization and score for nodes participating in the network.
 
 A node's reputation can incorporate observable network behavior such as:
 
@@ -766,7 +766,7 @@ Conceptually:
           │          │          │
           └──────────┼──────────┘
                      ▼
-                  Veritsa
+                  veritas
                      │
                      ▼
              Trust / Quality Signal
@@ -1326,7 +1326,7 @@ autheo/
 │   └── usage-metering
 │
 ├── reputation/
-│   └── veritsa
+│   └── veritas
 │
 ├── sdk/
 │
@@ -1440,7 +1440,7 @@ The documentation is organized around the major components of the platform:
 4. **Data** — local-first state, CRDTs, replication and storage
 5. **Security** — identity, isolation, secrets and post-quantum cryptography
 6. **Marketplace** — compute resources, pricing, providers and $THEO settlement
-7. **Reputation** — Veritsa node trust and service quality
+7. **Reputation** — veritas node trust and service quality
 8. **Autheo Network** — Cosmos SDK, IBC, EVM and network infrastructure
 
 ---
