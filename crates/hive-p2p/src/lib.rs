@@ -2101,7 +2101,8 @@ pub struct PeerPool {
     /// draws the same line). Cleared on a successful warm; grows
     /// delay + delay/2 + dither, capped at 5 minutes. A stale entry left
     /// behind after a REQUEST-driven recovery is harmless: warm's skip is a
-    /// no-op while the trunk is live, and the entry expires within one cap.
+    /// no-op while the trunk is live, and the entry stops BLOCKING within one
+    /// cap (it is removed on the next successful warm, not by a timer).
     warm_backoff: Mutex<HashMap<String, (u64, u64)>>,
     /// Negative-discovery memo: node_id → (until_ms, cur_delay_ms). A peer
     /// whose FRESH-DISCOVERY dial just failed is not re-discovered for a
@@ -2367,7 +2368,12 @@ impl PeerPool {
     /// for why iroh would otherwise never consult Discovery on its own here.
     async fn dial_fresh(&self, node_id: &str, id: iroh::EndpointId) -> Result<Connection> {
         let now = pool_now_ms();
-        if let Some((until, _)) = self.neg_discovery.lock().await.get(node_id) {
+        // Memo keyed on the CANONICAL endpoint id (available here by
+        // construction), never the caller's label — the two planes pass
+        // different labels for the same peer, and a label-keyed memo would
+        // give each caller its own window instead of one per peer.
+        let memo_key = id.to_string();
+        if let Some((until, _)) = self.neg_discovery.lock().await.get(&memo_key) {
             if now < *until {
                 // Fresh discovery against this peer failed moments ago; do not
                 // burn the multi-second budget again inside the memo window.
@@ -2380,20 +2386,20 @@ impl PeerPool {
         }
         let bump_memo = || async {
             let mut m = self.neg_discovery.lock().await;
-            let (_, delay) = m.get(node_id).copied().unwrap_or((0, 0));
+            let (_, delay) = m.get(&memo_key).copied().unwrap_or((0, 0));
             let grown = if delay == 0 {
                 30_000
             } else {
                 delay + delay / 2 + (now % (delay / 2 + 1))
             };
             let capped = grown.min(180_000);
-            m.insert(node_id.to_string(), (now + capped, capped));
+            m.insert(memo_key.clone(), (now + capped, capped));
         };
         let budget = discovery_budget();
         match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await
         {
             Ok(Ok(c)) => {
-                self.neg_discovery.lock().await.remove(node_id);
+                self.neg_discovery.lock().await.remove(&memo_key);
                 tracing::info!(
                     node_id,
                     "p2p connect recovered via fresh discovery (cached hint was stale)"

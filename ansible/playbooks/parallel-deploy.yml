@@ -281,8 +281,12 @@
 # converged cleanly against the already-settled fleet. One extra kick of node
 # #1 after the whole serial pass lets it re-form every trunk against the FINAL
 # fleet, the same remediation an operator applied by hand that night.
-- name: Re-kick the first-restarted node (trunks re-form against the settled fleet)
-  hosts: "{{ groups['platform'][0] }}"
+- name: Re-kick the earliest-restarted nodes (trunks re-form against the settled fleet)
+  # First THREE, serially — the measured incident wedged exactly the three
+  # earliest restarts (bkk, sj, sp), not only node #1; every later restart
+  # converged against the already-settled fleet and needs nothing.
+  hosts: "{{ groups['platform'][0:3] | join(':') }}"
+  serial: 1
   become: true
   tags: [backend]
   tasks:

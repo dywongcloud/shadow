@@ -3667,7 +3667,11 @@ fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
             // synchronization without changing the average cadence.
             let base = interval.as_millis() as u64;
             let dither = base / 5;
-            let jittered = base - dither + (hive_core::now_ms() % (2 * dither + 1));
+            // Mix per-node identity into the phase: wall time alone is SHARED
+            // entropy — two nodes computing in the same millisecond draw the
+            // identical "jitter" and stay in lockstep.
+            let phase = crate::meshwatch::node_stagger_ms(&cloud.node_name);
+            let jittered = base - dither + ((hive_core::now_ms() + phase) % (2 * dither + 1));
             tokio::time::sleep(Duration::from_millis(jittered)).await;
             let pool = match cloud.mesh.read().clone() {
                 Some(p) => p,

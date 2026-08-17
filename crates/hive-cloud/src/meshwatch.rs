@@ -120,14 +120,49 @@ pub fn degraded_floor(expected_peers: usize) -> usize {
 /// it must also be degraded RIGHT NOW (a node that genuinely recovered is
 /// never restarted for its history). Restart cadence self-limits to one per
 /// `trigger_ms` while genuinely stuck.
+/// Adversarial review of the first cut found three ways the naive form fired
+/// synchronized restarts on states a restart cannot fix; each added guard is
+/// one finding:
+///  - `ever_converged` (was ONCE at/above floor+1), not merely ever-saw-one-
+///    peer: a node that has NEVER converged (firewall misconfig, minority
+///    partition since boot) must stay alone-and-loud, not kill-loop — the
+///    continuous trigger's guard-2 doctrine applied here too.
+///  - `audible_peers >= floor`: the fleet must be gossip-AUDIBLE to us while
+///    our probes fail — that is a LOCAL transport wedge, which a restart
+///    heals. Survivors of a mass outage / a minority partition hear almost
+///    nobody, and restarting the platform's last remaining capacity every 20
+///    minutes is the opposite of degraded operation.
+///  - the caller staggers the effective trigger per node (`node_stagger_ms`),
+///    so a fleet-wide shared onset can never fire every node — including all
+///    three control-plane leaders — inside one 30s tick.
 pub fn cumulative_should_restart(
     expected_peers: usize,
-    ever_saw_peer: bool,
+    ever_converged: bool,
     degraded_now: bool,
+    audible_peers: usize,
     degraded_ms_in_window: u64,
     trigger_ms: u64,
 ) -> bool {
-    expected_peers > 0 && ever_saw_peer && degraded_now && degraded_ms_in_window >= trigger_ms
+    expected_peers > 0
+        && ever_converged
+        && degraded_now
+        && audible_peers >= degraded_floor(expected_peers)
+        && degraded_ms_in_window >= trigger_ms
+}
+
+/// Deterministic per-node stagger added to the cumulative trigger: FNV over
+/// the node name, spread across 0..10 minutes. Identity-derived (never shared
+/// wall time), so nodes crossing the threshold in the same tick still exit
+/// minutes apart — the first restart usually heals the wedge for the rest,
+/// and a synchronized fleet-wide bounce (the deploy playbook's own forbidden
+/// state) is structurally impossible.
+pub fn node_stagger_ms(node_name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in node_name.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h % 600_000
 }
 
 fn degraded_window_ms() -> u64 {
@@ -166,7 +201,11 @@ pub fn spawn(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         let wedge_ms = wedge_secs().saturating_mul(1000);
         let window_ms = degraded_window_ms();
-        let trigger_ms = degraded_trigger_ms();
+        let trigger_ms = degraded_trigger_ms() + node_stagger_ms(&cloud.node_name);
+        // Latched once this node was genuinely CONVERGED (visible above the
+        // floor) — the cumulative trigger's arming bar. Loop-local: resets on
+        // restart, so a fresh process must converge again before it may fire.
+        let mut ever_converged = false;
         // Sliding window of (sample ts, was-degraded) — one 30s sample per tick.
         let mut samples: std::collections::VecDeque<(u64, bool)> = Default::default();
         loop {
@@ -187,6 +226,9 @@ pub fn spawn(cloud: Arc<CloudState>) {
             }
             let degraded_ms: u64 = samples.iter().filter(|(_, d)| *d).count() as u64 * 30_000;
             let ever = EVER_SAW_PEER.load(Ordering::Relaxed) == 1;
+            if h.expected_peers > 0 && h.visible_healthy_peers > degraded_floor(h.expected_peers) {
+                ever_converged = true;
+            }
             if degraded_now {
                 tracing::warn!(
                     visible_healthy_peers = h.visible_healthy_peers,
@@ -200,8 +242,9 @@ pub fn spawn(cloud: Arc<CloudState>) {
             }
             if cumulative_should_restart(
                 h.expected_peers,
-                ever,
+                ever_converged,
                 degraded_now,
+                h.audible_peers,
                 degraded_ms,
                 trigger_ms,
             ) {
