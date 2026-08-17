@@ -7297,6 +7297,13 @@ async fn wf_define(
     Ok(Json(json!(defs)))
 }
 
+const WF_LAST_GOOD_TTL_MS: u64 = 60_000;
+type WfLastGoodMap = std::collections::HashMap<String, (u64, Value)>;
+fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
+    static LG: std::sync::OnceLock<parking_lot::Mutex<WfLastGoodMap>> = std::sync::OnceLock::new();
+    LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
+}
+
 pub(crate) async fn wf_runs(
     State(c): State<Arc<CloudState>>,
     headers: HeaderMap,
@@ -7361,6 +7368,19 @@ pub(crate) async fn wf_runs(
             }
         }
     };
+    // STALE-WHILE-REVALIDATE: with a computation already in flight, a recent
+    // last-known-good answer beats blocking this poll on the aggregation — the
+    // dashboard polls every few seconds, so it picks the fresh rows up on the
+    // next tick from the cache the detached task writes. Only the genuinely
+    // FIRST poll (nothing known yet) waits out the computation.
+    {
+        let g = wf_last_good().lock();
+        if let Some((at, v)) = g.get(&cache_key) {
+            if hive_core::now_ms().saturating_sub(*at) < WF_LAST_GOOD_TTL_MS {
+                return Json(v.clone());
+            }
+        }
+    }
     loop {
         if let Some(v) = rx.borrow().clone() {
             return Json(v);
@@ -7590,13 +7610,6 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     // seconds-stale, never to false-empty. Genuine emptiness still wins once
     // the hold expires (WF_LAST_GOOD_TTL), so a truly-cleared world shows
     // empty within a minute rather than pinning stale rows forever.
-    const WF_LAST_GOOD_TTL_MS: u64 = 60_000;
-    type WfLastGoodMap = std::collections::HashMap<String, (u64, Value)>;
-    fn wf_last_good() -> &'static parking_lot::Mutex<WfLastGoodMap> {
-        static LG: std::sync::OnceLock<parking_lot::Mutex<WfLastGoodMap>> =
-            std::sync::OnceLock::new();
-        LG.get_or_init(|| parking_lot::Mutex::new(WfLastGoodMap::new()))
-    }
     if is_top_level {
         if runs.is_empty() {
             let g = wf_last_good().lock();

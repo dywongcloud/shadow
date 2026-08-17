@@ -339,8 +339,12 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
         let (bare, protocol) = split_proto_suffix(s);
         let segs: Vec<&str> = bare.split(':').collect();
         let container = segs.last()?.trim().parse::<u16>().ok()?;
+        // Host `0` is docker's "pick an ephemeral port" — a publish with no
+        // specific number, so it maps to "published, no preference"… which the
+        // platform has no lane for (publish implies a concrete public port), so
+        // it normalizes to internal-only rather than a literal preference of 0.
         let host = if segs.len() >= 2 {
-            segs[segs.len() - 2].trim().parse::<u16>().ok()
+            segs[segs.len() - 2].trim().parse::<u16>().ok().filter(|&h| h != 0)
         } else {
             None
         };
@@ -370,7 +374,8 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
                 v.as_u64()
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
-            .and_then(|n| u16::try_from(n).ok());
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|&h| h != 0);
         return u16::try_from(n).ok().map(|container| ComposePort {
             container,
             host,
