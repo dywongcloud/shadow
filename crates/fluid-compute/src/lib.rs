@@ -379,12 +379,43 @@ impl Drop for ColdStartGuard {
         // on the pool so the circuit that these failures are about to open still
         // names the node instead of telling the user to check their entrypoint.
         let node_fault = self.error.as_deref().and_then(node_fault_marker);
+        // An ABANDONED cold start (the caller's deadline fired first) is not
+        // evidence the deployment is broken, and must not drive the circuit.
+        //
+        // This was self-reinforcing and it took a real deployment down:
+        // shoomoo.shadw.app is a heavy Node app whose cold start outlives an
+        // impatient client, so every request abandoned mid-start, each
+        // abandonment grew `warm_fail_streak`, the streak opened the circuit at
+        // 3, and an open circuit then answers 503 INSTANTLY (measured: 0.35s)
+        // without attempting a start at all — so the app could never finish
+        // booting and could never clear the streak. Measured live on
+        // fc-virginia: fail_streak=54, every single one
+        // `abandoned=true, error="caller gave up before the cold start
+        // finished"`. Not one was an application fault.
+        //
+        // Safe because a genuinely broken deployment still opens the circuit
+        // through the REAL error path: `wait_tcp_ready` has its own bounded
+        // budget and returns `DEPLOYMENT_START_FAILED` (an `Err`, so
+        // `self.error` is `Some`) when the process never listens. Abandonment
+        // means only that the CALLER stopped waiting, which is a statement
+        // about the caller's deadline, not the app.
+        //
+        // The reservation release and a backoff still happen unconditionally:
+        // the `provisioning` decrement is the leak fix this guard exists for
+        // (AGENTS.md, "Request cancellation is a failure mode"), and the
+        // backoff still prevents a stampede of concurrent cold starts.
+        let abandoned = self.error.is_none();
         let mut streak = 0u32;
         if let Some(p) = self.fluid.registry.lock().get_mut(&self.key) {
             p.provisioning = p.provisioning.saturating_sub(1);
-            p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+            if !abandoned {
+                p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+                p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
+            }
+            // Back off either way (a stampede of cold starts helps nobody), but
+            // an abandoned attempt backs off on the CURRENT streak rather than
+            // growing it.
             p.warm_backoff_until_ms = now_ms() + (1000u64 << p.warm_fail_streak.min(6));
-            p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
             streak = p.warm_fail_streak;
             // Only overwrite on a fault we could classify: an abandoned cold
             // start (error = None) says nothing about the node, and must not
