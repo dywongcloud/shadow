@@ -1308,7 +1308,17 @@ async fn run_build(
                     .flatten()
                     .any(|d| d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready);
             if ok {
-                cleanup_non_targets(cloud, &project, &names).await;
+                // OFF the critical path: the new placement is provably serving
+                // at this point, so the user's build must not stay "Building"
+                // while stale copies are reaped from unrelated peers. Every
+                // delete is idempotent and independently retried, and nothing
+                // below reads its result.
+                let c2 = cloud.clone();
+                let p2 = project.clone();
+                let n2 = names.clone();
+                tokio::spawn(async move {
+                    cleanup_non_targets(&c2, &p2, &n2).await;
+                });
             } else if cancelled {
                 log(if had_prior_deployment {
                     "Build cancelled by user — keeping the existing deployment in place.".into()
@@ -1352,7 +1362,10 @@ async fn run_build(
 
     log(format!("Running build in {region_label} - {region}"));
     log("Build machine configuration: 4 cores, 8 GB".into());
-    tokio::time::sleep(Duration::from_millis(350)).await;
+    // (No artificial pause here. A fixed 350ms sleep used to sit between these
+    // two cosmetic log lines and the real work; nothing synchronizes on it —
+    // the checkout-collision it was once entangled with is solved by the
+    // build-id-suffixed dir names below.)
 
     // Acquire the source: extract an UPLOADED ZIP, or `git clone` a repo.
     //
@@ -2918,7 +2931,15 @@ async fn fanout_remote(
         .and_then(|b| serde_json::to_value(b).ok());
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
     let mut all_ok = true;
-    for (idx, t) in remote.iter().enumerate() {
+    // PHASE 1 — dispatch every target CONCURRENTLY, then PHASE 2 mirrors them
+    // all concurrently (below). This loop used to do both serially per target:
+    // dispatch region A, then await A's ENTIRE remote build (clone + npm
+    // install + framework build, minutes) before region B was even told to
+    // start. Two regions cost 2x a full build end-to-end, three cost 3x — the
+    // single largest multiplier on the reported 8-minute deploys, and pure
+    // dead time since the sub-builds are completely independent (each carries
+    // `no_fanout: true`, so none of them fans out again).
+    let dispatch_futs = remote.iter().enumerate().map(|(idx, t)| {
         let mut dreq = req.clone();
         dreq.no_fanout = true;
         // Everyone but the designated primary is a secondary replica — see this
@@ -2928,8 +2949,10 @@ async fn fanout_remote(
         dreq.env = Some(env.clone()); // carry env so a redeploy isn't env-less on the target
         dreq.build_config = build_config.clone();
         dreq.function_settings = function_settings.clone();
+        let team = team.clone();
+        async move {
         let route = if t.admin.is_some() { "http" } else { "iroh" };
-        log(format!("→ {}: dispatching deploy (via {route})", t.node));
+        cloud.builds.log(bid, format!("→ {}: dispatching deploy (via {route})", t.node));
         // Dispatch over HTTP admin (preferred) OR the iroh mesh (NAT'd coordinator →
         // FC nodes, the SSH tunnels are gone). Both return `{ "build_id": ... }`.
         // Each transport is attempted in turn rather than one being chosen and
@@ -2978,7 +3001,7 @@ async fn fanout_remote(
             None if t.iroh.is_some() => {
                 let (id, addr) = t.iroh.as_ref().expect("checked is_some");
                 if t.admin.is_some() {
-                    log(format!("→ {}: HTTP dispatch failed, retrying via iroh", t.node));
+                    cloud.builds.log(bid, format!("→ {}: HTTP dispatch failed, retrying via iroh", t.node));
                 }
                 let body = serde_json::to_vec(&dreq).unwrap_or_default();
                 let path = format!("/v1/git/deploy?{}", crate::admin::mesh_team_qs(&team));
@@ -3015,13 +3038,12 @@ async fn fanout_remote(
                 // admin URL and no iroh address, so there was nothing to try.
                 attempt_failures.push("no dispatch route (node advertises neither an admin URL nor an iroh address)".into());
             }
-            log(format!(
+            cloud.builds.log(bid, format!(
                 "✗ {}: deploy dispatch failed — {}",
                 t.node,
                 attempt_failures.join("; ")
             ));
-            all_ok = false;
-            continue;
+            return None;
         };
         let resp_json = Some(resp_json);
         let target_bid = resp_json
@@ -3032,28 +3054,65 @@ async fn fanout_remote(
                 .as_ref()
                 .and_then(|v| v.get("error").and_then(|x| x.as_str()))
                 .unwrap_or("no build id returned");
-            log(format!("✗ {}: {err}", t.node));
-            all_ok = false;
-            continue;
+            cloud.builds.log(bid, format!("✗ {}: {err}", t.node));
+            return None;
         };
-        // This target is the build's designated PRIMARY (see the doc above) —
-        // publish it as the cancel mirror so `cancel_build` on THIS (mirror)
-        // build id reaches the REAL process, which runs on `t`, not here.
-        // Secondaries are extras a cancel doesn't need to chase.
-        if !dreq.fanout_secondary {
-            cloud.build_cancels.set_mirror(
-                bid,
-                MirrorTarget {
-                    admin: t.admin.clone(),
-                    iroh: t.iroh.clone(),
-                    target_bid: target_bid.clone(),
-                },
-            );
+        Some((target_bid, dreq.fanout_secondary))
         }
-        let ok = mirror_remote_build(cloud, bid, t, &target_bid, &t.node).await;
-        if !ok {
-            all_ok = false;
-        } else if let Some(admin) = &t.admin {
+    });
+
+    // Dispatch all targets at once. `join_all` polls these futures on THIS
+    // task (no spawn), so the borrows of `cloud`/`req`/`remote` stay valid and
+    // nothing needs to be 'static.
+    let dispatched: Vec<Option<(String, bool)>> =
+        futures::future::join_all(dispatch_futs).await;
+
+    // Register the PRIMARY's cancel mirror before any mirroring begins — see
+    // this fn's doc: `cancel_build` on the coordinator's mirror build id has to
+    // reach the REAL process, which runs on the primary target, not here.
+    // Secondaries are extras a cancel doesn't need to chase.
+    let mut live: Vec<(&crate::schedule::Target, String)> = Vec::new();
+    for (t, d) in remote.iter().zip(dispatched.into_iter()) {
+        match d {
+            None => all_ok = false, // already logged by the dispatch future
+            Some((target_bid, secondary)) => {
+                if !secondary {
+                    cloud.build_cancels.set_mirror(
+                        bid,
+                        MirrorTarget {
+                            admin: t.admin.clone(),
+                            iroh: t.iroh.clone(),
+                            target_bid: target_bid.clone(),
+                        },
+                    );
+                }
+                live.push((t, target_bid));
+            }
+        }
+    }
+
+    // PHASE 2 — mirror every dispatched build concurrently. Wall-clock is now
+    // the SLOWEST remote build, not their sum.
+    let mirrors = futures::future::join_all(
+        live.iter()
+            .map(|(t, target_bid)| mirror_remote_build(cloud, bid, t, target_bid, &t.node)),
+    )
+    .await;
+    if mirrors.iter().any(|ok| !ok) {
+        all_ok = false;
+    }
+
+    // Sync auto-detected Build settings back from ONE reachable HTTP target
+    // (they all built the same project, so N syncs wrote the same fields N
+    // times — and doing it inside the now-concurrent mirror phase would race
+    // `set_build` against itself).
+    let sync_from = live
+        .iter()
+        .zip(mirrors.iter())
+        .find(|(entry, ok)| **ok && entry.0.admin.is_some())
+        .map(|(entry, _)| entry.0);
+    if let Some(t) = sync_from {
+        if let Some(admin) = &t.admin {
             // Sync the host's auto-detected Build settings back to THIS coordinator
             // so the dashboard (which reads settings here) shows the framework +
             // commands that were actually used (Issue #3). Only fill fields the
@@ -3153,10 +3212,29 @@ async fn mirror_remote_build(
                 .log(bid, format!("{node}: mirror stopped (build cancelled)"));
             return false;
         }
-        // Poll the target's build over the SAME transport we dispatched on.
-        let v: Option<serde_json::Value> = if let Some(admin) = &target.admin {
-            let sep = if team_qs.is_empty() { "" } else { "?" };
-            match cloud
+        // Poll the target's build over HTTP admin when one is advertised, and
+        // FALL BACK to iroh IN THE SAME ITERATION when HTTP yields nothing.
+        //
+        // This used to be an `else if` — HTTP *or* iroh, chosen once by which
+        // field was populated — and that is a real, measured 10-minute stall,
+        // not a theoretical one. `fanout_remote`'s DISPATCH already falls back
+        // (it logs "HTTP dispatch failed, retrying via iroh"), so on a node
+        // whose 8786/8787 is firewalled — a documented condition on this fleet
+        // (AGENTS.md, "a restrictive cloud security group that blocks
+        // 8786/8787 … pushes deploys onto the iroh path"; the GPU/CVM hosts
+        // allow inbound 22 only) — the deploy is dispatched fine over iroh
+        // while every subsequent poll retries only the dead HTTP route. The
+        // remote build finishes in seconds; the coordinator keeps polling a
+        // black hole until the 10-minute deadline below and then reports
+        // "lost contact with remote build". A target that advertises an admin
+        // URL is therefore NOT evidence that the admin URL is reachable, and
+        // the poll must never assume it is.
+        let sep = if team_qs.is_empty() { "" } else { "?" };
+        let mut tried_http = false;
+        let mut v: Option<serde_json::Value> = None;
+        if let Some(admin) = &target.admin {
+            tried_http = true;
+            v = match cloud
                 .http
                 .get(format!("{admin}/v1/builds/{target_bid}{sep}{team_qs}"))
                 .timeout(Duration::from_secs(8))
@@ -3166,28 +3244,28 @@ async fn mirror_remote_build(
             {
                 Some(r) => r.json::<serde_json::Value>().await.ok(),
                 None => None,
+            };
+        }
+        if v.is_none() {
+            if let Some((id, addr)) = &target.iroh {
+                // 20s, matching the DISPATCH timeout above. This poll used to get 8s,
+                // which is a shorter budget than the request that successfully placed
+                // the deploy in the first place — an iroh dial that has to fall back
+                // through a relay can exceed it, and then every single poll returns
+                // None while the remote build has actually already finished.
+                v = crate::gossip::request_to(
+                    cloud,
+                    id,
+                    addr,
+                    hive_p2p::GOSSIP_GET,
+                    &format!("/v1/builds/{target_bid}{sep}{team_qs}"),
+                    &[],
+                    20,
+                )
+                .await
+                .and_then(|b| serde_json::from_slice(&b).ok());
             }
-        } else if let Some((id, addr)) = &target.iroh {
-            // 20s, matching the DISPATCH timeout above. This poll used to get 8s,
-            // which is a shorter budget than the request that successfully placed
-            // the deploy in the first place — an iroh dial that has to fall back
-            // through a relay can exceed it, and then every single poll returns
-            // None while the remote build has actually already finished.
-            let sep = if team_qs.is_empty() { "" } else { "?" };
-            crate::gossip::request_to(
-                cloud,
-                id,
-                addr,
-                hive_p2p::GOSSIP_GET,
-                &format!("/v1/builds/{target_bid}{sep}{team_qs}"),
-                &[],
-                20,
-            )
-            .await
-            .and_then(|b| serde_json::from_slice(&b).ok())
-        } else {
-            None
-        };
+        }
         let Some(v) = v else {
             // A failed poll used to be SILENT (request_to just returns None), so a
             // build stuck at "Building" for a deploy that had really succeeded gave
@@ -3197,9 +3275,15 @@ async fn mirror_remote_build(
             // implicated immediately.
             polls_failed += 1;
             if polls_failed == 1 || polls_failed % 20 == 0 {
+                let transport = match (tried_http, target.iroh.is_some()) {
+                    (true, true) => "http+iroh",
+                    (true, false) => "http",
+                    (false, true) => "iroh",
+                    (false, false) => "none",
+                };
                 tracing::warn!(
                     node = %node, build = %bid, target_build = %target_bid,
-                    transport = if target.admin.is_some() { "http" } else { "iroh" },
+                    transport,
                     polls_failed,
                     "cannot read the remote build state — mirrored deploy status will stall"
                 );
@@ -3300,12 +3384,20 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
         .filter(|n| !n.is_self && n.healthy)
         .map(|n| n.name)
         .collect();
-    for node in peers {
-        if target_names.iter().any(|t| t == &node) {
-            continue; // keep the chosen targets
-        }
-        crate::admin::dispatch_project_delete(cloud, &node, project, &team).await;
-    }
+    // CONCURRENTLY, not one peer at a time. `dispatch_project_delete` retries
+    // 3x with a 15s HTTP timeout plus a 20s iroh timeout per attempt, so a
+    // single registry-healthy-but-unreachable peer costs ~107s serially and
+    // every peer behind it waits — on the pure-remote branch this ran BEFORE
+    // the build was stamped Ready, i.e. it showed up to the user as minutes of
+    // "Building" on a deployment that was already serving. The receiving arm
+    // is idempotent and order-independent, so fanning out is safe.
+    futures::future::join_all(
+        peers
+            .iter()
+            .filter(|node| !target_names.iter().any(|t| t == *node))
+            .map(|node| crate::admin::dispatch_project_delete(cloud, node, project, &team)),
+    )
+    .await;
 }
 
 /// Best-effort GitHub Commit Status report (Vercel-style "shadw — Deployment
@@ -3993,8 +4085,22 @@ async fn build_via_fdi(
             .map_err(|e| anyhow::anyhow!("build command failed: {e}"))?;
     }
     // 3) Save the warm cache for the next build (and for peers to pull).
+    //
+    // OFF the critical path: nothing downstream in THIS build reads the cache
+    // tar — it exists purely for future builds — yet tarring a multi-GB
+    // node_modules (hundreds of thousands of small files, single-threaded)
+    // was awaited here, between the build finishing and the deployment being
+    // delivered/registered. `save_cache` already writes to a build-id-suffixed
+    // temp path and atomically renames, so it is safe to run concurrently with
+    // the rest of the pipeline and with other builds.
     if let Some(k) = &cache_key {
-        save_cache(cloud, bid, install_dir, k).await;
+        let c2 = cloud.clone();
+        let bid2 = bid.to_string();
+        let dir2 = install_dir.to_path_buf();
+        let k2 = k.clone();
+        // Detached on purpose: dropping the JoinHandle does not cancel a
+        // spawned task, so this runs to completion in the background.
+        tokio::spawn(async move { save_cache(&c2, &bid2, &dir2, &k2).await });
     }
 
     let has_bo = fluid_build::has_build_output(dir);
@@ -5183,15 +5289,44 @@ fn verify_pulled_artifact(
 /// copy and tries the next, never writing untrusted bytes to the cache.
 async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool {
     let peers = cloud.peers.read().clone();
-    for peer in peers {
+    // RACE the peers instead of walking them one at a time. This sits directly
+    // in front of `npm install` on every build whose lockfile hash isn't
+    // cached locally, and several fleet nodes' 8786/8787 are firewalled such
+    // that a request SYN-drops and burns the whole timeout rather than failing
+    // fast — serially that was up to 20s x (unreachable peers) of dead air
+    // before the install could even start. Concurrently the cost is one
+    // timeout total, and the whole phase is additionally capped: a cache pull
+    // that is slower than a clean install is not worth waiting for.
+    let per_peer = Duration::from_secs(
+        std::env::var("HIVE_BUILDCACHE_PEER_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6),
+    );
+    let total_budget = Duration::from_secs(
+        std::env::var("HIVE_BUILDCACHE_FETCH_BUDGET_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20),
+    );
+    let attempts = peers.into_iter().map(|peer| {
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
-        if let Ok(resp) = cloud
-            .http
-            .get(&url)
-            .timeout(Duration::from_secs(20))
-            .send()
-            .await
-        {
+        async move { (peer, cloud.http.get(&url).timeout(per_peer).send().await) }
+    });
+    let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts)).await
+    {
+        Ok(r) => r,
+        Err(_) => {
+            tracing::warn!(
+                key = %key,
+                budget_secs = total_budget.as_secs(),
+                "build-cache peer fetch exceeded its budget — installing fresh instead of waiting"
+            );
+            return false;
+        }
+    };
+    for (peer, resp) in results {
+        if let Ok(resp) = resp {
             if resp.status().is_success() {
                 let sha = resp
                     .headers()

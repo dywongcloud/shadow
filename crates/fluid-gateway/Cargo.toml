@@ -23,6 +23,11 @@ reqwest = { workspace = true }
 # Pure-Rust image codecs (no native deps with these features) for the Image
 # Optimization endpoint: JPEG/PNG/WebP/GIF decode + JPEG/PNG/WebP encode.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif"] }
+# Static-asset compression (Vercel-style): serve a precompressed `.br`/`.gz`
+# sibling when one exists, else compress once inline and persist the sibling.
+# Both are pure Rust, no native deps.
+brotli = "7"
+flate2 = "1"
 
 [dev-dependencies]
 reqwest = { workspace = true }

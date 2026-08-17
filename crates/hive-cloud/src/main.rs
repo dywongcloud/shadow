@@ -2284,7 +2284,6 @@ async fn dashboard_proxy(
                 | "content-length"
                 | "upgrade"
                 | "keep-alive"
-                | "accept-encoding"
                 | "x-forwarded-host"
                 | "x-forwarded-proto"
         ) {
@@ -2311,9 +2310,27 @@ async fn dashboard_proxy(
             let mut builder = axum::http::Response::builder().status(status);
             for (k, v) in resp.headers().iter() {
                 let name = k.as_str().to_ascii_lowercase();
+                // `content-encoding` is deliberately NOT stripped, and
+                // `accept-encoding` is deliberately forwarded upstream (see the
+                // request loop above). The two are ONE change: the upstream
+                // Next server (`compress: true`) only compresses when it sees
+                // the client's Accept-Encoding, and its compressed bytes are
+                // only decodable by the browser if the Content-Encoding label
+                // survives this hop. Stripping the request header made the
+                // dashboard serve every HTML/JS/CSS byte uncompressed while
+                // still emitting `Vary: Accept-Encoding` — the exact live
+                // signature measured on shadw.cloud. Stripping only ONE of the
+                // two would be worse than the bug: forwarding the header while
+                // deleting the label hands the browser brotli bytes labelled
+                // as plaintext. This is safe to pass through because the
+                // workspace `reqwest` is built WITHOUT the gzip/brotli
+                // features, so it never transparently decompresses the body
+                // behind our back; the body is streamed verbatim below, and
+                // `content-length`/`transfer-encoding` are still dropped so the
+                // re-framing stays consistent.
                 if matches!(
                     name.as_str(),
-                    "connection" | "transfer-encoding" | "content-length" | "content-encoding"
+                    "connection" | "transfer-encoding" | "content-length"
                 ) {
                     continue;
                 }

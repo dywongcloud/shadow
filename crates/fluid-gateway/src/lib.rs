@@ -1122,8 +1122,9 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             // function (the CDN→function model) so dynamic routes still render.
             // When no `origin_function` is set (the common case) this is exactly
             // the previous behavior — `serve_static` with its SPA/404 fallback.
+            let enc = accepted_encodings(&parts.headers);
             match dep.manifest.origin_function.clone() {
-                Some(origin) => match read_static_file(&dep, &path).await {
+                Some(origin) => match read_static_file(&dep, &path, enc).await {
                     Some(r) => r,
                     None => {
                         let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
@@ -1144,7 +1145,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                         .await
                     }
                 },
-                None => serve_static(&dep, &path).await,
+                None => serve_static(&dep, &path, enc).await,
             }
         }
         RouteTarget::Function(name) => {
@@ -1638,6 +1639,185 @@ fn static_cache_control(path: &str) -> &'static str {
     }
 }
 
+/// Which content encodings the client accepts, best-first. Honors an explicit
+/// `q=0` (RFC 9110's "not acceptable"), which is the one case where naive
+/// substring matching would hand a client bytes it told us it cannot decode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AcceptedEncodings {
+    pub br: bool,
+    pub gzip: bool,
+}
+
+fn accepted_encodings(headers: &HeaderMap) -> AcceptedEncodings {
+    let raw = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mut out = AcceptedEncodings::default();
+    for part in raw.split(',') {
+        let mut it = part.split(';');
+        let name = it.next().unwrap_or("").trim().to_ascii_lowercase();
+        // `;q=0` (and `q=0.0`) means explicitly NOT acceptable.
+        let refused = it.any(|p| {
+            let p = p.trim().to_ascii_lowercase();
+            p.strip_prefix("q=")
+                .map(|q| q.parse::<f32>().map(|v| v <= 0.0).unwrap_or(false))
+                .unwrap_or(false)
+        });
+        if refused {
+            continue;
+        }
+        match name.as_str() {
+            "br" => out.br = true,
+            "gzip" => out.gzip = true,
+            "*" => {
+                out.br = true;
+                out.gzip = true;
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Is this content type worth compressing? Already-compressed binary formats
+/// (png/jpeg/webp/woff2/zip/video) get nothing but wasted CPU from a second
+/// pass — Vercel draws the same line.
+fn is_compressible(ctype: &str) -> bool {
+    let c = ctype.split(';').next().unwrap_or("").trim();
+    c.starts_with("text/")
+        || matches!(
+            c,
+            "application/javascript"
+                | "text/javascript"
+                | "application/json"
+                | "application/manifest+json"
+                | "application/ld+json"
+                | "application/xml"
+                | "application/rss+xml"
+                | "application/atom+xml"
+                | "image/svg+xml"
+                | "application/wasm"
+                | "application/x-font-ttf"
+                | "font/ttf"
+                | "font/otf"
+        )
+}
+
+/// Below this, framing overhead outweighs any saving.
+const MIN_COMPRESS_BYTES: usize = 1024;
+/// Above this we serve identity rather than block a request on a large inline
+/// compress; the build-time precompression path (which has no request waiting
+/// on it) is what covers very large assets.
+const MAX_INLINE_COMPRESS_BYTES: usize = 8 * 1024 * 1024;
+
+/// Is `sibling` a usable precompressed copy of `src` — i.e. present and not
+/// older than the source? An asset rebuilt in place without its sibling being
+/// refreshed must never be served as stale bytes under a fresh URL.
+async fn fresh_sibling(src: &std::path::Path, sibling: &std::path::Path) -> Option<Vec<u8>> {
+    let (sm, bm) = (
+        tokio::fs::metadata(src).await.ok()?,
+        tokio::fs::metadata(sibling).await.ok()?,
+    );
+    let (st, bt) = (sm.modified().ok()?, bm.modified().ok()?);
+    if bt < st {
+        return None;
+    }
+    tokio::fs::read(sibling).await.ok()
+}
+
+fn compress_bytes(bytes: &[u8], br: bool) -> Option<Vec<u8>> {
+    use std::io::Write;
+    if br {
+        let mut out = Vec::with_capacity(bytes.len() / 3);
+        {
+            // q6/lgwin22: the knee of the ratio-vs-time curve for text served
+            // once and then cached as a sibling.
+            let mut w = brotli::CompressorWriter::new(&mut out, 4096, 6, 22);
+            w.write_all(bytes).ok()?;
+            w.flush().ok()?;
+        }
+        Some(out)
+    } else {
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        e.write_all(bytes).ok()?;
+        e.finish().ok()
+    }
+}
+
+/// Build the response for a static asset, negotiating `Content-Encoding`.
+///
+/// Order: an on-disk precompressed sibling (`<file>.br`, then `<file>.gz`) is
+/// preferred — zero CPU per request, which is the whole point of Vercel's
+/// precompress-at-build-time model. Failing that, the bytes are compressed
+/// ONCE inline and the sibling is written next to the source (tmp+rename, so a
+/// concurrent request never observes a partial file), making every subsequent
+/// request of that asset free. `Vary: Accept-Encoding` is always set, including
+/// on identity responses, because the same URL genuinely varies by request
+/// header and a shared cache must not reuse one client's answer for another.
+async fn static_asset_response(
+    file: &std::path::Path,
+    bytes: Vec<u8>,
+    ctype: &str,
+    cache_control: &str,
+    enc: AcceptedEncodings,
+) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(ctype) {
+        headers.insert(header::CONTENT_TYPE, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(cache_control) {
+        headers.insert(header::CACHE_CONTROL, v);
+    }
+    headers.insert(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    let want_br = enc.br;
+    let want_gz = enc.gzip;
+    if (want_br || want_gz) && is_compressible(ctype) && bytes.len() >= MIN_COMPRESS_BYTES {
+        // 1) Precompressed sibling.
+        for (want, ext, label) in [(want_br, "br", "br"), (want_gz, "gz", "gzip")] {
+            if !want {
+                continue;
+            }
+            let sib = std::path::PathBuf::from(format!("{}.{ext}", file.display()));
+            if let Some(pre) = fresh_sibling(file, &sib).await {
+                headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(label));
+                return (headers, pre).into_response();
+            }
+        }
+        // 2) Compress once inline, then persist for next time.
+        if bytes.len() <= MAX_INLINE_COMPRESS_BYTES {
+            let use_br = want_br;
+            let src = bytes.clone();
+            if let Ok(Some(out)) =
+                tokio::task::spawn_blocking(move || compress_bytes(&src, use_br)).await
+            {
+                // Only worth serving if it actually got smaller.
+                if out.len() < bytes.len() {
+                    let ext = if use_br { "br" } else { "gz" };
+                    let sib = std::path::PathBuf::from(format!("{}.{ext}", file.display()));
+                    let tmp = std::path::PathBuf::from(format!(
+                        "{}.{}.tmp",
+                        sib.display(),
+                        std::process::id()
+                    ));
+                    let payload = out.clone();
+                    tokio::spawn(async move {
+                        if tokio::fs::write(&tmp, &payload).await.is_ok() {
+                            let _ = tokio::fs::rename(&tmp, &sib).await;
+                        }
+                    });
+                    headers.insert(
+                        header::CONTENT_ENCODING,
+                        HeaderValue::from_static(if use_br { "br" } else { "gzip" }),
+                    );
+                    return (headers, out).into_response();
+                }
+            }
+        }
+    }
+    (headers, bytes).into_response()
+}
+
 /// True if a filename carries a content hash (a `.`/`-`-delimited hex token of
 /// 8+ chars containing a digit), e.g. `index-4f3a9c2b.js`, `main.1a2b3c4d.css`.
 fn is_hashed_asset(file: &str) -> bool {
@@ -1652,7 +1832,11 @@ fn is_hashed_asset(file: &str) -> bool {
 /// `static_dir`. Returns `Some(response)` only when an actual file (or its
 /// cleanUrls `.html` sibling) exists; returns `None` on a miss WITHOUT the
 /// SPA-index/404 fallback, so the caller can fall through to an origin function.
-async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
+async fn read_static_file(
+    dep: &Deployment,
+    path: &str,
+    enc: AcceptedEncodings,
+) -> Option<Response> {
     let static_dir = dep
         .manifest
         .static_dir
@@ -1670,14 +1854,7 @@ async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
     if let Ok(bytes) = tokio::fs::read(&file).await {
         let ctype = content_type(&file);
         return Some(
-            (
-                [
-                    (header::CONTENT_TYPE, ctype),
-                    (header::CACHE_CONTROL, static_cache_control(path)),
-                ],
-                bytes,
-            )
-                .into_response(),
+            static_asset_response(&file, bytes, ctype, static_cache_control(path), enc).await,
         );
     }
     // cleanUrls: `/about` -> `about.html`.
@@ -1686,14 +1863,14 @@ async fn read_static_file(dep: &Deployment, path: &str) -> Option<Response> {
         if is_within(&base, &html) {
             if let Ok(bytes) = tokio::fs::read(&html).await {
                 return Some(
-                    (
-                        [
-                            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                            (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
-                        ],
+                    static_asset_response(
+                        &html,
                         bytes,
+                        "text/html; charset=utf-8",
+                        "public, max-age=0, must-revalidate",
+                        enc,
                     )
-                        .into_response(),
+                    .await,
                 );
             }
         }
@@ -1754,7 +1931,7 @@ fn no_static_file(dep: &Deployment, path: &str) -> Response {
     resp
 }
 
-async fn serve_static(dep: &Deployment, path: &str) -> Response {
+async fn serve_static(dep: &Deployment, path: &str, enc: AcceptedEncodings) -> Response {
     let static_dir = dep
         .manifest
         .static_dir
@@ -1774,14 +1951,7 @@ async fn serve_static(dep: &Deployment, path: &str) -> Response {
     match tokio::fs::read(&file).await {
         Ok(bytes) => {
             let ctype = content_type(&file);
-            (
-                [
-                    (header::CONTENT_TYPE, ctype),
-                    (header::CACHE_CONTROL, static_cache_control(path)),
-                ],
-                bytes,
-            )
-                .into_response()
+            static_asset_response(&file, bytes, ctype, static_cache_control(path), enc).await
         }
         Err(_) => {
             // cleanUrls: serve `about.html` for a request to `/about`.
@@ -1789,28 +1959,28 @@ async fn serve_static(dep: &Deployment, path: &str) -> Response {
                 let html = base.join(format!("{rel}.html"));
                 if is_within(&base, &html) {
                     if let Ok(bytes) = tokio::fs::read(&html).await {
-                        return (
-                            [
-                                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                                (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
-                            ],
+                        return static_asset_response(
+                            &html,
                             bytes,
+                            "text/html; charset=utf-8",
+                            "public, max-age=0, must-revalidate",
+                            enc,
                         )
-                            .into_response();
+                        .await;
                     }
                 }
             }
             // SPA-ish fallback: try index.html at the static root.
             let idx = base.join("index.html");
             if let Ok(bytes) = tokio::fs::read(&idx).await {
-                (
-                    [
-                        (header::CONTENT_TYPE, "text/html"),
-                        (header::CACHE_CONTROL, "public, max-age=0, must-revalidate"),
-                    ],
+                static_asset_response(
+                    &idx,
                     bytes,
+                    "text/html",
+                    "public, max-age=0, must-revalidate",
+                    enc,
                 )
-                    .into_response()
+                .await
             } else {
                 no_static_file(dep, path)
             }
@@ -1939,14 +2109,95 @@ async fn serve_optimized_image(dep: &Deployment, query: &str, req_headers: &Head
         .map(|a| a.contains("image/webp"))
         .unwrap_or(false);
     let formats = cfg.map(|c| c.formats.clone()).unwrap_or_default();
+
+    // CONTENT-ADDRESSED CACHE, checked before any CPU is spent. Vercel's
+    // optimizer is a cache keyed on (source, width, quality, output format);
+    // without one, every single request re-fetched, re-decoded, Lanczos3-
+    // resized and re-encoded the same image — ~100-800ms of blocking CPU per
+    // request for a 1-4 MP source, and a trivially self-inflicted DoS on the
+    // node serving a popular page (the response's own `max-age` is only 60s by
+    // default, so browsers come back for it). The key covers the SOURCE BYTES
+    // (not its URL), so a changed asset is a different entry with no
+    // invalidation step, and the negotiated output format, so a webp-accepting
+    // and a jpeg-only client never read each other's bytes.
+    let key = image_cache_key(&bytes, width, q, accept_webp, &formats);
+    let cache_dir = image_cache_dir();
+    let cache_file = cache_dir.join(&key);
+    if let Ok(hit) = tokio::fs::read(&cache_file).await {
+        // Stored as `<ctype>\n<bytes>` so the negotiated content type survives
+        // the round trip without a second sidecar file to keep in sync.
+        if let Some(nl) = hit.iter().position(|b| *b == b'\n') {
+            let (ct, body) = hit.split_at(nl);
+            if let Ok(ct) = std::str::from_utf8(ct) {
+                return image_response(body[1..].to_vec(), &ct.to_string(), cfg);
+            }
+        }
+    }
+
     let encoded = tokio::task::spawn_blocking(move || {
         optimize_bytes(&bytes, width, q, accept_webp, &formats)
     })
     .await;
     match encoded {
-        Ok(Some((out, ctype))) => image_response(out, ctype, cfg),
+        Ok(Some((out, ctype))) => {
+            // Persist for next time (tmp+rename so a concurrent reader never
+            // sees a partial file). Best-effort and off the response path.
+            let payload = {
+                let mut v = Vec::with_capacity(ctype.len() + 1 + out.len());
+                v.extend_from_slice(ctype.as_bytes());
+                v.push(b'\n');
+                v.extend_from_slice(&out);
+                v
+            };
+            tokio::spawn(async move {
+                if tokio::fs::create_dir_all(&cache_dir).await.is_ok() {
+                    let tmp = cache_file.with_extension(format!("{}.tmp", std::process::id()));
+                    if tokio::fs::write(&tmp, &payload).await.is_ok() {
+                        let _ = tokio::fs::rename(&tmp, &cache_file).await;
+                    }
+                }
+            });
+            image_response(out, ctype, cfg)
+        }
         _ => (StatusCode::UNPROCESSABLE_ENTITY, "could not process image").into_response(),
     }
+}
+
+/// Where optimized-image bytes are cached on this node. Node-local derived
+/// data, so it lives under the node's data dir and never rides replicated
+/// state (the `dns_geo.json` precedent).
+fn image_cache_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("HIVE_DATA").unwrap_or_else(|_| "/var/lib/hive".into()))
+        .join("image-cache")
+}
+
+/// Content-address an optimizer result. Keyed on the SOURCE BYTES plus every
+/// input that changes the output, so it is correct by construction: a
+/// re-deployed or edited image hashes differently and simply misses.
+fn image_cache_key(
+    src: &[u8],
+    width: u32,
+    quality: u8,
+    accept_webp: bool,
+    formats: &[String],
+) -> String {
+    // FNV-1a over the source bytes + parameters. Not a security boundary (the
+    // inputs are already trusted, server-derived), just a collision-resistant
+    // enough content address for a local cache.
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |b: &[u8]| {
+        for x in b {
+            h ^= *x as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(src);
+    mix(&width.to_le_bytes());
+    mix(&[quality, accept_webp as u8]);
+    for f in formats {
+        mix(f.as_bytes());
+    }
+    format!("{h:016x}-{}-{}", width, quality)
 }
 
 /// Build the optimized-image response with caching / disposition / CSP headers.
