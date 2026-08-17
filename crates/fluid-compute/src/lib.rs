@@ -1478,15 +1478,35 @@ impl Fluid {
                 .collect()
         };
 
-        for (key, handles, current, max) in targets {
+        // Sample EVERY instance of EVERY pool concurrently, then fold.
+        //
+        // This was a nested serial `for`: one awaited `cpu_percent` per live
+        // instance, per 500ms tick, on the same task that runs keep-warm — so
+        // sampling latency directly delays the next warm/drain decision, and a
+        // single backend call that blocks (each takes the backend's cell-map
+        // mutex, which `terminate` used to hold across `podman rm`) stalls the
+        // whole autoscaler. Cost was N serial awaits x 120 ticks/min.
+        // Concurrency here is bounded by the instance count of one node, and
+        // each call is a cheap sampler read, so a plain `join_all` per pool
+        // with the pools themselves joined is enough — no semaphore needed.
+        let sampled_pools = futures::future::join_all(targets.into_iter().map(
+            |(key, handles, current, max)| async move {
+                let samples = futures::future::join_all(
+                    handles.iter().map(|h| self.backend.cpu_percent(h)),
+                )
+                .await;
+                (key, samples, current, max)
+            },
+        ))
+        .await;
+
+        for (key, samples, current, max) in sampled_pools {
             let mut max_cpu = 0.0f32;
             let mut sampled = false;
-            for h in &handles {
-                if let Some(c) = self.backend.cpu_percent(h).await {
-                    sampled = true;
-                    if c > max_cpu {
-                        max_cpu = c;
-                    }
+            for c in samples.into_iter().flatten() {
+                sampled = true;
+                if c > max_cpu {
+                    max_cpu = c;
                 }
             }
             if !sampled {

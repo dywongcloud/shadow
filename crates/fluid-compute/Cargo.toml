@@ -13,6 +13,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 parking_lot = { workspace = true }
 serde = { workspace = true }
+# `join_all` for the autoscaler's per-instance CPU sampling (one tick samples
+# every live instance concurrently instead of serially).
+futures = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }

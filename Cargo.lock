@@ -1896,6 +1896,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "fluid-core",
+ "futures",
  "hive-backend",
  "hive-core",
  "parking_lot",

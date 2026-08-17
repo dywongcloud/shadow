@@ -156,33 +156,64 @@ fn all_procs() -> Vec<(u32, u32, u64)> {
     Vec::new()
 }
 
-/// Sum cumulative CPU (ns) over `root` and all its descendants in `procs`.
-/// `None` if `root` isn't present (process gone).
-fn subtree_cpu_ns(root: u32, procs: &[(u32, u32, u64)]) -> Option<u64> {
-    use std::collections::{HashMap, HashSet, VecDeque};
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    let mut cpu: HashMap<u32, u64> = HashMap::new();
-    for &(pid, ppid, c) in procs {
-        children.entry(ppid).or_default().push(pid);
-        cpu.insert(pid, c);
+/// A pid -> (children, cumulative-cpu) index built ONCE per process snapshot.
+///
+/// This used to be rebuilt inside `subtree_cpu_ns` on every call, i.e. once per
+/// sampled instance: the autoscaler samples every live instance every 500ms, so
+/// on a node with N instances and P host processes it re-derived the SAME index
+/// from the SAME cached snapshot N times per tick — O(N x P) hashmap inserts
+/// and allocations 120x/minute (measured shape: ~1000 procs x 30 instances =
+/// ~60k inserts per tick, ~7.2M/minute) to answer N subtree queries that each
+/// touch a handful of pids. Building it with the snapshot makes each query
+/// O(subtree) instead of O(P).
+#[derive(Default)]
+struct ProcIndex {
+    children: std::collections::HashMap<u32, Vec<u32>>,
+    cpu: std::collections::HashMap<u32, u64>,
+}
+
+impl ProcIndex {
+    fn build(procs: &[(u32, u32, u64)]) -> Self {
+        let mut children: std::collections::HashMap<u32, Vec<u32>> =
+            std::collections::HashMap::with_capacity(procs.len());
+        let mut cpu: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::with_capacity(procs.len());
+        for &(pid, ppid, c) in procs {
+            children.entry(ppid).or_default().push(pid);
+            cpu.insert(pid, c);
+        }
+        ProcIndex { children, cpu }
     }
-    cpu.get(&root)?; // root must exist
-    let mut sum = 0u64;
-    let mut seen = HashSet::new();
-    let mut q = VecDeque::new();
-    q.push_back(root);
-    seen.insert(root);
-    while let Some(p) = q.pop_front() {
-        sum = sum.saturating_add(cpu.get(&p).copied().unwrap_or(0));
-        if let Some(cs) = children.get(&p) {
-            for &c in cs {
-                if seen.insert(c) {
-                    q.push_back(c);
+
+    /// Sum cumulative CPU (ns) over `root` and all its descendants.
+    /// `None` if `root` isn't present (process gone).
+    fn subtree_cpu_ns(&self, root: u32) -> Option<u64> {
+        use std::collections::{HashSet, VecDeque};
+        self.cpu.get(&root)?; // root must exist
+        let mut sum = 0u64;
+        let mut seen = HashSet::new();
+        let mut q = VecDeque::new();
+        q.push_back(root);
+        seen.insert(root);
+        while let Some(p) = q.pop_front() {
+            sum = sum.saturating_add(self.cpu.get(&p).copied().unwrap_or(0));
+            if let Some(cs) = self.children.get(&p) {
+                for &c in cs {
+                    if seen.insert(c) {
+                        q.push_back(c);
+                    }
                 }
             }
         }
+        Some(sum)
     }
-    Some(sum)
+}
+
+/// Sum cumulative CPU (ns) over `root` and all its descendants in `procs`.
+/// `None` if `root` isn't present (process gone). Thin wrapper over
+/// [`ProcIndex`] for one-shot callers (the sampler itself keeps a built index).
+fn subtree_cpu_ns(root: u32, procs: &[(u32, u32, u64)]) -> Option<u64> {
+    ProcIndex::build(procs).subtree_cpu_ns(root)
 }
 
 /// Per-cell CPU sampler shared by the backends for `cpu_percent` (#2). Computes
@@ -195,7 +226,9 @@ pub(crate) struct CpuSampler {
 }
 
 struct SamplerState {
-    snapshot: Vec<(u32, u32, u64)>,
+    /// Index over the current snapshot, built once when the snapshot is
+    /// refreshed rather than once per sampled instance (see [`ProcIndex`]).
+    index: ProcIndex,
     snapshot_at: Option<std::time::Instant>,
     prev: std::collections::HashMap<u32, (u64, std::time::Instant)>,
 }
@@ -204,7 +237,7 @@ impl CpuSampler {
     pub(crate) fn new() -> Self {
         CpuSampler {
             inner: std::sync::Mutex::new(SamplerState {
-                snapshot: Vec::new(),
+                index: ProcIndex::default(),
                 snapshot_at: None,
                 prev: std::collections::HashMap::new(),
             }),
@@ -223,10 +256,10 @@ impl CpuSampler {
             .map(|t| t.elapsed() >= std::time::Duration::from_millis(250))
             .unwrap_or(true);
         if stale {
-            g.snapshot = all_procs();
+            g.index = ProcIndex::build(&all_procs());
             g.snapshot_at = Some(now);
         }
-        let cur_ns = subtree_cpu_ns(pid, &g.snapshot)?;
+        let cur_ns = g.index.subtree_cpu_ns(pid)?;
         let pct = match g.prev.get(&pid) {
             Some((prev_ns, prev_t)) => {
                 let wall_ns = now.duration_since(*prev_t).as_nanos() as u64;
@@ -240,6 +273,16 @@ impl CpuSampler {
             None => 0.0,
         };
         g.prev.insert(pid, (cur_ns, now));
+        // Evict history for pids that no longer exist. Without this the map is
+        // append-only for the process's whole life: every cell that ever ran on
+        // this node leaves an entry behind, and cells are created and destroyed
+        // continuously (scale-to-zero + cold start). Cheap because it only runs
+        // on a snapshot refresh (~4x/s at most), and `index.cpu` is exactly the
+        // set of live pids.
+        if stale && g.prev.len() > 256 {
+            let live: std::collections::HashSet<u32> = g.index.cpu.keys().copied().collect();
+            g.prev.retain(|p, _| live.contains(p));
+        }
         Some(pct)
     }
 }

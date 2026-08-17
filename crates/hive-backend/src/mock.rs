@@ -697,12 +697,18 @@ impl CellBackend for MockBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Stop the tunnel accept loop.
-        if let Some(task) = self.tunnels.lock().await.remove(&cell.id) {
+        // Each `remove` binds out of the guard BEFORE the await that follows —
+        // see the same change in `firecracker.rs::terminate` for why: an
+        // `if let Some(x) = map.lock().await.remove(..)` keeps the map locked
+        // for the whole body, holding it across `container rm`/`child.wait()`
+        // and blocking `cpu_percent` + cold starts node-wide.
+        let tunnel = self.tunnels.lock().await.remove(&cell.id);
+        if let Some(task) = tunnel {
             task.abort();
         }
         // Remove any container bound to this cell.
-        if let Some((name, apple)) = self.containers.lock().await.remove(&cell.id) {
+        let container = self.containers.lock().await.remove(&cell.id);
+        if let Some((name, apple)) = container {
             let bin = if apple { "container" } else { "podman" };
             let _ = Command::new(bin)
                 .args(crate::container_cli::rm_args(apple, &name))
@@ -710,7 +716,8 @@ impl CellBackend for MockBackend {
                 .await;
         }
         // Kill any function process bound to this cell.
-        if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
+        let func = self.funcs.lock().await.remove(&cell.id);
+        if let Some(mut child) = func {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
@@ -719,7 +726,8 @@ impl CellBackend for MockBackend {
         // runner rather than replace itself — this reaches the runner
         // directly by its own binary name + this cell's unique
         // `--tun-device-name=`, so its utun device is never orphaned.
-        if let Some(net) = self.litebox_macos_cells.lock().await.remove(&cell.id) {
+        let macos_net = self.litebox_macos_cells.lock().await.remove(&cell.id);
+        if let Some(net) = macos_net {
             crate::litebox_macos::kill_runner(&self.litebox_macos_cfg, &net).await;
         }
         // Single-use build cell: blow away the work dir.
