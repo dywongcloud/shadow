@@ -54,6 +54,7 @@ mod inference;
 mod integrations;
 mod lease;
 mod memwatch;
+mod meshwatch;
 mod mesh_raw;
 mod metrics;
 mod microfrontends;
@@ -1372,6 +1373,15 @@ async fn main() -> anyhow::Result<()> {
     // burst, and logs the allocator/RSS/bound gauges every tick above the arm
     // threshold — the record that survives the kill. See `memwatch`.
     memwatch::spawn(cloud.hive.clone());
+
+    // Mesh-isolation watchdog. Every node. A node whose iroh transport wedges
+    // keeps its process, unit and HTTP surfaces healthy while seeing ZERO of
+    // its peers — and never recovers on its own (measured: 2.17M iroh
+    // transport events, gossip completely dead, `systemctl is-active` still
+    // `active`). On the control-plane leader that also fails every admin
+    // mutation fleet-wide, because the leader-forward candidate list is built
+    // from the local registry and comes out empty. See `meshwatch`.
+    meshwatch::spawn(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
     // against (a SIGKILLed process cannot write it on the way out, which is
