@@ -529,10 +529,8 @@ async fn mint_token(
     // client-supplied claim for it. Case-insensitive membership, mirroring the
     // owner check's eq_ignore_ascii_case.
     let email = req.email.trim();
-    let platform_admin = !email.is_empty()
-        && c.admin_emails
-            .iter()
-            .any(|a| email.eq_ignore_ascii_case(a));
+    let platform_admin =
+        !email.is_empty() && c.admin_emails.iter().any(|a| email.eq_ignore_ascii_case(a));
     // Admins are always enterprise (feature: "make all admins automatically
     // always enterprise plan no matter what"). Set an unbypassable tier FLOOR
     // on the admin's tenant via the existing lock — the same mechanism
@@ -2317,8 +2315,7 @@ pub(crate) async fn build_cancel(
     let Some(b) = c.builds.get(&id) else {
         if !c.is_control_plane_leader() {
             let leader = c.control_plane_leader();
-            if let Some(v) =
-                post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
+            if let Some(v) = post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
             {
                 return Ok(Json(v));
             }
@@ -2350,7 +2347,15 @@ pub(crate) async fn build_cancel(
     // reflects the cancel immediately even if the kill itself is still racing
     // the build's own natural completion.
     c.build_cancels.cancel(&c, &id).await;
-    let ev = c.event(&c.region, "CANCEL", &b.project, "/", 200, "deploy", "build cancelled by user");
+    let ev = c.event(
+        &c.region,
+        "CANCEL",
+        &b.project,
+        "/",
+        200,
+        "deploy",
+        "build cancelled by user",
+    );
     c.record(ev);
     crate::webhooks::dispatch(
         &c.webhooks,
@@ -3390,6 +3395,12 @@ async fn purge_project_resources(
     if !released.is_empty() {
         tracing::info!(project, ports = ?released, "released public raw port(s) on project delete");
     }
+
+    // The purge runs DETACHED from both delete paths, after their persist() dirty
+    // bump — so the debounced writer can capture a snapshot BEFORE these catalog
+    // mutations land, and nothing here bumped it again. A restart in that window
+    // resurrected already-purged database rows. Bump once at the end.
+    crate::persist::persist(c);
 }
 
 /// Remove every volume named `hive-vol-<project>` or `hive-vol-<project>-<service>`
@@ -3453,10 +3464,7 @@ async fn purge_project_podman_volumes(project: &str) {
 /// written before the name was sanitized for path use).
 async fn purge_project_source_dirs(project: &str) {
     let prefixes = crate::git::checkout_prefixes(project);
-    for base in [
-        crate::git::deploy_root(),
-        crate::git::legacy_deploy_root(),
-    ] {
+    for base in [crate::git::deploy_root(), crate::git::legacy_deploy_root()] {
         let Ok(mut rd) = tokio::fs::read_dir(&base).await else {
             continue;
         };
@@ -3545,15 +3553,41 @@ async fn project_delete(
                 .map(|n| n.name)
                 .collect();
             let n_peers = peers.len();
-            let accepted = futures::future::join_all(
-                peers
-                    .iter()
-                    .map(|node| dispatch_project_delete(&c, node, &project, &t)),
-            )
-            .await
-            .into_iter()
-            .filter(|ok| *ok)
-            .count();
+            // Quick single-attempt pass, hard-capped per peer: the user is waiting,
+            // and the leader-forward client that proxied this request times out at
+            // 30s — an answer slower than that reads as failure even when the
+            // cascade later succeeds. Peers the quick pass could not reach get the
+            // full retry budget DETACHED below.
+            let results: Vec<bool> = futures::future::join_all(peers.iter().map(|node| {
+                let c = c.clone();
+                let project = project.clone();
+                let t = t.clone();
+                async move {
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(20),
+                        dispatch_project_delete_with(&c, node, &project, &t, 1),
+                    )
+                    .await
+                    .unwrap_or(false)
+                }
+            }))
+            .await;
+            let accepted = results.iter().filter(|ok| **ok).count();
+            let unreached: Vec<String> = peers
+                .iter()
+                .zip(results.iter())
+                .filter(|(_, ok)| !**ok)
+                .map(|(n, _)| n.clone())
+                .collect();
+            if !unreached.is_empty() {
+                let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
+                tokio::spawn(async move {
+                    futures::future::join_all(unreached.iter().map(|node| {
+                        dispatch_project_delete_with(&c2, node, &project2, &team2, 3)
+                    }))
+                    .await;
+                });
+            }
             if accepted == 0 {
                 // Nobody confirmed. Either the project does not exist under this tenant,
                 // or every node that could own it is unreachable. Both are honest
@@ -3661,6 +3695,23 @@ pub(crate) async fn dispatch_project_delete(
     project: &str,
     team: &str,
 ) -> bool {
+    dispatch_project_delete_with(c, node, project, team, 3).await
+}
+
+/// [`dispatch_project_delete`] with an explicit retry budget. The AWAITED
+/// cascade (the not-hosted-here delete path) uses `attempts = 1`: with the full
+/// 3-attempt budget a single dead peer holds the user's request for over a
+/// minute — longer than the leader-forward client's own 30s timeout, so the
+/// user would be told the delete failed while it went on to succeed. Reliability
+/// is not lost: the caller spawns the full-budget variant DETACHED for any peer
+/// the quick pass could not reach.
+pub(crate) async fn dispatch_project_delete_with(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    team: &str,
+    attempts: u32,
+) -> bool {
     if node == c.node_name {
         return true; // local copy already handled by the caller
     }
@@ -3672,8 +3723,7 @@ pub(crate) async fn dispatch_project_delete(
     // exclusive by transport availability, and retry the whole pair a few
     // times with backoff so one transient blip on both transports in the same
     // instant doesn't strand the peer either.
-    const ATTEMPTS: u32 = 3;
-    for attempt in 0..ATTEMPTS {
+    for attempt in 0..attempts {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
         }
@@ -3707,11 +3757,31 @@ pub(crate) async fn dispatch_project_delete(
         if let Some((id, addr)) = target {
             let path = format!("/v1/projects/{project}/delete?{}", mesh_team_qs(team));
             // See `fetch_from_host`: bumped from 15s for discovery-fallback headroom.
-            if crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
-                .await
-                .is_some()
+            if let Some(body) =
+                crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20)
+                    .await
             {
-                return true;
+                // The mesh protocol carries no status code, so a peer's REFUSAL
+                // ("not owner") arrives as a perfectly well-delivered body.
+                // Treating any reply as acceptance fabricated `accepted_by`
+                // counts for projects that exist nowhere — on the fleet, where
+                // `node_admins` is empty and iroh is the only transport, EVERY
+                // peer's refusal was counted as a confirmed deletion. Accepted
+                // means the arm actually ran `delete_project_local` (it answers
+                // `{"removed": n}`); an `error` body is an authoritative no, so
+                // further transports/retries are pointless for this peer.
+                let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+                let accepted = v
+                    .as_ref()
+                    .map(|v| v.get("error").is_none() && v.get("removed").is_some())
+                    .unwrap_or(false);
+                if accepted {
+                    return true;
+                }
+                if v.map(|v| v.get("error").is_some()).unwrap_or(false) {
+                    return false;
+                }
+                // Unparseable reply: fall through to the retry loop.
             }
         } else if admin.is_none() {
             tracing::warn!(
@@ -3725,7 +3795,7 @@ pub(crate) async fn dispatch_project_delete(
     tracing::warn!(
         node,
         project,
-        attempts = ATTEMPTS,
+        attempts,
         "project delete dispatch failed on every transport after retries — peer may keep \
          serving the deleted project until it receives a delete for another reason"
     );
@@ -3754,10 +3824,23 @@ pub(crate) async fn delete_project_local(c: &Arc<CloudState>, project: &str, tea
     } else {
         team.to_string()
     };
-    purge_project_resources(c, project, &team, ids.len()).await;
+    // Same discipline as the HTTP handler above, for the same reasons — and one
+    // more that is specific to THIS path: the mesh caller polls with a 20s
+    // budget while the purge is unbounded (per-container `podman rm -f`, volume
+    // enumeration, source-tree removal, a raw-ports release with its own leader
+    // round trip). Purging inline blew that budget, the caller retried, and a
+    // second concurrent delete of the same project ran against a half-torn-down
+    // first — commit the row, answer fast, reclaim detached. This function is
+    // the receiving side of the fleet's ONLY working delete transport
+    // (`node_admins` is empty on Firecracker nodes), so the ordering fix in the
+    // HTTP handler alone would have missed every real cross-node delete.
     c.projects.remove(project);
     c.git_index.remove_project(project);
     crate::persist::persist(c);
+    {
+        let (c2, project2, team2, n) = (c.clone(), project.to_string(), team.clone(), ids.len());
+        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+    }
     ids.len()
 }
 
@@ -8175,17 +8258,12 @@ fn project_unowned(c: &Arc<CloudState>, project: &str) -> bool {
     if record_tenant(&c.projects.team_of(project)) != UNTAGGED_TENANT {
         return false;
     }
-    let local_clean = c
-        .gw
-        .deployment_records()
-        .iter()
-        .all(|r| !r.project.eq_ignore_ascii_case(project) || record_tenant(&r.tenant) == UNTAGGED_TENANT);
-    let peer_clean = c
-        .peer_deployments
-        .read()
-        .values()
-        .flatten()
-        .all(|d| !d.project.eq_ignore_ascii_case(project) || record_tenant(&d.tenant) == UNTAGGED_TENANT);
+    let local_clean = c.gw.deployment_records().iter().all(|r| {
+        !r.project.eq_ignore_ascii_case(project) || record_tenant(&r.tenant) == UNTAGGED_TENANT
+    });
+    let peer_clean = c.peer_deployments.read().values().flatten().all(|d| {
+        !d.project.eq_ignore_ascii_case(project) || record_tenant(&d.tenant) == UNTAGGED_TENANT
+    });
     local_clean && peer_clean
 }
 
@@ -8760,7 +8838,11 @@ async fn databases_list(
         }
     }
     // Deterministic order so a re-poll never reshuffles the rendered list.
-    list.sort_by(|a, b| b.created_ms.cmp(&a.created_ms).then_with(|| a.id.cmp(&b.id)));
+    list.sort_by(|a, b| {
+        b.created_ms
+            .cmp(&a.created_ms)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Json(json!(list))
 }
 
@@ -8926,7 +9008,12 @@ async fn database_create(
         .databases
         .list(Some(&project))
         .into_iter()
-        .find(|d| d.team == req.team && d.name == req.name && d.kind == req.kind && !matches!(d.status, crate::databases::DbStatus::Error))
+        .find(|d| {
+            d.team == req.team
+                && d.name == req.name
+                && d.kind == req.kind
+                && !matches!(d.status, crate::databases::DbStatus::Error)
+        })
         .map(|d| d.id)
     {
         if let Some(existing) = c.databases.get_raw(&existing_id) {
@@ -11407,45 +11494,43 @@ async fn billing_checkout(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let mut target = String::new();
-    let (plan, amount, label, price_id): (String, u64, String, Option<String>) = match req
-        .kind
-        .as_str()
-    {
-        "credits" => {
-            let amt = req.amount_cents.unwrap_or(1000);
-            (
-                "".to_string(),
-                amt,
-                format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
-                None,
-            )
-        }
-        "addon" => {
-            if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
-                return Err(StatusCode::BAD_REQUEST);
+    let (plan, amount, label, price_id): (String, u64, String, Option<String>) =
+        match req.kind.as_str() {
+            "credits" => {
+                let amt = req.amount_cents.unwrap_or(1000);
+                (
+                    "".to_string(),
+                    amt,
+                    format!("OpenEdge credits (${:.2})", amt as f64 / 100.0),
+                    None,
+                )
             }
-            target = req.target.clone().unwrap_or_default();
-            if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
-                return Err(StatusCode::FORBIDDEN);
+            "addon" => {
+                if req.sku.as_deref() != Some(crate::tencent_eip::SKU) {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
+                target = req.target.clone().unwrap_or_default();
+                if target.is_empty() || !project_owned_by(&c, &target, norm(&t)) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                (
+                    "".to_string(),
+                    crate::tencent_eip::PRICE_CENTS,
+                    format!("Dedicated IPv4 — {target}"),
+                    crate::tencent_eip::price_id(),
+                )
             }
-            (
-                "".to_string(),
-                crate::tencent_eip::PRICE_CENTS,
-                format!("Dedicated IPv4 — {target}"),
-                crate::tencent_eip::price_id(),
-            )
-        }
-        _ => {
-            let plan = req.plan.unwrap_or_else(|| "pro".into());
-            let spec = crate::billing::plan_spec(&plan);
-            (
-                plan,
-                spec.price_cents,
-                format!("OpenEdge {} plan", spec.name),
-                spec.stripe_price_id.map(|s| s.to_string()),
-            )
-        }
-    };
+            _ => {
+                let plan = req.plan.unwrap_or_else(|| "pro".into());
+                let spec = crate::billing::plan_spec(&plan);
+                (
+                    plan,
+                    spec.price_cents,
+                    format!("OpenEdge {} plan", spec.name),
+                    spec.stripe_price_id.map(|s| s.to_string()),
+                )
+            }
+        };
     // A free plan (Hobby, or any future $0 tier) has nothing to charge —
     // Stripe Checkout rejects a $0 payment/subscription outright, and there's
     // no reason to round-trip it at all. Apply immediately, same as the mock
@@ -11474,9 +11559,14 @@ async fn billing_checkout(
     // already idempotent on `ProjectSettings::dedicated_ipv4` (see its own doc
     // comment), so this is safe to hit more than once for the same project.
     if amount == 0 && req.kind == "addon" {
-        let co = c
-            .billing
-            .open_checkout_full(&t, &req.kind, &plan, amount, crate::tencent_eip::SKU, &target);
+        let co = c.billing.open_checkout_full(
+            &t,
+            &req.kind,
+            &plan,
+            amount,
+            crate::tencent_eip::SKU,
+            &target,
+        );
         let (co, _acc) = c
             .billing
             .confirm_checkout(&co.id)
@@ -11522,7 +11612,10 @@ async fn billing_checkout(
                 percent_encoding::utf8_percent_encode(&target, percent_encoding::NON_ALPHANUMERIC)
                     .to_string();
             (
-                format!("{base}/projects/{enc}/settings/network?addon_success={}", co.id),
+                format!(
+                    "{base}/projects/{enc}/settings/network?addon_success={}",
+                    co.id
+                ),
                 format!("{base}/projects/{enc}/settings/network?addon_canceled=1"),
             )
         } else {

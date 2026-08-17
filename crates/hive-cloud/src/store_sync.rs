@@ -149,7 +149,10 @@ pub static REGISTRY: &[SyncedStore] = &[
         snapshot: |c| {
             let (accounts, ledger) = c.billing.snapshot();
             let by_tenant: std::collections::BTreeMap<String, crate::billing::BillingAccount> =
-                accounts.into_iter().map(|a| (a.tenant.clone(), a)).collect();
+                accounts
+                    .into_iter()
+                    .map(|a| (a.tenant.clone(), a))
+                    .collect();
             enc(&(by_tenant, ledger))
         },
         adopt: |c, b| {
@@ -271,9 +274,8 @@ pub static REGISTRY: &[SyncedStore] = &[
         // fails to parse and declines to adopt, which leaves its own state intact —
         // the safe direction.
         adopt: |c, b| {
-            let synced: crate::databases::SyncedDatabases = serde_json::from_slice(b)
-                .ok()
-                .or_else(|| {
+            let synced: crate::databases::SyncedDatabases =
+                serde_json::from_slice(b).ok().or_else(|| {
                     let dbs: Vec<crate::databases::Database> = serde_json::from_slice(b).ok()?;
                     Some(crate::databases::SyncedDatabases {
                         dbs,

@@ -400,17 +400,9 @@ async fn cancel_remote_build(cloud: &Arc<CloudState>, m: &MirrorTarget) -> bool 
             .unwrap_or(false);
     }
     if let Some((id, addr)) = &m.iroh {
-        return crate::gossip::request_to(
-            cloud,
-            id,
-            addr,
-            hive_p2p::GOSSIP_POST,
-            &path,
-            &[],
-            15,
-        )
-        .await
-        .is_some();
+        return crate::gossip::request_to(cloud, id, addr, hive_p2p::GOSSIP_POST, &path, &[], 15)
+            .await
+            .is_some();
     }
     false
 }
@@ -817,7 +809,9 @@ pub fn start_build(cloud: Arc<CloudState>, req: GitDeployRequest) -> String {
             let cancelled = e.downcast_ref::<BuildCancelled>().is_some()
                 || cloud.build_cancels.is_cancelled(&bid);
             if cancelled {
-                cloud.builds.log(&bid, "Build cancelled by user.".to_string());
+                cloud
+                    .builds
+                    .log(&bid, "Build cancelled by user.".to_string());
                 cloud.builds.update(&bid, |b| {
                     if !matches!(b.state, DeployState::Cancelled) {
                         b.state = DeployState::Cancelled;
@@ -919,9 +913,7 @@ fn infer_browser_entry(build_dir: &Path, fn_name: &str) -> Option<String> {
             candidates.push(format!("{stem}.{ext}"));
         }
     }
-    candidates
-        .into_iter()
-        .find(|c| build_dir.join(c).is_file())
+    candidates.into_iter().find(|c| build_dir.join(c).is_file())
 }
 
 /// Every function name a repo's `fluid.json` EXPLICITLY opted into browser
@@ -1329,17 +1321,12 @@ async fn run_build(
             // deployment records, ever) and every failure log line still said
             // "keeping the existing deployment in place", which reads as "your
             // site is fine" to an operator watching a genuinely-down project.
-            let had_prior_deployment = cloud
-                .gw
-                .deployment_records()
-                .iter()
-                .any(|r| r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready)
-                || cloud
-                    .peer_deployments
-                    .read()
-                    .values()
-                    .flatten()
-                    .any(|d| d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready);
+            let had_prior_deployment =
+                cloud.gw.deployment_records().iter().any(|r| {
+                    r.project.eq_ignore_ascii_case(&project) && r.state == DeployState::Ready
+                }) || cloud.peer_deployments.read().values().flatten().any(|d| {
+                    d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready
+                });
             if promotable {
                 // DEGRADED, not failed: name every target the deploy could not
                 // be delivered to, so the operator sees reduced replication
@@ -1503,7 +1490,14 @@ async fn run_build(
         // project (or a concurrent redeploy re-extracting it) otherwise truncate/
         // rewrite this shared file mid-read — a torn zip fails the OTHER build.
         let retained = retained_source_write_path(&project);
-        let retained_tmp = deploy_root().join(format!("{}.{}.tmp", retained.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), bid));
+        let retained_tmp = deploy_root().join(format!(
+            "{}.{}.tmp",
+            retained
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            bid
+        ));
         match tokio::fs::write(&retained_tmp, &bytes).await {
             Ok(()) => {
                 if let Err(e) = tokio::fs::rename(&retained_tmp, &retained).await {
@@ -1716,7 +1710,9 @@ async fn run_build(
                                         .arg("checkout")
                                         .arg("-q")
                                         .arg("FETCH_HEAD");
-                                    match run_cancellable_output(&mut checkout, &ccloud, &cbid).await {
+                                    match run_cancellable_output(&mut checkout, &ccloud, &cbid)
+                                        .await
+                                    {
                                         Ok(cout) if cout.status.success() => {
                                             return (true, scrub(&cout.stderr));
                                         }
@@ -2316,10 +2312,9 @@ async fn run_build(
     // through `Runtime::resolve` (config value wins, else argv basename) rather
     // than a bare string compare, so a function whose runtime was inferred from
     // a `wasmer …` start_cmd counts too.
-    let is_wasm = manifest
-        .functions
-        .iter()
-        .any(|f| hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer);
+    let is_wasm = manifest.functions.iter().any(|f| {
+        hive_core::Runtime::resolve(&f.runtime, &f.start_cmd) == hive_core::Runtime::Wasmer
+    });
 
     // ---- Stateful fanout-replica guard (the remote sub-build side) ---------
     // The coordinator's two placement gates cannot cover the pure-remote fanout
@@ -2447,7 +2442,8 @@ async fn run_build(
             })
             .collect();
         if !dropped.is_empty() {
-            let msg = format!(
+            let msg =
+                format!(
                 "Browser opt-in rejected — the deployment was NOT registered. fluid.json declares \
                  `functions[].browser` for {}, but this project builds through the {} path, which \
                  constructs its own function list and cannot carry a per-function browser opt-in. \
@@ -2488,10 +2484,7 @@ async fn run_build(
                 continue; // explicit opt-in — leave it exactly as authored
             }
             let runtime = hive_core::Runtime::resolve(&f.runtime, &f.start_cmd);
-            if !matches!(
-                runtime,
-                hive_core::Runtime::Node | hive_core::Runtime::Bun
-            ) {
+            if !matches!(runtime, hive_core::Runtime::Node | hive_core::Runtime::Bun) {
                 // container/python/go/command — never browser-eligible. Recorded
                 // rather than skipped: this is the single most common reason a
                 // ready deployment is missing from the picker.
@@ -2563,7 +2556,9 @@ async fn run_build(
             for note in &bundled.notes {
                 log(format!("Browser artifact ({}): {note}", f.name));
             }
-            if let Err(e) = crate::browser_artifacts::persist(&bundled.source, &bundled.descriptor).await {
+            if let Err(e) =
+                crate::browser_artifacts::persist(&bundled.source, &bundled.descriptor).await
+            {
                 let msg = format!(
                     "Browser artifact ({}): could not persist to the content-addressed store: {e}",
                     f.name
@@ -2690,7 +2685,9 @@ async fn run_build(
     // persisted; ownership is bookkeeping — the GC keep-set derives from live
     // deployment records, so a failed write here is a WARN, never fatal.
     for (function, descriptor) in &browser_bundles {
-        if let Err(e) = crate::browser_artifacts::add_owner(&descriptor.policy_digest, &info.id.0).await {
+        if let Err(e) =
+            crate::browser_artifacts::add_owner(&descriptor.policy_digest, &info.id.0).await
+        {
             log(format!(
                 "WARN: browser artifact ({function}) ownership was not recorded ({e}); the GC keep-set still protects it."
             ));
@@ -2964,14 +2961,8 @@ async fn run_build(
         // with a brand-new, independent, non-synced volume. See
         // `schedule::place`'s `stateful` doc.
         let needs_gpu = cloud.projects.get(&project).functions.gpu;
-        let targets = crate::schedule::place(
-            cloud,
-            &regions,
-            false,
-            is_stateful,
-            needs_gpu,
-            is_wasm,
-        );
+        let targets =
+            crate::schedule::place(cloud, &regions, false, is_stateful, needs_gpu, is_wasm);
         if targets
             .iter()
             .any(|t| t.admin.is_none() && t.iroh.is_none())
@@ -3254,8 +3245,7 @@ async fn fanout_remote(
     // Dispatch all targets at once. `join_all` polls these futures on THIS
     // task (no spawn), so the borrows of `cloud`/`req`/`remote` stay valid and
     // nothing needs to be 'static.
-    let dispatched: Vec<Option<(String, bool)>> =
-        futures::future::join_all(dispatch_futs).await;
+    let dispatched: Vec<Option<(String, bool)>> = futures::future::join_all(dispatch_futs).await;
 
     // Register the PRIMARY's cancel mirror before any mirroring begins — see
     // this fn's doc: `cancel_build` on the coordinator's mirror build id has to
@@ -3374,22 +3364,22 @@ async fn mirror_remote_build(
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
-    // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-    // anonymous tenant, `build_owned_by` never matched the build's real
-    // team, and every poll 404'd — INCLUDING every poll against a target
-    // build that had already finished. Verified live: 400/400 polls failed
-    // for a target build that reached `ready` in under 3 seconds, on a
-    // reachable node, every single time. This is not a mesh-health symptom;
-    // it silently broke remote-build status mirroring for every
-    // fanout-placed deployment on the whole fleet, always burning the full
-    // 10-minute deadline regardless of how fast the actual remote build was.
-    // `mesh_team_qs` is the SAME delegation-token minting already used for
-    // every other mesh-internal proxied read (`fetch_from_host` and
-    // friends) — the coordinator knows the real owning team from its own
-    // local build record, so it can assert it the same way.
+                                              // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
+                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+                                              // anonymous tenant, `build_owned_by` never matched the build's real
+                                              // team, and every poll 404'd — INCLUDING every poll against a target
+                                              // build that had already finished. Verified live: 400/400 polls failed
+                                              // for a target build that reached `ready` in under 3 seconds, on a
+                                              // reachable node, every single time. This is not a mesh-health symptom;
+                                              // it silently broke remote-build status mirroring for every
+                                              // fanout-placed deployment on the whole fleet, always burning the full
+                                              // 10-minute deadline regardless of how fast the actual remote build was.
+                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
+                                              // every other mesh-internal proxied read (`fetch_from_host` and
+                                              // friends) — the coordinator knows the real owning team from its own
+                                              // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -4009,7 +3999,10 @@ async fn build_via_fdi(
                  to count; a Git-LFS pointer or truncated download does not)"
             );
         };
-        log(format!("Provisioning Wasmer server: `{}`.", start.join(" ")));
+        log(format!(
+            "Provisioning Wasmer server: `{}`.",
+            start.join(" ")
+        ));
         return Ok(function_manifest(project, start, runtime_override));
     }
 
@@ -4589,7 +4582,11 @@ async fn detect_wasmer_start_cmd(dir: &Path) -> Option<Vec<String>> {
 /// a 4-byte read of a file already on local disk.
 async fn is_wasm_module(p: &Path) -> bool {
     use tokio::io::AsyncReadExt;
-    if !tokio::fs::metadata(p).await.map(|m| m.is_file()).unwrap_or(false) {
+    if !tokio::fs::metadata(p)
+        .await
+        .map(|m| m.is_file())
+        .unwrap_or(false)
+    {
         return false;
     }
     let Ok(mut f) = tokio::fs::File::open(p).await else {
@@ -5526,7 +5523,8 @@ async fn try_peer_fetch(cloud: &Arc<CloudState>, key: &str, dest: &Path) -> bool
         let url = format!("{}/v1/buildcache/{}", peer.trim_end_matches('/'), key);
         async move { (peer, cloud.http.get(&url).timeout(per_peer).send().await) }
     });
-    let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts)).await
+    let results = match tokio::time::timeout(total_budget, futures::future::join_all(attempts))
+        .await
     {
         Ok(r) => r,
         Err(_) => {
@@ -6541,7 +6539,15 @@ async fn build_compose_manifest(
             memory_mib: 512,
             max_concurrency: 20,
             min_instances: 1, // keep every service warm so internal deps actually run
-            max_instances: 3,
+            // ONE instance per compose service, structurally: every instance of a
+            // service shares the single static `--ip` in its start_cmd, so a second
+            // instance always collides with the first — before the live-holder
+            // guard existed, the "self-heal" then force-removed instance #1 (the
+            // service thrashed itself under scale-out); with the guard it is an
+            // honest failed start. Neither is scaling. Compose semantics are one
+            // container per service on a shared network — concurrency scales via
+            // max_concurrency, not replicas.
+            max_instances: 1,
             idle_ttl_secs: 300,
             max_duration_secs: 300,
             protocol: resolved_protocol,
@@ -6561,15 +6567,55 @@ async fn build_compose_manifest(
             // stayed permanently unallocated — the primary service's own log line
             // a few lines down ("reachable through its allocated raw public port
             // instead") was a promise the code never kept.
-            ports: if svc.expose.enabled {
-                vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
-            } else if is_primary && resolved_protocol.needs_raw_proxy() {
-                vec![PortSpec::single(svc.port, resolved_protocol)]
-            } else {
-                Vec::new()
+            ports: {
+                // The primary allocation, exactly as before.
+                let mut specs = if svc.expose.enabled {
+                    vec![PortSpec::single(resolved_expose_port, resolved_protocol)]
+                } else if is_primary && resolved_protocol.needs_raw_proxy() {
+                    vec![PortSpec::single(svc.port, resolved_protocol)]
+                } else {
+                    Vec::new()
+                };
+                // …plus every OTHER port the service declared. Only the first was
+                // ever read, so a service publishing several ports had the rest
+                // discarded in silence — MinIO's `["9000:9000", "9001:9001"]` lost
+                // its web console with nothing in the build output to say so. This
+                // mirrors what the single-image path already does with an image's
+                // `ExposedPorts`: a raw-protocol extra gets its public allocation
+                // (`raw_ports::allocate_raw_ports_coordinated` reads this list), and
+                // an http extra is DOCUMENTED here without public ingress.
+                for (p, proto) in svc.all_ports.iter().copied() {
+                    if !specs.iter().any(|s| s.container_port == p) {
+                        specs.push(PortSpec::single(p, proto));
+                    }
+                }
+                specs
             },
             ..Default::default()
         });
+        if svc.all_ports.len() > 1 {
+            // Say out loud what is and is not publicly reachable. Dropping these
+            // silently is what made the MinIO console present as "the port just
+            // closes the connection", with no way to tell from the build output
+            // that the platform had never been told about that port at all.
+            let extra: Vec<String> = svc
+                .all_ports
+                .iter()
+                .skip(1)
+                .map(|(p, proto)| format!("{p}/{proto}"))
+                .collect();
+            log(format!(
+                "Service '{}' declares {} ports; '/' routes to {}/{}. Additional port(s) {} are \
+                 reachable from sibling services on the shared network, and get a public raw \
+                 allocation only for tcp/udp protocols. To publish an extra HTTP port, split it \
+                 into its own compose service with `x-shadw-expose`.",
+                svc.name,
+                svc.all_ports.len(),
+                svc.port,
+                resolved_protocol,
+                extra.join(", ")
+            ));
+        }
         if is_primary && !resolved_protocol.needs_raw_proxy() {
             routes.push(Route {
                 pattern: "/".into(),
@@ -7162,13 +7208,14 @@ fn git_poll_concurrency() -> usize {
 /// count regardless of how many git-sourced projects the platform has.
 async fn git_poll_cycle(cloud: &Arc<CloudState>) {
     let projects: Vec<String> = cloud.projects.snapshot().into_keys().collect();
-    let outcomes: Vec<GitPollOutcome> = futures::stream::iter(projects.into_iter().map(|project| {
-        let cloud = Arc::clone(cloud);
-        async move { git_poll_one(&cloud, project).await }
-    }))
-    .buffer_unordered(git_poll_concurrency())
-    .collect()
-    .await;
+    let outcomes: Vec<GitPollOutcome> =
+        futures::stream::iter(projects.into_iter().map(|project| {
+            let cloud = Arc::clone(cloud);
+            async move { git_poll_one(&cloud, project).await }
+        }))
+        .buffer_unordered(git_poll_concurrency())
+        .collect()
+        .await;
 
     let mut n_git = 0u32; // git-sourced projects actually polled this cycle
     let mut n_deployed = 0u32; // projects whose HEAD advanced -> build started

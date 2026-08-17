@@ -42,7 +42,10 @@ pub fn routes() -> Router<Arc<CloudState>> {
     Router::new()
         .route("/v1/drive/:project/list", get(list))
         .route("/v1/drive/:project/mkdir", post(mkdir))
-        .route("/v1/drive/:project/file", get(get_file).put(put_file).delete(delete_file))
+        .route(
+            "/v1/drive/:project/file",
+            get(get_file).put(put_file).delete(delete_file),
+        )
         .route("/v1/drive/:project/move", post(move_node))
         .route("/v1/drive/:project/share", post(share_create))
         .route("/v1/drive/:project/webdav-token", post(webdav_token_mint))
@@ -72,14 +75,20 @@ fn split_path(path: &str) -> Vec<String> {
 
 /// Walk a dir-only chain (`""` = root, always valid) to the id of the
 /// directory at `path`. `Err` names which segment failed and why.
-pub(crate) async fn resolve_dir_id(project: &str, path: &str) -> Result<String, (StatusCode, Json<Value>)> {
+pub(crate) async fn resolve_dir_id(
+    project: &str,
+    path: &str,
+) -> Result<String, (StatusCode, Json<Value>)> {
     let mut parent_id = String::new();
     for seg in split_path(path) {
         let node = relational::drive_resolve(project, &parent_id, &seg)
             .await
             .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("no such directory: {seg}")))?;
         if node.kind != "dir" {
-            return Err(err(StatusCode::BAD_REQUEST, format!("{seg} is not a directory")));
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                format!("{seg} is not a directory"),
+            ));
         }
         parent_id = node.id;
     }
@@ -108,7 +117,10 @@ pub(crate) async fn resolve_full(project: &str, path: &str) -> Option<DriveNode>
 /// `mkdir` (create the last segment) and `PUT file` (write the last segment)
 /// need. The parent chain must already exist; this never creates
 /// intermediate directories.
-pub(crate) async fn resolve_parent(project: &str, path: &str) -> Result<(String, String), (StatusCode, Json<Value>)> {
+pub(crate) async fn resolve_parent(
+    project: &str,
+    path: &str,
+) -> Result<(String, String), (StatusCode, Json<Value>)> {
     let mut segs = split_path(path);
     let name = segs
         .pop()
@@ -221,7 +233,12 @@ async fn put_file(
         .to_string();
     let content_hash = crate::drive_blobs::add_bytes(body.clone())
         .await
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("blob store: {e}")))?;
+        .map_err(|e| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("blob store: {e}"),
+            )
+        })?;
     let node = relational::drive_put_file(
         &project,
         &parent_id,
@@ -233,7 +250,12 @@ async fn put_file(
         &c.node_name,
     )
     .await
-    .map_err(|_| err(StatusCode::CONFLICT, format!("{name} already exists and is not a file")))?;
+    .map_err(|_| {
+        err(
+            StatusCode::CONFLICT,
+            format!("{name} already exists and is not a file"),
+        )
+    })?;
     Ok(Json(node_json(&node)))
 }
 
@@ -241,7 +263,8 @@ async fn put_file(
 /// proxied — the `browser_artifacts::verify_bytes` discipline applied to
 /// drive bytes.
 fn verify_bytes(node: &DriveNode, bytes: &[u8]) -> bool {
-    bytes.len() as u64 == node.size_bytes as u64 && crate::drive_blobs::matches(bytes, &node.content_hash)
+    bytes.len() as u64 == node.size_bytes as u64
+        && crate::drive_blobs::matches(bytes, &node.content_hash)
 }
 
 fn file_response(node: &DriveNode, bytes: Vec<u8>) -> Response {
@@ -302,7 +325,8 @@ async fn fetch_drive_file_bytes(
             "/v1/drive/mesh-file/?project={project}&path={encoded}&{}",
             mesh_team_qs(team)
         );
-        return crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20).await;
+        return crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20)
+            .await;
     }
     None
 }
@@ -325,8 +349,12 @@ pub(crate) async fn resolve_and_fetch_bytes(
     path: &str,
     tenant: &str,
 ) -> Option<(DriveNode, Vec<u8>)> {
-    let node = resolve_full(project, path).await.filter(|n| n.kind == "file")?;
-    if let Ok(bytes) = crate::drive_blobs::read_local(&node.content_hash, node.size_bytes as u64).await {
+    let node = resolve_full(project, path)
+        .await
+        .filter(|n| n.kind == "file")?;
+    if let Ok(bytes) =
+        crate::drive_blobs::read_local(&node.content_hash, node.size_bytes as u64).await
+    {
         if verify_bytes(&node, &bytes) {
             return Some((node, bytes));
         }
@@ -360,22 +388,40 @@ async fn get_file(
             .await
             .ok()
             .filter(|b| verify_bytes(&node, b))
-            .ok_or_else(|| err(StatusCode::NOT_FOUND, "file bytes are not persisted on this node"))?;
+            .ok_or_else(|| {
+                err(
+                    StatusCode::NOT_FOUND,
+                    "file bytes are not persisted on this node",
+                )
+            })?;
         return Ok(file_response(&node, bytes));
     }
     let (node, bytes) = resolve_and_fetch_bytes(&c, &project, &q.path, &t)
         .await
-        .ok_or_else(|| err(StatusCode::NOT_FOUND, "file not found or its bytes are unavailable on every owning node"))?;
+        .ok_or_else(|| {
+            err(
+                StatusCode::NOT_FOUND,
+                "file not found or its bytes are unavailable on every owning node",
+            )
+        })?;
     Ok(file_response(&node, bytes))
 }
 
 /// Serving half of the `/v1/drive/mesh-file/` gossip arm.
-pub async fn mesh_get_file(cloud: &Arc<CloudState>, tenant: &str, project: &str, path: &str) -> Vec<u8> {
+pub async fn mesh_get_file(
+    cloud: &Arc<CloudState>,
+    tenant: &str,
+    project: &str,
+    path: &str,
+) -> Vec<u8> {
     let tenant = norm(tenant).to_string();
     if !crate::admin::project_owned_by(cloud, project, &tenant) {
         return Vec::new();
     }
-    let Some(node) = resolve_full(project, path).await.filter(|n| n.kind == "file") else {
+    let Some(node) = resolve_full(project, path)
+        .await
+        .filter(|n| n.kind == "file")
+    else {
         return Vec::new();
     };
     crate::drive_blobs::read_local(&node.content_hash, node.size_bytes as u64)
@@ -397,7 +443,11 @@ async fn delete_file(
     let node = resolve_full(&project, &q.path)
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
-    if node.kind == "dir" && !relational::drive_list_children(&project, &node.id).await.is_empty() {
+    if node.kind == "dir"
+        && !relational::drive_list_children(&project, &node.id)
+            .await
+            .is_empty()
+    {
         return Err(err(StatusCode::CONFLICT, "directory is not empty"));
     }
     relational::drive_tombstone(&node.id).await;
@@ -423,7 +473,10 @@ async fn move_node(
         .await
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "source not found"))?;
     let (new_parent_id, new_name) = resolve_parent(&project, &body.to).await?;
-    if relational::drive_resolve(&project, &new_parent_id, &new_name).await.is_some() {
+    if relational::drive_resolve(&project, &new_parent_id, &new_name)
+        .await
+        .is_some()
+    {
         return Err(err(StatusCode::CONFLICT, "destination already exists"));
     }
     relational::drive_move(&node.id, &new_parent_id, &new_name).await;
@@ -473,7 +526,8 @@ async fn share_create(
         .ok_or_else(|| err(StatusCode::NOT_FOUND, "not found"))?;
     let token = rand_token("dshr");
     let expires_at = hive_core::now_ms() as i64 + (body.ttl.min(365 * 24 * 3600) as i64 * 1000);
-    let id = relational::drive_share_mint(&node.id, &sha256_hex(&token), &body.scope, expires_at).await;
+    let id =
+        relational::drive_share_mint(&node.id, &sha256_hex(&token), &body.scope, expires_at).await;
     Ok(Json(json!({
         "id": id,
         "token": token,
@@ -498,14 +552,21 @@ async fn share_get(
     Path(token): Path<String>,
     Query(q): Query<ShareLocalQ>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    let (node, _grant) = resolve_share(&token).await.ok_or_else(|| err(StatusCode::NOT_FOUND, "invalid or expired share link"))?;
-    if let Ok(bytes) = crate::drive_blobs::read_local(&node.content_hash, node.size_bytes as u64).await {
+    let (node, _grant) = resolve_share(&token)
+        .await
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "invalid or expired share link"))?;
+    if let Ok(bytes) =
+        crate::drive_blobs::read_local(&node.content_hash, node.size_bytes as u64).await
+    {
         if verify_bytes(&node, &bytes) {
             return Ok(file_response(&node, bytes));
         }
     }
     if q.local == Some(true) {
-        return Err(err(StatusCode::NOT_FOUND, "file bytes are not persisted on this node"));
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "file bytes are not persisted on this node",
+        ));
     }
     for candidate in owner_candidates(&c, &node.owner_node) {
         let Some(bytes) = fetch_drive_share_bytes(&c, &candidate, &token).await else {
@@ -515,7 +576,10 @@ async fn share_get(
             return Ok(file_response(&node, bytes));
         }
     }
-    Err(err(StatusCode::NOT_FOUND, "file bytes are unavailable on every owning node"))
+    Err(err(
+        StatusCode::NOT_FOUND,
+        "file bytes are unavailable on every owning node",
+    ))
 }
 
 /// `token` -> (live target node, its grant), independently re-derivable by
@@ -533,7 +597,11 @@ async fn resolve_share(token: &str) -> Option<(DriveNode, relational::DriveShare
     Some((node, grant))
 }
 
-async fn fetch_drive_share_bytes(cloud: &Arc<CloudState>, node_addr: &str, token: &str) -> Option<Vec<u8>> {
+async fn fetch_drive_share_bytes(
+    cloud: &Arc<CloudState>,
+    node_addr: &str,
+    token: &str,
+) -> Option<Vec<u8>> {
     let rest_path = format!("/v1/drive/share/{token}?local=true");
     if let Some(bytes) = fetch_bytes_from_host(cloud, node_addr, &rest_path, "").await {
         return Some(bytes);
@@ -546,7 +614,8 @@ async fn fetch_drive_share_bytes(cloud: &Arc<CloudState>, node_addr: &str, token
         .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
     if let Some((id, addr)) = target {
         let p = format!("/v1/drive/mesh-share/?token={token}");
-        return crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20).await;
+        return crate::gossip::request_to(cloud, &id, &addr, hive_p2p::GOSSIP_GET, &p, &[], 20)
+            .await;
     }
     None
 }
@@ -594,7 +663,11 @@ async fn webdav_token_mint(
 
 /// Verify a presented WebDAV Basic-auth (username, password) pair against
 /// `project`'s stored token — `drive_webdav.rs`'s own auth gate.
-pub(crate) async fn verify_webdav_credentials(project: &str, username: &str, password: &str) -> bool {
+pub(crate) async fn verify_webdav_credentials(
+    project: &str,
+    username: &str,
+    password: &str,
+) -> bool {
     if username != project {
         return false;
     }

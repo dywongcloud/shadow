@@ -192,7 +192,11 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             let tenant = mesh_tenant(p);
             let project = qparam(p, "project").unwrap_or_default();
             let path = qparam(p, "path")
-                .map(|v| percent_encoding::percent_decode_str(&v).decode_utf8_lossy().to_string())
+                .map(|v| {
+                    percent_encoding::percent_decode_str(&v)
+                        .decode_utf8_lossy()
+                        .to_string()
+                })
                 .unwrap_or_default();
             if tenant.is_empty() || project.is_empty() {
                 Vec::new()

@@ -394,8 +394,7 @@ fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> Resta
     } else {
         mem_limit_bytes().unwrap_or(0)
     };
-    let pct = (limit > 0 && prev.rss_bytes > 0)
-        .then(|| prev.rss_bytes.saturating_mul(100) / limit);
+    let pct = (limit > 0 && prev.rss_bytes > 0).then(|| prev.rss_bytes.saturating_mul(100) / limit);
     let mut rec = RestartRecord {
         ts_ms: now,
         verdict: "unclean_exit".into(),

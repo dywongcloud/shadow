@@ -61,7 +61,11 @@ fn unauthorized() -> Response {
 /// Decode `Authorization: Basic <b64>` into (username, password); `None` on
 /// any absent/malformed header (never a panic on attacker-controlled input).
 fn basic_credentials(req: &Request) -> Option<(String, String)> {
-    let v = req.headers().get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
+    let v = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
     let b64 = v.strip_prefix("Basic ")?;
     use base64::Engine;
     let raw = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
@@ -118,7 +122,8 @@ async fn handler(
         .await
         .unwrap_or_default();
     let mut out = Response::from_parts(parts, axum::body::Body::from(bytes.clone()));
-    out.headers_mut().remove(axum::http::header::TRANSFER_ENCODING);
+    out.headers_mut()
+        .remove(axum::http::header::TRANSFER_ENCODING);
     out.headers_mut().insert(
         axum::http::header::CONTENT_LENGTH,
         axum::http::HeaderValue::from_str(&bytes.len().to_string())
@@ -297,7 +302,10 @@ impl DavFile for WriteFile {
                 return Ok(());
             }
             self.flushed = true;
-            let max = crate::billing::plan_max_drive_bytes(&crate::drive_api::plan_of(&self.cloud, &self.tenant));
+            let max = crate::billing::plan_max_drive_bytes(&crate::drive_api::plan_of(
+                &self.cloud,
+                &self.tenant,
+            ));
             if max > 0 {
                 let used = relational::drive_bytes_used(&self.project).await;
                 if used.saturating_add(self.buf.len() as u64) > max {
@@ -325,7 +333,11 @@ impl DavFile for WriteFile {
 }
 
 impl DavFileSystem for DriveFs {
-    fn open<'a>(&'a self, path: &'a DavPath, options: OpenOptions) -> FsFuture<'a, Box<dyn DavFile>> {
+    fn open<'a>(
+        &'a self,
+        path: &'a DavPath,
+        options: OpenOptions,
+    ) -> FsFuture<'a, Box<dyn DavFile>> {
         Box::pin(async move {
             let p = to_fs_path(path);
             if options.write {
@@ -333,7 +345,9 @@ impl DavFileSystem for DriveFs {
                     .await
                     .map_err(|_| FsError::NotFound)?;
                 if options.create_new
-                    && relational::drive_resolve(&self.project, &parent_id, &name).await.is_some()
+                    && relational::drive_resolve(&self.project, &parent_id, &name)
+                        .await
+                        .is_some()
                 {
                     return Err(FsError::Exists);
                 }
@@ -347,9 +361,14 @@ impl DavFileSystem for DriveFs {
                     flushed: false,
                 }) as Box<dyn DavFile>)
             } else {
-                let (node, data) = crate::drive_api::resolve_and_fetch_bytes(&self.cloud, &self.project, &p, &self.tenant)
-                    .await
-                    .ok_or(FsError::NotFound)?;
+                let (node, data) = crate::drive_api::resolve_and_fetch_bytes(
+                    &self.cloud,
+                    &self.project,
+                    &p,
+                    &self.tenant,
+                )
+                .await
+                .ok_or(FsError::NotFound)?;
                 Ok(Box::new(ReadFile {
                     data,
                     pos: 0,
@@ -388,7 +407,11 @@ impl DavFileSystem for DriveFs {
         Box::pin(async move {
             let p = to_fs_path(path);
             if p.is_empty() {
-                return Ok(Box::new(NodeMeta { size: 0, mtime_ms: 0, is_dir: true }) as Box<dyn DavMetaData>);
+                return Ok(Box::new(NodeMeta {
+                    size: 0,
+                    mtime_ms: 0,
+                    is_dir: true,
+                }) as Box<dyn DavMetaData>);
             }
             let node = crate::drive_api::resolve_full(&self.project, &p)
                 .await
@@ -419,7 +442,10 @@ impl DavFileSystem for DriveFs {
             if node.kind != "dir" {
                 return Err(FsError::Forbidden);
             }
-            if !relational::drive_list_children(&self.project, &node.id).await.is_empty() {
+            if !relational::drive_list_children(&self.project, &node.id)
+                .await
+                .is_empty()
+            {
                 return Err(FsError::Forbidden);
             }
             relational::drive_tombstone(&node.id).await;
@@ -451,7 +477,10 @@ impl DavFileSystem for DriveFs {
             let (new_parent_id, new_name) = crate::drive_api::resolve_parent(&self.project, &to_p)
                 .await
                 .map_err(|_| FsError::NotFound)?;
-            if relational::drive_resolve(&self.project, &new_parent_id, &new_name).await.is_some() {
+            if relational::drive_resolve(&self.project, &new_parent_id, &new_name)
+                .await
+                .is_some()
+            {
                 return Err(FsError::Exists);
             }
             relational::drive_move(&node.id, &new_parent_id, &new_name).await;

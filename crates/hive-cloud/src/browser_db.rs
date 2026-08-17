@@ -45,9 +45,7 @@ use std::sync::Arc;
 
 use fluid_core::{BrowserDbPolicy, ResolvedBrowserDbPolicy};
 use fluid_gateway::BrowserScope;
-use hive_browser_proto::{
-    reset as browser_reset, CrrStatus, CrrSyncReply, BROWSER_MAX_CRR_FRAME,
-};
+use hive_browser_proto::{reset as browser_reset, CrrStatus, CrrSyncReply, BROWSER_MAX_CRR_FRAME};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -268,7 +266,10 @@ pub fn auto_db_deployment_for_tenant(
 /// libsql/Hrana + Upstash REST surface (`browser_db_rest`) can never observe
 /// a DIFFERENT spec than the CRR sync protocol does for the identical
 /// project — one opt-in source, every consumer.
-pub(crate) fn policy_for_project(cloud: &Arc<CloudState>, project: &str) -> Option<BrowserDbPolicy> {
+pub(crate) fn policy_for_project(
+    cloud: &Arc<CloudState>,
+    project: &str,
+) -> Option<BrowserDbPolicy> {
     opted_in_projects(cloud).remove(project)
 }
 
@@ -322,14 +323,10 @@ struct RoundGrant {
 /// Team scope syncs read+write; Public scope syncs read-only and only while
 /// the LIVE spec still says `public_read` — a redeploy flipping it off cuts
 /// public grants on the next request, not the next renewal.
-fn resolve_round_grant(
-    cloud: &Arc<CloudState>,
-    endpoint_id: &str,
-) -> Option<RoundGrant> {
-    let admission =
-        cloud
-            .browser_admissions
-            .live_for_endpoint(endpoint_id, hive_core::now_ms())?;
+fn resolve_round_grant(cloud: &Arc<CloudState>, endpoint_id: &str) -> Option<RoundGrant> {
+    let admission = cloud
+        .browser_admissions
+        .live_for_endpoint(endpoint_id, hive_core::now_ms())?;
     admission.db.as_ref()?;
     let (project, spec) = db_descriptor_for(cloud, &admission.tenant, &admission.deployment)?;
     let resolved = spec.resolve();
@@ -549,7 +546,12 @@ fn apply_push_batches(
     for raw in batches {
         let batch = match hive_crsql::ChangeBatch::decode(raw) {
             Ok(batch) => batch,
-            Err(_) => return (CrrStatus::BatchRefused, "undecodable HCB1 batch".to_string()),
+            Err(_) => {
+                return (
+                    CrrStatus::BatchRefused,
+                    "undecodable HCB1 batch".to_string(),
+                )
+            }
         };
         if let Some(c) = batch
             .changes
@@ -638,20 +640,22 @@ async fn operator_sync_round(
     // the browser's responder exports against.
     let watermarks = {
         let path = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<Vec<(Vec<u8>, i64)>, (axum::http::StatusCode, String)> {
-            let conn = hive_crsql::open(&path).map_err(|e| {
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("replica open failed: {e}"),
-                )
-            })?;
-            hive_crsql::known_sites(&conn).map_err(|e| {
-                (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("watermark read failed: {e}"),
-                )
-            })
-        })
+        tokio::task::spawn_blocking(
+            move || -> Result<Vec<(Vec<u8>, i64)>, (axum::http::StatusCode, String)> {
+                let conn = hive_crsql::open(&path).map_err(|e| {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("replica open failed: {e}"),
+                    )
+                })?;
+                hive_crsql::known_sites(&conn).map_err(|e| {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("watermark read failed: {e}"),
+                    )
+                })
+            },
+        )
         .await
         .map_err(|e| {
             (
@@ -660,12 +664,13 @@ async fn operator_sync_round(
             )
         })??
     };
-    let request = hive_browser_proto::encode_crr_sync_request(&hive_browser_proto::CrrSyncRequest {
-        db_file: replica_file_name(&grant.project),
-        push_more: false,
-        watermarks,
-        batches: Vec::new(),
-    });
+    let request =
+        hive_browser_proto::encode_crr_sync_request(&hive_browser_proto::CrrSyncRequest {
+            db_file: replica_file_name(&grant.project),
+            push_more: false,
+            watermarks,
+            batches: Vec::new(),
+        });
     let reply_bytes = pool
         .crr_sync(endpoint_id, &admission.addr_json, &request)
         .await
@@ -683,28 +688,30 @@ async fn operator_sync_round(
     })?;
     let reply_batch_count = reply.batches.len();
     let reply_more = reply.more;
-    let applied = tokio::task::spawn_blocking(move || -> Result<(CrrStatus, String, usize), (axum::http::StatusCode, String)> {
-        let conn = hive_crsql::open(&path).map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("replica open failed: {e}"),
-            )
-        })?;
-        ensure_schema(&conn, &resolved).map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("schema apply failed: {e}"),
-            )
-        })?;
-        let (status, message) = apply_push_batches(&conn, &path, &resolved, &reply.batches);
-        let watermarks = hive_crsql::known_sites(&conn).map_err(|e| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                format!("watermark read failed: {e}"),
-            )
-        })?;
-        Ok((status, message, watermarks.len()))
-    })
+    let applied = tokio::task::spawn_blocking(
+        move || -> Result<(CrrStatus, String, usize), (axum::http::StatusCode, String)> {
+            let conn = hive_crsql::open(&path).map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("replica open failed: {e}"),
+                )
+            })?;
+            ensure_schema(&conn, &resolved).map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("schema apply failed: {e}"),
+                )
+            })?;
+            let (status, message) = apply_push_batches(&conn, &path, &resolved, &reply.batches);
+            let watermarks = hive_crsql::known_sites(&conn).map_err(|e| {
+                (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("watermark read failed: {e}"),
+                )
+            })?;
+            Ok((status, message, watermarks.len()))
+        },
+    )
     .await
     .map_err(|e| {
         (
@@ -937,7 +944,11 @@ fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolic
         for info in deployments {
             if info.state == fluid_core::DeployState::Ready {
                 if let Some(spec) = &info.browser_db {
-                    consider(info.project.clone(), spec, if info.production { 2 } else { 0 });
+                    consider(
+                        info.project.clone(),
+                        spec,
+                        if info.production { 2 } else { 0 },
+                    );
                 }
             }
         }
@@ -945,11 +956,17 @@ fn opted_in_projects(cloud: &Arc<CloudState>) -> BTreeMap<String, BrowserDbPolic
     for record in cloud.gw.deployment_records() {
         if record.state == fluid_core::DeployState::Ready {
             if let Some(spec) = &record.manifest.browser_db {
-                consider(record.project.clone(), spec, if record.production { 3 } else { 1 });
+                consider(
+                    record.project.clone(),
+                    spec,
+                    if record.production { 3 } else { 1 },
+                );
             }
         }
     }
-    out.into_iter().map(|(project, (spec, _))| (project, spec)).collect()
+    out.into_iter()
+        .map(|(project, (spec, _))| (project, spec))
+        .collect()
 }
 
 /// Periodic reconcile: for every opted-in project, ensure the replica file
@@ -1204,12 +1221,13 @@ async fn fleet_pull_round(
     .await
     .map_err(|e| e.to_string())??;
 
-    let request = hive_browser_proto::encode_crr_sync_request(&hive_browser_proto::CrrSyncRequest {
-        db_file: file,
-        push_more: false,
-        watermarks,
-        batches: Vec::new(),
-    });
+    let request =
+        hive_browser_proto::encode_crr_sync_request(&hive_browser_proto::CrrSyncRequest {
+            db_file: file,
+            push_more: false,
+            watermarks,
+            batches: Vec::new(),
+        });
 
     let reply_bytes = crate::gossip::request_to(
         cloud,
@@ -1226,7 +1244,8 @@ async fn fleet_pull_round(
     if reply_bytes.is_empty() {
         return Ok(0);
     }
-    let reply = hive_browser_proto::split_crr_sync_reply(&reply_bytes).map_err(|e| e.to_string())?;
+    let reply =
+        hive_browser_proto::split_crr_sync_reply(&reply_bytes).map_err(|e| e.to_string())?;
     if reply.batches.is_empty() {
         return Ok(0);
     }
@@ -1900,7 +1919,11 @@ fn reconcile_shards(cloud: &Arc<CloudState>) {
             unplaced = plan.unplaced_fragments,
             under_replicated = plan.under_replicated_fragments,
             refusals = plan.refusals_total,
-            first_refusal = plan.refusals.first().map(|r| r.detail.as_str()).unwrap_or(""),
+            first_refusal = plan
+                .refusals
+                .first()
+                .map(|r| r.detail.as_str())
+                .unwrap_or(""),
             "browser shards: fragments are not fully placed"
         );
     }
@@ -1914,7 +1937,9 @@ async fn shard_plan_http(
 ) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
     crate::admin::require_operator(claims.map(|c| c.0).as_ref())?;
     let plan = shard_plan(&cloud);
-    Ok(axum::Json(json!({ "plan": plan, "trust": shard_trust_json() })))
+    Ok(axum::Json(
+        json!({ "plan": plan, "trust": shard_trust_json() }),
+    ))
 }
 
 /// `GET /v1/browser/shards/fragment/:store/:index[?digest=<hex>]` —

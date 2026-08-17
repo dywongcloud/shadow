@@ -2046,14 +2046,13 @@ impl DampingMemory {
         }
         let age = hive_core::now_ms().saturating_sub(disk.saved_ms);
         if age > DAMPING_MAX_AGE_MS {
-            tracing::info!(age_ms = age, "dns damping: persisted flap memory is stale; starting empty");
+            tracing::info!(
+                age_ms = age,
+                "dns damping: persisted flap memory is stale; starting empty"
+            );
             return out;
         }
-        out.publish.unhealthy = disk
-            .unhealthy
-            .into_iter()
-            .take(DAMPING_MAX_NODES)
-            .collect();
+        out.publish.unhealthy = disk.unhealthy.into_iter().take(DAMPING_MAX_NODES).collect();
         out.publish.healthy = disk.healthy.into_iter().take(DAMPING_MAX_NODES).collect();
         out.publish.withheld = disk.withheld.into_iter().take(DAMPING_MAX_NODES).collect();
         out.api.ready = disk.api_ready;

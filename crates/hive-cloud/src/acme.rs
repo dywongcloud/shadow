@@ -590,7 +590,9 @@ async fn account(
                                 "migrated the plaintext ACME account credential into the sealed, \
                                  replicated store and removed the plaintext file"
                             ),
-                            Err(e) => tracing::warn!(error = %e, "sealed the ACME account credential but could not remove the plaintext file — delete it by hand"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "sealed the ACME account credential but could not remove the plaintext file — delete it by hand")
+                            }
                         }
                     } else {
                         tracing::error!(

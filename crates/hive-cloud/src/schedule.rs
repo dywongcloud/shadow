@@ -122,7 +122,14 @@ pub fn place_for_project(
             }
         }
     }
-    place(cloud, regions, is_container, stateful, needs_gpu, needs_wasm)
+    place(
+        cloud,
+        regions,
+        is_container,
+        stateful,
+        needs_gpu,
+        needs_wasm,
+    )
 }
 
 /// May `n` host a deployment whose functions run on `Runtime::Wasmer`?

@@ -585,7 +585,10 @@ pub(crate) async fn upsert_billing(
     invoices: &[crate::billing::Invoice],
     checkouts: &[crate::billing::Checkout],
 ) {
-    upsert_billing_many(std::slice::from_ref(&(account, ledger, invoices, checkouts))).await
+    upsert_billing_many(std::slice::from_ref(&(
+        account, ledger, invoices, checkouts,
+    )))
+    .await
 }
 
 /// One tenant's billing rows, as the batch writer takes them.
@@ -1598,7 +1601,9 @@ pub(crate) async fn drive_resolve(project: &str, parent_id: &str, name: &str) ->
         q(name),
     );
     let res = exec(&mut s, &query).await.ok()?;
-    rows_to_json_objects(&res).into_iter().find_map(drive_node_from_row)
+    rows_to_json_objects(&res)
+        .into_iter()
+        .find_map(drive_node_from_row)
 }
 
 /// Look up a node by its own id, regardless of tombstone state (callers that
@@ -1607,9 +1612,14 @@ pub(crate) async fn drive_resolve(project: &str, parent_id: &str, name: &str) ->
 pub(crate) async fn drive_get(id: &str) -> Option<DriveNode> {
     let db = crate::guardian::sql_db().await.ok()?;
     let mut s = session(db).await;
-    let query = format!("SELECT {DRIVE_NODE_COLUMNS} FROM drive_nodes WHERE id = {}", q(id));
+    let query = format!(
+        "SELECT {DRIVE_NODE_COLUMNS} FROM drive_nodes WHERE id = {}",
+        q(id)
+    );
     let res = exec(&mut s, &query).await.ok()?;
-    rows_to_json_objects(&res).into_iter().find_map(drive_node_from_row)
+    rows_to_json_objects(&res)
+        .into_iter()
+        .find_map(drive_node_from_row)
 }
 
 /// Every live child directly under `parent_id`, directories first then files,
@@ -1669,7 +1679,9 @@ pub(crate) async fn drive_put_file(
         // this module has (a failure here never blocks the mutation it
         // mirrors).
         return Ok(DriveNode {
-            id: existing.map(|e| e.id).unwrap_or_else(|| format!("dnode_{}", uuid::Uuid::new_v4().simple())),
+            id: existing
+                .map(|e| e.id)
+                .unwrap_or_else(|| format!("dnode_{}", uuid::Uuid::new_v4().simple())),
             project: project.into(),
             parent_id: parent_id.into(),
             name: name.into(),
@@ -1861,7 +1873,12 @@ pub(crate) struct DriveShare {
 /// Mint a share grant against `node_id`, keyed by the SHA-256 of the
 /// capability token (apikeys.rs's own "hash, never store the secret"
 /// convention — a share link is exactly as sensitive as an API key).
-pub(crate) async fn drive_share_mint(node_id: &str, token_hash: &str, scope: &str, expires_at: i64) -> String {
+pub(crate) async fn drive_share_mint(
+    node_id: &str,
+    token_hash: &str,
+    scope: &str,
+    expires_at: i64,
+) -> String {
     let id = format!("dshare_{}", uuid::Uuid::new_v4().simple());
     if let Ok(db) = crate::guardian::sql_db().await {
         let mut s = session(db).await;
@@ -1905,7 +1922,10 @@ pub(crate) async fn drive_share_resolve(token_hash: &str) -> Option<DriveShare> 
                     Some(SqlValue::Int4(n)) => *n as i64,
                     _ => 0,
                 };
-                return Some(DriveShare { node_id, expires_at });
+                return Some(DriveShare {
+                    node_id,
+                    expires_at,
+                });
             }
         }
     }
@@ -1949,7 +1969,8 @@ pub(crate) async fn drive_token_verify(project: &str, token_hash: &str) -> bool 
             if let Some(SqlValue::Text(stored)) = rows.first().and_then(|row| row.first()) {
                 let a = stored.as_bytes();
                 let b = token_hash.as_bytes();
-                if a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0 {
+                if a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+                {
                     return true;
                 }
             }

@@ -84,6 +84,19 @@ pub struct ParsedService {
     /// Explicit opt-in for external routing when this service is NOT the primary
     /// entrypoint (`x-shadw-expose`). See [`ComposeExpose`]; default is internal-only.
     pub expose: ComposeExpose,
+    /// EVERY container-side port the service declares, in declaration order —
+    /// `port`/`protocol` above are just the first of these.
+    ///
+    /// Only the first was ever parsed, so a service publishing more than one port
+    /// had the rest discarded without a word. MinIO — the exact case that broke
+    /// `compose-yaml.shadw.app` — declares `["9000:9000", "9001:9001"]`: the S3 API
+    /// and the web console. The console simply did not exist as far as the platform
+    /// was concerned, and nothing in the build output said so, which is why the
+    /// symptom presented as "the port closes the connection" with no diagnosis
+    /// available anywhere. Carrying the full list lets the manifest DOCUMENT the
+    /// extra ports (and allocate public ones for raw-protocol extras) exactly the
+    /// way the single-image path already does from the image's `ExposedPorts`.
+    pub all_ports: Vec<(u16, ServiceProtocol)>,
     /// `command:` — the argv appended AFTER the image, exactly as Docker/Compose
     /// treat it (it overrides the image's `CMD`, not its `ENTRYPOINT`).
     ///
@@ -201,7 +214,10 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
             .cloned()
             .unwrap_or_default();
         let published = !ports.is_empty();
-        let (port, protocol) = container_port(&ports)
+        let all_ports = container_ports(&ports);
+        let (port, protocol) = all_ports
+            .first()
+            .copied()
             .or_else(|| {
                 svc.get("expose")
                     .and_then(|v| v.as_sequence())
@@ -222,6 +238,7 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
             expose,
             command: parse_argv(svc.get("command")),
             entrypoint: parse_argv(svc.get("entrypoint")),
+            all_ports,
         });
     }
     anyhow::ensure!(!out.is_empty(), "compose file declares no services");
@@ -270,31 +287,49 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
 /// `{ target: N, protocol: "udp" }`). We want what the app listens on, plus whether
 /// the mapping declared a real transport change — see [`ParsedService::protocol`].
 fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
+    container_ports(ports).first().copied()
+}
+
+/// EVERY container-side port in a `ports:` sequence, in declaration order, deduped
+/// on (port, protocol). Same per-entry grammar as [`container_port`], which is now
+/// just "the first of these" — see [`ParsedService::all_ports`] for why the rest
+/// must not be dropped on the floor.
+fn container_ports(ports: &[serde_yaml::Value]) -> Vec<(u16, ServiceProtocol)> {
+    let mut out: Vec<(u16, ServiceProtocol)> = Vec::new();
     for p in ports {
-        if let Some(s) = p.as_str() {
-            // Split off an optional /proto suffix, take the last colon-segment (container side).
-            let (bare, proto) = split_proto_suffix(s);
-            if let Some(seg) = bare.rsplit(':').next() {
-                if let Ok(n) = seg.trim().parse::<u16>() {
-                    return Some((n, proto));
-                }
+        if let Some(e) = one_container_port(p) {
+            if !out.contains(&e) {
+                out.push(e);
             }
-        } else if let Some(n) = p.get("target").and_then(|t| t.as_u64()) {
-            let proto = p
-                .get("protocol")
-                .and_then(|v| v.as_str())
-                .map(|s| {
-                    if s.eq_ignore_ascii_case("udp") {
-                        ServiceProtocol::Udp
-                    } else {
-                        ServiceProtocol::Http
-                    }
-                })
-                .unwrap_or(ServiceProtocol::Http);
-            return u16::try_from(n).ok().map(|n| (n, proto));
-        } else if let Some(n) = p.as_u64() {
-            return u16::try_from(n).ok().map(|n| (n, ServiceProtocol::Http));
         }
+    }
+    out
+}
+
+fn one_container_port(p: &serde_yaml::Value) -> Option<(u16, ServiceProtocol)> {
+    if let Some(s) = p.as_str() {
+        // Split off an optional /proto suffix, take the last colon-segment (container side).
+        let (bare, proto) = split_proto_suffix(s);
+        if let Some(seg) = bare.rsplit(':').next() {
+            if let Ok(n) = seg.trim().parse::<u16>() {
+                return Some((n, proto));
+            }
+        }
+    } else if let Some(n) = p.get("target").and_then(|t| t.as_u64()) {
+        let proto = p
+            .get("protocol")
+            .and_then(|v| v.as_str())
+            .map(|s| {
+                if s.eq_ignore_ascii_case("udp") {
+                    ServiceProtocol::Udp
+                } else {
+                    ServiceProtocol::Http
+                }
+            })
+            .unwrap_or(ServiceProtocol::Http);
+        return u16::try_from(n).ok().map(|n| (n, proto));
+    } else if let Some(n) = p.as_u64() {
+        return u16::try_from(n).ok().map(|n| (n, ServiceProtocol::Http));
     }
     None
 }

@@ -1135,35 +1135,61 @@ pub(crate) async fn podman_run_container(
             v
         };
         // Is the container named in the conflict actually ALIVE? This decides whether
-        // the collision is a leaked lease (a ghost we may reap) or a real, running
-        // peer that simply holds the address — most often the PREVIOUS GENERATION of
-        // this very deployment during a rolling redeploy's overlap window. The reap
-        // below is a force-remove, so getting this wrong destroys a container that is
-        // serving live traffic, and the network reset in step 2 takes every sibling on
-        // the project network with it (managed databases included). Neither is ever an
-        // acceptable price for placing one address: when the holder is live we leave
-        // BOTH steps alone and fall through to step 3, which drops the static `--ip`
-        // and starts on a dynamic address — availability preserved, nothing destroyed.
+        // the collision is a leaked lease (a ghost we may reap) or a real peer that
+        // simply holds the address — most often the PREVIOUS GENERATION of this very
+        // deployment during a rolling redeploy's overlap window. The reap below is a
+        // force-remove, so getting this wrong destroys a container that is serving
+        // live traffic, and the network reset in step 2 takes every sibling on the
+        // project network with it. Two hard-won details of the verdict itself:
+        //  - `.State.Status`, never `.State.Running`: a PAUSED container reads
+        //    `Running=false` while being precisely the live lease-holder that
+        //    produced this conflict (proven with a live paused holder); the same
+        //    goes for `restarting`/`stopping`. Only states with no process and a
+        //    released netns count as dead.
+        //  - The probe FAILS TOWARD LIVE: `podman inspect` erroring (daemon busy,
+        //    lock-pool exhaustion — a documented condition on this fleet) proves
+        //    nothing about the holder, and "couldn't check" must never authorize a
+        //    force-remove. Only a provable "no such container" or a provably dead
+        //    status permits the reap.
         let conflict = parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr));
         let holder_live = match &conflict {
-            Some((_, id)) => Command::new(bin)
-                .args(["inspect", "--format", "{{.State.Running}}", id])
+            Some((_, id)) => match Command::new(bin)
+                .args(["inspect", "--format", "{{.State.Status}}", id])
                 .env("PATH", path_env)
                 .output()
                 .await
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
-                .unwrap_or(false),
+            {
+                Ok(o) if o.status.success() => {
+                    let st = String::from_utf8_lossy(&o.stdout).trim().to_ascii_lowercase();
+                    !matches!(st.as_str(), "exited" | "stopped" | "created" | "configured")
+                }
+                Ok(o) => {
+                    // Nonzero exit: only a definitive "does not exist" is dead.
+                    let e = String::from_utf8_lossy(&o.stderr).to_ascii_lowercase();
+                    !(e.contains("no such") || e.contains("not found"))
+                }
+                Err(_) => true,
+            },
             None => false,
         };
         if holder_live {
-            tracing::warn!(
-                network = %netname,
-                holder = %conflict.as_ref().map(|(_, i)| i.as_str()).unwrap_or(""),
-                "static IP is held by a RUNNING container (generation overlap, not a leak) \
-                 — not reaping it; falling back to a dynamic address"
+            // A LIVE holder is not a fault to heal — it is the previous generation
+            // (or another instance) legitimately serving on this address, and only
+            // compose services pin `--ip` at all. Every alternative is worse than
+            // failing: reaping it kills live traffic, and starting THIS container on
+            // a dynamic address silently cross-wires generations — the siblings'
+            // baked `/etc/hosts` still names the static address, so their traffic
+            // keeps landing on the OLD generation and then goes dark when it expires
+            // (measured live). The address frees when that generation's idle TTL
+            // runs out, so an honest, retryable error is the correct outcome.
+            let holder = conflict.as_ref().map(|(_, i)| i.as_str()).unwrap_or("");
+            anyhow::bail!(
+                "static address on network {netname} is held by live container {holder} \
+                 (previous generation still serving — not destroying it). The address \
+                 frees when that generation expires; this start will be retried."
             );
         }
-        if !holder_live {
+        {
             // Step 1: when the error names a specific stale container holding our
             // IP, try to free just that address — disconnect the ghost from the
             // network, then remove it. Cheap + surgical when the ghost still
@@ -1217,17 +1243,25 @@ pub(crate) async fn podman_run_container(
                 // never justifies that, so the reset is only permissible when nothing
                 // is actually running on the network; otherwise step 3's dynamic
                 // address gets this launch up without touching anyone else.
-                let attached = Command::new(bin)
-                    .args(["ps", "-q", "--filter", &format!("network={netname}")])
+                // `-a` is load-bearing: `network rm --force` destroys attached
+                // containers in ANY state, while `ps` without `-a` lists only
+                // running ones — a paused or between-restarts (exited) database
+                // container is exactly what this guard exists to protect and
+                // exactly what a running-only listing is blind to (proven live:
+                // a paused + an exited container both survived rm --force only
+                // once this listed them). And the probe FAILS CLOSED: a podman
+                // error proves nothing empty, so it must read as "occupied".
+                let attached = match Command::new(bin)
+                    .args(["ps", "-a", "-q", "--filter", &format!("network={netname}")])
                     .env("PATH", path_env)
                     .output()
                     .await
-                    .map(|o| {
-                        String::from_utf8_lossy(&o.stdout)
-                            .split_whitespace()
-                            .count()
-                    })
-                    .unwrap_or(0);
+                {
+                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+                        .split_whitespace()
+                        .count(),
+                    _ => usize::MAX,
+                };
                 if attached > 0 {
                     tracing::warn!(
                         network = %netname, attached,

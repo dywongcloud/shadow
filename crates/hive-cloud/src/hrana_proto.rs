@@ -568,7 +568,9 @@ fn eval_cond(
             })
         }
         "not" => {
-            let inner = cond.get("cond").ok_or("`not` condition is missing `cond`")?;
+            let inner = cond
+                .get("cond")
+                .ok_or("`not` condition is missing `cond`")?;
             Ok(!eval_cond(inner, states, conn, version)?)
         }
         "and" | "or" => {

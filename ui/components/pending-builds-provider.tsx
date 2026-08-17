@@ -7,7 +7,7 @@
 
 import { useEffect } from "react";
 import { apiGet, type Build } from "@/lib/api";
-import { getPendingBuilds, removePendingBuild, markPendingSettled, SETTLED_GRACE_MS } from "@/lib/pending-builds";
+import { getPendingBuilds, removePendingBuild, markPendingSettled, rehomePendingTeam, SETTLED_GRACE_MS } from "@/lib/pending-builds";
 
 const STALE_MS = 15 * 60_000; // a build that never resolves is pruned after 15 min
 
@@ -17,6 +17,10 @@ export function PendingBuildsProvider() {
     const tick = async () => {
       const list = getPendingBuilds();
       if (!list.length) return;
+      // A row stored while identity was still resolving carries the "__pending__"
+      // placeholder as its team, which would render for EVERY viewer. Re-home such
+      // rows to the tenant the session actually resolved to.
+      rehomePendingTeam();
       const now = Date.now();
       for (const b of list) {
         if (now - b.at > STALE_MS) {
@@ -45,7 +49,7 @@ export function PendingBuildsProvider() {
             // polled, and removing now is exactly what made the row blink out near
             // the end of a deploy. Mark it settled instead; the lists' `mergePending`
             // drops it the moment the real record is actually visible.
-            markPendingSettled(b.id);
+            markPendingSettled(b.id, build.deployment_id);
           } else if (build.state === "error" || build.state === "cancelled") {
             // No deployment record is coming, so there is nothing to hand over to.
             removePendingBuild(b.id);

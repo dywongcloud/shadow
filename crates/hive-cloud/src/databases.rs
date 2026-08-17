@@ -1147,8 +1147,7 @@ pub fn rotate_blob_credentials(store: &Arc<DatabaseStore>, id: &str) -> Option<D
         return None;
     }
     store.update(id, |d| {
-        d.connection
-            .insert("access_key_id".into(), token("AKIA"));
+        d.connection.insert("access_key_id".into(), token("AKIA"));
         d.connection
             .insert("secret_access_key".into(), token("hbsk"));
         d.connection

@@ -25,10 +25,10 @@ mod db_gateway;
 mod db_replicate;
 mod db_rest;
 mod dedicated_ipv4_listener;
+mod dht_probe;
 mod discovery;
 mod dns;
 mod dns_geo;
-mod dht_probe;
 mod dns_probe;
 mod dnsserver;
 mod docstore;
@@ -54,8 +54,8 @@ mod inference;
 mod integrations;
 mod lease;
 mod memwatch;
-mod meshwatch;
 mod mesh_raw;
+mod meshwatch;
 mod metrics;
 mod microfrontends;
 mod microfrontends_api;
@@ -125,7 +125,10 @@ struct BrowserRelayAccess {
 }
 
 impl iroh_relay::server::AccessControl for BrowserRelayAccess {
-    async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> iroh_relay::server::Access {
+    async fn on_connect(
+        &self,
+        request: &iroh_relay::server::ClientRequest,
+    ) -> iroh_relay::server::Access {
         let Some(cloud) = self.cloud.get().and_then(|w| w.upgrade()) else {
             // Either CloudState isn't constructed yet (a connection landing in
             // the narrow startup window) or it has already been dropped
@@ -134,7 +137,10 @@ impl iroh_relay::server::AccessControl for BrowserRelayAccess {
             return iroh_relay::server::Access::Allow;
         };
         let endpoint_id = request.endpoint_id().to_string();
-        if cloud.browser_admissions.is_denied(&endpoint_id, hive_core::now_ms()) {
+        if cloud
+            .browser_admissions
+            .is_denied(&endpoint_id, hive_core::now_ms())
+        {
             return iroh_relay::server::Access::Deny {
                 reason: Some("browser admission revoked".to_string()),
             };
@@ -234,6 +240,20 @@ struct Args {
     /// table legitimately misses the first attempts). Non-zero exit on a miss.
     #[arg(long = "dht-probe", value_delimiter = ',')]
     dht_probe: Vec<String>,
+    /// Operator diagnostic (same family as `--dns-probe`/`--dht-probe`): parse a
+    /// compose file through the REAL `compose::parse_compose` the build pipeline
+    /// uses and print exactly what the platform will run and route — every
+    /// service, its full port list, which single port `/` reaches, the resolved
+    /// `command`/`entrypoint` argv, and which ports get no public ingress.
+    ///
+    /// This exists because the failure it diagnoses was undiagnosable: a compose
+    /// service publishing several ports had every port after the first discarded
+    /// in silence, so a MinIO console on `:9001` simply did not exist as far as
+    /// the platform was concerned and the only symptom available to the user was
+    /// a closed connection. Reads a file; binds nothing, joins no mesh, needs no
+    /// node. Non-zero exit on a parse error.
+    #[arg(long = "compose-probe")]
+    compose_probe: Option<std::path::PathBuf>,
     /// Operator diagnostic (same family as `--dns-probe`): seed the ACME
     /// DNS-01 challenge store at boot with `<fqdn>=<txt value>` — through the
     /// SAME `AcmeChallengeStore::insert` the real issuance path calls — then
@@ -281,6 +301,56 @@ async fn main() -> anyhow::Result<()> {
     }
     if !args.dht_probe.is_empty() {
         return dht_probe::run_cli(&args.dht_probe).await;
+    }
+    if let Some(path) = &args.compose_probe {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let services = compose::parse_compose(&text)?;
+        let primary = compose::primary_service(&services).map(|s| s.name.clone());
+        println!("{} — {} service(s)", path.display(), services.len());
+        for svc in &services {
+            let is_primary = primary.as_deref() == Some(svc.name.as_str());
+            let src = match (&svc.build, &svc.image) {
+                (Some(b), _) => format!("build {}", b.context),
+                (None, Some(i)) => format!("image {i}"),
+                _ => "(no image or build)".into(),
+            };
+            println!(
+                "\n  {}{}\n    source     {src}\n    ports      {}",
+                svc.name,
+                if is_primary { "  [PRIMARY — serves /]" } else { "" },
+                if svc.all_ports.is_empty() {
+                    "(none declared; defaults to 8080/http)".to_string()
+                } else {
+                    svc.all_ports
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (p, proto))| {
+                            format!("{p}/{proto}{}", if i == 0 { " <- routed" } else { "" })
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
+            if let Some(e) = &svc.entrypoint {
+                println!("    entrypoint {e:?}");
+            }
+            if let Some(c) = &svc.command {
+                println!("    command    {c:?}");
+            }
+            if svc.all_ports.len() > 1 {
+                println!(
+                    "    NOTE       {} additional port(s) have NO public HTTP ingress; split \
+                     into their own service with `x-shadw-expose` to publish one.",
+                    svc.all_ports.len() - 1
+                );
+            }
+        }
+        println!(
+            "\npublic entrypoint: {}",
+            primary.as_deref().unwrap_or("(none)")
+        );
+        return Ok(());
     }
     if args.litebox_probe {
         let be = hive_backend::litebox::LiteboxBackend::default();
@@ -1079,7 +1149,10 @@ async fn main() -> anyhow::Result<()> {
         let browser_crr = std::env::var("HIVE_BROWSER_DB_LISTEN")
             .ok()
             .filter(|v| v.trim() == "0")
-            .map_or_else(|| Some(crate::browser_db::crr_sync_handler(&cloud)), |_| None);
+            .map_or_else(
+                || Some(crate::browser_db::crr_sync_handler(&cloud)),
+                |_| None,
+            );
         // bn-impl-relay-byte-metering (registration line; sibling-owned file, flagged)
         hive_p2p::set_browser_meter(Some(crate::browser_metering::meter_handler(&cloud)));
         tokio::spawn(hive_p2p::serve_tunnels_full(
@@ -1640,10 +1713,7 @@ async fn main() -> anyhow::Result<()> {
     // engaged through the public ingress. Mirror admin_ingress's discipline
     // here: mutations on a non-leader forward to the leader; reads stay local.
     let admin_router = admin_router.layer(axum::middleware::from_fn_with_state(
-        (
-            cloud.clone(),
-            format!("api.{}", cloud.platform_domain),
-        ),
+        (cloud.clone(), format!("api.{}", cloud.platform_domain)),
         admin_loopback_forward,
     ));
 
@@ -1698,7 +1768,10 @@ fn owner_routed(path: &str) -> bool {
 /// locally; /v1/token is stateless HS256 minting and must never depend on
 /// leader reachability.
 async fn admin_loopback_forward(
-    axum::extract::State((cloud, api_host)): axum::extract::State<(std::sync::Arc<state::CloudState>, String)>,
+    axum::extract::State((cloud, api_host)): axum::extract::State<(
+        std::sync::Arc<state::CloudState>,
+        String,
+    )>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
@@ -2018,11 +2091,7 @@ const NOT_LEADER_BODY: &str = "not control-plane leader";
 /// retried).
 fn not_leader_refusal() -> axum::response::Response {
     use axum::response::IntoResponse;
-    (
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-        NOT_LEADER_BODY,
-    )
-        .into_response()
+    (axum::http::StatusCode::SERVICE_UNAVAILABLE, NOT_LEADER_BODY).into_response()
 }
 
 /// True for exactly the response [`not_leader_refusal`] produces.
@@ -2100,7 +2169,11 @@ fn leader_forward_candidates(cloud: &Arc<CloudState>) -> Vec<(String, String)> {
         }
     };
     if let Some(leader) = cloud.leader_node() {
-        if let Some(ip) = leader.public_ip.clone().or_else(|| leader.public_ip6.clone()) {
+        if let Some(ip) = leader
+            .public_ip
+            .clone()
+            .or_else(|| leader.public_ip6.clone())
+        {
             push(leader.name.clone(), ip);
         }
     }
@@ -2514,7 +2587,8 @@ fn spawn_disk_refresh(registry: Arc<hive_edge::NodeRegistry>, backend_name: Stri
                 // keeps claiming true for an image that lost the binary, which
                 // routes Wasmer work onto a node that can only fail it). One
                 // Path::exists() on firecracker, a PATH scan elsewhere.
-                registry.set_self_wasm_runtime(crate::resources::detect_wasm_runtime(&backend_name));
+                registry
+                    .set_self_wasm_runtime(crate::resources::detect_wasm_runtime(&backend_name));
                 // Same tick, same reason as the disk figure: the restart
                 // audit's 24h window SLIDES, so a boot-time-only value goes
                 // stale in the direction that matters (a node keeps
@@ -4003,15 +4077,15 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             })
                             .collect();
                         let bounded = futures::stream::iter(futs)
-                        .buffer_unordered(
-                            std::env::var("HIVE_STORE_SYNC_CONCURRENCY")
-                                .ok()
-                                .and_then(|v| v.parse().ok())
-                                .filter(|v| *v > 0)
-                                .unwrap_or(8),
-                        )
-                        .collect::<Vec<_>>()
-                        .await;
+                            .buffer_unordered(
+                                std::env::var("HIVE_STORE_SYNC_CONCURRENCY")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .filter(|v| *v > 0)
+                                    .unwrap_or(8),
+                            )
+                            .collect::<Vec<_>>()
+                            .await;
                         for (store, local, bytes) in bounded {
                             let Some(bytes) = bytes else { continue };
                             // Raw byte-compare change-gate: `snapshot` is

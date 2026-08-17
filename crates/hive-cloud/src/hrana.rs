@@ -338,7 +338,13 @@ fn checkin(mut stream: Stream) -> Option<String> {
 async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}"), None),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+                None,
+            )
+        }
     };
     let baton = parsed
         .get("baton")
@@ -390,7 +396,13 @@ async fn pipeline(db: &Database, version: u8, body: &[u8]) -> Response {
 async fn cursor(db: &Database, version: u8, body: &[u8]) -> Response {
     let parsed: Value = match serde_json::from_slice(body) {
         Ok(v) => v,
-        Err(e) => return err(StatusCode::BAD_REQUEST, &format!("invalid JSON body: {e}"), None),
+        Err(e) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid JSON body: {e}"),
+                None,
+            )
+        }
     };
     let baton = parsed
         .get("baton")
@@ -429,12 +441,14 @@ async fn cursor(db: &Database, version: u8, body: &[u8]) -> Response {
         out.push_str(&e.to_string());
     }
     out.push('\n');
-    cors((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        out,
+    cors(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            out,
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 // ---- Owner proxy ----------------------------------------------------------
@@ -581,7 +595,10 @@ pub async fn mesh_serve(cloud: &Arc<CloudState>, id: &str, env: &Value) -> Value
     }
     let bearer = env.get("auth").and_then(|a| a.as_str()).unwrap_or_default();
     if !crate::db_rest::credential_matches(&db, bearer) {
-        return refuse(StatusCode::UNAUTHORIZED, "invalid auth token for this database");
+        return refuse(
+            StatusCode::UNAUTHORIZED,
+            "invalid auth token for this database",
+        );
     }
     // NO RE-PROXY: if this node is not the owner either, the caller's routing
     // information is stale. Answering honestly beats a proxy loop.
@@ -701,30 +718,14 @@ async fn api_probe_v2(
     AxPath(id): AxPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    api_serve(
-        c,
-        id,
-        headers,
-        Method::GET,
-        "/v2",
-        axum::body::Bytes::new(),
-    )
-    .await
+    api_serve(c, id, headers, Method::GET, "/v2", axum::body::Bytes::new()).await
 }
 async fn api_probe_v3(
     State(c): State<Arc<CloudState>>,
     AxPath(id): AxPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    api_serve(
-        c,
-        id,
-        headers,
-        Method::GET,
-        "/v3",
-        axum::body::Bytes::new(),
-    )
-    .await
+    api_serve(c, id, headers, Method::GET, "/v3", axum::body::Bytes::new()).await
 }
 
 async fn preflight() -> Response {
@@ -760,12 +761,14 @@ async fn mesh_route(
 // ---- Response helpers -----------------------------------------------------
 
 fn ok_json(v: Value) -> Response {
-    cors((
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/json")],
-        v.to_string(),
+    cors(
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            v.to_string(),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 /// Hrana's HTTP error body is `{message, code}` — clients surface `message`
@@ -775,12 +778,14 @@ fn err(code: StatusCode, msg: &str, hrana_code: Option<&str>) -> Response {
         Some(c) => json!({ "message": msg, "code": c }),
         None => json!({ "message": msg }),
     };
-    cors((
-        code,
-        [(header::CONTENT_TYPE, "application/json")],
-        body.to_string(),
+    cors(
+        (
+            code,
+            [(header::CONTENT_TYPE, "application/json")],
+            body.to_string(),
+        )
+            .into_response(),
     )
-        .into_response())
 }
 
 fn cors(mut resp: Response) -> Response {
