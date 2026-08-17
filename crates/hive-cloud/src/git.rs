@@ -6188,8 +6188,33 @@ async fn build_compose_manifest(
             );
             image
         } else if let Some(img) = &svc.image {
-            log(format!("Service '{}' uses prebuilt image {img}", svc.name));
-            img.clone()
+            // FULLY QUALIFY the ref, exactly as the prebuilt-image deploy path
+            // does (`qualify_image_ref`, used at the `deploy_image` call site).
+            // A compose file names images the way Docker Hub users write them —
+            // `minio/minio:latest`, `redis:7`, `nginx` — and Linux podman runs
+            // with `short-name-mode=enforcing`, which cannot resolve a short
+            // name without an interactive registry prompt. Non-interactively it
+            // fails with "short-name resolution enforced but cannot prompt
+            // without a TTY", so the container NEVER starts, every cold start
+            // fails, and the deployment's circuit opens: measured live on
+            // fc-sanjose-2, `minio/minio:latest` at fail_streak=688 while
+            // `compose-yaml.shadw.app` served 503 DEPLOYMENT_CIRCUIT_OPEN.
+            //
+            // This was the exact "same image works one way, fails the other"
+            // inconsistency between deploy paths: `deploy_image` qualified its
+            // ref and compose did not, so an identical `minio/minio:latest`
+            // deployed fine as a single prebuilt image and was unstartable as a
+            // compose service.
+            let qualified = qualify_image_ref(img);
+            if qualified == *img {
+                log(format!("Service '{}' uses prebuilt image {img}", svc.name));
+            } else {
+                log(format!(
+                    "Service '{}' uses prebuilt image {img} (resolved to {qualified})",
+                    svc.name
+                ));
+            }
+            qualified
         } else {
             anyhow::bail!(
                 "compose service '{}' has neither `build` nor `image`",

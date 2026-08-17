@@ -1123,6 +1123,56 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
             // When no `origin_function` is set (the common case) this is exactly
             // the previous behavior — `serve_static` with its SPA/404 fallback.
             let enc = accepted_encodings(&parts.headers);
+            // UNROUTABLE-BUT-FUNCTIONAL deployment: a manifest that declares
+            // function(s) but NO routes and NO static_dir resolves every path
+            // to `Static` (see `Manifest::resolve`'s fallback), then finds no
+            // file to serve and answers 404 NO_ROUTE_MATCHED — for a project
+            // whose whole purpose is the function. Measured live:
+            // `shoomoo.shadw.app` had a Ready production deployment on
+            // fc-virginia with `functions:[{name:"web",runtime:"node",
+            // start_cmd:["node","server.js"]}]`, `routes: []`,
+            // `static_dir: null` — and 404'd every request. `route_matched`
+            // exists precisely because `resolve` cannot distinguish "a route
+            // said static" from "nothing matched at all"; this is the arm that
+            // finally acts on that distinction.
+            //
+            // Deliberately narrow so a genuine static site is untouched: only
+            // when NOTHING matched, the manifest declares no static_dir, and
+            // there IS a function to serve. A static site either has a
+            // static_dir, or has no functions, and takes the unchanged path
+            // below. Fixing it here rather than only at build time also
+            // rescues deployments ALREADY on disk with this manifest shape,
+            // which would otherwise stay dark until someone redeployed them.
+            let implicit_fn = (!dep.manifest.route_matched(&path)
+                && dep.manifest.static_dir.is_none()
+                && dep.manifest.origin_function.is_none())
+            .then(|| {
+                dep.manifest
+                    .functions
+                    .iter()
+                    .find(|f| f.name == "web")
+                    .or_else(|| dep.manifest.functions.first())
+                    .map(|f| f.name.clone())
+            })
+            .flatten();
+            if let Some(name) = implicit_fn {
+                let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                    Ok(b) => b,
+                    Err(_) => return (StatusCode::BAD_REQUEST, "body too large").into_response(),
+                };
+                // Falls through to the same post-match route-policy + header
+                // injection every other arm gets.
+                proxy_function(
+                    &gw,
+                    &dep,
+                    &name,
+                    &parts.method,
+                    &path_q,
+                    &parts.headers,
+                    body_bytes,
+                )
+                .await
+            } else {
             match dep.manifest.origin_function.clone() {
                 Some(origin) => match read_static_file(&dep, &path, enc).await {
                     Some(r) => r,
@@ -1146,6 +1196,7 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                     }
                 },
                 None => serve_static(&dep, &path, enc).await,
+            }
             }
         }
         RouteTarget::Function(name) => {
@@ -2710,11 +2761,39 @@ async fn proxy_function(
     let key = func_key(dep.id.as_str(), name);
 
     // Collect forwardable request headers once.
-    let hvec: Vec<(String, String)> = headers
+    //
+    // `host` is deliberately DROPPED here and re-added below together with the
+    // `x-forwarded-*` set, because the platform is the only party that knows
+    // the public origin and the function has no other way to learn it.
+    //
+    // Previously `host` was dropped and nothing replaced it, so
+    // `fluid_tunnel`'s server fell back to its hardcoded `host:
+    // fluid.internal` and no `x-forwarded-*` header was ever sent. A tenant app
+    // therefore had NOTHING to build an absolute URL from, and every framework
+    // that emits one — an auth redirect, an OAuth callback, a canonical link,
+    // a `Location` on a 30x — fell back to its own bind address. Measured live:
+    // `https://hive.shadw.app/` answered `302 Location:
+    // http://0.0.0.0:3000/ui/login?next=%2F`, i.e. it sent the browser to the
+    // container's own listen address. `dashboard_proxy` in hive-cloud already
+    // sets `x-forwarded-host`/`x-forwarded-proto` for exactly this reason; the
+    // tenant-facing path simply never did, which is the inconsistency.
+    //
+    // Scheme is hardcoded `https`: every public entry point to a deployment is
+    // TLS-terminated (the edge listener, the anycast front, the apps zone), so
+    // an app that trusts `x-forwarded-proto` builds `https://` URLs — the only
+    // correct answer for a link a browser will follow back in.
+    let mut hvec: Vec<(String, String)> = headers
         .iter()
         .filter(|(k, _)| {
             let n = k.as_str();
-            n != "connection" && n != "content-length" && n != "host"
+            n != "connection"
+                && n != "content-length"
+                && n != "host"
+                // Re-derived below from THIS hop; never trust a client-supplied
+                // value (a spoofed x-forwarded-host is a cache-poisoning and
+                // password-reset-link primitive).
+                && n != "x-forwarded-host"
+                && n != "x-forwarded-proto"
         })
         .filter_map(|(k, v)| {
             v.to_str()
@@ -2722,6 +2801,18 @@ async fn proxy_function(
                 .map(|s| (k.as_str().to_string(), s.to_string()))
         })
         .collect();
+    if let Some(public_host) = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.trim().is_empty())
+    {
+        // Preserve the ORIGINAL Host so frameworks that read it (Next.js and
+        // most Node servers do) generate correct absolute URLs by default,
+        // and add the explicit forwarded pair for everything that prefers it.
+        hvec.push(("host".into(), public_host.to_string()));
+        hvec.push(("x-forwarded-host".into(), public_host.to_string()));
+        hvec.push(("x-forwarded-proto".into(), "https".into()));
+    }
 
     match try_browser(gw, dep, name, method, path_q, headers, &body).await {
         BrowserAttempt::Response(response) => return response,
