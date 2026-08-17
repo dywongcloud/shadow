@@ -55,6 +55,23 @@ pub struct ComposeExpose {
     pub port: Option<u16>,
 }
 
+/// One declared container port of a compose service, with its publish request.
+///
+/// Docker-compose's own `ports:` grammar distinguishes a PUBLISH request from a
+/// bare container-side declaration: `"9000:9000"` (or long-syntax `published:`)
+/// says "make this reachable from outside on host port 9000", while a bare
+/// `"9000"` only documents the container-side listen port. The platform honors
+/// the same split — a published entry asks the raw-port allocator for its
+/// literal host port; a bare entry stays internal-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComposePort {
+    /// Container-side listen port (`CONTAINER` in `HOST:CONTAINER`).
+    pub container: u16,
+    /// The declared HOST side, when the entry is a publish request.
+    pub host: Option<u16>,
+    pub protocol: ServiceProtocol,
+}
+
 /// One parsed Compose service, normalized for the build pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedService {
@@ -96,7 +113,7 @@ pub struct ParsedService {
     /// available anywhere. Carrying the full list lets the manifest DOCUMENT the
     /// extra ports (and allocate public ones for raw-protocol extras) exactly the
     /// way the single-image path already does from the image's `ExposedPorts`.
-    pub all_ports: Vec<(u16, ServiceProtocol)>,
+    pub all_ports: Vec<ComposePort>,
     /// `command:` — the argv appended AFTER the image, exactly as Docker/Compose
     /// treat it (it overrides the image's `CMD`, not its `ENTRYPOINT`).
     ///
@@ -217,7 +234,7 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
         let all_ports = container_ports(&ports);
         let (port, protocol) = all_ports
             .first()
-            .copied()
+            .map(|p| (p.container, p.protocol))
             .or_else(|| {
                 svc.get("expose")
                     .and_then(|v| v.as_sequence())
@@ -287,18 +304,23 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
 /// `{ target: N, protocol: "udp" }`). We want what the app listens on, plus whether
 /// the mapping declared a real transport change — see [`ParsedService::protocol`].
 fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
-    container_ports(ports).first().copied()
+    container_ports(ports).first().map(|p| (p.container, p.protocol))
 }
 
 /// EVERY container-side port in a `ports:` sequence, in declaration order, deduped
 /// on (port, protocol). Same per-entry grammar as [`container_port`], which is now
 /// just "the first of these" — see [`ParsedService::all_ports`] for why the rest
 /// must not be dropped on the floor.
-fn container_ports(ports: &[serde_yaml::Value]) -> Vec<(u16, ServiceProtocol)> {
-    let mut out: Vec<(u16, ServiceProtocol)> = Vec::new();
+fn container_ports(ports: &[serde_yaml::Value]) -> Vec<ComposePort> {
+    let mut out: Vec<ComposePort> = Vec::new();
     for p in ports {
         if let Some(e) = one_container_port(p) {
-            if !out.contains(&e) {
+            // Dedup on the container side; declaration order wins, same as the
+            // primary-port rule.
+            if !out
+                .iter()
+                .any(|x| x.container == e.container && x.protocol == e.protocol)
+            {
                 out.push(e);
             }
         }
@@ -306,17 +328,30 @@ fn container_ports(ports: &[serde_yaml::Value]) -> Vec<(u16, ServiceProtocol)> {
     out
 }
 
-fn one_container_port(p: &serde_yaml::Value) -> Option<(u16, ServiceProtocol)> {
+fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
     if let Some(s) = p.as_str() {
-        // Split off an optional /proto suffix, take the last colon-segment (container side).
-        let (bare, proto) = split_proto_suffix(s);
-        if let Some(seg) = bare.rsplit(':').next() {
-            if let Ok(n) = seg.trim().parse::<u16>() {
-                return Some((n, proto));
-            }
-        }
-    } else if let Some(n) = p.get("target").and_then(|t| t.as_u64()) {
-        let proto = p
+        // Short syntax: "PORT", "HOST:CONTAINER", "IP:HOST:CONTAINER", each with
+        // an optional "/udp"/"/tcp" suffix. The LAST colon-segment is the
+        // container side; the one before it (when numeric) is the publish
+        // request's host port. An IP prefix ("127.0.0.1:8080:80") is accepted
+        // and the IP itself ignored — the platform's raw ingress binds fleet
+        // addresses, not the compose author's loopback.
+        let (bare, protocol) = split_proto_suffix(s);
+        let segs: Vec<&str> = bare.split(':').collect();
+        let container = segs.last()?.trim().parse::<u16>().ok()?;
+        let host = if segs.len() >= 2 {
+            segs[segs.len() - 2].trim().parse::<u16>().ok()
+        } else {
+            None
+        };
+        return Some(ComposePort {
+            container,
+            host,
+            protocol,
+        });
+    }
+    if let Some(n) = p.get("target").and_then(|t| t.as_u64()) {
+        let protocol = p
             .get("protocol")
             .and_then(|v| v.as_str())
             .map(|s| {
@@ -327,9 +362,27 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<(u16, ServiceProtocol)> {
                 }
             })
             .unwrap_or(ServiceProtocol::Http);
-        return u16::try_from(n).ok().map(|n| (n, proto));
-    } else if let Some(n) = p.as_u64() {
-        return u16::try_from(n).ok().map(|n| (n, ServiceProtocol::Http));
+        // Long syntax carries the publish request as `published:` (number, or a
+        // string for ranges — only a plain number can be honored per-entry).
+        let host = p
+            .get("published")
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .and_then(|n| u16::try_from(n).ok());
+        return u16::try_from(n).ok().map(|container| ComposePort {
+            container,
+            host,
+            protocol,
+        });
+    }
+    if let Some(n) = p.as_u64() {
+        return u16::try_from(n).ok().map(|container| ComposePort {
+            container,
+            host: None,
+            protocol: ServiceProtocol::Http,
+        });
     }
     None
 }

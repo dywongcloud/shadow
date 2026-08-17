@@ -46,7 +46,22 @@ export async function POST(req: NextRequest) {
   const sep = returnTo.includes("?") ? "&" : "?";
   const redirectUrl = `${origin}${returnTo}${sep}connected=github`;
   const result = await githubConnect(entity, redirectUrl);
-  return result.redirectUrl
-    ? NextResponse.json({ redirectUrl: result.redirectUrl, provider: "composio" })
-    : NextResponse.json({ error: result.error || "Failed to initiate GitHub connection" }, { status: 500 });
+  if (result.redirectUrl) {
+    return NextResponse.json({ redirectUrl: result.redirectUrl, provider: "composio" });
+  }
+  // A provider-side disable is not a platform failure and must not dead-end the
+  // user on a third party's notice: 503 (it genuinely is "service unavailable",
+  // and retryable once re-enabled) plus the always-working alternative named
+  // explicitly — importing by plain git URL needs no OAuth provider at all.
+  if (result.providerDisabled) {
+    return NextResponse.json(
+      {
+        error: result.error,
+        fallback: "manual-git-url",
+        hint: "You can import any repository by its git URL from the New Project page — no GitHub connection required.",
+      },
+      { status: 503 }
+    );
+  }
+  return NextResponse.json({ error: result.error || "Failed to initiate GitHub connection" }, { status: 500 });
 }

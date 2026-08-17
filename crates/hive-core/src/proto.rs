@@ -261,6 +261,22 @@ pub struct UdpPublish {
     pub host_port: u16,
 }
 
+/// One TCP port publish for a CONTAINER function — same shape and role as
+/// [`UdpPublish`] but for the stream side: every raw/published TCP-transport
+/// port spec (extra Tcp/Grpc specs of a multi-port service, and any compose
+/// PUBLISHED Http port) gets its own loopback host port
+/// (`-p 127.0.0.1:<host_port>:<container_port>`), so the raw proxy's mesh
+/// resolver has a direct local splice leg per port instead of only the
+/// primary's tunnel. The PRIMARY port rides here too (host = the launch's
+/// assigned `port`), which is what lets a published Http primary (MinIO's
+/// :9000) be spliced without the HTTP-framed tunnel corrupting it — emitters
+/// of `-p` flags dedupe against the primary pairing they already publish.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TcpPublish {
+    pub container_port: u16,
+    pub host_port: u16,
+}
+
 /// How to launch a long-lived function server inside a cell (Fluid compute).
 /// The process MUST listen on `$PORT` (Vercel/Heroku convention).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -315,6 +331,11 @@ pub struct FunctionLaunch {
     /// messages wire-compatible. Ignored by the microVM/process paths.
     #[serde(default)]
     pub udp_ports: Vec<UdpPublish>,
+    /// TCP ports a CONTAINER function publishes on loopback (see
+    /// [`TcpPublish`]; includes the primary). Same wire-compat posture as
+    /// `udp_ports`: empty for non-container functions and pre-upgrade peers.
+    #[serde(default)]
+    pub tcp_ports: Vec<TcpPublish>,
     /// Pass the host's GPUs through to a CONTAINER function's cell (CDI
     /// `nvidia.com/gpu=all`; with a `runsc` sandbox runtime, gVisor `nvproxy`).
     /// Set by fluid-compute's `cold_start` from `FunctionConfig::gpu`. `false`
@@ -526,6 +547,7 @@ mod runtime_tests {
             runtime: Runtime::Bun,
             raw_proxy: false,
             udp_ports: Vec::new(),
+            tcp_ports: Vec::new(),
             gpu: false,
         };
         let json = serde_json::to_string(&launch).unwrap();

@@ -46,9 +46,15 @@ pub fn resolver(cloud: Arc<CloudState>) -> RawTargetResolver {
 /// L7 gateway), enforced separately via `needs_raw_proxy`.
 fn proto_matches(spec: fluid_core::ServiceProtocol, proto: RawProto) -> bool {
     match proto {
+        // Http is here for compose-PUBLISHED ports: a published Http port is a
+        // plain TCP byte stream on the wire, and the spec filter below only
+        // admits an Http spec when it carries a publish request — an unpublished
+        // Http port still never resolves.
         RawProto::Tcp => matches!(
             spec,
-            fluid_core::ServiceProtocol::Tcp | fluid_core::ServiceProtocol::Grpc
+            fluid_core::ServiceProtocol::Tcp
+                | fluid_core::ServiceProtocol::Grpc
+                | fluid_core::ServiceProtocol::Http
         ),
         RawProto::Udp => spec == fluid_core::ServiceProtocol::Udp,
     }
@@ -86,7 +92,7 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
     //    allocated public ports for), never an arbitrary local port.
     let spec_idx = f.ports.iter().position(|s| {
         s.container_port == t.port
-            && s.protocol.needs_raw_proxy()
+            && (s.protocol.needs_raw_proxy() || s.preferred_public_port.is_some())
             && proto_matches(s.protocol, t.proto)
     })?;
     match t.proto {
@@ -100,13 +106,6 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
             // loopback `host_port` surfaced out of the backend (today it never
             // leaves `podman_run_container`) — same gap as UDP below; until
             // then, refuse loudly instead of splicing the wrong port.
-            if spec_idx != 0 || !f.needs_raw_proxy() {
-                tracing::warn!(
-                    project = %t.project, function = %t.function, port = t.port,
-                    "raw mesh target refused: only the primary port of a raw-protocol function is forwardable today"
-                );
-                return None;
-            }
             let key = fluid_compute::func_key(&rec.id, &t.function);
             let lease = match cloud.fluid.lease(&key).await {
                 Ok(l) => l,
@@ -115,19 +114,44 @@ pub(crate) async fn resolve(cloud: &Arc<CloudState>, t: RawTarget) -> Option<Raw
                     return None;
                 }
             };
-            let addr = match &lease.endpoint {
-                hive_backend::CellEndpoint::Tcp(a) => a.clone(),
-                // A vsock (microVM) endpoint has no TCP address to splice; raw
-                // services run as host containers, so this is not a served shape.
-                hive_backend::CellEndpoint::Vsock { .. } => {
-                    tracing::warn!(func = %key, "raw mesh target: vsock endpoint has no raw TCP leg");
-                    return None;
-                }
+            // Two local legs, chosen by what fronts the port:
+            //  - The PRIMARY port of a raw-protocol function keeps the
+            //    per-instance tunnel listener, which serves a raw byte splice
+            //    when `FunctionLaunch::raw_proxy` is set (unchanged path).
+            //  - Every OTHER eligible spec — extra Tcp/Grpc ports of a
+            //    multi-port service, and compose-PUBLISHED Http ports (primary
+            //    included: an Http function's tunnel is HTTP-framed and would
+            //    corrupt a raw splice) — dials the container's own per-port
+            //    loopback publish (`Lease::tcp_host_port`, the TCP twin of the
+            //    UDP relay's `udp_host_port` leg).
+            if spec_idx == 0 && f.needs_raw_proxy() {
+                let addr = match &lease.endpoint {
+                    hive_backend::CellEndpoint::Tcp(a) => a.clone(),
+                    // A vsock (microVM) endpoint has no TCP address to splice; raw
+                    // services run as host containers, so this is not a served shape.
+                    hive_backend::CellEndpoint::Vsock { .. } => {
+                        tracing::warn!(func = %key, "raw mesh target: vsock endpoint has no raw TCP leg");
+                        return None;
+                    }
+                };
+                // The lease rides as the guard so instance inflight accounting
+                // covers the connection's whole lifetime (released on splice end).
+                return Some(RawTargetConn {
+                    addr,
+                    guard: Some(Box::new(lease)),
+                });
+            }
+            let Some(host_port) = lease.tcp_host_port(t.port) else {
+                tracing::warn!(
+                    project = %t.project, function = %t.function, port = t.port,
+                    "raw tcp target refused: instance publishes no such TCP port (pre-upgrade \
+                     instance still warm, non-container function, or publish skipped) — \
+                     a redeploy re-publishes it"
+                );
+                return None;
             };
-            // The lease rides as the guard so instance inflight accounting
-            // covers the connection's whole lifetime (released on splice end).
             Some(RawTargetConn {
-                addr,
+                addr: format!("127.0.0.1:{host_port}"),
                 guard: Some(Box::new(lease)),
             })
         }

@@ -359,6 +359,18 @@ impl CellBackend for MockBackend {
                 host_port: u.host_port,
                 protocol: crate::ContainerProtocol::Udp,
             }));
+            // Extra raw/published TCP publishes, minus the primary pairing
+            // already at ports[0] (a duplicate `-p` fails the run).
+            ports.extend(func.tcp_ports.iter().filter_map(|t| {
+                if t.host_port == port {
+                    return None;
+                }
+                Some(crate::ContainerPort {
+                    container_port: t.container_port,
+                    host_port: t.host_port,
+                    protocol: crate::ContainerProtocol::Tcp,
+                })
+            }));
             let mut args: Vec<String> = vec![
                 "run".into(),
                 "-d".into(),

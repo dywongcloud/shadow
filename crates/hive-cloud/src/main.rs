@@ -325,8 +325,17 @@ async fn main() -> anyhow::Result<()> {
                     svc.all_ports
                         .iter()
                         .enumerate()
-                        .map(|(i, (p, proto))| {
-                            format!("{p}/{proto}{}", if i == 0 { " <- routed" } else { "" })
+                        .map(|(i, p)| {
+                            format!(
+                                "{}/{}{}{}",
+                                p.container,
+                                p.protocol,
+                                match p.host {
+                                    Some(h) => format!(" published:{h}"),
+                                    None => " internal".to_string(),
+                                },
+                                if i == 0 { " <- routed at /" } else { "" }
+                            )
                         })
                         .collect::<Vec<_>>()
                         .join(", ")
@@ -338,11 +347,15 @@ async fn main() -> anyhow::Result<()> {
             if let Some(c) = &svc.command {
                 println!("    command    {c:?}");
             }
-            if svc.all_ports.len() > 1 {
+            let published = svc.all_ports.iter().filter(|p| p.host.is_some()).count();
+            let internal = svc.all_ports.len().saturating_sub(published).saturating_sub(
+                usize::from(published == 0 && !svc.all_ports.is_empty()),
+            );
+            if published > 0 || internal > 0 {
                 println!(
-                    "    NOTE       {} additional port(s) have NO public HTTP ingress; split \
-                     into their own service with `x-shadw-expose` to publish one.",
-                    svc.all_ports.len() - 1
+                    "    NOTE       {published} published port(s) get a public raw-TCP \
+                     allocation preferring the literal host port; internal-only ports are \
+                     reachable from sibling services, not publicly."
                 );
             }
         }

@@ -2639,10 +2639,38 @@ async fn run_build(
     // claim not persistable) degrades with a logged warning rather than
     // failing the whole deploy — HTTP-family routes still work.
     match crate::raw_ports::allocate_raw_ports_coordinated(cloud, &project, &mut manifest).await {
-        Ok(ports) if !ports.is_empty() => log(format!(
-            "Allocated public raw port(s): {} (stable across redeploys).",
-            ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
-        )),
+        Ok(ports) if !ports.is_empty() => {
+            log(format!(
+                "Allocated public raw port(s): {} (stable across redeploys).",
+                ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+            // A compose publish request asked for a LITERAL host port. Name the
+            // outcome for every such spec — grant == request is confirmation,
+            // grant != request is the loud never-silent fallback the compose
+            // author needs to see (their :9000 is somewhere else).
+            for f in &manifest.functions {
+                for spec in &f.ports {
+                    let (Some(want), Some(got)) = (spec.preferred_public_port, spec.public_port)
+                    else {
+                        continue;
+                    };
+                    if want == got {
+                        log(format!(
+                            "✓ '{}' port {}: published on :{got} as requested — reach it at \
+                             <host>:{got} (plain TCP passthrough; HTTPS stays on 443).",
+                            f.name, spec.container_port
+                        ));
+                    } else {
+                        log(format!(
+                            "⚠ '{}' port {}: requested public port :{want} is reserved or \
+                             already taken fleet-wide — published on :{got} INSTEAD. Update \
+                             clients to <host>:{got}, or free :{want} and redeploy.",
+                            f.name, spec.container_port
+                        ));
+                    }
+                }
+            }
+        }
         Ok(_) => {}
         Err(e) => log(format!(
             "WARN: could not allocate public raw port(s): {e} — raw TCP/UDP ingress is unavailable for this deployment."
@@ -6579,41 +6607,58 @@ async fn build_compose_manifest(
                 // …plus every OTHER port the service declared. Only the first was
                 // ever read, so a service publishing several ports had the rest
                 // discarded in silence — MinIO's `["9000:9000", "9001:9001"]` lost
-                // its web console with nothing in the build output to say so. This
-                // mirrors what the single-image path already does with an image's
-                // `ExposedPorts`: a raw-protocol extra gets its public allocation
-                // (`raw_ports::allocate_raw_ports_coordinated` reads this list), and
-                // an http extra is DOCUMENTED here without public ingress.
-                for (p, proto) in svc.all_ports.iter().copied() {
-                    if !specs.iter().any(|s| s.container_port == p) {
-                        specs.push(PortSpec::single(p, proto));
+                // its web console with nothing in the build output to say so.
+                //
+                // A `HOST:CONTAINER` entry is docker-compose's own PUBLISH request
+                // and is honored as one: the spec carries the declared host port as
+                // `preferred_public_port`, which makes it eligible for a public raw
+                // allocation even when its protocol is Http (served as plain-TCP
+                // passthrough — the same thing `docker compose up` publishes; TLS
+                // stays the shared 443 gateway's job). The allocator prefers the
+                // literal number and the build log names the outcome either way.
+                // A bare `PORT` entry keeps today's behavior: documented on the
+                // manifest, reachable from siblings, no public ingress.
+                for cp in svc.all_ports.iter().copied() {
+                    if let Some(existing) =
+                        specs.iter_mut().find(|s| s.container_port == cp.container)
+                    {
+                        // The primary/expose spec above already covers this
+                        // container port — carry the publish request onto it.
+                        if existing.preferred_public_port.is_none() {
+                            existing.preferred_public_port = cp.host;
+                        }
+                        continue;
                     }
+                    let mut spec = PortSpec::single(cp.container, cp.protocol);
+                    spec.preferred_public_port = cp.host;
+                    specs.push(spec);
                 }
                 specs
             },
             ..Default::default()
         });
-        if svc.all_ports.len() > 1 {
+        if svc.all_ports.len() > 1 || svc.all_ports.iter().any(|p| p.host.is_some()) {
             // Say out loud what is and is not publicly reachable. Dropping these
             // silently is what made the MinIO console present as "the port just
             // closes the connection", with no way to tell from the build output
             // that the platform had never been told about that port at all.
-            let extra: Vec<String> = svc
+            let described: Vec<String> = svc
                 .all_ports
                 .iter()
-                .skip(1)
-                .map(|(p, proto)| format!("{p}/{proto}"))
+                .map(|p| match p.host {
+                    Some(h) => format!("{}/{} published on :{h}", p.container, p.protocol),
+                    None => format!("{}/{} internal-only", p.container, p.protocol),
+                })
                 .collect();
             log(format!(
-                "Service '{}' declares {} ports; '/' routes to {}/{}. Additional port(s) {} are \
-                 reachable from sibling services on the shared network, and get a public raw \
-                 allocation only for tcp/udp protocols. To publish an extra HTTP port, split it \
-                 into its own compose service with `x-shadw-expose`.",
+                "Service '{}' ports: {}. Published entries get a public raw-TCP allocation \
+                 preferring the declared host port (exact outcome logged at allocation); \
+                 internal-only entries stay reachable from sibling services on the shared \
+                 network. '/' still routes over HTTPS to {}/{}.",
                 svc.name,
-                svc.all_ports.len(),
+                described.join(", "),
                 svc.port,
                 resolved_protocol,
-                extra.join(", ")
             ));
         }
         if is_primary && !resolved_protocol.needs_raw_proxy() {

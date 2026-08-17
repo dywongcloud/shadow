@@ -933,6 +933,7 @@ pub(crate) async fn project_network_put(
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty()),
             public_port: None,
+            preferred_public_port: None,
         });
     }
     let recs = c.gw.deployment_records();
@@ -6594,7 +6595,7 @@ pub(crate) struct LocalQ {
     pub(crate) local: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub(crate) struct WfQuery {
     /// Restrict to a single project.
     pub(crate) project: Option<String>,
@@ -7319,6 +7320,77 @@ pub(crate) async fn wf_runs(
             return Json(v);
         }
     }
+    if !is_top_level {
+        // Inner `local=true` hop: run inline, never cached, never coalesced —
+        // its caller (a peer's own aggregation) carries the budget.
+        return Json(wf_runs_collect(c, team, q).await);
+    }
+    // Top-level: the aggregation runs on a DETACHED task, coalesced per cache
+    // key. Two reasons, both live-witnessed as "Error loading runs" on the
+    // dashboard: (1) the dashboard's own world proxy aborts this request at
+    // 20s, and axum then DROPS this handler future mid-await — with the
+    // caches written only at handler completion, an aborted poll starved
+    // `resp_cache` AND the last-known-good belt forever, so EVERY subsequent
+    // poll re-ran the full slow path and aborted identically (steady-state
+    // failure, not a transient). Detaching means the computation always
+    // finishes and always writes the caches — one slow poll instead of an
+    // endless series. (2) Coalescing means five aborted-and-retried polls
+    // spawn ONE aggregation, not five (the dc8286f amplification rule).
+    type WfShared = tokio::sync::watch::Receiver<Option<Value>>;
+    fn wf_inflight() -> &'static parking_lot::Mutex<std::collections::HashMap<String, WfShared>> {
+        static M: std::sync::OnceLock<
+            parking_lot::Mutex<std::collections::HashMap<String, WfShared>>,
+        > = std::sync::OnceLock::new();
+        M.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
+    let mut rx = {
+        let mut m = wf_inflight().lock();
+        match m.get(&cache_key) {
+            Some(rx) => rx.clone(),
+            None => {
+                let (tx, rx) = tokio::sync::watch::channel(None);
+                m.insert(cache_key.clone(), rx.clone());
+                let (c2, team2, q2, key2) = (c.clone(), team.clone(), q.clone(), cache_key.clone());
+                tokio::spawn(async move {
+                    let v = wf_runs_collect(c2.clone(), team2, q2).await;
+                    c2.resp_cache.set(key2.clone(), v.clone());
+                    let _ = tx.send(Some(v));
+                    wf_inflight().lock().remove(&key2);
+                });
+                rx
+            }
+        }
+    };
+    loop {
+        if let Some(v) = rx.borrow().clone() {
+            return Json(v);
+        }
+        if rx.changed().await.is_err() {
+            // Compute task died (panic) — degrade to the collector inline.
+            return Json(wf_runs_collect(c, team, q).await);
+        }
+    }
+}
+
+/// The actual aggregation `wf_runs` serves — local workflow store + per-project
+/// Upstash world reads + peer fan-out, each slow phase under its OWN budget so
+/// the worst case stays inside the dashboard's 20s client abort (the phases'
+/// dial-resilience budgets — 10s HTTP + 20s iroh per peer, 20s per world read —
+/// are correct for one-shot control operations and structurally wrong for a
+/// polled read: this endpoint is re-asked every few seconds, so a phase that
+/// misses one poll's budget simply contributes to the next poll). Writes the
+/// LAST-KNOWN-GOOD belt (and consults it for empties) itself, so completion —
+/// not the HTTP caller's patience — is what populates it.
+async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value {
+    let is_top_level = !q.local.unwrap_or(false);
+    let cache_key = format!(
+        "wf_runs:{team}:{}:{}",
+        q.project.as_deref().unwrap_or(""),
+        q.summary.unwrap_or(false)
+    );
+    /// One phase's budget: generous for a healthy fleet, and small enough that
+    /// world-read + fan-out in sequence still complete under the client abort.
+    const PHASE_BUDGET: Duration = Duration::from_secs(8);
     // Scoped request for a project with a locally-readable, tenant-owned WORLD
     // (env is gossiped, so this is true on EVERY node): never depend on the
     // mesh forward for the world rows — the forward path returned a false-[]
@@ -7334,18 +7406,18 @@ pub(crate) async fn wf_runs(
     if let Some(project) = q.project.as_deref() {
         if c.gw.git_for_project(project).is_none() && !scoped_world_local {
             if let Some(node) = host_node_for_project(&c, project) {
-                if let Some(v) = fetch_from_host(
-                    &c,
-                    &node,
-                    &format!("/v1/workflows/runs?project={project}&local=true"),
-                    &team,
+                if let Ok(Some(v)) = tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(
+                        &c,
+                        &node,
+                        &format!("/v1/workflows/runs?project={project}&local=true"),
+                        &team,
+                    ),
                 )
                 .await
                 {
-                    if is_top_level {
-                        c.resp_cache.set(cache_key.clone(), v.clone());
-                    }
-                    return Json(v);
+                    return v;
                 }
             }
         }
@@ -7409,13 +7481,22 @@ pub(crate) async fn wf_runs(
         // time (this function's own doc/comment history calls it "the most
         // expensive read on the dashboard"). join_all bounds the added latency to
         // the slowest single project's read instead of the sum of every project.
-        for wruns in
-            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100)))
-                .await
-                .into_iter()
-                .flatten()
+        // Budgeted: a single slow/hung Upstash world must cost this POLL its
+        // rows for that project, never the whole endpoint its deadline.
+        if let Ok(all) = tokio::time::timeout(
+            PHASE_BUDGET,
+            futures::future::join_all(locals.iter().map(|p| crate::world::list_runs(&c, p, 100))),
+        )
+        .await
         {
-            runs.extend(wruns);
+            for wruns in all.into_iter().flatten() {
+                runs.extend(wruns);
+            }
+        } else if !locals.is_empty() {
+            tracing::warn!(
+                team, projects = locals.len(),
+                "wf_runs: world reads exceeded the phase budget — serving without them this poll"
+            );
         }
     }
     let run_key = |r: &Value| -> Option<String> {
@@ -7427,7 +7508,15 @@ pub(crate) async fn wf_runs(
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
-        for v in fan_out_peers(&c, &peers, &team, "/v1/workflows/runs?local=true").await {
+        // Budgeted like the world reads: one dark peer (still listed in the
+        // gossiped view) previously cost 10s HTTP + 20s iroh on EVERY poll.
+        for v in tokio::time::timeout(
+            PHASE_BUDGET,
+            fan_out_peers(&c, &peers, &team, "/v1/workflows/runs?local=true"),
+        )
+        .await
+        .unwrap_or_default()
+        {
             if let Some(arr) = v.as_array() {
                 for r in arr {
                     if let Some(id) = run_key(r) {
@@ -7452,11 +7541,14 @@ pub(crate) async fn wf_runs(
             if let Some(node) = host_node_for_project(&c, project) {
                 let mut seen: std::collections::HashSet<String> =
                     runs.iter().filter_map(run_key).collect();
-                if let Some(v) = fetch_from_host(
-                    &c,
-                    &node,
-                    &format!("/v1/workflows/runs?project={project}&local=true"),
-                    &team,
+                if let Ok(Some(v)) = tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(
+                        &c,
+                        &node,
+                        &format!("/v1/workflows/runs?project={project}&local=true"),
+                        &team,
+                    ),
                 )
                 .await
                 {
@@ -7510,7 +7602,7 @@ pub(crate) async fn wf_runs(
             let g = wf_last_good().lock();
             if let Some((at, v)) = g.get(&cache_key) {
                 if hive_core::now_ms().saturating_sub(*at) < WF_LAST_GOOD_TTL_MS {
-                    return Json(v.clone());
+                    return v.clone();
                 }
             }
         } else {
@@ -7519,11 +7611,7 @@ pub(crate) async fn wf_runs(
                 .insert(cache_key.clone(), (hive_core::now_ms(), json!(runs)));
         }
     }
-    let result = json!(runs);
-    if is_top_level {
-        c.resp_cache.set(cache_key, result.clone());
-    }
-    Json(result)
+    json!(runs)
 }
 
 /// One run with full step detail (for the trace timeline / Gantt). Resolves from

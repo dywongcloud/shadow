@@ -52,10 +52,18 @@ use tokio::net::{TcpListener, TcpStream};
 use crate::state::CloudState;
 
 /// Protocols this proxy carries: anything whose public transport is a TCP byte
-/// stream. (`Udp` needs the datagram relay; HTTP-family never gets a stamped
-/// public port at all.)
+/// stream. `Udp` needs the datagram relay. `Http`-family is here because of
+/// compose PUBLISH requests (`ports: ["9001:9001"]` → a stamped public port on
+/// an Http spec): the published port is served as a plain-TCP passthrough —
+/// exactly what `docker compose up` publishes, plain HTTP with no TLS; the
+/// shared 443 gateway remains the platform's TLS surface. An Http spec WITHOUT
+/// a publish request still never gets a stamped public port, so nothing
+/// reaches this proxy for it.
 fn tcp_transport(p: ServiceProtocol) -> bool {
-    matches!(p, ServiceProtocol::Tcp | ServiceProtocol::Grpc)
+    matches!(
+        p,
+        ServiceProtocol::Tcp | ServiceProtocol::Grpc | ServiceProtocol::Http
+    )
 }
 
 /// What a public port maps to — the flattened allocation identity, from
