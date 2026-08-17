@@ -444,7 +444,31 @@ impl CellBackend for MockBackend {
                     p.host_port, p.container_port
                 ));
             }
+            // compose `entrypoint:` (a run OPTION, before the image) and
+            // `command:` (trailing argv, after it) — same semantics podman gets
+            // in `podman_run_container`; see that call site for why dropping
+            // them makes images like `minio/minio` unstartable.
+            let argv_of = |key: &str| -> Vec<String> {
+                net.as_ref()
+                    .and_then(|n| n.get(key))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let entrypoint = argv_of("entrypoint");
+            if !entrypoint.is_empty() {
+                args.push("--entrypoint".into());
+                args.push(
+                    serde_json::to_string(&entrypoint)
+                        .unwrap_or_else(|_| entrypoint.join(" ")),
+                );
+            }
             args.push(image.clone());
+            args.extend(argv_of("cmd"));
             let status = Command::new(bin)
                 .args(&args)
                 .env("PATH", path_env)

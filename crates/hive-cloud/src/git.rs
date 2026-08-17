@@ -6245,6 +6245,15 @@ async fn build_compose_manifest(
             // Dockerfile/image, same as any other compose deployment target.
             "vol": format!("hive-vol-{}-{}", sanitize_tag(project), sanitize_tag(&svc.name)),
             "volpath": container_volume_path(None),
+            // `command:` / `entrypoint:` from the compose file. Omitted entirely
+            // when absent so an existing manifest's JSON is byte-identical.
+            // Dropping these silently is what made a canonical MinIO compose
+            // (`image: minio/minio` + `command: server /data ...`) unstartable:
+            // run bare, the image's entrypoint prints usage and exits, so the
+            // container never listens and the circuit opens. See
+            // `compose::ParsedService::command`.
+            "cmd": svc.command,
+            "entrypoint": svc.entrypoint,
         })
         .to_string();
         let is_primary = Some(&svc.name) == primary.as_ref();

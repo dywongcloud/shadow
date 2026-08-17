@@ -84,6 +84,81 @@ pub struct ParsedService {
     /// Explicit opt-in for external routing when this service is NOT the primary
     /// entrypoint (`x-shadw-expose`). See [`ComposeExpose`]; default is internal-only.
     pub expose: ComposeExpose,
+    /// `command:` — the argv appended AFTER the image, exactly as Docker/Compose
+    /// treat it (it overrides the image's `CMD`, not its `ENTRYPOINT`).
+    ///
+    /// Dropping this silently makes a large class of real compose files
+    /// unstartable, because many official images ship an ENTRYPOINT that is
+    /// useless without arguments. The canonical MinIO compose — the exact case
+    /// that broke `compose-yaml.shadw.app` — is `image: minio/minio` plus
+    /// `command: server /data --console-address ":9001"`; run bare, `minio`
+    /// prints usage and exits non-zero in well under a second, so the container
+    /// never listens, every cold start fails, and the deployment's circuit
+    /// opens. Same for `postgres` with a custom `-c` flag, `redis-server` with a
+    /// config path, and so on.
+    pub command: Option<Vec<String>>,
+    /// `entrypoint:` — replaces the image's own ENTRYPOINT (podman
+    /// `--entrypoint`). Parsed alongside `command` for the same reason.
+    pub entrypoint: Option<Vec<String>>,
+}
+
+/// Parse a Compose `command:`/`entrypoint:` value, which may be either a YAML
+/// sequence (already argv) or a single string (shell-style, split on
+/// whitespace honoring quotes — Compose's own "shell form").
+fn parse_argv(v: Option<&serde_yaml::Value>) -> Option<Vec<String>> {
+    match v {
+        Some(serde_yaml::Value::Sequence(seq)) => {
+            let argv: Vec<String> = seq
+                .iter()
+                .filter_map(|x| match x {
+                    serde_yaml::Value::String(s) => Some(s.clone()),
+                    serde_yaml::Value::Number(n) => Some(n.to_string()),
+                    serde_yaml::Value::Bool(b) => Some(b.to_string()),
+                    _ => None,
+                })
+                .collect();
+            (!argv.is_empty()).then_some(argv)
+        }
+        Some(serde_yaml::Value::String(s)) => {
+            let argv = shell_split(s);
+            (!argv.is_empty()).then_some(argv)
+        }
+        _ => None,
+    }
+}
+
+/// Split a shell-form command string into argv, honoring single and double
+/// quotes. MinIO's `--console-address ":9001"` is the motivating case: a naive
+/// `split_whitespace` would hand podman a literal `":9001"` INCLUDING the
+/// quote characters, which the app then fails to parse as an address.
+fn shell_split(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut any = false;
+    for c in s.chars() {
+        match quote {
+            Some(q) if c == q => {
+                quote = None;
+            }
+            Some(_) => cur.push(c),
+            None if c == '\'' || c == '"' => {
+                quote = Some(c);
+                any = true; // `""` is a real, empty argument
+            }
+            None if c.is_whitespace() => {
+                if !cur.is_empty() || any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() || any {
+        out.push(cur);
+    }
+    out
 }
 
 /// Locate a Compose file in `dir` (the canonical names, newest spec first).
@@ -145,6 +220,8 @@ pub fn parse_compose(text: &str) -> anyhow::Result<Vec<ParsedService>> {
             env,
             protocol,
             expose,
+            command: parse_argv(svc.get("command")),
+            entrypoint: parse_argv(svc.get("entrypoint")),
         });
     }
     anyhow::ensure!(!out.is_empty(), "compose file declares no services");

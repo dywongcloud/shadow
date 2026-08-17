@@ -1030,7 +1030,35 @@ pub(crate) async fn podman_run_container(
             p.host_port, p.container_port
         ));
     }
+    // `entrypoint:` REPLACES the image's ENTRYPOINT, so it is a run OPTION and
+    // must precede the image name.
+    let argv_of = |key: &str| -> Vec<String> {
+        net.as_ref()
+            .and_then(|n| n.get(key))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let entrypoint = argv_of("entrypoint");
+    if !entrypoint.is_empty() {
+        // podman's `--entrypoint` takes a JSON array for a multi-word form.
+        base.push("--entrypoint".into());
+        base.push(
+            serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")),
+        );
+    }
     base.push(image.to_string());
+    // `command:` OVERRIDES the image's CMD, so it is trailing argv AFTER the
+    // image — the same position `docker run <image> <cmd...>` puts it. Dropping
+    // this made every image whose ENTRYPOINT needs arguments unstartable (the
+    // canonical `minio/minio` + `command: server /data --console-address
+    // ":9001"` case: bare, it prints usage and exits, so the container never
+    // listens and the deployment's circuit opens).
+    base.extend(argv_of("cmd"));
 
     // Attempt 1: with the requested sandbox runtime (e.g. gVisor `runsc`) if any —
     // podman only. Apple's `container` has no equivalent concept (every container is
