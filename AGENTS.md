@@ -850,9 +850,16 @@ releases).
   `$HIVE_DATA/sqlite-dbs/hive-sqlite-{sanitize_tag(db_id)}.db`, queried over the
   libsql wire protocol. `browser_db` (below) is a cr-sqlite CRR replica per
   PROJECT under `$HIVE_DATA/browser-dbs/`, replicated to browsers by
-  `Op::CrrSync` with no query endpoint at all. **Never point the Hrana handler
+  `Op::CrrSync`, plus a token-gated libsql/Hrana + Upstash-style REST surface
+  for non-browser clients (`browser_db_rest`, below). **Never point the Hrana handler
   at a `browser-dbs` file**: a direct SQL writer bypasses the clock tables the
   CRR merge reads, which is silent permanent divergence in an LWW store. The
+  sanctioned HTTP query path for this lane is `browser_db_rest` (see "The
+  `browser_db` contract" below): it opens the replica via `hive_crsql::open`
+  (the cr-sqlite extension LOADED) and wraps every request in one explicit
+  transaction with `set_ts` applied, so its writes DO maintain the clock
+  tables — the hazard is specifically `sqlite_pool`'s bare
+  `rusqlite::Connection`, which loads no extension. The
   separation is by directory, by name template and by identity (database id vs
   project), and this lane never loads the cr-sqlite extension. The dashboard
   models them as two kinds (`sqlite` / `browser_sqlite`) for the same reason.
@@ -1031,6 +1038,35 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   `HIVE_CRSQL_EXTENSION_PATH` points at the packaged cr-sqlite extension on
   fleet nodes (the vendored build is the local-dev default; a missing
   extension is a loud WARN + refused rounds, never a boot failure).
+- **The REST/Hrana surface (`browser_db_rest`) is this lane's non-browser
+  query path, and it is CRR-safe by construction.** A server, CI job or curl
+  reads/writes the same replica browsers sync, without embedding a QUIC
+  client: `POST /v1/projects/:project/browser-db/rest-token` mints one of two
+  per-project bearers (team = read+write, public = read-only, re-checked live
+  against `public_read` on EVERY request; plaintext shown once, only the
+  SHA-256 hash stored in the replicated ProjectSettings row), then
+  `libsql://api.<domain>/v1/browser-db/<project>/` (v2/v3 pipeline —
+  `hrana_proto::execute_pipeline` verbatim) and the Upstash-style
+  `POST .../sql` (`{query, params}` → `{fields, rows, rowCount}`). Safety
+  invariants that must survive any edit: connections open via
+  `hive_crsql::open` (extension LOADED — never `sqlite_pool`'s bare
+  rusqlite), every request is one explicit transaction with `set_ts` right
+  after BEGIN on any non-read-only request; read-only sessions are enforced
+  by a hard statement-class denylist (PRAGMA/ATTACH/DETACH,
+  comment-aware) plus refusing the "sequence" request type — a per-connection
+  `PRAGMA query_only` is NOT a boundary (a public token toggled it off and
+  escalated to write in the first pass); `max_bytes` is measured AFTER the
+  RESERVED lock is held (checking before it let 8 concurrent writers all
+  observe the same stale under-cap size); there is no stored `host_node`, so
+  requests PROXY to a deterministic rendezvous-hash owner
+  (`browser_db::rest_owner_for_project`, the `inference::coordinator_for`
+  pattern) which lazily opens-or-creates its replica on first request. v1
+  limits, stated honestly: no interactive baton streams (every pipeline is
+  self-contained, a presented baton gets STREAM_EXPIRED), no v3 cursor (404
+  naming the gap), no client-issued literal BEGIN/COMMIT text. The storage
+  page reads the URLs + token existence from
+  `GET /v1/projects/:project/browser-db/status`'s `rest` block —
+  server-derived from `api_base()`, never reconstructed client-side.
 
 ## Tenant volume isolation (verified, keep it this way)
 

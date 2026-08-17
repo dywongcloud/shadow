@@ -215,21 +215,32 @@ async fn rest_token_mint(
             created_ms: hive_core::now_ms(),
         }),
     );
+    let (libsql_url, sql_url) = rest_urls(&cloud, &project);
+    Ok(Json(json!({
+        "project": project,
+        "scope": if public { "public" } else { "team" },
+        "token": token,
+        "libsql_url": libsql_url,
+        "sql_url": sql_url,
+    })))
+}
+
+/// The two public URLs of a project's REST/Hrana surface, derived from the
+/// same `api_base()` everywhere they are published (mint response, status
+/// endpoint) — one construction, never two format strings to keep in sync.
+/// The libsql base's TRAILING SLASH is load-bearing: libsql clients resolve
+/// `v2/pipeline` RELATIVELY against it (the `hrana.rs` precedent).
+pub(crate) fn rest_urls(cloud: &Arc<CloudState>, project: &str) -> (String, String) {
     let base = cloud.api_base();
     let base_trimmed = base.trim_end_matches('/');
     let scheme_swapped = base_trimmed
         .strip_prefix("https://")
         .map(|rest| format!("libsql://{rest}"))
         .unwrap_or_else(|| base_trimmed.to_string());
-    Ok(Json(json!({
-        "project": project,
-        "scope": if public { "public" } else { "team" },
-        "token": token,
-        // TRAILING SLASH is load-bearing: libsql clients resolve `v2/pipeline`
-        // RELATIVELY against this base (the `hrana.rs` precedent).
-        "libsql_url": format!("{scheme_swapped}/v1/browser-db/{project}/"),
-        "sql_url": format!("{base_trimmed}/v1/browser-db/{project}/sql"),
-    })))
+    (
+        format!("{scheme_swapped}/v1/browser-db/{project}/"),
+        format!("{base_trimmed}/v1/browser-db/{project}/sql"),
+    )
 }
 
 /// Which scope (if any) `bearer` matches for `project`'s minted REST

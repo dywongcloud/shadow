@@ -808,7 +808,13 @@ async fn browser_db_projects_http(
     owned.sort_by(|a, b| a.0.cmp(&b.0));
     let projects: Vec<Value> = owned
         .into_iter()
-        .map(|(project, policy)| json!({ "project": project, "browser_db": policy }))
+        .map(|(project, policy)| {
+            // The REST/Hrana URLs ride along (server-derived from `api_base()`)
+            // so the storage LIST can show the endpoint without one status
+            // fetch per row.
+            let (libsql_url, sql_url) = crate::browser_db_rest::rest_urls(&cloud, &project);
+            json!({ "project": project, "browser_db": policy, "rest": { "libsql_url": libsql_url, "sql_url": sql_url } })
+        })
         .collect();
     Ok(axum::Json(json!({ "projects": projects })))
 }
@@ -836,7 +842,8 @@ async fn project_db_status_http(
     axum::extract::Path(project): axum::extract::Path<String>,
 ) -> Result<axum::Json<Value>, (axum::http::StatusCode, String)> {
     crate::admin::require_project(&cloud, &headers, claims.as_ref().map(|e| &e.0), &project)?;
-    let Some(policy) = cloud.projects.get(&project).browser_db else {
+    let settings = cloud.projects.get(&project);
+    let Some(policy) = settings.browser_db else {
         return Ok(axum::Json(json!({ "opted_in": false })));
     };
     let resolved = policy.resolve();
@@ -867,6 +874,11 @@ async fn project_db_status_http(
         // way, an honest "no replica here yet", never a fabricated zero-cap.
         Err(_) => (false, 0u64, 0usize, None),
     };
+    // The REST/Hrana surface (`browser_db_rest`) is published here too so the
+    // dashboard never reconstructs a URL client-side: `api_base()` is the
+    // authority, and the token fields disclose only EXISTENCE + mint time —
+    // the plaintext is shown once at mint and only its hash is stored.
+    let (libsql_url, sql_url) = crate::browser_db_rest::rest_urls(&cloud, &project);
     Ok(axum::Json(json!({
         "opted_in": true,
         "max_bytes": resolved.max_bytes,
@@ -879,6 +891,12 @@ async fn project_db_status_http(
             "bytes": bytes,
             "sites": sites,
             "last_modified_ms": last_modified_ms,
+        },
+        "rest": {
+            "libsql_url": libsql_url,
+            "sql_url": sql_url,
+            "team_token_ms": settings.browser_db_rest_team.as_ref().map(|t| t.created_ms),
+            "public_token_ms": settings.browser_db_rest_public.as_ref().map(|t| t.created_ms),
         },
     })))
 }

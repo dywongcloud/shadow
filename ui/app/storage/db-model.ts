@@ -13,9 +13,10 @@
  *    project on every node.
  *
  * A SQLite database is a database. It gets the same row, the same detail page and
- * the same affordances as the rest — the ONE thing that genuinely differs is that
- * it has no server-side wire endpoint, and that is stated instead of faked.
- * See `SQLITE_NO_DSN` / `sqliteConnectivity()`.
+ * the same affordances as the rest. The browser-replicated lane's difference is
+ * HOW clients connect: browsers sync a local replica (no DSN), while servers use
+ * its libsql/Hrana + Upstash-style REST endpoint (`browser_db_rest`) with a
+ * minted per-project token — see `sqliteConnectivity()`.
  */
 
 import type { Database, DbKind, Deployment, BrowserDbPolicy } from "@/lib/api";
@@ -222,29 +223,33 @@ export interface SqliteDb {
   /** Newest deployment of the project — the redeploy target. */
   redeployTarget: Deployment | null;
   replicaFile: string;
+  /** Server-derived REST/Hrana URLs (`browser_db_rest`), when the lane's poll
+   *  carried them. Display-only — the token gates actual use. */
+  restUrls?: { libsql_url: string; sql_url: string };
 }
 
 export const SQLITE_NO_DSN =
-  "No connection string — a browser-replicated database has no server-side wire " +
-  "endpoint. (The managed SQLite kind does: create one from Browse Storage to get " +
-  "a libsql:// DSN.)";
+  "Browsers never use a connection string — each admitted browser holds a full " +
+  "local replica and queries it in-process. Servers, CI and curl use this " +
+  "database's libsql/REST endpoint with a minted access token (below).";
 
 /**
  * The honest capability statement for the SQLite lane. Every clause is a fact
- * from `docs/browser-db-contract.md` / `crates/hive-cloud/src/browser_db.rs`,
- * not a roadmap promise.
+ * from `docs/browser-db-contract.md` / `crates/hive-cloud/src/browser_db.rs` /
+ * `crates/hive-cloud/src/browser_db_rest.rs`, not a roadmap promise.
  */
 export function sqliteConnectivity(): { how: string[]; missing: string[] } {
   return {
     how: [
       "Each admitted browser holds a full read-write replica in OPFS and your app queries it locally through the run-node worker — no network round trip, no DSN.",
       "The fleet keeps one cr-sqlite replica per project on every node; it converges with browsers over the authenticated sync exchange (Op::CrrSync on the hive/browser/0 ALPN), which is a change-batch merge, not a query protocol.",
-      "Access is granted by the admission lease, scoped to the tenant. Team scope is read-write; public read (when enabled) is read-only.",
+      "Servers, CI jobs and curl reach the same replica over plain HTTP: a libsql/Hrana endpoint (v2/v3 pipeline — any libsql/Turso client) and an Upstash-style POST /sql JSON endpoint, both gated by a per-project access token you mint here (team = read+write, public = read-only).",
+      "Access is granted per scope. Team scope is read-write; public read (when enabled) is read-only, re-checked live on every request.",
     ],
     missing: [
-      "This lane has no libsql/Hrana endpoint: it converges by change-batch merge, and a file copy is not a merge. For a server-queryable SQLite database with a libsql:// DSN, create the managed SQLite kind instead — that is a different database, not this one exposed differently.",
-      "There is no server-side connection pool for it, because there are no server-side connections to pool.",
-      "Server-side (Node/Python function) access to THIS replica is deliberately deferred — contract §9 lists an injected DSN / host op as not yet designed.",
+      "Interactive Hrana streams (a baton spanning several HTTP requests) and the v3 cursor are not supported in v1 — every pipeline request is self-contained; use the batch request type for atomic multi-statement groups.",
+      "There is no server-side connection pool for it, because there are no persistent server-side connections to pool — each REST request is one short-lived connection behind a per-project concurrency cap.",
+      "Server-side (Node/Python function) access with an injected DSN / host op is deliberately deferred — contract §9 lists it as not yet designed; the REST endpoint is the server path today.",
     ],
   };
 }
@@ -317,6 +322,7 @@ function newestAny(deployments: Deployment[]): Deployment | null {
 export function sqliteDatabases(
   deployments: Deployment[],
   settings: Record<string, BrowserDbPolicy | null | undefined>,
+  restUrls?: Record<string, { libsql_url: string; sql_url: string }>,
 ): SqliteDb[] {
   const byProject = new Map<string, Deployment[]>();
   for (const d of deployments) {
@@ -349,11 +355,15 @@ export function sqliteDatabases(
         liveDeployment,
         redeployTarget: newestAny(list),
         replicaFile: replicaFileName(project),
+        restUrls: restUrls?.[project],
       };
     });
 }
 
 export function sqliteRow(db: SqliteDb): UnifiedDb {
+  // The libsql base URL is shown host-only, exactly like the managed kinds
+  // show host:port — the address is not the secret, the minted token is.
+  const restHost = db.restUrls ? endpointHost(db.restUrls.libsql_url) : "";
   return {
     id: sqliteRouteId(db.project),
     href: `/storage/${encodeURIComponent(sqliteRouteId(db.project))}`,
@@ -371,8 +381,15 @@ export function sqliteRow(db: SqliteDb): UnifiedDb {
     createdTitle: db.live
       ? "Live since the deployment that carries this project's browser_db block."
       : "Not carried by a Ready deployment yet — redeploy to apply.",
-    endpoint: null,
-    noEndpointReason: SQLITE_NO_DSN,
+    endpoint: restHost
+      ? {
+          key: "LIBSQL_URL",
+          address: restHost,
+          reach: reachOfHost(restHost),
+          protocol: "libsql + REST (token-gated)",
+        }
+      : null,
+    noEndpointReason: restHost ? "" : SQLITE_NO_DSN,
     source: "sqlite",
     sqlite: db,
   };

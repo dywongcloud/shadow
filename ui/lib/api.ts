@@ -1075,7 +1075,37 @@ export type BrowserDbStatusResponse =
         sites: number;
         last_modified_ms: number | null;
       };
+      /** The server-derived REST/Hrana surface (`browser_db_rest`). URLs come
+       *  from the backend's own `api_base()` — never reconstructed client-side.
+       *  `*_token_ms` disclose existence + mint time only; the plaintext token
+       *  is shown once at mint and only its hash is stored server-side. */
+      rest: {
+        libsql_url: string;
+        sql_url: string;
+        team_token_ms: number | null;
+        public_token_ms: number | null;
+      };
     };
+
+/** `POST /v1/projects/:project/browser-db/rest-token` response — the plaintext
+ *  `token` is returned ONCE and never recoverable again (rotate to replace). */
+export interface BrowserDbRestMint {
+  project: string;
+  scope: "team" | "public";
+  token: string;
+  libsql_url: string;
+  sql_url: string;
+}
+
+/** Mint (rotating) a browser_db REST credential. `scope` "team" is read+write;
+ *  "public" is read-only and mintable only while the policy has public_read. */
+export function mintBrowserDbRestToken(project: string, scope: "team" | "public"): Promise<BrowserDbRestMint> {
+  return apiSend<BrowserDbRestMint>(
+    "POST",
+    `/v1/projects/${encodeURIComponent(project)}/browser-db/rest-token`,
+    { scope },
+  );
+}
 
 /** See `ProjectSettings.git_ci`. Mirrors `hive-cloud::project_settings::GitCiStatus`. */
 export interface GitCiStatus {

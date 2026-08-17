@@ -90,7 +90,7 @@ function useDatabases() {
   // different failure modes, so the backend now answers the whole lane at once
   // (`browser_db::browser_db_projects_http`, tenant-filtered server-side).
   const { data: browserDb, refresh: refreshBrowserDb } =
-    usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy }[] }>(
+    usePoll<{ projects: { project: string; browser_db: BrowserDbPolicy; rest?: { libsql_url: string; sql_url: string } }[] }>(
       "/v1/browser-db/projects",
       15000,
     );
@@ -99,11 +99,16 @@ function useDatabases() {
     for (const entry of browserDb?.projects ?? []) out[entry.project] = entry.browser_db;
     return out;
   }, [browserDb]);
+  const restUrls = useMemo(() => {
+    const out: Record<string, { libsql_url: string; sql_url: string }> = {};
+    for (const entry of browserDb?.projects ?? []) if (entry.rest) out[entry.project] = entry.rest;
+    return out;
+  }, [browserDb]);
   // Identity is the project, but the lane is fetched whole — so re-reading it
   // after a save is one refresh, not a per-project one.
   const refreshProject = useCallback(async (_project?: string) => { await refreshBrowserDb(); }, [refreshBrowserDb]);
 
-  const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings), [deployments, settings]);
+  const sqlite = useMemo(() => sqliteDatabases(deployments ?? [], settings, restUrls), [deployments, settings, restUrls]);
   const rows = useMemo(() => unifiedDatabases(managed ?? [], sqlite), [managed, sqlite]);
 
   // `managed` null AND no sqlite row = still loading / genuinely nothing. The
@@ -257,8 +262,14 @@ function ConnectionCell({ row }: { row: UnifiedDb }) {
     e.preventDefault();
     e.stopPropagation();
     try {
-      const full = await apiGet<Database>(`/v1/databases/${row.id}/credentials`, { fresh: true });
-      const value = full.connection?.[endpoint.key] ?? "";
+      // browser_sqlite has no credentials endpoint — its address IS the full
+      // value (the libsql base URL is not secret; the minted token is).
+      const value = row.source === "sqlite"
+        ? row.sqlite?.restUrls?.libsql_url ?? ""
+        : await (async () => {
+            const full = await apiGet<Database>(`/v1/databases/${row.id}/credentials`, { fresh: true });
+            return full.connection?.[endpoint.key] ?? "";
+          })();
       if (!value) {
         toast(`No ${endpoint.key} available yet`, {});
         return;
