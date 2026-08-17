@@ -127,6 +127,22 @@ pub fn install_bundle(bundle: &CertBundle) -> anyhow::Result<()> {
 }
 
 /// A rustls `ServerConfig` using the SNI resolver (plus HTTP/1.1+h2 ALPN).
+/// TLS config for PUBLISHED raw ports (compose `ports: ["9001:9001"]` served
+/// with TLS termination): the same SNI resolver as the 443 gateway — same
+/// wildcard/per-host certs, so `https://<project>.<apps-domain>:9001` presents
+/// exactly the certificate the browser already trusts for the project — but
+/// ALPN pinned to http/1.1 ONLY. The gateway's h2 offer would be wrong here:
+/// the terminated plaintext is spliced byte-for-byte into the container's own
+/// HTTP server, and a client that negotiated h2 via ALPN would then speak h2
+/// frames at an HTTP/1.1 backend.
+pub fn raw_server_config() -> Arc<rustls::ServerConfig> {
+    let mut cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(SniResolver));
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Arc::new(cfg)
+}
+
 pub fn server_config() -> Arc<rustls::ServerConfig> {
     let mut cfg = rustls::ServerConfig::builder()
         .with_no_client_auth()
