@@ -2067,8 +2067,29 @@ async fn run_build(
         if f.max_duration_secs == fluid_core::FunctionConfig::default().max_duration_secs {
             f.max_duration_secs = fsettings.default_max_duration_secs;
         }
-        f.vcpus = fsettings.vcpus.max(1);
-        f.memory_mib = fsettings.memory_mib;
+        // Same rule, same reason, for the size knobs: a value the FUNCTION
+        // declared must survive the project default. These two were left as
+        // unconditional overwrites when `max_duration_secs` above was fixed,
+        // so a fluid.json `{"memory_mib": 8192}` (or a container's
+        // `{"container":{"memory":"8g"}}`, which lands here as `memory_mib`)
+        // was silently replaced by the dashboard default on EVERY deploy. The
+        // user-visible shape is the reported one: the setting has no effect,
+        // and a container that genuinely needs the memory is OOM-killed
+        // (exit 137) — which then presents as repeated cold-start failure and
+        // an open circuit, blamed on the app.
+        //
+        // Distinguishing "explicitly wrote the default" from "omitted" is not
+        // possible through serde here, and it does not matter: falling back to
+        // the project setting when the function is AT the default is a no-op
+        // whenever they agree, and honours the project default when they
+        // differ — which is exactly the intent.
+        if f.vcpus == fluid_core::FunctionConfig::default().vcpus {
+            f.vcpus = fsettings.vcpus.max(1);
+        }
+        if f.memory_mib == fluid_core::FunctionConfig::default().memory_mib {
+            f.memory_mib = fsettings.memory_mib;
+        }
+        f.vcpus = f.vcpus.max(1);
         // Serverless GPU: the project-level toggle marks every function; a
         // per-function fluid.json `gpu: true` (already parsed into the manifest)
         // is preserved — settings can only turn GPU ON, never strip a
