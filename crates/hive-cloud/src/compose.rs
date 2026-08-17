@@ -304,7 +304,9 @@ fn parse_build(v: Option<&serde_yaml::Value>) -> Option<ComposeBuild> {
 /// `{ target: N, protocol: "udp" }`). We want what the app listens on, plus whether
 /// the mapping declared a real transport change — see [`ParsedService::protocol`].
 fn container_port(ports: &[serde_yaml::Value]) -> Option<(u16, ServiceProtocol)> {
-    container_ports(ports).first().map(|p| (p.container, p.protocol))
+    container_ports(ports)
+        .first()
+        .map(|p| (p.container, p.protocol))
 }
 
 /// EVERY container-side port in a `ports:` sequence, in declaration order, deduped
@@ -344,7 +346,11 @@ fn one_container_port(p: &serde_yaml::Value) -> Option<ComposePort> {
         // platform has no lane for (publish implies a concrete public port), so
         // it normalizes to internal-only rather than a literal preference of 0.
         let host = if segs.len() >= 2 {
-            segs[segs.len() - 2].trim().parse::<u16>().ok().filter(|&h| h != 0)
+            segs[segs.len() - 2]
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|&h| h != 0)
         } else {
             None
         };

@@ -1143,6 +1143,17 @@ impl Fluid {
                             });
                         }
                         match free_port() {
+                            // A fresh probe returning EXACTLY the launch's own
+                            // primary host port would collide with the primary
+                            // `-p` pairing (the emitters dedupe on host ==
+                            // launch.port, so the extra spec would be
+                            // advertised in tcp_ports yet published nowhere —
+                            // its traffic spliced into the PRIMARY container
+                            // port). Skip it; the next cold start re-probes.
+                            Ok(hp) if hp == port => {
+                                warn!(func = %key, container_port = s.container_port, "loopback TCP probe returned the primary host port; skipping this publish for this instance");
+                                None
+                            }
                             Ok(hp) => Some(hive_core::TcpPublish {
                                 container_port: s.container_port,
                                 host_port: hp,
@@ -1589,10 +1600,9 @@ impl Fluid {
         // with the pools themselves joined is enough — no semaphore needed.
         let sampled_pools = futures::future::join_all(targets.into_iter().map(
             |(key, handles, current, max)| async move {
-                let samples = futures::future::join_all(
-                    handles.iter().map(|h| self.backend.cpu_percent(h)),
-                )
-                .await;
+                let samples =
+                    futures::future::join_all(handles.iter().map(|h| self.backend.cpu_percent(h)))
+                        .await;
                 (key, samples, current, max)
             },
         ))

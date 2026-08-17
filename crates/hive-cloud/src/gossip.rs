@@ -386,6 +386,46 @@ pub async fn dispatch(cloud: &Arc<CloudState>, method: u8, path: &str, body: &[u
             )
             .await)
         }
+        // Relocation reap (single hop): remove THIS node's superseded
+        // PRODUCTION-lane records of the project — previews and settings stay.
+        // A deliberately separate arm from the full delete below so a
+        // pre-upgrade peer answers NO_HANDLER (safe no-op) instead of running
+        // the full teardown the reaper used to trigger (which is how preview
+        // records and node-local team tags were being destroyed fleet-wide).
+        p if method == hive_p2p::GOSSIP_POST
+            && p.starts_with("/v1/projects/")
+            && p.contains("/reap-deployments") =>
+        {
+            let project = p
+                .trim_start_matches("/v1/projects/")
+                .split('/')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let team = team_claims(p)
+                .map(|axum::Extension(cl)| crate::admin::norm(&cl.tenant).to_string())
+                .or_else(|| {
+                    if crate::auth::enforced() {
+                        None
+                    } else {
+                        qparam(p, "team")
+                    }
+                })
+                .unwrap_or_default();
+            let owner = cloud.projects.team_of(&project);
+            let owns_settings = !team.is_empty() && crate::admin::norm(&owner) == team;
+            let owns_deploys = !team.is_empty()
+                && cloud.gw.list().iter().any(|d| {
+                    d.project == project && crate::admin::record_tenant(&d.tenant) == team
+                });
+            if project.is_empty() || !(owns_settings || owns_deploys) {
+                return serde_json::to_vec(&serde_json::json!({ "error": "not owner" }))
+                    .unwrap_or_default();
+            }
+            let reaped = crate::admin::reap_deployments_local(&cloud, &project).await;
+            serde_json::to_vec(&serde_json::json!({ "project": project, "reaped": reaped }))
+                .unwrap_or_default()
+        }
         // Mesh project-delete cascade (single hop): the coordinator's cross-node
         // teardown for hosting nodes reachable only over iroh. Team must OWN the
         // project on THIS node (or the project must be absent — idempotent).

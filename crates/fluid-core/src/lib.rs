@@ -832,7 +832,10 @@ pub fn browser_policy_digest(
         BROWSER_POLICY_DIGEST_DOMAIN.len()
             + 32
             + 4
-            + abis.iter().map(|(_, abi)| 8 + 1 + 4 + abi.len()).sum::<usize>()
+            + abis
+                .iter()
+                .map(|(_, abi)| 8 + 1 + 4 + abi.len())
+                .sum::<usize>()
             + 1
             + 8 * 3,
     );
@@ -1760,7 +1763,8 @@ impl Manifest {
                     // text — else a catch-all `/*` (2 chars) would outrank the
                     // `/api` (4 chars) it is meant to be the fallback for the
                     // moment wildcards became matchable.
-                    Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {}
+                    Some(b) if route_prefix(&b.pattern).len() >= route_prefix(&r.pattern).len() => {
+                    }
                     _ => best = Some(r),
                 }
             }

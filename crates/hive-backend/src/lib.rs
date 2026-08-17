@@ -1047,9 +1047,7 @@ pub(crate) async fn podman_run_container(
     if !entrypoint.is_empty() {
         // podman's `--entrypoint` takes a JSON array for a multi-word form.
         base.push("--entrypoint".into());
-        base.push(
-            serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")),
-        );
+        base.push(serde_json::to_string(&entrypoint).unwrap_or_else(|_| entrypoint.join(" ")));
     }
     base.push(image.to_string());
     // `command:` OVERRIDES the image's CMD, so it is trailing argv AFTER the
@@ -1160,7 +1158,9 @@ pub(crate) async fn podman_run_container(
                 .await
             {
                 Ok(o) if o.status.success() => {
-                    let st = String::from_utf8_lossy(&o.stdout).trim().to_ascii_lowercase();
+                    let st = String::from_utf8_lossy(&o.stdout)
+                        .trim()
+                        .to_ascii_lowercase();
                     !matches!(st.as_str(), "exited" | "stopped" | "created" | "configured")
                 }
                 Ok(o) => {

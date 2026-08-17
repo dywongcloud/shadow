@@ -1351,12 +1351,22 @@ async fn run_build(
                 // "keep" list only in the sense that they were never reached —
                 // `names` still lists every intended target, so a node that is
                 // simply unreachable right now is NOT reaped as a stale copy.
-                let c2 = cloud.clone();
-                let p2 = project.clone();
-                let n2 = names.clone();
-                tokio::spawn(async move {
-                    cleanup_non_targets(&c2, &p2, &n2).await;
-                });
+                // Relocation reaping is PRODUCTION-lane semantics: only a
+                // production build defines a new authoritative placement whose
+                // non-targets hold "stale copies". A preview build must never
+                // reap anything (its placement says nothing about where
+                // production lives), and an UNRESOLVABLE environment (no
+                // explicit target, production_branch unknown here) skips the
+                // reap — stale copies linger until the next classified
+                // production build, which is retention, never correctness.
+                if request_is_production(cloud, &req, &project) == Some(true) {
+                    let c2 = cloud.clone();
+                    let p2 = project.clone();
+                    let n2 = names.clone();
+                    tokio::spawn(async move {
+                        cleanup_non_targets(&c2, &p2, &n2).await;
+                    });
+                }
             } else if cancelled {
                 log(if had_prior_deployment {
                     "Build cancelled by user — keeping the existing deployment in place.".into()
@@ -2693,7 +2703,49 @@ async fn run_build(
 
     // Tenant = the project's team; tags the deployment + every cell it spawns so
     // compute is partitioned and quota'd per team (same resolver billing/audit use).
-    let tenant = cloud.projects.team_of(&manifest.project);
+    let tenant = {
+        // STICKY: never downgrade an already-tagged project to untagged. The
+        // team tag lives in node-local ProjectSettings; on a node that never
+        // ran set_team (webhook/poll-triggered build landing on a fresh
+        // placement) team_of comes back untagged, and stamping THAT onto the
+        // record hid the deployment from every fail-closed tenant listing —
+        // "the project disappeared from the account". Inherit from the newest
+        // record that knows (local, then gossiped peers) before accepting
+        // untagged as truth.
+        let own = cloud.projects.team_of(&manifest.project);
+        if crate::admin::record_tenant(&own) != crate::admin::UNTAGGED_TENANT {
+            own
+        } else {
+            let inherited = cloud
+                .gw
+                .list()
+                .into_iter()
+                .filter(|d| d.project == manifest.project)
+                .max_by_key(|d| d.created_at_ms)
+                .map(|d| d.tenant.clone())
+                .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
+                .or_else(|| {
+                    cloud
+                        .peer_deployments
+                        .read()
+                        .values()
+                        .flatten()
+                        .filter(|d| d.project == manifest.project)
+                        .max_by_key(|d| d.created_at_ms)
+                        .map(|d| d.tenant.clone())
+                        .filter(|t| crate::admin::record_tenant(t) != crate::admin::UNTAGGED_TENANT)
+                });
+            match inherited {
+                Some(t) => {
+                    // Repair the local settings row too, so the NEXT build (and
+                    // every listing served from this node) has the tag directly.
+                    cloud.projects.set_team(&manifest.project, &t);
+                    t
+                }
+                None => own,
+            }
+        }
+    };
     let info = cloud.gw.deploy_full(
         build_dir.to_string_lossy().into_owned(),
         manifest,
@@ -2852,13 +2904,38 @@ async fn run_build(
         }
     }
 
+    // The host THIS deployment answers on. `info.alias` is the PROJECT's
+    // production host — correct for a production deploy, and exactly wrong for
+    // a PREVIEW: stamping it on the build record sent the deploy page, the
+    // GitHub commit status, the audit line and the webhook all to the
+    // production URL, so "selecting the preview" showed production. A preview's
+    // own host is its immutable per-deployment alias (`id_alias`), which always
+    // routes to THIS deployment — including while a different deployment holds
+    // the production domain.
+    let self_alias = if is_production {
+        info.alias.clone()
+    } else if !info.commit_alias.is_empty() {
+        // Prefer the commit alias for previews: it is minted on EVERY fanout
+        // target (same commit), so it routes through pooled ingress even when
+        // round-robin lands on a different target node — the per-deployment
+        // id_alias exists only on the node that registered that record.
+        info.commit_alias.clone()
+    } else if !info.id_alias.is_empty() {
+        info.id_alias.clone()
+    } else {
+        info.alias.clone()
+    };
     if build_failed {
         log(format!(
-            "Deployment created (build failed). Aliased to {}",
+            "Deployment created (build failed). Aliased to {self_alias}"
+        ));
+    } else if is_production {
+        log(format!("Deployment ready. Aliased to {self_alias}"));
+    } else {
+        log(format!(
+            "Preview deployment ready. Aliased to {self_alias} (production stays on {})",
             info.alias
         ));
-    } else {
-        log(format!("Deployment ready. Aliased to {}", info.alias));
     }
     cloud.builds.update(bid, |b| {
         b.state = if build_failed {
@@ -2868,7 +2945,7 @@ async fn run_build(
         };
         b.finished_ms = Some(now_ms());
         b.deployment_id = Some(info.id.to_string());
-        b.alias = Some(info.alias.clone());
+        b.alias = Some(self_alias.clone());
     });
     // Persist HERE, not only at the tail of this function: `deploy_full` above
     // already minted the (in-memory-only) Deployment record, and this update
@@ -2939,14 +3016,14 @@ async fn run_build(
         },
         "deployment",
         &info.id.to_string(),
-        &format!("{} → {}", info.project, info.alias),
+        &format!("{} → {self_alias}", info.project),
     );
     crate::persist::persist(cloud);
     // Best-effort final GitHub commit status (success/failure). No-op without a
     // GITHUB_TOKEN; points the check at the live deployment URL.
     {
         let (repo, sha) = (req.repo_url.clone(), full_sha.clone());
-        let url = cloud.deploy_url(&info.alias);
+        let url = cloud.deploy_url(&self_alias);
         let (state, desc) = if build_failed {
             ("failure", "Build failed")
         } else if is_production {
@@ -2970,7 +3047,7 @@ async fn run_build(
         serde_json::json!({
             "id": info.id.to_string(),
             "project": info.project,
-            "url": cloud.deploy_url(&info.alias),
+            "url": cloud.deploy_url(&self_alias),
             "state": "ready",
             "production": is_production,
             "target": if is_production { "production" } else { "preview" },
@@ -3008,8 +3085,10 @@ async fn run_build(
                 // for stateless deploys, where the secondary flag is inert.
                 let _ = fanout_remote(cloud, bid, &req, &project, &remote, false).await;
             }
-            let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
-            cleanup_non_targets(cloud, &project, &names).await;
+            if is_production {
+                let names: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
+                cleanup_non_targets(cloud, &project, &names).await;
+            }
         }
     }
     Ok(())
@@ -3151,6 +3230,18 @@ async fn fanout_remote(
     let dispatch_futs = remote.iter().enumerate().map(|(idx, t)| {
         let mut dreq = req.clone();
         dreq.no_fanout = true;
+        // Stamp the ENVIRONMENT before dispatch whenever this node can resolve
+        // it: the remote's classification uses ITS node-local production_branch
+        // — never gossiped, never previously forwarded — so a fresh node (or
+        // one whose settings a pre-fix reaper wiped) classified a preview
+        // branch as production, claimed the production domain, and poisoned its
+        // own production_branch with the preview branch. With the target
+        // explicit, the remote's branch heuristic never runs.
+        if dreq.target.is_none() {
+            if let Some(is_prod) = request_is_production(cloud, &dreq, project) {
+                dreq.target = Some(if is_prod { "production" } else { "preview" }.into());
+            }
+        }
         // Everyone but the designated primary is a secondary replica — see this
         // fn's doc + the stateful fanout-replica guard in `run_build`.
         dreq.fanout_secondary = !(primary_first && idx == 0);
@@ -3578,6 +3669,30 @@ async fn mirror_remote_build(
 /// After placing a project on its target node(s), tell every OTHER node that
 /// still hosts it to delete it — so changing regions RELOCATES the deployment
 /// rather than leaving stale copies. Best-effort; never fails the deploy.
+/// Resolve a request's environment WITHOUT running the build: Some(true/false)
+/// when this node can classify it (explicit target, or branch vs a locally
+/// KNOWN production_branch), None when it genuinely cannot. Callers that gate
+/// destructive production-lane actions treat None as "not production".
+fn request_is_production(
+    cloud: &Arc<CloudState>,
+    req: &fluid_core::GitDeployRequest,
+    project: &str,
+) -> Option<bool> {
+    match req.target.as_deref().map(str::trim) {
+        Some("production") => Some(true),
+        Some("preview") => Some(false),
+        _ => {
+            let pb = cloud.projects.production_branch_of(project);
+            let branch = req.branch.as_deref().unwrap_or("").trim();
+            if !pb.is_empty() && !branch.is_empty() {
+                Some(branch == pb)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_names: &[String]) {
     // SELF cleanup first: peer_routes only ever lists PEERS, so a stale copy on
     // THIS (coordinator) node would otherwise survive a relocation — wasting disk,
@@ -3592,11 +3707,14 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
             sub == project || sub.starts_with(&format!("{project}-"))
         });
         if hosts_locally {
-            let removed = cloud.gw.remove_project(project).await;
+            // Superseded PRODUCTION records only — a preview hosted here is not
+            // a stale copy of the production placement; reaping it is what made
+            // preview URLs 404 after every production push.
+            let removed = cloud.gw.remove_project_superseded(project).await;
             tracing::info!(
                 project,
                 removed = removed.len(),
-                "relocation: removed stale local copy from coordinator"
+                "relocation: removed stale local production copy from coordinator"
             );
             crate::persist::persist(cloud);
         }
@@ -3622,11 +3740,19 @@ async fn cleanup_non_targets(cloud: &Arc<CloudState>, project: &str, target_name
     // the build was stamped Ready, i.e. it showed up to the user as minutes of
     // "Building" on a deployment that was already serving. The receiving arm
     // is idempotent and order-independent, so fanning out is safe.
+    // SCOPED reap, never the full project delete: the receiving arm removes
+    // only superseded production-lane records — previews survive, and so do
+    // the peer's node-local ProjectSettings (team tag, production_branch,
+    // env). Reusing the full-teardown primitive here is what made projects
+    // vanish from accounts (the team tag is how listings find them) and made
+    // preview records disappear after every production push. A pre-upgrade
+    // peer answers NO_HANDLER and keeps its stale copies until it upgrades —
+    // retention, not correctness.
     futures::future::join_all(
         peers
             .iter()
             .filter(|node| !target_names.iter().any(|t| t == *node))
-            .map(|node| crate::admin::dispatch_project_delete(cloud, node, project, &team)),
+            .map(|node| crate::admin::dispatch_deployments_reap(cloud, node, project, &team)),
     )
     .await;
 }

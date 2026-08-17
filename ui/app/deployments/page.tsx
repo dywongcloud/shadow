@@ -8,7 +8,7 @@ import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, cancelBuild, usePoll, type Deployment } from "@/lib/api";
 import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
-import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+import { deploymentUrl, deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 import { RedeployModal } from "@/components/redeploy-modal";
 
 export default function DeploymentsPage() {
@@ -130,8 +130,10 @@ export default function DeploymentsPage() {
                   {/* Prefer the SHARED, mesh-routable commit alias for previews; the
                       per-node id alias (dpl-<id>) only resolves on its own host node
                       under multi-region fanout, so it 404s through the pooled ingress. */}
-                  {(() => { const self = d.production ? d.alias : (d.commit_alias || d.branch_alias || d.id_alias || d.alias);
-                    return <a className="text-link hover:underline" href={deploymentUrl(self)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{deploymentHost(self)}</a>; })()}
+                  {(() => { const self = deploymentSelfAlias(d);
+                    return self
+                      ? <a className="text-link hover:underline" href={deploymentUrl(self, d.region_code)} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()}>{deploymentHost(self, d.region_code)}</a>
+                      : <span className="text-muted">no preview URL yet</span>; })()}
                 </Td>
                 <Td className="text-xs text-secondary hidden md:table-cell">
                   {d.git ? <span className="font-mono">{d.git.branch}@{d.git.commit || "—"}</span> : <span className="text-muted">CLI</span>}

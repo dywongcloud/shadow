@@ -14,7 +14,7 @@ import { RedeployModal } from "@/components/redeploy-modal";
 import { RawPortConnections } from "@/components/raw-port-connections";
 import { apiSend, cancelBuild, usePoll, type Deployment, type Build, type Event } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
-import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
+import { deploymentUrl, deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
 
 // `https://github.com/owner/repo(.git)` (or scp-style) → `owner/repo` for display.
 function ownerRepo(url: string): string {
@@ -81,8 +81,12 @@ function DeploymentDetail({ id }: { id: string }) {
     build && build.finished_ms ? `${Math.max(1, Math.round((build.finished_ms - build.started_ms) / 1000))}s` : building ? "in progress" : "—";
   const created = dep?.created_at_ms ?? build?.started_ms ?? 0;
   const creator = dep?.creator || "—";
-  // A preview opens at its own immutable URL; production at the production alias.
-  const self = dep ? (dep.production ? dep.alias : dep.commit_alias || dep.branch_alias || dep.id_alias || dep.alias) : build?.alias;
+  // A preview opens at its own immutable URL; production at the production
+  // alias — and a preview with NO alias of its own renders as pending rather
+  // than falling back to the production URL (`deploymentSelfAlias` returns ""
+  // there). `build?.alias` covers the record-not-yet-visible window; the
+  // backend stamps it with the deployment's own self alias per environment.
+  const self = dep ? deploymentSelfAlias(dep) : build?.alias;
   const url = self ? deploymentUrl(self, dep?.region_code) : "";
   const host = self ? deploymentHost(self, dep?.region_code) : "";
   const git = dep?.git ?? (build?.repo_url ? { repo_url: build.repo_url, branch: build.branch, commit: build.commit, commit_message: build.commit_message } : null);

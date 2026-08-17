@@ -599,6 +599,31 @@ impl Gateway {
     }
 
     /// Delete every deployment for a project. Returns the removed deployment ids.
+    /// Relocation-scoped removal: drop this node's PRODUCTION-lane deployment
+    /// records for a project (target != "preview"; empty target = pre-target
+    /// legacy = production lane) and KEEP every preview. The relocation reaper
+    /// runs after every promotable production build against every non-target
+    /// node — using the full [`Registry::remove_project`] there destroyed
+    /// preview deployments hosted on nodes the new production placement did
+    /// not pick (preview URL 404, row gone from the table), and vice versa.
+    /// A preview is not a "stale copy" of anything: it was placed where it
+    /// was placed, and only a user delete or preview-retention policy may
+    /// remove it.
+    pub async fn remove_project_superseded(&self, project: &str) -> Vec<String> {
+        let ids: Vec<String> = {
+            let st = self.state.lock();
+            st.deployments
+                .values()
+                .filter(|d| d.project == project && d.target != "preview")
+                .map(|d| d.id.to_string())
+                .collect()
+        };
+        for id in &ids {
+            self.remove(id).await;
+        }
+        ids
+    }
+
     pub async fn remove_project(&self, project: &str) -> Vec<String> {
         let ids: Vec<String> = {
             let st = self.state.lock();
@@ -1173,30 +1198,32 @@ async fn handle_public(State(gw): State<Arc<Gateway>>, req: Request) -> Response
                 )
                 .await
             } else {
-            match dep.manifest.origin_function.clone() {
-                Some(origin) => match read_static_file(&dep, &path, enc).await {
-                    Some(r) => r,
-                    None => {
-                        let body_bytes = match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
-                            Ok(b) => b,
-                            Err(_) => {
-                                return (StatusCode::BAD_REQUEST, "body too large").into_response()
-                            }
-                        };
-                        proxy_function(
-                            &gw,
-                            &dep,
-                            &origin,
-                            &parts.method,
-                            &path_q,
-                            &parts.headers,
-                            body_bytes,
-                        )
-                        .await
-                    }
-                },
-                None => serve_static(&dep, &path, enc).await,
-            }
+                match dep.manifest.origin_function.clone() {
+                    Some(origin) => match read_static_file(&dep, &path, enc).await {
+                        Some(r) => r,
+                        None => {
+                            let body_bytes =
+                                match axum::body::to_bytes(body, 16 * 1024 * 1024).await {
+                                    Ok(b) => b,
+                                    Err(_) => {
+                                        return (StatusCode::BAD_REQUEST, "body too large")
+                                            .into_response()
+                                    }
+                                };
+                            proxy_function(
+                                &gw,
+                                &dep,
+                                &origin,
+                                &parts.method,
+                                &path_q,
+                                &parts.headers,
+                                body_bytes,
+                            )
+                            .await
+                        }
+                    },
+                    None => serve_static(&dep, &path, enc).await,
+                }
             }
         }
         RouteTarget::Function(name) => {
@@ -2639,12 +2666,11 @@ async fn try_browser(
                 BrowserScope::Public => true,
                 BrowserScope::Team => caller_tenant.as_deref() == Some(target.tenant.as_str()),
             };
-            let quota_ok = browser
-                .invoke_quota
-                .get(&target.endpoint_id)
-                .is_none_or(|(window_start, count)| {
+            let quota_ok = browser.invoke_quota.get(&target.endpoint_id).is_none_or(
+                |(window_start, count)| {
                     now.saturating_sub(*window_start) >= quota_window_ms || *count < quota_max
-                });
+                },
+            );
             target.tenant == dep.tenant
                 && target.deployment == dep.id.as_str()
                 && target.function == name

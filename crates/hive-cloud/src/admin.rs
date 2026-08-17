@@ -937,6 +937,30 @@ pub(crate) async fn project_network_put(
         });
     }
     let recs = c.gw.deployment_records();
+    // A Settings→Network save rebuilds the spec list from the FORM, which has
+    // no notion of compose publish requests — leaving `preferred_public_port`
+    // blank here silently UNPUBLISHED every compose-published port fleet-wide
+    // within one reconcile tick (the spec drops out of `raw_targets`, loses
+    // its stamp, and every raw-proxy listener closes). The publish request
+    // belongs to the compose file, not this form: carry it over from the
+    // current record's matching spec.
+    {
+        let current: Vec<fluid_core::PortSpec> = recs
+            .iter()
+            .filter(|r| r.project == project)
+            .max_by_key(|r| (r.production, r.created_at_ms))
+            .and_then(|r| r.manifest.functions.first())
+            .map(|f| f.ports.clone())
+            .unwrap_or_default();
+        for spec in specs.iter_mut() {
+            if let Some(cur) = current
+                .iter()
+                .find(|cs| cs.container_port == spec.container_port && cs.protocol == spec.protocol)
+            {
+                spec.preferred_public_port = cur.preferred_public_port;
+            }
+        }
+    }
     let rec = recs
         .iter()
         .filter(|r| r.project == project && r.production)
@@ -3583,9 +3607,11 @@ async fn project_delete(
             if !unreached.is_empty() {
                 let (c2, project2, team2) = (c.clone(), project.clone(), t.clone());
                 tokio::spawn(async move {
-                    futures::future::join_all(unreached.iter().map(|node| {
-                        dispatch_project_delete_with(&c2, node, &project2, &team2, 3)
-                    }))
+                    futures::future::join_all(
+                        unreached.iter().map(|node| {
+                            dispatch_project_delete_with(&c2, node, &project2, &team2, 3)
+                        }),
+                    )
                     .await;
                 });
             }
@@ -3679,6 +3705,80 @@ async fn project_delete(
     Ok(Json(
         json!({ "project": project, "removed_deployments": ids }),
     ))
+}
+
+/// LOCAL-ONLY relocation reap (the receiving side of
+/// [`dispatch_deployments_reap`]): remove THIS node's production-lane
+/// deployment records for the project and nothing else — previews stay,
+/// ProjectSettings stay (team tag, production_branch, env), the relational row
+/// stays, no resource purge. The full-teardown primitive
+/// ([`delete_project_local`]) was reused for relocation reaping and its
+/// settings wipe is what made projects vanish from accounts (the team tag is
+/// how every listing filter finds them) and made push-classified builds treat
+/// preview branches as production (production_branch erased).
+pub(crate) async fn reap_deployments_local(c: &Arc<CloudState>, project: &str) -> usize {
+    let ids = c.gw.remove_project_superseded(project).await;
+    if !ids.is_empty() {
+        record_event(
+            c,
+            project,
+            "reap",
+            &format!(
+                "relocation: removed {} superseded production record(s) of {project}",
+                ids.len()
+            ),
+        );
+        crate::persist::persist(c);
+    }
+    ids.len()
+}
+
+/// Relocation-reap dispatch to ONE peer over the iroh mesh. Deliberately a NEW
+/// arm rather than a parameter on the delete arm: a pre-upgrade peer answers
+/// NO_HANDLER (a safe no-op — its stale copies linger until it upgrades)
+/// instead of an old binary ignoring the scope parameter and running the FULL
+/// teardown, which is the destroy-by-omission this replaces.
+pub(crate) async fn dispatch_deployments_reap(
+    c: &Arc<CloudState>,
+    node: &str,
+    project: &str,
+    team: &str,
+) -> bool {
+    if node == c.node_name {
+        return true;
+    }
+    for attempt in 0..2u32 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+        }
+        let target = c
+            .registry
+            .nodes()
+            .into_iter()
+            .find(|n| n.name == node)
+            .and_then(|n| Some((n.peer_id?, n.iroh_addr?)));
+        let Some((id, addr)) = target else {
+            return false;
+        };
+        let path = format!(
+            "/v1/projects/{project}/reap-deployments?{}",
+            mesh_team_qs(team)
+        );
+        if let Some(body) =
+            crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &path, &[], 20).await
+        {
+            let v: Option<serde_json::Value> = serde_json::from_slice(&body).ok();
+            if v.as_ref()
+                .map(|v| v.get("reaped").is_some())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            // NO_HANDLER (pre-upgrade peer) or a refusal — both terminal.
+            return false;
+        }
+    }
+    false
 }
 
 /// Tear down a project on ONE peer node, over whatever control-plane transport
@@ -5222,10 +5322,44 @@ pub(crate) async fn nodes(
     let cl = claims.as_ref().map(|e| &e.0);
     require_auth_read(cl)?;
     let list = c.registry.nodes();
+    // Typed connectivity, derived from signals the node already tracks — the
+    // boolean `healthy` collapses three distinct situations the operator needs
+    // to tell apart, and the dashboard rendered them all as one gray:
+    //  - "healthy":  gossip-alive and this observer's probes pass.
+    //  - "degraded": gossip-alive and probes pass, but THIS observer's trunk
+    //    to it recently failed (`health::is_cold`) — an observer-local
+    //    transport fault, not a sick node; requests route around it while the
+    //    trunk re-forms.
+    //  - "suspect":  gossip-alive but this observer's probes fail repeatedly
+    //    (withdrawn from placement/DNS by `health::demote`'s guarded path).
+    //  - absent from the list entirely = no gossip for 30s = offline; the
+    //    registry already drops those, so the dashboard's "unreachable" rows
+    //    come from its own roster diff, not from this endpoint.
+    // Per-observer by design (AGENTS.md: a health verdict is per-OBSERVER) —
+    // reading this through the ops proxy answers with the LEADER's view.
+    let connectivity = |n: &hive_edge::region::NodeInfo| -> &'static str {
+        if n.is_self {
+            "self"
+        } else if !n.healthy {
+            "suspect"
+        } else if crate::health::is_cold(&n.name) {
+            "degraded"
+        } else {
+            "healthy"
+        }
+    };
     // Operators (and the mesh-internal gossip path) get the full record —
     // peer sync depends on iroh_addr/peer_id being present.
     if operator_allowed(cl, crate::auth::enforced()) {
-        return Ok(Json(json!(list)));
+        let full: Vec<Value> = list
+            .iter()
+            .map(|n| {
+                let mut v = json!(n);
+                v["connectivity"] = json!(connectivity(n));
+                v
+            })
+            .collect();
+        return Ok(Json(json!(full)));
     }
     // Every other signed-in user gets the sanitized topology: enough to render
     // the network page (mesh map, health, capacity totals), none of the
@@ -5249,6 +5383,7 @@ pub(crate) async fn nodes(
                 "lat": n.lat,
                 "lon": n.lon,
                 "healthy": n.healthy,
+                "connectivity": connectivity(&n),
                 "last_seen_ms": n.last_seen_ms,
                 "is_self": n.is_self,
                 "backend": n.backend,
@@ -7359,10 +7494,20 @@ pub(crate) async fn wf_runs(
                 m.insert(cache_key.clone(), rx.clone());
                 let (c2, team2, q2, key2) = (c.clone(), team.clone(), q.clone(), cache_key.clone());
                 tokio::spawn(async move {
+                    // The map entry MUST clear even if the collector panics:
+                    // a leaked entry's dead sender makes every later poll fall
+                    // through to the uncached inline path forever — the exact
+                    // steady-state starvation this task exists to prevent.
+                    struct ClearOnDrop(String);
+                    impl Drop for ClearOnDrop {
+                        fn drop(&mut self) {
+                            wf_inflight().lock().remove(&self.0);
+                        }
+                    }
+                    let _clear = ClearOnDrop(key2.clone());
                     let v = wf_runs_collect(c2.clone(), team2, q2).await;
-                    c2.resp_cache.set(key2.clone(), v.clone());
+                    c2.resp_cache.set(key2, v.clone());
                     let _ = tx.send(Some(v));
-                    wf_inflight().lock().remove(&key2);
                 });
                 rx
             }
@@ -7514,7 +7659,8 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
             }
         } else if !locals.is_empty() {
             tracing::warn!(
-                team, projects = locals.len(),
+                team,
+                projects = locals.len(),
                 "wf_runs: world reads exceeded the phase budget — serving without them this poll"
             );
         }
@@ -7528,15 +7674,30 @@ async fn wf_runs_collect(c: Arc<CloudState>, team: String, q: WfQuery) -> Value 
     if q.project.is_none() && !q.local.unwrap_or(false) {
         let mut seen: std::collections::HashSet<String> = runs.iter().filter_map(run_key).collect();
         let peers = peer_nodes_for_tenant(&c, &team);
-        // Budgeted like the world reads: one dark peer (still listed in the
-        // gossiped view) previously cost 10s HTTP + 20s iroh on EVERY poll.
-        for v in tokio::time::timeout(
-            PHASE_BUDGET,
-            fan_out_peers(&c, &peers, &team, "/v1/workflows/runs?local=true"),
-        )
+        // Budgeted PER PEER, never as one timeout over the whole join: a
+        // single dark peer used to trip the outer budget and silently discard
+        // every HEALTHY peer's rows too — fast but permanently incomplete,
+        // and the incomplete (non-empty) result then overwrote last-known-
+        // good. Per-peer budgets bound the wall clock to one budget (the
+        // fetches run concurrently) while each healthy peer's rows land.
+        let peer_results: Vec<Value> = futures::future::join_all(peers.iter().map(|node| {
+            let c = c.clone();
+            let team = team.clone();
+            async move {
+                tokio::time::timeout(
+                    PHASE_BUDGET,
+                    fetch_from_host(&c, node, "/v1/workflows/runs?local=true", &team),
+                )
+                .await
+                .ok()
+                .flatten()
+            }
+        }))
         .await
-        .unwrap_or_default()
-        {
+        .into_iter()
+        .flatten()
+        .collect();
+        for v in peer_results {
             if let Some(arr) = v.as_array() {
                 for r in arr {
                     if let Some(id) = run_key(r) {

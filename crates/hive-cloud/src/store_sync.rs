@@ -181,20 +181,29 @@ pub static REGISTRY: &[SyncedStore] = &[
         // that never locally built a given project serves that project's
         // settings/env/domains as empty defaults until it happens to receive a
         // write for it.
-        snapshot: |c| {
-            let m: std::collections::BTreeMap<String, crate::project_settings::ProjectSettings> =
-                c.projects.snapshot().into_iter().collect();
-            enc(&m)
-        },
+        snapshot: |c| enc(&c.projects.snapshot_synced()),
+        // MERGE with tombstones, never replace — the `databases` fix applied to
+        // the store whose wholesale replacement is how a single node's row loss
+        // became "the project vanished from the account fleet-wide within 60s".
+        // Legacy payloads (a bare map, from a pre-upgrade node) are accepted
+        // tombstone-less; a pre-upgrade node receiving THIS shape fails to
+        // parse and keeps its own state — the safe direction, as with databases.
         adopt: |c, b| {
-            let m: std::collections::BTreeMap<String, crate::project_settings::ProjectSettings> =
-                serde_json::from_slice(b).ok()?;
-            if m.is_empty() {
+            let synced: crate::project_settings::SyncedProjects =
+                serde_json::from_slice(b).ok().or_else(|| {
+                    let m: std::collections::BTreeMap<
+                        String,
+                        crate::project_settings::ProjectSettings,
+                    > = serde_json::from_slice(b).ok()?;
+                    Some(crate::project_settings::SyncedProjects {
+                        rows: m,
+                        tombstones: Default::default(),
+                    })
+                })?;
+            if synced.rows.is_empty() && synced.tombstones.is_empty() {
                 return None;
             }
-            let n = m.len();
-            c.projects.load(m.into_iter().collect());
-            Some(n)
+            Some(c.projects.merge_synced(synced))
         },
     },
     SyncedStore {

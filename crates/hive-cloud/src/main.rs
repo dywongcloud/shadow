@@ -318,7 +318,11 @@ async fn main() -> anyhow::Result<()> {
             println!(
                 "\n  {}{}\n    source     {src}\n    ports      {}",
                 svc.name,
-                if is_primary { "  [PRIMARY — serves /]" } else { "" },
+                if is_primary {
+                    "  [PRIMARY — serves /]"
+                } else {
+                    ""
+                },
                 if svc.all_ports.is_empty() {
                     "(none declared; defaults to 8080/http)".to_string()
                 } else {
@@ -348,9 +352,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("    command    {c:?}");
             }
             let published = svc.all_ports.iter().filter(|p| p.host.is_some()).count();
-            let internal = svc.all_ports.len().saturating_sub(published).saturating_sub(
-                usize::from(published == 0 && !svc.all_ports.is_empty()),
-            );
+            let internal = svc
+                .all_ports
+                .len()
+                .saturating_sub(published)
+                .saturating_sub(usize::from(published == 0 && !svc.all_ports.is_empty()));
             if published > 0 || internal > 0 {
                 println!(
                     "    NOTE       {published} published port(s) get a public raw-TCP \
@@ -4436,7 +4442,22 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                 } else {
                     timeout
                 };
-                async move { (name, gossip::probe(&cloud, &id, &addr, budget).await) }
+                async move {
+                    // TWO samples per round, pass on EITHER (tau's multi-ping
+                    // liveness): a single lost datagram train on a lossy
+                    // cross-continent path counted as a full round miss, and
+                    // at threshold=2 two unlucky rounds withdrew a healthy
+                    // peer. The samples run sequentially so the second only
+                    // spends budget when the first genuinely failed (which
+                    // also gives `probe`'s trunk-eviction from the first
+                    // failure a fresh-dial chance within the same round).
+                    let first = gossip::probe(&cloud, &id, &addr, budget).await;
+                    let rtt = match first {
+                        Some(ms) => Some(ms),
+                        None => gossip::probe(&cloud, &id, &addr, budget).await,
+                    };
+                    (name, rtt)
+                }
             }))
             .await;
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();

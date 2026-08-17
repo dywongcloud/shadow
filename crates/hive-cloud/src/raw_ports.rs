@@ -252,7 +252,9 @@ fn reserved_public_port(p: u16) -> bool {
             | 5432 | 6379   // db-gateway Postgres/Redis listeners
             | 8786 | 8787   // node admin / gateway HTTP
             | 50052         // llama.cpp rpc-server (GPU pooling)
+            | 9090          // relay metrics (hive-lockdown LOCKED_PORTS)
         )
+        || (7799..=7804).contains(&p) // hive-rt-node workers (no-auth, 0.0.0.0)
         || (50_100..=50_999).contains(&p) // managed-inference llama-server range
 }
 
@@ -355,10 +357,16 @@ fn claim_local(
     // in-memory map must never diverge from what a reload would produce.
     let mut newly: Vec<(String, u16, Option<RawPortAllocation>)> = Vec::new();
     let rollback = |reg: &mut Registry, newly: &[(String, u16, Option<RawPortAllocation>)]| {
-        for (k, p, displaced) in newly {
+        // LIFO: undo in reverse claim order so a later claim that (somehow)
+        // interacted with an earlier migration's ports is unwound before the
+        // earlier state is restored.
+        for (k, p, displaced) in newly.iter().rev() {
             reg.by_key.remove(k);
             reg.in_use.remove(p);
             if let Some(old) = displaced {
+                // The displaced grant's number was quarantined (never removed
+                // from in_use), so restoring the mapping alone reproduces the
+                // exact pre-call state a reload from disk would give.
                 reg.in_use.insert(old.public_port);
                 reg.by_key.insert(k.clone(), old.clone());
             }
@@ -375,27 +383,29 @@ fn claim_local(
         // logs the outcome in the BUILD LOG either way, so a fallback is never
         // silent. (`in_use` check first: probing a port our OWN proxy already
         // listens on would fail the bind probe and wrongly reject a re-grant.)
-        let preferred = spec.preferred_public_port.filter(|&p| !reserved_public_port(p));
-        let claim_preferred = |reg: &mut Registry, p: u16| -> bool {
-            !reg.in_use.contains(&p) && probe_bindable(p)
-        };
+        // Probed EXACTLY ONCE per target, before the branch decision: probing
+        // in a match guard and again in the arm gave the OS a window to change
+        // the answer between the two, sending a migration to a random
+        // range-allocated port that is neither the standing grant nor the
+        // preference.
+        let preferred_ok = spec
+            .preferred_public_port
+            .filter(|&p| !reserved_public_port(p))
+            .filter(|&p| !reg.in_use.contains(&p) && probe_bindable(p));
         let alloc = match reg.by_key.get(&key).cloned() {
             // Redeploy of a known service: the SAME public port, no probe —
             // the service's own live listener legitimately holds it. One
             // exception: the compose author CHANGED the published host port
-            // (preference differs from the standing grant). Honoring the new
-            // number is what "the compose file is the source of truth" means —
-            // migrate when the new port is free, keep (and let the caller log
-            // loudly) when it is not.
+            // and the new number is claimable — honoring it is what "the
+            // compose file is the source of truth" means; when it is not
+            // claimable the standing grant stays and the caller logs it.
             Some(existing)
-                if preferred.is_none()
-                    || preferred == Some(existing.public_port)
-                    || !claim_preferred(&mut reg, preferred.unwrap()) =>
+                if preferred_ok.is_none() || preferred_ok == Some(existing.public_port) =>
             {
                 existing
             }
             prior => {
-                let p = match preferred.filter(|&p| claim_preferred(&mut reg, p)) {
+                let p = match preferred_ok {
                     Some(p) => p,
                     None => match next_free(&mut reg) {
                         Ok(p) => p,
@@ -405,17 +415,29 @@ fn claim_local(
                         }
                     },
                 };
-                // Migrating an existing grant to a new preferred port: free the
-                // old number so the pool never leaks it; `newly` remembers the
-                // displaced allocation so a failed batch restores it.
+                // Migration QUARANTINES the old number instead of freeing it:
+                // every node adopted the old claim into its local read cache
+                // (`adopt_allocations`/`adopt_record`/its own raw_ports.json)
+                // and nothing invalidates those on a migration — re-granting
+                // the number to a DIFFERENT tenant would make stale entry
+                // nodes route that tenant's public port to the OLD project
+                // (cross-tenant misroute, surviving reboots). Leaving it in
+                // `in_use` (without a by_key owner) makes it un-grantable for
+                // the registry's lifetime; the project's eventual release
+                // clears its live claims and the quarantined number stays
+                // burned — one number out of a 10k range per migration, the
+                // safe direction. Consequence, documented: a port SWAP
+                // (A:9000→9001 while B:9001→9000) cannot converge, and a
+                // migration back to a previously-quarantined number is
+                // refused.
                 if let Some(old) = &prior {
-                    reg.in_use.remove(&old.public_port);
                     tracing::info!(
                         project,
                         function = %f.name,
                         old_port = old.public_port,
                         new_port = p,
-                        "raw-port allocator: publish preference changed — migrating grant"
+                        "raw-port allocator: publish preference changed — migrating grant \
+                         (old number quarantined, never re-granted)"
                     );
                 }
                 let a = RawPortAllocation {

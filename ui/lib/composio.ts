@@ -176,6 +176,9 @@ export async function connectToolkit(
     return { error: "Composio returned no redirect URL." };
   } catch (e: any) {
     console.error("composio connectToolkit failed", e);
+    if (isToolkitDisabled(e?.message)) {
+      return { error: toolkitDisabledMessage(slug.toUpperCase()), providerDisabled: true };
+    }
     return { error: `Composio: ${e?.message || "unknown error"}` };
   }
 }
