@@ -1029,9 +1029,25 @@ pub(crate) fn redeploy_on_host(
             true,
         )
         .await;
-        let cancelled = !ok && cloud.build_cancels.is_cancelled(&bid);
+        // Single pinned host: promotable == that one host is Ready. The
+        // outcome type still matters here for the REASON reported — an
+        // unreachable pinned host is a fleet fault, not a build failure.
+        let promotable = ok.promotable();
+        let cancelled = (!promotable && ok.cancelled())
+            || (!promotable && cloud.build_cancels.is_cancelled(&bid));
+        if !promotable && !cancelled && ok.build_failed() == 0 {
+            let unreachable = ok.unreachable().join(", ");
+            cloud.builds.log(
+                &bid,
+                format!(
+                    "✗ could not reach {unreachable} to run this deploy — nothing was built there, \
+                     so the existing deployment is untouched. This is a fleet-reachability fault, \
+                     not a build failure; retry once the node is back."
+                ),
+            );
+        }
         cloud.builds.update(&bid, |b| {
-            b.state = if ok {
+            b.state = if promotable {
                 DeployState::Ready
             } else if cancelled {
                 DeployState::Cancelled
@@ -1288,7 +1304,16 @@ async fn run_build(
             // take down the currently-serving deployment; the old one keeps serving
             // and the user just sees a failed build. (This is the bug that dropped a
             // healthy project when a relocating redeploy errored.)
-            let cancelled = !ok && cloud.build_cancels.is_cancelled(bid);
+            // PROMOTION POLICY (see `FanoutOutcome::promotable`): at least one
+            // target genuinely Ready promotes the deployment. A target we could
+            // never REACH degrades capacity; it does not veto the regions that
+            // are demonstrably serving. Before this, every outcome folded into
+            // one bool, so an unreachable node failed the whole deploy even
+            // when two regions had built and gone live.
+            let promotable = ok.promotable();
+            let unreachable = ok.unreachable();
+            let cancelled = (!promotable && ok.cancelled())
+                || (!promotable && cloud.build_cancels.is_cancelled(bid));
             // Honest wording. "Keeping the existing deployment in place" is a
             // claim that something is still serving, and it is FALSE for a
             // project's first-ever deploy attempt — there is nothing to keep.
@@ -1307,12 +1332,30 @@ async fn run_build(
                     .values()
                     .flatten()
                     .any(|d| d.project.eq_ignore_ascii_case(&project) && d.state == DeployState::Ready);
-            if ok {
+            if promotable {
+                // DEGRADED, not failed: name every target the deploy could not
+                // be delivered to, so the operator sees reduced replication
+                // instead of silence, and so a later reconcile can repair it.
+                if !unreachable.is_empty() {
+                    log(format!(
+                        "⚠ Deployed to {} of {} target(s). Could not reach: {} — those regions ran \
+                         nothing and are DEGRADED, not failed; replication is repaired when they \
+                         return. Serving continues from the healthy region(s).",
+                        ok.ready(),
+                        ok.per_target.len(),
+                        unreachable.join(", ")
+                    ));
+                }
                 // OFF the critical path: the new placement is provably serving
                 // at this point, so the user's build must not stay "Building"
                 // while stale copies are reaped from unrelated peers. Every
                 // delete is idempotent and independently retried, and nothing
                 // below reads its result.
+                //
+                // Unreachable targets are EXCLUDED from the relocation set's
+                // "keep" list only in the sense that they were never reached —
+                // `names` still lists every intended target, so a node that is
+                // simply unreachable right now is NOT reaped as a stale copy.
                 let c2 = cloud.clone();
                 let p2 = project.clone();
                 let n2 = names.clone();
@@ -1325,6 +1368,24 @@ async fn run_build(
                 } else {
                     "Build cancelled by user.".to_string()
                 });
+            } else if ok.build_failed() == 0 && !unreachable.is_empty() {
+                // NOTHING ran anywhere: every target was unreachable. Still a
+                // failed deploy (there is no new version serving), but it must
+                // NOT be reported as a build failure — the application was
+                // never executed, so nothing is known about whether it builds.
+                // Saying "Build failed" here sent users to debug an app that
+                // was never run.
+                log(format!(
+                    "✗ Could not reach any target to run this deploy ({}). Nothing was built, so {} \
+                     This is a fleet-reachability fault, not a build failure — retry when the \
+                     node(s) are back.",
+                    unreachable.join(", "),
+                    if had_prior_deployment {
+                        "the existing deployment is untouched and still serving."
+                    } else {
+                        "this project still has nothing serving."
+                    }
+                ));
             } else {
                 log(if had_prior_deployment {
                     "Build failed — keeping the existing deployment in place (no relocation)."
@@ -1336,7 +1397,7 @@ async fn run_build(
                 });
             }
             cloud.builds.update(bid, |b| {
-                b.state = if ok {
+                b.state = if promotable {
                     DeployState::Ready
                 } else if cancelled {
                     DeployState::Cancelled
@@ -2916,10 +2977,84 @@ async fn run_build(
     Ok(())
 }
 
+/// What happened to ONE target of a fan-out, kept distinct instead of folded
+/// into a bare `bool`.
+///
+/// The distinction is the whole point: `DispatchFailed` means the request never
+/// reached the node, so that node's application NEVER RAN and has said nothing
+/// about whether it builds. `BuildFailed` means the node received the deploy,
+/// ran it, and the application genuinely failed. Collapsing both to `false` let
+/// one unreachable node veto an otherwise-successful multi-region deploy:
+/// measured in production with targets fc-sanjose-gpu-3 (built, ready),
+/// fc-virginia-3 (built, ready) and shadw1 (never reached —
+/// "iroh: no reply (peer unreachable over the mesh, or timed out after 20s)"),
+/// where the whole deployment was stamped Error and the user was told
+/// "Build failed — keeping the existing deployment in place (no relocation)"
+/// despite two healthy regions being live.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TargetOutcome {
+    /// The remote build reached a Ready deployment.
+    Ready,
+    /// The deploy was DELIVERED and the remote build reported failure — a real
+    /// application fault, and the only outcome that may fail a deployment.
+    BuildFailed,
+    /// The request never reached this node (no transport succeeded), or the
+    /// node accepted it but its state could never be read back. Nothing ran
+    /// there, so this is a FLEET-health condition, not an app fault.
+    DispatchFailed,
+    /// The user cancelled the build.
+    Cancelled,
+}
+
+/// The aggregate verdict over every target of one fan-out.
+pub(crate) struct FanoutOutcome {
+    pub per_target: Vec<(String, TargetOutcome)>,
+}
+
+impl FanoutOutcome {
+    fn count(&self, want: TargetOutcome) -> usize {
+        self.per_target.iter().filter(|(_, o)| *o == want).count()
+    }
+    /// Targets that are live and serving.
+    pub(crate) fn ready(&self) -> usize {
+        self.count(TargetOutcome::Ready)
+    }
+    /// Targets that ran the app and failed it.
+    pub(crate) fn build_failed(&self) -> usize {
+        self.count(TargetOutcome::BuildFailed)
+    }
+    /// Targets we could not reach at all — degraded capacity, repairable by a
+    /// later reconcile once the node returns.
+    pub(crate) fn unreachable(&self) -> Vec<String> {
+        self.per_target
+            .iter()
+            .filter(|(_, o)| *o == TargetOutcome::DispatchFailed)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+    pub(crate) fn cancelled(&self) -> bool {
+        self.count(TargetOutcome::Cancelled) > 0
+    }
+    /// PROMOTION POLICY: at least one target is genuinely serving.
+    ///
+    /// Chosen over quorum deliberately. Each target of a stateless fan-out is
+    /// an INDEPENDENT full replica that serves the project on its own (the
+    /// sub-deploys carry `no_fanout: true` and each registers its own
+    /// deployment record), so one Ready region is a working deployment, not a
+    /// minority of a consensus group — there is no shared log or split-brain
+    /// risk to protect against here. Quorum would mean discarding a region
+    /// that is demonstrably serving users because a DIFFERENT region is
+    /// unreachable, which is the bug this type exists to fix.
+    pub(crate) fn promotable(&self) -> bool {
+        self.ready() > 0
+    }
+}
+
 /// Dispatch a per-target deploy to each remote target's admin and MIRROR its
 /// build into this coordinator build record (so the dashboard's existing build
-/// page streams the real, remote build log). Returns true if every target ended
-/// in a Ready state. Each dispatched deploy carries `no_fanout:true` so the
+/// page streams the real, remote build log). Returns the PER-TARGET outcome —
+/// see [`TargetOutcome`] for why this is not a bool. Each dispatched deploy
+/// carries `no_fanout:true` so the
 /// target just builds + hosts (no recursion), the project's current env (so the
 /// target has it even on a redeploy), and the owning team header.
 ///
@@ -2939,7 +3074,7 @@ async fn fanout_remote(
     project: &str,
     remote: &[crate::schedule::Target],
     primary_first: bool,
-) -> bool {
+) -> FanoutOutcome {
     let log = |s: String| cloud.builds.log(bid, s);
     let team = cloud.projects.team_of(project);
     let env = cloud.projects.env_map(project);
@@ -2951,7 +3086,6 @@ async fn fanout_remote(
         .map(|s| s.build)
         .and_then(|b| serde_json::to_value(b).ok());
     let function_settings = serde_json::to_value(cloud.projects.get(project).functions).ok();
-    let mut all_ok = true;
     // PHASE 1 — dispatch every target CONCURRENTLY, then PHASE 2 mirrors them
     // all concurrently (below). This loop used to do both serially per target:
     // dispatch region A, then await A's ENTIRE remote build (clone + npm
@@ -3093,9 +3227,16 @@ async fn fanout_remote(
     // reach the REAL process, which runs on the primary target, not here.
     // Secondaries are extras a cancel doesn't need to chase.
     let mut live: Vec<(&crate::schedule::Target, String)> = Vec::new();
+    let mut per_target: Vec<(String, TargetOutcome)> = Vec::new();
     for (t, d) in remote.iter().zip(dispatched.into_iter()) {
         match d {
-            None => all_ok = false, // already logged by the dispatch future
+            None => {
+                // Dispatch never landed (every transport failed, or the node
+                // advertised none) — the deploy did NOT run here, so this can
+                // never be reported as an application failure. Already logged
+                // with its real cause by the dispatch future.
+                per_target.push((t.node.clone(), TargetOutcome::DispatchFailed));
+            }
             Some((target_bid, secondary)) => {
                 if !secondary {
                     cloud.build_cancels.set_mirror(
@@ -3119,8 +3260,8 @@ async fn fanout_remote(
             .map(|(t, target_bid)| mirror_remote_build(cloud, bid, t, target_bid, &t.node)),
     )
     .await;
-    if mirrors.iter().any(|ok| !ok) {
-        all_ok = false;
+    for ((t, _), outcome) in live.iter().zip(mirrors.iter()) {
+        per_target.push((t.node.clone(), *outcome));
     }
 
     // Sync auto-detected Build settings back from ONE reachable HTTP target
@@ -3130,7 +3271,7 @@ async fn fanout_remote(
     let sync_from = live
         .iter()
         .zip(mirrors.iter())
-        .find(|(entry, ok)| **ok && entry.0.admin.is_some())
+        .find(|(entry, o)| **o == TargetOutcome::Ready && entry.0.admin.is_some())
         .map(|(entry, _)| entry.0);
     if let Some(t) = sync_from {
         if let Some(admin) = &t.admin {
@@ -3181,7 +3322,7 @@ async fn fanout_remote(
             }
         }
     }
-    all_ok
+    FanoutOutcome { per_target }
 }
 
 /// Poll a remote node's `/v1/builds/{id}` and stream NEW log lines into this
@@ -3194,7 +3335,7 @@ async fn mirror_remote_build(
     target: &crate::schedule::Target,
     target_bid: &str,
     node: &str,
-) -> bool {
+) -> TargetOutcome {
     let mut mirrored = 0usize;
     let mut polls_failed = 0usize;
     let deadline = now_ms() + 10 * 60 * 1000; // 10 min cap
@@ -3231,7 +3372,7 @@ async fn mirror_remote_build(
             cloud
                 .builds
                 .log(bid, format!("{node}: mirror stopped (build cancelled)"));
-            return false;
+            return TargetOutcome::Cancelled;
         }
         // Poll the target's build over HTTP admin when one is advertised, and
         // FALL BACK to iroh IN THE SAME ITERATION when HTTP yields nothing.
@@ -3311,7 +3452,10 @@ async fn mirror_remote_build(
             }
             if now_ms() > deadline {
                 cloud.builds.log(bid, format!("✗ {node}: lost contact with remote build after {polls_failed} failed polls"));
-                return false;
+                // NOT a build failure: this node never told us its app failed —
+                // we simply could not read it. Treated as unreachable so it
+                // degrades capacity instead of vetoing healthy regions.
+                return TargetOutcome::DispatchFailed;
             }
             continue;
         };
@@ -3338,7 +3482,7 @@ async fn mirror_remote_build(
                 });
             }
             cloud.builds.log(bid, format!("✓ {node}: deployment ready"));
-            return true;
+            return TargetOutcome::Ready;
         }
         if state.eq_ignore_ascii_case("error") {
             // Link the FAILED remote build to its deployment too (the remote
@@ -3354,13 +3498,15 @@ async fn mirror_remote_build(
                 });
             }
             cloud.builds.log(bid, format!("✗ {node}: build failed"));
-            return false;
+            return TargetOutcome::BuildFailed;
         }
         if now_ms() > deadline {
             cloud
                 .builds
                 .log(bid, format!("✗ {node}: remote build timed out"));
-            return false;
+            // Distinct from "lost contact": we COULD read this node's state, so
+            // the deploy really did run there and never reached Ready.
+            return TargetOutcome::BuildFailed;
         }
     }
 }

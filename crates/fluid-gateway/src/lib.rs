@@ -3240,6 +3240,41 @@ fn insert_deploy_aliases(st: &mut GwState, id: &DeploymentId) {
     }
 }
 
+/// The public wildcard domain user deployments are actually reachable on
+/// (`*.{apps_domain}`), published once at startup by the node.
+///
+/// The reported aliases used to be hardcoded `format!("{project}.localhost")`,
+/// a local-dev default that outlived local dev: a PRODUCTION deployment
+/// reported "Aliased to shoomoo.localhost" while genuinely serving on
+/// shoomoo.shadw.app, sending anyone who trusted the deploy log to a dead
+/// hostname.
+///
+/// This is display/reporting only and CANNOT affect routing — every host
+/// lookup (`host_deployment_id`, `serves_host`, `attribution_for_host`,
+/// `select`) keys on the FIRST LABEL of the host (`h.split('.').next()`), so
+/// the alias map is keyed by bare subdomain and the suffix here is never
+/// matched against anything. Changing it corrects what users are told without
+/// touching what the router does.
+static PUBLIC_APPS_DOMAIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Publish the node's apps domain for deployment-URL reporting. Idempotent;
+/// the first non-empty value wins. Unset (local dev, tests) keeps the previous
+/// `.localhost` behavior byte-for-byte.
+pub fn set_public_apps_domain(domain: &str) {
+    let d = domain.trim().trim_matches('.');
+    if !d.is_empty() {
+        let _ = PUBLIC_APPS_DOMAIN.set(d.to_ascii_lowercase());
+    }
+}
+
+/// `<sub>.<apps domain>`, or `<sub>.localhost` when no domain is configured.
+fn public_host(sub: &str) -> String {
+    match PUBLIC_APPS_DOMAIN.get() {
+        Some(d) => format!("{sub}.{d}"),
+        None => format!("{sub}.localhost"),
+    }
+}
+
 fn view_of(d: &Deployment) -> DeploymentInfo {
     let has_static = d.manifest.static_dir.is_some();
     let has_fn = !d.manifest.functions.is_empty();
@@ -3254,13 +3289,13 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
         .git
         .as_ref()
         .filter(|g| !g.commit.is_empty())
-        .map(|g| format!("{}.localhost", commit_alias(&d.project, &g.commit)))
+        .map(|g| public_host(&commit_alias(&d.project, &g.commit)))
         .unwrap_or_default();
     let branch_alias = d
         .git
         .as_ref()
         .filter(|g| !g.branch.is_empty())
-        .map(|g| format!("{}.localhost", branch_alias(&d.project, &g.branch)))
+        .map(|g| public_host(&branch_alias(&d.project, &g.branch)))
         .unwrap_or_default();
     DeploymentInfo {
         id: d.id.clone(),
@@ -3272,10 +3307,10 @@ fn view_of(d: &Deployment) -> DeploymentInfo {
             .map(|f| f.name.clone())
             .collect(),
         created_at_ms: d.created_at_ms,
-        alias: format!("{}.localhost", d.project),
+        alias: public_host(&d.project),
         commit_alias,
         branch_alias,
-        id_alias: format!("{}.localhost", d.id.as_str()),
+        id_alias: public_host(d.id.as_str()),
         // Immutable build environment (a superseded prod build stays "production").
         target: if d.target.is_empty() {
             if d.production {

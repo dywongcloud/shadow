@@ -783,6 +783,15 @@ async fn main() -> anyhow::Result<()> {
     // keeping CloudState alive.
     let _ = browser_relay_access_cell.set(Arc::downgrade(&cloud));
 
+    // Tell the gateway the PUBLIC domain user deployments are reachable on, so
+    // the URLs it reports (`DeploymentInfo::alias` and friends, which the
+    // dashboard shows and the build log prints as "Aliased to …") name the host
+    // that actually serves the deployment. Without this they fall back to the
+    // local-dev `<project>.localhost`, which is what made a production deploy
+    // report "Aliased to shoomoo.localhost". Reporting only — routing keys on
+    // the host's first label and is unaffected either way.
+    fluid_gateway::set_public_apps_domain(&cloud.apps_domain);
+
     // `--acme-txt-selftest` seed (see the arg's doc comment).
     if let Some((fqdn, value)) = args
         .acme_txt_selftest
