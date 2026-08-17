@@ -526,6 +526,21 @@ pub(crate) async fn projects_for_team(team: &str) -> Vec<String> {
     all_text_pairs(&res).into_iter().map(|(p, _)| p).collect()
 }
 
+/// EVERY (project, team) pair in this node's replica — the tenancy
+/// reconciler's repair source. Unlike `projects_for_team` it is not scoped: the
+/// reconciler does not know which teams lost rows, and the whole table is small
+/// (one row per project).
+pub(crate) async fn all_project_teams() -> Vec<(String, String)> {
+    let Ok(db) = crate::guardian::sql_db().await else {
+        return Vec::new();
+    };
+    let mut s = session(db).await;
+    let Ok(res) = exec(&mut s, "SELECT project, team FROM project_teams").await else {
+        return Vec::new();
+    };
+    all_text_pairs(&res)
+}
+
 // ---------------------------------------------------------------------------
 // Billing (fleet-consistent reads on top of the existing single-writer meter)
 // ---------------------------------------------------------------------------

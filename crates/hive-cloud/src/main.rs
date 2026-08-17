@@ -85,6 +85,7 @@ mod store_sync;
 mod supervise;
 mod svcgraph;
 mod teams;
+mod tenancy_reconcile;
 mod tencent_eip;
 mod udp_relay;
 mod vercel_dns;
@@ -1483,6 +1484,7 @@ async fn main() -> anyhow::Result<()> {
     // mutation fleet-wide, because the leader-forward candidate list is built
     // from the local registry and comes out empty. See `meshwatch`.
     meshwatch::spawn(cloud.clone());
+    tenancy_reconcile::spawn(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
     // against (a SIGKILLed process cannot write it on the way out, which is
