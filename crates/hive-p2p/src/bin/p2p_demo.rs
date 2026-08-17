@@ -82,7 +82,13 @@ async fn main() -> Result<()> {
         handles.push(tokio::spawn(async move {
             let resp = tokio::time::timeout(
                 Duration::from_secs(20),
-                c.request("GET", &format!("/p2p/{i}"), vec![], b"", Duration::from_secs(20)),
+                c.request(
+                    "GET",
+                    &format!("/p2p/{i}"),
+                    vec![],
+                    b"",
+                    Duration::from_secs(20),
+                ),
             )
             .await
             .expect("timeout")

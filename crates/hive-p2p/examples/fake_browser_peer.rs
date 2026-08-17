@@ -43,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
-    let reply_mode = std::env::var("HIVE_FAKE_BROWSER_REPLY_MODE")
-        .unwrap_or_else(|_| "normal".to_string());
+    let reply_mode =
+        std::env::var("HIVE_FAKE_BROWSER_REPLY_MODE").unwrap_or_else(|_| "normal".to_string());
     let observe_ms = std::env::var("HIVE_FAKE_BROWSER_OBSERVE_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())

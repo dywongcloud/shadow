@@ -3657,9 +3657,16 @@ fn spawn_trunk_warmer(cloud: Arc<CloudState>) {
     let interval = Duration::from_secs(env_u64("HIVE_TRUNK_WARM_INTERVAL", 10));
     tracing::info!(?interval, "eager mesh trunk warmer");
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
         loop {
-            tick.tick().await;
+            // ±20% dither per tick (now-derived): after a fleet roll every
+            // node's warmer otherwise fires in lockstep, and 14 nodes
+            // holepunching the same restarted peer in the same instant is a
+            // reconnect thundering herd — the tau-style jitter breaks the
+            // synchronization without changing the average cadence.
+            let base = interval.as_millis() as u64;
+            let dither = base / 5;
+            let jittered = base - dither + (hive_core::now_ms() % (2 * dither + 1));
+            tokio::time::sleep(Duration::from_millis(jittered)).await;
             let pool = match cloud.mesh.read().clone() {
                 Some(p) => p,
                 None => continue, // iroh transport not bound yet

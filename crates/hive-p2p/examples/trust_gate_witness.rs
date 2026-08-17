@@ -104,11 +104,14 @@ async fn main() -> anyhow::Result<()> {
     report(
         refused_ok,
         "untrusted-peer-refused",
-        &format!("peer {id_untrusted} not in trust set was not served (outcome: {})", match &refused {
-            Ok(Ok(_)) => "SERVED — gate broken".to_string(),
-            Ok(Err(e)) => format!("request error: {e}"),
-            Err(_) => "request timed out unserved".to_string(),
-        }),
+        &format!(
+            "peer {id_untrusted} not in trust set was not served (outcome: {})",
+            match &refused {
+                Ok(Ok(_)) => "SERVED — gate broken".to_string(),
+                Ok(Err(e)) => format!("request error: {e}"),
+                Err(_) => "request timed out unserved".to_string(),
+            }
+        ),
         &mut failures,
     );
 
@@ -127,17 +130,23 @@ async fn main() -> anyhow::Result<()> {
         Ok(Ok(resp)) => report(
             resp.status == 200 && String::from_utf8_lossy(&resp.body).contains("iroh-p2p"),
             "trusted-peer-served",
-            &format!("peer {id_trusted} in trust set served status={}", resp.status),
+            &format!(
+                "peer {id_trusted} in trust set served status={}",
+                resp.status
+            ),
             &mut failures,
         ),
         other => report(
             false,
             "trusted-peer-served",
-            &format!("trusted peer was NOT served: {}", match other {
-                Ok(Err(e)) => format!("request error: {e}"),
-                Err(_) => "timed out".to_string(),
-                Ok(Ok(_)) => unreachable!(),
-            }),
+            &format!(
+                "trusted peer was NOT served: {}",
+                match other {
+                    Ok(Err(e)) => format!("request error: {e}"),
+                    Err(_) => "timed out".to_string(),
+                    Ok(Ok(_)) => unreachable!(),
+                }
+            ),
             &mut failures,
         ),
     }
@@ -187,16 +196,18 @@ async fn main() -> anyhow::Result<()> {
     let seeds = hive_p2p::parse_bootstrap_seeds(&csv);
     let seeds_ok = seeds.len() == 3
         && seeds.iter().all(|s| s.node_id == id_b)
-        && seeds
-            .iter()
-            .all(|s| hive_p2p::endpoint_id_from_addr_json(&s.addr_json).as_deref() == Some(id_b.as_str()))
+        && seeds.iter().all(|s| {
+            hive_p2p::endpoint_id_from_addr_json(&s.addr_json).as_deref() == Some(id_b.as_str())
+        })
         && seeds[1].addr_json.contains("1.2.3.4")
         && seeds[1].addr_json.contains("5.6.7.8")
         && hive_p2p::parse_bootstrap_seeds("").is_empty();
     report(
         seeds_ok,
         "bootstrap-seed-forms",
-        &format!("3 valid seed forms parsed (bare / @addrs / |relay), garbage dropped, empty csv empty"),
+        &format!(
+            "3 valid seed forms parsed (bare / @addrs / |relay), garbage dropped, empty csv empty"
+        ),
         &mut failures,
     );
 

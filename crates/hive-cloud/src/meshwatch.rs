@@ -100,6 +100,61 @@ pub fn should_restart(
     expected_peers > 0 && ever_saw_peer && isolated_for_ms >= wedge_ms
 }
 
+/// The severe-degradation floor: seeing fewer than a QUARTER of the expected
+/// fleet (min 1) is the measured wedge shape — fc-bangkok sat at 3 of 18
+/// visible for 90 minutes. A healthy node on this fleet holds 10-16 of 18
+/// (several "expected" ids are permanently-off dev nodes), so the floor stays
+/// far below normal variance; and tiny fleets degrade the floor to 1, where
+/// the zero-visible case is the continuous-isolation trigger's job anyway.
+pub fn degraded_floor(expected_peers: usize) -> usize {
+    (expected_peers / 4).max(1)
+}
+
+/// CUMULATIVE-degradation restart decision — the flapping blind spot's fix.
+/// The continuous trigger above resets whenever isolation clears for one tick,
+/// and the failure actually observed was exactly that: isolation clearing for
+/// 30s every few minutes, forever, while the node stayed effectively dark
+/// (meshwatch logged "sees NONE"→"cleared" cycles for 90 minutes and never
+/// fired). This trigger sums DEGRADED time (visible < [`degraded_floor`])
+/// over a sliding window, so clearing for a tick no longer erases the streak;
+/// it must also be degraded RIGHT NOW (a node that genuinely recovered is
+/// never restarted for its history). Restart cadence self-limits to one per
+/// `trigger_ms` while genuinely stuck.
+pub fn cumulative_should_restart(
+    expected_peers: usize,
+    ever_saw_peer: bool,
+    degraded_now: bool,
+    degraded_ms_in_window: u64,
+    trigger_ms: u64,
+) -> bool {
+    expected_peers > 0 && ever_saw_peer && degraded_now && degraded_ms_in_window >= trigger_ms
+}
+
+fn degraded_window_ms() -> u64 {
+    std::env::var("HIVE_MESH_DEGRADED_WINDOW_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1800)
+        * 1000
+}
+
+fn degraded_trigger_ms() -> u64 {
+    std::env::var("HIVE_MESH_DEGRADED_TRIGGER_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1200)
+        * 1000
+}
+
+fn degraded_restart_enabled() -> bool {
+    !matches!(
+        std::env::var("HIVE_MESH_DEGRADED_RESTART")
+            .unwrap_or_default()
+            .trim(),
+        "0" | "false" | "off"
+    )
+}
+
 /// Spawn the watchdog loop. Cheap: one registry read every 30s.
 pub fn spawn(cloud: Arc<CloudState>) {
     // ms timestamp of the first tick of the CURRENT isolation streak; 0 = not
@@ -110,10 +165,62 @@ pub fn spawn(cloud: Arc<CloudState>) {
 
     tokio::spawn(async move {
         let wedge_ms = wedge_secs().saturating_mul(1000);
+        let window_ms = degraded_window_ms();
+        let trigger_ms = degraded_trigger_ms();
+        // Sliding window of (sample ts, was-degraded) — one 30s sample per tick.
+        let mut samples: std::collections::VecDeque<(u64, bool)> = Default::default();
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let h = cloud.mesh_health();
             let now = hive_core::now_ms();
+
+            // ---- Cumulative-degradation trigger (runs EVERY tick, before the
+            // continuous-isolation logic's early continues) ----
+            let degraded_now =
+                h.expected_peers > 0 && h.visible_healthy_peers < degraded_floor(h.expected_peers);
+            samples.push_back((now, degraded_now));
+            while samples
+                .front()
+                .is_some_and(|(ts, _)| now.saturating_sub(*ts) > window_ms)
+            {
+                samples.pop_front();
+            }
+            let degraded_ms: u64 = samples.iter().filter(|(_, d)| *d).count() as u64 * 30_000;
+            let ever = EVER_SAW_PEER.load(Ordering::Relaxed) == 1;
+            if degraded_now {
+                tracing::warn!(
+                    visible_healthy_peers = h.visible_healthy_peers,
+                    expected_peers = h.expected_peers,
+                    floor = degraded_floor(h.expected_peers),
+                    degraded_secs_in_window = degraded_ms / 1000,
+                    trigger_secs = trigger_ms / 1000,
+                    window_secs = window_ms / 1000,
+                    "mesh watchdog: node is severely DEGRADED (below the visible-peer floor)"
+                );
+            }
+            if cumulative_should_restart(
+                h.expected_peers,
+                ever,
+                degraded_now,
+                degraded_ms,
+                trigger_ms,
+            ) {
+                if !degraded_restart_enabled() {
+                    tracing::error!(
+                        degraded_secs_in_window = degraded_ms / 1000,
+                        "mesh watchdog: cumulative degradation past the trigger — restart                          disabled by HIVE_MESH_DEGRADED_RESTART=0"
+                    );
+                } else {
+                    tracing::error!(
+                        visible_healthy_peers = h.visible_healthy_peers,
+                        expected_peers = h.expected_peers,
+                        degraded_secs_in_window = degraded_ms / 1000,
+                        "mesh watchdog: node is WEDGED BY FLAPPING — visible peers sat below                          the floor for the cumulative trigger within the window, the exact                          shape the continuous-isolation trigger structurally misses (every                          30s clear reset it; fc-bangkok rode that blind spot at 3/18 for 90                          minutes). Flushing state and exiting for a clean systemd restart.                          Set HIVE_MESH_DEGRADED_RESTART=0 to disable."
+                    );
+                    crate::persist::flush_blocking();
+                    std::process::exit(17);
+                }
+            }
 
             if h.visible_healthy_peers > 0 {
                 EVER_SAW_PEER.store(1, Ordering::Relaxed);
@@ -141,7 +248,6 @@ pub fn spawn(cloud: Arc<CloudState>) {
                 s => s,
             };
             let isolated_for_ms = now.saturating_sub(since);
-            let ever = EVER_SAW_PEER.load(Ordering::Relaxed) == 1;
 
             tracing::warn!(
                 expected_peers = h.expected_peers,

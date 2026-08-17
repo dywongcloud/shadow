@@ -78,8 +78,11 @@ async fn connect_by_bare_id(
     target: iroh::EndpointId,
     budget: Duration,
 ) -> Result<(), String> {
-    match tokio::time::timeout(budget, ep.connect(EndpointAddr::new(target), hive_p2p::HIVE_ALPN))
-        .await
+    match tokio::time::timeout(
+        budget,
+        ep.connect(EndpointAddr::new(target), hive_p2p::HIVE_ALPN),
+    )
+    .await
     {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(e)) => Err(format!("{e}")),
@@ -107,7 +110,10 @@ async fn no_source_cannot_dial_by_id() -> bool {
     match r {
         Err(e) => pass(
             N,
-            format!("zero providers ⇒ connect refused in {}ms: {e}", t.elapsed().as_millis()),
+            format!(
+                "zero providers ⇒ connect refused in {}ms: {e}",
+                t.elapsed().as_millis()
+            ),
         ),
         Ok(()) => fail(N, "connected with no address source configured"),
     }
@@ -121,7 +127,10 @@ async fn dht_publishes_and_resolves() -> (bool, Option<iroh::EndpointId>) {
         Err(e) => return (fail(N, format!("bind A failed: {e}")), None),
     };
     if !hive_p2p::dht::stats().dht_registered {
-        return (fail(N, "DHT provider not registered — is outbound UDP blocked?"), None);
+        return (
+            fail(N, "DHT provider not registered — is outbound UDP blocked?"),
+            None,
+        );
     }
     let a_id = a.id();
     accept_forever(a);
@@ -134,7 +143,12 @@ async fn dht_publishes_and_resolves() -> (bool, Option<iroh::EndpointId>) {
             "      probe HIT {}ms attempts={} relay={:?} direct={:?}",
             hit.elapsed_ms, hit.attempts, hit.relay_urls, hit.direct_addrs
         ),
-        Ok(None) => return (fail(N, "independent DHT probe found no record for A"), Some(a_id)),
+        Ok(None) => {
+            return (
+                fail(N, "independent DHT probe found no record for A"),
+                Some(a_id),
+            )
+        }
         Err(e) => return (fail(N, format!("probe error: {e}")), Some(a_id)),
     }
 
@@ -202,7 +216,10 @@ async fn publish_filter_strips_private_addrs() -> bool {
             if leaked.is_empty() {
                 pass(
                     N,
-                    format!("local addrs {local:?} ⇒ published {:?} (no private addr)", hit.direct_addrs),
+                    format!(
+                        "local addrs {local:?} ⇒ published {:?} (no private addr)",
+                        hit.direct_addrs
+                    ),
                 )
             } else {
                 fail(N, format!("private addresses published: {leaked:?}"))
@@ -303,7 +320,9 @@ async fn existing_sources_intact() -> bool {
     // mode we want) rather than never found ("No addressing information").
     let seed_addr = EndpointAddr::from_parts(
         seed_key.public(),
-        [TransportAddr::Ip("203.0.113.7:3399".parse().expect("literal"))],
+        [TransportAddr::Ip(
+            "203.0.113.7:3399".parse().expect("literal"),
+        )],
     );
     let seeds = vec![hive_p2p::SeedPeer {
         node_id: seed_key.public().to_string(),

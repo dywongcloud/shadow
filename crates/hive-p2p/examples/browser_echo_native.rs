@@ -69,11 +69,8 @@ async fn main() -> anyhow::Result<()> {
                 let conn = ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?;
                 let (mut send, mut recv) = conn.open_bi().await?;
                 let frame = if std::env::var("HIVE_BROWSER_RAW_OP").as_deref() == Ok("invoke") {
-                    let payload = hive_browser_proto::encode_invoke(
-                        &"a".repeat(64),
-                        "{}",
-                    )
-                    .expect("64-hex digest is valid");
+                    let payload = hive_browser_proto::encode_invoke(&"a".repeat(64), "{}")
+                        .expect("64-hex digest is valid");
                     encode_request(Op::Invoke, &payload)
                 } else {
                     encode_request(Op::Echo, b"stop-reading-witness")
@@ -105,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
                 let request_path = std::env::var("HIVE_BROWSER_REQUEST_FILE")
                     .expect("workload needs HIVE_BROWSER_REQUEST_FILE");
                 let request_json = std::fs::read_to_string(request_path)?;
-                let digest = std::env::var("HIVE_BROWSER_DIGEST")
-                    .unwrap_or_else(|_| "a".repeat(64));
+                let digest =
+                    std::env::var("HIVE_BROWSER_DIGEST").unwrap_or_else(|_| "a".repeat(64));
                 let payload = hive_browser_proto::encode_invoke(&digest, &request_json)?;
                 let frame = encode_request(Op::Invoke, &payload);
                 println!("WORKLOAD_FRAME_BYTES:{}", frame.len());
@@ -130,11 +127,8 @@ async fn main() -> anyhow::Result<()> {
                             tokio::time::timeout(stage_timeout, recv.read_exact(&mut body))
                                 .await??;
                             let mut trailing = [0u8; 1];
-                            let eof = tokio::time::timeout(
-                                stage_timeout,
-                                recv.read(&mut trailing),
-                            )
-                            .await?;
+                            let eof = tokio::time::timeout(stage_timeout, recv.read(&mut trailing))
+                                .await?;
                             match eof {
                                 Ok(None) => {}
                                 Ok(Some(_)) => anyhow::bail!("reply had trailing bytes"),
@@ -184,14 +178,15 @@ async fn main() -> anyhow::Result<()> {
                 }
                 println!("CONN_CAP_HELD:{}", conns.len());
                 let fifth = ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?;
-                let reason = tokio::time::timeout(
-                    std::time::Duration::from_millis(wait_ms),
-                    fifth.closed(),
-                )
-                .await;
+                let reason =
+                    tokio::time::timeout(std::time::Duration::from_millis(wait_ms), fifth.closed())
+                        .await;
                 match reason {
                     Ok(iroh::endpoint::ConnectionError::ApplicationClosed(frame)) => {
-                        println!("CONN_CAP_FIFTH_CLOSE_CODE:{}", frame.error_code.into_inner());
+                        println!(
+                            "CONN_CAP_FIFTH_CLOSE_CODE:{}",
+                            frame.error_code.into_inner()
+                        );
                         println!(
                             "CONN_CAP_FIFTH_CLOSE_REASON:{}",
                             String::from_utf8_lossy(&frame.reason)
@@ -202,7 +197,10 @@ async fn main() -> anyhow::Result<()> {
                 }
                 // The four held connections must still serve traffic.
                 let body = echo_roundtrip(&conns[0]).await?;
-                println!("CONN_CAP_HELD_ECHO_REPLY:{}", String::from_utf8_lossy(&body));
+                println!(
+                    "CONN_CAP_HELD_ECHO_REPLY:{}",
+                    String::from_utf8_lossy(&body)
+                );
                 return Ok(());
             }
             // Row audit-browser-idle-connection-capacity loop 2: one small echo,
@@ -295,10 +293,9 @@ async fn main() -> anyhow::Result<()> {
                 // new stream on the SAME connection must proceed normally.
                 tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
                 match echo_roundtrip(&conn).await {
-                    Ok(body) => println!(
-                        "STALL_POST_RELEASE_ECHO:{}",
-                        String::from_utf8_lossy(&body)
-                    ),
+                    Ok(body) => {
+                        println!("STALL_POST_RELEASE_ECHO:{}", String::from_utf8_lossy(&body))
+                    }
                     Err(error) => println!("STALL_POST_RELEASE_ECHO_ERR:{error}"),
                 }
                 return Ok(());
@@ -323,8 +320,8 @@ async fn main() -> anyhow::Result<()> {
                 for _ in 0..4 {
                     conns.push(ep.connect(addr.clone(), hive_p2p::BROWSER_ALPN).await?);
                 }
-                let deadline = std::time::Instant::now()
-                    + std::time::Duration::from_millis(duration_ms);
+                let deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
                 let mut opened = 0u64;
                 let mut tasks = Vec::new();
                 while std::time::Instant::now() < deadline {
@@ -453,7 +450,10 @@ async fn main() -> anyhow::Result<()> {
         }
         println!("BROWSER_MULTI_INVOKE_COUNT:{}", addrs.len());
         println!("BROWSER_MULTI_TRUNKS:{}", pool.trunk_count().await);
-        println!("BROWSER_POOL_STATS:{}", serde_json::to_string(&pool.stats())?);
+        println!(
+            "BROWSER_POOL_STATS:{}",
+            serde_json::to_string(&pool.stats())?
+        );
         return Ok(());
     }
     // The 1 MiB exact-frame capacity witness needs a request body larger than
@@ -499,8 +499,14 @@ async fn main() -> anyhow::Result<()> {
             }
             pool.close_endpoint(&unrelated).await;
             let reply = invoke.await??;
-            println!("BROWSER_UNRELATED_CLOSE_REPLY:{}", String::from_utf8_lossy(&reply));
-            println!("BROWSER_POOL_STATS:{}", serde_json::to_string(&pool.stats())?);
+            println!(
+                "BROWSER_UNRELATED_CLOSE_REPLY:{}",
+                String::from_utf8_lossy(&reply)
+            );
+            println!(
+                "BROWSER_POOL_STATS:{}",
+                serde_json::to_string(&pool.stats())?
+            );
             return Ok(());
         }
         if std::env::var("HIVE_BROWSER_CLOSE_DURING_DIAL").as_deref() == Ok("1") {
@@ -582,12 +588,16 @@ async fn main() -> anyhow::Result<()> {
             for invoke in invokes {
                 let _ = invoke.await;
             }
-            let reply = pool
-                .invoke(&endpoint_id, &addr, &digest, &request)
-                .await?;
-            println!("BROWSER_ABORT_RECOVERY_REPLY:{}", String::from_utf8_lossy(&reply));
+            let reply = pool.invoke(&endpoint_id, &addr, &digest, &request).await?;
+            println!(
+                "BROWSER_ABORT_RECOVERY_REPLY:{}",
+                String::from_utf8_lossy(&reply)
+            );
             println!("BROWSER_ABORT_RECOVERY_TRUNKS:{}", pool.trunk_count().await);
-            println!("BROWSER_POOL_STATS:{}", serde_json::to_string(&pool.stats())?);
+            println!(
+                "BROWSER_POOL_STATS:{}",
+                serde_json::to_string(&pool.stats())?
+            );
             return Ok(());
         }
         let mut replies = Vec::with_capacity(concurrency);
@@ -599,7 +609,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let stats = pool.stats();
-        println!("BROWSER_INVOKE_ELAPSED_MS:{}", started.elapsed().as_millis());
+        println!(
+            "BROWSER_INVOKE_ELAPSED_MS:{}",
+            started.elapsed().as_millis()
+        );
         println!("BROWSER_POOL_STATS:{}", serde_json::to_string(&stats)?);
         if std::env::var("HIVE_BROWSER_EXPECT_ERROR").as_deref() == Ok("1") {
             println!("BROWSER_INVOKE_ERROR_COUNT:{}", errors.len());
@@ -609,7 +622,10 @@ async fn main() -> anyhow::Result<()> {
             );
             println!(
                 "BROWSER_INVOKE_ERROR:{}",
-                errors.first().map(|error| error.message.as_str()).unwrap_or("")
+                errors
+                    .first()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("")
             );
             if replies.is_empty() && errors.len() == concurrency {
                 pool.close_endpoint(&endpoint_id).await;
