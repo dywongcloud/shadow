@@ -54,6 +54,7 @@ mod inference;
 mod integrations;
 mod lease;
 mod memwatch;
+mod meshwatch;
 mod mesh_raw;
 mod metrics;
 mod microfrontends;
@@ -1373,6 +1374,15 @@ async fn main() -> anyhow::Result<()> {
     // threshold — the record that survives the kill. See `memwatch`.
     memwatch::spawn(cloud.hive.clone());
 
+    // Mesh-isolation watchdog. Every node. A node whose iroh transport wedges
+    // keeps its process, unit and HTTP surfaces healthy while seeing ZERO of
+    // its peers — and never recovers on its own (measured: 2.17M iroh
+    // transport events, gossip completely dead, `systemctl is-active` still
+    // `active`). On the control-plane leader that also fails every admin
+    // mutation fleet-wide, because the leader-forward candidate list is built
+    // from the local registry and comes out empty. See `meshwatch`.
+    meshwatch::spawn(cloud.clone());
+
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
     // against (a SIGKILLed process cannot write it on the way out, which is
     // exactly why the kill was invisible), and re-states an OOM-cycling
@@ -2284,7 +2294,6 @@ async fn dashboard_proxy(
                 | "content-length"
                 | "upgrade"
                 | "keep-alive"
-                | "accept-encoding"
                 | "x-forwarded-host"
                 | "x-forwarded-proto"
         ) {
@@ -2311,9 +2320,27 @@ async fn dashboard_proxy(
             let mut builder = axum::http::Response::builder().status(status);
             for (k, v) in resp.headers().iter() {
                 let name = k.as_str().to_ascii_lowercase();
+                // `content-encoding` is deliberately NOT stripped, and
+                // `accept-encoding` is deliberately forwarded upstream (see the
+                // request loop above). The two are ONE change: the upstream
+                // Next server (`compress: true`) only compresses when it sees
+                // the client's Accept-Encoding, and its compressed bytes are
+                // only decodable by the browser if the Content-Encoding label
+                // survives this hop. Stripping the request header made the
+                // dashboard serve every HTML/JS/CSS byte uncompressed while
+                // still emitting `Vary: Accept-Encoding` — the exact live
+                // signature measured on shadw.cloud. Stripping only ONE of the
+                // two would be worse than the bug: forwarding the header while
+                // deleting the label hands the browser brotli bytes labelled
+                // as plaintext. This is safe to pass through because the
+                // workspace `reqwest` is built WITHOUT the gzip/brotli
+                // features, so it never transparently decompresses the body
+                // behind our back; the body is streamed verbatim below, and
+                // `content-length`/`transfer-encoding` are still dropped so the
+                // re-framing stays consistent.
                 if matches!(
                     name.as_str(),
-                    "connection" | "transfer-encoding" | "content-length" | "content-encoding"
+                    "connection" | "transfer-encoding" | "content-length"
                 ) {
                     continue;
                 }
@@ -3853,7 +3880,12 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                 h.finish()
             };
             let mut tick = tokio::time::interval(interval);
-            let (mut teams_hash, mut billing_hash, mut deps_hash) = (0u64, 0u64, 0u64);
+            let (mut teams_hash, mut deps_hash) = (0u64, 0u64);
+            // Per-tenant billing hashes: only tenants whose own rows changed are
+            // re-upserted (an aggregate hash re-wrote all of them for one
+            // tenant's change).
+            let mut billing_hashes: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
             let billing_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -3923,32 +3955,67 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             peer.peer_id.clone().unwrap(),
                             peer.iroh_addr.clone().unwrap(),
                         );
-                        for store in store_sync::REGISTRY {
-                            let local = (store.snapshot)(&cloud);
-                            let path = format!("/v1/store-snapshot/{}", store.name);
-                            if let Some(bytes) = gossip::request_to(
-                                &cloud,
-                                &peer_id,
-                                &peer_addr,
-                                hive_p2p::GOSSIP_GET,
-                                &path,
-                                &[],
-                                10,
-                            )
-                            .await
-                            {
-                                // Raw byte-compare change-gate: `snapshot` is
-                                // deterministic, so equal bytes = no change. Skip
-                                // empties (an old leader without this arm returns []).
-                                if !bytes.is_empty() && bytes != local {
-                                    if let Some(n) = (store.adopt)(&cloud, &bytes) {
-                                        tracing::info!(
-                                            leader = %leader,
-                                            store = store.name,
-                                            count = n,
-                                            "store follower-sync: adopted the leader's snapshot"
-                                        );
-                                    }
+                        // FETCH CONCURRENTLY, adopt after. This was a serial
+                        // `for` over the whole registry — ~24 stores today —
+                        // each a mesh round trip with its own 10s budget, so
+                        // one slow store stalled every store behind it and the
+                        // worst case (24 x 10s) overran the loop's own tick
+                        // interval outright, leaving followers silently stale.
+                        // A healthy cross-continent probe on this fleet has
+                        // measured 7462ms (AGENTS.md), so this is not a
+                        // hypothetical tail. `reconcile_on_promotion` already
+                        // fetches this exact way; matching it here.
+                        //
+                        // `adopt` stays OFF the concurrent half deliberately:
+                        // it is synchronous and takes store locks, so it runs
+                        // in a plain loop after the join, preserving the
+                        // existing one-at-a-time apply semantics exactly.
+                        use futures::StreamExt as _;
+                        let futs: Vec<_> = store_sync::REGISTRY
+                            .iter()
+                            .map(|store| {
+                                let (peer_id, peer_addr) = (peer_id.clone(), peer_addr.clone());
+                                let cloud = cloud.clone();
+                                async move {
+                                    let local = (store.snapshot)(&cloud);
+                                    let path = format!("/v1/store-snapshot/{}", store.name);
+                                    let bytes = gossip::request_to(
+                                        &cloud,
+                                        &peer_id,
+                                        &peer_addr,
+                                        hive_p2p::GOSSIP_GET,
+                                        &path,
+                                        &[],
+                                        10,
+                                    )
+                                    .await;
+                                    (store, local, bytes)
+                                }
+                            })
+                            .collect();
+                        let bounded = futures::stream::iter(futs)
+                        .buffer_unordered(
+                            std::env::var("HIVE_STORE_SYNC_CONCURRENCY")
+                                .ok()
+                                .and_then(|v| v.parse().ok())
+                                .filter(|v| *v > 0)
+                                .unwrap_or(8),
+                        )
+                        .collect::<Vec<_>>()
+                        .await;
+                        for (store, local, bytes) in bounded {
+                            let Some(bytes) = bytes else { continue };
+                            // Raw byte-compare change-gate: `snapshot` is
+                            // deterministic, so equal bytes = no change. Skip
+                            // empties (an old leader without this arm returns []).
+                            if !bytes.is_empty() && bytes != local {
+                                if let Some(n) = (store.adopt)(&cloud, &bytes) {
+                                    tracing::info!(
+                                        leader = %leader,
+                                        store = store.name,
+                                        count = n,
+                                        "store follower-sync: adopted the leader's snapshot"
+                                    );
                                 }
                             }
                         }
@@ -3995,15 +4062,45 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             (acc, ledger, invoices, checkouts)
                         })
                         .collect();
-                    if let Ok(json) = serde_json::to_string(&per_tenant) {
+                    // PER-TENANT dirty-check. This used to serialize the whole
+                    // fleet's billing dataset to one JSON string and hash that,
+                    // which meant (a) an unconditional full clone + serialize of
+                    // every tenant's entire unbounded ledger on EVERY tick even
+                    // when nothing changed, and (b) any single tenant's change
+                    // flipping the aggregate hash and re-upserting EVERY tenant.
+                    // Hashing each tenant's own tuple independently keeps the
+                    // exact same "any billing-related change triggers a re-sync"
+                    // guarantee while writing only the tenants that actually
+                    // moved, and drops the whole-dataset JSON round trip.
+                    let mut dirty: Vec<relational::BillingRows<'_>> = Vec::new();
+                    let mut next_hashes: std::collections::HashMap<String, u64> =
+                        std::collections::HashMap::with_capacity(per_tenant.len());
+                    for (acc, ledger, invoices, checkouts) in &per_tenant {
+                        let Ok(json) = serde_json::to_string(&(acc, ledger, invoices, checkouts))
+                        else {
+                            continue;
+                        };
                         let h = hash_of(&json);
-                        if h != billing_hash {
-                            for (acc, ledger, invoices, checkouts) in &per_tenant {
-                                relational::upsert_billing(acc, ledger, invoices, checkouts).await;
-                            }
-                            billing_hash = h;
+                        next_hashes.insert(acc.tenant.clone(), h);
+                        if billing_hashes.get(&acc.tenant) != Some(&h) {
+                            dirty.push((
+                                *acc,
+                                ledger.as_slice(),
+                                invoices.as_slice(),
+                                checkouts.as_slice(),
+                            ));
                         }
                     }
+                    if !dirty.is_empty() {
+                        // ONE session (one full index refresh) for the whole
+                        // batch instead of one per tenant — see
+                        // `relational::upsert_billing_many`. Per-tenant
+                        // transactions are unchanged.
+                        relational::upsert_billing_many(&dirty).await;
+                    }
+                    // Replace wholesale so a tenant that disappeared from the
+                    // snapshot stops being tracked (no unbounded growth).
+                    billing_hashes = next_hashes;
                 }
             }
         }
@@ -4100,22 +4197,40 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                 }
             }
             let mut charged_any = 0u64;
+            // Meter first, then mirror the whole tick's tenants in ONE batch.
+            // Mirroring inside this loop called `relational::upsert_billing`
+            // per tenant, and each of those re-read the ENTIRE relational
+            // index before writing (see `upsert_billing_many`). Metering
+            // itself is unchanged and still strictly per tenant.
+            let mut metered: Vec<String> = Vec::new();
             for (tenant, tot) in totals {
                 charged_any += cloud.billing.meter_usage(&tenant, tot);
-                // Mirror into the fleet-replicated relational layer (see
-                // relational.rs's module doc) right after metering — ONLY this
-                // node (the elected billing authority) ever writes it, so
-                // every OTHER node's local replica converges to this SAME
-                // account state within seconds instead of staying empty/stale
-                // (the confirmed 5-way billing-divergence bug). Best-effort:
-                // the existing HTTP proxy-to-leader read remains correct and
-                // available regardless of this mirror's freshness.
-                let acc = cloud.billing.account(&tenant);
-                let ledger = cloud.billing.ledger(&tenant);
-                let invoices = cloud.billing.finalized_invoices(&tenant);
-                let checkouts = cloud.billing.checkouts_for_tenant(&tenant);
-                relational::upsert_billing(&acc, &ledger, &invoices, &checkouts).await;
+                metered.push(tenant);
             }
+            // Mirror into the fleet-replicated relational layer (see
+            // relational.rs's module doc) right after metering — ONLY this
+            // node (the elected billing authority) ever writes it, so
+            // every OTHER node's local replica converges to this SAME
+            // account state within seconds instead of staying empty/stale
+            // (the confirmed 5-way billing-divergence bug). Best-effort:
+            // the existing HTTP proxy-to-leader read remains correct and
+            // available regardless of this mirror's freshness.
+            let owned: Vec<_> = metered
+                .iter()
+                .map(|tenant| {
+                    (
+                        cloud.billing.account(tenant),
+                        cloud.billing.ledger(tenant),
+                        cloud.billing.finalized_invoices(tenant),
+                        cloud.billing.checkouts_for_tenant(tenant),
+                    )
+                })
+                .collect();
+            let batch: Vec<relational::BillingRows<'_>> = owned
+                .iter()
+                .map(|(a, l, i, c)| (a, l.as_slice(), i.as_slice(), c.as_slice()))
+                .collect();
+            relational::upsert_billing_many(&batch).await;
             if charged_any > 0 {
                 tracing::debug!(cents = charged_any, "billing meter charged usage");
             }

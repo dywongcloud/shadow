@@ -56,6 +56,12 @@ pub struct MockBackend {
     containers: Arc<AsyncMutex<HashMap<CellId, (String, bool)>>>,
     /// Throttled batch CPU sampler for `cpu_percent` (#2).
     sampler: Arc<crate::CpuSampler>,
+    /// Native macOS litebox: config + per-cell net identity (needed by
+    /// `terminate` to kill the real runner process and by callers that want
+    /// to know a cell's dial target). See `crate::litebox_macos`.
+    litebox_macos_cfg: crate::litebox_macos::LiteboxMacosConfig,
+    litebox_macos_net: Arc<crate::litebox_macos::NetAllocator>,
+    litebox_macos_cells: Arc<AsyncMutex<HashMap<CellId, crate::litebox_macos::MacosNet>>>,
 }
 
 impl MockBackend {
@@ -66,6 +72,9 @@ impl MockBackend {
             tunnels: Arc::new(AsyncMutex::new(HashMap::new())),
             containers: Arc::new(AsyncMutex::new(HashMap::new())),
             sampler: Arc::new(crate::CpuSampler::new()),
+            litebox_macos_cfg: crate::litebox_macos::LiteboxMacosConfig::default(),
+            litebox_macos_net: Arc::new(crate::litebox_macos::NetAllocator::new()),
+            litebox_macos_cells: Arc::new(AsyncMutex::new(HashMap::new())),
         }
     }
 }
@@ -435,7 +444,31 @@ impl CellBackend for MockBackend {
                     p.host_port, p.container_port
                 ));
             }
+            // compose `entrypoint:` (a run OPTION, before the image) and
+            // `command:` (trailing argv, after it) — same semantics podman gets
+            // in `podman_run_container`; see that call site for why dropping
+            // them makes images like `minio/minio` unstartable.
+            let argv_of = |key: &str| -> Vec<String> {
+                net.as_ref()
+                    .and_then(|n| n.get(key))
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let entrypoint = argv_of("entrypoint");
+            if !entrypoint.is_empty() {
+                args.push("--entrypoint".into());
+                args.push(
+                    serde_json::to_string(&entrypoint)
+                        .unwrap_or_else(|_| entrypoint.join(" ")),
+                );
+            }
             args.push(image.clone());
+            args.extend(argv_of("cmd"));
             let status = Command::new(bin)
                 .args(&args)
                 .env("PATH", path_env)
@@ -522,6 +555,19 @@ impl CellBackend for MockBackend {
             });
             self.tunnels.lock().await.insert(cell.id.clone(), task);
             return Ok(CellEndpoint::Tcp(tunnel_addr));
+        }
+
+        // Native macOS litebox: real syscall-level sandboxing for Node
+        // functions (see `crate::litebox_macos`'s module doc). Capability is
+        // PROBED, never assumed — `available` fails fast (no sudoers grant
+        // installed, or on any non-macOS host `cfg!` alone already gates it)
+        // and this falls through to the plain host exec below exactly like
+        // today, so a node without the grant behaves identically to before
+        // this feature existed.
+        if crate::litebox_macos::eligible(func.runtime)
+            && crate::litebox_macos::available(&self.litebox_macos_cfg).await
+        {
+            return self.start_function_litebox_macos(cell, func).await;
         }
 
         let workdir = func
@@ -675,12 +721,18 @@ impl CellBackend for MockBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Stop the tunnel accept loop.
-        if let Some(task) = self.tunnels.lock().await.remove(&cell.id) {
+        // Each `remove` binds out of the guard BEFORE the await that follows —
+        // see the same change in `firecracker.rs::terminate` for why: an
+        // `if let Some(x) = map.lock().await.remove(..)` keeps the map locked
+        // for the whole body, holding it across `container rm`/`child.wait()`
+        // and blocking `cpu_percent` + cold starts node-wide.
+        let tunnel = self.tunnels.lock().await.remove(&cell.id);
+        if let Some(task) = tunnel {
             task.abort();
         }
         // Remove any container bound to this cell.
-        if let Some((name, apple)) = self.containers.lock().await.remove(&cell.id) {
+        let container = self.containers.lock().await.remove(&cell.id);
+        if let Some((name, apple)) = container {
             let bin = if apple { "container" } else { "podman" };
             let _ = Command::new(bin)
                 .args(crate::container_cli::rm_args(apple, &name))
@@ -688,9 +740,19 @@ impl CellBackend for MockBackend {
                 .await;
         }
         // Kill any function process bound to this cell.
-        if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
+        let func = self.funcs.lock().await.remove(&cell.id);
+        if let Some(mut child) = func {
             let _ = child.start_kill();
             let _ = child.wait().await;
+        }
+        // Belt-and-suspenders for a litebox-macos cell: `start_kill()` above
+        // reaches the `sudo` wrapper, which may only fork-and-exec the real
+        // runner rather than replace itself — this reaches the runner
+        // directly by its own binary name + this cell's unique
+        // `--tun-device-name=`, so its utun device is never orphaned.
+        let macos_net = self.litebox_macos_cells.lock().await.remove(&cell.id);
+        if let Some(net) = macos_net {
+            crate::litebox_macos::kill_runner(&self.litebox_macos_cfg, &net).await;
         }
         // Single-use build cell: blow away the work dir.
         let _ = tokio::fs::remove_dir_all(&cell.root).await;
@@ -706,6 +768,119 @@ impl CellBackend for MockBackend {
             funcs.get(&cell.id).and_then(|c| c.id())?
         };
         self.sampler.cpu_percent(pid, cell.resources.vcpus)
+    }
+}
+
+impl MockBackend {
+    /// Start a Node function inside the native macOS litebox runner instead
+    /// of a bare host process — see `crate::litebox_macos`'s module doc for
+    /// the full mechanism/privilege story. Only called once the caller has
+    /// already confirmed `crate::litebox_macos::available`, so failures past
+    /// this point are real (staged rootfs missing, tar/runner failure) —
+    /// they surface as an ordinary `DEPLOYMENT_START_FAILED`-shaped error,
+    /// never silently fall back (a silent fallback would mean a tenant
+    /// believes their function got real sandboxing when it did not).
+    async fn start_function_litebox_macos(
+        &self,
+        cell: &CellHandle,
+        func: &FunctionLaunch,
+    ) -> anyhow::Result<CellEndpoint> {
+        let workdir = func
+            .workdir
+            .as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| cell.root.clone());
+
+        let base_rootfs = std::env::var("HIVE_LITEBOX_MACOS_ROOTFS")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| self.cfg.root.join("litebox-macos-rootfs.tar"));
+        anyhow::ensure!(
+            base_rootfs.exists(),
+            "{}: litebox-macos: no base rootfs staged at {} (set HIVE_LITEBOX_MACOS_ROOTFS or \
+             place the Node+npm bundle there)",
+            hive_core::fault::NODE_RUNTIME_MISSING,
+            base_rootfs.display()
+        );
+
+        let net = self.litebox_macos_net.next();
+        let tar_dest = self
+            .cfg
+            .root
+            .join("litebox-macos-tars")
+            .join(format!("{}.tar", cell.id.as_str()));
+        crate::litebox_macos::build_combined_tar(&base_rootfs, &workdir, &tar_dest).await?;
+
+        // The guest's own shell (this rootfs ships busybox `sh`) resolves
+        // argv[0] via PATH — mirrors `func.start_cmd.join(" ")` semantics a
+        // real shell would apply, so "npm"/"npx"/a node_modules/.bin tool
+        // all resolve the same way a host process rooted at `workdir` would,
+        // without this code needing to special-case each one.
+        let guest_path = "/usr/local/bin:/usr/local/lib/node_modules/npm/bin:/bin:/usr/bin:./node_modules/.bin";
+        let script = func
+            .start_cmd
+            .iter()
+            .map(|s| shell_quote(s))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let mut env = func.env.clone();
+        env.insert("PORT".into(), func.port.to_string());
+        env.insert("PATH".into(), guest_path.into());
+        env.insert("HOME".into(), "/".into());
+
+        let child = crate::litebox_macos::start(
+            &self.litebox_macos_cfg,
+            &net,
+            &tar_dest,
+            "/bin/sh",
+            &["-c".to_string(), script],
+            &env,
+        )
+        .await?;
+
+        self.litebox_macos_cells
+            .lock()
+            .await
+            .insert(cell.id.clone(), net.clone());
+        self.funcs.lock().await.insert(cell.id.clone(), child);
+
+        // The runner's own `start()` only returns once the utun device is up
+        // and addressed, so a route to `net.guest_ip` already exists — the
+        // remaining wait is purely for the guest's OWN process to accept a
+        // connection (matches every other backend's readiness contract).
+        let func_addr = format!("{}:{}", net.guest_ip, func.port);
+        if let Err(e) = wait_tcp_ready(&func_addr, Duration::from_secs(60)).await {
+            self.funcs.lock().await.remove(&cell.id);
+            self.litebox_macos_cells.lock().await.remove(&cell.id);
+            crate::litebox_macos::kill_runner(&self.litebox_macos_cfg, &net).await;
+            return Err(e);
+        }
+
+        let raw_proxy = func.raw_proxy;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let tunnel_addr = listener.local_addr()?.to_string();
+        let max_conc = func.max_concurrency.max(1);
+        let task = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((conn, _)) => {
+                        let local = func_addr.clone();
+                        tokio::spawn(async move {
+                            if raw_proxy {
+                                fluid_tunnel::TunnelServer::serve_raw(conn, local).await;
+                            } else {
+                                fluid_tunnel::TunnelServer::serve_maybe_raw(conn, local, max_conc)
+                                    .await;
+                            }
+                        });
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        self.tunnels.lock().await.insert(cell.id.clone(), task);
+
+        Ok(CellEndpoint::Tcp(tunnel_addr))
     }
 }
 

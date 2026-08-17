@@ -585,6 +585,42 @@ pub(crate) async fn upsert_billing(
     invoices: &[crate::billing::Invoice],
     checkouts: &[crate::billing::Checkout],
 ) {
+    upsert_billing_many(std::slice::from_ref(&(account, ledger, invoices, checkouts))).await
+}
+
+/// One tenant's billing rows, as the batch writer takes them.
+pub(crate) type BillingRows<'a> = (
+    &'a crate::billing::BillingAccount,
+    &'a [crate::billing::LedgerEntry],
+    &'a [crate::billing::Invoice],
+    &'a [crate::billing::Checkout],
+);
+
+/// Mirror MANY tenants' billing rows using ONE session — i.e. ONE index
+/// refresh and ONE schema reconciliation for the whole batch.
+///
+/// This exists because both billing loops used to call `upsert_billing` once
+/// per tenant inside a `for`, and `session()` (see its doc) runs
+/// `storage().refresh()`, which re-reads the ENTIRE local relational index —
+/// every row of `billing_ledger` (one row per ledger entry, unbounded and
+/// append-only), `billing_invoices`, `billing_invoice_lines`, `teams`,
+/// `deployments`, and the rest — sequentially, one blob read per row. Doing
+/// that per tenant made a single mirror tick O(tenants x all_rows): with 50
+/// tenants and a 20k-entry ledger it re-read the whole dataset 50 times to
+/// write 50 tenants' rows.
+///
+/// Refreshing once per BATCH rather than once per tenant preserves the
+/// `refresh()`-before-read requirement exactly (the batch still starts from a
+/// freshly-synced index) while making the cost O(all_rows) again. Each
+/// tenant keeps its OWN `BEGIN; ... COMMIT;` transaction, so the atomicity
+/// guarantee AGENTS.md pins for `upsert_billing` — a tenant's account plus
+/// every ledger/invoice/invoice-line/checkout row lands together or not at
+/// all — is unchanged, and one tenant's failure still cannot roll back
+/// another's.
+pub(crate) async fn upsert_billing_many(batch: &[BillingRows<'_>]) {
+    if batch.is_empty() {
+        return;
+    }
     let Ok(db) = crate::guardian::sql_db().await else {
         return;
     };
@@ -593,21 +629,23 @@ pub(crate) async fn upsert_billing(
     reconcile_billing_accounts_schema(&mut s).await;
     reconcile_billing_checkouts_schema(&mut s).await;
 
-    let mut sql = String::from("BEGIN;");
-    sql.push_str(&build_account_sql(account, now));
-    sql.push_str(&build_ledger_sql(ledger));
-    sql.push_str(&build_invoices_sql(invoices));
-    sql.push_str(&build_checkouts_sql(checkouts));
-    sql.push_str("COMMIT;");
+    for (account, ledger, invoices, checkouts) in batch {
+        let mut sql = String::from("BEGIN;");
+        sql.push_str(&build_account_sql(account, now));
+        sql.push_str(&build_ledger_sql(ledger));
+        sql.push_str(&build_invoices_sql(invoices));
+        sql.push_str(&build_checkouts_sql(checkouts));
+        sql.push_str("COMMIT;");
 
-    if let Err(e) = exec(&mut s, &sql).await {
-        tracing::debug!(
-            tenant = %account.tenant,
-            error = %e,
-            "relational: upsert_billing transaction failed (non-fatal, HTTP proxy-to-leader remains the \
-             fallback — and since this ran as ONE transaction, the failure rolled back atomically: no \
-             partial account/ledger/invoice/checkout row state was left behind)"
-        );
+        if let Err(e) = exec(&mut s, &sql).await {
+            tracing::debug!(
+                tenant = %account.tenant,
+                error = %e,
+                "relational: upsert_billing transaction failed (non-fatal, HTTP proxy-to-leader remains the \
+                 fallback — and since this ran as ONE transaction, the failure rolled back atomically: no \
+                 partial account/ledger/invoice/checkout row state was left behind)"
+            );
+        }
     }
 }
 

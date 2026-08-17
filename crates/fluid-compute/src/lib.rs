@@ -379,12 +379,43 @@ impl Drop for ColdStartGuard {
         // on the pool so the circuit that these failures are about to open still
         // names the node instead of telling the user to check their entrypoint.
         let node_fault = self.error.as_deref().and_then(node_fault_marker);
+        // An ABANDONED cold start (the caller's deadline fired first) is not
+        // evidence the deployment is broken, and must not drive the circuit.
+        //
+        // This was self-reinforcing and it took a real deployment down:
+        // shoomoo.shadw.app is a heavy Node app whose cold start outlives an
+        // impatient client, so every request abandoned mid-start, each
+        // abandonment grew `warm_fail_streak`, the streak opened the circuit at
+        // 3, and an open circuit then answers 503 INSTANTLY (measured: 0.35s)
+        // without attempting a start at all — so the app could never finish
+        // booting and could never clear the streak. Measured live on
+        // fc-virginia: fail_streak=54, every single one
+        // `abandoned=true, error="caller gave up before the cold start
+        // finished"`. Not one was an application fault.
+        //
+        // Safe because a genuinely broken deployment still opens the circuit
+        // through the REAL error path: `wait_tcp_ready` has its own bounded
+        // budget and returns `DEPLOYMENT_START_FAILED` (an `Err`, so
+        // `self.error` is `Some`) when the process never listens. Abandonment
+        // means only that the CALLER stopped waiting, which is a statement
+        // about the caller's deadline, not the app.
+        //
+        // The reservation release and a backoff still happen unconditionally:
+        // the `provisioning` decrement is the leak fix this guard exists for
+        // (AGENTS.md, "Request cancellation is a failure mode"), and the
+        // backoff still prevents a stampede of concurrent cold starts.
+        let abandoned = self.error.is_none();
         let mut streak = 0u32;
         if let Some(p) = self.fluid.registry.lock().get_mut(&self.key) {
             p.provisioning = p.provisioning.saturating_sub(1);
-            p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+            if !abandoned {
+                p.warm_fail_streak = p.warm_fail_streak.saturating_add(1);
+                p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
+            }
+            // Back off either way (a stampede of cold starts helps nobody), but
+            // an abandoned attempt backs off on the CURRENT streak rather than
+            // growing it.
             p.warm_backoff_until_ms = now_ms() + (1000u64 << p.warm_fail_streak.min(6));
-            p.circuit_probe_after_ms = now_ms() + CIRCUIT_PROBE_INTERVAL_MS;
             streak = p.warm_fail_streak;
             // Only overwrite on a fault we could classify: an abandoned cold
             // start (error = None) says nothing about the node, and must not
@@ -1478,15 +1509,35 @@ impl Fluid {
                 .collect()
         };
 
-        for (key, handles, current, max) in targets {
+        // Sample EVERY instance of EVERY pool concurrently, then fold.
+        //
+        // This was a nested serial `for`: one awaited `cpu_percent` per live
+        // instance, per 500ms tick, on the same task that runs keep-warm — so
+        // sampling latency directly delays the next warm/drain decision, and a
+        // single backend call that blocks (each takes the backend's cell-map
+        // mutex, which `terminate` used to hold across `podman rm`) stalls the
+        // whole autoscaler. Cost was N serial awaits x 120 ticks/min.
+        // Concurrency here is bounded by the instance count of one node, and
+        // each call is a cheap sampler read, so a plain `join_all` per pool
+        // with the pools themselves joined is enough — no semaphore needed.
+        let sampled_pools = futures::future::join_all(targets.into_iter().map(
+            |(key, handles, current, max)| async move {
+                let samples = futures::future::join_all(
+                    handles.iter().map(|h| self.backend.cpu_percent(h)),
+                )
+                .await;
+                (key, samples, current, max)
+            },
+        ))
+        .await;
+
+        for (key, samples, current, max) in sampled_pools {
             let mut max_cpu = 0.0f32;
             let mut sampled = false;
-            for h in &handles {
-                if let Some(c) = self.backend.cpu_percent(h).await {
-                    sampled = true;
-                    if c > max_cpu {
-                        max_cpu = c;
-                    }
+            for c in samples.into_iter().flatten() {
+                sampled = true;
+                if c > max_cpu {
+                    max_cpu = c;
                 }
             }
             if !sampled {

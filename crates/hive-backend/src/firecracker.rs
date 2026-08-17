@@ -1154,15 +1154,25 @@ impl CellBackend for FirecrackerBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        // Container cell: stop the tunnel loop + remove the podman container.
-        if let Some(task) = self.ctnl_tasks.lock().await.remove(&cell.id) {
+        // Every `remove` below binds its value OUT of the guard before any
+        // await. Written as `if let Some(x) = map.lock().await.remove(..)` the
+        // temporary guard lives to the end of the `if let`, so the map stays
+        // LOCKED across `podman_stop_container` (seconds under load) and across
+        // `child.wait()`. That map is the same one `cpu_percent` takes on every
+        // autoscaler tick (500ms) and that container cold starts take to insert
+        // — so a drain wave serialized terminations against each other AND
+        // stalled sampling/cold-starts on the whole node for its duration.
+        let ctnl_task = self.ctnl_tasks.lock().await.remove(&cell.id);
+        if let Some(task) = ctnl_task {
             task.abort();
         }
-        if let Some(name) = self.containers.lock().await.remove(&cell.id) {
+        let container = self.containers.lock().await.remove(&cell.id);
+        if let Some(name) = container {
             crate::podman_stop_container(&name, Self::PODMAN_PATH).await;
         }
         // Firecracker microVM cell: kill the process + tear down its egress net.
-        if let Some(mut child) = self.procs.lock().await.remove(&cell.id) {
+        let proc = self.procs.lock().await.remove(&cell.id);
+        if let Some(mut child) = proc {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }

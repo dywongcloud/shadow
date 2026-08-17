@@ -1236,16 +1236,25 @@ impl CellBackend for LiteboxBackend {
     }
 
     async fn terminate(&self, cell: &CellHandle) -> anyhow::Result<()> {
-        if let Some(task) = self.tunnels.lock().await.remove(&cell.id) {
+        // Bind each `remove` out of its guard before the following await — see
+        // `firecracker.rs::terminate` for the full reasoning (an `if let` over
+        // `map.lock().await.remove(..)` holds the map for the whole body, i.e.
+        // across `podman_stop_container` and `child.wait()`, blocking
+        // `cpu_percent` and cold starts node-wide during a drain).
+        let tunnel = self.tunnels.lock().await.remove(&cell.id);
+        if let Some(task) = tunnel {
             task.abort();
         }
-        if let Some(task) = self.ctnl_tasks.lock().await.remove(&cell.id) {
+        let ctnl_task = self.ctnl_tasks.lock().await.remove(&cell.id);
+        if let Some(task) = ctnl_task {
             task.abort();
         }
-        if let Some(name) = self.containers.lock().await.remove(&cell.id) {
+        let container = self.containers.lock().await.remove(&cell.id);
+        if let Some(name) = container {
             crate::podman_stop_container(&name, crate::PODMAN_PATH).await;
         }
-        if let Some(mut child) = self.funcs.lock().await.remove(&cell.id) {
+        let func = self.funcs.lock().await.remove(&cell.id);
+        if let Some(mut child) = func {
             let _ = child.start_kill();
             let _ = child.wait().await;
         }
