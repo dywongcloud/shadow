@@ -6,7 +6,7 @@ import { useRouter } from "next/navigation";
 import { RotateCcw, RefreshCw, Trash2, Loader2, Plus, CircleX } from "lucide-react";
 import { Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
 import { apiSend, cancelBuild, usePoll, type Deployment } from "@/lib/api";
-import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
+import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost } from "@/lib/deploy-url";
 import { RedeployModal } from "@/components/redeploy-modal";
@@ -14,8 +14,12 @@ import { RedeployModal } from "@/components/redeploy-modal";
 export default function DeploymentsPage() {
   const router = useRouter();
   const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
-  // In-flight builds from the persistent store — survive navigation/reload.
-  const pending = usePendingBuilds();
+  // In-flight builds from the persistent store — survive navigation/reload. MERGED
+  // with the real records rather than replaced by them: a pending row is dropped
+  // only once a deployment record it corresponds to is actually visible here, which
+  // is what keeps the row on screen for the deploy's whole lifecycle instead of
+  // blinking out during the build->record handover.
+  const pending = mergePending(usePendingBuilds(), deps);
   const [busy, setBusy] = useState<string>("");
   // The deployment whose Redeploy modal is open (null = closed).
   const [redeployFor, setRedeployFor] = useState<Deployment | null>(null);

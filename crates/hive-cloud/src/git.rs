@@ -1039,11 +1039,19 @@ pub(crate) fn redeploy_on_host(
             let unreachable = ok.unreachable().join(", ");
             cloud.builds.log(
                 &bid,
-                format!(
-                    "✗ could not reach {unreachable} to run this deploy — nothing was built there, \
-                     so the existing deployment is untouched. This is a fleet-reachability fault, \
-                     not a build failure; retry once the node is back."
-                ),
+                if unreachable.is_empty() {
+                    // Reachable, but it declined to host (stateful single-writer
+                    // guard). Not a fleet fault and not a build failure.
+                    "✗ the pinned host declined to run this deploy as a stateful single-writer \
+                     service — nothing was built there and the existing deployment is untouched."
+                        .to_string()
+                } else {
+                    format!(
+                        "✗ could not reach {unreachable} to run this deploy — nothing was built \
+                         there, so the existing deployment is untouched. This is a \
+                         fleet-reachability fault, not a build failure; retry once the node is back."
+                    )
+                },
             );
         }
         cloud.builds.update(&bid, |b| {
@@ -1385,6 +1393,17 @@ async fn run_build(
                     } else {
                         "this project still has nothing serving."
                     }
+                ));
+            } else if ok.build_failed() == 0 && ok.declined() > 0 {
+                // Every reachable target deliberately declined to host (stateful
+                // single-writer guard) and none failed. Nothing is serving the new
+                // version, but no application fault occurred — reporting "Build
+                // failed" here would send the user to debug an app that built fine.
+                log(format!(
+                    "✗ No target hosted this deploy: {} target(s) declined as a stateful \
+                     single-writer service. Nothing was built incorrectly — this is a placement \
+                     outcome, not a build failure.",
+                    ok.declined()
                 ));
             } else {
                 log(if had_prior_deployment {
@@ -3004,6 +3023,18 @@ pub(crate) enum TargetOutcome {
     DispatchFailed,
     /// The user cancelled the build.
     Cancelled,
+    /// The node received the deploy and deliberately DECLINED to host it — the
+    /// stateful `fanout_secondary` guard, which stamps its own build Ready with
+    /// NO deployment id precisely because it is not registering a replica.
+    ///
+    /// This must never count toward promotion. It reads as success on the wire
+    /// (`state: "ready"`), and under the at-least-one-ready policy a deploy
+    /// whose primary was unreachable and whose two secondaries both declined
+    /// would otherwise promote with ZERO nodes actually serving it — strictly
+    /// worse than the veto bug this enum exists to fix. It is equally not a
+    /// failure: declining is the correct, designed behavior for a single-writer
+    /// service, so it must not fail the deploy either.
+    Declined,
 }
 
 /// The aggregate verdict over every target of one fan-out.
@@ -3034,6 +3065,10 @@ impl FanoutOutcome {
     }
     pub(crate) fn cancelled(&self) -> bool {
         self.count(TargetOutcome::Cancelled) > 0
+    }
+    /// Targets that deliberately refused to host (stateful single-writer guard).
+    pub(crate) fn declined(&self) -> usize {
+        self.count(TargetOutcome::Declined)
     }
     /// PROMOTION POLICY: at least one target is genuinely serving.
     ///
@@ -3471,16 +3506,27 @@ async fn mirror_remote_build(
         }
         let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("");
         if state.eq_ignore_ascii_case("ready") {
-            if let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) {
-                let dep = dep.to_string();
-                let alias = v.get("alias").and_then(|x| x.as_str()).map(String::from);
-                cloud.builds.update(bid, |b| {
-                    b.deployment_id = Some(dep.clone());
-                    if let Some(a) = &alias {
-                        b.alias = Some(a.clone());
-                    }
-                });
-            }
+            // A Ready state with NO deployment id is not a replica: it is the
+            // stateful `fanout_secondary` guard declining to host (it stamps its
+            // own build Ready on the way out). Counting it as Ready would let a
+            // deploy promote with nothing serving it, so the deployment id — the
+            // proof that something is actually registered and routable on that
+            // node — is what distinguishes the two.
+            let Some(dep) = v.get("deployment_id").and_then(|x| x.as_str()) else {
+                cloud.builds.log(
+                    bid,
+                    format!("• {node}: declined to host (stateful service, not replicated here)"),
+                );
+                return TargetOutcome::Declined;
+            };
+            let dep = dep.to_string();
+            let alias = v.get("alias").and_then(|x| x.as_str()).map(String::from);
+            cloud.builds.update(bid, |b| {
+                b.deployment_id = Some(dep.clone());
+                if let Some(a) = &alias {
+                    b.alias = Some(a.clone());
+                }
+            });
             cloud.builds.log(bid, format!("✓ {node}: deployment ready"));
             return TargetOutcome::Ready;
         }
@@ -6302,7 +6348,38 @@ async fn build_compose_manifest(
     };
     let subnet = format!("10.{o2}.{o3}.0/24");
     let gw = format!("10.{o2}.{o3}.1");
-    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + i);
+    // Per-GENERATION block INSIDE that project /24. The host part used to be keyed on
+    // the project alone (`11 + i`), so every redeploy re-requested the exact addresses
+    // the still-running PREVIOUS generation held — old instances linger for
+    // `idle_ttl_secs` after the new deployment goes Ready, by design. podman refused
+    // the run ("requested ip address X is already allocated to container Y") and the
+    // IPAM self-heal in `hive-backend` then force-removed what it took for a leaked
+    // ghost but which was in fact the LIVE serving container — or escalated to
+    // removing the whole project network and every sibling on it, managed database
+    // containers included. That is the redeploy breakage: the new generation could not
+    // start, and the old one was destroyed trying.
+    //
+    // A block per BUILD lets the two generations coexist for the overlap window, which
+    // is exactly what a rolling redeploy needs. Blocks are sized to the service count
+    // so the whole /24 stays usable, and the offset is a stable FNV-1a over the build
+    // id — never `DefaultHasher`, whose output is not stable across rustc versions,
+    // and these addresses are written into a manifest that outlives this process.
+    let n_svc = services.len().max(1);
+    anyhow::ensure!(
+        n_svc <= 243,
+        "compose file declares {n_svc} services — more than the {} that fit one project /24",
+        243
+    );
+    let blocks = (243 / n_svc).max(1);
+    let gen_off = {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in bid.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        (h % blocks as u64) as usize * n_svc
+    };
+    let svc_ip = |i: usize| format!("10.{o2}.{o3}.{}", 11 + gen_off + i);
     let hosts: Vec<String> = services
         .iter()
         .enumerate()

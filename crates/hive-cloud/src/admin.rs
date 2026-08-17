@@ -3526,24 +3526,50 @@ async fn project_delete(
     // broadcast the single-hop cascade and let owners tear down their copies.
     if !authorized {
         if q.cascade.unwrap_or(true) {
-            let c2 = c.clone();
-            let project2 = project.clone();
-            let team2 = t.clone();
-            tokio::spawn(async move {
-                let peers: Vec<String> = c2
-                    .registry
-                    .nodes()
-                    .into_iter()
-                    .filter(|n| !n.is_self && n.healthy)
-                    .map(|n| n.name)
-                    .collect();
-                for node in peers {
-                    dispatch_project_delete(&c2, &node, &project2, &team2).await;
-                }
-            });
-            return Ok(Json(
-                json!({ "project": project, "removed_deployments": [], "note": "not hosted here — cascade broadcast to peers" }),
-            ));
+            // AWAIT the broadcast rather than spawning it and answering 200. This node
+            // holds no copy of the project, so a 200 here asserted a deletion it never
+            // performed and never observed anyone else perform — and the dashboard,
+            // which treats any 2xx as success, showed the user nothing at all while the
+            // project kept serving. That is the "deleting a project does nothing" bug.
+            // Deletes are rare and each hop is small, so paying the round trip to be
+            // able to tell the truth is the right trade.
+            //
+            // Broadcast to EVERY peer, not just healthy ones: health is a per-observer
+            // verdict, and a peer this node currently calls unhealthy is exactly the one
+            // most likely to still be serving the copy nobody could reach.
+            let peers: Vec<String> = c
+                .registry
+                .nodes()
+                .into_iter()
+                .filter(|n| !n.is_self)
+                .map(|n| n.name)
+                .collect();
+            let n_peers = peers.len();
+            let accepted = futures::future::join_all(
+                peers
+                    .iter()
+                    .map(|node| dispatch_project_delete(&c, node, &project, &t)),
+            )
+            .await
+            .into_iter()
+            .filter(|ok| *ok)
+            .count();
+            if accepted == 0 {
+                // Nobody confirmed. Either the project does not exist under this tenant,
+                // or every node that could own it is unreachable. Both are honest
+                // failures the user must see; neither is a deletion.
+                tracing::warn!(
+                    project, tenant = %t, peers = n_peers,
+                    "project delete: not hosted locally and no peer accepted the cascade"
+                );
+                return Err(StatusCode::BAD_GATEWAY);
+            }
+            return Ok(Json(json!({
+                "project": project,
+                "removed_deployments": [],
+                "accepted_by": accepted,
+                "note": "not hosted here — deleted on peers that accepted the cascade",
+            })));
         }
         return Err(StatusCode::NOT_FOUND);
     }
@@ -3558,10 +3584,24 @@ async fn project_delete(
         "delete",
         &format!("deleted project {project} ({} deployment(s))", ids.len()),
     );
-    purge_project_resources(&c, &project, &t, ids.len()).await;
+    // Commit the authoritative state change BEFORE the best-effort resource purge.
+    // The purge is unbounded — it reaches databases, volumes and containers — and axum
+    // DROPS this request future the moment the client gives up (browser navigation,
+    // proxy deadline). With the purge first, an abandoned delete left the deployments
+    // removed and the PROJECT ROW STILL PRESENT: a half-deleted project that comes
+    // back in the dashboard with nothing behind it, and cannot be deleted again
+    // because the deployments the authorization check looks for are already gone.
+    // The row is the record of intent; write it first, then reclaim.
     c.projects.remove(&project);
     c.git_index.remove_project(&project);
     crate::persist::persist(&c);
+    {
+        // Reclamation itself runs detached for the same reason: a dropped future must
+        // not be able to abort it halfway through (the `ColdStartGuard` rule applied to
+        // teardown), and the dashboard should not wait on remote database deletes.
+        let (c2, project2, team2, n) = (c.clone(), project.clone(), t.clone(), ids.len());
+        tokio::spawn(async move { purge_project_resources(&c2, &project2, &team2, n).await });
+    }
     crate::webhooks::dispatch(
         &c.webhooks,
         &project,
@@ -3581,16 +3621,24 @@ async fn project_delete(
         let project2 = project.clone();
         let team2 = t.clone();
         tokio::spawn(async move {
+            // Every peer, not only the ones this node currently calls healthy: health is
+            // a per-OBSERVER verdict, so an "unhealthy" peer is precisely the one most
+            // likely to still be serving a copy nobody could reach — and a delete it
+            // never receives is a project that serves forever. Concurrently, so one slow
+            // peer cannot delay the rest.
             let peers: Vec<String> = c2
                 .registry
                 .nodes()
                 .into_iter()
-                .filter(|n| !n.is_self && n.healthy)
+                .filter(|n| !n.is_self)
                 .map(|n| n.name)
                 .collect();
-            for node in peers {
-                dispatch_project_delete(&c2, &node, &project2, &team2).await;
-            }
+            futures::future::join_all(
+                peers
+                    .iter()
+                    .map(|node| dispatch_project_delete(&c2, node, &project2, &team2)),
+            )
+            .await;
         });
     }
     Ok(Json(
@@ -3604,14 +3652,17 @@ async fn project_delete(
 /// tunnels were cut, which is exactly why HTTP-only cascade deletes silently
 /// never reached the hosting nodes and "deleting a project didn't work").
 /// `cascade=false` semantics on the receiving side: single hop, no loops.
+/// Returns `true` when a peer ACCEPTED the delete over some transport. The caller
+/// on the not-hosted-here path reports that outcome to the user instead of
+/// claiming success it never observed.
 pub(crate) async fn dispatch_project_delete(
     c: &Arc<CloudState>,
     node: &str,
     project: &str,
     team: &str,
-) {
+) -> bool {
     if node == c.node_name {
-        return; // local copy already handled by the caller
+        return true; // local copy already handled by the caller
     }
     // A delete is a ONE-SHOT broadcast — unlike a database write mirror
     // (`db_replicate::send_mirrored`), there is no "next delete" to naturally
@@ -3640,7 +3691,7 @@ pub(crate) async fn dispatch_project_delete(
                 .map(|r| r.status().is_success())
                 .unwrap_or(false);
             if ok {
-                return;
+                return true;
             }
         }
         // iroh mesh path: resolve the peer's cryptographic identity + address from
@@ -3660,7 +3711,7 @@ pub(crate) async fn dispatch_project_delete(
                 .await
                 .is_some()
             {
-                return;
+                return true;
             }
         } else if admin.is_none() {
             tracing::warn!(
@@ -3668,7 +3719,7 @@ pub(crate) async fn dispatch_project_delete(
                 project,
                 "project delete: no route to hosting node (no admin URL, no iroh identity)"
             );
-            return; // no route exists at all; retrying won't help until routes change
+            return false; // no route exists at all; retrying won't help until routes change
         }
     }
     tracing::warn!(
@@ -3678,6 +3729,7 @@ pub(crate) async fn dispatch_project_delete(
         "project delete dispatch failed on every transport after retries — peer may keep \
          serving the deleted project until it receives a delete for another reason"
     );
+    false
 }
 
 /// LOCAL-ONLY project teardown used by the mesh delete arm (the receiving side of

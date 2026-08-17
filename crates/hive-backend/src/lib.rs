@@ -1134,15 +1134,42 @@ pub(crate) async fn podman_run_container(
             v.extend(base.iter().cloned());
             v
         };
-        {
+        // Is the container named in the conflict actually ALIVE? This decides whether
+        // the collision is a leaked lease (a ghost we may reap) or a real, running
+        // peer that simply holds the address — most often the PREVIOUS GENERATION of
+        // this very deployment during a rolling redeploy's overlap window. The reap
+        // below is a force-remove, so getting this wrong destroys a container that is
+        // serving live traffic, and the network reset in step 2 takes every sibling on
+        // the project network with it (managed databases included). Neither is ever an
+        // acceptable price for placing one address: when the holder is live we leave
+        // BOTH steps alone and fall through to step 3, which drops the static `--ip`
+        // and starts on a dynamic address — availability preserved, nothing destroyed.
+        let conflict = parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr));
+        let holder_live = match &conflict {
+            Some((_, id)) => Command::new(bin)
+                .args(["inspect", "--format", "{{.State.Running}}", id])
+                .env("PATH", path_env)
+                .output()
+                .await
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+                .unwrap_or(false),
+            None => false,
+        };
+        if holder_live {
+            tracing::warn!(
+                network = %netname,
+                holder = %conflict.as_ref().map(|(_, i)| i.as_str()).unwrap_or(""),
+                "static IP is held by a RUNNING container (generation overlap, not a leak) \
+                 — not reaping it; falling back to a dynamic address"
+            );
+        }
+        if !holder_live {
             // Step 1: when the error names a specific stale container holding our
             // IP, try to free just that address — disconnect the ghost from the
             // network, then remove it. Cheap + surgical when the ghost still
             // exists as a container. (An orphaned lease with no container is
             // handled by the network reset in step 2.)
-            if let Some((_, stale_id)) =
-                parse_ipam_conflict(&net, &String::from_utf8_lossy(&out.stderr))
-            {
+            if let Some((_, stale_id)) = conflict {
                 tracing::warn!(
                     network = %netname, stale = %stale_id,
                     "IPAM address collision on a leaked lease — reaping stale container and retrying"
@@ -1182,7 +1209,33 @@ pub(crate) async fn podman_run_container(
             if !out.status.success()
                 && is_static_ip_failure(&net, &String::from_utf8_lossy(&out.stderr))
             {
-                if let Some(n) = &net {
+                // `network rm --force` disconnects and destroys EVERY container still
+                // attached, not just the one holding our address. On a project network
+                // that is the deployment's whole compose topology — the previous
+                // generation still serving traffic, sibling services, a managed
+                // database container with a tenant's data volume. Reclaiming one IP
+                // never justifies that, so the reset is only permissible when nothing
+                // is actually running on the network; otherwise step 3's dynamic
+                // address gets this launch up without touching anyone else.
+                let attached = Command::new(bin)
+                    .args(["ps", "-q", "--filter", &format!("network={netname}")])
+                    .env("PATH", path_env)
+                    .output()
+                    .await
+                    .map(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .split_whitespace()
+                            .count()
+                    })
+                    .unwrap_or(0);
+                if attached > 0 {
+                    tracing::warn!(
+                        network = %netname, attached,
+                        "IPAM lease still held, but live containers are on this network \
+                         — refusing the network reset; falling back to a dynamic address"
+                    );
+                }
+                if let Some(n) = net.as_ref().filter(|_| attached == 0) {
                     tracing::warn!(network = %netname, "IPAM lease still held after reap — resetting project network");
                     // Remove containers still attached, then the network itself.
                     let _ = Command::new(bin)

@@ -40,7 +40,7 @@ const ServiceGraph = dynamic(
   }
 );
 import { apiGet, apiSend, usePoll, type Deployment, type Metrics, type Overview } from "@/lib/api";
-import { usePendingBuilds, removePendingBuild } from "@/lib/pending-builds";
+import { usePendingBuilds, removePendingBuild, mergePending } from "@/lib/pending-builds";
 import { timeAgo } from "@/lib/utils";
 import { deploymentUrl, deploymentHost, openDeployment, zkEnabled } from "@/lib/deploy-url";
 import { RawPortConnections } from "@/components/raw-port-connections";
@@ -87,9 +87,14 @@ function ProjectDetailInner({ params }: { params: { project: string } }) {
   // PERSISTENT store (localStorage) so they survive navigating away + reload — the
   // global PendingBuildsProvider polls each build and removes it on completion, at
   // which point the REAL deployment row (a different id from the build id) appears.
-  const pendingRows = usePendingBuilds({ project: name });
+  const rawPending = usePendingBuilds({ project: name });
 
   const mine = (deps ?? []).filter((d) => d.project === name);
+  // MERGE, never replace: a pending row is dropped only once the real deployment
+  // record for it is actually present in `mine`. Removing it the instant the build
+  // reported ready left a visible gap, because the record is created on whichever
+  // node ran the build while this page polls through round-robin DNS.
+  const pendingRows = mergePending(rawPending, mine);
 
   // When a pending build completes (dropped from the store), pull the finished
   // deployment in immediately instead of waiting for the next poll tick.
