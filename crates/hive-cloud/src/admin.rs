@@ -2952,7 +2952,9 @@ async fn dep_list(
             .filter(|d| {
                 // Trust the deployment's OWN tenant tag first — it's authoritative
                 // for who actually built/owns it (matches the peer branch below).
-                // `ProjectStore.team_of` is NODE-LOCAL and never gossiped, so on a
+                // `ProjectStore.team_of` is REPLICATED (store_sync merges rows
+                // with per-row updated_ms + tombstones) but converges on a sync
+                // cadence and repairs on the tenancy-reconcile loop, so on a
                 // node other than the one that ran `set_team` it can miss even for
                 // a correctly-tagged deployment; only consult it as a fallback when
                 // the record itself was never tagged, and even then fail CLOSED

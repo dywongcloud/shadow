@@ -1156,6 +1156,89 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
   credential; a private repo reuses `git_webhook`'s token resolution
   (`github_app_auth` install token, else node `GITHUB_TOKEN`).
 
+## Deployment lifecycle: generations, previews, and the relocation reaper
+
+- **The relocation reaper is SCOPED, and un-scoping it is how projects
+  vanished.** `cleanup_non_targets` runs only for builds provably classified
+  PRODUCTION, reaps via the `/v1/projects/<p>/reap-deployments` mesh arm
+  (`reap_deployments_local`), and removes ONLY superseded production-lane
+  records — previews survive, node-local ProjectSettings (team tag,
+  production_branch, env) survive, the relational row survives, no resource
+  purge. Its previous shape reused the FULL project-delete primitive, which
+  destroyed preview records (preview URL 404, row gone) and settings rows
+  (project invisible in the tenant's listings; preview branches classified as
+  production on fresh nodes) on every non-target node after every promotable
+  build. A pre-upgrade peer answers the new arm with NO_HANDLER — stale copies
+  linger, which is retention, never destruction.
+- **ProjectSettings rows REPLICATE with per-row `updated_ms` + tombstones**
+  (store_sync `projects` entry, the `SyncedDatabases` shape) — the old
+  "node-local, never gossiped" claim is DEAD and was load-bearing in the wrong
+  direction (it justified the reaper's settings wipe). Every mutator stamps
+  `updated_ms` through `ProjectStore::touch`; `remove` records a tombstone
+  (persisted, 30d retention); merges never let absence erase a row.
+- **Tenancy is repaired, not only protected.** `spawn_tenancy_reconcile`
+  (every node, 60s after boot + every `HIVE_TENANCY_RECONCILE_SECS`) restores
+  any UNTAGGED local project row from the relational `project_teams` replica
+  (covers zero-deployment projects) overlaid with the newest tagged deployment
+  record (local or gossiped). Repair-only: never untags, never overwrites a
+  tag, never deletes. `run_build`'s tenant stamp is sticky the same way.
+- **A preview's own URL is `commit_alias || branch_alias || id_alias`, NEVER
+  the project alias.** The build record's `alias` carries that self-alias for
+  previews (commit alias first: it exists on every fanout target, so it routes
+  through pooled ingress; the per-node id alias only resolves on its host).
+  The dashboard derives every deployment URL through
+  `deploymentSelfAlias` (ui/lib/deploy-url.ts), whose preview tail is `""`
+  (rendered as pending) — a preview must never display the production URL.
+- **The coordinator stamps `target` before fanout** whenever it can resolve
+  the environment; remote nodes must never classify against their own
+  node-local `production_branch` (never forwarded, and historically wiped).
+
+## Compose published ports (`ports: ["9000:9000"]`)
+
+- The HOST side of a compose `ports:` entry is a PUBLISH REQUEST
+  (`PortSpec.preferred_public_port`): the allocator prefers the literal number
+  (reserved set + fleet-uniqueness + bind probe permitting) and the build log
+  names grant-vs-request loudly. A bare `"PORT"` entry stays internal-only.
+- Published Http ports get **TLS termination at the raw proxy** (same SNI
+  resolver/certs as the 443 gateway, ALPN pinned http/1.1) with first-byte
+  sniffing — `https://` and `http://` both work on the same number; raw
+  Tcp/Grpc/Udp bindings stay pure passthrough.
+- The data plane requires per-port loopback publishes on EVERY backend:
+  `FunctionLaunch::tcp_ports` must be emitted as `-p` flags by mock,
+  firecracker AND litebox (the mock-only first cut was connection-refused on
+  the whole FC fleet), resolved via `Lease::tcp_host_port` in `mesh_raw`.
+- **The Tencent security group is part of the path.** Host firewalls admit
+  these ports (HIVE_LOCKDOWN only drops its explicit list), but the VPC edge
+  drops inbound on anything the SG doesn't open — the raw range 20000-29999
+  is open; literal published ports (9000/9001, …) need an SG rule or they
+  time out from EVERYWHERE, node-to-node included. Verify with node→node
+  curls on public IPs, never only from a laptop.
+- A migrated-away public port is QUARANTINED, never re-granted (stale
+  entry-node caches would misroute it cross-tenant); a port swap therefore
+  cannot converge, documented in `claim_local`.
+
+## Mesh watchdogs & dial discipline (post-2026-08-17-incident shape)
+
+- meshwatch has TWO triggers: continuous total isolation (600s) and
+  CUMULATIVE degradation (visible < expected/4 for ≥20 of 30 min AND degraded
+  now AND ever-CONVERGED this process AND the fleet still gossip-AUDIBLE —
+  the last guard is what distinguishes "my transport wedged" from "the fleet
+  is genuinely down", where a restart conjures nothing). The effective
+  trigger carries a per-node FNV stagger (0-10 min) so a shared onset can
+  never bounce the fleet — or all three control-plane leaders — in one tick.
+- PeerPool: `warm()` honors per-peer exponential backoff (5s→5min, cleared on
+  success; request-driven `acquire` always dials); `dial_fresh` keeps a
+  negative-discovery memo (30s→180s cap, keyed on the canonical endpoint id,
+  cleared on success) so dead peers stop burning the discovery budget healthy
+  peers need. The caps are deliberately LOW: nothing is un-dialable for more
+  than three minutes — the retain_dialable partition lesson in code form.
+- The rollout re-kicks the first THREE serial batches after the fleet
+  settles: the earliest-restarted nodes form trunks against a fleet that then
+  bounces behind them, and the measured incident wedged exactly that trio.
+- `/v1/nodes` serves a typed `connectivity` field (self/healthy/degraded/
+  suspect; absent = offline) — the dashboard must stop collapsing
+  "observer-local cold trunk" and "probes failing" into one gray.
+
 ## Process
 
 - Git only via the `gm` skill's git verbs (`git_finalize`, `git_push`, etc.)
