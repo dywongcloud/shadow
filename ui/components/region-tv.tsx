@@ -12,10 +12,19 @@
 // double-click country zoom transforms only the SVG, so plots hold their
 // full-world positions until zoom-out.
 
-import { ChevronDown, ChevronUp, Tv, X } from "lucide-react";
+import { ChevronDown, ChevronUp, Circle, HardDrive, Square, Tv, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { MAP_VIEW, projectGeo } from "@/components/world-choropleth";
 import { regionTv, useTvCatalog, type RegionTv } from "@/lib/tv";
+import {
+  fmtBytes,
+  fmtClock,
+  pickMime,
+  startRecording,
+  type DvrRecording,
+  type RecordHandle,
+} from "@/lib/dvr";
+import { usePoll, type Deployment } from "@/lib/api";
 
 // Lazy hls.js, the StreamViewer pattern from the atlas: native HLS on
 // Safari/iOS, hls.js everywhere else, loaded only in the browser on demand.
@@ -146,6 +155,70 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const channel = region.channels[idx] ?? null;
 
+  // ---- Virtual DVR ----------------------------------------------------
+  // Drive is per-PROJECT, so a recording needs a destination project. Same
+  // convention the Drive page uses: the tenant's deployed projects.
+  const { data: deps } = usePoll<Deployment[]>("/deployments", 15000);
+  const projects = useMemo(
+    () => Array.from(new Set((deps ?? []).map((d) => d.project))).sort(),
+    [deps],
+  );
+  const [project, setProject] = useState<string>("");
+  useEffect(() => {
+    if (!project && projects.length) setProject(projects[0]);
+  }, [projects, project]);
+  const [mins, setMins] = useState(30);
+  const [recs, setRecs] = useState<DvrRecording[]>([]);
+  const handleRef = useRef<RecordHandle | null>(null);
+  const [activeId, setActiveId] = useState<string | null>(null);
+  const [elapsed, setElapsed] = useState(0);
+  const canRecord = !!pickMime();
+
+  const patch = (id: string, p: Partial<DvrRecording>) =>
+    setRecs((list) => list.map((r) => (r.id === id ? { ...r, ...p } : r)));
+
+  useEffect(() => {
+    if (!activeId) return;
+    const t = window.setInterval(() => setElapsed((e) => e + 1000), 1000);
+    return () => window.clearInterval(t);
+  }, [activeId]);
+
+  function record() {
+    const video = videoRef.current;
+    if (!video || !channel || !project) return;
+    const rec: DvrRecording = {
+      id: `${Date.now()}`,
+      project,
+      region: region.region,
+      channel: channel.name,
+      startAt: Date.now(),
+      durationMs: mins * 60_000,
+      state: "recording",
+      bytes: 0,
+    };
+    setRecs((l) => [rec, ...l]);
+    setActiveId(rec.id);
+    setElapsed(0);
+    handleRef.current = startRecording({
+      video,
+      rec,
+      onUpdate: (p) => {
+        patch(rec.id, p);
+        if (p.state && p.state !== "recording") {
+          setActiveId((cur) => (cur === rec.id ? null : cur));
+        }
+      },
+    });
+  }
+
+  function stopRecord() {
+    handleRef.current?.stop();
+    handleRef.current = null;
+  }
+
+  // Never leave a recorder running when the TV closes.
+  useEffect(() => () => handleRef.current?.stop(), []);
+
   useEffect(() => {
     setErr(null);
     const video = videoRef.current;
@@ -224,6 +297,95 @@ function RegionTvViewer({ region, onClose }: { region: RegionTv; onClose: () => 
           <button onClick={() => step(1)} className={`px-2 py-1 ${GLASS} hover:scale-105`}>
             NEXT ▶
           </button>
+        </div>
+
+        {/* ---- VIRTUAL DVR: the cable-box deck ---- */}
+        <div className={`mt-2 ${GLASS} p-2`}>
+          <div className={`mb-2 flex items-center gap-2 ${OLED}`}>
+            <HardDrive className="h-3.5 w-3.5" />
+            <span className="tracking-widest">VIRTUAL DVR</span>
+            <span className="opacity-60">· RECORDS ON YOUR BANDWIDTH · SAVES TO DRIVE /tv</span>
+          </div>
+          {!canRecord ? (
+            <div className={`${OLED} !text-amber-400`}>
+              THIS BROWSER CANNOT RECORD (NO MEDIARECORDER)
+            </div>
+          ) : (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                onClick={activeId ? stopRecord : record}
+                disabled={!channel || !project}
+                className={`flex items-center gap-1.5 px-2 py-1 ${GLASS} ${OLED} ${
+                  activeId ? "!text-red-400 !border-red-400/40" : ""
+                } disabled:opacity-40`}
+              >
+                {activeId ? <Square className="h-3 w-3 fill-current" /> : <Circle className="h-3 w-3 fill-current" />}
+                {activeId ? `STOP · ${fmtClock(elapsed)}` : "● REC"}
+              </button>
+              <label className={`flex items-center gap-1 ${OLED}`}>
+                LEN
+                <select
+                  value={mins}
+                  onChange={(e) => setMins(Number(e.target.value))}
+                  disabled={!!activeId}
+                  className={`bg-transparent ${OLED} outline-none`}
+                >
+                  {[5, 15, 30, 60, 120].map((m) => (
+                    <option key={m} value={m} className="bg-black">
+                      {m}M
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className={`flex items-center gap-1 ${OLED}`}>
+                TO
+                <select
+                  value={project}
+                  onChange={(e) => setProject(e.target.value)}
+                  disabled={!!activeId}
+                  className={`max-w-[10rem] bg-transparent ${OLED} outline-none`}
+                >
+                  {projects.length === 0 && <option value="" className="bg-black">NO PROJECT</option>}
+                  {projects.map((p) => (
+                    <option key={p} value={p} className="bg-black">
+                      {p.toUpperCase()}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {activeId && (
+                <span className={`${OLED} !text-red-400 animate-pulse`}>
+                  ● RECORDING — KEEP THIS TAB OPEN
+                </span>
+              )}
+            </div>
+          )}
+          {recs.length > 0 && (
+            <div className="mt-2 flex flex-col gap-1 border-t border-green-400/20 pt-2">
+              {recs.slice(0, 5).map((r) => (
+                <div key={r.id} className={`flex items-center justify-between gap-2 ${OLED}`}>
+                  <span className="truncate opacity-80">
+                    {r.channel.toUpperCase()} · {fmtBytes(r.bytes)}
+                  </span>
+                  <span
+                    className={
+                      r.state === "failed"
+                        ? "!text-amber-400"
+                        : r.state === "saved"
+                          ? "!text-green-300"
+                          : ""
+                    }
+                  >
+                    {r.state === "saved"
+                      ? `SAVED → ${r.path}`
+                      : r.state === "failed"
+                        ? `FAILED · ${(r.error ?? "").slice(0, 60).toUpperCase()}`
+                        : r.state.toUpperCase()}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
