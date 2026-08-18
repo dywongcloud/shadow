@@ -2746,12 +2746,36 @@ async fn run_build(
             }
         }
     };
+    // A FAILED build must never take the production alias off a WORKING
+    // deployment. `deploy_full`'s production branch unconditionally demotes
+    // every other deployment of the project and re-points the project alias +
+    // default route — so passing `is_production` while `build_failed` handed
+    // the live URL to a build-failed page fleet-wide AND let keep-warm drain
+    // the previous good deployment to zero instances. One bad push took a
+    // healthy app down until a human pushed a fix or promoted by hand; nothing
+    // self-healed. Vercel's semantics (which this path's own comments cite)
+    // are the opposite: a failed build never touches production.
+    //
+    // The record is still REGISTERED (browsable at its immutable `dpl-<id>`
+    // alias, listed in the dashboard, logs intact) — only the production flip
+    // is withheld. `deploy_full`'s own `!has_production` fallback still gives a
+    // FIRST-EVER deploy's failure page the project alias, so a brand-new
+    // project still resolves to something that explains itself.
+    let flip_production = is_production && !build_failed;
+    if is_production && build_failed {
+        log(
+            "Build failed — the current production deployment keeps serving; this build is \
+             browsable at its own deployment URL. Fix and push again, or promote another \
+             deployment."
+                .to_string(),
+        );
+    }
     let info = cloud.gw.deploy_full(
         build_dir.to_string_lossy().into_owned(),
         manifest,
         req.creator.clone().unwrap_or_else(|| "you".into()),
         Some(git),
-        is_production,
+        flip_production,
         if build_failed {
             DeployState::Error
         } else {
@@ -4258,7 +4282,19 @@ async fn build_via_fdi(
 
     let has_pkg = install_dir.join("package.json").exists();
     // Build cache key (lockfile + package manager) for restore/save.
-    let cache_key = compute_cache_key(install_dir, pm).await;
+    // Tenant-scoped: the cache executes what it restores, so it must never
+    // cross a tenant boundary (see `compute_cache_key`). `team_of` is the same
+    // resolver every tenant-scoped surface uses; an untagged project falls back
+    // to its own name, which is still a scope — never a fleet-wide bucket.
+    let cache_tenant = {
+        let t = cloud.projects.team_of(project);
+        if crate::admin::record_tenant(&t) == crate::admin::UNTAGGED_TENANT {
+            format!("project:{project}")
+        } else {
+            format!("team:{t}")
+        }
+    };
+    let cache_key = compute_cache_key(install_dir, pm, &cache_tenant).await;
 
     // For a pnpm workspace, scope the install to just this package + its deps
     // (`--filter`) so we don't install the entire monorepo.
@@ -5512,9 +5548,22 @@ pub fn cache_root() -> PathBuf {
 
 /// Content hash of the lockfile + package manager → cache key. None if there's
 /// nothing installable to key on.
-async fn compute_cache_key(install_dir: &Path, pm: &str) -> Option<String> {
+/// `tenant` SCOPES the key. Without it the key was SHA-256(package-manager +
+/// lockfile) truncated to 64 bits and shared fleet-wide, so every tenant who
+/// scaffolded the same `create-next-app` template collided on one key — and
+/// `save_cache` tars `node_modules` AFTER the tenant's arbitrary build command
+/// ran with write access to it, while `restore_cache` untars that blob into
+/// the NEXT tenant's build. That is a cross-tenant code-execution path into
+/// production builds. Sharing within a tenant is kept (the real hit rate);
+/// across tenants it is now impossible by construction. The digest is no
+/// longer truncated: 64 bits is a weak collision target for a cache that
+/// executes what it restores.
+async fn compute_cache_key(install_dir: &Path, pm: &str, tenant: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
+    hasher.update(b"tenant\x1f");
+    hasher.update(tenant.as_bytes());
+    hasher.update(b"\x1f");
     hasher.update(pm.as_bytes());
     let mut found = false;
     for name in [
@@ -5535,7 +5584,7 @@ async fn compute_cache_key(install_dir: &Path, pm: &str) -> Option<String> {
         return None;
     }
     let digest = hasher.finalize();
-    Some(digest.iter().take(8).map(|b| format!("{b:02x}")).collect())
+    Some(digest.iter().take(16).map(|b| format!("{b:02x}")).collect())
 }
 
 // ---- #22 build-artifact integrity + authenticity --------------------------
