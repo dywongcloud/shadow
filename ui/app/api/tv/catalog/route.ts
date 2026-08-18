@@ -31,17 +31,33 @@ interface IptvStream {
   url: string;
 }
 
+// One transient retry with a bounded timeout: a single blipped upstream fetch
+// (the node's egress hiccups) must not blank the whole world catalog on a
+// user's first load — the same "a blip is not a failure" rule the HLS proxy
+// follows. The hourly cache means this only ever runs on a cold entry.
+async function fetchJson<T>(url: string): Promise<T> {
+  let lastErr: unknown = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetch(url, {
+        next: { revalidate: 3600 },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (res.ok) return (await res.json()) as T;
+      lastErr = new Error(`upstream ${res.status}`);
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr ?? new Error("upstream unavailable");
+}
+
 export async function GET() {
   try {
-    const [chRes, stRes] = await Promise.all([
-      fetch(CHANNELS_URL, { next: { revalidate: 3600 } }),
-      fetch(STREAMS_URL, { next: { revalidate: 3600 } }),
+    const [channels, streams] = await Promise.all([
+      fetchJson<IptvChannel[]>(CHANNELS_URL),
+      fetchJson<IptvStream[]>(STREAMS_URL),
     ]);
-    if (!chRes.ok || !stRes.ok) {
-      return NextResponse.json({ error: "upstream catalog unavailable" }, { status: 502 });
-    }
-    const channels = (await chRes.json()) as IptvChannel[];
-    const streams = (await stRes.json()) as IptvStream[];
 
     // First https HLS stream per channel id.
     const streamByChannel = new Map<string, string>();
