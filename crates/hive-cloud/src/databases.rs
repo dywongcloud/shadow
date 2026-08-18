@@ -959,7 +959,9 @@ pub fn env_exports(db: &Database, api_base: &str) -> Vec<(String, String)> {
                     g("password"),
                     h,
                     c.get("net_port").cloned().unwrap_or_else(|| "5432".into()),
-                    c.get("database").cloned().unwrap_or_else(|| "postgres".into())
+                    c.get("database")
+                        .cloned()
+                        .unwrap_or_else(|| "postgres".into())
                 ),
                 None => g("DATABASE_URL"),
             };
@@ -1604,7 +1606,9 @@ async fn podman_pull_retry(image: &str) -> bool {
             .await;
         match out {
             Ok(o) if o.status.success() => return true,
-            Ok(o) => tracing::warn!(image, attempt, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "podman pull failed"),
+            Ok(o) => {
+                tracing::warn!(image, attempt, stderr = %String::from_utf8_lossy(&o.stderr).trim(), "podman pull failed")
+            }
             Err(e) => tracing::warn!(image, attempt, error = %e, "podman pull could not spawn"),
         }
         if attempt == 0 {
@@ -1708,9 +1712,18 @@ async fn provision_supabase(
     // Deterministic sibling IPs in bands clear of the managed-DB .200+ band
     // (and of compose's .11+ blocks in practice); a collision fails the
     // `podman run` loudly below, never silently.
-    let prefix = db_ip.rsplit_once('.').map(|(p, _)| p.to_string()).unwrap_or_default();
-    let meta_ip = format!("{prefix}.{}", 150 + (fnv1a(format!("{id}meta").as_bytes()) % 45));
-    let studio_ip = format!("{prefix}.{}", 100 + (fnv1a(format!("{id}studio").as_bytes()) % 45));
+    let prefix = db_ip
+        .rsplit_once('.')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    let meta_ip = format!(
+        "{prefix}.{}",
+        150 + (fnv1a(format!("{id}meta").as_bytes()) % 45)
+    );
+    let studio_ip = format!(
+        "{prefix}.{}",
+        100 + (fnv1a(format!("{id}studio").as_bytes()) % 45)
+    );
 
     let c_db = format!("hive-supa-{short}-db");
     let c_meta = format!("hive-supa-{short}-meta");
@@ -1751,11 +1764,21 @@ async fn provision_supabase(
     // password, so the vendored roles/jwt init SQL is not needed for this
     // dependency set.
     let db_args: Vec<String> = vec![
-        "run".into(), "-d".into(), "--name".into(), c_db.clone(), "--replace".into(),
-        "-e".into(), format!("POSTGRES_PASSWORD={pg_password}"),
-        "-v".into(), format!("{volume}:/var/lib/postgresql/data"),
-        "-p".into(), format!("127.0.0.1:{port_pg}:5432"),
-        "--network".into(), netname.clone(), "--ip".into(), db_ip.clone(),
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_db.clone(),
+        "--replace".into(),
+        "-e".into(),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        "-v".into(),
+        format!("{volume}:/var/lib/postgresql/data"),
+        "-p".into(),
+        format!("127.0.0.1:{port_pg}:5432"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        db_ip.clone(),
         "docker.io/supabase/postgres:15.8.1.085".into(),
     ];
     match podman_run_detached(&db_args).await {
@@ -1771,16 +1794,31 @@ async fn provision_supabase(
 
     // meta — pg-meta, Studio's management API. Internal only: no host publish.
     let meta_args: Vec<String> = vec![
-        "run".into(), "-d".into(), "--name".into(), c_meta.clone(), "--replace".into(),
-        "-e".into(), "PG_META_DB_HOST=db".into(),
-        "-e".into(), "PG_META_DB_PORT=5432".into(),
-        "-e".into(), format!("PG_META_DB_NAME={dbname}"),
-        "-e".into(), "PG_META_DB_USER=postgres".into(),
-        "-e".into(), format!("PG_META_DB_PASSWORD={pg_password}"),
-        "-e".into(), "PG_META_DB_SSL_MODE=disable".into(),
-        "-e".into(), format!("CRYPTO_KEY={crypto_key}"),
-        "--network".into(), netname.clone(), "--ip".into(), meta_ip.clone(),
-        "--add-host".into(), format!("db:{db_ip}"),
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_meta.clone(),
+        "--replace".into(),
+        "-e".into(),
+        "PG_META_DB_HOST=db".into(),
+        "-e".into(),
+        "PG_META_DB_PORT=5432".into(),
+        "-e".into(),
+        format!("PG_META_DB_NAME={dbname}"),
+        "-e".into(),
+        "PG_META_DB_USER=postgres".into(),
+        "-e".into(),
+        format!("PG_META_DB_PASSWORD={pg_password}"),
+        "-e".into(),
+        "PG_META_DB_SSL_MODE=disable".into(),
+        "-e".into(),
+        format!("CRYPTO_KEY={crypto_key}"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        meta_ip.clone(),
+        "--add-host".into(),
+        format!("db:{db_ip}"),
         "docker.io/supabase/postgres-meta:v0.95.2".into(),
     ];
     match podman_run_detached(&meta_args).await {
@@ -1794,26 +1832,65 @@ async fn provision_supabase(
 
     // studio — the dashboard itself, published on loopback for the edge proxy.
     let studio_args: Vec<String> = vec![
-        "run".into(), "-d".into(), "--name".into(), c_studio.clone(), "--replace".into(),
-        "-e".into(), "HOSTNAME=::".into(),
-        "-e".into(), "STUDIO_PG_META_URL=http://meta:8080".into(),
-        "-e".into(), "POSTGRES_HOST=db".into(),
-        "-e".into(), "POSTGRES_PORT=5432".into(),
-        "-e".into(), format!("POSTGRES_DB={dbname}"),
-        "-e".into(), format!("POSTGRES_PASSWORD={pg_password}"),
-        "-e".into(), format!("PG_META_CRYPTO_KEY={crypto_key}"),
-        "-e".into(), format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
-        "-e".into(), format!("DEFAULT_PROJECT_NAME={}", req.name),
-        "-e".into(), format!("SUPABASE_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
-        "-e".into(), format!("SUPABASE_PUBLIC_URL={}", conn.get("SUPABASE_URL").cloned().unwrap_or_default()),
-        "-e".into(), format!("SUPABASE_ANON_KEY={}", conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()),
-        "-e".into(), format!("SUPABASE_SERVICE_KEY={}", conn.get("SUPABASE_SERVICE_KEY").cloned().unwrap_or_default()),
-        "-e".into(), format!("AUTH_JWT_SECRET={jwt_secret}"),
-        "-e".into(), "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
-        "-p".into(), format!("127.0.0.1:{port_studio}:3000"),
-        "--network".into(), netname.clone(), "--ip".into(), studio_ip.clone(),
-        "--add-host".into(), format!("db:{db_ip}"),
-        "--add-host".into(), format!("meta:{meta_ip}"),
+        "run".into(),
+        "-d".into(),
+        "--name".into(),
+        c_studio.clone(),
+        "--replace".into(),
+        "-e".into(),
+        "HOSTNAME=::".into(),
+        "-e".into(),
+        "STUDIO_PG_META_URL=http://meta:8080".into(),
+        "-e".into(),
+        "POSTGRES_HOST=db".into(),
+        "-e".into(),
+        "POSTGRES_PORT=5432".into(),
+        "-e".into(),
+        format!("POSTGRES_DB={dbname}"),
+        "-e".into(),
+        format!("POSTGRES_PASSWORD={pg_password}"),
+        "-e".into(),
+        format!("PG_META_CRYPTO_KEY={crypto_key}"),
+        "-e".into(),
+        format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
+        "-e".into(),
+        format!("DEFAULT_PROJECT_NAME={}", req.name),
+        "-e".into(),
+        format!(
+            "SUPABASE_URL={}",
+            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_PUBLIC_URL={}",
+            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_ANON_KEY={}",
+            conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()
+        ),
+        "-e".into(),
+        format!(
+            "SUPABASE_SERVICE_KEY={}",
+            conn.get("SUPABASE_SERVICE_KEY")
+                .cloned()
+                .unwrap_or_default()
+        ),
+        "-e".into(),
+        format!("AUTH_JWT_SECRET={jwt_secret}"),
+        "-e".into(),
+        "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
+        "-p".into(),
+        format!("127.0.0.1:{port_studio}:3000"),
+        "--network".into(),
+        netname.clone(),
+        "--ip".into(),
+        studio_ip.clone(),
+        "--add-host".into(),
+        format!("db:{db_ip}"),
+        "--add-host".into(),
+        format!("meta:{meta_ip}"),
         "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
     ];
     match podman_run_detached(&studio_args).await {

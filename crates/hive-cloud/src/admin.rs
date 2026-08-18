@@ -3394,7 +3394,11 @@ async fn purge_project_resources(
             // plus the two below in `database_delete`/the "remove" op) stays
             // hardcoded to podman for that reason, unconditionally.
             // Comma-split: a Supabase record carries its whole stack.
-            for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for one in container
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 let _ = tokio::process::Command::new("podman")
                     .args(["rm", "-f", "-v", one])
                     .env(
@@ -4345,11 +4349,23 @@ async fn fan_out_peers(
     team: &str,
     path: &str,
 ) -> Vec<Value> {
-    futures::future::join_all(
-        peers
-            .iter()
-            .map(|name| fetch_from_host(c, name, path, team)),
-    )
+    // PER-PEER budget, at the one chokepoint every dashboard fan-out funnels
+    // through. `fetch_from_host`'s own budgets (10s HTTP admin, then 20s iroh)
+    // are DIAL-RESILIENCE budgets — right for one-shot control operations,
+    // structurally wrong for polled reads: one registry-healthy peer whose
+    // trunk is cold made `/v1/functions` and `/v1/metrics` take a flat ~20s
+    // per poll (measured live), which the 3-5s dashboard polling then piled
+    // onto until the usage page rendered nothing at all. The fetches run
+    // concurrently, so the whole fan-out now costs at most one budget; a peer
+    // that misses it contributes to the next poll instead (the wf_runs
+    // PHASE_BUDGET precedent, applied at the shared chokepoint).
+    const PER_PEER_BUDGET: Duration = Duration::from_secs(8);
+    futures::future::join_all(peers.iter().map(|name| async move {
+        tokio::time::timeout(PER_PEER_BUDGET, fetch_from_host(c, name, path, team))
+            .await
+            .ok()
+            .flatten()
+    }))
     .await
     .into_iter()
     .flatten()
@@ -9390,7 +9406,11 @@ async fn database_delete(
             // single-container kinds are unaffected by the split. `-v` is the
             // podman lock-pool rule (anonymous volumes leak locks forever);
             // the stack's NAMED data volume is removed explicitly below.
-            for one in container.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            for one in container
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 let _ = tokio::process::Command::new("podman")
                     .args(["rm", "-f", "-v", one])
                     .env(

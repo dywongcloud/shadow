@@ -785,9 +785,19 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
         .and_then(|raw| String::from_utf8(raw).ok())
         .map(|pair| {
             let (u, p) = pair.split_once(':').unwrap_or((pair.as_str(), ""));
-            let eu = db.connection.get("STUDIO_USERNAME").map(String::as_str).unwrap_or("");
-            let ep = db.connection.get("STUDIO_PASSWORD").map(String::as_str).unwrap_or("");
-            !eu.is_empty() && ct_eq(u.as_bytes(), eu.as_bytes()) && ct_eq(p.as_bytes(), ep.as_bytes())
+            let eu = db
+                .connection
+                .get("STUDIO_USERNAME")
+                .map(String::as_str)
+                .unwrap_or("");
+            let ep = db
+                .connection
+                .get("STUDIO_PASSWORD")
+                .map(String::as_str)
+                .unwrap_or("");
+            !eu.is_empty()
+                && ct_eq(u.as_bytes(), eu.as_bytes())
+                && ct_eq(p.as_bytes(), ep.as_bytes())
         })
         .unwrap_or(false);
     if !ok {
@@ -834,8 +844,15 @@ async fn supabase_studio_proxy(cloud: &Arc<CloudState>, db: &Database, req: Requ
             // Hop-by-hop + the gate itself: Kong's hide_credentials equivalent.
             if matches!(
                 name.as_str(),
-                "host" | "connection" | "content-length" | "transfer-encoding" | "keep-alive"
-                    | "upgrade" | "authorization" | "x-hive-proxied" | "x-hive-request-id"
+                "host"
+                    | "connection"
+                    | "content-length"
+                    | "transfer-encoding"
+                    | "keep-alive"
+                    | "upgrade"
+                    | "authorization"
+                    | "x-hive-proxied"
+                    | "x-hive-request-id"
             ) {
                 return None;
             }
