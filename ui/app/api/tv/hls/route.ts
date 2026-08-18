@@ -75,7 +75,12 @@ export async function GET(req: NextRequest) {
 
   if (isPlaylist) {
     const text = await upstream.text();
-    const rewritten = rewritePlaylist(text, target.toString());
+    // Resolve relative URIs against the FINAL url after redirects, not the
+    // requested one. iptv-org fronts most streams with a redirector (jmp2.uk),
+    // so the playlist's relative variant/segment URIs belong to the redirected
+    // host — resolving them against the original would 404 every one.
+    const base = upstream.url || target.toString();
+    const rewritten = rewritePlaylist(text, base);
     return new NextResponse(rewritten, {
       status: 200,
       headers: {
