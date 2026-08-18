@@ -13,13 +13,22 @@ export function Logo({ className = "h-6 w-auto" }: { className?: string }) {
   );
 }
 
-// The classic Vercel triangle brand mark — theme-aware via `currentColor`
-// (`text-fg` is black on light backgrounds, white on dark), so it inverts with
-// the theme without any image swap or hydration flash. Size with a height util.
+// The navbar brand mark: a Δ (Greek capital delta). Theme-aware via
+// `currentColor` (`text-fg` is black on light backgrounds, white on dark), so
+// it inverts with the theme with no image swap or hydration flash. Kept as a
+// vector path rather than a text glyph so it renders identically across
+// platform fonts and sizes cleanly with a height utility (e.g. `h-5`).
 export function VercelMark({ className = "h-5 w-auto" }: { className?: string }) {
   return (
-    <svg viewBox="0 0 76 65" className={`${className} text-fg`} fill="currentColor" aria-label="Vercel" role="img">
-      <path d="M37.5274 0L75.0548 65H0L37.5274 0Z" />
+    <svg viewBox="0 0 76 65" className={`${className} text-fg`} fill="currentColor" aria-label="Delta" role="img">
+      {/* Uppercase delta: an open (outlined) equilateral triangle, its stroke
+          weight built from the difference of the outer and inner triangles so
+          the fill (currentColor) forms the letterform. */}
+      <path
+        fillRule="evenodd"
+        clipRule="evenodd"
+        d="M38 0 76 65H0L38 0Zm0 13.6L12.9 56.6H63.1L38 13.6Z"
+      />
     </svg>
   );
 }
