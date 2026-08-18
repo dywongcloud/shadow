@@ -535,14 +535,27 @@ impl ProjectStore {
 
     /// Forget a project's settings (used when a project is deleted).
     pub fn remove(&self, project: &str) {
-        self.map.write().remove(project);
+        let existed = self.map.write().remove(project).is_some();
         // Record the deletion so it REPLICATES: without a tombstone, a peer
         // still holding the row hands it straight back on the next sync tick
         // (delete "doesn't stick"), and with wholesale-replace adoption the
         // ABSENCE itself was indistinguishable from not-yet-created.
-        self.tombstones
-            .write()
-            .insert(project.to_string(), now_ms());
+        //
+        // But a REPEAT removal must not move the timestamp. Deletes are retried
+        // by design — the mesh cascade re-dispatches to peers it could not
+        // reach, and the deletion reconcile re-applies the tombstone on every
+        // tick — and tombstones merge MAX-WINS, so a re-stamp would ratchet the
+        // tombstone forward in time forever. A project legitimately RE-CREATED
+        // after its deletion would then find a tombstone NEWER than its own row
+        // and be deleted again, fleet-wide, by the very loop meant to converge
+        // the original delete. Stamp only when this call actually removed a row
+        // (a real, newly-observed deletion) or when nothing has recorded one
+        // yet; otherwise keep the original instant.
+        if existed || !self.tombstones.read().contains_key(project) {
+            self.tombstones
+                .write()
+                .insert(project.to_string(), now_ms());
+        }
         let project = project.to_string();
         if let Ok(h) = tokio::runtime::Handle::try_current() {
             h.spawn(async move { crate::relational::remove_project(&project).await });

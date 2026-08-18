@@ -3832,7 +3832,15 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
     if candidates.is_empty() {
         return; // no reachable peer this round — nothing to compare against
     }
-    let idx = (now_ms() as usize) % candidates.len();
+    // Rotate with a monotonic counter, NEVER `now_ms() % len`. The loop ticks on
+    // a fixed 60s interval, so a clock-derived index advances by exactly
+    // `60000 mod len` each round — which is ZERO for len 12, 15 or 16, the exact
+    // band this ~17-node fleet sits in. That pinned every round on the SAME peer
+    // indefinitely: one unreachable candidate could consume the single per-round
+    // slot forever while every other peer went un-reconciled. A counter cannot
+    // alias with the tick period.
+    static ROUND: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let idx = ROUND.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % candidates.len();
     let peer = &candidates[idx];
     let (peer_id, peer_addr) = (
         peer.peer_id.clone().unwrap(),
