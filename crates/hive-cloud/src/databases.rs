@@ -698,34 +698,17 @@ impl DatabaseStore {
     /// container, plus the stored connection fields a re-create needs
     /// (kind, local host port, raw password). Internal-only — never serialized
     /// to a client.
-    pub(crate) fn containers_to_reconcile(
-        &self,
-    ) -> Vec<(
-        String,
-        DbKind,
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    )> {
+    /// Live records with a backing container, for `spawn_db_reconcile`. The
+    /// WHOLE record goes back so the loop can route multi-container kinds
+    /// (Supabase's comma-joined stack) and filter to records this node hosts
+    /// — checking a foreign node's record against the LOCAL podman reads
+    /// "GONE" forever and WARNs spuriously (witnessed fleet-wide 2026-08-18).
+    pub(crate) fn containers_to_reconcile(&self) -> Vec<Database> {
         self.dbs
             .read()
             .iter()
-            .filter(|d| d.mode == "live")
-            .filter_map(|d| {
-                let c = d.container.clone()?;
-                Some((
-                    d.id.clone(),
-                    d.kind,
-                    c,
-                    d.connection
-                        .get("local_port")
-                        .or_else(|| d.connection.get("port"))
-                        .cloned(),
-                    d.connection.get("password").cloned(),
-                    d.project.clone(),
-                ))
-            })
+            .filter(|d| d.mode == "live" && d.container.is_some())
+            .cloned()
             .collect()
     }
 
@@ -1656,6 +1639,121 @@ async fn podman_run_detached(args: &[String]) -> Result<(), String> {
     }
 }
 
+/// Everything needed to (re)build one Supabase stack's three containers.
+/// Constructed with FRESH secrets at provision time and from the stored
+/// record at reconcile-rebuild time — the two paths must produce
+/// byte-identical args, so they share this one builder.
+struct SupaStack {
+    id: String,
+    short: String,
+    port_pg: String,
+    port_studio: String,
+    pg_password: String,
+    jwt_secret: String,
+    crypto_key: String,
+    anon_key: String,
+    service_key: String,
+    dbname: String,
+    public_base: String,
+    project: String,
+    db_name: String,
+    netname: String,
+    db_ip: String,
+    volume: String,
+}
+
+/// The deterministic sibling IPs of a stack, derived from the db id + the
+/// db container's IP — recomputed identically at provision and at rebuild.
+fn supabase_ips(id: &str, db_ip: &str) -> (String, String) {
+    let prefix = db_ip
+        .rsplit_once('.')
+        .map(|(p, _)| p.to_string())
+        .unwrap_or_default();
+    (
+        format!("{prefix}.{}", 150 + (fnv1a(format!("{id}meta").as_bytes()) % 45)),
+        format!("{prefix}.{}", 100 + (fnv1a(format!("{id}studio").as_bytes()) % 45)),
+    )
+}
+
+/// (container-name, run-args) for each member of the stack, in start order.
+fn supabase_stack_args(p: &SupaStack) -> Vec<(String, Vec<String>)> {
+    let (meta_ip, studio_ip) = supabase_ips(&p.id, &p.db_ip);
+    let c_db = format!("hive-supa-{}-db", p.short);
+    let c_meta = format!("hive-supa-{}-meta", p.short);
+    let c_studio = format!("hive-supa-{}-studio", p.short);
+    let db_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_db.clone(), "--replace".into(),
+        "-e".into(), format!("POSTGRES_PASSWORD={}", p.pg_password),
+        "-v".into(), format!("{}:/var/lib/postgresql/data", p.volume),
+        "-p".into(), format!("127.0.0.1:{}:5432", p.port_pg),
+        "--network".into(), p.netname.clone(), "--ip".into(), p.db_ip.clone(),
+        "docker.io/supabase/postgres:15.8.1.085".into(),
+    ];
+    let meta_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_meta.clone(), "--replace".into(),
+        "-e".into(), "PG_META_DB_HOST=db".into(),
+        "-e".into(), "PG_META_DB_PORT=5432".into(),
+        "-e".into(), format!("PG_META_DB_NAME={}", p.dbname),
+        "-e".into(), "PG_META_DB_USER=postgres".into(),
+        "-e".into(), format!("PG_META_DB_PASSWORD={}", p.pg_password),
+        "-e".into(), "PG_META_DB_SSL_MODE=disable".into(),
+        "-e".into(), format!("CRYPTO_KEY={}", p.crypto_key),
+        "--network".into(), p.netname.clone(), "--ip".into(), meta_ip.clone(),
+        "--add-host".into(), format!("db:{}", p.db_ip),
+        "docker.io/supabase/postgres-meta:v0.95.2".into(),
+    ];
+    let studio_args: Vec<String> = vec![
+        "run".into(), "-d".into(), "--name".into(), c_studio.clone(), "--replace".into(),
+        "-e".into(), "HOSTNAME=::".into(),
+        "-e".into(), "STUDIO_PG_META_URL=http://meta:8080".into(),
+        "-e".into(), "POSTGRES_HOST=db".into(),
+        "-e".into(), "POSTGRES_PORT=5432".into(),
+        "-e".into(), format!("POSTGRES_DB={}", p.dbname),
+        "-e".into(), format!("POSTGRES_PASSWORD={}", p.pg_password),
+        "-e".into(), format!("PG_META_CRYPTO_KEY={}", p.crypto_key),
+        "-e".into(), format!("DEFAULT_ORGANIZATION_NAME={}", p.project),
+        "-e".into(), format!("DEFAULT_PROJECT_NAME={}", p.db_name),
+        "-e".into(), format!("SUPABASE_URL={}", p.public_base),
+        "-e".into(), format!("SUPABASE_PUBLIC_URL={}", p.public_base),
+        "-e".into(), format!("SUPABASE_ANON_KEY={}", p.anon_key),
+        "-e".into(), format!("SUPABASE_SERVICE_KEY={}", p.service_key),
+        "-e".into(), format!("AUTH_JWT_SECRET={}", p.jwt_secret),
+        "-e".into(), "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
+        "-p".into(), format!("127.0.0.1:{}:3000", p.port_studio),
+        "--network".into(), p.netname.clone(), "--ip".into(), studio_ip,
+        "--add-host".into(), format!("db:{}", p.db_ip),
+        "--add-host".into(), format!("meta:{meta_ip}"),
+        "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
+    ];
+    vec![(c_db, db_args), (c_meta, meta_args), (c_studio, studio_args)]
+}
+
+/// Rebuild a SupaStack from the stored record (reconcile rebuild path) —
+/// every value the containers need rides the connection map, so a vanished
+/// stack comes back identical, data included (the named volume survives).
+fn supa_stack_from_record(d: &Database) -> Option<SupaStack> {
+    let c = &d.connection;
+    let get = |k: &str| c.get(k).cloned().filter(|v| !v.is_empty());
+    Some(SupaStack {
+        id: d.id.clone(),
+        short: d.id[3..11.min(d.id.len())].to_string(),
+        port_pg: get("local_port").or_else(|| get("port"))?,
+        port_studio: get("studio_port")?,
+        pg_password: get("password")?,
+        jwt_secret: get("JWT_SECRET")?,
+        crypto_key: get("PG_META_CRYPTO_KEY")?,
+        anon_key: get("SUPABASE_ANON_KEY")?,
+        service_key: get("SUPABASE_SERVICE_KEY")?,
+        dbname: get("database").unwrap_or_else(|| "postgres".into()),
+        public_base: get("SUPABASE_URL")?,
+        project: d.project.clone(),
+        db_name: d.name.clone(),
+        netname: String::new(), // filled by the caller (recomputed from project)
+        db_ip: get("net_host")?,
+        volume: format!("hive-vol-supa-{}", &d.id[3..11.min(d.id.len())]),
+    })
+}
+
 async fn provision_supabase(
     store: &Arc<DatabaseStore>,
     id: &str,
@@ -1700,6 +1798,10 @@ async fn provision_supabase(
     conn.insert("STUDIO_URL".into(), public_base);
     conn.insert("STUDIO_USERNAME".into(), dashboard_user);
     conn.insert("STUDIO_PASSWORD".into(), dashboard_password);
+    // Stored so the reconcile rebuild recreates an IDENTICAL stack (they are
+    // already-secret material, same class as the engine password in this map).
+    conn.insert("JWT_SECRET".into(), jwt_secret.clone());
+    conn.insert("PG_META_CRYPTO_KEY".into(), crypto_key.clone());
 
     if !podman_available().await {
         return Ok(("simulated".into(), conn, None));
@@ -1709,27 +1811,9 @@ async fn provision_supabase(
     };
     conn.insert("net_host".into(), db_ip.clone());
     conn.insert("net_port".into(), "5432".into());
-    // Deterministic sibling IPs in bands clear of the managed-DB .200+ band
-    // (and of compose's .11+ blocks in practice); a collision fails the
-    // `podman run` loudly below, never silently.
-    let prefix = db_ip
-        .rsplit_once('.')
-        .map(|(p, _)| p.to_string())
-        .unwrap_or_default();
-    let meta_ip = format!(
-        "{prefix}.{}",
-        150 + (fnv1a(format!("{id}meta").as_bytes()) % 45)
-    );
-    let studio_ip = format!(
-        "{prefix}.{}",
-        100 + (fnv1a(format!("{id}studio").as_bytes()) % 45)
-    );
-
-    let c_db = format!("hive-supa-{short}-db");
-    let c_meta = format!("hive-supa-{short}-meta");
-    let c_studio = format!("hive-supa-{short}-studio");
-    let volume = format!("hive-vol-supa-{short}");
-    let mut started: Vec<String> = Vec::new();
+    // Sibling IPs are deterministic (see supabase_ips) in bands clear of the
+    // managed-DB .200+ band (and of compose's .11+ blocks in practice); a
+    // collision fails the `podman run` loudly below, never silently.
     let cleanup = |started: &[String]| {
         let names: Vec<String> = started.to_vec();
         async move {
@@ -1759,29 +1843,35 @@ async fn provision_supabase(
         }
     }
 
+    let stack = SupaStack {
+        id: id.to_string(),
+        short: short.to_string(),
+        port_pg: port_pg.to_string(),
+        port_studio: port_studio.to_string(),
+        pg_password,
+        jwt_secret,
+        crypto_key,
+        anon_key: conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default(),
+        service_key: conn.get("SUPABASE_SERVICE_KEY").cloned().unwrap_or_default(),
+        dbname: dbname.into(),
+        public_base: conn.get("SUPABASE_URL").cloned().unwrap_or_default(),
+        project: req.project.clone(),
+        db_name: req.name.clone(),
+        netname: netname.clone(),
+        db_ip: db_ip.clone(),
+        volume: format!("hive-vol-supa-{short}"),
+    };
+    let members = supabase_stack_args(&stack);
+    let c_db = members[0].0.clone();
+    let c_meta = members[1].0.clone();
+    let c_studio = members[2].0.clone();
+    let mut started: Vec<String> = Vec::new();
+
     // db — the engine. The supabase/postgres image bakes the Supabase role set;
     // meta and studio both connect as the `postgres` superuser with this
     // password, so the vendored roles/jwt init SQL is not needed for this
     // dependency set.
-    let db_args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        c_db.clone(),
-        "--replace".into(),
-        "-e".into(),
-        format!("POSTGRES_PASSWORD={pg_password}"),
-        "-v".into(),
-        format!("{volume}:/var/lib/postgresql/data"),
-        "-p".into(),
-        format!("127.0.0.1:{port_pg}:5432"),
-        "--network".into(),
-        netname.clone(),
-        "--ip".into(),
-        db_ip.clone(),
-        "docker.io/supabase/postgres:15.8.1.085".into(),
-    ];
-    match podman_run_detached(&db_args).await {
+    match podman_run_detached(&members[0].1).await {
         Ok(()) => started.push(c_db.clone()),
         Err(e) => {
             tracing::warn!(db = %id, error = %e, "supabase db container failed — simulating");
@@ -1793,35 +1883,7 @@ async fn provision_supabase(
     }
 
     // meta — pg-meta, Studio's management API. Internal only: no host publish.
-    let meta_args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        c_meta.clone(),
-        "--replace".into(),
-        "-e".into(),
-        "PG_META_DB_HOST=db".into(),
-        "-e".into(),
-        "PG_META_DB_PORT=5432".into(),
-        "-e".into(),
-        format!("PG_META_DB_NAME={dbname}"),
-        "-e".into(),
-        "PG_META_DB_USER=postgres".into(),
-        "-e".into(),
-        format!("PG_META_DB_PASSWORD={pg_password}"),
-        "-e".into(),
-        "PG_META_DB_SSL_MODE=disable".into(),
-        "-e".into(),
-        format!("CRYPTO_KEY={crypto_key}"),
-        "--network".into(),
-        netname.clone(),
-        "--ip".into(),
-        meta_ip.clone(),
-        "--add-host".into(),
-        format!("db:{db_ip}"),
-        "docker.io/supabase/postgres-meta:v0.95.2".into(),
-    ];
-    match podman_run_detached(&meta_args).await {
+    match podman_run_detached(&members[1].1).await {
         Ok(()) => started.push(c_meta.clone()),
         Err(e) => {
             tracing::warn!(db = %id, error = %e, "supabase meta container failed — simulating");
@@ -1831,69 +1893,7 @@ async fn provision_supabase(
     }
 
     // studio — the dashboard itself, published on loopback for the edge proxy.
-    let studio_args: Vec<String> = vec![
-        "run".into(),
-        "-d".into(),
-        "--name".into(),
-        c_studio.clone(),
-        "--replace".into(),
-        "-e".into(),
-        "HOSTNAME=::".into(),
-        "-e".into(),
-        "STUDIO_PG_META_URL=http://meta:8080".into(),
-        "-e".into(),
-        "POSTGRES_HOST=db".into(),
-        "-e".into(),
-        "POSTGRES_PORT=5432".into(),
-        "-e".into(),
-        format!("POSTGRES_DB={dbname}"),
-        "-e".into(),
-        format!("POSTGRES_PASSWORD={pg_password}"),
-        "-e".into(),
-        format!("PG_META_CRYPTO_KEY={crypto_key}"),
-        "-e".into(),
-        format!("DEFAULT_ORGANIZATION_NAME={}", req.project),
-        "-e".into(),
-        format!("DEFAULT_PROJECT_NAME={}", req.name),
-        "-e".into(),
-        format!(
-            "SUPABASE_URL={}",
-            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
-        ),
-        "-e".into(),
-        format!(
-            "SUPABASE_PUBLIC_URL={}",
-            conn.get("SUPABASE_URL").cloned().unwrap_or_default()
-        ),
-        "-e".into(),
-        format!(
-            "SUPABASE_ANON_KEY={}",
-            conn.get("SUPABASE_ANON_KEY").cloned().unwrap_or_default()
-        ),
-        "-e".into(),
-        format!(
-            "SUPABASE_SERVICE_KEY={}",
-            conn.get("SUPABASE_SERVICE_KEY")
-                .cloned()
-                .unwrap_or_default()
-        ),
-        "-e".into(),
-        format!("AUTH_JWT_SECRET={jwt_secret}"),
-        "-e".into(),
-        "NEXT_PUBLIC_ENABLE_LOGS=false".into(),
-        "-p".into(),
-        format!("127.0.0.1:{port_studio}:3000"),
-        "--network".into(),
-        netname.clone(),
-        "--ip".into(),
-        studio_ip.clone(),
-        "--add-host".into(),
-        format!("db:{db_ip}"),
-        "--add-host".into(),
-        format!("meta:{meta_ip}"),
-        "docker.io/supabase/studio:2026.02.16-sha-26c615c".into(),
-    ];
-    match podman_run_detached(&studio_args).await {
+    match podman_run_detached(&members[2].1).await {
         Ok(()) => started.push(c_studio.clone()),
         Err(e) => {
             tracing::warn!(db = %id, error = %e, "supabase studio container failed — simulating");
@@ -2003,9 +2003,32 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                 if !podman_available().await {
                     continue;
                 }
-                for (id, kind, cname, local_port, password, project) in
-                    cloud.databases.containers_to_reconcile()
-                {
+                for d in cloud.databases.containers_to_reconcile() {
+                    // Route by LOCAL EVIDENCE, not just the record: records
+                    // replicate fleet-wide, so every node's store holds DBs it
+                    // never hosted, and a foreign record reads "GONE" against
+                    // the local podman forever (spurious WARNs — and worse, a
+                    // rebuild-on-GONE on the wrong node would spawn a rogue
+                    // empty engine). A container is reconciled here iff the
+                    // record names this node OR the container exists in the
+                    // local podman; a GONE container is rebuilt only when it
+                    // was SEEN running here before (the marker file) or the
+                    // record names this node.
+                    let hosted_here = !d.host_node.is_empty() && d.host_node == cloud.node_name;
+                    let id = d.id.clone();
+                    let kind = d.kind;
+                    let project = d.project.clone();
+                    let local_port = d
+                        .connection
+                        .get("local_port")
+                        .or_else(|| d.connection.get("port"))
+                        .cloned();
+                    let password = d.connection.get("password").cloned();
+                    let Some(field) = d.container.clone() else { continue };
+                    // A Supabase record carries its whole stack comma-joined;
+                    // every member is reconciled independently.
+                    for cname in field.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    let cname = cname.to_string();
                     let inspect = Command::new("podman")
                         .args(["inspect", &cname, "--format", "{{.State.Running}}"])
                         .env("PATH", augmented_path())
@@ -2013,6 +2036,8 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                         .await;
                     match inspect {
                         Ok(o) if o.status.success() => {
+                            // It exists locally: this node hosts (or hosted) it.
+                            mark_db_container_local(&cname);
                             if String::from_utf8_lossy(&o.stdout).trim() != "true" {
                                 match Command::new("podman")
                                     .args(["start", &cname])
@@ -2032,9 +2057,9 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                                 }
                             }
                         }
-                        // inspect failed -> container record is GONE (machine reset /
-                        // pruned). Rebuild what we safely can.
-                        _ => match (kind, local_port.as_deref(), password.as_deref()) {
+                        // inspect failed -> no trace in the local podman. Rebuild
+                        // only with local evidence (or a record naming this node).
+                        _ if hosted_here || db_container_seen_local(&cname) => match (kind, local_port.as_deref(), password.as_deref()) {
                             (DbKind::Redis, Some(port), Some(pw))
                                 if !port.is_empty() && !pw.is_empty() =>
                             {
@@ -2070,15 +2095,98 @@ pub fn spawn_db_reconcile(cloud: Arc<crate::state::CloudState>) {
                                     }
                                 }
                             }
+                            // Supabase: rebuild the missing member from the record
+                            // (identical args via the shared builder). The named
+                            // volume survives a container loss, so a rebuilt db
+                            // container comes back WITH its data — this is the
+                            // fault-tolerance lane, not a data-loss event.
+                            (DbKind::Supabase, _, _) => {
+                                let rebuilt = match supa_stack_from_record(&d) {
+                                    Some(mut stack) => {
+                                        let net = ensure_project_db_net(&d.project, &d.id).await;
+                                        match net {
+                                            Some((netname, _ip)) => {
+                                                stack.netname = netname;
+                                                let members = supabase_stack_args(&stack);
+                                                match members.iter().find(|(n, _)| n == &cname) {
+                                                    Some((_, args)) => {
+                                                        let image = args.last().cloned().unwrap_or_default();
+                                                        if !podman_pull_retry(&image).await {
+                                                            Some(false)
+                                                        } else {
+                                                            match podman_run_detached(args).await {
+                                                                Ok(()) => Some(true),
+                                                                Err(e) => {
+                                                                    tracing::warn!(db = %id, container = %cname, error = %e, "db-reconcile: supabase member re-create failed");
+                                                                    Some(false)
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    None => None,
+                                                }
+                                            }
+                                            None => Some(false),
+                                        }
+                                    }
+                                    None => None,
+                                };
+                                match rebuilt {
+                                    Some(true) => {
+                                        tracing::warn!(db = %id, container = %cname, %project, "db-reconcile: supabase member was GONE — rebuilt from the record (named volume preserved, data intact)")
+                                    }
+                                    Some(false) => {
+                                        tracing::warn!(db = %id, container = %cname, %project, "db-reconcile: supabase member rebuild FAILED — the database is degraded until the next pass")
+                                    }
+                                    None => {
+                                        tracing::warn!(db = %id, container = %cname, %project, "db-reconcile: supabase member GONE and the record lacks the fields to rebuild it — re-provision to restore")
+                                    }
+                                }
+                            }
                             _ => {
                                 tracing::warn!(db = %id, container = %cname, %project, ?kind, "db-reconcile: backing container is GONE and this kind is not auto-rebuilt — the database is DOWN until re-provisioned");
                             }
                         },
+                        // No local trace and no local evidence — another node's
+                        // database; skip without a word (records replicate
+                        // fleet-wide, so this is the common case, not a fault).
+                        _ => {}
+                    }
                     }
                 }
             }
         }
     });
+}
+
+/// Local-evidence markers for db-reconcile routing: `$HIVE_DATA/db-containers/`
+/// holds one empty file per backing container ever SEEN in this node's
+/// podman. Records replicate fleet-wide, so the record alone cannot tell
+/// "mine, vanished" from "another node's, never here" — the marker can.
+/// Container names are platform-templated (`hive-db-*`, `hive-supa-*`), so a
+/// record value can never become an arbitrary path.
+fn db_container_marker_path(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return None;
+    }
+    Some(crate::persist::data_dir().join("db-containers").join(name))
+}
+
+fn mark_db_container_local(name: &str) {
+    if let Some(p) = db_container_marker_path(name) {
+        if !p.exists() {
+            let _ = std::fs::create_dir_all(p.parent().unwrap());
+            let _ = std::fs::write(p, b"");
+        }
+    }
+}
+
+fn db_container_seen_local(name: &str) -> bool {
+    db_container_marker_path(name).map(|p| p.exists()).unwrap_or(false)
 }
 
 async fn podman_available() -> bool {

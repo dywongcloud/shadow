@@ -105,6 +105,16 @@ WorkingDirectory={{ hive_src_dir }}
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# hive-cloud spawns podman, and rootful podman's conmon inherits the CALLER's
+# cgroup — so with the default KillMode=control-group, every `systemctl
+# restart hive-node` SIGTERMs every container on the node: managed Postgres/
+# Redis/Supabase stacks AND tenant cells all went down with each fleet roll
+# (witnessed 2026-08-18: two live Supabase databases 502'd after a roll;
+# postgres logged "received smart shutdown request" in the same millisecond
+# as the unit stop). KillMode=process signals ONLY the hive-cloud process —
+# the dockerd/containerd precedent for exactly this shape — so databases and
+# cells outlive a control-plane restart, as they must.
+KillMode=process
 
 [Install]
 WantedBy=multi-user.target

@@ -154,6 +154,17 @@ history).
 
 ## Containers: the podman lock pool
 
+- **`KillMode=process` on hive-node.service is load-bearing, never "tidy it
+  back" to control-group.** Rootful podman's conmon inherits the CALLER's
+  cgroup, so with the default KillMode every `systemctl restart hive-node`
+  SIGTERMs the whole service cgroup — every managed database container and
+  every tenant cell on the node dies with each fleet roll. Witnessed
+  2026-08-18: two live Supabase stacks 502'd right after a roll, postgres
+  logging "received smart shutdown request" in the same millisecond as the
+  unit stop. dockerd/containerd run KillMode=process for exactly this
+  reason. The db-reconcile loop is the belt-and-braces half: it restarts
+  exited backing containers and rebuilds vanished Redis/Supabase members
+  from their records every 60s.
 - podman allocates one lock from a **fixed pool** (`num_locks`, default 2048)
   per CONTAINER **and per VOLUME**. The pool is per-host and shared by every
   tenant, so leaking locks starves the whole node: witnessed 2032 leaked
@@ -979,10 +990,14 @@ releases).
   on `,`, removes with `-v` (podman lock-pool rule), and removes the named
   volume explicitly (delete = data destroyed, same semantics as any managed
   engine delete). Replicas are dropped at provision (a second stack is a
-  divergent database, the SQLite-lane rule). The reconcile loop does NOT
-  auto-rebuild a vanished stack (the Postgres-lane behavior): WARN + the
-  record stays `live` — rebuild-on-drift is a deliberate follow-up, not an
-  oversight.
+  divergent database, the SQLite-lane rule). The reconcile loop owns fault
+  tolerance for this lane: it restarts exited members and REBUILDS vanished
+  ones from the record via the same shared builder (`supabase_stack_args`)
+  provision uses — ports/secrets/JWTs ride the connection map
+  (`JWT_SECRET`/`PG_META_CRYPTO_KEY` included for exactly this), and the
+  named volume means a rebuilt db container returns WITH its data. The
+  builder takes the full db id for the deterministic sibling IPs — never
+  reconstruct one from the short container-name suffix.
 
 ## Browser-replicated databases (the `browser_db` contract)
 
