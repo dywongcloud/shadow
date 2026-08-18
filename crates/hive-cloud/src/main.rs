@@ -1485,6 +1485,7 @@ async fn main() -> anyhow::Result<()> {
     // from the local registry and comes out empty. See `meshwatch`.
     meshwatch::spawn(cloud.clone());
     tenancy_reconcile::spawn(cloud.clone());
+    spawn_deletion_reconcile_loop(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
     // against (a SIGKILLed process cannot write it on the way out, which is
@@ -3816,11 +3817,17 @@ fn spawn_anti_entropy_loop(cloud: Arc<CloudState>) {
 /// loop body itself stays a plain tick-and-call, matching this file's other
 /// periodic loops (`spawn_trunk_warmer`, `spawn_relay_sync_loop`).
 async fn anti_entropy_round(cloud: &Arc<CloudState>) {
+    // Deliberately NOT health-filtered. A peer this node currently calls
+    // unhealthy is precisely the one whose state is most likely to have
+    // diverged, and filtering it out starved exactly the peers that needed
+    // reconciling — the convergence machinery avoided its own repair targets.
+    // A dead peer just costs one failed RPC per round; a live-but-unprobeable
+    // one gets its state back.
     let candidates: Vec<NodeInfo> = cloud
         .registry
         .nodes()
         .into_iter()
-        .filter(|n| !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some())
+        .filter(|n| !n.is_self && n.peer_id.is_some() && n.iroh_addr.is_some())
         .collect();
     if candidates.is_empty() {
         return; // no reachable peer this round — nothing to compare against
@@ -3933,6 +3940,98 @@ async fn anti_entropy_round(cloud: &Arc<CloudState>) {
             }
         }
     }
+}
+
+/// Apply replicated project DELETION tombstones to this node's own deployment
+/// records.
+///
+/// A project tombstone already replicates (`ProjectStore::snapshot_synced`) and
+/// already removes the SETTINGS row on every peer that receives it — but nothing
+/// ever applied it to the DEPLOYMENT records, which are a separate store. So a
+/// peer that was unreachable when the delete cascaded (or that was down and came
+/// back) kept its deployment rows, kept serving them, and kept gossiping them
+/// into `peer_deployments` — which is what the dashboard's fleet view reads. The
+/// project reappeared, fully alive, and deleting it again hit the same
+/// unreachable peer. That is the "deleting a project does nothing" report, and
+/// no amount of retrying the cascade at delete time can close it: the peer is by
+/// definition not listening then.
+///
+/// Making the tombstone the durable, idempotent instruction — re-applied on
+/// every tick by whoever holds it — is what converges the fleet without an
+/// operator. Same shape as `tenancy_reconcile`: repair-only, never creative.
+///
+/// A project RE-CREATED after its deletion must survive, so the tombstone is
+/// only honoured while nothing newer than it exists: a settings row written
+/// after the tombstone, or ANY deployment created after it, cancels the pass for
+/// that project entirely (never a partial reap, which would delete a live
+/// deployment's siblings).
+fn spawn_deletion_reconcile_loop(cloud: Arc<CloudState>) {
+    let interval = Duration::from_secs(env_u64("HIVE_DELETION_RECONCILE_SECS", 60));
+    crate::supervise::spawn_supervised("deletion-reconcile", move || {
+        let cloud = cloud.clone();
+        async move {
+            let mut tick = tokio::time::interval(interval);
+            loop {
+                tick.tick().await;
+                crate::supervise::beat("deletion-reconcile");
+                for (project, tomb_ms) in cloud.projects.tombstones_snapshot() {
+                    // Re-created after deletion (settings): tombstone is spent.
+                    if cloud
+                        .projects
+                        .get_if_set(&project)
+                        .is_some_and(|s| s.updated_ms > tomb_ms)
+                    {
+                        continue;
+                    }
+                    let mine: Vec<fluid_core::DeploymentInfo> = cloud
+                        .gw
+                        .list()
+                        .into_iter()
+                        .filter(|d| d.project == project)
+                        .collect();
+                    if mine.is_empty() {
+                        // No deployment records left, but a node can still hold
+                        // the project's durable PUBLIC PORT claim: the release
+                        // runs inside `purge_project_resources`, which only runs
+                        // on a node that actually tore a deployment down. A node
+                        // that merely ALLOCATED the port (the allocator is
+                        // fleet-coordinated) keeps the claim in raw_ports.json
+                        // forever, and a quarantined port is never re-granted —
+                        // so the fleet slowly loses public ports to projects that
+                        // no longer exist. Witnessed: 9000/9001 still claimed for
+                        // a project deleted fleet-wide. The tombstone is the
+                        // authority here too.
+                        let released = crate::raw_ports::release_raw_ports(&project);
+                        if !released.is_empty() {
+                            tracing::warn!(
+                                project,
+                                ports = ?released,
+                                "deletion reconcile: released public raw port(s) still claimed \
+                                 by a project deleted fleet-wide"
+                            );
+                            crate::persist::persist(&cloud);
+                        }
+                        continue;
+                    }
+                    // Re-created after deletion (a newer deployment): leave the
+                    // whole project alone rather than reaping its older half.
+                    if mine.iter().any(|d| d.created_at_ms > tomb_ms) {
+                        continue;
+                    }
+                    let team = crate::admin::norm(&cloud.projects.team_of(&project)).to_string();
+                    let n = crate::admin::delete_project_local(&cloud, &project, &team).await;
+                    tracing::warn!(
+                        project,
+                        deployments = n,
+                        tombstone_ms = tomb_ms,
+                        "deletion reconcile: applied a replicated project tombstone to \
+                         deployment records this node still held — the project was deleted \
+                         while this node could not be reached"
+                    );
+                }
+            }
+        }
+    });
 }
 
 fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
@@ -4523,6 +4622,39 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                         );
                     }
                     None => {}
+                }
+            }
+            // Reverse any withdrawal the gossip evidence no longer supports.
+            // `demote` already refuses to withdraw a peer that is still
+            // announcing, but nothing undid a verdict once written: a peer whose
+            // probe path stayed broken while its gossip kept arriving was
+            // unhealthy for the life of the process, and unhealthy peers leave
+            // DNS and placement. Measured live as audible=15 / visible_healthy=6
+            // across nine nodes at once. Runs every round, after the verdicts.
+            let restored = crate::health::restore_gossip_alive(&cloud.registry);
+            if restored > 0 {
+                // Probing is what SHOULD be clearing these; a nonzero count is a
+                // local transport fault, not a peer fault.
+                tracing::warn!(
+                    restored,
+                    "health: restored peers that are gossiping but unprobeable — \
+                     this node's mesh transport is failing against live peers"
+                );
+                // Those peers' trunks are the ones that failed; drop them so the
+                // next probe re-dials fresh instead of re-timing-out on a wedge.
+                if let Some(pool) = cloud.mesh.read().clone() {
+                    let ids: Vec<String> = cloud
+                        .registry
+                        .nodes()
+                        .into_iter()
+                        .filter(|n| !n.is_self && n.healthy && n.latency_ms == hive_edge::region::NodeRegistry::RESTORED_LATENCY_MS)
+                        .filter_map(|n| n.peer_id)
+                        .collect();
+                    tokio::spawn(async move {
+                        for id in ids {
+                            pool.close_peer(&id).await;
+                        }
+                    });
                 }
             }
             // Forget miss-counters for nodes no longer in the probe set (relocated/gone).

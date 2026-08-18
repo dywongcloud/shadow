@@ -91,6 +91,7 @@ static DEMOTED: AtomicU64 = AtomicU64::new(0);
 static REFUSED_GOSSIP_ALIVE: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN_PEER: AtomicU64 = AtomicU64::new(0);
 static COLD_MARKS: AtomicU64 = AtomicU64::new(0);
+static RESTORED: AtomicU64 = AtomicU64::new(0);
 
 /// Record the node-local routing penalty. Returns `true` when the peer was not
 /// already cold — the caller uses that to log once per window instead of once
@@ -182,6 +183,48 @@ pub fn demote(
     true
 }
 
+/// Reverse withdrawals that the gossip evidence no longer supports.
+///
+/// [`demote`] refuses to withdraw a peer whose gossip is fresh, but until this
+/// existed nothing ever UNDID a withdrawal: only a successful probe could clear
+/// `healthy = false`, so a peer whose probe path was broken (stale cached addr,
+/// wedged trunk) while its announces kept arriving stayed unhealthy for the life
+/// of the process. Measured live on nine nodes simultaneously:
+/// `audible_peers = 15` beside `visible_healthy_peers = 6` — a node that had
+/// heard from 15 peers seconds earlier serving 6 to DNS and placement. Hand
+/// restarts "fixed" it only because a restart drops the stale verdict.
+///
+/// Applying the same evidence symmetrically is what makes this self-healing, and
+/// it cannot resurrect a genuinely dead peer: a silent node's `last_seen_ms`
+/// ages past the window and `NodeRegistry::nodes()` drops it outright at 30s.
+///
+/// Returns the number of peers restored this pass.
+pub fn restore_gossip_alive(registry: &hive_edge::region::NodeRegistry) -> usize {
+    let stale_ids: Vec<String> = registry
+        .nodes()
+        .into_iter()
+        .filter(|n| !n.is_self && !n.healthy)
+        .map(|n| n.id)
+        .collect();
+    let mut restored = 0usize;
+    for id in stale_ids {
+        if registry.restore_health_if_gossip_fresh(&id, GOSSIP_ALIVE_MS) {
+            restored += 1;
+            RESTORED.fetch_add(1, Ordering::Relaxed);
+            // A restored peer is reachable-by-evidence, so it must not keep
+            // serving out a routing penalty from the transport fault that
+            // withdrew it.
+            clear_cold(&id);
+            tracing::info!(
+                node = %id,
+                "peer RESTORED to healthy — it is still gossiping, so the withdrawal that \
+                 removed it from DNS/placement is no longer supported by evidence"
+            );
+        }
+    }
+    restored
+}
+
 /// Operator view (node-local, like `/v1/dns/stats`): how often this observer
 /// withdrew a peer, how often it declined to, and who is currently cold.
 ///
@@ -208,6 +251,11 @@ pub fn stats() -> serde_json::Value {
         // stay readable.
         "unknown_peer": UNKNOWN_PEER.load(Ordering::Relaxed),
         "cold_marks": COLD_MARKS.load(Ordering::Relaxed),
+        // Withdrawals REVERSED because the peer kept gossiping (see
+        // `restore_gossip_alive`). A steadily climbing value means this node's
+        // probe path is failing against demonstrably-live peers — the same
+        // signal as `refused_gossip_alive`, for verdicts already written.
+        "restored_gossip_alive": RESTORED.load(Ordering::Relaxed),
         "cold_now": cold_now,
     })
 }

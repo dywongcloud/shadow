@@ -526,6 +526,55 @@ impl NodeRegistry {
         self.peers.read().get(id).map(|p| p.last_seen_ms)
     }
 
+    /// Latency stamped on a peer restored by [`restore_health_if_gossip_fresh`].
+    ///
+    /// Deliberately NOT 0 (which sorts FIRST on the `anycast`/placement latency
+    /// key, so an unmeasured peer would out-rank every genuinely-probed one) and
+    /// not `u64::MAX` (`demote`'s value, which sorts last and is what we are
+    /// undoing). A restored peer is known-alive but unmeasured, so it ranks
+    /// behind every peer with a real RTT and ahead of the withdrawn.
+    pub const RESTORED_LATENCY_MS: u64 = 999;
+
+    /// Restore a peer's `healthy` flag when gossip proves it alive, WITHOUT
+    /// touching `last_seen_ms`.
+    ///
+    /// The counterpart to `hive-cloud`'s `health::demote`, and the half that was
+    /// missing: `demote` refuses to withdraw a peer whose gossip is fresh, but
+    /// nothing ever REVERSED a withdrawal once made, and only a successful probe
+    /// could clear it. A peer whose probe path is broken (stale cached addr,
+    /// wedged trunk) while its gossip keeps arriving therefore stayed unhealthy
+    /// for the life of the process — measured live as `audible_peers=15` beside
+    /// `visible_healthy_peers=6` on nine nodes at once, which is a fleet that has
+    /// heard from 15 peers in the last few seconds while reporting 6. Unhealthy
+    /// peers leave DNS and placement, so this silently shrank the fleet until an
+    /// operator restarted each node by hand.
+    ///
+    /// Applying the SAME evidence in both directions is what makes the state
+    /// self-healing: still gossiping ⇒ still served; gone quiet ⇒ aged out by
+    /// `nodes()`'s own staleness drop.
+    ///
+    /// `last_seen_ms` is deliberately preserved rather than refreshed (unlike
+    /// `set_health`): bumping it here would make this restore its OWN proof of
+    /// liveness on the next tick, so a peer that went silent would be kept
+    /// artificially alive forever instead of aging out.
+    ///
+    /// Returns `true` only when a withdrawal was actually reversed.
+    pub fn restore_health_if_gossip_fresh(&self, id: &str, max_age_ms: u64) -> bool {
+        let now = now_ms();
+        let mut peers = self.peers.write();
+        let Some(p) = peers.get_mut(id) else {
+            return false;
+        };
+        if p.healthy || now.saturating_sub(p.last_seen_ms) >= max_age_ms {
+            return false;
+        }
+        p.healthy = true;
+        if p.latency_ms == u64::MAX || p.latency_ms == 0 {
+            p.latency_ms = Self::RESTORED_LATENCY_MS;
+        }
+        true
+    }
+
     /// Record a peer's measured latency + health (from probing).
     pub fn set_health(&self, id: &str, latency_ms: u64, healthy: bool) {
         if let Some(p) = self.peers.write().get_mut(id) {

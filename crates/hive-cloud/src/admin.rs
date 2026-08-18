@@ -3589,7 +3589,18 @@ async fn project_delete(
         // a deployment of this project hosted locally under the requester's tenant
         || c.gw.list().iter().any(|d| d.project == project && record_tenant(&d.tenant) == t)
         // …or hosted on a peer (project lives only on a scheduler-placed node)
-        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t);
+        || c.peer_deployments.read().values().flatten().any(|d| d.project == project && record_tenant(&d.tenant) == t)
+        // …or known ONLY to the fleet-replicated relational mirror. This tier
+        // exists in the LISTING (`projects`' third fallback, added for a project
+        // created but never successfully deployed) and had no counterpart here,
+        // so a project the dashboard happily showed could never be authorized
+        // for deletion: every delete fell to the not-hosted-here branch, no peer
+        // could accept a cascade for a project none of them held either, and the
+        // handler answered 502 forever. Live-witnessed on `gpu-smoke` — zero
+        // deployments and zero settings rows fleet-wide, one `project_teams`
+        // row, undeletable from both the dashboard home and its own page.
+        // Anything we are willing to LIST for a tenant must be deletable by it.
+        || crate::relational::projects_for_team(&t).await.iter().any(|p| p == &project);
     // Not locally verifiable ≠ deniable: after a partial delete (or right after a
     // restart) this node may hold NO trace of a project that still serves on a
     // peer, and the gossip view can be sparse — a hard 404 here left ORPHANS
